@@ -35,18 +35,29 @@ class AppStrings {
 
   String get appName => 'P2WLAN';
 
-  String get dashboard => isZh ? '仪表盘' : 'Dashboard';
   String get nodes => isZh ? '节点' : 'Nodes';
-  String get tunnels => isZh ? '隧道' : 'Tunnels';
   String get diagnostics => isZh ? '诊断' : 'Diagnostics';
   String get settings => isZh ? '设置' : 'Settings';
-  String get more => isZh ? '更多' : 'More';
-  String get navGroupOverview => isZh ? '概览' : 'Overview';
-  String get navGroupNetwork => isZh ? '网络' : 'Network';
-  String get navGroupTools => isZh ? '工具' : 'Tools';
-  String get moreDescription => isZh
-      ? '诊断与设置等低频功能。'
-      : 'Diagnostics, settings, and other less frequent features.';
+
+  /// User-level navigation labels.
+  String get home => isZh ? '首页' : 'Home';
+  String get troubleshooting => isZh ? '故障排查' : 'Troubleshooting';
+  String get menu => isZh ? '菜单' : 'Menu';
+
+  // --- Shell status summary (desktop sidebar footer) ---
+  String get shellStatusHealthy => isZh ? '网络正常' : 'Network OK';
+  String get shellStatusAttention => isZh ? '网络异常' : 'Network issue';
+  String get shellStatusOffline => isZh ? '当前离线' : 'Offline';
+  String get shellStatusOfflineDetail =>
+      isZh ? '无法连接本地服务' : 'Cannot reach local service';
+  String get shellStatusStaleDetail =>
+      isZh ? '刷新查看最新状态' : 'Refresh to see latest status';
+  String shellPeersOnline(int count) => isZh
+      ? '$count 台设备在线'
+      : count == 1
+      ? '1 device online'
+      : '$count devices online';
+  String get openTroubleshooting => isZh ? '打开故障排查' : 'Open troubleshooting';
   String get restartRequired =>
       isZh ? '需要重启 P2WLAN' : 'P2WLAN restart required';
   String get restartRequiredDetail => isZh
@@ -81,6 +92,7 @@ class AppStrings {
   String get stopP2wlan => isZh ? '停止 P2WLAN' : 'Stop P2WLAN';
   String get daemonWorking => isZh ? '处理中...' : 'Working...';
   String get cancel => isZh ? '取消' : 'Cancel';
+  String get back => isZh ? '返回' : 'Back';
   String get close => isZh ? '关闭' : 'Close';
   String get closeWindow => isZh ? '退出应用' : 'Close window';
   String get continueAction => isZh ? '继续' : 'Continue';
@@ -103,55 +115,51 @@ class AppStrings {
   String get copyLaunchCommand => isZh ? '复制命令' : 'Copy command';
   String get copiedLaunchCommand => isZh ? '启动命令已复制' : 'Launch command copied';
 
-  String get dashboardSubtitle => isZh
-      ? '启动、停止并监控本机 P2WLAN 虚拟网络。'
-      : 'Start, stop, and monitor the local P2WLAN virtual network.';
-  String get networkCockpit => isZh ? '虚拟内网驾驶舱' : 'Virtual network cockpit';
-  String get virtualNetwork => isZh ? '虚拟内网' : 'Virtual network';
-  String get virtualNetworkRunning =>
-      isZh ? '虚拟内网运行中' : 'Virtual network running';
-  String get virtualNetworkStopped =>
-      isZh ? '虚拟内网未启动' : 'Virtual network stopped';
-  String get virtualNetworkRunningDetail => isZh
-      ? '本机已加入虚拟内网，可查看控制面、设备路径和中继状态。'
-      : 'This device is on the virtual network; control-plane, device paths, and relay status are available.';
-  String get virtualNetworkStoppedDetail => isZh
-      ? '启动后会显示虚拟 IP、控制面和设备路径状态。'
-      : 'Start P2WLAN to see virtual IP, control-plane, and device path status.';
-  String get networkTitle => isZh ? 'P2WLAN 网络' : 'P2WLAN network';
-  String get connectionOverview => isZh ? '连接概览' : 'Connection overview';
-  String get networkEnvironment => isZh ? '网络环境' : 'Network environment';
-  String get localNode => isZh ? '本机' : 'This device';
-  String get udp => isZh ? 'UDP' : 'UDP';
-  String get udpAvailable => isZh ? 'UDP 可用' : 'UDP available';
-  String get udpUnavailable => isZh ? 'UDP 不可用' : 'UDP unavailable';
-  String get dashboardStoppedTitle =>
-      isZh ? 'P2WLAN 尚未运行' : 'P2WLAN is not running';
-  String get dashboardStoppedDetail => isZh
-      ? '启动 P2WLAN 后，这里会显示你的设备和连接状态。'
-      : 'Start P2WLAN to see your devices and connection status here.';
-  String get dashboardUnavailableTitle =>
-      isZh ? '暂时无法获取网络状态' : 'Network status unavailable';
-  String get dashboardUnavailableDetail => isZh
-      ? '连接控制服务器后，这里会显示你的设备和连接状态。'
-      : 'Connect to the control server to see your devices and connection status here.';
+  // --- Home (network overview) ---
+  String get homePageSubtitle =>
+      isZh ? '网络状态与在线设备一览。' : 'Network status and online devices.';
+  String get homeNetworkTitle => isZh ? '网络状态' : 'Network status';
+  String get homeJoinedSubtitle =>
+      isZh ? '你的设备已加入 P2WLAN 网络' : 'Your device is on the P2WLAN network';
+  String get virtualIpLabel => isZh ? '虚拟 IP 地址' : 'Virtual IP address';
+  String get homeLoading => isZh ? '正在获取网络状态…' : 'Fetching network status…';
+  String get homeStoppedTitle => isZh ? 'P2WLAN 未运行' : 'P2WLAN is not running';
+  String get homeStoppedDetail =>
+      isZh ? '启动后即可加入虚拟网络。' : 'Start it to join the virtual network.';
+  String get homeUnavailableTitle =>
+      isZh ? '无法连接 P2WLAN' : 'Cannot reach P2WLAN';
+  String get homeUnavailableDetail => isZh
+      ? '本地网络服务当前不可用。'
+      : 'The local network service is currently unavailable.';
+  String get statusNormal => isZh ? '正常' : 'Normal';
+  String get notRunning => isZh ? '未运行' : 'Not running';
+  String get checkAgain => isZh ? '重新检查' : 'Check again';
+  String get homeStaleNote => isZh ? '数据可能已过期' : 'Data may be out of date';
+  String get viewAllDevices => isZh ? '查看全部' : 'View all';
+  String get noDevicesOnline => isZh ? '暂无其他设备在线' : 'No other devices online';
+  String get noDevicesOnlineDetail =>
+      isZh ? '设备上线后会显示在这里。' : 'Devices appear here when they come online.';
+  String get networkComponents => isZh ? '网络组件状态' : 'Network components';
+  String get componentControlServer => isZh ? '控制服务器' : 'Control server';
+  String get componentOverlayRoute => isZh ? 'Overlay 路由' : 'Overlay route';
+  String get componentPeerConnectivity => isZh ? '设备连接' : 'Device connectivity';
+  String get componentStatusNormal => isZh ? '正常' : 'Normal';
+  String get componentStatusDisconnected => isZh ? '未连接' : 'Disconnected';
+  String get componentStatusConnecting => isZh ? '连接中' : 'Connecting';
+  String get componentStatusError => isZh ? '异常' : 'Error';
+  String get componentStatusUnknown => isZh ? '未知' : 'Unknown';
+  String get homeIssueTitle => isZh ? '发现网络问题' : 'Network issue found';
+  String get checkIssues => isZh ? '检查问题' : 'Check issues';
+  String get manualStartNeeded =>
+      isZh ? '需要手动启动 P2WLAN' : 'Manual start needed';
+  String get viewCommand => isZh ? '查看命令' : 'View command';
+  String get hideCommand => isZh ? '收起' : 'Hide';
+
   String probeRtt(int probeRttMs) =>
       isZh ? '探测 RTT $probeRttMs ms' : 'probe RTT $probeRttMs ms';
-  String moreDevices(int count) => isZh
-      ? '还有 $count 台设备，可在「设备」页查看。'
-      : count == 1
-      ? '1 more device — see the Devices page.'
-      : '$count more devices — see the Devices page.';
-  String get daemonStatus => isZh ? '守护进程' : 'Daemon';
-  String get controlPlane => isZh ? '控制面' : 'Control plane';
   String get onlineDevices => isZh ? '在线设备' : 'Online devices';
-  String get pathOverview => isZh ? '路径概况' : 'Path overview';
   String get needsAttention => isZh ? '需要处理' : 'Needs attention';
-  String get reviewRecommended => isZh ? '建议确认' : 'Review recommended';
   String get noActionNeeded => isZh ? '当前无需处理' : 'No action needed';
-  String get dashboardAllGood => isZh
-      ? '守护进程、控制面和设备路径没有上报需要处理的问题。'
-      : 'Daemon, control-plane, and device paths are not reporting anything that needs action.';
   String get issueControlDisconnected => isZh
       ? '控制面未连接，设备目录和配置同步可能不可用。'
       : 'Control plane is disconnected; device catalog and config sync may be unavailable.';
@@ -170,9 +178,6 @@ class AppStrings {
   String get requestDuration => isZh ? '请求耗时' : 'Request duration';
   String get lastError => isZh ? '最近错误' : 'Last error';
   String get snapshot => isZh ? '快照' : 'Snapshot';
-  String get offlineSnapshotMessage => isZh
-      ? '当前没有运行快照。点击“启动 P2WLAN”启动本机 p2wlan-daemon。'
-      : 'No runtime snapshot is available. Click Start P2WLAN to launch the local p2wlan-daemon.';
   String get staleSnapshotMessage => isZh
       ? '运行状态已超过 90 秒未更新。请检查本机 daemon 后手动刷新。'
       : 'Runtime status has not updated for over 90 seconds. Check the local daemon, then refresh.';
@@ -240,6 +245,13 @@ class AppStrings {
   String get diagnosticsSubtitle => isZh
       ? '检查 P2WLAN 服务状态，并查看需要处理的问题。'
       : 'Check P2WLAN service status and see what needs attention.';
+  String get systemStatus => isZh ? '系统状态' : 'System status';
+  String get rechecking => isZh ? '正在检查…' : 'Checking…';
+  String get openDevices => isZh ? '查看设备' : 'View devices';
+  String get openSettings => isZh ? '打开设置' : 'Open settings';
+  String get networkAndRoutes => isZh ? '网络与路由' : 'Network & routes';
+  String get virtualNetwork => isZh ? '虚拟网络' : 'Virtual network';
+  String get supportTools => isZh ? '支持工具' : 'Support tools';
   String get diagnosticsOverview => isZh ? '诊断概览' : 'Diagnostics overview';
   String get healthChecks => isZh ? '状态检查' : 'Health checks';
   String get p2wlanService => isZh ? 'P2WLAN 服务' : 'P2WLAN service';
@@ -362,12 +374,11 @@ class AppStrings {
   String get recentDaemonLogs => isZh ? '最近 daemon 日志' : 'Recent daemon logs';
 
   String get nodesSubtitle => isZh
-      ? '查看本机节点和网络中的其他设备，管理名称、IP 与连接路径。'
+      ? '查看本机和网络中的其他设备，管理名称、IP 与连接方式。'
       : 'View this device and other devices in the network, including names, IPs, and paths.';
   String get noPeers => isZh
       ? '当前没有发现其他设备。'
       : 'No other devices are present in the current snapshot.';
-  String get peerSummary => isZh ? '设备概览' : 'Device summary';
   String get device => isZh ? '设备' : 'Device';
   String get peerId => isZh ? '节点 ID' : 'Node ID';
   String get state => isZh ? '状态' : 'State';
@@ -380,16 +391,13 @@ class AppStrings {
   String get direct => isZh ? '直连' : 'Direct';
   String get directTrial => isZh ? '直连试探' : 'Direct trial';
   String get probing => isZh ? '探测中' : 'probing';
-  String get attentionDevices => isZh ? '异常/需确认' : 'Attention';
-  String get directDevices => isZh ? '直连设备' : 'Direct devices';
-  String get relayDevices => isZh ? '中继设备' : 'Relay devices';
-  String get offlineDevices => isZh ? '离线设备' : 'Offline devices';
+  String get filter => isZh ? '筛选' : 'Filter';
 
   String get searchDevicesPlaceholder => isZh
       ? '搜索设备名称、虚拟 IP 或 Node ID'
       : 'Search device name, virtual IP, or Node ID';
   String get filterAll => isZh ? '全部' : 'All';
-  String get sortRecommended => isZh ? '推荐' : 'Recommended';
+  String get sortRecommended => isZh ? '默认排序' : 'Default';
   String get sortByName => isZh ? '名称' : 'Name';
   String get sortByLatency => isZh ? '延迟' : 'Latency';
   String deviceCountSummary(int total, int online) => isZh
@@ -401,21 +409,22 @@ class AppStrings {
   String get clearFilter => isZh ? '清除筛选' : 'Clear filters';
   String get noPeersTitle => isZh ? '还没有其他设备' : 'No other devices yet';
   String get noPeersBody => isZh
-      ? '登录另一台设备后，它会显示在这里。'
-      : 'Sign in on another device and it will appear here.';
-  String get noSearchResultsTitle => isZh ? '没有找到匹配设备' : 'No matching devices';
+      ? '当其他设备加入 P2WLAN 后，它们会出现在这里。'
+      : 'When another device joins P2WLAN, it will appear here.';
+  String get noSearchResultsTitle => isZh ? '没有找到设备' : 'No devices found';
   String get noSearchResultsBody => isZh
-      ? '换个关键词，或清除搜索查看全部设备。'
-      : 'Try a different query, or clear the search to see all devices.';
-  String get noFilterResultsTitle => isZh ? '没有匹配的设备' : 'No matching devices';
-  String get noFilterResultsBody => isZh
-      ? '当前筛选条件下没有设备，清除筛选查看全部。'
-      : 'No devices match this filter. Clear it to see everything.';
+      ? '检查名称、虚拟 IP 或 Node ID。'
+      : 'Check the name, virtual IP, or Node ID.';
+  String get noFilterResultsTitle =>
+      isZh ? '没有符合当前筛选条件的设备' : 'No devices match this filter';
+  String get noFilterResultsBody =>
+      isZh ? '清除筛选后即可查看全部设备。' : 'Clear the filter to see all devices.';
   String get sectionConnection => isZh ? '连接' : 'Connection';
   String get sectionNetwork => isZh ? '网络' : 'Network';
   String get sectionDevice => isZh ? '设备' : 'Device';
   String get sectionIssues => isZh ? '问题' : 'Issues';
   String get sectionActions => isZh ? '操作' : 'Actions';
+  String get advancedInfo => isZh ? '高级信息' : 'Advanced';
   String get onlineState => isZh ? '在线状态' : 'Online state';
   String get lastSeen => isZh ? '最后在线' : 'Last seen';
   String get pathDecision => isZh ? '路径判定' : 'Path decision';
@@ -473,7 +482,7 @@ class AppStrings {
   String get failedToSaveLocalSettings =>
       isZh ? '保存本地设置失败' : 'Failed to save local settings';
 
-  // --- Settings information architecture (Phase 4) ---
+  // --- Settings information architecture ---
   String get settingsSectionGeneral => isZh ? '常规' : 'General';
   String get settingsSectionAccountNetwork =>
       isZh ? '账号与网络' : 'Account & Network';
@@ -481,6 +490,11 @@ class AppStrings {
       isZh ? '高级网络' : 'Advanced Network';
   String get settingsSectionDeveloperDiagnostics =>
       isZh ? '开发与诊断' : 'Developer & Diagnostics';
+  // --- Settings category / IA ---
+  String get settingsCategoryApplication => isZh ? '应用' : 'App';
+  String get unsavedChanges => isZh ? '有未保存的更改' : 'Unsaved changes';
+  String get udpSubsection => 'UDP';
+  String get relaySubsection => 'Relay';
 
   String get saveChanges => isZh ? '保存更改' : 'Save changes';
   String get saveChangesRestartRequired =>
@@ -562,7 +576,7 @@ class AppStrings {
       ? '登录凭据、控制面与网络标识。'
       : 'Credentials, control plane, and network identity.';
 
-  // --- Login / authentication (Phase 5) ---
+  // --- Login / authentication ---
   String get loginSubtitleDesktop => isZh
       ? '登录后连接这台设备到你的 P2WLAN 网络。'
       : 'Sign in to connect this device to your P2WLAN network.';
@@ -630,7 +644,7 @@ class AppStrings {
   String get loginErrorUnknownTitle =>
       isZh ? '登录失败，请重试。' : 'Sign in failed. Please try again.';
 
-  // --- Onboarding (Phase 8 localization) ---
+  // --- Onboarding ---
   String get onboardingTitle =>
       isZh ? '把这台设备接入 P2WLAN' : 'Connect this device to P2WLAN';
   String get onboardingSubtitle => isZh
@@ -691,11 +705,7 @@ class AppStrings {
   String get onboardingStartFailed => isZh
       ? '无法启动 P2WLAN，请检查权限后重试。'
       : 'Could not start P2WLAN. Check permissions and try again.';
-  // --- Tunnels (Phase 8 localization) ---
-  String get tunnelsSubtitle => isZh
-      ? '查看虚拟网卡、UDP 绑定和 Overlay 路由生命周期。'
-      : 'Inspect virtual adapter, UDP bind, and overlay route lifecycle.';
-  String get tunnelSummary => isZh ? '隧道摘要' : 'Tunnel summary';
+  // --- Network & routes (Troubleshooting advanced) ---
   String get startupInterface => isZh ? '启动网卡配置' : 'Startup interface';
   String get startupMtu => isZh ? '启动 MTU 配置' : 'Startup MTU';
   String get virtualAdapter => isZh ? '虚拟网卡' : 'Virtual Adapter';
@@ -714,6 +724,7 @@ class AppStrings {
       isZh ? '权威状态：$state。' : 'Authoritative state: $state.';
   String get checkRoutes => isZh ? '检查路由' : 'Check routes';
   String get repairRoutes => isZh ? '修复路由' : 'Repair routes';
+  String get noFixNeeded => isZh ? '无需修复' : 'No fix needed';
   String get restartNetworkService =>
       isZh ? '重启网络服务（会短暂断开）' : 'Restart network service (brief disconnect)';
   String tunnelRouteRepaired(String after) => isZh
@@ -731,7 +742,7 @@ class AppStrings {
       ? '已通过重启 daemon 触发 Overlay 路由重装。'
       : 'Daemon restarted to reinstall overlay routes.';
 
-  // --- Nodes (Phase 8 localization) ---
+  // --- Nodes ---
   String nodeSynced(String name, String virtualIp) => isZh
       ? '本机节点已同步：$name / $virtualIp。重启 P2WLAN 后 IP 生效。'
       : 'This device synced: $name / $virtualIp. Restart P2WLAN to apply IP changes.';
@@ -747,7 +758,7 @@ class AppStrings {
       : 'This removes the device from the control plane. It must sign in or register again to rejoin.';
   String get deviceNameRequired =>
       isZh ? '设备名称不能为空' : 'Device name is required';
-  String get editThisDevice => isZh ? '编辑本机节点' : 'Edit this device';
+  String get editThisDevice => isZh ? '编辑本机' : 'Edit this device';
   String get requestedVirtualIp => isZh ? '期望虚拟 IP' : 'Requested virtual IP';
   String get requestedVirtualIpHelper => isZh
       ? '留空由控制面自动分配；修改后重启 P2WLAN 生效。'
@@ -756,7 +767,7 @@ class AppStrings {
       ? '虚拟 IP 格式不正确，例如 10.20.0.42'
       : 'Virtual IP must look like 10.20.0.42';
   String get version => isZh ? '版本' : 'Version';
-  String get thisDeviceTitle => isZh ? '本机节点' : 'This device';
+  String get thisDeviceTitle => isZh ? '本机' : 'This device';
   String get controlSyncReady => isZh ? '控制面同步就绪' : 'Control sync ready';
   String get savedLocally => isZh ? '本地保存' : 'Saved locally';
   String get directTypePublic => isZh ? '公网直连' : 'Public direct';
@@ -766,7 +777,7 @@ class AppStrings {
       ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
       : 'If it is only temporarily offline, leave it. Offline devices already sort to the bottom.';
 
-  // --- Settings (Phase 8 localization) ---
+  // --- Settings ---
   String get controlServerHelper => isZh
       ? '用户注册、设备认证和节点目录同步地址。'
       : 'Used for account auth, device registration, and peer catalog sync.';
@@ -780,6 +791,14 @@ class AppStrings {
       : 'Local daemon behind the diagnostics endpoint.';
   String get settingsSaveFailed =>
       isZh ? '无法保存配置，请重试。' : 'Could not save settings. Please try again.';
+
+  // --- Settings leave guard ---
+  String get discardSettingsTitle =>
+      isZh ? '放弃未保存的更改？' : 'Discard unsaved changes?';
+  String get discardSettingsBody =>
+      isZh ? '你有尚未保存的设置。' : 'You have unsaved settings.';
+  String get continueEditing => isZh ? '继续编辑' : 'Continue editing';
+  String get discardChanges => isZh ? '放弃更改' : 'Discard changes';
   String get deviceSaveFailed =>
       isZh ? '无法保存本机节点，请重试。' : 'Could not save this device. Please try again.';
   String get deviceRenameFailed =>
@@ -787,10 +806,10 @@ class AppStrings {
   String get deviceRemoveFailed =>
       isZh ? '无法移除设备，请重试。' : 'Could not remove the device. Please try again.';
 
-  // --- Diagnostics (Phase 8 localization) ---
+  // --- Diagnostics ---
   String get logExcerptCopied => isZh ? '日志片段已复制' : 'Log excerpt copied';
 
-  // --- Permissions presentation (Phase 8 follow-up) ---
+  // --- Permissions presentation ---
   String permActionElevationRequired() => isZh
       ? '启动 TUN 时需要管理员授权；P2WLAN 会使用系统授权弹窗，不读取或保存密码。'
       : 'Administrator authorization is required to create the TUN; P2WLAN uses the system prompt and never reads or stores your password.';
@@ -856,10 +875,9 @@ class AppStrings {
 
   String sectionLabel(String sectionName) {
     return switch (sectionName) {
-      'dashboard' => dashboard,
-      'nodes' => nodes,
-      'tunnels' => tunnels,
-      'diagnostics' => diagnostics,
+      'home' => home,
+      'devices' => devices,
+      'troubleshooting' => troubleshooting,
       'settings' => settings,
       _ => sectionName,
     };

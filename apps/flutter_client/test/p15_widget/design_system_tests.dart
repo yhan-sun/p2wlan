@@ -136,6 +136,38 @@ void _registerDesignSystemTests() {
       });
     }
   }
+
+  testWidgets('expanded dark shell renders sidebar, footer, and selection', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1280, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final stores = await _smokeStores(tester);
+    addTearDown(stores.dispose);
+    await tester.pumpWidget(
+      _DesignSystemHost(
+        dark: true,
+        child: P2WlanShell(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('macos'),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Sidebar with brand, primary sections, and the status footer.
+    expect(find.byType(DesktopSidebar), findsOneWidget);
+    expect(find.text('P2WLAN'), findsWidgets);
+    expect(find.text('Home'), findsOneWidget);
+    // Sidebar item and the Home section title share the Devices label.
+    expect(find.text('Devices'), findsWidgets);
+    expect(find.text('Troubleshooting'), findsOneWidget);
+    expect(find.text('Settings'), findsOneWidget);
+    // Footer: the smoke store reports a healthy snapshot with peers.
+    expect(find.text('Network OK'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }
 
 Future<void> _pumpDashboardSmoke(

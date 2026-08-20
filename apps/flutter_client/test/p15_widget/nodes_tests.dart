@@ -1,7 +1,7 @@
 part of '../p15_widget_test.dart';
 
 void _registerNodesTests() {
-  testWidgets('Nodes renders local device and readable peer sections', (
+  testWidgets('Nodes renders local device and a continuous device list', (
     tester,
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -31,15 +31,31 @@ void _registerNodesTests() {
       ),
     );
 
+    // Compact local-device section: name, IP, status — no Node ID, no sync
+    // text, no big panel.
     expect(find.text('This device'), findsOneWidget);
     expect(find.text('studio-mac'), findsOneWidget);
+    expect(find.byKey(const Key('nodes-local-row')), findsOneWidget);
+
+    // Toolbar: search + summary + filter/sort menus, never six chips.
     expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
-    expect(find.byKey(const Key('nodes-filter-all')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-filter-button')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-sort-button')), findsOneWidget);
+    expect(find.byType(ChoiceChip), findsNothing);
+    expect(find.text('2 devices · 2 online'), findsOneWidget);
+
+    // Continuous list: no group headers, judgment columns only.
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('relay-nas'), findsOneWidget);
     expect(find.byKey(const Key('node-row-peer-direct-001')), findsOneWidget);
     expect(find.byKey(const Key('node-row-peer-relay-002')), findsOneWidget);
-    expect(find.text('Peer 数'), findsNothing);
+    expect(find.text('Direct devices'), findsNothing);
+    expect(find.text('Offline devices'), findsNothing);
+
+    // First level never shows Node ID or the app version.
+    expect(find.text('Node ID'), findsNothing);
+    expect(find.text('1.0.0'), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('Nodes keeps peer list readable on narrow screens', (
@@ -76,6 +92,9 @@ void _registerNodesTests() {
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('10.20.0.11'), findsOneWidget);
     expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
+    // No inspector on mobile, no overflow menu on mobile rows.
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
+    expect(find.byTooltip('Device actions'), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -127,7 +146,7 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Nodes keeps errored offline peers in the offline group', (
+  testWidgets('Nodes offline peers show offline and never a stale path', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(800, 1200);
@@ -198,22 +217,21 @@ void _registerNodesTests() {
       ),
     );
 
-    final offlineGroupHeader = find.text('Offline devices').last;
-    final erroredOffline = find.text('offline-with-error');
-    final plainOffline = find.text('offline-plain');
-    expect(offlineGroupHeader, findsOneWidget);
-    expect(erroredOffline, findsOneWidget);
-    expect(plainOffline, findsOneWidget);
-    expect(
-      tester.getTopLeft(erroredOffline).dy,
-      greaterThan(tester.getTopLeft(offlineGroupHeader).dy),
-    );
-    expect(
-      tester.getTopLeft(plainOffline).dy,
-      greaterThan(tester.getTopLeft(offlineGroupHeader).dy),
-    );
-    // Raw lastError is not dumped into the list; a warning indicator is shown
-    // instead. The full error lives in the detail pane.
+    // No group headers: the offline peers live in the same continuous list.
+    expect(find.text('Offline devices'), findsNothing);
+    expect(find.text('offline-with-error'), findsOneWidget);
+    expect(find.text('offline-plain'), findsOneWidget);
+
+    // Offline wins: path column says Offline and latency is —, never a stale
+    // Direct/Relay claim or a fabricated latency.
+    expect(find.text('Offline'), findsNWidgets(2));
+    expect(find.text('—'), findsNWidgets(2));
+    expect(find.text('Direct'), findsOneWidget);
+    expect(find.text('Relay'), findsOneWidget);
+    expect(find.text('10 ms'), findsNothing);
+
+    // Raw lastError is not dumped into the list; a warning indicator is
+    // shown instead. The full error lives in the detail surfaces.
     expect(
       find.text('no direct probe ACK after 320 background UDP retry probes'),
       findsNothing,
@@ -262,7 +280,7 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Nodes details action opens a visible bounded dialog', (
+  testWidgets('Nodes details hide technical fields behind Advanced', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(800, 1200);
@@ -288,15 +306,28 @@ void _registerNodesTests() {
       ),
     );
 
-    await tester.tap(find.byTooltip('Device actions').first);
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('View details').last);
+    await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
 
     expect(find.byType(Dialog), findsOneWidget);
+    // Common info first: connection type and the summary line.
     expect(find.text('Connection type'), findsOneWidget);
-    expect(find.text('Node ID'), findsWidgets);
-    expect(find.byType(SelectableText), findsWidgets);
+    expect(find.text('Direct · 24 ms'), findsOneWidget);
+    // Advanced is collapsed: no Node ID, version, or state on the first
+    // level of the detail.
+    expect(find.text('Node ID'), findsNothing);
+    expect(find.text('1.0.0'), findsNothing);
+    expect(find.text('State'), findsNothing);
+
+    await tester.tap(find.byKey(const Key('nodes-advanced-toggle')));
+    await tester.pumpAndSettle();
+    expect(find.text('Node ID'), findsOneWidget);
+    expect(find.text('Version'), findsOneWidget);
+    expect(find.text('peer-direct-001'), findsOneWidget);
+    expect(find.text('direct'), findsOneWidget);
+    expect(find.text('—'), findsWidgets); // absent app_version/endpoint → dash
+    expect(find.text('State'), findsOneWidget);
+    expect(find.text('Copy ping command'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -334,16 +365,18 @@ void _registerNodesTests() {
       ),
     );
 
-    final speedTestButton = find.byKey(
-      const Key('node-speedtest-button-peer-direct-001'),
+    // The relay peer carries the "direct probe timed out" note, so it ranks
+    // first (needs attention) and its menu is the first on screen.
+    await tester.tap(find.byTooltip('Device actions').first);
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const Key('node-speedtest-action-peer-relay-002')),
     );
-    await tester.ensureVisible(speedTestButton);
-    await tester.tap(speedTestButton);
     await tester.pumpAndSettle();
 
     expect(find.byKey(const Key('node-speedtest-dialog')), findsOneWidget);
     expect(find.text('Test duration: 10 seconds'), findsOneWidget);
-    expect(find.text('direct-laptop'), findsWidgets);
+    expect(find.text('relay-nas'), findsWidgets);
 
     await tester.tap(find.byKey(const Key('node-speedtest-start')));
     await tester.pump();
@@ -384,11 +417,11 @@ void _registerNodesTests() {
       ),
     );
 
-    final speedTestButton = find.byKey(
-      const Key('node-speedtest-button-peer-direct-001'),
+    await tester.tap(find.byTooltip('Device actions').first);
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const Key('node-speedtest-action-peer-relay-002')),
     );
-    await tester.ensureVisible(speedTestButton);
-    await tester.tap(speedTestButton);
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('node-speedtest-start')));
     await tester.pump();
@@ -452,7 +485,9 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('node-row-node-office')), findsOneWidget);
   });
 
-  testWidgets('Nodes filter chips narrow the device set', (tester) async {
+  testWidgets('Nodes filter menu offers all six filters and narrows the set', (
+    tester,
+  ) async {
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
     final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
     final stores = (await tester.runAsync(
@@ -472,13 +507,35 @@ void _registerNodesTests() {
       ),
     );
 
-    Future<void> tapFilter(String name) async {
-      final finder = find.byKey(Key('nodes-filter-$name'));
-      await tester.ensureVisible(finder);
-      await tester.pump();
-      await tester.tap(finder);
-      await tester.pump();
+    // No chip row at all — the filter is a single menu.
+    expect(find.byType(ChoiceChip), findsNothing);
+
+    Future<void> openFilter() async {
+      await tester.tap(find.byKey(const Key('nodes-filter-button')));
+      await tester.pumpAndSettle();
     }
+
+    Future<void> tapFilter(String name) async {
+      await openFilter();
+      await tester.tap(find.byKey(Key('nodes-filter-$name')));
+      await tester.pumpAndSettle();
+    }
+
+    // The menu exposes every filter (menu items are keyed; the page itself
+    // also renders some of the same labels in the rows).
+    await openFilter();
+    for (final name in [
+      'all',
+      'online',
+      'direct',
+      'relay',
+      'attention',
+      'offline',
+    ]) {
+      expect(find.byKey(Key('nodes-filter-$name')), findsOneWidget);
+    }
+    await tester.tap(find.byKey(const Key('nodes-filter-all')));
+    await tester.pumpAndSettle();
 
     int rowCount() => tester
         .widgetList(find.byWidgetPredicate((widget) => widget is InkWell))
@@ -501,7 +558,9 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Nodes sort by name and by verified latency', (tester) async {
+  testWidgets('Nodes sort menu orders by name and by verified latency', (
+    tester,
+  ) async {
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
     final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
     final stores = (await tester.runAsync(
@@ -524,10 +583,15 @@ void _registerNodesTests() {
     double rowTop(String nodeId) =>
         tester.getTopLeft(find.byKey(Key('node-row-$nodeId'))).dy;
 
-    // Name sort: direct-laptop, offline-printer, probing-phone, relay-nas.
+    // The sort menu exposes Default / Name / Latency.
     await tester.tap(find.byKey(const Key('nodes-sort-button')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Name').last);
+    expect(find.byKey(const Key('nodes-sort-recommended')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-sort-name')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-sort-latency')), findsOneWidget);
+
+    // Name sort: direct-laptop, offline-printer, probing-phone, relay-nas.
+    await tester.tap(find.byKey(const Key('nodes-sort-name')));
     await tester.pumpAndSettle();
     expect(rowTop('node-direct'), lessThan(rowTop('node-offline')));
     expect(rowTop('node-offline'), lessThan(rowTop('node-probing')));
@@ -538,7 +602,7 @@ void _registerNodesTests() {
     // is not a latency and must not place probing-phone first.
     await tester.tap(find.byKey(const Key('nodes-sort-button')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Latency').last);
+    await tester.tap(find.byKey(const Key('nodes-sort-latency')));
     await tester.pumpAndSettle();
     expect(rowTop('node-direct'), lessThan(rowTop('node-relay')));
     expect(rowTop('node-relay'), lessThan(rowTop('node-offline')));
@@ -573,11 +637,12 @@ void _registerNodesTests() {
       ),
     );
 
-    // Detail pane exists and shows the recommended-first peer.
+    // Master/detail exists and the recommended-first peer is selected by
+    // default: the probing peer needs attention and ranks first.
     expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
-    expect(find.text('direct-laptop'), findsWidgets);
+    expect(find.text('probing-phone'), findsWidgets);
 
-    // Clicking the second row updates the detail pane.
+    // Clicking the second row updates the detail pane in place.
     await tester.tap(find.byKey(const Key('node-row-node-relay')));
     await tester.pump();
     expect(find.text('relay-nas'), findsWidgets);
@@ -591,7 +656,6 @@ void _registerNodesTests() {
     // Removing the selected peer hides it and falls back to the first visible
     // peer instead of showing stale details.
     final api = stores.statusStore;
-    // Simulate the peer disappearing from the snapshot.
     final pruned = _snapshotWithPeers(
       base,
       _fourPeerFixtures().where((p) => p['node_id'] != 'node-relay').toList(),
@@ -601,6 +665,59 @@ void _registerNodesTests() {
     await tester.pump();
     expect(find.text('relay-nas'), findsNothing);
     expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Nodes expanded rows hide Node ID and version until Advanced', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    final pane = find.byKey(const Key('nodes-detail-pane'));
+    Finder paneText(String text) =>
+        find.descendant(of: pane, matching: find.text(text));
+
+    // Rows and collapsed inspector: no Node ID, no version, no state.
+    expect(find.text('Node ID'), findsNothing);
+    expect(find.text('Version'), findsNothing);
+    expect(find.text('1.0.0'), findsNothing);
+    expect(paneText('Node ID'), findsNothing);
+
+    // Inspector header answers who/online/how without technical fields.
+    expect(paneText('probing-phone'), findsOneWidget);
+    expect(paneText('10.20.0.13'), findsWidgets); // header + network section
+
+    // Expanding Advanced reveals the technical metadata.
+    await tester.tap(find.byKey(const Key('nodes-advanced-toggle')));
+    await tester.pumpAndSettle();
+    expect(paneText('Node ID'), findsOneWidget);
+    expect(paneText('Version'), findsOneWidget);
+    expect(paneText('1.0.0'), findsOneWidget);
+    expect(paneText('State'), findsOneWidget);
+    // List rows themselves never show version even after expansion.
+    expect(find.text('1.0.0'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -695,7 +812,7 @@ void _registerNodesTests() {
     addTearDown(stores.dispose);
     await stores.statusStore.refresh();
 
-    // No peers at all.
+    // No peers at all: the local device still renders above the empty state.
     final noPeersSnapshot = _snapshotWithPeers(base, []);
     (stores.statusStore.diagnosticsApi as _FakeDiagnosticsApi).snapshot =
         noPeersSnapshot;
@@ -709,8 +826,9 @@ void _registerNodesTests() {
       ),
     );
     await tester.pump();
+    expect(find.text('This device'), findsOneWidget);
     expect(find.text('No other devices yet'), findsOneWidget);
-    expect(find.text('No matching devices'), findsNothing);
+    expect(find.text('No devices found'), findsNothing);
 
     // Search with no matches.
     final searchSnapshot = _snapshotWithPeers(base, _searchPeerFixtures());
@@ -727,18 +845,17 @@ void _registerNodesTests() {
     );
     await tester.enterText(find.byKey(const Key('nodes-search-field')), 'zzz');
     await tester.pump();
-    expect(find.text('No matching devices'), findsOneWidget);
+    expect(find.text('No devices found'), findsOneWidget);
     await tester.tap(find.text('Clear search'));
     await tester.pump();
     expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
 
-    // Filter with no matches.
-    final attentionChip = find.byKey(const Key('nodes-filter-attention'));
-    await tester.ensureVisible(attentionChip);
-    await tester.pump();
-    await tester.tap(attentionChip);
-    await tester.pump();
-    expect(find.text('No matching devices'), findsOneWidget);
+    // Filter with no matches, via the filter menu.
+    await tester.tap(find.byKey(const Key('nodes-filter-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('nodes-filter-attention')));
+    await tester.pumpAndSettle();
+    expect(find.text('No devices match this filter'), findsOneWidget);
     await tester.tap(find.text('Clear filters'));
     await tester.pump();
     expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
@@ -780,24 +897,22 @@ void _registerNodesTests() {
     await tester.pump();
     expect(paneText('relay-nas'), findsOneWidget);
 
-    // Filter to Direct: the Relay row disappears and the detail must switch
-    // to a Direct peer instead of showing the hidden Relay.
-    final directChip = find.byKey(const Key('nodes-filter-direct'));
-    await tester.ensureVisible(directChip);
-    await tester.pump();
-    await tester.tap(directChip);
-    await tester.pump();
+    // Filter to Direct via the menu: the Relay row disappears and the detail
+    // must switch to a Direct peer instead of showing the hidden Relay.
+    await tester.tap(find.byKey(const Key('nodes-filter-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('nodes-filter-direct')));
+    await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-relay')), findsNothing);
     expect(paneText('direct-laptop'), findsOneWidget);
     expect(paneText('relay-nas'), findsNothing);
 
     // Clearing the filter restores the list without exceptions; the stale
     // selection must not resurrect a hidden peer.
-    final allChip = find.byKey(const Key('nodes-filter-all'));
-    await tester.ensureVisible(allChip);
-    await tester.pump();
-    await tester.tap(allChip);
-    await tester.pump();
+    await tester.tap(find.byKey(const Key('nodes-filter-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('nodes-filter-all')));
+    await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-relay')), findsOneWidget);
     expect(tester.takeException(), isNull);
 
@@ -985,45 +1100,6 @@ void _registerNodesTests() {
     tester.view.resetDevicePixelRatio();
   });
 
-  testWidgets('Nodes uses neutral relay and warning attention group tones', (
-    tester,
-  ) async {
-    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
-    final stores = (await tester.runAsync(
-      () => _makeStores(
-        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      ),
-    ))!;
-    addTearDown(stores.dispose);
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: NodesPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-        ),
-      ),
-    );
-
-    StatusTone groupTone(String title) {
-      return tester
-          .widget<StatusBadge>(
-            find.descendant(
-              of: find.byKey(Key('nodes-group-${title.hashCode}')),
-              matching: find.byType(StatusBadge),
-            ),
-          )
-          .tone;
-    }
-
-    expect(groupTone('Attention'), StatusTone.warn);
-    expect(groupTone('Direct devices'), StatusTone.good);
-    expect(groupTone('Relay devices'), StatusTone.neutral);
-    expect(groupTone('Offline devices'), StatusTone.neutral);
-    expect(tester.takeException(), isNull);
-  });
-
   testWidgets('Nodes online count matches the online filter', (tester) async {
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
     final ghostPeer = _peerJson(
@@ -1058,144 +1134,167 @@ void _registerNodesTests() {
     );
 
     // The peer reports online=true but has no verified usable path (its
-    // computed path is offline). Summary and filter chip must agree: 1 online.
+    // computed path is offline). Summary and the Online filter must agree.
     expect(find.text('2 devices · 1 online'), findsOneWidget);
-    expect(find.text('Online 1'), findsOneWidget);
 
-    final onlineChip = find.byKey(const Key('nodes-filter-online'));
-    await tester.ensureVisible(onlineChip);
-    await tester.pump();
-    await tester.tap(onlineChip);
-    await tester.pump();
+    await tester.tap(find.byKey(const Key('nodes-filter-button')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('nodes-filter-online')));
+    await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
     expect(find.byKey(const Key('node-row-node-ghost')), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets(
-    'Nodes badges inside detail surfaces use explicit locale strings',
-    (tester) async {
-      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-      final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
+  testWidgets('Nodes shows a stale hint while keeping last-known data', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        enableFreshnessTimer: true,
+        maxSnapshotAge: const Duration(milliseconds: 300),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+    await stores.statusStore.refresh();
+    await tester.pump(const Duration(milliseconds: 600));
 
-      // English scope: the badge must stay English inside the dialog route even
-      // though that route is outside the home AppStringsScope (whose fallback is
-      // the default language, zh-Hans).
-      final enStores = (await tester.runAsync(
-        () => _makeStores(
-          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
         ),
-      ))!;
-      addTearDown(enStores.dispose);
-      await enStores.statusStore.refresh();
-      await tester.pumpWidget(
-        _TestApp(
-          child: NodesPage(
-            key: const ValueKey('nodes-badge-en'),
-            settingsStore: enStores.settingsStore,
-            statusStore: enStores.statusStore,
-          ),
-        ),
-      );
-      await tester.tap(find.byKey(const Key('node-row-node-direct')));
-      await tester.pumpAndSettle();
-      expect(find.byType(Dialog), findsOneWidget);
-      final enBadge = tester.widget<StatusBadge>(
-        find.descendant(
-          of: find.byType(Dialog),
-          matching: find.byType(StatusBadge),
-        ),
-      );
-      expect(enBadge.label, 'Direct');
-      await tester.tap(find.byTooltip('Cancel'));
-      await tester.pumpAndSettle();
+      ),
+    );
 
-      // Chinese scope: explicit zh strings must reach the dialog badge.
-      final zhStores = (await tester.runAsync(
-        () => _makeStores(
-          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-        ),
-      ))!;
-      addTearDown(zhStores.dispose);
-      await zhStores.statusStore.refresh();
-      await tester.pumpWidget(
-        _TestApp(
-          strings: AppStrings.fromCode('zh'),
-          child: NodesPage(
-            key: const ValueKey('nodes-badge-zh'),
-            settingsStore: zhStores.settingsStore,
-            statusStore: zhStores.statusStore,
-          ),
-        ),
-      );
-      await tester.tap(find.byKey(const Key('node-row-node-direct')));
-      await tester.pumpAndSettle();
-      expect(find.byType(Dialog), findsOneWidget);
-      final zhBadge = tester.widget<StatusBadge>(
-        find.descendant(
-          of: find.byType(Dialog),
-          matching: find.byType(StatusBadge),
-        ),
-      );
-      expect(zhBadge.label, '直连');
-      expect(
-        find.descendant(of: find.byType(Dialog), matching: find.text('Direct')),
-        findsNothing,
-      );
-      await tester.tap(find.byTooltip('取消'));
-      await tester.pumpAndSettle();
+    // Last-known list stays; the header hint flags staleness.
+    expect(find.text('direct-laptop'), findsOneWidget);
+    expect(find.text('relay-nas'), findsOneWidget);
+    expect(find.text('Stale'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 
-      // Verified relay peer keeps its localized label inside the dialog too.
-      final relayRow = find.byKey(const Key('node-row-node-relay'));
-      await tester.ensureVisible(relayRow);
-      await tester.pumpAndSettle();
-      await tester.tap(relayRow);
-      await tester.pumpAndSettle();
-      final zhRelayBadge = tester.widget<StatusBadge>(
-        find.descendant(
-          of: find.byType(Dialog),
-          matching: find.byType(StatusBadge),
-        ),
-      );
-      expect(zhRelayBadge.label, '中继');
-      await tester.tap(find.byTooltip('取消'));
-      await tester.pumpAndSettle();
+  testWidgets('Nodes details use explicit locale path labels across surfaces', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final snapshot = _snapshotWithPeers(base, _fourPeerFixtures());
 
-      // Compact mobile detail route preserves the explicit locale strings.
-      tester.view.physicalSize = const Size(390, 844);
-      tester.view.devicePixelRatio = 1;
-      await tester.pumpWidget(
-        _TestApp(
-          strings: AppStrings.fromCode('zh'),
-          child: NodesPage(
-            key: const ValueKey('nodes-badge-zh-mobile'),
-            settingsStore: zhStores.settingsStore,
-            statusStore: zhStores.statusStore,
-          ),
+    // English scope: labels stay English inside the dialog route even
+    // though that route is outside the home AppStringsScope (whose fallback
+    // is the default language, zh-Hans).
+    final enStores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(enStores.dispose);
+    await enStores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          key: const ValueKey('nodes-badge-en'),
+          settingsStore: enStores.settingsStore,
+          statusStore: enStores.statusStore,
         ),
-      );
-      await tester.tap(find.byKey(const Key('node-row-node-direct')));
-      await tester.pumpAndSettle();
-      expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
-      final mobileBadge = tester.widget<StatusBadge>(
-        find.descendant(
-          of: find.byKey(const Key('nodes-mobile-detail')),
-          matching: find.byType(StatusBadge),
+      ),
+    );
+    await tester.tap(find.byKey(const Key('node-row-node-direct')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('Direct')),
+      findsWidgets,
+    );
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('直连')),
+      findsNothing,
+    );
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
+
+    // Chinese scope: explicit zh strings must reach the dialog.
+    final zhStores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(zhStores.dispose);
+    await zhStores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        strings: AppStrings.fromCode('zh'),
+        child: NodesPage(
+          key: const ValueKey('nodes-badge-zh'),
+          settingsStore: zhStores.settingsStore,
+          statusStore: zhStores.statusStore,
         ),
-      );
-      expect(mobileBadge.label, '直连');
-      expect(
-        find.descendant(
-          of: find.byKey(const Key('nodes-mobile-detail')),
-          matching: find.text('Direct'),
+      ),
+    );
+    await tester.tap(find.byKey(const Key('node-row-node-direct')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('直连')),
+      findsWidgets,
+    );
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('Direct')),
+      findsNothing,
+    );
+    await tester.tap(find.byTooltip('取消'));
+    await tester.pumpAndSettle();
+
+    // Verified relay peer keeps its localized path label in the dialog too.
+    final relayRow = find.byKey(const Key('node-row-node-relay'));
+    await tester.ensureVisible(relayRow);
+    await tester.pumpAndSettle();
+    await tester.tap(relayRow);
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('中继')),
+      findsWidgets,
+    );
+    await tester.tap(find.byTooltip('取消'));
+    await tester.pumpAndSettle();
+
+    // Compact mobile detail route preserves the explicit locale strings.
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    await tester.pumpWidget(
+      _TestApp(
+        strings: AppStrings.fromCode('zh'),
+        child: NodesPage(
+          key: const ValueKey('nodes-badge-zh-mobile'),
+          settingsStore: zhStores.settingsStore,
+          statusStore: zhStores.statusStore,
         ),
-        findsNothing,
-      );
-      tester.view.resetPhysicalSize();
-      tester.view.resetDevicePixelRatio();
-      expect(tester.takeException(), isNull);
-    },
-  );
+      ),
+    );
+    await tester.tap(find.byKey(const Key('node-row-node-direct')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('nodes-mobile-detail')),
+        matching: find.text('直连'),
+      ),
+      findsWidgets,
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('nodes-mobile-detail')),
+        matching: find.text('Direct'),
+      ),
+      findsNothing,
+    );
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+    expect(tester.takeException(), isNull);
+  });
 }
 
 /// Three peers for search coverage: Laptop / NAS / Office PC with distinct

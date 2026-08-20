@@ -24,15 +24,38 @@ Future<_Stores> _pumpSettings(
       ),
     ),
   );
+  await tester.pumpAndSettle();
   return stores;
 }
-
-Finder _disclosure(String title) =>
-    find.byKey(Key('settings-disclosure-$title'));
 
 Finder _settingsTextField(String label) => find.byWidgetPredicate(
   (widget) => widget is TextField && widget.decoration?.labelText == label,
 );
+
+/// Opens a settings category. Works on the medium/compact root-detail layout
+/// (taps the root row) and on the desktop rail layout (taps the sidebar item).
+/// If a detail is already open it returns to the root first.
+Future<void> _openCategory(WidgetTester tester, String label) async {
+  if (find.byIcon(Icons.arrow_back_rounded).evaluate().isNotEmpty) {
+    await tester.tap(find.byIcon(Icons.arrow_back_rounded));
+    await tester.pumpAndSettle();
+  }
+  await tester.ensureVisible(find.text(label));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label));
+  await tester.pumpAndSettle();
+}
+
+/// Taps the save action inside a category detail (it only exists while the
+/// category is dirty).
+Future<void> _tapSave(WidgetTester tester) async {
+  final save = find.byKey(const Key('settings-save-button'));
+  expect(save, findsOneWidget);
+  await tester.ensureVisible(save);
+  await tester.pumpAndSettle();
+  await tester.tap(save);
+  await tester.pump();
+}
 
 /// Waits until [condition] is satisfied or the polling budget is exhausted.
 Future<void> _waitFor(WidgetTester tester, bool Function() condition) async {
@@ -44,20 +67,34 @@ Future<void> _waitFor(WidgetTester tester, bool Function() condition) async {
   }
 }
 
+/// Waits until the immediate-save dropdown at [key] is enabled again, i.e. the
+/// previous language/theme persistence fully completed (the in-memory value is
+/// set synchronously, before the async disk write finishes).
+Future<void> _waitForSaveComplete(WidgetTester tester, Key key) async {
+  for (var attempt = 0; attempt < 30; attempt += 1) {
+    final dropdown = tester.widget<DropdownButton<String>>(find.byKey(key));
+    if (dropdown.onChanged != null) return;
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 100)),
+    );
+    await tester.pump();
+  }
+  fail('Immediate-save dropdown never re-enabled for $key');
+}
+
 void _registerSettingsTests() {
   testWidgets('Settings validates diagnostics URL before saving', (
     tester,
   ) async {
     await _pumpSettings(tester, api: _FakeDiagnosticsApi(health: false));
 
-    await tester.tap(_disclosure('Developer & Diagnostics'));
-    await tester.pumpAndSettle();
+    await _openCategory(tester, 'Developer & Diagnostics');
     await tester.enterText(
       _settingsTextField('Diagnostics URL'),
       'ftp://127.0.0.1:39277',
     );
-    await tester.tap(find.byKey(const Key('settings-save-button')));
     await tester.pump();
+    await _tapSave(tester);
 
     expect(find.text('Diagnostics URL must use http or https'), findsOneWidget);
     expect(find.text('Diagnostics URL was not saved'), findsOneWidget);
@@ -72,10 +109,7 @@ void _registerSettingsTests() {
       physicalSize: const Size(390, 1200),
     );
 
-    await tester.ensureVisible(_disclosure('Advanced Network'));
-    await tester.pump();
-    await tester.tap(_disclosure('Advanced Network'));
-    await tester.pumpAndSettle();
+    await _openCategory(tester, 'Advanced Network');
 
     expect(find.text('Interface name'), findsOneWidget);
     expect(find.text('UDP advertise'), findsOneWidget);
@@ -94,11 +128,10 @@ void _registerSettingsTests() {
       await stores.statusStore.refresh();
       expect(stores.statusStore.daemonReachable, isTrue);
 
-      await tester.tap(_disclosure('Advanced Network'));
-      await tester.pumpAndSettle();
+      await _openCategory(tester, 'Advanced Network');
       await tester.enterText(_settingsTextField('MTU'), '1280');
-      await tester.tap(find.byKey(const Key('settings-save-button')));
       await tester.pump();
+      await _tapSave(tester);
       await _waitFor(tester, () => stores.settingsStore.settings.mtu == 1280);
       await _waitFor(
         tester,
@@ -133,6 +166,7 @@ void _registerSettingsTests() {
         ),
       ),
     );
+    await tester.pumpAndSettle();
 
     // Status is reported, the credential itself is never rendered.
     expect(find.text('Securely saved'), findsOneWidget);
@@ -140,6 +174,7 @@ void _registerSettingsTests() {
     // The token input is hidden until explicitly requested.
     expect(_settingsTextField('Auth token'), findsNothing);
 
+    await _openCategory(tester, 'Account & Network');
     await tester.tap(find.text('Change credential'));
     await tester.pump();
     final tokenField = _settingsTextField('Auth token');
@@ -148,8 +183,8 @@ void _registerSettingsTests() {
     expect(tester.widget<TextField>(tokenField).controller!.text, isEmpty);
 
     await tester.enterText(tokenField, 'replacement-token');
-    await tester.tap(find.byKey(const Key('settings-save-button')));
     await tester.pump();
+    await _tapSave(tester);
     await _waitFor(
       tester,
       () => stores.settingsStore.settings.authToken == 'replacement-token',
@@ -189,12 +224,19 @@ void _registerSettingsTests() {
         ),
       ),
     );
+    await tester.pumpAndSettle();
 
+    await _openCategory(tester, 'Account & Network');
     await tester.tap(find.text('Change credential'));
     await tester.pump();
-    // The revealed token field is empty; save without typing anything.
-    await tester.tap(find.byKey(const Key('settings-save-button')));
+    // The revealed token field is empty; save with nothing else changed would
+    // be a no-op, so also touch the control server to create a real draft.
+    await tester.enterText(
+      _settingsTextField('Control server'),
+      'https://ctrl.example',
+    );
     await tester.pump();
+    await _tapSave(tester);
     await _waitFor(tester, () => !stores.statusStore.refreshing);
 
     expect(stores.settingsStore.settings.authToken, 'kept-token');
@@ -212,6 +254,7 @@ void _registerSettingsTests() {
       onLogout: () => signedOut = true,
     );
 
+    await _openCategory(tester, 'Account & Network');
     expect(find.text('Sign out'), findsOneWidget);
     await tester.tap(find.text('Sign out'));
     expect(signedOut, isTrue);
@@ -220,6 +263,7 @@ void _registerSettingsTests() {
   testWidgets('Settings omits Sign out without a handler', (tester) async {
     await _pumpSettings(tester, api: _FakeDiagnosticsApi(health: false));
 
+    await _openCategory(tester, 'Account & Network');
     expect(find.text('Sign out'), findsNothing);
   });
 
@@ -233,12 +277,16 @@ void _registerSettingsTests() {
       physicalSize: const Size(390, 1200),
     );
 
+    // Root shows only remote-relevant categories and no technical fields.
     expect(find.text('Advanced Network'), findsNothing);
     expect(find.text('Developer & Diagnostics'), findsNothing);
     expect(find.text('Interface name'), findsNothing);
     expect(find.text('Diagnostics URL'), findsNothing);
     expect(find.text('Close window behavior'), findsNothing);
-    // Account-level fields remain available.
+    expect(find.text('Control server'), findsNothing);
+
+    // Account-level fields remain reachable inside the category detail.
+    await _openCategory(tester, 'Account & Network');
     expect(find.text('Control server'), findsOneWidget);
     expect(find.text('Network ID'), findsOneWidget);
     expect(tester.takeException(), isNull);
@@ -277,13 +325,15 @@ void _registerSettingsTests() {
         ),
       ),
     );
+    await tester.pumpAndSettle();
 
+    await _openCategory(tester, 'Account & Network');
     await tester.enterText(
       _settingsTextField('Control server'),
       'https://ctrl.example',
     );
-    await tester.tap(find.byKey(const Key('settings-save-button')));
     await tester.pump();
+    await _tapSave(tester);
     await _waitFor(
       tester,
       () =>
@@ -313,12 +363,13 @@ void _registerSettingsTests() {
     await stores.statusStore.refresh();
     expect(stores.statusStore.daemonReachable, isTrue);
 
+    await _openCategory(tester, 'Account & Network');
     await tester.enterText(
       _settingsTextField('Control server'),
       'https://ctrl.example',
     );
-    await tester.tap(find.byKey(const Key('settings-save-button')));
     await tester.pump();
+    await _tapSave(tester);
     await _waitFor(
       tester,
       () => find.text('P2WLAN restart required').evaluate().isNotEmpty,
@@ -340,6 +391,11 @@ void _registerSettingsTests() {
       api: _FakeDiagnosticsApi(health: false),
     );
 
+    await _openCategory(tester, 'General');
+
+    // Immediate settings never trigger the dirty save bar.
+    expect(find.text('Unsaved changes'), findsNothing);
+
     await tester.tap(find.byKey(const ValueKey('theme-system')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Dark').last);
@@ -348,10 +404,9 @@ void _registerSettingsTests() {
       tester,
       () => stores.settingsStore.settings.themeMode == 'dark',
     );
-    await _waitFor(
-      tester,
-      () => find.byType(CircularProgressIndicator).evaluate().isEmpty,
-    );
+    // The store value is set synchronously before persistence finishes; wait
+    // until the save completes (the dropdown re-enables) before the next edit.
+    await _waitForSaveComplete(tester, const ValueKey('language-en'));
     expect(stores.settingsStore.settings.themeMode, 'dark');
 
     await tester.tap(find.byKey(const ValueKey('language-en')));
@@ -362,18 +417,21 @@ void _registerSettingsTests() {
       tester,
       () => stores.settingsStore.settings.languageCode == 'zh-Hans',
     );
-    await _waitFor(
-      tester,
-      () => find.byType(CircularProgressIndicator).evaluate().isEmpty,
-    );
+    await _waitForSaveComplete(tester, const ValueKey('theme-dark'));
     expect(stores.settingsStore.settings.languageCode, 'zh-Hans');
     expect(find.text('设置'), findsWidgets);
+    // No connection settings save was triggered by the immediate edits.
+    expect(find.text('Unsaved changes'), findsNothing);
   });
 
   testWidgets(
     'Settings renders at tablet and desktop widths without overflow',
     (tester) async {
-      for (final size in const [Size(700, 1000), Size(1280, 900)]) {
+      for (final size in const [
+        Size(700, 1000),
+        Size(1280, 900),
+        Size(1440, 900),
+      ]) {
         tester.view.physicalSize = size;
         tester.view.devicePixelRatio = 1;
         final stores = (await tester.runAsync(
@@ -387,14 +445,9 @@ void _registerSettingsTests() {
             ),
           ),
         );
-        await tester.ensureVisible(_disclosure('Advanced Network'));
-        await tester.pump();
-        await tester.tap(_disclosure('Advanced Network'));
         await tester.pumpAndSettle();
-        await tester.ensureVisible(_disclosure('Developer & Diagnostics'));
-        await tester.pump();
-        await tester.tap(_disclosure('Developer & Diagnostics'));
-        await tester.pumpAndSettle();
+        await _openCategory(tester, 'Advanced Network');
+        await _openCategory(tester, 'Developer & Diagnostics');
         expect(tester.takeException(), isNull);
         stores.dispose();
       }
@@ -425,11 +478,11 @@ void _registerSettingsTests() {
         ),
       ),
     );
+    await tester.pumpAndSettle();
 
+    // The Account & Network category row summary carries the credential state.
     expect(find.text('Securely saved'), findsOneWidget);
 
-    // Switch the language without touching Save; the credential status must
-    // re-derive from the live store in the new locale.
     await tester.runAsync(
       () => stores.settingsStore.updateLanguageCode('zh-Hans'),
     );
@@ -438,7 +491,6 @@ void _registerSettingsTests() {
     expect(find.text('已安全保存'), findsOneWidget);
     expect(find.text('Securely saved'), findsNothing);
 
-    // Manual mode is reported from the saved settings, not the draft toggle.
     await tester.runAsync(
       () => stores.settingsStore.updateSettings(
         stores.settingsStore.settings.copyWith(manualMode: true),
@@ -462,11 +514,10 @@ void _registerSettingsTests() {
     expect(stores.statusStore.daemonReachable, isTrue);
 
     // First save: a real daemon-launch change (MTU) while the daemon runs.
-    await tester.tap(_disclosure('Advanced Network'));
-    await tester.pumpAndSettle();
+    await _openCategory(tester, 'Advanced Network');
     await tester.enterText(_settingsTextField('MTU'), '1280');
-    await tester.tap(find.byKey(const Key('settings-save-button')));
     await tester.pump();
+    await _tapSave(tester);
     await _waitFor(tester, () => stores.settingsStore.settings.mtu == 1280);
     await _waitFor(
       tester,
@@ -477,10 +528,7 @@ void _registerSettingsTests() {
 
     // Second save with no daemon-launch change (close behavior only). The
     // pending restart must NOT be cleared by this unrelated save.
-    await tester.ensureVisible(
-      find.byKey(const ValueKey('close-behavior-keep-running')),
-    );
-    await tester.pump();
+    await _openCategory(tester, 'App');
     await tester.tap(find.byKey(const ValueKey('close-behavior-keep-running')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Stop P2WLAN').last);
@@ -489,8 +537,7 @@ void _registerSettingsTests() {
       tester,
       () => find.byType(CircularProgressIndicator).evaluate().isEmpty,
     );
-    await tester.tap(find.byKey(const Key('settings-save-button')));
-    await tester.pump();
+    await _tapSave(tester);
     await _waitFor(
       tester,
       () => stores.settingsStore.settings.closeBehavior == 'stop-and-quit',
@@ -499,8 +546,6 @@ void _registerSettingsTests() {
     expect(find.text('P2WLAN restart required'), findsOneWidget);
     expect(find.text('Restart and apply'), findsOneWidget);
     expect(stores.settingsStore.settings.closeBehavior, 'stop-and-quit');
-    // Wait for the second save (including its refresh) to finish so the
-    // restart action is enabled again.
     await _waitFor(
       tester,
       () => find.byType(CircularProgressIndicator).evaluate().isEmpty,

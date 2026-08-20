@@ -125,7 +125,16 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                     ),
                   ),
                   const SizedBox(width: AppTokens.space12),
-                  _PathBadge(peer: widget.peer, strings: widget.strings),
+                  Text(
+                    _rowPathLabel(strings, widget.peer),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colorScheme.onSurfaceVariant,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
                   IconButton(
                     tooltip: strings.close,
                     onPressed: () => Navigator.of(context).pop(),

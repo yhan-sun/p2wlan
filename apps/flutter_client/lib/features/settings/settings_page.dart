@@ -9,20 +9,16 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
-import '../../shared/widgets/page_scaffold.dart';
 
-part 'settings_page/widgets.dart';
+part 'settings_page/categories.dart';
+part 'settings_page/common.dart';
+part 'settings_page/layout.dart';
+part 'settings_page/general.dart';
+part 'settings_page/account.dart';
+part 'settings_page/application.dart';
+part 'settings_page/advanced.dart';
+part 'settings_page/developer.dart';
 part 'settings_page/actions.dart';
-
-/// Describes credential state for display without ever revealing the token.
-String _describeCredential(AppSettings settings, AppStrings strings) {
-  if (settings.manualMode) {
-    return strings.credentialManualMode;
-  }
-  return settings.authToken.trim().isEmpty
-      ? strings.credentialNotSaved
-      : strings.credentialSaved;
-}
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
@@ -31,6 +27,7 @@ class SettingsPage extends StatefulWidget {
     required this.statusStore,
     this.capabilities,
     this.onLogout,
+    this.onDirtyChanged,
     this.showHeader = true,
   });
 
@@ -42,6 +39,12 @@ class SettingsPage extends StatefulWidget {
   final PlatformCapabilities? capabilities;
 
   final VoidCallback? onLogout;
+
+  /// Notifies the host shell when the page transitions between clean and dirty
+  /// (any category has unsaved drafts). The shell uses this to guard against
+  /// silently losing settings when the user navigates away.
+  final ValueChanged<bool>? onDirtyChanged;
+
   final bool showHeader;
 
   @override
@@ -65,17 +68,18 @@ class _SettingsPageState extends State<SettingsPage> {
 
   String? _diagnosticsError;
   String? _formError;
+  SettingsCategory? _formErrorCategory;
   var _saving = false;
   var _manualMode = false;
   var _socketPool = defaultSocketPool;
   var _restartRequired = false;
   var _closeBehavior = defaultCloseBehavior;
-  // Progressive-disclosure state. Advanced / Developer groups start collapsed;
-  // the change-credential field starts hidden so the token input is not a
-  // permanent fixture of the account section.
-  var _showAdvancedNetwork = false;
-  var _showDeveloper = false;
   var _showTokenField = false;
+
+  /// Currently open category in the medium/compact root-detail layout.
+  /// Null = the settings root. In the desktop rail layout it always maps to a
+  /// concrete category (defaulting to the first visible one). Not persisted.
+  SettingsCategory? _selectedCategory;
 
   void _updateState(VoidCallback fn) => setState(fn);
 
@@ -113,10 +117,73 @@ class _SettingsPageState extends State<SettingsPage> {
     _manualMode = settings.manualMode;
     _socketPool = normalizeSocketPool(settings.socketPool);
     _closeBehavior = normalizeCloseBehavior(settings.closeBehavior);
+    // Live dirty detection: any controller edit triggers a rebuild so the
+    // category save bar appears/disappears without needing an explicit submit.
+    for (final controller in [
+      _diagnosticsUrlController,
+      _controlServerController,
+      _authTokenController,
+      _networkIdController,
+      _virtualIpController,
+      _deviceNameController,
+      _overlayCidrController,
+      _tunInterfaceController,
+      _mtuController,
+      _udpBindController,
+      _udpAdvertiseController,
+      _relayServersController,
+    ]) {
+      controller.addListener(_onDraftChanged);
+    }
+    // Notify the host shell of the initial dirty state (always false on init).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _notifyDirty();
+    });
+  }
+
+  void _onDraftChanged() {
+    if (!mounted) return;
+    _notifyDirty();
+    setState(() {});
+  }
+
+  bool _lastNotifiedDirty = false;
+
+  void _notifyDirty() {
+    final dirty = _anyCategoryDirty;
+    if (dirty != _lastNotifiedDirty) {
+      _lastNotifiedDirty = dirty;
+      widget.onDirtyChanged?.call(dirty);
+    }
+  }
+
+  /// True when any visible category has unsaved drafts (excludes immediate-save
+  /// language/theme which never count as dirty).
+  bool get _anyCategoryDirty {
+    for (final category in _visibleCategories) {
+      if (_categoryDirty(category)) return true;
+    }
+    return false;
   }
 
   @override
   void dispose() {
+    for (final controller in [
+      _diagnosticsUrlController,
+      _controlServerController,
+      _authTokenController,
+      _networkIdController,
+      _virtualIpController,
+      _deviceNameController,
+      _overlayCidrController,
+      _tunInterfaceController,
+      _mtuController,
+      _udpBindController,
+      _udpAdvertiseController,
+      _relayServersController,
+    ]) {
+      controller.removeListener(_onDraftChanged);
+    }
     _diagnosticsUrlController.dispose();
     _controlServerController.dispose();
     _authTokenController.dispose();
@@ -132,413 +199,136 @@ class _SettingsPageState extends State<SettingsPage> {
     super.dispose();
   }
 
+  /// Describes credential state for display without ever revealing the token.
+  String _describeCredential(AppStrings strings) {
+    final settings = widget.settingsStore.settings;
+    if (settings.manualMode) {
+      return strings.credentialManualMode;
+    }
+    return settings.authToken.trim().isEmpty
+        ? strings.credentialNotSaved
+        : strings.credentialSaved;
+  }
+
+  /// Short summary shown on a category row so the settings home answers "find
+  /// a setting" without opening every detail.
+  String _categorySummary(SettingsCategory category, AppStrings strings) {
+    return switch (category) {
+      SettingsCategory.general =>
+        _deviceNameController.text.trim().isEmpty
+            ? strings.credentialNotSaved
+            : _deviceNameController.text.trim(),
+      SettingsCategory.accountNetwork => _describeCredential(strings),
+      SettingsCategory.application =>
+        _closeBehavior == 'keep-running'
+            ? strings.closeBehaviorKeepRunning
+            : strings.closeBehaviorStopAndQuit,
+      SettingsCategory.advancedNetwork =>
+        _manualMode ? strings.manualMode : 'MTU ${_mtuController.text.trim()}',
+      SettingsCategory.developer =>
+        widget.statusStore.daemonReachable
+            ? strings.daemonRunning
+            : strings.daemonStopped,
+    };
+  }
+
+  List<SettingsCategory> get _visibleCategories =>
+      visibleSettingsCategories(_capabilities);
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: widget.settingsStore,
+      animation: Listenable.merge([widget.settingsStore, widget.statusStore]),
       builder: (context, _) {
         final strings = AppStrings.fromCode(
           widget.settingsStore.settings.languageCode,
         );
-        final languageCode = widget.settingsStore.settings.languageCode;
-        final themeCode = widget.settingsStore.settings.themeMode;
-        final theme = Theme.of(context);
-        // Derived from the live store + current strings so a language switch
-        // (or any other store update) re-renders the status correctly. The raw
-        // token is never read back into a text field.
-        final credentialState = _describeCredential(
-          widget.settingsStore.settings,
-          strings,
-        );
-        return PageScaffold(
-          title: strings.settings,
-          subtitle: strings.settingsSubtitle,
-          showHeader: widget.showHeader,
-          maxWidth: settingsPageMaxWidth,
-          children: [
-            if (_formError != null) ...[
-              _ErrorBanner(message: _formError!),
-              const SizedBox(height: AppTokens.space14),
-            ],
-            if (_restartRequired) ...[
-              _PendingRestartNotice(
-                busy: _saving || widget.statusStore.daemonBusy,
-                canRestart: _capabilities.canControlLocalDaemon,
-                onRestart: _restartDaemonToApply,
-              ),
-              const SizedBox(height: AppTokens.space14),
-            ],
-            _SettingsSection(
-              title: strings.settingsSectionGeneral,
-              children: [
-                _SettingsTextField(
-                  controller: _deviceNameController,
-                  label: strings.deviceName,
-                  helper: strings.deviceNameHelper,
-                ),
-                _gap,
-                _SettingsRow(
-                  label: strings.language,
-                  subtitle: strings.languageHelper,
-                  control: DropdownButtonFormField<String>(
-                    key: ValueKey('language-$languageCode'),
-                    initialValue: AppLanguage.fromCode(languageCode).code,
-                    isExpanded: true,
-                    decoration: InputDecoration(labelText: strings.language),
-                    items: [
-                      for (final language in AppLanguage.values)
-                        DropdownMenuItem(
-                          value: language.code,
-                          child: Text(strings.languageLabel(language.code)),
-                        ),
-                    ],
-                    onChanged: _saving
-                        ? null
-                        : (value) {
-                            if (value != null) _saveLanguage(value);
-                          },
-                  ),
-                ),
-                _SettingsRow(
-                  label: strings.themeMode,
-                  subtitle: strings.themeModeHelper,
-                  control: DropdownButtonFormField<String>(
-                    key: ValueKey('theme-$themeCode'),
-                    initialValue: AppThemeMode.fromCode(themeCode).code,
-                    isExpanded: true,
-                    decoration: InputDecoration(labelText: strings.themeMode),
-                    items: [
-                      DropdownMenuItem(
-                        value: AppThemeMode.system.code,
-                        child: Text(strings.themeSystem),
-                      ),
-                      DropdownMenuItem(
-                        value: AppThemeMode.light.code,
-                        child: Text(strings.themeLight),
-                      ),
-                      DropdownMenuItem(
-                        value: AppThemeMode.dark.code,
-                        child: Text(strings.themeDark),
-                      ),
-                    ],
-                    onChanged: _saving
-                        ? null
-                        : (value) {
-                            if (value != null) _saveThemeMode(value);
-                          },
-                  ),
-                ),
-                if (_capabilities.canUseSystemTray)
-                  _SettingsRow(
-                    label: strings.closeBehavior,
-                    subtitle: strings.closeBehaviorHelper,
-                    control: DropdownButtonFormField<String>(
-                      key: ValueKey('close-behavior-$_closeBehavior'),
-                      initialValue: _closeBehavior,
-                      isExpanded: true,
-                      decoration: InputDecoration(
-                        labelText: strings.closeBehavior,
-                      ),
-                      items: [
-                        DropdownMenuItem(
-                          value: 'keep-running',
-                          child: Text(strings.closeBehaviorKeepRunning),
-                        ),
-                        DropdownMenuItem(
-                          value: 'stop-and-quit',
-                          child: Text(strings.closeBehaviorStopAndQuit),
-                        ),
-                      ],
-                      onChanged: _saving
-                          ? null
-                          : (value) {
-                              if (value != null) {
-                                setState(() => _closeBehavior = value);
-                              }
-                            },
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 18),
-            _SettingsSection(
-              title: strings.settingsSectionAccountNetwork,
-              helper: strings.settingsSubtitleAccountNetwork,
-              children: [
-                _SettingsRow(
-                  label: strings.credentialSectionTitle,
-                  subtitle: credentialState,
-                  control: TextButton.icon(
-                    onPressed: _saving
-                        ? null
-                        : () => setState(
-                            () => _showTokenField = !_showTokenField,
-                          ),
-                    icon: Icon(
-                      _showTokenField ? Icons.expand_less : Icons.edit_outlined,
-                      size: 16,
-                    ),
-                    label: Text(
-                      _showTokenField
-                          ? strings.hideCredential
-                          : strings.changeCredential,
-                    ),
-                  ),
-                ),
-                if (_showTokenField) ...[
-                  _SettingsTextField(
-                    controller: _authTokenController,
-                    label: strings.authToken,
-                    helper: strings.credentialChangeHelper,
-                    obscureText: true,
-                  ),
-                  _gap,
-                ],
-                _SettingsTextField(
-                  controller: _controlServerController,
-                  label: strings.controlServer,
-                  helper: strings.controlServerHelper,
-                  keyboardType: TextInputType.url,
-                ),
-                _gap,
-                _SettingsTextField(
-                  controller: _networkIdController,
-                  label: strings.networkId,
-                  helper: strings.networkIdHelper,
-                ),
-                _gap,
-                _SettingsTextField(
-                  controller: _virtualIpController,
-                  label: strings.requestedVirtualIp,
-                  helper: strings.requestedVirtualIpHelperSettings,
-                ),
-                if (widget.onLogout != null) ...[
-                  _gap,
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: OutlinedButton.icon(
-                      onPressed: _saving ? null : widget.onLogout,
-                      icon: const Icon(Icons.logout_outlined, size: 16),
-                      label: Text(strings.signOut),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: theme.colorScheme.error,
-                      ),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-            const SizedBox(height: 18),
-            if (_capabilities.canActAsLocalVpnNode)
-              _SettingsDisclosure(
-                title: strings.settingsSectionAdvancedNetwork,
-                subtitle: strings.advancedNetworkSubtitle,
-                open: _showAdvancedNetwork,
-                onToggle: () => setState(
-                  () => _showAdvancedNetwork = !_showAdvancedNetwork,
-                ),
+        // Provide the page's own string scope so shared widgets (rows, save
+        // bar, root, rail) resolve to the same locale as the page state, even
+        // when the surrounding host scope differs.
+        return AppStringsScope(strings: strings, child: _buildBody(strings));
+      },
+    );
+  }
+
+  Widget _buildBody(AppStrings strings) {
+    final theme = Theme.of(context);
+    final credentialState = _describeCredential(strings);
+    final categories = _visibleCategories;
+    final selected = _normalizeSelection(categories);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final layout = constraints.maxWidth >= _settingsSidebarBreakpoint
+            ? _SettingsLayout.expanded
+            : _SettingsLayout.rootDetail;
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(
+            AppTokens.space16,
+            AppTokens.space12,
+            AppTokens.space16,
+            AppTokens.space16,
+          ),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: settingsPageMaxWidth),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  _SettingsRow(
-                    label: strings.manualMode,
-                    subtitle: strings.manualModeHelper,
-                    control: Switch.adaptive(
-                      value: _manualMode,
-                      onChanged: _saving
-                          ? null
-                          : (value) => setState(() => _manualMode = value),
-                    ),
-                  ),
-                  _ResponsiveFieldRow(
-                    first: _SettingsTextField(
-                      controller: _tunInterfaceController,
-                      label: strings.interfaceName,
-                      helper: defaultTunInterface,
-                    ),
-                    second: _SettingsTextField(
-                      controller: _mtuController,
-                      label: strings.mtu,
-                      helper: strings.mtuHelper,
-                      keyboardType: TextInputType.number,
-                    ),
-                  ),
-                  _gap,
-                  _SettingsTextField(
-                    controller: _overlayCidrController,
-                    label: strings.overlayCidr,
-                    helper: defaultOverlayCidr,
-                  ),
-                  _gap,
-                  _ResponsiveFieldRow(
-                    first: _SettingsTextField(
-                      controller: _udpBindController,
-                      label: strings.udpBind,
-                      helper: '0.0.0.0:0',
-                    ),
-                    second: _SettingsTextField(
-                      controller: _udpAdvertiseController,
-                      label: strings.udpAdvertise,
-                      helper: strings.udpAdvertiseHelper,
-                    ),
-                  ),
-                  _gap,
-                  _SettingsRow(
-                    label: strings.socketPool,
-                    subtitle: strings.socketPoolHelper,
-                    control: DropdownButtonFormField<String>(
-                      key: ValueKey('socket-pool-$_socketPool'),
-                      initialValue: _socketPool,
-                      isExpanded: true,
-                      decoration: InputDecoration(
-                        labelText: strings.socketPool,
-                      ),
-                      items: const [
-                        DropdownMenuItem(value: 'off', child: Text('off')),
-                        DropdownMenuItem(value: '2', child: Text('2 sockets')),
-                        DropdownMenuItem(value: '3', child: Text('3 sockets')),
-                        DropdownMenuItem(value: '4', child: Text('4 sockets')),
-                      ],
-                      onChanged: _saving || widget.statusStore.daemonBusy
-                          ? null
-                          : (value) {
-                              if (value != null) {
-                                setState(() => _socketPool = value);
-                              }
-                            },
-                    ),
-                  ),
-                  _SettingsTextField(
-                    controller: _relayServersController,
-                    label: strings.relayCandidates,
-                    helper: strings.relayCandidatesHelper,
-                  ),
-                ],
-              ),
-            const SizedBox(height: 18),
-            if (_capabilities.canControlLocalDaemon)
-              _SettingsDisclosure(
-                title: strings.settingsSectionDeveloperDiagnostics,
-                subtitle: strings.developerSectionSubtitle,
-                open: _showDeveloper,
-                onToggle: () =>
-                    setState(() => _showDeveloper = !_showDeveloper),
-                children: [
-                  _SettingsTextField(
-                    controller: _diagnosticsUrlController,
-                    label: strings.diagnosticsUrl,
-                    hintText: defaultDiagnosticsUrl,
-                    helper: strings.diagnosticsUrlHelper,
-                    errorText: _diagnosticsError,
-                    keyboardType: TextInputType.url,
-                    onSubmitted: (_) => _saveAll(),
-                  ),
-                  const SizedBox(height: AppTokens.space10),
-                  Wrap(
-                    spacing: 12,
-                    runSpacing: 8,
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: widget.statusStore.refreshing
-                            ? null
-                            : () => widget.statusStore.refresh(),
-                        icon: const Icon(Icons.refresh, size: 16),
-                        label: Text(strings.refreshNow),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: _saving ? null : _resetDiagnosticsUrl,
-                        icon: const Icon(Icons.restore, size: 16),
-                        label: Text(strings.restoreDefaultUrl),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: AppTokens.space4),
-                  const Divider(height: 24),
-                  _SettingsRow(
-                    label: strings.localService,
-                    subtitle: strings.localServiceSubtitle,
-                    control: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Container(
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(
-                            color: widget.statusStore.daemonReachable
-                                ? theme.colorScheme.primary
-                                : theme.colorScheme.outline,
-                            shape: BoxShape.circle,
+                  if (widget.showHeader) ...[
+                    Align(
+                      alignment: Alignment.center,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            strings.settings,
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w600,
+                              color: theme.colorScheme.onSurface,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: AppTokens.space6),
-                        Text(
-                          widget.statusStore.daemonReachable
-                              ? strings.daemonRunning
-                              : strings.daemonStopped,
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                            color: theme.colorScheme.onSurface,
+                          const SizedBox(height: 3),
+                          Text(
+                            strings.settingsSubtitle,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
                           ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 16),
-                    child: Text(
-                      strings.localSettingsFile(
-                        widget.settingsStore.configPath ?? '—',
-                      ),
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: theme.colorScheme.onSurfaceVariant,
-                        fontFeatures: AppTokens.tabularFontFeatures,
+                        ],
                       ),
                     ),
-                  ),
-                  if (widget.settingsStore.lastError != null) ...[
-                    Text(
-                      widget.settingsStore.lastError!,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: P2WlanColors.of(context).dangerText,
-                      ),
-                    ),
-                    const SizedBox(height: AppTokens.space8),
+                    const SizedBox(height: AppTokens.space16),
                   ],
-                ],
-              ),
-            const SizedBox(height: AppTokens.space16),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final narrow = constraints.maxWidth < 520;
-                return Align(
-                  alignment: narrow ? Alignment.center : Alignment.centerRight,
-                  child: SizedBox(
-                    width: narrow ? double.infinity : null,
-                    child: FilledButton.icon(
-                      key: const Key('settings-save-button'),
-                      onPressed: _saving ? null : _saveAll,
-                      icon: _saving
-                          ? const SizedBox.square(
-                              dimension: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.save_outlined, size: 16),
-                      label: Text(
-                        _restartRequired
-                            ? strings.saveChangesRestartRequired
-                            : strings.saveChanges,
-                      ),
+                  Expanded(
+                    child: _SettingsShell(
+                      layout: layout,
+                      categories: categories,
+                      selected: selected,
+                      onSelect: (category) =>
+                          _updateState(() => _selectedCategory = category),
+                      onBack: () =>
+                          _updateState(() => _selectedCategory = null),
+                      strings: strings,
+                      credentialState: credentialState,
+                      state: this,
                     ),
                   ),
-                );
-              },
+                ],
+              ),
             ),
-          ],
+          ),
         );
       },
     );
   }
 
-  static const _gap = SizedBox(height: AppTokens.space12);
+  /// Resolves the currently effective category. In the desktop rail layout a
+  /// null selection maps to the first visible category (default: General).
+  SettingsCategory? _normalizeSelection(List<SettingsCategory> categories) {
+    final selected = _selectedCategory;
+    if (selected != null && categories.contains(selected)) return selected;
+    return null;
+  }
 }

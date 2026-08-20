@@ -25,11 +25,13 @@ Future<_Stores> _makeStores({
   Duration maxSnapshotAge = StatusStore.defaultMaxSnapshotAge,
   DaemonController? daemonController,
   bool manualMode = false,
+  SecureTokenRepository? tokenRepository,
 }) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_flutter_test_');
+  final repo = tokenRepository ?? InMemorySecureTokenRepository();
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir.path}/settings.json'),
-    tokenRepository: InMemorySecureTokenRepository(),
+    tokenRepository: repo,
   );
   await settingsStore.load();
   await settingsStore.updateSettings(
@@ -48,15 +50,21 @@ Future<_Stores> _makeStores({
     enableFreshnessTimer: enableFreshnessTimer,
     maxSnapshotAge: maxSnapshotAge,
   );
-  return _Stores(tempDir, settingsStore, statusStore);
+  return _Stores(tempDir, settingsStore, statusStore, repo);
 }
 
 class _Stores {
-  _Stores(this.tempDir, this.settingsStore, this.statusStore);
+  _Stores(
+    this.tempDir,
+    this.settingsStore,
+    this.statusStore,
+    this.tokenRepository,
+  );
 
   final Directory tempDir;
   final SettingsStore settingsStore;
   final StatusStore statusStore;
+  final SecureTokenRepository tokenRepository;
 
   void dispose() {
     statusStore.dispose();
@@ -69,20 +77,28 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   _FakeDiagnosticsApi({
     required this.health,
     this.snapshot,
-    this.snapshots,
     this.statusError,
     this.speedTestResult,
     this.speedTestError,
     this.repairRoutesError,
-  });
+    RoutesResponse? routes,
+    this.repairResult,
+  }) : routes = routes ?? _fakeRoutes;
 
   final bool health;
   DiagnosticsSnapshot? snapshot;
-  final List<DiagnosticsSnapshot>? snapshots;
   final Object? statusError;
   final SpeedTestResult? speedTestResult;
   final Object? speedTestError;
   final Object? repairRoutesError;
+
+  /// Route verification response (default: installed); tests swap this to
+  /// exercise missing/conflict/unverified states.
+  RoutesResponse routes;
+  Object? verifyRoutesError;
+
+  /// Repair response; default performs a successful in-place change.
+  RouteRepairResponse? repairResult;
   var statusFetchCount = 0;
   var speedTestCount = 0;
   var verifyRoutesCount = 0;
@@ -119,12 +135,6 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     statusFetchCount += 1;
     final error = statusError;
     if (error != null) throw error;
-    final sequence = snapshots;
-    if (sequence != null && sequence.isNotEmpty) {
-      final index = statusFetchCount - 1;
-      if (index < sequence.length) return sequence[index];
-      return sequence.last;
-    }
     final value = snapshot;
     if (value == null) {
       throw const DiagnosticsApiException('missing fixture snapshot');
@@ -135,7 +145,9 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   @override
   Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async {
     verifyRoutesCount += 1;
-    return _fakeRoutes;
+    final error = verifyRoutesError;
+    if (error != null) throw error;
+    return routes;
   }
 
   @override
@@ -143,7 +155,7 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     repairRoutesCount += 1;
     final error = repairRoutesError;
     if (error != null) throw error;
-    return _fakeRepair;
+    return repairResult ?? _fakeRepair;
   }
 
   @override

@@ -1,5 +1,5 @@
-import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../app/app_constants.dart';
@@ -12,19 +12,20 @@ import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/layout/app_breakpoints.dart';
-import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 
-part 'dashboard/helpers.dart';
-part 'dashboard/surface.dart';
-part 'dashboard/hero.dart';
-part 'dashboard/peer_overview.dart';
-part 'dashboard/connection_map.dart';
-part 'dashboard/network_environment.dart';
-part 'dashboard/issues.dart';
 part 'dashboard/actions.dart';
+part 'dashboard/components.dart';
+part 'dashboard/devices.dart';
+part 'dashboard/helpers.dart';
+part 'dashboard/hero.dart';
+part 'dashboard/issues.dart';
+part 'dashboard/surface.dart';
 
+/// Network Home: tells the user how the network is doing right now — status,
+/// Virtual IP, key metrics, a short device preview, and plain-language
+/// component state. Technical details live in Diagnostics / Troubleshooting.
 class DashboardPage extends StatelessWidget {
   const DashboardPage({
     super.key,
@@ -32,6 +33,8 @@ class DashboardPage extends StatelessWidget {
     required this.statusStore,
     this.showHeader = true,
     this.capabilities,
+    this.onOpenDevices,
+    this.onOpenTroubleshooting,
   });
 
   final SettingsStore settingsStore;
@@ -41,6 +44,12 @@ class DashboardPage extends StatelessWidget {
   /// Platform capability override (primarily for tests); defaults to the
   /// current runtime platform.
   final PlatformCapabilities? capabilities;
+
+  /// Opens the Devices section (supplied by the shell).
+  final VoidCallback? onOpenDevices;
+
+  /// Opens Troubleshooting for a reported issue (supplied by the shell).
+  final VoidCallback? onOpenTroubleshooting;
 
   @override
   Widget build(BuildContext context) {
@@ -57,6 +66,10 @@ class DashboardPage extends StatelessWidget {
         );
         final daemonAvailable =
             statusStore.daemonReachable || statusStore.statusReachable;
+        final loading =
+            snapshot == null &&
+            !daemonAvailable &&
+            (statusStore.refreshing || statusStore.daemonBusy);
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);
         final overviewPeers = _topOverviewPeers(peers);
@@ -75,14 +88,15 @@ class DashboardPage extends StatelessWidget {
             ? statusStore.lastDaemonManualCommand
             : null;
         return PageScaffold(
-          title: strings.dashboard,
-          subtitle: strings.dashboardSubtitle,
+          title: strings.home,
+          subtitle: strings.homePageSubtitle,
           showHeader: showHeader,
           maxWidth: dashboardPageMaxWidth,
           children: [
             _NetworkHero(
               snapshot: snapshot,
               status: status,
+              loading: loading,
               counts: counts,
               daemonAvailable: daemonAvailable,
               canControlLocalDaemon: capabilities.canControlLocalDaemon,
@@ -92,8 +106,20 @@ class DashboardPage extends StatelessWidget {
               onStopDaemon: statusStore.stopDaemon,
               onRefresh: statusStore.refresh,
             ),
+            if (issueMessage != null && daemonAvailable) ...[
+              const SizedBox(height: AppTokens.space12),
+              _HomeIssueBanner(
+                message: issueMessage,
+                tone:
+                    !statusStore.healthReachable &&
+                        statusStore.lastHealthError != null
+                    ? StatusTone.bad
+                    : StatusTone.warn,
+                onOpenTroubleshooting: onOpenTroubleshooting,
+              ),
+            ],
             if (snapshot != null) ...[
-              const SizedBox(height: AppTokens.space16),
+              const SizedBox(height: AppTokens.space20),
               LayoutBuilder(
                 builder: (context, constraints) {
                   if (constraints.maxWidth >= AppBreakpoints.expandedMinWidth) {
@@ -102,21 +128,17 @@ class DashboardPage extends StatelessWidget {
                       children: [
                         Expanded(
                           flex: 2,
-                          child: _PeerOverview(
+                          child: _OnlineDevicesSection(
                             peers: overviewPeers,
-                            totalPeers: peers.length,
-                            showMap:
-                                daemonAvailable && overviewPeers.isNotEmpty,
+                            onOpenDevices: onOpenDevices,
                           ),
                         ),
-                        const SizedBox(width: AppTokens.space14),
+                        const SizedBox(width: AppTokens.space16),
                         Expanded(
                           flex: 1,
-                          child: _NetworkEnvironment(
+                          child: _NetworkComponentsSection(
                             snapshot: snapshot,
-                            lastFetchedAt: statusStore.lastSuccessfulStatusAt,
-                            requestDuration: statusStore.lastRequestDuration,
-                            snapshotStale: statusStore.snapshotStale,
+                            counts: counts,
                           ),
                         ),
                       ],
@@ -125,37 +147,23 @@ class DashboardPage extends StatelessWidget {
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      _PeerOverview(
+                      _OnlineDevicesSection(
                         peers: overviewPeers,
-                        totalPeers: peers.length,
-                        showMap: false,
+                        onOpenDevices: onOpenDevices,
                       ),
-                      const SizedBox(height: AppTokens.space16),
-                      _NetworkEnvironment(
+                      const SizedBox(height: AppTokens.space20),
+                      _NetworkComponentsSection(
                         snapshot: snapshot,
-                        lastFetchedAt: statusStore.lastSuccessfulStatusAt,
-                        requestDuration: statusStore.lastRequestDuration,
-                        snapshotStale: statusStore.snapshotStale,
+                        counts: counts,
                       ),
                     ],
                   );
                 },
               ),
             ],
-            if (issueMessage != null && daemonAvailable) ...[
-              const SizedBox(height: AppTokens.space16),
-              _DashboardIssues(
-                message: issueMessage,
-                tone:
-                    !statusStore.healthReachable &&
-                        statusStore.lastHealthError != null
-                    ? StatusTone.bad
-                    : StatusTone.warn,
-              ),
-            ],
             if (manualCommand != null) ...[
-              const SizedBox(height: AppTokens.space16),
-              _ManualDaemonCommand(command: manualCommand),
+              const SizedBox(height: AppTokens.space12),
+              _ManualCommandCard(command: manualCommand),
             ],
           ],
         );

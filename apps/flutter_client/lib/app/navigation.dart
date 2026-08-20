@@ -5,9 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
-import '../app/app_constants.dart';
 import '../app/app_strings.dart';
-import '../app/app_tokens.dart';
+import '../app/navigation_model.dart';
 import '../app/p2wlan_colors.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/state/settings_store.dart';
@@ -16,21 +15,10 @@ import '../features/dashboard/dashboard_page.dart';
 import '../features/diagnostics/diagnostics_page.dart';
 import '../features/nodes/nodes_page.dart';
 import '../features/settings/settings_page.dart';
-import '../features/tunnels/tunnels_page.dart';
 import '../shared/layout/app_breakpoints.dart';
+import '../shared/widgets/app_nav_rail.dart';
+import '../shared/widgets/desktop_sidebar.dart';
 import '../shared/widgets/status_badge.dart';
-
-enum P2WlanSection {
-  dashboard(Icons.dashboard_outlined),
-  nodes(Icons.hub_outlined),
-  tunnels(Icons.cable_outlined),
-  diagnostics(Icons.monitor_heart_outlined),
-  settings(Icons.settings_outlined);
-
-  const P2WlanSection(this.icon);
-
-  final IconData icon;
-}
 
 class P2WlanShell extends StatefulWidget {
   const P2WlanShell({
@@ -54,11 +42,19 @@ class P2WlanShell extends StatefulWidget {
 }
 
 class _P2WlanShellState extends State<P2WlanShell> {
-  var _section = P2WlanSection.dashboard;
+  static const _sectionFadeDuration = Duration(milliseconds: 150);
 
-  /// Compact phones: "More" is a hub listing diagnostics/settings instead of
-  /// a fifth bottom tab. Rail layouts never open the hub.
-  var _showMoreHub = false;
+  var _section = P2WlanSection.home;
+
+  /// Last primary (bottom-bar) section, kept so the mobile bar keeps a valid
+  /// selection while a secondary section (troubleshooting) is open — no fake
+  /// fourth destination, never an out-of-range index.
+  var _lastPrimarySection = P2WlanSection.home;
+
+  /// Whether the Settings page currently has unsaved drafts across any
+  /// category. Set by the SettingsPage via [onDirtyChanged]; when true,
+  /// navigating away from Settings prompts a discard confirmation.
+  var _settingsDirty = false;
 
   @override
   void initState() {
@@ -89,48 +85,24 @@ class _P2WlanShellState extends State<P2WlanShell> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final breakpoint = AppBreakpoints.of(constraints.maxWidth);
-        // Phones get a four-item bottom bar; tablets and desktop (even when
-        // squeezed below the compact width) keep a rail so the navigation
-        // never suddenly morphs into a phone layout.
+        // Phones get the three-item bottom bar; tablets and desktop (even when
+        // squeezed below the compact width) keep a rail/sidebar so navigation
+        // never morphs into a phone layout.
         final useBottomNav =
             breakpoint == AppBreakpoint.compact && !_isDesktopShell;
-        // The More hub is meaningful only while the bottom bar is actually
-        // shown. If the viewport grows to a rail layout, derive it away so
-        // the current business section renders instead — no setState needed
-        // on viewport change.
-        final showMoreHub = useBottomNav && _showMoreHub;
-        final body = _buildBody(showMoreHub);
-        final dragWindowFromAppBar = _canDragWindowFromAppBar;
-        final macosChrome = _usesMacosChrome;
-        final windowsChrome = _usesWindowsChrome;
 
         return Scaffold(
-          appBar: AppBar(
-            leading: macosChrome ? const SizedBox.shrink() : null,
-            leadingWidth: macosChrome ? 76 : null,
-            title: Text(_appBarTitle(strings, showMoreHub)),
-            centerTitle: true,
-            flexibleSpace: dragWindowFromAppBar
-                ? const DragToMoveArea(child: SizedBox.expand())
-                : null,
-            actions: [
-              _ShellStatusActions(statusStore: widget.statusStore),
-              if (_showsInAppCloseButton) const _WindowsCloseButton(),
-              SizedBox(width: windowsChrome ? 148 : 8),
-            ],
-          ),
+          appBar: _buildTopBar(strings, useBottomNav, breakpoint),
           body: useBottomNav
-              ? body
+              ? _buildBody()
               : Row(
                   children: [
-                    _buildRail(breakpoint, strings),
+                    _buildNavigation(breakpoint, strings),
                     const VerticalDivider(width: 1),
-                    Expanded(child: body),
+                    Expanded(child: _buildBody()),
                   ],
                 ),
-          bottomNavigationBar: useBottomNav
-              ? _buildBottomNav(strings, showMoreHub)
-              : null,
+          bottomNavigationBar: useBottomNav ? _buildBottomNav(strings) : null,
         );
       },
     );
@@ -142,136 +114,183 @@ class _P2WlanShellState extends State<P2WlanShell> {
     }
   }
 
-  Widget _buildBody(bool showMoreHub) {
-    if (showMoreHub) {
-      return _MoreHub(onOpenSection: _openFromMoreHub);
+  Widget _buildNavigation(AppBreakpoint breakpoint, AppStrings strings) {
+    final selected = P2WlanSection.primary.contains(_section) ? _section : null;
+    if (breakpoint == AppBreakpoint.expanded) {
+      return DesktopSidebar(
+        selected: selected,
+        strings: strings,
+        statusStore: widget.statusStore,
+        onSelect: _select,
+        onFooterTap: () => _select(P2WlanSection.troubleshooting),
+      );
     }
-    return switch (_section) {
-      P2WlanSection.dashboard => DashboardPage(
+    return AppNavRail(
+      selected: selected,
+      iconOnly: breakpoint == AppBreakpoint.compact,
+      strings: strings,
+      onSelect: _select,
+    );
+  }
+
+  PreferredSizeWidget _buildTopBar(
+    AppStrings strings,
+    bool isMobileLayout,
+    AppBreakpoint breakpoint,
+  ) {
+    // Expanded desktop: the sidebar footer already carries the network status.
+    // Home: the hero itself is the strong status expression, so the top bar
+    // adds no duplicate badge there either. Other sections (Devices,
+    // Troubleshooting, Settings) keep the global badge on medium and compact
+    // desktop because they have no footer.
+    final showStatusBadge =
+        breakpoint != AppBreakpoint.expanded && _section != P2WlanSection.home;
+    return AppBar(
+      leading: _usesMacosChrome ? const SizedBox.shrink() : null,
+      leadingWidth: _usesMacosChrome ? 76 : null,
+      title: isMobileLayout ? Text(_appBarTitle(strings)) : null,
+      centerTitle: false,
+      flexibleSpace: _canDragWindowFromAppBar
+          ? const DragToMoveArea(child: SizedBox.expand())
+          : null,
+      actions: isMobileLayout
+          ? [
+              _MobileShellMenu(
+                statusStore: widget.statusStore,
+                onOpenTroubleshooting: () =>
+                    _select(P2WlanSection.troubleshooting),
+              ),
+            ]
+          : [
+              _ShellStatusActions(
+                statusStore: widget.statusStore,
+                showStatusBadge: showStatusBadge,
+              ),
+              if (_showsInAppCloseButton) const _WindowsCloseButton(),
+              const SizedBox(width: 8),
+            ],
+    );
+  }
+
+  Widget _buildBody() {
+    final page = switch (_section) {
+      P2WlanSection.home => DashboardPage(
+        settingsStore: widget.settingsStore,
+        statusStore: widget.statusStore,
+        showHeader: false,
+        onOpenDevices: () => _select(P2WlanSection.devices),
+        onOpenTroubleshooting: () => _select(P2WlanSection.troubleshooting),
+      ),
+      P2WlanSection.devices => NodesPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: false,
       ),
-      P2WlanSection.nodes => NodesPage(
-        settingsStore: widget.settingsStore,
-        statusStore: widget.statusStore,
-        showHeader: false,
-      ),
-      P2WlanSection.tunnels => TunnelsPage(
+      P2WlanSection.troubleshooting => DiagnosticsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         capabilities: widget.capabilities,
         showHeader: false,
-      ),
-      P2WlanSection.diagnostics => DiagnosticsPage(
-        statusStore: widget.statusStore,
-        capabilities: widget.capabilities,
-        showHeader: false,
+        onOpenDevices: () => _select(P2WlanSection.devices),
+        onOpenSettings: () => _select(P2WlanSection.settings),
       ),
       P2WlanSection.settings => SettingsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        capabilities: widget.capabilities,
         onLogout: widget.onLogout,
+        onDirtyChanged: (dirty) => _settingsDirty = dirty,
         showHeader: false,
       ),
     };
+    return AnimatedSwitcher(
+      duration: MediaQuery.disableAnimationsOf(context)
+          ? Duration.zero
+          : _sectionFadeDuration,
+      switchInCurve: Curves.easeOut,
+      switchOutCurve: Curves.easeIn,
+      child: KeyedSubtree(key: ValueKey(_section), child: page),
+    );
   }
 
-  String _appBarTitle(AppStrings strings, bool showMoreHub) {
-    if (showMoreHub) return strings.more;
+  String _appBarTitle(AppStrings strings) {
     return strings.sectionLabel(_section.name);
   }
 
   void _select(P2WlanSection section) {
-    if (_section != section || _showMoreHub) {
-      setState(() {
-        _section = section;
-        _showMoreHub = false;
-      });
+    // Leave guard: if Settings has unsaved drafts and the user is navigating
+    // to a different section, confirm before discarding.
+    if (_section == P2WlanSection.settings &&
+        section != P2WlanSection.settings &&
+        _settingsDirty) {
+      _showDiscardGuard(section);
+      return;
     }
+    _doSelect(section);
   }
 
-  void _openFromMoreHub(P2WlanSection section) {
+  void _doSelect(P2WlanSection section) {
     setState(() {
       _section = section;
-      _showMoreHub = false;
+      if (P2WlanSection.mobilePrimary.contains(section)) {
+        _lastPrimarySection = section;
+      }
     });
   }
 
-  int _bottomNavIndex(bool showMoreHub) {
-    if (showMoreHub) return 3;
-    return switch (_section) {
-      P2WlanSection.dashboard => 0,
-      P2WlanSection.nodes => 1,
-      P2WlanSection.tunnels => 2,
-      P2WlanSection.diagnostics => 3,
-      P2WlanSection.settings => 3,
-    };
+  void _showDiscardGuard(P2WlanSection targetSection) {
+    final strings = AppStrings.fromCode(
+      widget.settingsStore.settings.languageCode,
+    );
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(strings.discardSettingsTitle),
+        content: Text(strings.discardSettingsBody),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(strings.continueEditing),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
+            onPressed: () {
+              Navigator.of(context).pop();
+              _settingsDirty = false;
+              _doSelect(targetSection);
+            },
+            child: Text(strings.discardChanges),
+          ),
+        ],
+      ),
+    );
   }
 
-  void _onBottomNavSelected(int index) {
-    if (index == 3) {
-      if (!_showMoreHub) setState(() => _showMoreHub = true);
-      return;
-    }
-    _select(P2WlanSection.values[index]);
+  int _bottomNavIndex() {
+    final index = P2WlanSection.mobilePrimary.indexOf(_section);
+    if (index != -1) return index;
+    // Secondary sections keep the last primary selection highlighted.
+    final last = P2WlanSection.mobilePrimary.indexOf(_lastPrimarySection);
+    return last == -1 ? 0 : last;
   }
 
-  Widget _buildRail(AppBreakpoint breakpoint, AppStrings strings) {
-    if (breakpoint == AppBreakpoint.expanded) {
-      return _GroupedNavRail(
-        selected: _section,
-        strings: strings,
-        onSelect: _select,
-      );
-    }
-    // Medium, or desktop windows squeezed below the compact width: a plain
-    // rail. Narrow desktop windows get an icon-only rail instead of the
-    // phone bottom bar.
-    final iconOnly = breakpoint == AppBreakpoint.compact;
-    return NavigationRail(
-      selectedIndex: _section.index,
-      onDestinationSelected: (index) => _select(P2WlanSection.values[index]),
-      labelType: iconOnly
-          ? NavigationRailLabelType.none
-          : NavigationRailLabelType.all,
-      minWidth: iconOnly ? 64 : 88,
+  Widget _buildBottomNav(AppStrings strings) {
+    return NavigationBar(
+      selectedIndex: _bottomNavIndex(),
+      onDestinationSelected: (index) =>
+          _select(P2WlanSection.mobilePrimary[index]),
       destinations: [
-        for (final item in P2WlanSection.values)
-          NavigationRailDestination(
+        for (final item in P2WlanSection.mobilePrimary)
+          NavigationDestination(
             icon: MouseRegion(
               cursor: SystemMouseCursors.click,
               child: Icon(item.icon),
             ),
-            label: Text(strings.sectionLabel(item.name)),
+            label: strings.sectionLabel(item.name),
           ),
       ],
-    );
-  }
-
-  Widget _buildBottomNav(AppStrings strings, bool showMoreHub) {
-    return NavigationBar(
-      selectedIndex: _bottomNavIndex(showMoreHub),
-      onDestinationSelected: _onBottomNavSelected,
-      destinations: [
-        _bottomDestination(strings.dashboard, P2WlanSection.dashboard.icon),
-        _bottomDestination(strings.nodes, P2WlanSection.nodes.icon),
-        _bottomDestination(strings.tunnels, P2WlanSection.tunnels.icon),
-        NavigationDestination(
-          icon: MouseRegion(
-            cursor: SystemMouseCursors.click,
-            child: const Icon(Icons.more_horiz_rounded),
-          ),
-          label: strings.more,
-        ),
-      ],
-    );
-  }
-
-  NavigationDestination _bottomDestination(String label, IconData icon) {
-    return NavigationDestination(
-      icon: MouseRegion(cursor: SystemMouseCursors.click, child: Icon(icon)),
-      label: label,
     );
   }
 }
@@ -284,299 +303,74 @@ bool get _isDesktopShell =>
 
 bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
 
-bool get _usesWindowsChrome => false;
-
 bool get _canDragWindowFromAppBar {
   return !kIsWeb && (Platform.isMacOS || Platform.isWindows);
 }
 
 bool get _showsInAppCloseButton => !kIsWeb && Platform.isWindows;
 
-/// Compact phones only: a hub for low-frequency sections (diagnostics,
-/// settings) instead of a crowded five-item bottom bar.
-class _MoreHub extends StatelessWidget {
-  const _MoreHub({required this.onOpenSection});
+/// Compact mobile only: low-weight overflow menu in the top bar. Keeps the
+/// shell quiet — the bottom bar stays at exactly three destinations and
+/// troubleshooting is entered from here and from Home's issue banner.
+class _MobileShellMenu extends StatelessWidget {
+  const _MobileShellMenu({
+    required this.statusStore,
+    required this.onOpenTroubleshooting,
+  });
 
-  final ValueChanged<P2WlanSection> onOpenSection;
+  final StatusStore statusStore;
+  final VoidCallback onOpenTroubleshooting;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
-    return SafeArea(
-      child: ListView(
-        padding: const EdgeInsets.only(top: 10, bottom: 16),
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(18, 4, 18, 10),
-            child: Text(
-              strings.moreDescription,
-              style: TextStyle(
-                fontSize: 13,
-                height: 1.4,
+    return PopupMenuButton<_MobileMenuAction>(
+      icon: const Icon(Icons.more_horiz_rounded),
+      tooltip: strings.menu,
+      onSelected: (action) => switch (action) {
+        _MobileMenuAction.troubleshooting => onOpenTroubleshooting(),
+        _MobileMenuAction.refresh => statusStore.refresh(),
+      },
+      itemBuilder: (context) => [
+        PopupMenuItem(
+          value: _MobileMenuAction.troubleshooting,
+          height: 44,
+          child: Row(
+            children: [
+              Icon(
+                P2WlanSection.troubleshooting.icon,
+                size: 18,
                 color: theme.colorScheme.onSurfaceVariant,
               ),
-            ),
+              const SizedBox(width: 12),
+              Text(strings.troubleshooting),
+            ],
           ),
-          _MoreEntry(
-            icon: P2WlanSection.diagnostics.icon,
-            title: strings.diagnostics,
-            subtitle: strings.diagnosticsSubtitle,
-            onTap: () => onOpenSection(P2WlanSection.diagnostics),
-          ),
-          const Divider(height: 1, indent: 18, endIndent: 18),
-          _MoreEntry(
-            icon: P2WlanSection.settings.icon,
-            title: strings.settings,
-            subtitle: strings.settingsSubtitle,
-            onTap: () => onOpenSection(P2WlanSection.settings),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _MoreEntry extends StatelessWidget {
-  const _MoreEntry({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return ListTile(
-      onTap: onTap,
-      leading: Icon(icon, color: theme.colorScheme.onSurfaceVariant),
-      title: Text(
-        title,
-        style: TextStyle(
-          fontSize: 14,
-          fontWeight: FontWeight.w600,
-          color: theme.colorScheme.onSurface,
         ),
-      ),
-      subtitle: Text(
-        subtitle,
-        style: TextStyle(
-          fontSize: 12,
-          height: 1.3,
-          color: theme.colorScheme.onSurfaceVariant,
-        ),
-      ),
-      trailing: Icon(
-        Icons.chevron_right_rounded,
-        size: 20,
-        color: theme.colorScheme.onSurfaceVariant,
-      ),
-      contentPadding: const EdgeInsets.symmetric(horizontal: 18),
-    );
-  }
-}
-
-/// Expanded desktop: a real side navigation with brand header and visual
-/// grouping. Secondary (tool) sections are visually separated instead of
-/// flattened into one five-item list.
-class _GroupedNavRail extends StatelessWidget {
-  const _GroupedNavRail({
-    required this.selected,
-    required this.strings,
-    required this.onSelect,
-  });
-
-  final P2WlanSection selected;
-  final AppStrings strings;
-  final ValueChanged<P2WlanSection> onSelect;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final railColor =
-        theme.navigationRailTheme.backgroundColor ?? theme.colorScheme.surface;
-    return Container(
-      width: 208,
-      color: railColor,
-      child: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const _RailBrandHeader(),
-            Divider(height: 1),
-            Expanded(
-              child: ListView(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                children: [
-                  _RailGroupLabel(strings.navGroupOverview),
-                  _RailItem(
-                    icon: P2WlanSection.dashboard.icon,
-                    label: strings.dashboard,
-                    selected: selected == P2WlanSection.dashboard,
-                    onTap: () => onSelect(P2WlanSection.dashboard),
-                  ),
-                  _RailItem(
-                    icon: P2WlanSection.nodes.icon,
-                    label: strings.nodes,
-                    selected: selected == P2WlanSection.nodes,
-                    onTap: () => onSelect(P2WlanSection.nodes),
-                  ),
-                  _RailGroupLabel(strings.navGroupNetwork),
-                  _RailItem(
-                    icon: P2WlanSection.tunnels.icon,
-                    label: strings.tunnels,
-                    selected: selected == P2WlanSection.tunnels,
-                    onTap: () => onSelect(P2WlanSection.tunnels),
-                  ),
-                  _RailGroupLabel(strings.navGroupTools),
-                  _RailItem(
-                    icon: P2WlanSection.diagnostics.icon,
-                    label: strings.diagnostics,
-                    selected: selected == P2WlanSection.diagnostics,
-                    onTap: () => onSelect(P2WlanSection.diagnostics),
-                  ),
-                  _RailItem(
-                    icon: P2WlanSection.settings.icon,
-                    label: strings.settings,
-                    selected: selected == P2WlanSection.settings,
-                    onTap: () => onSelect(P2WlanSection.settings),
-                  ),
-                ],
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: _MobileMenuAction.refresh,
+          height: 44,
+          enabled: !statusStore.refreshing,
+          child: Row(
+            children: [
+              Icon(
+                Icons.refresh,
+                size: 18,
+                color: theme.colorScheme.onSurfaceVariant,
               ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _RailBrandHeader extends StatelessWidget {
-  const _RailBrandHeader();
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
-      child: Row(
-        children: [
-          Container(
-            width: 28,
-            height: 28,
-            decoration: BoxDecoration(
-              color: theme.colorScheme.primary,
-              borderRadius: BorderRadius.circular(AppTokens.radiusSm + 1),
-            ),
-            child: Icon(
-              Icons.hub_outlined,
-              size: 17,
-              color: theme.colorScheme.onPrimary,
-            ),
-          ),
-          const SizedBox(width: AppTokens.space10),
-          Text(
-            p2wlanAppName,
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0,
-              color: theme.colorScheme.onSurface,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _RailGroupLabel extends StatelessWidget {
-  const _RailGroupLabel(this.label);
-
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 14, 20, 6),
-      child: Text(
-        label,
-        style: TextStyle(
-          fontSize: 11,
-          fontWeight: FontWeight.w600,
-          letterSpacing: 0.4,
-          color: Theme.of(context).colorScheme.onSurfaceVariant,
-        ),
-      ),
-    );
-  }
-}
-
-class _RailItem extends StatelessWidget {
-  const _RailItem({
-    required this.icon,
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final foreground = selected
-        ? theme.colorScheme.primary
-        : theme.colorScheme.onSurfaceVariant;
-    final indicatorColor =
-        theme.navigationRailTheme.indicatorColor ?? theme.colorScheme.surface;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 1.5),
-      child: Material(
-        color: selected ? indicatorColor : Colors.transparent,
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-          hoverColor: selected ? null : P2WlanColors.of(context).hoverSurface,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal: AppTokens.space10,
-              vertical: AppTokens.space8,
-            ),
-            child: Row(
-              children: [
-                Icon(icon, size: 20, color: foreground),
-                const SizedBox(width: AppTokens.space10),
-                Expanded(
-                  child: Text(
-                    label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-                      color: foreground,
-                    ),
-                  ),
-                ),
-              ],
-            ),
+              const SizedBox(width: 12),
+              Text(strings.refresh),
+            ],
           ),
         ),
-      ),
+      ],
     );
   }
 }
+
+enum _MobileMenuAction { troubleshooting, refresh }
 
 class _WindowsCloseButton extends StatelessWidget {
   const _WindowsCloseButton();
@@ -598,9 +392,13 @@ Future<void> _destroyWindow() async {
 }
 
 class _ShellStatusActions extends StatelessWidget {
-  const _ShellStatusActions({required this.statusStore});
+  const _ShellStatusActions({
+    required this.statusStore,
+    this.showStatusBadge = true,
+  });
 
   final StatusStore statusStore;
+  final bool showStatusBadge;
 
   @override
   Widget build(BuildContext context) {
@@ -613,12 +411,13 @@ class _ShellStatusActions extends StatelessWidget {
         return Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Center(
-                child: StatusBadge(label: label, tone: tone),
+            if (showStatusBadge)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Center(
+                  child: StatusBadge(label: label, tone: tone),
+                ),
               ),
-            ),
             IconButton(
               tooltip: strings.refresh,
               onPressed: statusStore.refreshing ? null : statusStore.refresh,

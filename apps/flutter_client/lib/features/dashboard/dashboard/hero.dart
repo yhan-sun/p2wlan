@@ -1,9 +1,12 @@
 part of '../dashboard_page.dart';
 
+/// Home hero: quiet status, Virtual IP, identity line, key metrics, and the
+/// daemon recovery actions. One surface — the only strong container on Home.
 class _NetworkHero extends StatelessWidget {
   const _NetworkHero({
     required this.snapshot,
     required this.status,
+    required this.loading,
     required this.counts,
     required this.daemonAvailable,
     required this.canControlLocalDaemon,
@@ -16,11 +19,10 @@ class _NetworkHero extends StatelessWidget {
 
   final DiagnosticsSnapshot? snapshot;
   final _NetworkStatus status;
-  final _PeerCounts counts;
 
-  /// Whether any daemon endpoint is reachable (health or status). When only
-  /// health is up (e.g. GET /status failing), the daemon is running but its
-  /// state is unavailable.
+  /// First load / recovery in flight: the daemon state is not known yet.
+  final bool loading;
+  final _PeerCounts counts;
   final bool daemonAvailable;
   final bool canControlLocalDaemon;
   final bool daemonBusy;
@@ -39,13 +41,13 @@ class _NetworkHero extends StatelessWidget {
       children: [
         Expanded(
           child: Text(
-            strings.networkTitle,
+            strings.homeNetworkTitle,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: theme.colorScheme.onSurface,
               fontSize: 15,
-              fontWeight: FontWeight.w800,
+              fontWeight: FontWeight.w700,
               letterSpacing: 0,
             ),
           ),
@@ -58,50 +60,64 @@ class _NetworkHero extends StatelessWidget {
       ],
     );
 
-    // Full stop guidance only when the network is truly stopped and this device
-    // can start the daemon; unavailable (health up / status down) and mobile
-    // get the "unavailable" message instead.
     final showStartGuide =
         status == _NetworkStatus.stopped && canControlLocalDaemon;
+
     final infoBlock = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (hasSnapshot) ...[
-          _HeroLabel(strings.virtualIp),
-          const SizedBox(height: AppTokens.space4),
+        if (loading) ...[
           Text(
-            dash(snapshot!.virtualIp),
+            strings.homeLoading,
+            style: TextStyle(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontSize: 13,
+              height: 1.4,
+            ),
+          ),
+        ] else if (hasSnapshot) ...[
+          Text(
+            strings.homeJoinedSubtitle,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
-              color: theme.colorScheme.onSurface,
-              fontSize: 28,
-              fontWeight: FontWeight.w800,
-              height: 1.05,
-              fontFeatures: AppTokens.tabularFontFeatures,
+              color: theme.colorScheme.onSurfaceVariant,
+              fontSize: 13,
+              height: 1.3,
             ),
           ),
-          if (counts.total > 0) ...[
+          const SizedBox(height: AppTokens.space14),
+          _VirtualIpBlock(
+            virtualIp: snapshot!.virtualIp,
+            networkId: snapshot!.networkId,
+          ),
+          if (status == _NetworkStatus.stale) ...[
             const SizedBox(height: AppTokens.space14),
-            _HeroCounts(counts: counts),
+            _StaleNote(refreshing: refreshing, onRefresh: onRefresh),
+          ],
+          if (status != _NetworkStatus.stale) ...[
+            const SizedBox(height: AppTokens.space16),
+            const Divider(height: 1),
+            const SizedBox(height: AppTokens.space14),
+            _HomeMetrics(counts: counts),
           ],
         ] else ...[
           Text(
             showStartGuide
-                ? strings.dashboardStoppedTitle
-                : strings.dashboardUnavailableTitle,
+                ? strings.homeStoppedTitle
+                : strings.homeUnavailableTitle,
             style: TextStyle(
               color: theme.colorScheme.onSurface,
               fontSize: 20,
-              fontWeight: FontWeight.w800,
+              fontWeight: FontWeight.w700,
               height: 1.15,
             ),
           ),
           const SizedBox(height: AppTokens.space6),
           Text(
             showStartGuide
-                ? strings.dashboardStoppedDetail
-                : strings.dashboardUnavailableDetail,
+                ? strings.homeStoppedDetail
+                : strings.homeUnavailableDetail,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
@@ -114,7 +130,9 @@ class _NetworkHero extends StatelessWidget {
       ],
     );
 
-    final actions = _DashboardActions(
+    final actions = _HomeActions(
+      status: status,
+      loading: loading,
       daemonAvailable: daemonAvailable,
       daemonBusy: daemonBusy,
       canControlLocalDaemon: canControlLocalDaemon,
@@ -124,38 +142,28 @@ class _NetworkHero extends StatelessWidget {
       onRefresh: onRefresh,
     );
 
-    return _DashboardSurface(
+    final showActions =
+        !loading &&
+        (status == _NetworkStatus.stopped ||
+            status == _NetworkStatus.unavailable ||
+            hasSnapshot);
+
+    return _HeroSurface(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           header,
           const SizedBox(height: AppTokens.space14),
           infoBlock,
-          const SizedBox(height: AppTokens.space16),
-          const Divider(height: 1),
-          const SizedBox(height: AppTokens.space16),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              if (constraints.maxWidth < 560) {
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _NetworkIdLine(snapshot: snapshot),
-                    const SizedBox(height: AppTokens.space12),
-                    actions,
-                  ],
-                );
-              }
-              return Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  Expanded(child: _NetworkIdLine(snapshot: snapshot)),
-                  const SizedBox(width: AppTokens.space16),
-                  actions,
-                ],
-              );
-            },
-          ),
+          if (showActions) ...[
+            if (hasSnapshot) ...[
+              const SizedBox(height: AppTokens.space14),
+              Align(alignment: Alignment.centerRight, child: actions),
+            ] else ...[
+              const SizedBox(height: AppTokens.space16),
+              actions,
+            ],
+          ],
         ],
       ),
     );
@@ -189,152 +197,251 @@ class _NetworkHero extends StatelessWidget {
   }
 }
 
-class _HeroCounts extends StatelessWidget {
-  const _HeroCounts({required this.counts});
+/// The one prominent surface on Home: light border, no shadow, radius 12.
+class _HeroSurface extends StatelessWidget {
+  const _HeroSurface({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+        border: Border.all(color: theme.colorScheme.outline, width: 1),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(AppTokens.space16),
+        child: child,
+      ),
+    );
+  }
+}
+
+/// Virtual IP with tap-to-copy (tooltip + lightweight snackbar).
+class _VirtualIpBlock extends StatelessWidget {
+  const _VirtualIpBlock({required this.virtualIp, required this.networkId});
+
+  final String virtualIp;
+  final String networkId;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          strings.virtualIpLabel,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            height: 1.2,
+          ),
+        ),
+        const SizedBox(height: AppTokens.space4),
+        Tooltip(
+          message: strings.copyVirtualIp,
+          child: InkWell(
+            key: const Key('home-virtual-ip'),
+            onTap: () => _copy(context, strings),
+            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      dash(virtualIp),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontSize: 28,
+                        fontWeight: FontWeight.w700,
+                        height: 1.1,
+                        fontFeatures: AppTokens.tabularFontFeatures,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: AppTokens.space8),
+                  Icon(
+                    Icons.copy_rounded,
+                    size: 15,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: AppTokens.space6),
+        Text(
+          '${strings.networkId}  ${dash(networkId)}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontSize: 11.5,
+            fontWeight: FontWeight.w500,
+            height: 1.2,
+            fontFeatures: AppTokens.tabularFontFeatures,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _copy(BuildContext context, AppStrings strings) async {
+    await Clipboard.setData(ClipboardData(text: virtualIp));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(strings.copied)));
+  }
+}
+
+/// Last-known data kept, with an explicit stale note and refresh.
+class _StaleNote extends StatelessWidget {
+  const _StaleNote({required this.refreshing, required this.onRefresh});
+
+  final bool refreshing;
+  final Future<void> Function() onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final c = P2WlanColors.of(context);
+    return Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 7,
+      runSpacing: 4,
+      children: [
+        Container(
+          width: 7,
+          height: 7,
+          decoration: BoxDecoration(
+            color: c.warningDot,
+            shape: BoxShape.circle,
+          ),
+        ),
+        Text(
+          strings.homeStaleNote,
+          style: TextStyle(
+            color: c.warningText,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            height: 1.2,
+          ),
+        ),
+        TextButton.icon(
+          key: const Key('home-stale-refresh'),
+          onPressed: refreshing ? null : onRefresh,
+          icon: refreshing
+              ? const SizedBox.square(
+                  dimension: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.refresh_rounded, size: 16),
+          label: Text(strings.refresh),
+          style: TextButton.styleFrom(
+            visualDensity: VisualDensity.compact,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Online / Direct / Relay — one quiet row, subtle dividers, no metric cards.
+class _HomeMetrics extends StatelessWidget {
+  const _HomeMetrics({required this.counts});
 
   final _PeerCounts counts;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final c = P2WlanColors.of(context);
-    final good = c.direct;
-    final warn = c.probing;
-    final relay = c.relay;
-    return Wrap(
-      spacing: AppTokens.space20,
-      runSpacing: AppTokens.space10,
-      crossAxisAlignment: WrapCrossAlignment.center,
+    return Row(
       children: [
-        _HeroCount(
+        _MetricCell(
           key: const Key('dashboard-count-online'),
-          label: strings.onlineDevices,
           value: counts.online,
-          color: good,
+          label: strings.onlineDevices,
         ),
-        _HeroCount(
+        _MetricDivider(),
+        _MetricCell(
           key: const Key('dashboard-count-direct'),
-          label: strings.direct,
           value: counts.direct,
-          color: good,
+          label: strings.direct,
         ),
-        _HeroCount(
+        _MetricDivider(),
+        _MetricCell(
           key: const Key('dashboard-count-relay'),
-          label: strings.relay,
           value: counts.relay,
-          color: relay,
+          label: strings.relay,
         ),
-        if (counts.probing > 0)
-          _HeroCount(
-            key: const Key('dashboard-count-probing'),
-            label: strings.probing,
-            value: counts.probing,
-            color: warn,
-          ),
       ],
     );
   }
 }
 
-class _HeroCount extends StatelessWidget {
-  const _HeroCount({
-    super.key,
-    required this.label,
-    required this.value,
-    required this.color,
-  });
+class _MetricCell extends StatelessWidget {
+  const _MetricCell({super.key, required this.value, required this.label});
 
-  final String label;
   final int value;
-  final Color color;
+  final String label;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Container(
-          width: 8,
-          height: 8,
-          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-        ),
-        const SizedBox(width: 7),
-        Text(
-          '$value',
-          style: TextStyle(
-            color: theme.colorScheme.onSurface,
-            fontSize: 15,
-            fontWeight: FontWeight.w800,
-            height: 1.1,
-            fontFeatures: AppTokens.tabularFontFeatures,
+    return Expanded(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '$value',
+            style: TextStyle(
+              color: theme.colorScheme.onSurface,
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+              height: 1.1,
+              fontFeatures: AppTokens.tabularFontFeatures,
+            ),
           ),
-        ),
-        const SizedBox(width: 5),
-        Text(
-          label,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: theme.colorScheme.onSurfaceVariant,
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
-            height: 1.2,
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _HeroLabel extends StatelessWidget {
-  const _HeroLabel(this.value);
-
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return Text(
-      value,
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
-      style: TextStyle(
-        color: Theme.of(context).colorScheme.onSurfaceVariant,
-        fontSize: 12,
-        fontWeight: FontWeight.w700,
-        height: 1.2,
-      ),
-    );
-  }
-}
-
-class _NetworkIdLine extends StatelessWidget {
-  const _NetworkIdLine({required this.snapshot});
-
-  final DiagnosticsSnapshot? snapshot;
-
-  @override
-  Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Flexible(
-          child: Text(
-            '${strings.networkId}  ${dash(snapshot?.networkId)}',
+          const SizedBox(height: 2),
+          Text(
+            label,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: theme.colorScheme.onSurfaceVariant,
               fontSize: 12,
-              fontWeight: FontWeight.w500,
+              fontWeight: FontWeight.w600,
               height: 1.2,
-              fontFeatures: AppTokens.tabularFontFeatures,
             ),
           ),
-        ),
-      ],
+        ],
+      ),
+    );
+  }
+}
+
+class _MetricDivider extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 1,
+      height: 30,
+      color: P2WlanColors.of(context).divider,
     );
   }
 }

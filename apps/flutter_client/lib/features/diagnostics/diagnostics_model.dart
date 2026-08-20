@@ -12,6 +12,38 @@ import '../../core/security/redactor.dart';
 
 enum DiagnosticSeverity { good, warning, bad, neutral }
 
+/// Lightweight presentation-level issue category. Drives the *safe* action a
+/// user issue can offer (recheck, open devices, open settings) without
+/// inventing an "auto fix" that has no real backend operation behind it.
+enum DiagnosticIssueKind {
+  /// Snapshot older than the freshness window → recheck.
+  stale,
+
+  /// Health endpoint unreachable, no snapshot → recheck.
+  serviceUnavailable,
+
+  /// Health reachable but status unavailable → recheck.
+  statusUnavailable,
+
+  /// Control plane requires a fresh credential → open settings.
+  reauthRequired,
+
+  /// Service reports a non-healthy status → explanation only.
+  serviceHealth,
+
+  /// A critical background task is failing → explanation only.
+  criticalTask,
+
+  /// Control plane disconnected → explanation only.
+  controlDisconnected,
+
+  /// Relay path failing → explanation only.
+  relay,
+
+  /// One or more peer paths need review → open devices.
+  peerPath,
+}
+
 class DiagnosticCheck {
   const DiagnosticCheck({
     required this.title,
@@ -31,12 +63,16 @@ class DiagnosticIssue {
     required this.title,
     required this.detail,
     required this.severity,
+    this.kind = DiagnosticIssueKind.serviceHealth,
     this.technicalDetail,
   });
 
   final String title;
   final String detail;
   final DiagnosticSeverity severity;
+
+  /// Presentation category that selects a safe, real action (or none).
+  final DiagnosticIssueKind kind;
 
   /// Redacted technical detail, shown only in the advanced section.
   final String? technicalDetail;
@@ -235,6 +271,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.issueStaleDetail,
         detail: strings.staleSnapshotMessage,
         severity: DiagnosticSeverity.warning,
+        kind: DiagnosticIssueKind.stale,
       ),
     );
   }
@@ -245,6 +282,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.issueCannotReachService,
         detail: strings.issueCannotReachServiceDetail,
         severity: DiagnosticSeverity.bad,
+        kind: DiagnosticIssueKind.serviceUnavailable,
       ),
     );
     return issues;
@@ -256,6 +294,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.issueStatusUnavailableTitle,
         detail: strings.issueStatusUnavailableDetail,
         severity: DiagnosticSeverity.warning,
+        kind: DiagnosticIssueKind.statusUnavailable,
       ),
     );
     return issues;
@@ -269,6 +308,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.issueReauthTitle,
         detail: strings.issueReauthDetail,
         severity: DiagnosticSeverity.bad,
+        kind: DiagnosticIssueKind.reauthRequired,
         technicalDetail: _redactedReason(health),
       ),
     );
@@ -283,6 +323,7 @@ List<DiagnosticIssue> _buildIssues({
         severity: _fatalServiceStatus(health.status)
             ? DiagnosticSeverity.bad
             : DiagnosticSeverity.warning,
+        kind: DiagnosticIssueKind.serviceHealth,
         technicalDetail: _redactedReason(health),
       ),
     );
@@ -297,6 +338,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.issueCriticalTaskTitle,
         detail: strings.issueCriticalTaskDetail,
         severity: DiagnosticSeverity.bad,
+        kind: DiagnosticIssueKind.criticalTask,
         technicalDetail: failedTasks
             .map((task) => '${task.name}: ${redactSensitive(task.error!)}')
             .join('\n'),
@@ -310,6 +352,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.issueControlServerTitle,
         detail: strings.issueControlServerDetail,
         severity: DiagnosticSeverity.warning,
+        kind: DiagnosticIssueKind.controlDisconnected,
       ),
     );
   }
@@ -321,6 +364,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.issueRelayTitle,
         detail: strings.issueRelayDetail,
         severity: DiagnosticSeverity.warning,
+        kind: DiagnosticIssueKind.relay,
         technicalDetail: redactSensitive(relayError),
       ),
     );
@@ -335,6 +379,7 @@ List<DiagnosticIssue> _buildIssues({
         title: strings.devicesNeedPathReview(pathWarnings),
         detail: strings.issuePeerPathsDetail,
         severity: DiagnosticSeverity.warning,
+        kind: DiagnosticIssueKind.peerPath,
       ),
     );
   }

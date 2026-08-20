@@ -194,29 +194,6 @@ abstract final class AppTheme {
           );
         }),
       ),
-      navigationRailTheme: NavigationRailThemeData(
-        backgroundColor: AppTokens.colorSurfaceSubtle,
-        indicatorColor: AppTokens.colorSurface,
-        elevation: 0,
-        unselectedLabelTextStyle: const TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w500,
-          color: AppTokens.colorTextSecondary,
-        ),
-        selectedLabelTextStyle: const TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w700,
-          color: AppTokens.colorAccent,
-        ),
-        unselectedIconTheme: const IconThemeData(
-          color: AppTokens.colorTextSecondary,
-          size: 20,
-        ),
-        selectedIconTheme: const IconThemeData(
-          color: AppTokens.colorAccent,
-          size: 20,
-        ),
-      ),
       dividerTheme: const DividerThemeData(
         color: AppTokens.colorBorder,
         thickness: 1,
@@ -418,29 +395,6 @@ abstract final class AppTheme {
             size: 22,
           );
         }),
-      ),
-      navigationRailTheme: NavigationRailThemeData(
-        backgroundColor: AppTokens.colorDarkSurfaceSubtle,
-        indicatorColor: AppTokens.colorDarkSurface,
-        elevation: 0,
-        unselectedLabelTextStyle: const TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w500,
-          color: AppTokens.colorDarkTextSecondary,
-        ),
-        selectedLabelTextStyle: const TextStyle(
-          fontSize: 12,
-          fontWeight: FontWeight.w700,
-          color: AppTokens.colorDarkAccent,
-        ),
-        unselectedIconTheme: const IconThemeData(
-          color: AppTokens.colorDarkTextSecondary,
-          size: 20,
-        ),
-        selectedIconTheme: const IconThemeData(
-          color: AppTokens.colorDarkAccent,
-          size: 20,
-        ),
       ),
       dividerTheme: const DividerThemeData(
         color: AppTokens.colorDarkBorder,

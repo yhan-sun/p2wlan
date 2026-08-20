@@ -186,22 +186,27 @@ void _registerFinalRegressionTests() {
     expect(tester.takeException(), isNull);
   });
 
-  // --- Tunnels capabilities ---
-  testWidgets('Tunnels desktop shows local route actions', (tester) async {
+  // --- Network & route diagnostics (Troubleshooting Advanced) ---
+  testWidgets('Troubleshooting desktop shows local route actions', (
+    tester,
+  ) async {
     final stores = await _smokeStores(tester);
     addTearDown(stores.dispose);
     await tester.pumpWidget(
       _localeHost(
         tester,
         'en',
-        TunnelsPage(
+        DiagnosticsPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
           capabilities: PlatformCapabilities.fromPlatform('macos'),
+          permissionCheck: _noopPermissionCheck,
+          logPreviewLoader: _noopLogPreviewLoader,
         ),
       ),
     );
     await tester.pumpAndSettle();
+    await _expandAdvanced(tester);
 
     expect(find.text('Check routes'), findsOneWidget);
     expect(find.text('Repair routes'), findsOneWidget);
@@ -212,49 +217,55 @@ void _registerFinalRegressionTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Tunnels android hides local actions and never verifies routes', (
+  testWidgets(
+    'Troubleshooting android hides local actions and never verifies routes',
+    (tester) async {
+      final api = _FakeDiagnosticsApi(
+        health: true,
+        snapshot: (await tester.runAsync(_loadFixtureSnapshot)),
+      );
+      final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      // The store refresh calls verifyRoutes itself; baseline it so we can
+      // prove the page (on android) does not issue an additional local check.
+      final baselineVerifyCount = api.verifyRoutesCount;
+
+      await tester.pumpWidget(
+        _localeHost(
+          tester,
+          'en',
+          DiagnosticsPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('android'),
+            permissionCheck: _noopPermissionCheck,
+            logPreviewLoader: _noopLogPreviewLoader,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await _expandAdvanced(tester);
+
+      expect(find.text('Check routes'), findsNothing);
+      expect(find.text('Repair routes'), findsNothing);
+      expect(
+        find.text('Restart network service (brief disconnect)'),
+        findsNothing,
+      );
+      expect(api.verifyRoutesCount, baselineVerifyCount);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  // --- Network route repair raw errors ---
+  testWidgets('Troubleshooting route repair failure is localized', (
     tester,
   ) async {
     final api = _FakeDiagnosticsApi(
       health: true,
       snapshot: (await tester.runAsync(_loadFixtureSnapshot)),
-    );
-    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
-    addTearDown(stores.dispose);
-    await stores.statusStore.refresh();
-    // The store refresh calls verifyRoutes itself; baseline it so we can prove
-    // the page (on android) does not issue an additional local route check.
-    final baselineVerifyCount = api.verifyRoutesCount;
-
-    await tester.pumpWidget(
-      _localeHost(
-        tester,
-        'en',
-        TunnelsPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
-          capabilities: PlatformCapabilities.fromPlatform('android'),
-        ),
-      ),
-    );
-    await tester.pumpAndSettle();
-
-    expect(find.text('Tunnel summary'), findsOneWidget);
-    expect(find.text('Check routes'), findsNothing);
-    expect(find.text('Repair routes'), findsNothing);
-    expect(
-      find.text('Restart network service (brief disconnect)'),
-      findsNothing,
-    );
-    expect(api.verifyRoutesCount, baselineVerifyCount);
-    expect(tester.takeException(), isNull);
-  });
-
-  // --- Tunnels raw errors ---
-  testWidgets('Tunnels route repair failure is localized', (tester) async {
-    final api = _FakeDiagnosticsApi(
-      health: true,
-      snapshot: (await tester.runAsync(_loadFixtureSnapshot)),
+      routes: missingRoutesFixture,
       repairRoutesError: Exception('SUPER_SECRET'),
     );
     final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
@@ -265,14 +276,17 @@ void _registerFinalRegressionTests() {
       _localeHost(
         tester,
         'en',
-        TunnelsPage(
+        DiagnosticsPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
           capabilities: PlatformCapabilities.fromPlatform('macos'),
+          permissionCheck: _noopPermissionCheck,
+          logPreviewLoader: _noopLogPreviewLoader,
         ),
       ),
     );
     await tester.pumpAndSettle();
+    await _expandAdvanced(tester);
     tester
         .widget<OutlinedButton>(
           find.widgetWithText(OutlinedButton, 'Repair routes'),
@@ -289,7 +303,7 @@ void _registerFinalRegressionTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Tunnels restart failure is localized', (tester) async {
+  testWidgets('Troubleshooting restart failure is localized', (tester) async {
     final stores = await _permissionStepStores(
       tester,
       preflight: satisfiedPreflight,
@@ -303,14 +317,17 @@ void _registerFinalRegressionTests() {
       _localeHost(
         tester,
         'en',
-        TunnelsPage(
+        DiagnosticsPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
           capabilities: PlatformCapabilities.fromPlatform('macos'),
+          permissionCheck: _noopPermissionCheck,
+          logPreviewLoader: _noopLogPreviewLoader,
         ),
       ),
     );
     await tester.pumpAndSettle();
+    await _expandAdvanced(tester);
     tester
         .widget<TextButton>(
           find.widgetWithText(
@@ -331,7 +348,9 @@ void _registerFinalRegressionTests() {
   });
 
   // --- Async lifecycle: dispose mid-rebuild ---
-  testWidgets('disposing Tunnels mid-rebuild does not throw', (tester) async {
+  testWidgets('disposing network section mid-restart does not throw', (
+    tester,
+  ) async {
     final api = _FakeDiagnosticsApi(
       health: true,
       snapshot: (await tester.runAsync(_loadFixtureSnapshot)),
@@ -347,14 +366,17 @@ void _registerFinalRegressionTests() {
       _localeHost(
         tester,
         'en',
-        TunnelsPage(
+        DiagnosticsPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
           capabilities: PlatformCapabilities.fromPlatform('macos'),
+          permissionCheck: _noopPermissionCheck,
+          logPreviewLoader: _noopLogPreviewLoader,
         ),
       ),
     );
     await tester.pumpAndSettle();
+    await _expandAdvanced(tester);
 
     tester
         .widget<TextButton>(
@@ -392,14 +414,16 @@ void _registerFinalRegressionTests() {
       ),
     ),
     (
-      'Tunnels',
+      'Troubleshooting',
       (WidgetTester t, String code, _Stores s) => _localeHost(
         t,
         code,
-        TunnelsPage(
+        DiagnosticsPage(
           settingsStore: s.settingsStore,
           statusStore: s.statusStore,
           capabilities: PlatformCapabilities.fromPlatform('macos'),
+          permissionCheck: _noopPermissionCheck,
+          logPreviewLoader: _noopLogPreviewLoader,
         ),
       ),
     ),
@@ -453,9 +477,10 @@ Future<_Stores> _completionStepStores(WidgetTester tester) async {
   final tempDir = await tester.runAsync(
     () => Directory.systemTemp.createTemp('p2wlan_completion_test_'),
   );
+  final tokenRepository = _ThrowingCompletionTokenRepository();
   final settingsStore = SettingsStore(
     settingsFile: File('${tempDir!.path}/settings.json'),
-    tokenRepository: _ThrowingCompletionTokenRepository(),
+    tokenRepository: tokenRepository,
   );
   await tester.runAsync(settingsStore.load);
   await tester.runAsync(
@@ -473,7 +498,7 @@ Future<_Stores> _completionStepStores(WidgetTester tester) async {
     autoRefreshInterval: const Duration(minutes: 5),
   );
   await statusStore.refresh();
-  return _Stores(tempDir, settingsStore, statusStore);
+  return _Stores(tempDir, settingsStore, statusStore, tokenRepository);
 }
 
 class _FailingDaemonController extends DaemonController {
