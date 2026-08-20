@@ -5,12 +5,14 @@
 ///   Expanded  >= 1024  wide desktop windows
 ///
 /// Pages may refine their own internal layouts on top of this (e.g. a list
-/// flipping to master-detail), but the shell navigation and top-level page
-/// width policy hang off these breakpoints.
+/// flipping to master-detail). Desktop navigation has one additional
+/// platform-aware threshold: desktop windows at 800px and above use the full
+/// sidebar even while page content is still in the medium band.
 enum AppBreakpoint { compact, medium, expanded }
 
 abstract final class AppBreakpoints {
   static const compactMaxWidth = 600.0;
+  static const desktopSidebarMinWidth = 800.0;
   static const expandedMinWidth = 1024.0;
 
   static AppBreakpoint of(double width) {

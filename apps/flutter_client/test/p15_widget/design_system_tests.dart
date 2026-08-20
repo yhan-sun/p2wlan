@@ -168,6 +168,38 @@ void _registerDesignSystemTests() {
     expect(find.text('Network OK'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  for (final dark in [false, true]) {
+    testWidgets('desktop 860 shell keeps complete sidebar in both themes', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      await tester.binding.setSurfaceSize(const Size(860, 628));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final stores = await _smokeStores(tester);
+      addTearDown(stores.dispose);
+      await tester.pumpWidget(
+        _DesignSystemHost(
+          dark: dark,
+          child: P2WlanShell(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('macos'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(DesktopSidebar), findsOneWidget);
+      expect(find.byType(AppNavRail), findsNothing);
+      expect(find.byType(NavigationBar), findsNothing);
+      expect(find.byKey(const Key('desktop-sidebar-brand')), findsOneWidget);
+      expect(find.byKey(const Key('desktop-sidebar-status')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+
+      debugDefaultTargetPlatformOverride = null;
+    });
+  }
 }
 
 Future<void> _pumpDashboardSmoke(

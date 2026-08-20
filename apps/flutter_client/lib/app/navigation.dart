@@ -85,19 +85,26 @@ class _P2WlanShellState extends State<P2WlanShell> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final breakpoint = AppBreakpoints.of(constraints.maxWidth);
-        // Phones get the three-item bottom bar; tablets and desktop (even when
-        // squeezed below the compact width) keep a rail/sidebar so navigation
-        // never morphs into a phone layout.
+        // Desktop navigation is platform-aware: an 860px desktop window is
+        // still a desktop sidebar, while a 700px desktop window gets the
+        // compact icon-only sidebar. Non-desktop tablets keep the labeled rail
+        // until the regular expanded content breakpoint.
+        final useDesktopSidebar =
+            breakpoint == AppBreakpoint.expanded ||
+            (_isDesktopShell &&
+                constraints.maxWidth >= AppBreakpoints.desktopSidebarMinWidth);
+        // Phones get the three-item bottom bar; desktop windows keep desktop
+        // interaction even when squeezed below the compact width.
         final useBottomNav =
             breakpoint == AppBreakpoint.compact && !_isDesktopShell;
 
         return Scaffold(
-          appBar: _buildTopBar(strings, useBottomNav, breakpoint),
+          appBar: _buildTopBar(strings, useBottomNav, useDesktopSidebar),
           body: useBottomNav
               ? _buildBody()
               : Row(
                   children: [
-                    _buildNavigation(breakpoint, strings),
+                    _buildNavigation(strings, useDesktopSidebar),
                     const VerticalDivider(width: 1),
                     Expanded(child: _buildBody()),
                   ],
@@ -114,9 +121,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
     }
   }
 
-  Widget _buildNavigation(AppBreakpoint breakpoint, AppStrings strings) {
+  Widget _buildNavigation(AppStrings strings, bool useDesktopSidebar) {
     final selected = P2WlanSection.primary.contains(_section) ? _section : null;
-    if (breakpoint == AppBreakpoint.expanded) {
+    if (useDesktopSidebar) {
       return DesktopSidebar(
         selected: selected,
         strings: strings,
@@ -127,24 +134,27 @@ class _P2WlanShellState extends State<P2WlanShell> {
     }
     return AppNavRail(
       selected: selected,
-      iconOnly: breakpoint == AppBreakpoint.compact,
+      // Desktop compact windows use an icon-only sidebar. Non-desktop medium
+      // layouts keep labels, but the rail renders them horizontally.
+      iconOnly: _isDesktopShell,
       strings: strings,
+      statusStore: widget.statusStore,
       onSelect: _select,
+      onFooterTap: () => _select(P2WlanSection.troubleshooting),
     );
   }
 
   PreferredSizeWidget _buildTopBar(
     AppStrings strings,
     bool isMobileLayout,
-    AppBreakpoint breakpoint,
+    bool hasSidebarFooter,
   ) {
     // Expanded desktop: the sidebar footer already carries the network status.
     // Home: the hero itself is the strong status expression, so the top bar
     // adds no duplicate badge there either. Other sections (Devices,
     // Troubleshooting, Settings) keep the global badge on medium and compact
     // desktop because they have no footer.
-    final showStatusBadge =
-        breakpoint != AppBreakpoint.expanded && _section != P2WlanSection.home;
+    final showStatusBadge = !hasSidebarFooter && _section != P2WlanSection.home;
     return AppBar(
       leading: _usesMacosChrome ? const SizedBox.shrink() : null,
       leadingWidth: _usesMacosChrome ? 76 : null,

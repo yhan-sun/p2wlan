@@ -22,7 +22,7 @@ class DesktopSidebar extends StatelessWidget {
     required this.onFooterTap,
   });
 
-  static const width = 216.0;
+  static const width = 184.0;
 
   final P2WlanSection? selected;
   final AppStrings strings;
@@ -34,6 +34,7 @@ class DesktopSidebar extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Container(
+      key: const Key('desktop-sidebar-surface'),
       width: width,
       color: theme.colorScheme.surface,
       child: SafeArea(
@@ -85,21 +86,22 @@ class _SidebarBrandHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return SizedBox(
-      height: 56,
+      key: const Key('desktop-sidebar-brand'),
+      height: 52,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space16),
+        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space14),
         child: Row(
           children: [
             Container(
-              width: 28,
-              height: 28,
+              width: 26,
+              height: 26,
               decoration: BoxDecoration(
                 color: theme.colorScheme.primary,
                 borderRadius: BorderRadius.circular(AppTokens.radiusSm + 1),
               ),
               child: Icon(
                 Icons.hub_outlined,
-                size: 17,
+                size: 16,
                 color: theme.colorScheme.onPrimary,
               ),
             ),
@@ -107,7 +109,7 @@ class _SidebarBrandHeader extends StatelessWidget {
             Text(
               strings.appName,
               style: TextStyle(
-                fontSize: 14,
+                fontSize: 13,
                 fontWeight: FontWeight.w700,
                 letterSpacing: 0,
                 color: theme.colorScheme.onSurface,
@@ -141,7 +143,7 @@ class _SidebarItem extends StatelessWidget {
         ? theme.colorScheme.primary
         : theme.colorScheme.onSurfaceVariant;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: AppTokens.space10),
+      padding: const EdgeInsets.symmetric(horizontal: AppTokens.space8),
       child: AnimatedContainer(
         duration: AppTokens.durationMedium,
         curve: AppTokens.curveEase,
@@ -158,11 +160,23 @@ class _SidebarItem extends StatelessWidget {
               borderRadius: BorderRadius.circular(AppTokens.radiusMd),
               hoverColor: selected ? null : colors.hoverSurface,
               child: SizedBox(
-                height: 38,
+                height: 36,
                 child: Row(
                   children: [
-                    const SizedBox(width: AppTokens.space10),
-                    Icon(icon, size: 20, color: foreground),
+                    const SizedBox(width: AppTokens.space8),
+                    AnimatedContainer(
+                      duration: AppTokens.durationMedium,
+                      width: 2,
+                      height: selected ? 18 : 0,
+                      decoration: BoxDecoration(
+                        color: selected
+                            ? theme.colorScheme.primary
+                            : Colors.transparent,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                    const SizedBox(width: AppTokens.space8),
+                    Icon(icon, size: 18, color: foreground),
                     const SizedBox(width: AppTokens.space10),
                     Expanded(
                       child: Text(
@@ -178,6 +192,7 @@ class _SidebarItem extends StatelessWidget {
                         ),
                       ),
                     ),
+                    const SizedBox(width: AppTokens.space8),
                   ],
                 ),
               ),
@@ -218,64 +233,67 @@ class _SidebarFooter extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             const Divider(height: 1),
-            Tooltip(
-              message: strings.openTroubleshooting,
-              child: Material(
-                type: MaterialType.transparency,
-                child: InkWell(
-                  onTap: onTap,
-                  hoverColor: colors.hoverSurface,
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(
-                      AppTokens.space16,
-                      AppTokens.space12,
-                      AppTokens.space14,
-                      AppTokens.space12,
-                    ),
-                    child: Row(
-                      children: [
-                        Container(
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(
-                            color: dotColor,
-                            shape: BoxShape.circle,
+            Container(
+              key: const Key('desktop-sidebar-status'),
+              child: Tooltip(
+                message: strings.openTroubleshooting,
+                child: Material(
+                  type: MaterialType.transparency,
+                  child: InkWell(
+                    onTap: onTap,
+                    hoverColor: colors.hoverSurface,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(
+                        AppTokens.space14,
+                        AppTokens.space10,
+                        AppTokens.space10,
+                        AppTokens.space10,
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 7,
+                            height: 7,
+                            decoration: BoxDecoration(
+                              color: dotColor,
+                              shape: BoxShape.circle,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: AppTokens.space10),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                label,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w600,
-                                  color: theme.colorScheme.onSurface,
+                          const SizedBox(width: AppTokens.space8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  label,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: theme.colorScheme.onSurface,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                detail,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: theme.colorScheme.onSurfaceVariant,
+                                const SizedBox(height: 2),
+                                Text(
+                                  detail,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
-                        ),
-                        Icon(
-                          Icons.chevron_right_rounded,
-                          size: 16,
-                          color: theme.colorScheme.onSurfaceVariant,
-                        ),
-                      ],
+                          Icon(
+                            Icons.chevron_right_rounded,
+                            size: 16,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),

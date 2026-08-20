@@ -4,54 +4,140 @@ import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/navigation_model.dart';
 import '../../app/p2wlan_colors.dart';
+import '../../core/state/status_store.dart';
+import 'status_badge.dart';
 
-/// Custom primary navigation rail for medium layouts (tablet / small desktop
-/// windows) and compact desktop windows.
+/// Compact desktop and medium non-desktop navigation.
 ///
-/// Deliberately not Material's `NavigationRail`: the stock widget's pill
-/// indicator reads as a Material demo, while the shell needs a quiet
-/// native-style rail (subtle selected surface, short left accent bar, muted
-/// hover). Window width and input form factor are different things — a
-/// desktop window squeezed below the compact width must not become a phone
-/// bottom bar.
+/// This is intentionally not Material's [NavigationRail]. A desktop-sized
+/// window should keep a quiet, native-style navigation surface: labels are
+/// horizontal when present, and compact desktop shows only icon buttons with
+/// tooltips. It never uses the stock icon-above-label presentation.
 class AppNavRail extends StatelessWidget {
   const AppNavRail({
     super.key,
     required this.selected,
     required this.iconOnly,
     required this.strings,
+    required this.statusStore,
     required this.onSelect,
+    required this.onFooterTap,
   });
 
-  /// Rail width when labels are shown (medium layouts).
-  static const expandedWidth = 88.0;
+  /// Labeled width for non-desktop medium layouts.
+  static const expandedWidth = 156.0;
 
-  /// Rail width for compact desktop windows (icon-only).
-  static const compactWidth = 60.0;
+  /// Compact desktop width: icon buttons and a bottom status entry.
+  static const compactWidth = 64.0;
 
   /// Current section; secondary/non-primary sections render no selection.
   final P2WlanSection? selected;
   final bool iconOnly;
   final AppStrings strings;
+  final StatusStore statusStore;
   final ValueChanged<P2WlanSection> onSelect;
+  final VoidCallback onFooterTap;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Container(
+      key: const Key('app-nav-rail-surface'),
       width: iconOnly ? compactWidth : expandedWidth,
       color: theme.colorScheme.surface,
       child: SafeArea(
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            for (final section in P2WlanSection.primary)
-              _NavRailItem(
-                section: section,
-                iconOnly: iconOnly,
-                selected: selected == section,
-                label: strings.sectionLabel(section.name),
-                onTap: () => onSelect(section),
+            _RailBrand(strings: strings, iconOnly: iconOnly),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppTokens.space4,
+                  vertical: AppTokens.space6,
+                ),
+                children: [
+                  for (final (index, group)
+                      in P2WlanSection.sidebarGroups.indexed) ...[
+                    if (index > 0)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 5),
+                        child: Divider(indent: 8, endIndent: 8),
+                      ),
+                    for (final section in group)
+                      _NavRailItem(
+                        section: section,
+                        iconOnly: iconOnly,
+                        selected: selected == section,
+                        label: strings.sectionLabel(section.name),
+                        onTap: () => onSelect(section),
+                      ),
+                  ],
+                ],
               ),
+            ),
+            if (iconOnly)
+              _CompactRailStatus(
+                strings: strings,
+                statusStore: statusStore,
+                onTap: onFooterTap,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _RailBrand extends StatelessWidget {
+  const _RailBrand({required this.strings, required this.iconOnly});
+
+  final AppStrings strings;
+  final bool iconOnly;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final mark = Container(
+      width: 24,
+      height: 24,
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primary,
+        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+      ),
+      child: Icon(
+        Icons.hub_outlined,
+        size: 15,
+        color: theme.colorScheme.onPrimary,
+      ),
+    );
+    if (iconOnly) {
+      return Tooltip(
+        message: strings.appName,
+        child: SizedBox(
+          key: const Key('compact-sidebar-brand'),
+          height: 52,
+          child: Center(child: mark),
+        ),
+      );
+    }
+    return SizedBox(
+      key: const Key('rail-brand'),
+      height: 52,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space12),
+        child: Row(
+          children: [
+            mark,
+            const SizedBox(width: AppTokens.space8),
+            Text(
+              strings.appName,
+              style: TextStyle(
+                color: theme.colorScheme.onSurface,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
           ],
         ),
       ),
@@ -83,8 +169,6 @@ class _NavRailItem extends StatelessWidget {
       label: label,
       onTap: onTap,
     );
-    // Icon-only rail: labels are hidden from pixels but the tooltip keeps the
-    // destination discoverable.
     if (iconOnly) {
       return Tooltip(message: label, child: item);
     }
@@ -115,14 +199,14 @@ class _RailItemSurface extends StatelessWidget {
         ? theme.colorScheme.primary
         : theme.colorScheme.onSurfaceVariant;
     final labelStyle = TextStyle(
-      fontSize: 12,
+      fontSize: 13,
       fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
       color: foreground,
     );
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        padding: const EdgeInsets.symmetric(horizontal: AppTokens.space4),
         child: AnimatedContainer(
           duration: AppTokens.durationMedium,
           curve: AppTokens.curveEase,
@@ -137,16 +221,15 @@ class _RailItemSurface extends StatelessWidget {
               borderRadius: BorderRadius.circular(AppTokens.radiusSm),
               hoverColor: selected ? null : colors.hoverSurface,
               child: SizedBox(
-                height: iconOnly ? 44 : 56,
+                height: 40,
                 child: Stack(
                   children: [
                     if (selected)
                       Align(
                         alignment: Alignment.centerLeft,
                         child: Container(
-                          width: 3,
+                          width: 2,
                           height: 18,
-                          margin: const EdgeInsets.only(left: 3),
                           decoration: BoxDecoration(
                             color: theme.colorScheme.primary,
                             borderRadius: BorderRadius.circular(2),
@@ -154,15 +237,27 @@ class _RailItemSurface extends StatelessWidget {
                         ),
                       ),
                     if (iconOnly)
-                      Center(child: Icon(icon, size: 20, color: foreground))
+                      Center(child: Icon(icon, size: 19, color: foreground))
                     else
-                      Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(icon, size: 20, color: foreground),
-                          const SizedBox(height: AppTokens.space4),
-                          Text(label, maxLines: 1, style: labelStyle),
-                        ],
+                      Padding(
+                        padding: const EdgeInsets.only(
+                          left: AppTokens.space12,
+                          right: AppTokens.space8,
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(icon, size: 19, color: foreground),
+                            const SizedBox(width: AppTokens.space10),
+                            Expanded(
+                              child: Text(
+                                label,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: labelStyle,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                   ],
                 ),
@@ -171,6 +266,105 @@ class _RailItemSurface extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _CompactRailStatus extends StatelessWidget {
+  const _CompactRailStatus({
+    required this.strings,
+    required this.statusStore,
+    required this.onTap,
+  });
+
+  final AppStrings strings;
+  final StatusStore statusStore;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AnimatedBuilder(
+      animation: statusStore,
+      builder: (context, _) {
+        final (tone, label, detail) = _status(strings, statusStore);
+        final colors = P2WlanColors.of(context);
+        final dotColor = switch (tone) {
+          StatusTone.good => colors.successDot,
+          StatusTone.warn => colors.warningDot,
+          StatusTone.bad => colors.dangerDot,
+          StatusTone.neutral => colors.neutralDot,
+        };
+        return Container(
+          key: const Key('compact-sidebar-status'),
+          decoration: BoxDecoration(
+            border: Border(top: BorderSide(color: theme.colorScheme.outline)),
+          ),
+          child: Tooltip(
+            message: [
+              strings.openTroubleshooting,
+              '$label · $detail',
+            ].join(': '),
+            child: Semantics(
+              label: '$label, $detail',
+              button: true,
+              child: Material(
+                type: MaterialType.transparency,
+                child: InkWell(
+                  onTap: onTap,
+                  hoverColor: colors.hoverSurface,
+                  child: SizedBox(
+                    height: 48,
+                    child: Center(child: _StatusDot(color: dotColor)),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  (StatusTone, String, String) _status(AppStrings strings, StatusStore store) {
+    if (!store.daemonReachable || store.snapshot == null) {
+      return (
+        StatusTone.neutral,
+        strings.shellStatusOffline,
+        strings.shellStatusOfflineDetail,
+      );
+    }
+    if (store.snapshotStale) {
+      return (StatusTone.warn, strings.stale, strings.shellStatusStaleDetail);
+    }
+    final health = store.snapshot!.health.status.toLowerCase();
+    if (health == 'healthy') {
+      final online = store.snapshot!.peers.where((p) => p.online).length;
+      return (
+        StatusTone.good,
+        strings.shellStatusHealthy,
+        strings.shellPeersOnline(online),
+      );
+    }
+    return (
+      StatusTone.warn,
+      strings.shellStatusAttention,
+      strings.needsAttention,
+    );
+  }
+}
+
+class _StatusDot extends StatelessWidget {
+  const _StatusDot({required this.color});
+
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 8,
+      height: 8,
+      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
     );
   }
 }

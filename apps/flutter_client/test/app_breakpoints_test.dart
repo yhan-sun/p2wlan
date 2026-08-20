@@ -24,6 +24,10 @@ void main() {
       expect(AppBreakpoints.compactMaxWidth, 600);
     });
 
+    test('desktop sidebar starts at 800', () {
+      expect(AppBreakpoints.desktopSidebarMinWidth, 800);
+    });
+
     test('expanded starts at 1024', () {
       expect(AppBreakpoints.expandedMinWidth, 1024);
     });

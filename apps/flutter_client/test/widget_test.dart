@@ -155,6 +155,79 @@ void main() {
     expect(find.byType(StatusBadge), findsOneWidget);
   });
 
+  testWidgets('desktop 860x628 uses the complete compact sidebar shape', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    tester.view.physicalSize = const Size(860, 628);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await _pumpTestApp(tester);
+
+    final sidebar = find.byType(DesktopSidebar);
+    expect(sidebar, findsOneWidget);
+    expect(find.byType(AppNavRail), findsNothing);
+    expect(find.byType(NavigationBar), findsNothing);
+    expect(
+      find.descendant(
+        of: sidebar,
+        matching: find.byKey(const Key('desktop-sidebar-brand')),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: sidebar,
+        matching: find.byKey(const Key('desktop-sidebar-status')),
+      ),
+      findsOneWidget,
+    );
+    for (final label in const ['首页', '设备', '故障排查', '设置']) {
+      expect(
+        find.descendant(of: sidebar, matching: find.text(label)),
+        findsOneWidget,
+      );
+    }
+    expect(tester.takeException(), isNull);
+
+    // Must be reset inside the test body before framework invariants run.
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets(
+    'desktop 700x600 uses compact icon-only sidebar, not mobile navigation',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      tester.view.physicalSize = const Size(700, 600);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await _pumpTestApp(tester);
+
+      final rail = find.byType(AppNavRail);
+      expect(rail, findsOneWidget);
+      expect(tester.widget<AppNavRail>(rail).iconOnly, isTrue);
+      expect(find.byType(DesktopSidebar), findsNothing);
+      expect(find.byType(NavigationBar), findsNothing);
+      expect(find.byKey(const Key('compact-sidebar-brand')), findsOneWidget);
+      expect(find.byKey(const Key('compact-sidebar-status')), findsOneWidget);
+      expect(
+        find.descendant(of: rail, matching: find.text('首页')),
+        findsNothing,
+      );
+      expect(
+        find.descendant(of: rail, matching: find.text('故障排查')),
+        findsNothing,
+      );
+      expect(tester.takeException(), isNull);
+
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
+
   testWidgets(
     'mobile overflow opens troubleshooting with exactly three destinations',
     (tester) async {
