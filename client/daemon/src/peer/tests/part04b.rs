@@ -91,6 +91,36 @@ async fn generation_change_opens_immediate_direct_reclaim_window() {
 }
 
 #[tokio::test]
+async fn network_handover_revokes_healthy_direct_so_candidate_fanout_is_not_suppressed() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "192.168.2.11:51840".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    assert!(
+        manager.should_defer_relay_assisted_punch("peer1").await,
+        "a healthy confirmed Direct path normally suppresses refresh fan-out"
+    );
+
+    let generation = manager
+        .advance_network_generation("physical network identity changed")
+        .await;
+
+    assert_eq!(generation, 1);
+    assert!(
+        !manager.should_defer_relay_assisted_punch("peer1").await,
+        "a real handover must re-enable candidate offer and synchronized punching"
+    );
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+    assert_ne!(conn.direct_generation, generation);
+    assert!(manager.direct_reclaim_active("peer1").await);
+}
+
+#[tokio::test]
 async fn direct_reclaim_window_bypasses_retry_and_pair_cooldowns() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "203.0.113.21:41000".parse().unwrap();

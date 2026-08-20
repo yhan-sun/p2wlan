@@ -322,7 +322,10 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             // (field evidence: v0.1.116 acceptance rounds timed out at
             // ~102 s); moving the public mapping to the front unconditionally
             // (it is already present from gathering) fixes the priority.
-            if let Some(index) = candidates.iter().position(|candidate| candidate == endpoint) {
+            if let Some(index) = candidates
+                .iter()
+                .position(|candidate| candidate == endpoint)
+            {
                 candidates.remove(index);
             }
             candidates.insert(0, endpoint.clone());
@@ -414,10 +417,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             .as_ref()
             .map(|snapshot| snapshot.network_identity.clone())
             .unwrap_or_default();
-        let should_advance_generation = network_identity_changed(
-            &previous_network_identity,
-            &next_network_identity,
-        );
+        let should_advance_generation =
+            network_identity_changed(&previous_network_identity, &next_network_identity);
         let public_candidate_readiness_changed = public_candidate_readiness_changed(
             &previous_candidates,
             &previous_candidate_sources,
@@ -479,7 +480,13 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             .unwrap_or_default();
         if should_advance_generation {
             peers
-                .advance_candidate_refresh_generation("refreshed UDP candidates")
+                // `network_identity_changed` only becomes true when an
+                // existing physical/public identity was replaced.  That is
+                // a real handover, not ordinary candidate churn: carrying a
+                // confirmed Direct pair into the new generation would make
+                // the fan-out below skip the offer/punch that must rebuild
+                // the path on the new network.
+                .advance_network_generation("UDP network identity changed")
                 .await;
         }
         drop(refresh_guard);
@@ -564,7 +571,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             "UDP candidate refresh",
             Some(HolePunchSignalContext {
                 control: control.clone(),
-                        candidate_snapshot: candidate_snapshot.clone(),
+                candidate_snapshot: candidate_snapshot.clone(),
                 stun_servers: stun_servers.clone(),
                 stun_timeout,
                 boot_epoch_ms,

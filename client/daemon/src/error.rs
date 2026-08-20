@@ -32,6 +32,15 @@ pub enum DaemonError {
     #[error("relay error: {0}")]
     Relay(String),
 
+    /// The kernel route used by a live Relay connection changed. This is a
+    /// local handover signal, not a relay-endpoint failure, so the supervisor
+    /// reconnects immediately without putting that relay into cooldown.
+    #[error("relay route changed for {endpoint}: {signature:?}")]
+    RelayRouteChanged {
+        endpoint: String,
+        signature: Vec<String>,
+    },
+
     /// A relay data command failed after the daemon handed it to the relay
     /// client's command boundary.  Keeping the original typed relay error is
     /// important here: `try_send` rejection is safe to re-encrypt from

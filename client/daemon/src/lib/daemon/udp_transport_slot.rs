@@ -83,12 +83,10 @@ impl UdpTransportPublication {
         if let Some(stop) = state.current_stop.take() {
             let _ = stop.send(true);
         }
-        if let (Some(previous_owner), Some(previous_transport)) = (
-            previous_owner,
-            self.inner.legacy.read().await.clone(),
-        ) {
-            previous_transport
-                .clear_inbound_publication_owner_if_matches(previous_owner.0);
+        if let (Some(previous_owner), Some(previous_transport)) =
+            (previous_owner, self.inner.legacy.read().await.clone())
+        {
+            previous_transport.clear_inbound_publication_owner_if_matches(previous_owner.0);
         }
 
         state.next_owner = state.next_owner.wrapping_add(1);
@@ -135,6 +133,10 @@ impl UdpTransportPublication {
         true
     }
 
+    async fn is_current_owner(&self, owner: UdpTransportOwner) -> bool {
+        self.inner.state.lock().await.current_owner == Some(owner)
+    }
+
     /// Withdraw whichever instance is current, used during daemon shutdown.
     async fn clear_current(&self) {
         let mut state = self.inner.state.lock().await;
@@ -150,7 +152,6 @@ impl UdpTransportPublication {
         state.current_owner = None;
     }
 
-    #[cfg(test)]
     async fn current_owner(&self) -> Option<UdpTransportOwner> {
         self.inner.state.lock().await.current_owner
     }
@@ -197,13 +198,7 @@ mod udp_transport_slot_tests {
             expected_addr
         );
         assert_eq!(
-            legacy
-                .read()
-                .await
-                .as_ref()
-                .unwrap()
-                .local_addr()
-                .unwrap(),
+            legacy.read().await.as_ref().unwrap().local_addr().unwrap(),
             expected_addr
         );
     }
@@ -236,15 +231,12 @@ mod udp_transport_slot_tests {
             !publication.clear_if_owner(old_lease.owner()).await,
             "a late old worker must not clear the replacement"
         );
-        assert_eq!(publication.current_owner().await, Some(replacement_lease.owner()));
         assert_eq!(
-            legacy
-                .read()
-                .await
-                .as_ref()
-                .unwrap()
-                .local_addr()
-                .unwrap(),
+            publication.current_owner().await,
+            Some(replacement_lease.owner())
+        );
+        assert_eq!(
+            legacy.read().await.as_ref().unwrap().local_addr().unwrap(),
             replacement_addr
         );
         assert_eq!(

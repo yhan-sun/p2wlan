@@ -32,6 +32,8 @@ use super::{is_stun_clear_value, unix_time_millis};
 
 /// Short cooldown after a selected Relay fails at runtime before trying it again.
 const RELAY_RUNTIME_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
+const RELAY_ROUTE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const RELAY_ROUTE_STABILITY_SAMPLES: u8 = 2;
 /// Confirm relay peer reachability proactively instead of waiting for user traffic.
 const RELAY_PEER_VALIDATION_INTERVAL: Duration = Duration::from_secs(5);
 const RELAY_PEER_VALIDATION_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -247,6 +249,75 @@ pub(crate) fn relay_renewal_deadline(expires_at_unix: i64, now_unix: i64) -> Dur
     )
 }
 
+/// Confirm a kernel-route handover twice before retiring a live Relay TCP
+/// connection. Route inspection can be momentarily empty while DHCP updates;
+/// empty samples never tear down a healthy connection.
+struct RelayRouteMonitor {
+    baseline: Vec<String>,
+    pending: Option<(Vec<String>, u8)>,
+    ticker: tokio::time::Interval,
+}
+
+impl RelayRouteMonitor {
+    fn new(baseline: Vec<String>) -> Self {
+        let mut ticker = interval(RELAY_ROUTE_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            baseline,
+            pending: None,
+            ticker,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        !self.baseline.is_empty()
+    }
+
+    fn reset(&mut self, baseline: Vec<String>) {
+        self.baseline = baseline;
+        self.pending = None;
+    }
+
+    fn observe(&mut self, observed: Vec<String>) -> Option<Vec<String>> {
+        if observed.is_empty() {
+            self.pending = None;
+            return None;
+        }
+        if observed == self.baseline {
+            self.pending = None;
+            return None;
+        }
+        match &mut self.pending {
+            Some((candidate, samples)) if *candidate == observed => {
+                *samples = samples.saturating_add(1);
+                if *samples >= RELAY_ROUTE_STABILITY_SAMPLES {
+                    self.pending = None;
+                    Some(observed)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.pending = Some((observed, 1));
+                None
+            }
+        }
+    }
+
+    async fn wait_for_change(&mut self) -> Vec<String> {
+        loop {
+            self.ticker.tick().await;
+            let observed =
+                tokio::task::spawn_blocking(|| crate::netenv::network_route_signature(&[]))
+                    .await
+                    .unwrap_or_default();
+            if let Some(changed) = self.observe(observed) {
+                return changed;
+            }
+        }
+    }
+}
+
 impl RelaySupervisor {
     /// Supervise one relay connection through its renewal lifecycle.
     ///
@@ -302,6 +373,8 @@ impl RelaySupervisor {
         // link after a real failure.
         let mut generation: u64 = 0;
         let mut current_transport = current_transport;
+        let mut route_monitor =
+            RelayRouteMonitor::new(current_transport.route_signature().to_vec());
         let mut inbound_ended =
             self.spawn_inbound_task(generation, current_transport.clone(), relay_rx);
         let mut renewal = spawn_renewal(
@@ -317,6 +390,26 @@ impl RelaySupervisor {
         let mut pending_current_end: Option<Result<()>> = None;
         loop {
             tokio::select! {
+                changed = route_monitor.wait_for_change(), if route_monitor.enabled() => {
+                    connection_generation.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    current_transport.abort_writer();
+                    self.timeline.emit(
+                        "relay_transport_route_changed",
+                        Some("relay"),
+                        Some("network_route_changed"),
+                        Some(format!(
+                            "endpoint={endpoint} connection_id={} signature={changed:?}",
+                            current_transport.connection_id(),
+                        )),
+                    );
+                    return Err(DaemonError::RelayRouteChanged {
+                        endpoint: endpoint.to_string(),
+                        signature: changed,
+                    });
+                }
                 ended = relay_oneshot_wait(&mut inbound_ended), if inbound_ended.is_some() => {
                     match ended {
                         Some(Ok((ended_generation, result))) => {
@@ -466,6 +559,7 @@ impl RelaySupervisor {
                                 new_rx,
                             );
                             current_transport = new_transport;
+                            route_monitor.reset(current_transport.route_signature().to_vec());
                             pending_current_end = None;
                             renewal = spawn_renewal(
                                 connection_generation.load(std::sync::atomic::Ordering::SeqCst),
@@ -589,6 +683,19 @@ struct ArmedRelayRenewal {
     /// an EOF that arrives while the renewal is already connecting is held
     /// until the renewal resolves instead of aborting a successful handoff.
     connecting: Arc<std::sync::atomic::AtomicBool>,
+    /// Abort the detached ticket-fetch/connect task when the supervisor moves
+    /// to a new network generation or drops the renewal for any other reason.
+    /// Without this handle a route change could leave a stale task running
+    /// long enough to register an orphaned newest-wins relay connection.
+    abort_handle: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for ArmedRelayRenewal {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.abort_handle.take() {
+            abort_handle.abort();
+        }
+    }
 }
 
 /// Await an optional inbound-end oneshot receiver (used inside `tokio::select!`
@@ -672,7 +779,7 @@ async fn spawn_relay_renewal_task_impl(
     let (tx, rx) = oneshot::channel();
     let connecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let connecting_task = connecting.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Sleep until the renewal deadline (expiry - margin), re-checking
         // in bounded steps so the wait always ends before the server's
         // expiry close.
@@ -704,6 +811,9 @@ async fn spawn_relay_renewal_task_impl(
         let result = async {
             let (ticket, expires_at) =
                 ticket_cache.refresh_ticket(&audience, &region).await.ok()?;
+            if generation_token.load(std::sync::atomic::Ordering::SeqCst) != expected_generation {
+                return None;
+            }
             let (transport, relay_rx) = RelayTransport::connect_secure(
                 &endpoint,
                 &region,
@@ -715,6 +825,10 @@ async fn spawn_relay_renewal_task_impl(
             )
             .await
             .ok()?;
+            if generation_token.load(std::sync::atomic::Ordering::SeqCst) != expected_generation {
+                transport.abort_writer();
+                return None;
+            }
             Some((
                 transport.with_ticket_metadata(&audience, &region, expires_at),
                 relay_rx,
@@ -726,6 +840,7 @@ async fn spawn_relay_renewal_task_impl(
     Some(ArmedRelayRenewal {
         result: Some(rx),
         connecting,
+        abort_handle: Some(task.abort_handle()),
     })
 }
 
@@ -868,7 +983,8 @@ impl RelaySupervisor {
                     .invalidate_relay_transport(&endpoint, peer_failure_code, peer_failure_reason)
                     .await;
 
-                let should_cooldown = self.relay_candidates.len() > 1;
+                let route_changed = matches!(&ended, Err(DaemonError::RelayRouteChanged { .. }));
+                let should_cooldown = self.relay_candidates.len() > 1 && !route_changed;
                 let cooldown_ms = duration_millis(RELAY_RUNTIME_FAILURE_COOLDOWN);
                 if should_cooldown {
                     cooldowns.insert(
@@ -878,6 +994,10 @@ impl RelaySupervisor {
                 }
 
                 let (reason, fallback_code) = match (ended, should_cooldown) {
+                    (Err(DaemonError::RelayRouteChanged { .. }), _) => (
+                        format!("local network route changed; reconnecting relay {endpoint}"),
+                        "network_route_changed",
+                    ),
                     (Ok(()), true) => (
                         format!(
                             "relay {endpoint} disconnected; cooling down for {cooldown_ms} ms before reselection"
@@ -1456,7 +1576,8 @@ pub(super) async fn run_relay_peer_probe_loop(
                     request_id,
                     owner_token,
                 );
-                let packet = Ipv4Packet::build_icmp_echo_request(local_ip, peer_ip, request_id, 1, &payload);
+                let packet =
+                    Ipv4Packet::build_icmp_echo_request(local_ip, peer_ip, request_id, 1, &payload);
                 let send_transport = transport.clone();
                 let send_relay = relay.clone();
                 let send_peer_id = peer_id.clone();
@@ -1553,6 +1674,20 @@ pub(super) async fn send_relay_validation_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_route_monitor_requires_two_nonempty_matching_changes() {
+        let original = vec!["default:en0:192.168.1.1".to_string()];
+        let replacement = vec!["default:en1:192.168.2.1".to_string()];
+        let mut monitor = RelayRouteMonitor::new(original.clone());
+
+        assert!(monitor.enabled());
+        assert!(monitor.observe(replacement.clone()).is_none());
+        assert!(monitor.observe(Vec::new()).is_none());
+        assert!(monitor.observe(original).is_none());
+        assert!(monitor.observe(replacement.clone()).is_none());
+        assert_eq!(monitor.observe(replacement.clone()), Some(replacement));
+    }
 
     #[test]
     fn relay_ticket_renewal_deadline_precedes_expiry_with_margin() {
@@ -1787,6 +1922,7 @@ mod tests {
         let (fake, mut armed_rx) = FakeRenewalQueue::new(vec![ArmedRelayRenewal {
             result: Some(renewal_rx),
             connecting: connecting.clone(),
+            abort_handle: None,
         }]);
         let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let fake_task = fake.clone();
@@ -1897,6 +2033,7 @@ mod tests {
         let (fake, mut armed_rx) = FakeRenewalQueue::new(vec![ArmedRelayRenewal {
             result: Some(renewal_rx),
             connecting: connecting.clone(),
+            abort_handle: None,
         }]);
         let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let fake_task = fake.clone();
@@ -1999,6 +2136,7 @@ mod tests {
         let (fake, mut armed_rx) = FakeRenewalQueue::new(vec![ArmedRelayRenewal {
             result: Some(renewal_rx),
             connecting: connecting.clone(),
+            abort_handle: None,
         }]);
         let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let fake_task = fake.clone();
@@ -2158,10 +2296,12 @@ mod tests {
             ArmedRelayRenewal {
                 result: Some(renewal_rx_2),
                 connecting: connecting_2.clone(),
+                abort_handle: None,
             },
             ArmedRelayRenewal {
                 result: Some(renewal_rx_1),
                 connecting: connecting_1.clone(),
+                abort_handle: None,
             },
         ]);
         let connection_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));

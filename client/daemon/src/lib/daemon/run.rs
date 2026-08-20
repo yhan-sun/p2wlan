@@ -154,14 +154,26 @@ impl Daemon {
             .as_ref()
             .map(|tun| vec![tun.name().to_string()])
             .unwrap_or_default();
-        let proxy_env = crate::netenv::detect_proxy_environment(&excluded_interfaces);
+        let detection_excluded_interfaces = excluded_interfaces.clone();
+        let proxy_env = tokio::task::spawn_blocking(move || {
+            crate::netenv::detect_proxy_environment(&detection_excluded_interfaces)
+        })
+        .await
+        .map_err(|error| {
+            DaemonError::Network(format!(
+                "network environment detection task failed: {error}"
+            ))
+        })?;
         if proxy_env.intercepted() {
             warn!(
-                "Network egress appears intercepted: verdict={} env_proxies={:?} system_proxy={:?} default_route_interface={:?} (STUN public endpoints and NAT profile may describe the proxy egress, not the local NAT)",
+                "Network egress appears intercepted: verdict={} env_proxy_count={} system_proxy={:?} default_route_interface={:?} public_route_interfaces={:?} capture_interface={:?} physical_bypass_interface={:?}",
                 proxy_env.label(),
-                proxy_env.env_proxies,
+                proxy_env.env_proxies.len(),
                 proxy_env.system_proxy,
                 proxy_env.default_route_interface,
+                proxy_env.public_route_interfaces,
+                proxy_env.capture_iface,
+                proxy_env.physical_route_interface,
             );
         } else {
             info!(
@@ -219,9 +231,7 @@ impl Daemon {
             })
             .await;
         } else {
-            debug!(
-                "No relay servers configured; direct UDP only unless peers provide relay later"
-            );
+            debug!("No relay servers configured; direct UDP only unless peers provide relay later");
         }
 
         let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
@@ -429,51 +439,9 @@ impl Daemon {
         self.spawn_dataplane_tasks(tun, network_inbound_rx).await;
 
         let local_candidate_sources = self.local_candidate_sources.clone();
-let udp_direct_context = UdpDirectTaskContext {
-    udp_bind,
-    peers: self.peers.clone(),
-    control: self.control.clone(),
-    local_candidates: self.local_candidates.clone(),
-     local_candidate_sources: local_candidate_sources.clone(),
-     local_network_identity: self.local_network_identity.clone(),
-     candidate_snapshot: self.candidate_snapshot.clone(),
-    candidate_refresh_lock: self.candidate_refresh_lock.clone(),
-    nat_profile: self.nat_profile.clone(),
-    gateway_mapping_runtime: self.gateway_mapping_runtime.clone(),
-    gateway_mapping_diagnostics: self.gateway_mapping_diagnostics.clone(),
-    udp_transport_publication: self.udp_transport_publication.clone(),
-    direct_validation_transport: self.transport.clone(),
-    direct_validation_local_ip: self.config.network.virtual_ip.clone(),
-    udp_inbound_tx: network_inbound_tx.clone(),
-    local_node_id: self.config.node.node_id.clone(),
-    stun_servers,
-    stun_timeout,
-    udp_advertise,
-    upnp_enabled,
-    socket_pool_enabled,
-    socket_pool_size,
-    keepalive_interval,
-    punch_deduplicator: self.punch_attempts.clone(),
-    udp_punch_interval: punch_interval,
-    udp_punch_attempts: punch_attempts,
-    boot_epoch_ms: self.boot_epoch_ms,
-    proxy_env,
-    shutdown_rx: self.shutdown_rx.clone(),
-};
-self.task_manager
-    .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))
-    .await;
-
-// Periodic session rekey checker — truly invokes needs_rekey / is_expired.
-self.task_manager
-    .spawn(
-        "handshake-maintenance",
-        false,
-        run_handshake_maintenance(HandshakeMaintenanceContext {
+        let udp_direct_context = UdpDirectTaskContext {
+            udp_bind,
             peers: self.peers.clone(),
-            transport: self.transport.clone(),
-            pending: self.pending_handshakes.clone(),
-            handshake_arbiter: self.handshake_arbiter.clone(),
             control: self.control.clone(),
             local_candidates: self.local_candidates.clone(),
             local_candidate_sources: local_candidate_sources.clone(),
@@ -481,15 +449,61 @@ self.task_manager
             candidate_snapshot: self.candidate_snapshot.clone(),
             candidate_refresh_lock: self.candidate_refresh_lock.clone(),
             nat_profile: self.nat_profile.clone(),
-            udp_transport: self.udp_transport.clone(),
+            gateway_mapping_runtime: self.gateway_mapping_runtime.clone(),
+            gateway_mapping_diagnostics: self.gateway_mapping_diagnostics.clone(),
+            udp_transport_publication: self.udp_transport_publication.clone(),
+            direct_validation_transport: self.transport.clone(),
+            direct_validation_local_ip: self.config.network.virtual_ip.clone(),
+            udp_inbound_tx: network_inbound_tx.clone(),
+            local_node_id: self.config.node.node_id.clone(),
+            stun_servers,
+            stun_server_specs: self.config.network.stun_servers.clone(),
+            udp_observer_specs: self.config.network.udp_observers.clone(),
             runtime_stun_servers: self.runtime_stun_servers.clone(),
-            runtime_stun_timeout: self.runtime_stun_timeout.clone(),
-            udp_advertise: self.config.network.udp_advertise.clone(),
-            node_private_key: self.config.node.private_key.clone(),
-            kick_rx: handshake_kick_rx,
-        }),
-    )
-    .await;
+            stun_timeout,
+            udp_advertise,
+            upnp_enabled,
+            socket_pool_enabled,
+            socket_pool_size,
+            keepalive_interval,
+            punch_deduplicator: self.punch_attempts.clone(),
+            udp_punch_interval: punch_interval,
+            udp_punch_attempts: punch_attempts,
+            boot_epoch_ms: self.boot_epoch_ms,
+            proxy_env,
+            excluded_interfaces,
+            shutdown_rx: self.shutdown_rx.clone(),
+        };
+        self.task_manager
+            .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))
+            .await;
+
+        // Periodic session rekey checker — truly invokes needs_rekey / is_expired.
+        self.task_manager
+            .spawn(
+                "handshake-maintenance",
+                false,
+                run_handshake_maintenance(HandshakeMaintenanceContext {
+                    peers: self.peers.clone(),
+                    transport: self.transport.clone(),
+                    pending: self.pending_handshakes.clone(),
+                    handshake_arbiter: self.handshake_arbiter.clone(),
+                    control: self.control.clone(),
+                    local_candidates: self.local_candidates.clone(),
+                    local_candidate_sources: local_candidate_sources.clone(),
+                    local_network_identity: self.local_network_identity.clone(),
+                    candidate_snapshot: self.candidate_snapshot.clone(),
+                    candidate_refresh_lock: self.candidate_refresh_lock.clone(),
+                    nat_profile: self.nat_profile.clone(),
+                    udp_transport: self.udp_transport.clone(),
+                    runtime_stun_servers: self.runtime_stun_servers.clone(),
+                    runtime_stun_timeout: self.runtime_stun_timeout.clone(),
+                    udp_advertise: self.config.network.udp_advertise.clone(),
+                    node_private_key: self.config.node.private_key.clone(),
+                    kick_rx: handshake_kick_rx,
+                }),
+            )
+            .await;
 
         self.run_control_event_loop(&mut relay_started, network_inbound_tx.clone())
             .await;
@@ -497,7 +511,8 @@ self.task_manager
         info!("Daemon shutting down");
         // Explicit cleanup: notify control loop and clean routes without relying on Drop.
         if let Some(udp) = self.udp_transport.read().await.clone() {
-            udp.detach_all_dynamic_punch_sockets("daemon_shutdown").await;
+            udp.detach_all_dynamic_punch_sockets("daemon_shutdown")
+                .await;
         }
         // Withdraw the live publication before background tasks are aborted so
         // inbound consumers and the instance-owned peer-reflexive worker see

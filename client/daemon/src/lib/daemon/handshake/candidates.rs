@@ -13,9 +13,9 @@ impl Daemon {
     }
 
     async fn current_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
-        self.leased_candidate_set().await.unwrap_or_else(|| {
-            (Vec::new(), HashMap::new())
-        })
+        self.leased_candidate_set()
+            .await
+            .unwrap_or_else(|| (Vec::new(), HashMap::new()))
     }
 
     /// Snapshot the cached candidate set WITHOUT taking the refresh lock.
@@ -243,9 +243,7 @@ impl Daemon {
             }
         }
         let refreshed = self.refresh_local_candidates_core(udp, reason).await?;
-        if let Some(endpoint) =
-            control_udp_endpoint_from_candidates(&refreshed.0, &refreshed.1)
-        {
+        if let Some(endpoint) = control_udp_endpoint_from_candidates(&refreshed.0, &refreshed.1) {
             let nat_type = self
                 .nat_profile
                 .read()
@@ -269,9 +267,7 @@ impl Daemon {
                     warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}")
                 }
                 Err(_) => {
-                    debug!(
-                        "Pre-signal UDP endpoint publish '{endpoint}' exceeded its budget"
-                    )
+                    debug!("Pre-signal UDP endpoint publish '{endpoint}' exceeded its budget")
                 }
             }
         }
@@ -313,7 +309,9 @@ impl Daemon {
             }
         };
 
-        self.peers.update_nat_profile(report.nat_profile.clone()).await;
+        self.peers
+            .update_nat_profile(report.nat_profile.clone())
+            .await;
         *self.nat_profile.write().await = Some(report.nat_profile.clone());
 
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
@@ -334,21 +332,23 @@ impl Daemon {
                 candidates.remove(index);
             }
             candidates.insert(0, endpoint.clone());
-            candidate_sources.entry(endpoint.clone()).or_insert_with(|| {
-                if self
-                    .config
-                    .network
-                    .udp_advertise
-                    .as_deref()
-                    .is_some_and(|configured| {
-                        !configured.trim().is_empty() && configured.trim() == endpoint
-                    })
-                {
-                    "manual".to_string()
-                } else {
-                    "host".to_string()
-                }
-            });
+            candidate_sources
+                .entry(endpoint.clone())
+                .or_insert_with(|| {
+                    if self
+                        .config
+                        .network
+                        .udp_advertise
+                        .as_deref()
+                        .is_some_and(|configured| {
+                            !configured.trim().is_empty() && configured.trim() == endpoint
+                        })
+                    {
+                        "manual".to_string()
+                    } else {
+                        "host".to_string()
+                    }
+                });
         }
 
         let previous_snapshot = self.cached_candidate_snapshot().await;
@@ -370,10 +370,8 @@ impl Daemon {
             .as_ref()
             .map(|snapshot| snapshot.network_identity.clone())
             .unwrap_or_default();
-        let should_advance_generation = network_identity_changed(
-            &previous_network_identity,
-            &next_network_identity,
-        );
+        let should_advance_generation =
+            network_identity_changed(&previous_network_identity, &next_network_identity);
         let change_reason = candidate_set_change_reason(
             &previous_candidates,
             &candidates,
@@ -400,7 +398,11 @@ impl Daemon {
             *self.local_network_identity.write().await = next_network_identity.clone();
             if should_advance_generation {
                 self.peers
-                    .advance_candidate_refresh_generation("pre-signal UDP candidate refresh")
+                    // A replaced physical/public identity is a true network
+                    // handover.  Fully invalidate the old Direct proof so
+                    // the imminent signal cannot be suppressed as an
+                    // already-healthy Direct path.
+                    .advance_network_generation("pre-signal UDP network identity changed")
                     .await;
             }
             info!(
@@ -525,8 +527,6 @@ impl Daemon {
         )
         .await;
     }
-
-
 }
 
 /// Select the candidate payload for the relay-first handshake fast path.

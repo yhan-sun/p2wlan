@@ -149,29 +149,22 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 debug!("No control peer info for handshake with {}", conn.node_id);
                 continue;
             };
-            let Ok(private_key) =
-                decode_x25519_key(&node_private_key, "node private key")
-            else {
+            let Ok(private_key) = decode_x25519_key(&node_private_key, "node private key") else {
                 pending.lock().await.cancel_reservation(&conn.node_id);
                 continue;
             };
-            let Ok(peer_public) =
-                decode_x25519_key(&peer_info.public_key, "peer public key")
+            let Ok(peer_public) = decode_x25519_key(&peer_info.public_key, "peer public key")
             else {
                 pending.lock().await.cancel_reservation(&conn.node_id);
                 continue;
             };
             let identity = NodeIdentity::from_private_key(private_key);
-            if !local_is_designated_handshake_initiator(
-                &identity.public_key(),
-                &peer_public,
-            ) {
+            if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
                 // Let the deterministically selected peer initiate.
                 pending.lock().await.cancel_reservation(&conn.node_id);
                 continue;
             }
-            let mut initiator =
-                HandshakeInitiator::new(identity, peer_public, None);
+            let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
             let Ok(initiation) = initiator.create_initiation() else {
                 pending.lock().await.cancel_reservation(&conn.node_id);
                 continue;
@@ -191,10 +184,18 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // a healthy Direct peer's rekey never re-triggers traversal churn.
             let refreshed = {
                 let _lease_guard = candidate_refresh_lock.lock().await;
-                let leased = candidate_snapshot.read().await.as_ref().and_then(|snapshot| {
-                    (!snapshot.candidates.is_empty())
-                        .then(|| (snapshot.candidates.clone(), snapshot.candidate_sources.clone()))
-                });
+                let leased = candidate_snapshot
+                    .read()
+                    .await
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        (!snapshot.candidates.is_empty()).then(|| {
+                            (
+                                snapshot.candidates.clone(),
+                                snapshot.candidate_sources.clone(),
+                            )
+                        })
+                    });
                 drop(_lease_guard);
                 if let Some(leased) = leased {
                     debug!(
@@ -249,8 +250,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             }
 
             let session_id = new_probe_session_id();
-            let (probe_ephemeral, probe_ephemeral_public_key) =
-                new_probe_ephemeral_keypair();
+            let (probe_ephemeral, probe_ephemeral_public_key) = new_probe_ephemeral_keypair();
             let Some((attempt_no, pending_id)) = ({
                 let epoch_gate = peers.network_epoch_gate();
                 let _epoch_guard = epoch_gate.lock().await;
@@ -268,8 +268,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                         handshake_generation,
                     )
                     .map(|pending_id| {
-                        let attempts =
-                            state.attempts.entry(conn.node_id.clone()).or_insert(0);
+                        let attempts = state.attempts.entry(conn.node_id.clone()).or_insert(0);
                         *attempts = attempts.saturating_add(1);
                         (*attempts, pending_id)
                     })
@@ -390,16 +389,12 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 };
                 if removed {
                     peers2
-                        .discard_pending_probe_session_binding(
-                            &timeout_peer,
-                            &timeout_session_id,
-                        )
+                        .discard_pending_probe_session_binding(&timeout_peer, &timeout_session_id)
                         .await;
                 }
             });
         }
     }
-
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -452,15 +447,17 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         if !candidates.contains(&endpoint) {
             candidates.insert(0, endpoint.clone());
         }
-        candidate_sources.entry(endpoint.clone()).or_insert_with(|| {
-            if udp_advertise.is_some_and(|configured| {
-                !configured.trim().is_empty() && configured.trim() == endpoint
-            }) {
-                "manual".to_string()
-            } else {
-                "host".to_string()
-            }
-        });
+        candidate_sources
+            .entry(endpoint.clone())
+            .or_insert_with(|| {
+                if udp_advertise.is_some_and(|configured| {
+                    !configured.trim().is_empty() && configured.trim() == endpoint
+                }) {
+                    "manual".to_string()
+                } else {
+                    "host".to_string()
+                }
+            });
     }
 
     let previous_snapshot = candidate_snapshot.read().await.clone();
@@ -482,10 +479,8 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         .as_ref()
         .map(|snapshot| snapshot.network_identity.clone())
         .unwrap_or_default();
-    let should_advance_generation = network_identity_changed(
-        &previous_network_identity,
-        &next_network_identity,
-    );
+    let should_advance_generation =
+        network_identity_changed(&previous_network_identity, &next_network_identity);
     let changed = previous_candidates != candidates
         || previous_candidate_sources != candidate_sources
         || previous_network_identity != next_network_identity;
@@ -503,7 +498,10 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         *local_network_identity.write().await = next_network_identity;
         if should_advance_generation {
             peers
-                .advance_candidate_refresh_generation("pre-signal UDP candidate refresh")
+                // Identity replacement means the socket/NAT path changed;
+                // ordinary refresh retention would incorrectly preserve the
+                // old Direct pair and suppress the required re-punch.
+                .advance_network_generation("pre-signal UDP network identity changed")
                 .await;
         }
         info!(
