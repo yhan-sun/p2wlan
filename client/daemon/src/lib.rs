@@ -38,15 +38,18 @@ pub mod control;
 pub mod dataplane;
 pub mod diagnostics;
 pub mod dns;
+// The bounded MTU decision state is currently exercised as a pure module and
+// is not wired into the live probe scheduler yet.
+#[allow(dead_code)]
 pub(crate) mod dplpmtud;
 pub mod error;
 pub mod gateway_mapping;
 pub mod incarnation;
 pub mod netenv;
 mod network_outbound;
+pub(crate) mod path_commit;
 pub mod peer;
 pub mod port_mapping;
-pub(crate) mod path_commit;
 pub mod relay;
 pub(crate) mod relay_probe;
 pub(crate) mod relay_runtime;

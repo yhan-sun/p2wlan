@@ -557,9 +557,9 @@ fn build_model_from_gapped(
     for observation in &successful_obs {
         match previous_sequence {
             Some(previous) if observation.sequence.saturating_sub(previous) == 1 => {
-                runs.last_mut().expect("a run always exists after the first push").push(
-                    observation.observed.port(),
-                );
+                runs.last_mut()
+                    .expect("a run always exists after the first push")
+                    .push(observation.observed.port());
             }
             _ => runs.push(vec![observation.observed.port()]),
         }
@@ -567,7 +567,11 @@ fn build_model_from_gapped(
     }
 
     // Prefer the longest gap-free run; trust it only when it is single-direction.
-    if let Some(run) = runs.iter().filter(|run| run.len() >= 3).max_by_key(|run| run.len()) {
+    if let Some(run) = runs
+        .iter()
+        .filter(|run| run.len() >= 3)
+        .max_by_key(|run| run.len())
+    {
         let model = build_model(run, public_ip, batch.started_at_ms);
         let forward = model.deltas.iter().filter(|delta| **delta > 0).count();
         let backward = model.deltas.iter().filter(|delta| **delta < 0).count();
@@ -1521,7 +1525,11 @@ mod tests {
         // override the model's signed step on a sign conflict, or the top
         // candidate walks up to 30003 and misses the real next mapping 29991.
         let model = build_model(&[30000, 29997, 29994], Some(ip()), 1000);
-        assert!(matches!(model.kind, PortModelKind::FixedStep { step: -3 }), "{:?}", model.kind);
+        assert!(
+            matches!(model.kind, PortModelKind::FixedStep { step: -3 }),
+            "{:?}",
+            model.kind
+        );
         let predicted = predict_ports_with_learning(&model, 29994, 0, 0, Some(3), true);
         assert_eq!(
             predicted.first().map(|c| c.port),
@@ -1621,7 +1629,10 @@ mod tests {
         // the same port twice — and never port 0.
         let ports = [1000u16, 17384, 33768]; // +16384 each -> FixedStep{16384}
         let model = build_model(&ports, Some(ip()), 1000);
-        assert!(matches!(model.kind, PortModelKind::FixedStep { step: 16384 }));
+        assert!(matches!(
+            model.kind,
+            PortModelKind::FixedStep { step: 16384 }
+        ));
         for last in [33768u16, 50152, 65000] {
             let predicted = predict_ports(&model, last);
             let mut seen = std::collections::HashSet::new();

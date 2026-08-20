@@ -173,7 +173,8 @@ mod tests {
     #[test]
     fn path_commit_payload_build_and_parse_round_trip() {
         for kind in [PathCommitKind::Request, PathCommitKind::Ack] {
-            let payload = build_path_commit_payload(kind, 0x1122_3344_5566_7788, 0x1234, 0xdead_beef);
+            let payload =
+                build_path_commit_payload(kind, 0x1122_3344_5566_7788, 0x1234, 0xdead_beef);
             let packet = Ipv4Packet::build_icmp_echo_request(
                 "10.20.0.1".parse().unwrap(),
                 "10.20.0.2".parse().unwrap(),

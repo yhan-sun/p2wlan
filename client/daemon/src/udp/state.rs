@@ -94,9 +94,9 @@ fn remove_heartbeat_lease_if_owned(
     peer_id: &str,
     owner_token: u64,
 ) -> bool {
-    if !leases
+    if leases
         .get(peer_id)
-        .is_some_and(|lease| lease.owner_token == owner_token)
+        .is_none_or(|lease| lease.owner_token != owner_token)
     {
         return false;
     }

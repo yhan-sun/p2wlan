@@ -2829,17 +2829,16 @@ impl WireGuardTransport {
                             if let Some(path_token) = path_commit {
                                 if relay_endpoint.is_some() {
                                     let path_kind = path_token.kind;
-                                    let path_session_guard = if path_kind
-                                        == crate::path_commit::PathCommitKind::Ack
-                                    {
-                                        self.acquire_current_session_evidence_guard(
-                                            &inbound.peer_id,
-                                            inbound.session_instance,
-                                        )
-                                        .await
-                                    } else {
-                                        None
-                                    };
+                                    let path_session_guard =
+                                        if path_kind == crate::path_commit::PathCommitKind::Ack {
+                                            self.acquire_current_session_evidence_guard(
+                                                &inbound.peer_id,
+                                                inbound.session_instance,
+                                            )
+                                            .await
+                                        } else {
+                                            None
+                                        };
                                     let path_session_current = if inbound.session_instance.is_none()
                                     {
                                         true
@@ -3246,21 +3245,19 @@ impl WireGuardTransport {
                                             Some(detail),
                                         );
                                     }
-                                } else {
-                                    if let Some(timeline) = feed.timeline.as_ref() {
-                                        timeline.emit(
-                                            "stale_session_evidence",
-                                            Some(match path {
-                                                crate::peer::NetworkPath::Relay => "relay",
-                                                crate::peer::NetworkPath::Direct => "direct",
-                                            }),
-                                            Some("session_replaced_or_removed"),
-                                            Some(format!(
-                                                "peer={} session_instance={:?} business_ingress=stale",
-                                                inbound.peer_id, inbound.session_instance,
-                                            )),
-                                        );
-                                    }
+                                } else if let Some(timeline) = feed.timeline.as_ref() {
+                                    timeline.emit(
+                                        "stale_session_evidence",
+                                        Some(match path {
+                                            crate::peer::NetworkPath::Relay => "relay",
+                                            crate::peer::NetworkPath::Direct => "direct",
+                                        }),
+                                        Some("session_replaced_or_removed"),
+                                        Some(format!(
+                                            "peer={} session_instance={:?} business_ingress=stale",
+                                            inbound.peer_id, inbound.session_instance,
+                                        )),
+                                    );
                                 }
                                 drop(session_guard);
                             }

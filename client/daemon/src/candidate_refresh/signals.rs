@@ -576,7 +576,7 @@ pub(super) fn has_real_public_candidate(
             .get(endpoint_text)
             .map(String::as_str);
         !matches!(source, Some("peer_reflexive" | "learned" | "predicted"))
-            && !source.is_some_and(|source| crate::parse_fresh_prediction_source_label(source).is_some())
+            && source.is_none_or(|source| crate::parse_fresh_prediction_source_label(source).is_none())
     })
 }
 

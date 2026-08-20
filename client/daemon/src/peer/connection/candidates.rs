@@ -371,10 +371,10 @@ impl PeerConnection {
     ) -> usize {
         if self.state != ConnectionState::Direct
             || self.direct_health.consecutive_failures != 0
-            || !self
+            || self
                 .direct_health
                 .success_age()
-                .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+                .is_none_or(|age| age > RELAY_PEER_CONFIRMATION_MAX_AGE)
             || !self.candidate_pairs.iter().any(|pair| {
                 pair.local_generation == local_generation
                     && pair.state == CandidatePairState::Selected

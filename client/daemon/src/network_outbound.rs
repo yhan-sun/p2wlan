@@ -1340,7 +1340,7 @@ async fn maintenance(
     let expired: Vec<String> = {
         let mut expired = Vec::new();
         for (peer_id, entry) in pending.iter() {
-            if !entry.wait_deadline.is_some_and(|deadline| now >= deadline) {
+            if entry.wait_deadline.is_none_or(|deadline| now < deadline) {
                 continue;
             }
             let relay_available = relay_transport.read().await.is_some();
