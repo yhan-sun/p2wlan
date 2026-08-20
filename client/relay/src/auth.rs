@@ -64,6 +64,7 @@ impl RelayErrorCode {
     pub const NETWORK_MISMATCH: u16 = 4016;
     pub const TICKET_NOT_YET_VALID: u16 = 4017;
     pub const UNKNOWN_TICKET_KEY: u16 = 4018;
+    pub const AUTH_RATE_LIMITED: u16 = 4019;
 }
 
 // ============================================================
