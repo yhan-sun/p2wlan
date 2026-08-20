@@ -1,6 +1,29 @@
 part of '../daemon_controller.dart';
 
 extension DaemonControllerPids on DaemonController {
+  /// Whether a daemon is already occupying the diagnostics instance this
+  /// controller is about to start.
+  ///
+  /// `/health` is deliberately a cheap liveness endpoint and can remain
+  /// reachable while the daemon's TUN/dataplane is dead.  Prefer a verified
+  /// process identity or a process whose command line contains this exact
+  /// diagnostics bind; use health only as a final signal so `start()` can
+  /// hand the situation to the verified `stop()` path instead of silently
+  /// skipping elevation.
+  Future<bool> _hasExistingDaemonForStart(String diagnosticsUrl) async {
+    if (await _diagnosticsProcessId(diagnosticsUrl) != null) return true;
+
+    final bind = _diagnosticsBindFromStatusUrl(diagnosticsUrl);
+    if (await _findDaemonPidByDiagnosticsBind(bind) != null) return true;
+
+    // If the previous instance used another diagnostics port, the exact-bind
+    // scan cannot see it.  Only accept a single daemon process here; the
+    // existing stop() path will still re-verify the command line before kill.
+    if (await _findSingleDaemonPid() != null) return true;
+
+    return _diagnosticsApi.fetchHealth(diagnosticsUrl);
+  }
+
   Future<int?> _readVerifiedPid() async {
     final pidPath =
         '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.pid';

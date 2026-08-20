@@ -45,13 +45,6 @@ class DaemonController {
       );
     }
 
-    if (await _diagnosticsApi.fetchHealth(settings.diagnosticsUrl)) {
-      return const DaemonCommandResult(
-        ok: true,
-        message: 'p2wlan-daemon is already running.',
-      );
-    }
-
     final binary = await _resolveDaemonBinary();
     if (binary == null) {
       return const DaemonCommandResult(
@@ -59,6 +52,21 @@ class DaemonController {
         message:
             'Could not find p2wlan-daemon. Build it with cargo or set P2WLAN_DAEMON_BIN.',
       );
+    }
+
+    // A stale daemon can keep /health returning 200 after its TUN/dataplane
+    // has failed.  Do not treat the liveness endpoint as proof that the
+    // instance is reusable: clean up the verified old daemon first, then
+    // launch the binary selected above.  This also handles a daemon left by
+    // an older Debug/Release app bundle on the same diagnostics port.
+    if (await _hasExistingDaemonForStart(settings.diagnosticsUrl)) {
+      final stopped = await stop(settings.diagnosticsUrl);
+      if (!stopped.ok) {
+        return DaemonCommandResult(
+          ok: false,
+          message: '检测到旧 p2wlan-daemon，但启动新实例前无法停止它：${stopped.message}',
+        );
+      }
     }
 
     final bind = _diagnosticsBindFromStatusUrl(settings.diagnosticsUrl);
