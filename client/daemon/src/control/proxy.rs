@@ -109,6 +109,7 @@ fn build_control_http_client(
     )))]
     let builder = {
         let _ = outbound_interface;
+        let _ = server_url;
         builder
     };
 
