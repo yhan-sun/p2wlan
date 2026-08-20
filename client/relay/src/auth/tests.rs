@@ -394,14 +394,15 @@ use super::*;
             RelayErrorCode::NETWORK_MISMATCH,
             RelayErrorCode::TICKET_NOT_YET_VALID,
             RelayErrorCode::UNKNOWN_TICKET_KEY,
+            RelayErrorCode::AUTH_RATE_LIMITED,
         ];
 
         let mut seen = std::collections::HashSet::new();
         for &code in &codes {
             assert!(seen.insert(code), "duplicate error code: {code}");
             assert!(
-                (4011..=4018).contains(&code),
-                "error code {code} outside expected range 4011-4018"
+                (4011..=4019).contains(&code),
+                "error code {code} outside expected range 4011-4019"
             );
         }
     }

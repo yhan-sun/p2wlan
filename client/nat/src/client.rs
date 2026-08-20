@@ -340,13 +340,19 @@ mod tests {
             let mut response =
                 StunMessage::with_transaction_id(BINDING_RESPONSE, req.transaction_id);
             response.add_attribute(StunAttribute::XorMappedAddress(client_addr));
-            socket.send_to(&response.encode(), client_addr).await.unwrap();
+            socket
+                .send_to(&response.encode(), client_addr)
+                .await
+                .unwrap();
         });
 
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stun = StunClient::with_timeout(Duration::from_secs(1));
         let response = stun.binding_request(&client_socket, addr).await.unwrap();
-        assert_eq!(response.reflexive_address, Some(client_socket.local_addr().unwrap()));
+        assert_eq!(
+            response.reflexive_address,
+            Some(client_socket.local_addr().unwrap())
+        );
     }
 
     #[tokio::test]

@@ -445,7 +445,7 @@ mod tests {
         // The dominant mode is -1, so the estimate must land negative or at
         // least not be clamped up to a positive stride.
         assert!(
-            learner.estimate().map_or(true, |e| e <= 0),
+            learner.estimate().is_none_or(|e| e <= 0),
             "a reversing batch must not yield a positive clamped stride, got {:?}",
             learner.estimate()
         );

@@ -112,6 +112,7 @@ pub enum RelayErrorCode {
     NetworkMismatch = 4016,
     TicketNotYetValid = 4017,
     UnknownTicketKey = 4018,
+    AuthRateLimited = 4019,
 }
 
 impl RelayErrorCode {
@@ -136,6 +137,7 @@ impl RelayErrorCode {
             4016 => Some(Self::NetworkMismatch),
             4017 => Some(Self::TicketNotYetValid),
             4018 => Some(Self::UnknownTicketKey),
+            4019 => Some(Self::AuthRateLimited),
             _ => None,
         }
     }
@@ -165,6 +167,7 @@ impl RelayErrorCode {
             Self::NetworkMismatch => "network_mismatch",
             Self::TicketNotYetValid => "ticket_not_yet_valid",
             Self::UnknownTicketKey => "unknown_ticket_key",
+            Self::AuthRateLimited => "auth_rate_limited",
         }
     }
 }
@@ -255,5 +258,13 @@ mod tests {
         );
         let err = RelayError::ServerError(4008, "backpressure".into());
         assert_eq!(err.to_snake_case(), "peer_backpressure");
+        assert_eq!(
+            RelayErrorCode::from_u16(4019),
+            Some(RelayErrorCode::AuthRateLimited)
+        );
+        assert_eq!(
+            RelayError::ServerError(4019, "authentication rate limited".into()).to_snake_case(),
+            "auth_rate_limited"
+        );
     }
 }

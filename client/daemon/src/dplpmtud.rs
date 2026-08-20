@@ -60,8 +60,7 @@ impl MtuState {
     /// The next size the caller should probe, or `None` when probing is done
     /// (the largest ladder size that succeeded is the effective MTU).
     pub fn next_probe(&self) -> Option<u32> {
-        self.next_index
-            .and_then(|i| MTU_LADDER.get(i).copied())
+        self.next_index.and_then(|i| MTU_LADDER.get(i).copied())
     }
 
     /// The effective path MTU: the largest size confirmed possible.  For a
@@ -170,6 +169,8 @@ mod tests {
 
     #[test]
     fn ipv6_safe_min_is_at_least_floor() {
-        assert!(IPV6_SAFE_MIN_MTU >= MTU_FLOOR);
+        const {
+            assert!(IPV6_SAFE_MIN_MTU >= MTU_FLOOR);
+        }
     }
 }

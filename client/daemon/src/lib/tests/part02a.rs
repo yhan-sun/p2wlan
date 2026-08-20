@@ -773,10 +773,10 @@ fn malformed_and_zero_generation_labels_do_not_claim_fresh_budget() {
     }
     assert!(
         candidates.iter().all(|endpoint| {
-            !crate::parse_fresh_prediction_source_label(
+            crate::parse_fresh_prediction_source_label(
                 sources.get(endpoint).map(String::as_str).unwrap_or(""),
             )
-            .is_some()
+            .is_none()
         }),
         "no malformed/zero label may be treated as a valid fresh prediction"
     );

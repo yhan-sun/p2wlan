@@ -228,7 +228,7 @@ async fn run_candidate_offer_worker(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let result = match http.current() {
             Err(error) => Err(error),
-            Ok(current_http) if remaining.is_zero() => Err(DaemonError::ControlPlane(
+            Ok(_) if remaining.is_zero() => Err(DaemonError::ControlPlane(
                 "candidate offer deadline exceeded before delivery".into(),
             )),
             Ok(current_http) => loop {

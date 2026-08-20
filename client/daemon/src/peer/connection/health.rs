@@ -566,10 +566,10 @@ impl PeerConnection {
     pub(crate) fn direct_is_healthy_confirmed(&self) -> bool {
         if self.state != ConnectionState::Direct
             || self.direct_health.consecutive_failures != 0
-            || !self
+            || self
                 .direct_health
                 .success_age()
-                .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+                .is_none_or(|age| age > RELAY_PEER_CONFIRMATION_MAX_AGE)
         {
             return false;
         }
