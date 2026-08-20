@@ -137,6 +137,51 @@ mod tests {
     }
 
     #[test]
+    fn handshake_messages_reject_reserved_bytes_and_zero_indices() {
+        let initiation = MessageInitiation {
+            sender_index: 7,
+            ephemeral: [1; 32],
+            encrypted_static: [2; 48],
+            encrypted_timestamp: [3; 28],
+            mac1: [4; 16],
+            mac2: [0; 16],
+        };
+        let mut reserved = initiation.to_bytes();
+        reserved[2] = 1;
+        assert!(matches!(
+            MessageInitiation::from_bytes(&reserved),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+        let mut zero_index = initiation.to_bytes();
+        zero_index[4..8].fill(0);
+        assert!(matches!(
+            MessageInitiation::from_bytes(&zero_index),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+
+        let response = MessageResponse {
+            sender_index: 8,
+            receiver_index: 7,
+            ephemeral: [5; 32],
+            encrypted_empty: [6; 16],
+            mac1: [7; 16],
+            mac2: [0; 16],
+        };
+        let mut reserved = response.to_bytes();
+        reserved[1] = 1;
+        assert!(matches!(
+            MessageResponse::from_bytes(&reserved),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+        let mut zero_index = response.to_bytes();
+        zero_index[8..12].fill(0);
+        assert!(matches!(
+            MessageResponse::from_bytes(&zero_index),
+            Err(WireGuardError::InvalidPacket(_))
+        ));
+    }
+
+    #[test]
     fn test_transport_roundtrip() {
         let payload = vec![
             0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE,

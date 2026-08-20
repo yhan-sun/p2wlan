@@ -20,6 +20,7 @@ use p2pnet_crypto::{
     NodeIdentity, PublicKeyBytes,
 };
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 use crate::error::{Result, WireGuardError};
 use crate::types::{MessageInitiation, MessageResponse, MAC_SIZE, TIMESTAMP_SIZE};
@@ -36,6 +37,15 @@ fn compute_mac1(responder_public: &PublicKeyBytes, msg_for_mac1: &[u8]) -> [u8; 
     result
 }
 
+fn mac1_matches(
+    recipient_public: &PublicKeyBytes,
+    msg_for_mac1: &[u8],
+    received: &[u8; MAC_SIZE],
+) -> bool {
+    let expected = compute_mac1(recipient_public, msg_for_mac1);
+    bool::from(expected.ct_eq(received))
+}
+
 /// Generate a random sender index.
 fn random_index() -> u32 {
     let mut rng = rand::thread_rng();
@@ -44,22 +54,60 @@ fn random_index() -> u32 {
     u32::from_le_bytes(buf) | 1 // Never zero (0 is reserved)
 }
 
-/// Build a TAI64N timestamp (12 bytes).
-///
-/// Format: 4 bytes TAI64 seconds (big-endian, offset from epoch) +
-///          8 bytes nanoseconds (big-endian).
+/// WireGuard's TAI64N epoch bias: 2^62 plus the 10-second TAI offset at the
+/// Unix epoch. The wire format is 8-byte seconds followed by 4-byte nanos.
+const TAI64N_BASE: u64 = 0x4000_0000_0000_000a;
+
+/// Build a canonical WireGuard TAI64N timestamp (12 bytes).
 fn build_timestamp() -> [u8; TIMESTAMP_SIZE] {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
 
     let mut ts = [0u8; TIMESTAMP_SIZE];
-    // TAI64 = UTC + 10 seconds (leap seconds adjustment)
-    let tai_seconds = now.as_secs() + 10;
-    ts[0..4].copy_from_slice(&(tai_seconds as u32).to_be_bytes());
-    let nanos = now.subsec_nanos() as u64;
-    ts[4..12].copy_from_slice(&nanos.to_be_bytes());
+    let tai_seconds = TAI64N_BASE.saturating_add(now.as_secs());
+    ts[0..8].copy_from_slice(&tai_seconds.to_be_bytes());
+    ts[8..12].copy_from_slice(&now.subsec_nanos().to_be_bytes());
     ts
+}
+
+/// Normalize a timestamp for monotonic replay comparison. New messages use
+/// canonical TAI64N. The previous p2wlan encoding accidentally used 4-byte
+/// `(unix + 10)` seconds followed by 8-byte nanos; accepting and normalizing
+/// that layout keeps rolling upgrades interoperable while new senders emit
+/// the standard layout.
+fn normalize_timestamp(timestamp: &[u8]) -> Result<[u8; TIMESTAMP_SIZE]> {
+    if timestamp.len() != TIMESTAMP_SIZE {
+        return Err(WireGuardError::HandshakeFailed(format!(
+            "invalid timestamp length: {}",
+            timestamp.len()
+        )));
+    }
+
+    let mut canonical = [0u8; TIMESTAMP_SIZE];
+    if timestamp[0] == 0x40 {
+        let seconds = u64::from_be_bytes(timestamp[0..8].try_into().unwrap());
+        let nanos = u32::from_be_bytes(timestamp[8..12].try_into().unwrap());
+        if seconds < TAI64N_BASE || nanos >= 1_000_000_000 {
+            return Err(WireGuardError::HandshakeFailed(
+                "invalid TAI64N timestamp".into(),
+            ));
+        }
+        canonical.copy_from_slice(timestamp);
+        return Ok(canonical);
+    }
+
+    let legacy_seconds = u32::from_be_bytes(timestamp[0..4].try_into().unwrap()) as u64;
+    let legacy_nanos = u64::from_be_bytes(timestamp[4..12].try_into().unwrap());
+    if legacy_seconds < 10 || legacy_nanos >= 1_000_000_000 {
+        return Err(WireGuardError::HandshakeFailed(
+            "invalid legacy handshake timestamp".into(),
+        ));
+    }
+    let seconds = TAI64N_BASE.saturating_add(legacy_seconds - 10);
+    canonical[0..8].copy_from_slice(&seconds.to_be_bytes());
+    canonical[8..12].copy_from_slice(&(legacy_nanos as u32).to_be_bytes());
+    Ok(canonical)
 }
 
 // =============================================================================
@@ -115,20 +163,27 @@ impl HandshakeInitiator {
     /// This is message 1 of the Noise IK handshake.
     /// After calling this, the initiator waits for the response.
     pub fn create_initiation(&mut self) -> Result<MessageInitiation> {
+        if self.ephemeral.is_some() {
+            return Err(WireGuardError::HandshakeFailed(
+                "handshake initiation already created".into(),
+            ));
+        }
+
         // 1. Generate ephemeral key pair
         let ephemeral = DhKeyPair::generate();
         let e_pub = ephemeral.public_key();
+
+        // Compute all fallible DH operations before mutating the Noise state.
+        // This keeps a failed call retryable and avoids leaving a half-built
+        // handshake that would otherwise panic or silently diverge later.
+        let dh1 = ephemeral.diffie_hellman(&self.responder_public)?;
+        let dh2 = self.identity.diffie_hellman(&self.responder_public)?;
         self.ephemeral = Some(ephemeral);
 
         // 2. mix_hash(E_i) — mix ephemeral public key into hash
         self.noise.mix_hash(&e_pub);
 
         // 3. mix_key(DH(e_i, S_r)) — ephemeral × responder static
-        let dh1 = self
-            .ephemeral
-            .as_ref()
-            .unwrap()
-            .diffie_hellman(&self.responder_public)?;
         self.noise.mix_key(&dh1);
 
         // 4. encrypt_and_hash(S_i) — encrypt our static public key
@@ -136,7 +191,6 @@ impl HandshakeInitiator {
         let enc_static = self.noise.encrypt_and_hash(&our_static_pub);
 
         // 5. mix_key(DH(S_i, S_r)) — static × static
-        let dh2 = self.identity.diffie_hellman(&self.responder_public)?;
         self.noise.mix_key(&dh2);
 
         // 6. encrypt_and_hash(timestamp)
@@ -181,6 +235,34 @@ impl HandshakeInitiator {
     }
 
     fn consume_response_inner(&mut self, msg: &MessageResponse) -> Result<TransportKeyPair> {
+        let ephemeral = self.ephemeral.clone().ok_or_else(|| {
+            WireGuardError::HandshakeFailed(
+                "cannot consume a response before creating an initiation".into(),
+            )
+        })?;
+        if msg.sender_index == 0 {
+            return Err(WireGuardError::HandshakeFailed(
+                "response sender_index must not be zero".into(),
+            ));
+        }
+        if msg.mac2 != [0u8; MAC_SIZE] {
+            return Err(WireGuardError::InvalidMac(
+                "unsupported non-zero response MAC2".into(),
+            ));
+        }
+        // A response is addressed to the initiator, so its MAC1 is keyed by
+        // the initiator's static public key. Accept the historical p2wlan key
+        // (responder static) during rolling upgrades, but emit only the
+        // recipient-keyed form below.
+        let mac1_data = msg.bytes_for_mac1();
+        let recipient_mac_valid = mac1_matches(&self.identity.public_key(), &mac1_data, &msg.mac1);
+        let legacy_mac_valid = mac1_matches(&self.responder_public, &mac1_data, &msg.mac1);
+        if !recipient_mac_valid && !legacy_mac_valid {
+            return Err(WireGuardError::InvalidMac(
+                "response MAC1 verification failed".into(),
+            ));
+        }
+
         // Verify receiver_index matches our sender_index
         if msg.receiver_index != self.sender_index {
             return Err(WireGuardError::HandshakeFailed(format!(
@@ -193,11 +275,7 @@ impl HandshakeInitiator {
         self.noise.mix_hash(&msg.ephemeral);
 
         // 2. mix_key(DH(e_i, E_r)) — our ephemeral × responder ephemeral
-        let dh3 = self
-            .ephemeral
-            .as_ref()
-            .unwrap()
-            .diffie_hellman(&msg.ephemeral)?;
+        let dh3 = ephemeral.diffie_hellman(&msg.ephemeral)?;
         self.noise.mix_key(&dh3);
 
         // 3. mix_key(DH(S_i, E_r)) — our static × responder ephemeral
@@ -231,6 +309,7 @@ impl HandshakeInitiator {
 // =============================================================================
 
 /// State for the responder side of a Noise IK handshake.
+#[derive(Clone)]
 pub struct HandshakeResponder {
     /// The responder's node identity (static key pair).
     identity: NodeIdentity,
@@ -248,6 +327,10 @@ pub struct HandshakeResponder {
     pub sender_index: u32,
     /// The initiator's sender index (used as receiver_index in our response).
     initiator_index: u32,
+    /// Most recent authenticated, canonical TAI64N timestamp. A caller that
+    /// reuses this responder (or seeds a new responder with the floor) rejects
+    /// replayed and out-of-order initiations.
+    latest_timestamp: Option<[u8; TIMESTAMP_SIZE]>,
 }
 
 impl HandshakeResponder {
@@ -271,7 +354,21 @@ impl HandshakeResponder {
             noise,
             sender_index: random_index(),
             initiator_index: 0,
+            latest_timestamp: None,
         }
+    }
+
+    /// Create a responder with a previously authenticated timestamp floor.
+    /// This is used when responder objects are short-lived but replay state is
+    /// retained per peer by the owning daemon.
+    pub fn new_with_timestamp_floor(
+        identity: NodeIdentity,
+        preshared_key: Option<[u8; 32]>,
+        timestamp_floor: Option<[u8; TIMESTAMP_SIZE]>,
+    ) -> Self {
+        let mut responder = Self::new(identity, preshared_key);
+        responder.latest_timestamp = timestamp_floor;
+        responder
     }
 
     /// Process the handshake initiation message (Type 1) and create a response (Type 2).
@@ -284,6 +381,39 @@ impl HandshakeResponder {
         &mut self,
         msg: &MessageInitiation,
     ) -> Result<(MessageResponse, TransportKeyPair)> {
+        // The final timestamp authentication and response construction mutate
+        // Noise state. Stage all work so a bad initiation cannot poison a
+        // reusable responder and make the next legitimate initiation fail.
+        let mut staged = self.clone();
+        let result = staged.consume_initiation_and_respond_inner(msg)?;
+        *self = staged;
+        Ok(result)
+    }
+
+    fn consume_initiation_and_respond_inner(
+        &mut self,
+        msg: &MessageInitiation,
+    ) -> Result<(MessageResponse, TransportKeyPair)> {
+        if msg.sender_index == 0 {
+            return Err(WireGuardError::HandshakeFailed(
+                "initiation sender_index must not be zero".into(),
+            ));
+        }
+        if msg.mac2 != [0u8; MAC_SIZE] {
+            return Err(WireGuardError::InvalidMac(
+                "unsupported non-zero initiation MAC2".into(),
+            ));
+        }
+        if !mac1_matches(
+            &self.identity.public_key(),
+            &msg.bytes_for_mac1(),
+            &msg.mac1,
+        ) {
+            return Err(WireGuardError::InvalidMac(
+                "initiation MAC1 verification failed".into(),
+            ));
+        }
+
         self.initiator_index = msg.sender_index;
 
         // 1. mix_hash(E_i) — mix initiator's ephemeral public key
@@ -307,13 +437,24 @@ impl HandshakeResponder {
         let dh2 = self.identity.diffie_hellman(&init_pub)?;
         self.noise.mix_key(&dh2);
 
-        // 5. decrypt_and_hash(enc_timestamp) → timestamp (verified but not used)
-        let _timestamp = self
+        // 5. decrypt_and_hash(enc_timestamp) and enforce the per-peer
+        // monotonic replay floor.
+        let timestamp = self
             .noise
             .decrypt_and_hash(&msg.encrypted_timestamp)
             .map_err(|e| {
                 WireGuardError::HandshakeFailed(format!("decrypt timestamp failed: {e}"))
             })?;
+        let timestamp = normalize_timestamp(&timestamp)?;
+        if self
+            .latest_timestamp
+            .is_some_and(|latest| timestamp <= latest)
+        {
+            return Err(WireGuardError::HandshakeFailed(
+                "replayed or out-of-order initiation timestamp".into(),
+            ));
+        }
+        self.latest_timestamp = Some(timestamp);
 
         // === Now create the response message ===
 
@@ -355,9 +496,10 @@ impl HandshakeResponder {
         };
         response.encrypted_empty.copy_from_slice(&enc_empty);
 
-        // Compute MAC1 (keyed with our public key since we're the responder)
+        // The response is addressed to the initiator, so MAC1 is keyed with
+        // the initiator's authenticated static public key.
         let mac1_data = response.bytes_for_mac1();
-        response.mac1 = compute_mac1(&self.identity.public_key(), &mac1_data);
+        response.mac1 = compute_mac1(&init_pub, &mac1_data);
 
         // 12. Derive transport keys
         let (k1, k2) = self.noise.derive_transport_keys();
@@ -375,6 +517,11 @@ impl HandshakeResponder {
     /// Get the initiator's public key (learned during handshake).
     pub fn initiator_public_key(&self) -> Option<&PublicKeyBytes> {
         self.initiator_public.as_ref()
+    }
+
+    /// Canonical timestamp authenticated by the latest successful initiation.
+    pub fn latest_timestamp(&self) -> Option<[u8; TIMESTAMP_SIZE]> {
+        self.latest_timestamp
     }
 }
 

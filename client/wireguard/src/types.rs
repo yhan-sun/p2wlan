@@ -89,6 +89,16 @@ impl MessageInitiation {
         if data[0] != TYPE_INITIALIZATION {
             return Err(WireGuardError::InvalidMessageType(data[0]));
         }
+        if data[1..4] != [0, 0, 0] {
+            return Err(WireGuardError::InvalidPacket(
+                "initiation message reserved bytes must be zero".into(),
+            ));
+        }
+        if data[4..8] == [0, 0, 0, 0] {
+            return Err(WireGuardError::InvalidPacket(
+                "initiation sender_index must not be zero".into(),
+            ));
+        }
 
         let mut msg = Self {
             sender_index: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
@@ -176,6 +186,16 @@ impl MessageResponse {
         if data[0] != TYPE_RESPONSE {
             return Err(WireGuardError::InvalidMessageType(data[0]));
         }
+        if data[1..4] != [0, 0, 0] {
+            return Err(WireGuardError::InvalidPacket(
+                "response message reserved bytes must be zero".into(),
+            ));
+        }
+        if data[4..8] == [0, 0, 0, 0] || data[8..12] == [0, 0, 0, 0] {
+            return Err(WireGuardError::InvalidPacket(
+                "response indices must not be zero".into(),
+            ));
+        }
 
         let mut msg = Self {
             sender_index: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
@@ -249,6 +269,11 @@ impl MessageTransport {
         }
         if data[0] != TYPE_TRANSPORT {
             return Err(WireGuardError::InvalidMessageType(data[0]));
+        }
+        if data[1..4] != [0, 0, 0] {
+            return Err(WireGuardError::InvalidPacket(
+                "transport message reserved bytes must be zero".into(),
+            ));
         }
 
         let receiver_index = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);

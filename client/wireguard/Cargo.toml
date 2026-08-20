@@ -12,6 +12,7 @@ tracing = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 p2pnet-tun = { path = "../tun" }

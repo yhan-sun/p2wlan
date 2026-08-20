@@ -148,6 +148,11 @@ struct PendingHandshakeState {
     /// responder messages are randomized, so duplicate offers must replay the
     /// same bytes and key material rather than generate a second session.
     responder_cache: HashMap<(String, String), CachedResponderHandshake>,
+    /// Latest authenticated WireGuard initiation timestamp per peer/static
+    /// identity. Responder objects are deliberately short-lived, so replay
+    /// state must outlive an individual Noise transaction. Keeping the static
+    /// key with the floor lets a legitimate identity rotation start fresh.
+    responder_timestamp_floors: HashMap<String, ([u8; 32], [u8; 12])>,
     /// Exactly one event-triggered responder worker may perform slow work for
     /// a peer. Later offers coalesce into a single newest-wins queue slot.
     responder_workers: HashMap<String, ResponderWorkOwner>,
@@ -478,6 +483,39 @@ impl PendingHandshakeState {
             .insert((peer_id.to_string(), token.to_string()), cached);
     }
 
+    fn responder_timestamp_floor(
+        &self,
+        peer_id: &str,
+        initiator_static_public_key: &[u8; 32],
+    ) -> Option<[u8; 12]> {
+        self.responder_timestamp_floors
+            .get(peer_id)
+            .filter(|(public_key, _)| public_key == initiator_static_public_key)
+            .map(|(_, timestamp)| *timestamp)
+    }
+
+    /// Commit a newly authenticated timestamp. False means another responder
+    /// generation already committed an equal/newer value, so this initiation
+    /// is a replay and must not install another transport session.
+    fn commit_responder_timestamp(
+        &mut self,
+        peer_id: &str,
+        initiator_static_public_key: [u8; 32],
+        timestamp: [u8; 12],
+    ) -> bool {
+        if self
+            .responder_timestamp_floor(peer_id, &initiator_static_public_key)
+            .is_some_and(|floor| timestamp <= floor)
+        {
+            return false;
+        }
+        self.responder_timestamp_floors.insert(
+            peer_id.to_string(),
+            (initiator_static_public_key, timestamp),
+        );
+        true
+    }
+
     /// Coalesce event-triggered responder work to one active worker per peer.
     /// Repeated control delivery is expected; keeping only the latest offer
     /// avoids an unbounded waiter queue while preserving the peer's retry.
@@ -529,7 +567,11 @@ impl PendingHandshakeState {
     /// identity becomes available.  That makes the replay newest-wins even
     /// when several offers arrived during the registration wait: the stale
     /// value never reaches candidate admission or WireGuard processing.
-    fn take_queued_responder_work(&mut self, peer_id: &str, owner: u64) -> Option<PendingPeerOffer> {
+    fn take_queued_responder_work(
+        &mut self,
+        peer_id: &str,
+        owner: u64,
+    ) -> Option<PendingPeerOffer> {
         let worker = self.responder_workers.get_mut(peer_id)?;
         if worker.owner != owner || *worker.cancellation.borrow() {
             return None;
@@ -541,11 +583,7 @@ impl PendingHandshakeState {
     /// worker ownership.  If there is no queued offer, release the worker.
     /// A stale worker that was cancelled/cleared cannot release a replacement
     /// because its owner token no longer matches.
-    fn finish_responder_work(
-        &mut self,
-        peer_id: &str,
-        owner: u64,
-    ) -> Option<PendingPeerOffer> {
+    fn finish_responder_work(&mut self, peer_id: &str, owner: u64) -> Option<PendingPeerOffer> {
         let worker = self.responder_workers.get_mut(peer_id)?;
         if worker.owner != owner || *worker.cancellation.borrow() {
             return None;

@@ -3,6 +3,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initiator_rejects_response_before_initiation_without_panicking() {
+        let initiator_identity = NodeIdentity::generate();
+        let responder_identity = NodeIdentity::generate();
+        let mut initiator =
+            HandshakeInitiator::new(initiator_identity, responder_identity.public_key(), None);
+        let response = MessageResponse {
+            sender_index: 1,
+            receiver_index: 1,
+            ephemeral: [1u8; 32],
+            encrypted_empty: [0u8; 16],
+            mac1: [0u8; MAC_SIZE],
+            mac2: [0u8; MAC_SIZE],
+        };
+        let error = initiator
+            .consume_response(&response)
+            .expect_err("response before initiation must be rejected");
+        assert!(error.to_string().contains("before creating an initiation"));
+    }
+
+    #[test]
+    fn initiator_rejects_duplicate_initiation() {
+        let initiator_identity = NodeIdentity::generate();
+        let responder_identity = NodeIdentity::generate();
+        let mut initiator =
+            HandshakeInitiator::new(initiator_identity, responder_identity.public_key(), None);
+        initiator.create_initiation().unwrap();
+        let error = initiator
+            .create_initiation()
+            .expect_err("a pending initiation must not be overwritten");
+        assert!(error.to_string().contains("already created"));
+    }
+
+    #[test]
     fn test_full_handshake() {
         // Generate identities
         let initiator_identity = NodeIdentity::generate();
@@ -44,12 +77,10 @@ mod tests {
     #[test]
     fn invalid_response_does_not_poison_pending_initiator() {
         let initiator_identity = NodeIdentity::generate();
+        let initiator_public = initiator_identity.public_key();
         let responder_identity = NodeIdentity::generate();
-        let mut initiator = HandshakeInitiator::new(
-            initiator_identity,
-            responder_identity.public_key(),
-            None,
-        );
+        let mut initiator =
+            HandshakeInitiator::new(initiator_identity, responder_identity.public_key(), None);
         let initiation = initiator.create_initiation().unwrap();
         let mut responder = HandshakeResponder::new(responder_identity, None);
         let (valid_response, _) = responder
@@ -58,9 +89,85 @@ mod tests {
 
         let mut invalid_response = valid_response.clone();
         invalid_response.encrypted_empty[0] ^= 0x80;
+        invalid_response.mac1 = compute_mac1(&initiator_public, &invalid_response.bytes_for_mac1());
         assert_eq!(invalid_response.receiver_index, initiator.sender_index);
         assert!(initiator.consume_response(&invalid_response).is_err());
         assert!(initiator.consume_response(&valid_response).is_ok());
+    }
+
+    #[test]
+    fn invalid_initiation_does_not_poison_reusable_responder() {
+        let initiator_identity = NodeIdentity::generate();
+        let responder_identity = NodeIdentity::generate();
+        let responder_public = responder_identity.public_key();
+        let mut initiator = HandshakeInitiator::new(initiator_identity, responder_public, None);
+        let valid = initiator.create_initiation().unwrap();
+        let mut invalid = valid.clone();
+        invalid.encrypted_static[0] ^= 0x80;
+        invalid.mac1 = compute_mac1(&responder_public, &invalid.bytes_for_mac1());
+
+        let mut responder = HandshakeResponder::new(responder_identity, None);
+        assert!(responder.consume_initiation_and_respond(&invalid).is_err());
+        assert!(responder.consume_initiation_and_respond(&valid).is_ok());
+    }
+
+    #[test]
+    fn handshake_mac1_is_verified_on_both_messages() {
+        let initiator_identity = NodeIdentity::generate();
+        let responder_identity = NodeIdentity::generate();
+        let mut initiator =
+            HandshakeInitiator::new(initiator_identity, responder_identity.public_key(), None);
+        let initiation = initiator.create_initiation().unwrap();
+
+        let mut bad_initiation = initiation.clone();
+        bad_initiation.mac1[0] ^= 1;
+        let mut rejecting_responder = HandshakeResponder::new(responder_identity.clone(), None);
+        assert!(matches!(
+            rejecting_responder.consume_initiation_and_respond(&bad_initiation),
+            Err(WireGuardError::InvalidMac(_))
+        ));
+
+        let mut responder = HandshakeResponder::new(responder_identity, None);
+        let (response, _) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
+        let mut bad_response = response;
+        bad_response.mac1[0] ^= 1;
+        assert!(matches!(
+            initiator.consume_response(&bad_response),
+            Err(WireGuardError::InvalidMac(_))
+        ));
+    }
+
+    #[test]
+    fn initiator_accepts_legacy_response_mac_during_rolling_upgrade() {
+        let initiator_identity = NodeIdentity::generate();
+        let responder_identity = NodeIdentity::generate();
+        let responder_public = responder_identity.public_key();
+        let mut initiator = HandshakeInitiator::new(initiator_identity, responder_public, None);
+        let initiation = initiator.create_initiation().unwrap();
+        let mut responder = HandshakeResponder::new(responder_identity, None);
+        let (mut response, _) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
+        response.mac1 = compute_mac1(&responder_public, &response.bytes_for_mac1());
+        assert!(initiator.consume_response(&response).is_ok());
+    }
+
+    #[test]
+    fn timestamp_floor_rejects_replayed_initiation_across_responder_objects() {
+        let initiator_identity = NodeIdentity::generate();
+        let responder_identity = NodeIdentity::generate();
+        let mut initiator =
+            HandshakeInitiator::new(initiator_identity, responder_identity.public_key(), None);
+        let initiation = initiator.create_initiation().unwrap();
+        let mut first = HandshakeResponder::new(responder_identity.clone(), None);
+        first.consume_initiation_and_respond(&initiation).unwrap();
+        let floor = first.latest_timestamp().expect("authenticated timestamp");
+
+        let mut second =
+            HandshakeResponder::new_with_timestamp_floor(responder_identity, None, Some(floor));
+        assert!(second.consume_initiation_and_respond(&initiation).is_err());
     }
 
     #[test]
@@ -150,6 +257,29 @@ mod tests {
     fn test_timestamp_size() {
         let ts = build_timestamp();
         assert_eq!(ts.len(), TIMESTAMP_SIZE);
+        assert_eq!(ts[0], 0x40, "canonical TAI64N must use 8-byte seconds");
+        assert_eq!(normalize_timestamp(&ts).unwrap(), ts);
+        let nanos = u32::from_be_bytes(ts[8..12].try_into().unwrap());
+        assert!(nanos < 1_000_000_000);
+    }
+
+    #[test]
+    fn legacy_timestamp_layout_is_normalized_for_rolling_upgrade() {
+        let unix_seconds = 1_700_000_000u32;
+        let nanos = 123_456_789u64;
+        let mut legacy = [0u8; TIMESTAMP_SIZE];
+        legacy[0..4].copy_from_slice(&(unix_seconds + 10).to_be_bytes());
+        legacy[4..12].copy_from_slice(&nanos.to_be_bytes());
+
+        let normalized = normalize_timestamp(&legacy).unwrap();
+        assert_eq!(
+            u64::from_be_bytes(normalized[0..8].try_into().unwrap()),
+            TAI64N_BASE + u64::from(unix_seconds)
+        );
+        assert_eq!(
+            u32::from_be_bytes(normalized[8..12].try_into().unwrap()),
+            nanos as u32
+        );
     }
 
     #[test]

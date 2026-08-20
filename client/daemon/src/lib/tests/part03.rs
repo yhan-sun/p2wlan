@@ -312,11 +312,8 @@ async fn initiator_rekey_keeps_peer_in_direct_state() {
 
     let old_local_identity = NodeIdentity::generate();
     let old_remote_identity = NodeIdentity::generate();
-    let mut old_initiator = HandshakeInitiator::new(
-        old_local_identity,
-        old_remote_identity.public_key(),
-        None,
-    );
+    let mut old_initiator =
+        HandshakeInitiator::new(old_local_identity, old_remote_identity.public_key(), None);
     let old_initiation = old_initiator.create_initiation().unwrap();
     let mut old_responder = HandshakeResponder::new(old_remote_identity, None);
     let (old_response, _) = old_responder
@@ -328,11 +325,8 @@ async fn initiator_rekey_keeps_peer_in_direct_state() {
         .add_session(peer_id, TransportSession::new(old_local_keys))
         .await;
 
-    let mut initiator = HandshakeInitiator::new(
-        daemon.local_identity().unwrap(),
-        peer_public_key,
-        None,
-    );
+    let mut initiator =
+        HandshakeInitiator::new(daemon.local_identity().unwrap(), peer_public_key, None);
     let initiation = initiator.create_initiation().unwrap();
     let mut responder = HandshakeResponder::new(peer_identity, None);
     let (response, _) = responder
@@ -409,14 +403,7 @@ async fn wireguard_answer_from_previous_network_generation_cannot_install_sessio
 
     {
         let mut state = daemon.pending_handshakes.lock().await;
-        state.insert_with_generation(
-            peer_id.to_string(),
-            initiator,
-            None,
-            None,
-            None,
-            0,
-        );
+        state.insert_with_generation(peer_id.to_string(), initiator, None, None, None, 0);
     }
     assert_eq!(
         daemon
@@ -432,7 +419,12 @@ async fn wireguard_answer_from_previous_network_generation_cannot_install_sessio
         .unwrap();
 
     assert!(
-        daemon.pending_handshakes.lock().await.pending.contains_key(peer_id),
+        daemon
+            .pending_handshakes
+            .lock()
+            .await
+            .pending
+            .contains_key(peer_id),
         "a stale answer must not consume the pending transaction"
     );
     assert!(
@@ -490,11 +482,8 @@ async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() 
 
     let old_local_identity = NodeIdentity::generate();
     let old_remote_identity = NodeIdentity::generate();
-    let mut old_initiator = HandshakeInitiator::new(
-        old_local_identity,
-        old_remote_identity.public_key(),
-        None,
-    );
+    let mut old_initiator =
+        HandshakeInitiator::new(old_local_identity, old_remote_identity.public_key(), None);
     let old_initiation = old_initiator.create_initiation().unwrap();
     let mut old_responder = HandshakeResponder::new(old_remote_identity, None);
     let (old_response, old_remote_keys) = old_responder
@@ -604,11 +593,7 @@ async fn modern_offer_rejects_missing_or_malformed_probe_ephemeral_key() {
             relay_rtt_ms: None,
         })
         .await;
-    let mut initiator = HandshakeInitiator::new(
-        peer_identity,
-        local_public,
-        None,
-    );
+    let mut initiator = HandshakeInitiator::new(peer_identity, local_public, None);
     let initiation = initiator.create_initiation().unwrap().to_bytes();
 
     let missing = daemon
@@ -1207,17 +1192,17 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
         .reserve_event_initiator_handshake(&peer_info.node_id)
         .await
         .expect("event initiator reservation must be admitted");
-    let mut worker = Box::pin(daemon.run_reserved_initiator_handshake(
-        &peer_info,
-        &mut reservation,
-    ));
+    let mut worker =
+        Box::pin(daemon.run_reserved_initiator_handshake(&peer_info, &mut reservation));
 
     // A direct poll reaches the blocked candidate lock. If the initiator still
     // held its arbiter guard at this point, the acquisition below would time
     // out; a crossing offer/answer could not make progress.
     std::future::poll_fn(|context| match worker.as_mut().poll(context) {
         Poll::Pending => Poll::Ready(()),
-        Poll::Ready(result) => panic!("candidate-blocked worker completed unexpectedly: {result:?}"),
+        Poll::Ready(result) => {
+            panic!("candidate-blocked worker completed unexpectedly: {result:?}")
+        }
     })
     .await;
     let guard = tokio::time::timeout(
@@ -1427,6 +1412,29 @@ fn responder_handshake_cache_replays_exact_answer_and_rejects_token_reuse() {
     ));
 }
 
+#[test]
+fn responder_timestamp_floor_is_monotonic_and_scoped_to_static_identity() {
+    let mut state = PendingHandshakeState::default();
+    let first_key = [1u8; 32];
+    let rotated_key = [2u8; 32];
+    let first_timestamp = [3u8; 12];
+    let newer_timestamp = [4u8; 12];
+
+    assert!(state.commit_responder_timestamp("peer-a", first_key, first_timestamp));
+    assert_eq!(
+        state.responder_timestamp_floor("peer-a", &first_key),
+        Some(first_timestamp)
+    );
+    assert!(!state.commit_responder_timestamp("peer-a", first_key, first_timestamp));
+    assert!(state.commit_responder_timestamp("peer-a", first_key, newer_timestamp));
+    assert_eq!(
+        state.responder_timestamp_floor("peer-a", &rotated_key),
+        None,
+        "a verified static-key rotation must not inherit the old key's timestamp floor"
+    );
+    assert!(state.commit_responder_timestamp("peer-a", rotated_key, first_timestamp));
+}
+
 #[tokio::test]
 async fn responder_cache_rejects_offer_after_peer_static_key_rotation() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
@@ -1508,11 +1516,13 @@ async fn responder_cache_rejects_offer_after_peer_static_key_rotation() {
     assert!(error
         .to_string()
         .contains("different handshake or Probe key material"));
-    assert!(!daemon
-        .transport
-        .session_status(peer_id)
-        .await
-        .has_pending_responder);
+    assert!(
+        !daemon
+            .transport
+            .session_status(peer_id)
+            .await
+            .has_pending_responder
+    );
 }
 
 #[tokio::test]
@@ -1567,11 +1577,7 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
             relay_rtt_ms: None,
         })
         .await;
-    let mut offer_initiator = HandshakeInitiator::new(
-        offer_identity,
-        local_public,
-        None,
-    );
+    let mut offer_initiator = HandshakeInitiator::new(offer_identity, local_public, None);
     let offer_initiation = offer_initiator.create_initiation().unwrap();
     let offer_bytes = offer_initiation.to_bytes();
     let request_probe_public_key = hex::encode(DhKeyPair::generate().public_key());
@@ -1601,7 +1607,7 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
             },
         );
 
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let error = daemon
             .handle_peer_offer(
                 peer_id,
@@ -1614,9 +1620,19 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
             )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("exact cached answer is unavailable"));
+        let error = error.to_string();
+        if attempt == 0 {
+            assert!(
+                error.contains("exact cached answer is unavailable"),
+                "unexpected first conflict error: {error}"
+            );
+        } else {
+            assert!(
+                error.contains("replayed or out-of-order initiation timestamp")
+                    || error.contains("refusing replayed WireGuard initiation"),
+                "unexpected replay error: {error}"
+            );
+        }
         assert!(!daemon
             .pending_handshakes
             .lock()
@@ -1655,9 +1671,15 @@ async fn test_network_outbound_uses_relay_when_udp_unavailable() {
     let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
         .await
         .unwrap();
-    assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
 
     let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
     let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
@@ -1758,9 +1780,15 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
     let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
         .await
         .unwrap();
-    assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
 
     let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
     let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
@@ -1936,9 +1964,12 @@ async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_bef
         .expect_err("relay should not receive before relay transport is published");
     let mut direct_buf = [0u8; 64];
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), direct_sink.recv_from(&mut direct_buf))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            direct_sink.recv_from(&mut direct_buf)
+        )
+        .await
+        .is_err(),
         "a configured relay must block Direct business handoff during startup"
     );
 
@@ -1947,9 +1978,11 @@ async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_bef
     peers
         .mark_relay_transport_ready("node-b", &relay_endpoint, generation)
         .await;
-    assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, generation)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer("node-b", &relay_endpoint, generation)
+            .await
+    );
     let _ = relay_available_tx.send(true);
 
     let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
@@ -2048,11 +2081,9 @@ async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
                         }
                     }
                     let head = String::from_utf8_lossy(&buf).into_owned();
-                    let is_register =
-                        head.starts_with("POST") && head.contains("/api/v1/devices");
+                    let is_register = head.starts_with("POST") && head.contains("/api/v1/devices");
                     let is_poll = head.starts_with("GET") && head.contains("/api/v1/signals");
-                    let is_signal =
-                        head.starts_with("POST") && head.contains("/api/v1/signals");
+                    let is_signal = head.starts_with("POST") && head.contains("/api/v1/signals");
                     let body = if is_signal {
                         let content_length = head
                             .lines()
@@ -2332,7 +2363,10 @@ async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_deliver
             Err(_) => continue, // keep polling until the deadline
         }
     }
-    assert!(!saw_data, "packet must not reach relay when relay never becomes available");
+    assert!(
+        !saw_data,
+        "packet must not reach relay when relay never becomes available"
+    );
 
     // The timeline must carry the stable reason event with the peer detail.
     let snapshot = timeline.snapshot();
@@ -2345,7 +2379,11 @@ async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_deliver
         event.reason_code.is_some(),
         "timeout event must carry a stable reason_code"
     );
-    assert!(event.detail.as_deref().unwrap_or_default().contains("peer=node-b"));
+    assert!(event
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .contains("peer=node-b"));
 
     worker.abort();
     forwarder.abort();
@@ -2468,11 +2506,18 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
     let (_relay_c, mut rx_c) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-c")
         .await
         .unwrap();
-    assert!(peers
-        .confirm_relay_peer("node-c", &relay_endpoint, peers.current_network_generation().await)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-c",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
 
-    let (transport, outbound_rx, mut node_c_remote_session) = part03_outbound_transport("node-c").await;
+    let (transport, outbound_rx, mut node_c_remote_session) =
+        part03_outbound_transport("node-c").await;
     let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
     let forwarder = tokio::spawn({
         let transport = transport.clone();
@@ -2635,13 +2680,20 @@ async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() 
                 Some(crate::network_outbound::REASON_RELAY_STARTUP_WAIT_EXPIRED)
             );
             assert!(
-                event.detail.as_deref().unwrap_or_default().contains("dropped=3"),
+                event
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("dropped=3"),
                 "all 3 queued packets must be dropped together in ONE deadline, got {:?}",
                 event.detail
             );
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "drop event never emitted");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drop event never emitted"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let elapsed = started.elapsed();
@@ -2730,21 +2782,20 @@ async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_neve
     // bounded relay-first window.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let generation = peers.current_network_generation().await;
-    assert!(peers
-        .record_direct_success_for_generation("node-b", Some(direct_endpoint), generation)
-        .await);
+    assert!(
+        peers
+            .record_direct_success_for_generation("node-b", Some(direct_endpoint), generation)
+            .await
+    );
 
     // The waiting packet must be flushed over DIRECT after the bounded relay
     // window, not dropped or held forever.  The direct sink receives the
     // worker's ENCRYPTED wire bytes.
     let mut buf = [0u8; 256];
-    let (n, _from) = tokio::time::timeout(
-        Duration::from_secs(4),
-        direct_sink.recv_from(&mut buf),
-    )
-    .await
-    .expect("the waiting first packet must reach Direct after the bounded relay window")
-    .unwrap();
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(4), direct_sink.recv_from(&mut buf))
+        .await
+        .expect("the waiting first packet must reach Direct after the bounded relay window")
+        .unwrap();
     assert_eq!(
         remote_session.decrypt_from_bytes(&buf[..n]).unwrap(),
         packet,
@@ -2837,9 +2888,15 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
     // the relay path just before the deadline.  The confirmation must flush the
     // waiting packet over the relay instead of the expiry dropping it.
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
 
     let mut saw_data = false;
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -2859,16 +2916,17 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
             Err(_) => continue,
         }
     }
-    assert!(saw_data, "the waiting first packet must ride the relay after confirmation");
+    assert!(
+        saw_data,
+        "the waiting first packet must ride the relay after confirmation"
+    );
 
     // The confirmation must not be defeated by a racing startup-wait expiry.
     let snapshot = timeline.snapshot();
     assert!(
-        !snapshot
-            .events
-            .iter()
-            .any(|event| event.event == "relay_unavailable_or_first_packet_expired"
-                && event.reason_code.as_deref() == Some("relay_startup_wait_expired")),
+        !snapshot.events.iter().any(|event| event.event
+            == "relay_unavailable_or_first_packet_expired"
+            && event.reason_code.as_deref() == Some("relay_startup_wait_expired")),
         "a confirmed relay path must never be dropped by relay_startup_wait_expired"
     );
 
@@ -2911,9 +2969,11 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
         request_id: 7,
         owner_token: 0xbbb, // wrong owner
     };
-    assert!(!peers
-        .consume_relay_probe_ack("node-b", foreign_ack, &relay_endpoint)
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", foreign_ack, &relay_endpoint)
+            .await
+    );
     assert!(!peers.is_relay_peer_confirmed("node-b").await);
 
     // A matching ACK over the SAME relay confirms.
@@ -2923,30 +2983,35 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
         request_id: 7,
         owner_token: 0xaaa,
     };
-    assert!(peers
-        .consume_relay_probe_ack("node-b", matching_ack, &relay_endpoint)
-        .await);
+    assert!(
+        peers
+            .consume_relay_probe_ack("node-b", matching_ack, &relay_endpoint)
+            .await
+    );
     assert!(peers.is_relay_peer_confirmed("node-b").await);
     // Duplicate ACK is a no-op.
-    assert!(!peers
-        .consume_relay_probe_ack("node-b", matching_ack, &relay_endpoint)
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", matching_ack, &relay_endpoint)
+            .await
+    );
 
     // A matching TOKEN that arrives over a DIFFERENT relay must NOT confirm:
     // the ACK is bound to the real ingress relay the probe was sent on.
     peers.revoke_relay_peer_confirmation("node-b").await;
     assert!(!peers.is_relay_peer_confirmed("node-b").await);
-    peers
-        .register_relay_probe_expectation("node-b", generation, 9, 0xddd, &relay_endpoint);
+    peers.register_relay_probe_expectation("node-b", generation, 9, 0xddd, &relay_endpoint);
     let other_relay_ack = crate::relay_probe::RelayProbeToken {
         kind: crate::relay_probe::RelayProbeKind::Ack,
         generation,
         request_id: 9,
         owner_token: 0xddd,
     };
-    assert!(!peers
-        .consume_relay_probe_ack("node-b", other_relay_ack, "tcp://relay-other.test:18081")
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", other_relay_ack, "tcp://relay-other.test:18081")
+            .await
+    );
     assert!(
         !peers.is_relay_peer_confirmed("node-b").await,
         "an ACK over a different relay must never confirm the path"
@@ -2954,19 +3019,22 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
 
     // A matching ACK whose probe generation is no longer current must NOT
     // confirm (the candidate/NAT mapping advanced since the probe was sent).
-    peers
-        .register_relay_probe_expectation("node-b", generation, 10, 0xeee, &relay_endpoint);
+    peers.register_relay_probe_expectation("node-b", generation, 10, 0xeee, &relay_endpoint);
     let old_gen = peers.current_network_generation().await;
-    peers.advance_network_generation("test generation advance").await;
+    peers
+        .advance_network_generation("test generation advance")
+        .await;
     let stale_gen_ack = crate::relay_probe::RelayProbeToken {
         kind: crate::relay_probe::RelayProbeKind::Ack,
         generation: old_gen,
         request_id: 10,
         owner_token: 0xeee,
     };
-    assert!(!peers
-        .consume_relay_probe_ack("node-b", stale_gen_ack, &relay_endpoint)
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", stale_gen_ack, &relay_endpoint)
+            .await
+    );
     assert!(
         !peers.is_relay_peer_confirmed("node-b").await,
         "an ACK from an advanced generation must never confirm the current path"
@@ -2974,20 +3042,21 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
 
     // Re-confirm under the current generation.
     let generation = peers.current_network_generation().await;
-    peers
-        .register_relay_probe_expectation("node-b", generation, 8, 0xccc, &relay_endpoint);
-    assert!(peers
-        .consume_relay_probe_ack(
-            "node-b",
-            crate::relay_probe::RelayProbeToken {
-                kind: crate::relay_probe::RelayProbeKind::Ack,
-                generation,
-                request_id: 8,
-                owner_token: 0xccc,
-            },
-            &relay_endpoint,
-        )
-        .await);
+    peers.register_relay_probe_expectation("node-b", generation, 8, 0xccc, &relay_endpoint);
+    assert!(
+        peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 8,
+                    owner_token: 0xccc,
+                },
+                &relay_endpoint,
+            )
+            .await
+    );
     assert!(peers.is_relay_peer_confirmed("node-b").await);
 
     // The FIRST peer_not_found revokes the confirmation IMMEDIATELY (the
@@ -2995,7 +3064,11 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
     // even inside the recovery grace window): outbound must not keep sending
     // on a path the relay will 404.
     peers
-        .record_relay_failure("node-b", "peer_not_found", "peer node-b not registered on relay")
+        .record_relay_failure(
+            "node-b",
+            "peer_not_found",
+            "peer node-b not registered on relay",
+        )
         .await;
     assert!(
         !peers.is_relay_peer_confirmed("node-b").await,
@@ -3013,18 +3086,20 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
     // Even a syntactically matching ACK must be rejected while the peer is
     // quarantined.  This is the late-ACK boundary for the old registration.
     peers.register_relay_probe_expectation("node-b", generation, 11, 0x111, &relay_endpoint);
-    assert!(!peers
-        .consume_relay_probe_ack(
-            "node-b",
-            crate::relay_probe::RelayProbeToken {
-                kind: crate::relay_probe::RelayProbeKind::Ack,
-                generation,
-                request_id: 11,
-                owner_token: 0x111,
-            },
-            &relay_endpoint,
-        )
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 11,
+                    owner_token: 0x111,
+                },
+                &relay_endpoint,
+            )
+            .await
+    );
     assert!(!peers.is_relay_peer_confirmed("node-b").await);
 
     // A quarantined peer cannot be re-confirmed by an old registration.  The
@@ -3036,20 +3111,21 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
 
     // Re-confirm, then invalidate the whole relay transport: confirmation is
     // revoked again.
-    peers
-        .register_relay_probe_expectation("node-b", generation, 8, 0xccc, &relay_endpoint);
-    assert!(peers
-        .consume_relay_probe_ack(
-            "node-b",
-            crate::relay_probe::RelayProbeToken {
-                kind: crate::relay_probe::RelayProbeKind::Ack,
-                generation,
-                request_id: 8,
-                owner_token: 0xccc,
-            },
-            &relay_endpoint,
-        )
-        .await);
+    peers.register_relay_probe_expectation("node-b", generation, 8, 0xccc, &relay_endpoint);
+    assert!(
+        peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 8,
+                    owner_token: 0xccc,
+                },
+                &relay_endpoint,
+            )
+            .await
+    );
     assert!(peers.is_relay_peer_confirmed("node-b").await);
     peers
         .invalidate_relay_transport(&relay_endpoint, "relay_transport_closed", "transport gone")
@@ -3190,9 +3266,15 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
     );
 
     // Now confirm the relay path: the parked business packet must flush.
-    assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
     let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
         .await
         .expect("the parked first packet must flush after confirmation")
@@ -3346,11 +3428,20 @@ async fn run_burst_confirmation_replay_test(count: usize) {
         )
         .await
         .expect("probe encrypt must not fail");
-    assert!(probe_sent, "the relay probe must be emitted while the burst waits");
+    assert!(
+        probe_sent,
+        "the relay probe must be emitted while the burst waits"
+    );
 
-    assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
 
     // Collect count + 1 frames (the probe + the burst) in ARRIVAL order.
     let mut counters = Vec::with_capacity(count + 1);
@@ -3430,9 +3521,15 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
             relay_rtt_ms: None,
         })
         .await;
-    assert!(peers
-        .confirm_relay_peer("node-b", &relay_endpoint, peers.current_network_generation().await)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
 
     let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
         .await
@@ -3516,7 +3613,9 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
             .unwrap();
     }
     // A direct-validation style control packet interleaves.
-    assert!(send_control(b"p2wlan-direct-validation".to_vec()).await.unwrap());
+    assert!(send_control(b"p2wlan-direct-validation".to_vec())
+        .await
+        .unwrap());
     // Burst 2 (20 packets).
     for seq in 0..20u16 {
         dataplane_tx
@@ -3647,12 +3746,18 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (dropped, bytes) = loop {
         let stats = peers.outbound_loss_stats().await;
-        if let Some(entry) = stats.drops.get(crate::network_outbound::REASON_OUTBOUND_QUEUE_FULL) {
+        if let Some(entry) = stats
+            .drops
+            .get(crate::network_outbound::REASON_OUTBOUND_QUEUE_FULL)
+        {
             if entry.packets == expected_dropped {
                 break (entry.packets, entry.bytes);
             }
         }
-        assert!(std::time::Instant::now() < deadline, "overflow counters never reached {expected_dropped}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "overflow counters never reached {expected_dropped}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
 
@@ -3684,8 +3789,14 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
         })
         .map(|event| event.bytes)
         .sum();
-    assert_eq!(event_packets, dropped, "loss event ledger must retain packet totals");
-    assert_eq!(event_bytes, bytes, "loss event ledger must retain byte totals");
+    assert_eq!(
+        event_packets, dropped,
+        "loss event ledger must retain packet totals"
+    );
+    assert_eq!(
+        event_bytes, bytes,
+        "loss event ledger must retain byte totals"
+    );
 
     // The timeline carries the same total: one event per overflow occurrence,
     // each with the exact per-occurrence counts; the SUM must equal the
@@ -3852,46 +3963,52 @@ async fn test_relay_probe_old_relay_ack_never_confirms_new_relay_and_duplicate_a
     // Probe sent over relay A; the expectation binds to relay A.
     peers.register_relay_probe_expectation("node-b", generation, 3, 0xaaa, "relay-a");
     // An ACK arriving over relay B (mismatched ingress) must NOT confirm.
-    assert!(!peers
-        .consume_relay_probe_ack(
-            "node-b",
-            crate::relay_probe::RelayProbeToken {
-                kind: crate::relay_probe::RelayProbeKind::Ack,
-                generation,
-                request_id: 3,
-                owner_token: 0xaaa,
-            },
-            "relay-b",
-        )
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 3,
+                    owner_token: 0xaaa,
+                },
+                "relay-b",
+            )
+            .await
+    );
     assert!(!peers.is_relay_peer_confirmed("node-b").await);
     // The matching ACK over relay A confirms.
-    assert!(peers
-        .consume_relay_probe_ack(
-            "node-b",
-            crate::relay_probe::RelayProbeToken {
-                kind: crate::relay_probe::RelayProbeKind::Ack,
-                generation,
-                request_id: 3,
-                owner_token: 0xaaa,
-            },
-            "relay-a",
-        )
-        .await);
+    assert!(
+        peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 3,
+                    owner_token: 0xaaa,
+                },
+                "relay-a",
+            )
+            .await
+    );
     assert!(peers.is_relay_peer_confirmed("node-b").await);
     // A duplicate ACK no-ops (the expectation was consumed).
-    assert!(!peers
-        .consume_relay_probe_ack(
-            "node-b",
-            crate::relay_probe::RelayProbeToken {
-                kind: crate::relay_probe::RelayProbeKind::Ack,
-                generation,
-                request_id: 3,
-                owner_token: 0xaaa,
-            },
-            "relay-a",
-        )
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 3,
+                    owner_token: 0xaaa,
+                },
+                "relay-a",
+            )
+            .await
+    );
     assert!(peers.is_relay_peer_confirmed("node-b").await);
 
     // The confirmation is bound to relay A: an invalidation of relay B must
@@ -4015,21 +4132,26 @@ async fn test_relay_probe_stale_generation_ack_never_confirms() {
     let old_generation = peers.current_network_generation().await;
     // Advance the local network generation (a restart/churn equivalent).
     let new_generation = peers.advance_network_generation("test").await;
-    assert_ne!(new_generation, old_generation, "the test needs a real generation advance");
+    assert_ne!(
+        new_generation, old_generation,
+        "the test needs a real generation advance"
+    );
 
     peers.register_relay_probe_expectation("node-b", old_generation, 9, 0xbbb, "relay-a");
-    assert!(!peers
-        .consume_relay_probe_ack(
-            "node-b",
-            crate::relay_probe::RelayProbeToken {
-                kind: crate::relay_probe::RelayProbeKind::Ack,
-                generation: old_generation,
-                request_id: 9,
-                owner_token: 0xbbb,
-            },
-            "relay-a",
-        )
-        .await);
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation: old_generation,
+                    request_id: 9,
+                    owner_token: 0xbbb,
+                },
+                "relay-a",
+            )
+            .await
+    );
     assert!(
         !peers.is_relay_peer_confirmed("node-b").await,
         "a stale-generation ACK must never confirm the current path"

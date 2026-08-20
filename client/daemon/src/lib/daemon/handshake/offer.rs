@@ -42,10 +42,11 @@ impl Daemon {
                     ) => guard,
                 }
             }
-            None => self
-                .handshake_arbiter
-                .acquire_with_timeout(from_node_id, RESPONDER_HANDSHAKE_ARBITER_TIMEOUT)
-                .await,
+            None => {
+                self.handshake_arbiter
+                    .acquire_with_timeout(from_node_id, RESPONDER_HANDSHAKE_ARBITER_TIMEOUT)
+                    .await
+            }
         };
         match guard {
             Some(guard) => {
@@ -264,16 +265,13 @@ impl Daemon {
             .clone()
             .unwrap_or_else(|| format!("legacy-wg-{}", initiation.sender_index));
         let cached = {
-            self.pending_handshakes
-                .lock()
-                .await
-                .responder_cache_lookup(
-                    from_node_id,
-                    &handshake_token,
-                    handshake_init,
-                    modern_probe_public_key.as_deref(),
-                    &expected_peer_public,
-                )
+            self.pending_handshakes.lock().await.responder_cache_lookup(
+                from_node_id,
+                &handshake_token,
+                handshake_init,
+                modern_probe_public_key.as_deref(),
+                &expected_peer_public,
+            )
         };
         let cache_state = match &cached {
             ResponderHandshakeCacheLookup::Hit(_) => "hit",
@@ -314,7 +312,13 @@ impl Daemon {
             }
             ResponderHandshakeCacheLookup::Miss => {
                 let identity = self.local_identity()?;
-                let mut responder = HandshakeResponder::new(identity, None);
+                let timestamp_floor = self
+                    .pending_handshakes
+                    .lock()
+                    .await
+                    .responder_timestamp_floor(from_node_id, &expected_peer_public);
+                let mut responder =
+                    HandshakeResponder::new_with_timestamp_floor(identity, None, timestamp_floor);
                 let (response, keys) = responder
                     .consume_initiation_and_respond(&initiation)
                     .map_err(|e| DaemonError::Peer(format!("WireGuard response failed: {e}")))?;
@@ -324,20 +328,39 @@ impl Daemon {
                         "WireGuard initiation public key mismatch for peer {from_node_id}"
                     )));
                 }
+                let authenticated_timestamp = responder.latest_timestamp().ok_or_else(|| {
+                    DaemonError::Peer(format!(
+                        "WireGuard initiation from {from_node_id} did not authenticate a timestamp"
+                    ))
+                })?;
+                if !self
+                    .pending_handshakes
+                    .lock()
+                    .await
+                    .commit_responder_timestamp(
+                        from_node_id,
+                        expected_peer_public,
+                        authenticated_timestamp,
+                    )
+                {
+                    return Err(DaemonError::Peer(format!(
+                        "refusing replayed WireGuard initiation from {from_node_id}"
+                    )));
+                }
 
                 let (response_probe_ephemeral_public_key, probe_ephemeral_shared) =
                     match modern_probe_public_key.as_deref() {
-                    Some(peer_probe_public_key) => {
-                        let (local_probe_ephemeral, local_probe_public_key) =
-                            new_probe_ephemeral_keypair();
-                        let shared = derive_probe_ephemeral_shared(
-                            &local_probe_ephemeral,
-                            peer_probe_public_key,
-                        )?;
-                        (Some(local_probe_public_key), Some(shared))
-                    }
-                    None => (None, None),
-                };
+                        Some(peer_probe_public_key) => {
+                            let (local_probe_ephemeral, local_probe_public_key) =
+                                new_probe_ephemeral_keypair();
+                            let shared = derive_probe_ephemeral_shared(
+                                &local_probe_ephemeral,
+                                peer_probe_public_key,
+                            )?;
+                            (Some(local_probe_public_key), Some(shared))
+                        }
+                        None => (None, None),
+                    };
                 let response_bytes = response.to_bytes();
                 let cache_entry = CachedResponderHandshake {
                     handshake_init: handshake_init.to_vec(),
@@ -345,8 +368,8 @@ impl Daemon {
                     request_probe_ephemeral_public_key: modern_probe_public_key.clone(),
                     response_bytes: response_bytes.clone(),
                     transport_keys: keys.clone(),
-                    response_probe_ephemeral_public_key:
-                        response_probe_ephemeral_public_key.clone(),
+                    response_probe_ephemeral_public_key: response_probe_ephemeral_public_key
+                        .clone(),
                     probe_ephemeral_shared,
                     expires_at: Instant::now() + RESPONDER_HANDSHAKE_CACHE_TTL,
                 };
@@ -427,8 +450,7 @@ impl Daemon {
                     ResponderSessionStage::ReplayableDuplicate { had_active } => {
                         (had_active, false)
                     }
-                    ResponderSessionStage::StaleDuplicate
-                    | ResponderSessionStage::Busy => {
+                    ResponderSessionStage::StaleDuplicate | ResponderSessionStage::Busy => {
                         return Err(DaemonError::Peer(format!(
                             "refusing stale cached WireGuard answer for {from_node_id}: responder key is no longer safely restageable"
                         )));
@@ -534,11 +556,9 @@ impl Daemon {
             let snapshot = self.cached_local_candidate_set().await;
             let mut relay_available = self.relay_available_tx.subscribe();
             let relay_is_available = *relay_available.borrow();
-            if let Some(snapshot) = relay_first_candidate_shortcut(
-                snapshot.0,
-                snapshot.1,
-                relay_is_available,
-            ) {
+            if let Some(snapshot) =
+                relay_first_candidate_shortcut(snapshot.0, snapshot.1, relay_is_available)
+            {
                 snapshot
             } else {
                 match cancellation.as_deref_mut() {
@@ -602,27 +622,25 @@ impl Daemon {
                     _ = cancellation.changed() => return Ok(()),
                 }
             }
-            None => self
-                .control
-                .send_peer_answer_with_sources_schedule_and_session(
-                    from_node_id,
-                    &candidates,
-                    &candidate_sources,
-                    &response_bytes,
-                    punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
-                    punch_at_server_ms,
-                    session_id.clone(),
-                    response_probe_ephemeral_public_key,
-                )
-                .await,
+            None => {
+                self.control
+                    .send_peer_answer_with_sources_schedule_and_session(
+                        from_node_id,
+                        &candidates,
+                        &candidate_sources,
+                        &response_bytes,
+                        punch_at_ms.or_else(|| Some(relay_assisted_punch_at_ms())),
+                        punch_at_server_ms,
+                        session_id.clone(),
+                        response_probe_ephemeral_public_key,
+                    )
+                    .await
+            }
         };
         self.timeline.emit(
             "peer_answer_control_result",
             None,
-            answer_result
-                .as_ref()
-                .err()
-                .map(|_| "control_plane_error"),
+            answer_result.as_ref().err().map(|_| "control_plane_error"),
             Some(format!(
                 "peer={from_node_id} generation={} session_fp={} candidates={} delivered={}",
                 expected_network_generation
@@ -790,10 +808,7 @@ impl Daemon {
             .get_connection(from_node_id)
             .await
             .map(|connection| connection.state);
-        if should_mark_connecting_after_session_install(
-            had_active,
-            current_state,
-        ) {
+        if should_mark_connecting_after_session_install(had_active, current_state) {
             self.peers
                 .update_state(from_node_id, ConnectionState::Connecting)
                 .await;
@@ -837,5 +852,4 @@ impl Daemon {
         // otherwise harmless four-second best-effort operation.
         Ok(())
     }
-
 }
