@@ -263,6 +263,7 @@ pub fn parse_route_get_interface(output: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_route_get_gateway(output: &str) -> Option<String> {
     output
         .lines()
@@ -316,6 +317,7 @@ fn parse_route_default_path(output: &str) -> Option<(String, Option<String>)> {
     None
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn parse_physical_default_path(output: &str) -> Option<(String, Option<String>)> {
     output.lines().find_map(|line| {
         let trimmed = line.trim();
@@ -724,6 +726,7 @@ default            10.0.0.1           UGScg           utun3
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn physical_default_parser_skips_split_tun_route() {
         let output = "default 10.0.0.1 UGScg utun23\n\
@@ -734,6 +737,7 @@ default 192.168.0.1 UGScg en5\n";
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn physical_selection_rejects_own_excluded_tun() {
         let output = "default 10.0.0.1 UGScg utun9\n\

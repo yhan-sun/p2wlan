@@ -65,28 +65,53 @@ fn build_control_http_client(
     server_url: Option<&str>,
     outbound_interface: Option<&str>,
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
-    if mode == ControlProxyMode::Direct
-        && server_url.is_some_and(|url| !control_server_is_local(url))
-    {
-        if let Some(interface) = outbound_interface {
-            #[cfg(any(
-                target_os = "android",
-                target_os = "fuchsia",
-                target_os = "illumos",
-                target_os = "ios",
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "solaris",
-                target_os = "tvos",
-                target_os = "visionos",
-                target_os = "watchos",
-            ))]
-            {
+    let builder = reqwest::Client::builder();
+
+    // `reqwest::ClientBuilder::interface` is unavailable on Windows. Keep
+    // the binding code behind the same target gate so a Windows build does
+    // not report the builder as unnecessarily mutable or the interface as an
+    // unused variable.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    ))]
+    let builder = {
+        let mut builder = builder;
+        if mode == ControlProxyMode::Direct
+            && server_url.is_some_and(|url| !control_server_is_local(url))
+        {
+            if let Some(interface) = outbound_interface {
                 builder = builder.interface(interface);
             }
         }
-    }
+        builder
+    };
+
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+    )))]
+    let builder = {
+        let _ = outbound_interface;
+        builder
+    };
+
     let client = match mode {
         ControlProxyMode::Direct => builder.no_proxy().build(),
         ControlProxyMode::Environment => builder.build(),
