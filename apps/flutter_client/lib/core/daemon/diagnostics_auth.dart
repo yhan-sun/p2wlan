@@ -9,6 +9,8 @@
 // token) is regenerated, so callers always read it fresh.
 import 'dart:io';
 
+import 'package:flutter/services.dart';
+
 /// Platform-normalized directory the daemon writes its log and token files to.
 Directory defaultP2WlanLogDir() {
   if (Platform.isMacOS) {
@@ -40,6 +42,17 @@ String diagnosticsAuthTokenPath() {
 /// Read the current per-process diagnostics auth token, or `null` when the
 /// daemon has not written one yet (not running, or just starting up).
 Future<String?> readDiagnosticsAuthToken() async {
+  if (Platform.isAndroid) {
+    try {
+      final value = await const MethodChannel(
+        'p2wlan/android_vpn',
+      ).invokeMethod<String>('diagnosticsAuthToken');
+      final token = value?.trim();
+      return token == null || token.isEmpty ? null : token;
+    } catch (_) {
+      return null;
+    }
+  }
   final file = File(diagnosticsAuthTokenPath());
   try {
     if (!await file.exists()) return null;

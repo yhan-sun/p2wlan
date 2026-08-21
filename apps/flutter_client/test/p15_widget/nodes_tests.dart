@@ -1,6 +1,33 @@
 part of '../p15_widget_test.dart';
 
 void _registerNodesTests() {
+  testWidgets(
+    'Nodes mobile uses remote-management state without fake local offline node',
+    (tester) async {
+      final stores = (await tester.runAsync(
+        () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
+      ))!;
+      addTearDown(stores.dispose);
+
+      await tester.pumpWidget(
+        _TestApp(
+          child: NodesPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('ios'),
+          ),
+        ),
+      );
+
+      expect(find.text('Mobile management mode'), findsOneWidget);
+      expect(find.text('This device'), findsNothing);
+      expect(find.byKey(const Key('nodes-local-row')), findsNothing);
+      expect(find.byKey(const Key('nodes-search-field')), findsNothing);
+      expect(find.text('Cannot reach local service'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('Nodes renders local device and a continuous device list', (
     tester,
   ) async {
@@ -407,6 +434,13 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
 
     expect(api.speedTestCount, 1);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('node-speedtest-dialog')),
+        matching: find.text('43 ms'),
+      ),
+      findsOneWidget,
+    );
     expect(find.text('123.4 Mbps'), findsOneWidget);
     expect(find.text('56.7 Mbps'), findsOneWidget);
     expect(find.text('147.1 MB / 67.6 MB'), findsOneWidget);

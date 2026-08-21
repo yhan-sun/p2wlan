@@ -70,6 +70,7 @@ impl PeerConnection {
             relay_first_business_sent_generation = ?self.relay_first.business_sent_generation,
             relay_first_business_received_generation = ?self.relay_first.business_received_generation,
             relay_first_business_exchange_generation = ?self.relay_first.business_exchange_generation,
+            relay_first_business_gate_completed_generation = ?self.relay_first.business_gate_completed_generation,
             first_usable_generation = ?self.first_usable_generation,
             first_usable_path = ?self.first_usable_path,
             "path selector state changed: path={:?} reason_code={} reason={}",

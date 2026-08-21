@@ -77,6 +77,11 @@ pub struct PeerDiagnostics {
     pub relay_first_business_received_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_first_business_exchange_generation: Option<u64>,
+    /// Generation in which the relay-first business gate completed once.
+    /// This remains set across relay ticket renewal so an established Direct
+    /// path is not mistaken for a new first-business race.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_first_business_gate_completed_generation: Option<u64>,
     /// Path that became first usable for this peer (`Relay` or `Direct`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_usable_path: Option<NetworkPath>,
@@ -163,6 +168,7 @@ impl PeerDiagnostics {
         let relay_first_business_pending = (conn.relay_ready_generation == Some(local_generation)
             || conn.relay_first.gate_generation == Some(local_generation))
             && relay_peer_confirmed
+            && conn.relay_first.business_gate_completed_generation != Some(local_generation)
             && conn.relay_first.business_exchange_generation != Some(local_generation);
         let confirmed_direct_active =
             confirmed_direct_snapshot && !relay_first_pending && !relay_first_business_pending;
@@ -342,6 +348,9 @@ impl PeerDiagnostics {
             relay_first_business_sent_generation: conn.relay_first.business_sent_generation,
             relay_first_business_received_generation: conn.relay_first.business_received_generation,
             relay_first_business_exchange_generation: conn.relay_first.business_exchange_generation,
+            relay_first_business_gate_completed_generation: conn
+                .relay_first
+                .business_gate_completed_generation,
             first_usable_path: conn.first_usable_path,
             first_usable_generation: conn.first_usable_generation,
             candidate_pair_stats: candidate_pair_source_stats(

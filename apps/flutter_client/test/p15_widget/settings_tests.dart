@@ -273,7 +273,7 @@ void _registerSettingsTests() {
     await _pumpSettings(
       tester,
       api: _FakeDiagnosticsApi(health: false),
-      capabilities: PlatformCapabilities.fromPlatform('android'),
+      capabilities: PlatformCapabilities.fromPlatform('ios'),
       physicalSize: const Size(390, 1200),
     );
 
@@ -321,7 +321,7 @@ void _registerSettingsTests() {
         child: SettingsPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
-          capabilities: PlatformCapabilities.fromPlatform('android'),
+          capabilities: PlatformCapabilities.fromPlatform('ios'),
         ),
       ),
     );
@@ -358,7 +358,7 @@ void _registerSettingsTests() {
     final stores = await _pumpSettings(
       tester,
       api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
-      capabilities: PlatformCapabilities.fromPlatform('android'),
+      capabilities: PlatformCapabilities.fromPlatform('ios'),
     );
     await stores.statusStore.refresh();
     expect(stores.statusStore.daemonReachable, isTrue);

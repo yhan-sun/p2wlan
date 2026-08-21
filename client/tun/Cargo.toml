@@ -12,9 +12,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
 
-# Linux specific
-[target.'cfg(target_os = "linux")'.dependencies]
+# Linux and Android use Unix file descriptors for their TUN devices.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { workspace = true }
+
+# Linux creates the device with ioctl; Android receives an already-established
+# fd from VpnService and therefore does not need nix.
+[target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["net", "ioctl", "fs"] }
 
 # Windows specific

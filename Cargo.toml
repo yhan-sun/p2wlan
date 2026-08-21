@@ -10,11 +10,12 @@ members = [
     "client/cli",
     "client/desktop-host",
     "client/tray",
+    "client/android-native",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.121"
+version = "0.1.122"
 edition = "2021"
 authors = ["P2PNet Team"]
 license = "MIT"

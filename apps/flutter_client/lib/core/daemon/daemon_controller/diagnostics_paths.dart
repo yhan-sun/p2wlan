@@ -31,7 +31,8 @@ extension DaemonControllerDiagnosticsPaths on DaemonController {
     if (pid != null) return false;
     final logFile = File(logPath);
     if (!await logFile.exists()) return false;
-    return _logShowsPermanentAuthFailure(logPath);
+    return await _logShowsPermanentAuthFailure(logPath) ||
+        await _logShowsWintunMissing(logPath);
   }
 
   /// Whether the daemon log tail carries a permanent control auth failure
@@ -40,6 +41,10 @@ extension DaemonControllerDiagnosticsPaths on DaemonController {
   /// token never reaches diagnostics readiness.
   Future<bool> _logShowsPermanentAuthFailure(String logPath) {
     return logTailShowsPermanentAuthFailure(logPath);
+  }
+
+  Future<bool> _logShowsWintunMissing(String logPath) {
+    return logTailShowsWintunMissing(logPath);
   }
 
   Future<bool> _waitForHealthDown(
@@ -148,6 +153,30 @@ Future<bool> logTailShowsPermanentAuthFailure(String logPath) async {
       'list nodes request returned http 401',
       'list signals returned http 401',
     ].any(lower.contains);
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Whether the Windows daemon exited because its side-by-side Wintun runtime
+/// could not be loaded. This is kept separate from permission failures: UAC
+/// elevation cannot fix a missing DLL, and the UI should say so directly.
+Future<bool> logTailShowsWintunMissing(String logPath) async {
+  final logFile = File(logPath);
+  if (!await logFile.exists()) return false;
+  try {
+    final length = await logFile.length();
+    final start = length > _authFailureScanBytes
+        ? length - _authFailureScanBytes
+        : 0;
+    final contents = await logFile
+        .openRead(start)
+        .fold<String>(
+          '',
+          (buffer, chunk) => buffer + utf8.decode(chunk, allowMalformed: true),
+        );
+    final lower = contents.toLowerCase();
+    return lower.contains('wintun.dll not found or not loadable');
   } catch (_) {
     return false;
   }

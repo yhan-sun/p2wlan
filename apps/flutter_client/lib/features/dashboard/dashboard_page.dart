@@ -99,20 +99,25 @@ class DashboardPage extends StatelessWidget {
           showHeader: showHeader,
           maxWidth: dashboardPageMaxWidth,
           children: [
-            _NetworkHero(
-              snapshot: snapshot,
-              status: status,
-              loading: loading,
-              counts: counts,
-              daemonAvailable: daemonAvailable,
-              canControlLocalDaemon: capabilities.canControlLocalDaemon,
-              daemonBusy: statusStore.daemonBusy,
-              refreshing: statusStore.refreshing,
-              onStartDaemon: statusStore.startDaemon,
-              onStopDaemon: statusStore.stopDaemon,
-              onRefresh: statusStore.refresh,
-            ),
-            if (issueMessage != null && daemonAvailable) ...[
+            if (capabilities.canActAsLocalVpnNode)
+              _NetworkHero(
+                snapshot: snapshot,
+                status: status,
+                loading: loading,
+                counts: counts,
+                daemonAvailable: daemonAvailable,
+                canControlLocalDaemon: capabilities.canControlLocalDaemon,
+                daemonBusy: statusStore.daemonBusy,
+                refreshing: statusStore.refreshing,
+                onStartDaemon: statusStore.startDaemon,
+                onStopDaemon: statusStore.stopDaemon,
+                onRefresh: statusStore.refresh,
+              )
+            else
+              _RemoteOnlyHero(onOpenDevices: onOpenDevices),
+            if (capabilities.canActAsLocalVpnNode &&
+                issueMessage != null &&
+                daemonAvailable) ...[
               const SizedBox(height: AppTokens.space12),
               _HomeIssueBanner(
                 message: issueMessage,
@@ -124,7 +129,7 @@ class DashboardPage extends StatelessWidget {
                 onOpenTroubleshooting: onOpenTroubleshooting,
               ),
             ],
-            if (snapshot != null) ...[
+            if (capabilities.canActAsLocalVpnNode && snapshot != null) ...[
               const SizedBox(height: AppTokens.space20),
               Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -140,7 +145,7 @@ class DashboardPage extends StatelessWidget {
                 ],
               ),
             ],
-            if (manualCommand != null) ...[
+            if (capabilities.canActAsLocalVpnNode && manualCommand != null) ...[
               const SizedBox(height: AppTokens.space12),
               _ManualCommandCard(command: manualCommand),
             ],

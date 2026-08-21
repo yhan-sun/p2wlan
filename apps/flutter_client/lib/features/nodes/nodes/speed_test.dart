@@ -203,7 +203,11 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
                   color: colorScheme.error,
                 )
               else if (result != null)
-                _SpeedTestResult(result: result, strings: strings)
+                _SpeedTestResult(
+                  result: result,
+                  latencyMs: widget.peer.latencyMs,
+                  strings: strings,
+                )
               else
                 _SpeedTestMessage(
                   icon: Icons.speed_rounded,
@@ -314,9 +318,14 @@ class _SpeedTestMessage extends StatelessWidget {
 }
 
 class _SpeedTestResult extends StatelessWidget {
-  const _SpeedTestResult({required this.result, required this.strings});
+  const _SpeedTestResult({
+    required this.result,
+    required this.latencyMs,
+    required this.strings,
+  });
 
   final SpeedTestResult result;
+  final int? latencyMs;
   final AppStrings strings;
 
   @override
@@ -325,6 +334,12 @@ class _SpeedTestResult extends StatelessWidget {
       spacing: 18,
       runSpacing: 2,
       children: [
+        MetricTile(
+          label: strings.latency,
+          value: formatLatency(latencyMs),
+          minWidth: 100,
+          maxWidth: 130,
+        ),
         MetricTile(
           label: strings.speedTestDownload,
           value: '${result.downloadMbps.toStringAsFixed(1)} Mbps',

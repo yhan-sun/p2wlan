@@ -239,7 +239,7 @@ void _registerFinalRegressionTests() {
           DiagnosticsPage(
             settingsStore: stores.settingsStore,
             statusStore: stores.statusStore,
-            capabilities: PlatformCapabilities.fromPlatform('android'),
+            capabilities: PlatformCapabilities.fromPlatform('ios'),
             permissionCheck: _noopPermissionCheck,
             logPreviewLoader: _noopLogPreviewLoader,
           ),

@@ -26,24 +26,33 @@ void _registerTroubleshootingShellTests() {
   }
 
   Future<void> goToTroubleshooting(WidgetTester tester) async {
-    final sidebarItem = find.descendant(
-      of: find.byType(DesktopSidebar),
-      matching: find.text('Troubleshooting'),
-    );
-    final railItem = find.descendant(
-      of: find.byType(AppNavRail),
-      matching: find.text('Troubleshooting'),
-    );
-    final target = sidebarItem.evaluate().isNotEmpty ? sidebarItem : railItem;
-    if (target.evaluate().isEmpty) {
-      // Mobile: troubleshooting lives in the top-bar overflow menu.
-      await tester.tap(find.byIcon(Icons.more_horiz_rounded));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Troubleshooting'));
+    // Troubleshooting is no longer a permanent left-nav item. Expanded
+    // desktop reaches it from the status footer; compact desktop uses the
+    // icon-only footer; phones keep the overflow entry.
+    final desktopFooter = find.byKey(const Key('desktop-sidebar-status'));
+    if (desktopFooter.evaluate().isNotEmpty) {
+      await tester.tap(desktopFooter);
       await tester.pumpAndSettle();
       return;
     }
-    await tester.tap(target);
+    final compactFooter = find.byKey(const Key('compact-sidebar-status'));
+    if (compactFooter.evaluate().isNotEmpty) {
+      await tester.tap(compactFooter);
+      await tester.pumpAndSettle();
+      return;
+    }
+
+    final shellAction = find.byKey(const Key('shell-open-troubleshooting'));
+    if (shellAction.evaluate().isNotEmpty) {
+      await tester.tap(shellAction);
+      await tester.pumpAndSettle();
+      return;
+    }
+
+    // Mobile: troubleshooting lives in the top-bar overflow menu.
+    await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Troubleshooting'));
     await tester.pumpAndSettle();
   }
 

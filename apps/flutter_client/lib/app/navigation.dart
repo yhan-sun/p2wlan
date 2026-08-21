@@ -175,6 +175,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
               _ShellStatusActions(
                 statusStore: widget.statusStore,
                 showStatusBadge: showStatusBadge,
+                showTroubleshootingAction: !hasSidebarFooter,
+                onOpenTroubleshooting: () =>
+                    _select(P2WlanSection.troubleshooting),
               ),
               if (_showsInAppCloseButton) const _WindowsCloseButton(),
               const SizedBox(width: 8),
@@ -188,6 +191,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: false,
+        capabilities: widget.capabilities,
         onOpenDevices: () => _select(P2WlanSection.devices),
         onOpenPeer: (peer) => showPeerDetailsSurface(context, peer),
         onOpenTroubleshooting: () => _select(P2WlanSection.troubleshooting),
@@ -196,6 +200,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         showHeader: false,
+        capabilities: widget.capabilities,
       ),
       P2WlanSection.troubleshooting => DiagnosticsPage(
         settingsStore: widget.settingsStore,
@@ -406,10 +411,14 @@ class _ShellStatusActions extends StatelessWidget {
   const _ShellStatusActions({
     required this.statusStore,
     this.showStatusBadge = true,
+    this.showTroubleshootingAction = false,
+    this.onOpenTroubleshooting,
   });
 
   final StatusStore statusStore;
   final bool showStatusBadge;
+  final bool showTroubleshootingAction;
+  final VoidCallback? onOpenTroubleshooting;
 
   @override
   Widget build(BuildContext context) {
@@ -428,6 +437,13 @@ class _ShellStatusActions extends StatelessWidget {
                 child: Center(
                   child: StatusBadge(label: label, tone: tone),
                 ),
+              ),
+            if (showTroubleshootingAction && onOpenTroubleshooting != null)
+              IconButton(
+                key: const Key('shell-open-troubleshooting'),
+                tooltip: strings.openTroubleshooting,
+                onPressed: onOpenTroubleshooting,
+                icon: Icon(P2WlanSection.troubleshooting.icon),
               ),
             IconButton(
               tooltip: strings.refresh,

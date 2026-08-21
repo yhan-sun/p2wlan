@@ -7,6 +7,11 @@ on:
       - codex/**
     paths:
       - "apps/flutter_client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "client/android-native/**"
+      - "client/tun/**"
+      - "scripts/build_android_native.sh"
       # The daemon owns the authoritative status/route/event contract the
       # Flutter client consumes; changes must re-run client tests + contract
       # test (ADR 0004, P2-04).
@@ -23,6 +28,11 @@ on:
     branches: [ main ]
     paths:
       - "apps/flutter_client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "client/android-native/**"
+      - "client/tun/**"
+      - "scripts/build_android_native.sh"
       - "client/daemon/src/diagnostics/**"
       - "client/daemon/src/route/**"
       - "client/daemon/src/connection_timeline.rs"
@@ -81,6 +91,19 @@ jobs:
         with:
           channel: stable
           cache: true
+
+      - name: Set up Rust Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Configure Android NDK for Rust bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
 
       - name: Flutter pub get
         run: flutter pub get
@@ -232,6 +255,11 @@ jobs:
       - name: Bundle Windows daemon
         shell: pwsh
         run: Copy-Item ..\..\target\release\p2wlan-daemon.exe build\windows\x64\runner\Release\p2wlan-daemon.exe -Force
+
+      - name: Bundle Wintun runtime
+        shell: pwsh
+        working-directory: apps/flutter_client
+        run: .\scripts\fetch_wintun.ps1 -DestinationDirectory "build\windows\x64\runner\Release" -Architecture amd64
 
       - name: Pack Windows bundle
         shell: pwsh

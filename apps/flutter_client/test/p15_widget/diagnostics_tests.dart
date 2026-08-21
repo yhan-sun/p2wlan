@@ -540,7 +540,7 @@ void _registerDiagnosticsTests() {
         child: DiagnosticsPage(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
-          capabilities: PlatformCapabilities.fromPlatform('android'),
+          capabilities: PlatformCapabilities.fromPlatform('ios'),
         ),
       ),
     );

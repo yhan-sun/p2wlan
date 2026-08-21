@@ -4,17 +4,13 @@ import 'package:p2wlan_flutter_client/app/navigation_model.dart';
 
 void main() {
   group('P2WlanSection — primary IA', () {
-    test(
-      'primary user-level destinations are Home, Devices, Troubleshooting, Settings',
-      () {
-        expect(P2WlanSection.primary, [
-          P2WlanSection.home,
-          P2WlanSection.devices,
-          P2WlanSection.troubleshooting,
-          P2WlanSection.settings,
-        ]);
-      },
-    );
+    test('primary user-level destinations are Home, Devices, Settings', () {
+      expect(P2WlanSection.primary, [
+        P2WlanSection.home,
+        P2WlanSection.devices,
+        P2WlanSection.settings,
+      ]);
+    });
 
     test('there is no separate tunnels section', () {
       // Phase 5: Tunnels was fully absorbed into Troubleshooting → Advanced.
@@ -31,7 +27,6 @@ void main() {
     test('sidebar groups match the desktop model', () {
       expect(P2WlanSection.sidebarGroups, [
         [P2WlanSection.home, P2WlanSection.devices],
-        [P2WlanSection.troubleshooting],
         [P2WlanSection.settings],
       ]);
     });
@@ -56,16 +51,31 @@ void main() {
       );
     });
 
-    test('troubleshooting stays a primary (routable) section on mobile', () {
-      expect(P2WlanSection.primary, contains(P2WlanSection.troubleshooting));
+    test('troubleshooting stays routable without a permanent nav item', () {
+      expect(P2WlanSection.values, contains(P2WlanSection.troubleshooting));
+      expect(
+        P2WlanSection.primary,
+        isNot(contains(P2WlanSection.troubleshooting)),
+      );
+      expect(
+        P2WlanSection.sidebarGroups.expand((group) => group),
+        isNot(contains(P2WlanSection.troubleshooting)),
+      );
     });
 
-    test('primary covers every section exactly once', () {
+    test('primary covers every visible section exactly once', () {
       expect(
         P2WlanSection.primary.toSet().length,
         P2WlanSection.primary.length,
       );
-      expect(P2WlanSection.primary, containsAll(P2WlanSection.values));
+      expect(
+        P2WlanSection.primary,
+        containsAll([
+          P2WlanSection.home,
+          P2WlanSection.devices,
+          P2WlanSection.settings,
+        ]),
+      );
     });
   });
 

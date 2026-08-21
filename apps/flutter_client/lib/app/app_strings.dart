@@ -131,6 +131,12 @@ class AppStrings {
   String get homeUnavailableDetail => isZh
       ? '本地网络服务当前不可用。'
       : 'The local network service is currently unavailable.';
+  String get mobileModeBadge => isZh ? '移动端' : 'Mobile';
+  String get mobileModeTitle => isZh ? '移动端管理模式' : 'Mobile management mode';
+  String get mobileModeDetail => isZh
+      ? 'Android 当前用于查看和管理网络、设备。本机不启动桌面 daemon；需要本地 VPN 节点时，请使用已支持的桌面端。'
+      : 'Android is used to view and manage the network and devices. It does not start the desktop daemon locally; use a supported desktop node when this device needs a local VPN tunnel.';
+  String get mobileModeOpenDevices => isZh ? '查看设备' : 'View devices';
   String get statusNormal => isZh ? '正常' : 'Normal';
   String get notRunning => isZh ? '未运行' : 'Not running';
   String get checkAgain => isZh ? '重新检查' : 'Check again';

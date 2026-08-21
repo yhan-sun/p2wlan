@@ -55,8 +55,8 @@ class PlatformCapabilities {
   /// Baseline capabilities for a normalized OS name.
   ///
   /// `os` is one of `windows`, `macos`, `linux`, `android`, `ios`, `fuchsia`,
-  /// `web`. Mobile and web are deliberately local-daemon/TUN-incapable until a
-  /// native VPN mode is built; they keep remote-management capability.
+  /// `web`. Android uses the native VpnService bridge; iOS and web remain
+  /// remote-management-only.
   factory PlatformCapabilities.fromPlatform(String os) {
     switch (os) {
       case 'windows':
@@ -74,6 +74,17 @@ class PlatformCapabilities {
           canManageRemoteDevices: true,
         );
       case 'android':
+        return const PlatformCapabilities(
+          canControlLocalDaemon: true,
+          canRequestElevation: false,
+          canVerifyRoutes: true,
+          canRepairRoutes: false,
+          canOpenLocalLogs: false,
+          canCreateSupportBundle: false,
+          canUseSystemTray: false,
+          canActAsLocalVpnNode: true,
+          canManageRemoteDevices: true,
+        );
       case 'ios':
       case 'fuchsia':
         return const PlatformCapabilities(

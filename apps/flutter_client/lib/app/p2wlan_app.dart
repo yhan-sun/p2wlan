@@ -79,9 +79,14 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       );
       unawaited(_desktopTrayController!.initialize());
     }
-    if (widget.autoStartPolling) {
+    // Mobile/web builds are remote-management clients. They do not ship a
+    // local diagnostics daemon, so polling the desktop default
+    // 127.0.0.1:39277 would manufacture a "local service unavailable" state
+    // on every Android/iOS launch.
+    final canPollLocalDaemon = _capabilities.canActAsLocalVpnNode;
+    if (widget.autoStartPolling && canPollLocalDaemon) {
       _statusStore.startPolling();
-    } else if (widget.initialRefresh) {
+    } else if (widget.initialRefresh && canPollLocalDaemon) {
       unawaited(_statusStore.refreshUntilPeerCatalogSettled());
     }
   }

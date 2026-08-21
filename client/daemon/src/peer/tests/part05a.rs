@@ -97,6 +97,101 @@ async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
 }
 
 #[tokio::test]
+async fn relay_ticket_renewal_does_not_rearm_completed_relay_first_gate() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.62:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18083";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(101),
+        )
+        .await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    assert!(manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(101),
+        )
+        .await);
+    assert!(manager
+        .mark_relay_first_business_sent_for_generation("peer1", generation)
+        .await);
+    assert!(manager
+        .mark_relay_first_business_received_for_generation_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(101),
+        )
+        .await);
+
+    let completed = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(
+        completed
+            .relay_first
+            .business_gate_completed_generation,
+        Some(generation)
+    );
+    assert_eq!(
+        manager
+            .select_path_for_data("peer1", true, true)
+            .await
+            .path,
+        Some(NetworkPath::Direct)
+    );
+
+    // A make-before-break ticket renewal replaces the relay transport and
+    // revokes only the old relay confirmation. It must not make an already
+    // established Direct path wait for the first-business exchange again.
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(202),
+        )
+        .await;
+    let replacement = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(replacement.relay_confirmed_generation, None);
+    assert_eq!(
+        replacement
+            .relay_first
+            .business_gate_completed_generation,
+        Some(generation)
+    );
+    assert_eq!(
+        manager
+            .select_path_for_data("peer1", true, true)
+            .await
+            .path,
+        Some(NetworkPath::Direct)
+    );
+
+    assert!(manager
+        .confirm_relay_peer_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(202),
+        )
+        .await);
+    let after_confirmation = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(after_confirmation.path, Some(NetworkPath::Direct));
+    assert!(manager.path_commit_targets().await.is_empty());
+}
+
+#[tokio::test]
 async fn one_way_business_does_not_permanently_block_direct_when_pathcommit_proves_relay() {
     // P0-4 (audit): one-directional traffic (telemetry, video push, heartbeat
     // only) never produces a natural *received* business direction, so the

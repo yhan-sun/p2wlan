@@ -93,6 +93,9 @@ pub struct Daemon {
     /// outbound path can wait event-driven for a relay to come up instead of
     /// polling at a fixed interval.
     relay_available_tx: watch::Sender<bool>,
+    /// Android's VpnService establishes the TUN before the Rust daemon starts.
+    #[cfg(target_os = "android")]
+    android_tun_fd: Option<std::os::fd::RawFd>,
 }
 
 impl Daemon {
@@ -221,7 +224,17 @@ impl Daemon {
             timeline,
             status_events,
             relay_available_tx,
+            #[cfg(target_os = "android")]
+            android_tun_fd: None,
         }
+    }
+
+    /// Construct a daemon around the fd owned by Android's VpnService.
+    #[cfg(target_os = "android")]
+    pub fn new_with_android_tun(config: Config, tun_fd: std::os::fd::RawFd) -> Self {
+        let mut daemon = Self::new(config);
+        daemon.android_tun_fd = Some(tun_fd);
+        daemon
     }
 
     /// Return a clone of the shutdown sender so main can signal SIGTERM/SIGINT.

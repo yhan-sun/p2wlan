@@ -9,6 +9,7 @@ import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../core/api/control_api.dart';
+import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -16,6 +17,7 @@ import '../../shared/formatters.dart';
 import '../../shared/layout/app_breakpoints.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
+import '../../shared/widgets/status_badge.dart';
 
 part 'nodes/local_node.dart';
 part 'nodes/toolbar.dart';
@@ -24,6 +26,7 @@ part 'nodes/peer_detail.dart';
 part 'nodes/peer_dialogs.dart';
 part 'nodes/helpers.dart';
 part 'nodes/speed_test.dart';
+part 'nodes/remote_only.dart';
 
 enum _NodesLayout { compact, medium, expanded }
 
@@ -34,6 +37,7 @@ class NodesPage extends StatefulWidget {
     required this.statusStore,
     this.showHeader = true,
     this.controlApi,
+    this.capabilities,
   });
 
   final SettingsStore settingsStore;
@@ -43,6 +47,11 @@ class NodesPage extends StatefulWidget {
   /// Control-plane API override (primarily for tests); defaults to a real
   /// [ControlApi].
   final ControlApi? controlApi;
+
+  /// Platform capability override. Mobile clients do not own a local daemon
+  /// or TUN, so they render an explicit remote-management state instead of a
+  /// fabricated offline local node.
+  final PlatformCapabilities? capabilities;
 
   @override
   State<NodesPage> createState() => _NodesPageState();
@@ -114,6 +123,9 @@ class _NodesPageState extends State<NodesPage> {
             widget.settingsStore,
           ]),
           builder: (context, _) {
+            final capabilities =
+                widget.capabilities ?? PlatformCapabilities.current();
+            final remoteOnly = !capabilities.canActAsLocalVpnNode;
             final snapshot = widget.statusStore.snapshot;
             final allPeers = _dedupeAndSortPeers(
               snapshot?.peers ?? const <PeerSnapshot>[],
@@ -132,93 +144,96 @@ class _NodesPageState extends State<NodesPage> {
               subtitle: stringsOf(context).nodesSubtitle,
               showHeader: widget.showHeader,
               maxWidth: nodesPageMaxWidth,
-              children: [
-                _NodeToolbar(
-                  searchController: _searchController,
-                  searchFocusNode: _searchFocusNode,
-                  filter: _filter,
-                  sort: _sort,
-                  allPeers: allPeers,
-                  onFilterChanged: (filter) => setState(() => _filter = filter),
-                  onSortChanged: (sort) => setState(() => _sort = sort),
-                  onQueryChanged: () => setState(() {}),
-                  onClearSearch: () => setState(_searchController.clear),
-                ),
-                if (widget.statusStore.snapshotStale) ...[
-                  const SizedBox(height: AppTokens.space8),
-                  Row(
-                    children: [
-                      Container(
-                        width: 7,
-                        height: 7,
-                        decoration: BoxDecoration(
-                          color: P2WlanColors.of(context).warningDot,
-                          shape: BoxShape.circle,
-                        ),
+              children: remoteOnly
+                  ? const [_RemoteOnlyNodesState()]
+                  : [
+                      _NodeToolbar(
+                        searchController: _searchController,
+                        searchFocusNode: _searchFocusNode,
+                        filter: _filter,
+                        sort: _sort,
+                        allPeers: allPeers,
+                        onFilterChanged: (filter) =>
+                            setState(() => _filter = filter),
+                        onSortChanged: (sort) => setState(() => _sort = sort),
+                        onQueryChanged: () => setState(() {}),
+                        onClearSearch: () => setState(_searchController.clear),
                       ),
-                      const SizedBox(width: 7),
-                      Text(
-                        stringsOf(context).stale,
-                        style: TextStyle(
-                          color: P2WlanColors.of(context).warningText,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
+                      if (widget.statusStore.snapshotStale) ...[
+                        const SizedBox(height: AppTokens.space8),
+                        Row(
+                          children: [
+                            Container(
+                              width: 7,
+                              height: 7,
+                              decoration: BoxDecoration(
+                                color: P2WlanColors.of(context).warningDot,
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            const SizedBox(width: 7),
+                            Text(
+                              stringsOf(context).stale,
+                              style: TextStyle(
+                                color: P2WlanColors.of(context).warningText,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
                         ),
+                      ],
+                      const SizedBox(height: AppTokens.space14),
+                      _LocalNodePanel(
+                        snapshot: snapshot,
+                        settings: settings,
+                        daemonReachable: widget.statusStore.daemonReachable,
+                        onEdit: () => _editLocalNode(snapshot),
                       ),
+                      const SizedBox(height: AppTokens.space12),
+                      if (allPeers.isEmpty)
+                        _NodesEmptyState(
+                          icon: Icons.devices_other_rounded,
+                          title: stringsOf(context).noPeersTitle,
+                          body: stringsOf(context).noPeersBody,
+                        )
+                      else if (visiblePeers.isEmpty)
+                        _NodesEmptyState(
+                          icon: query.trim().isNotEmpty
+                              ? Icons.search_off_rounded
+                              : Icons.filter_alt_off_rounded,
+                          title: query.trim().isNotEmpty
+                              ? stringsOf(context).noSearchResultsTitle
+                              : stringsOf(context).noFilterResultsTitle,
+                          body: query.trim().isNotEmpty
+                              ? stringsOf(context).noSearchResultsBody
+                              : stringsOf(context).noFilterResultsBody,
+                          actionLabel: query.trim().isNotEmpty
+                              ? stringsOf(context).clearSearch
+                              : stringsOf(context).clearFilter,
+                          onAction: query.trim().isNotEmpty
+                              ? () => setState(_searchController.clear)
+                              : () => setState(() => _filter = _NodeFilter.all),
+                        )
+                      else
+                        LayoutBuilder(
+                          builder: (context, constraints) {
+                            final layout =
+                                constraints.maxWidth >= nodesInspectorMinWidth
+                                ? _NodesLayout.expanded
+                                : constraints.maxWidth <
+                                      AppBreakpoints.compactMaxWidth
+                                ? _NodesLayout.compact
+                                : _NodesLayout.medium;
+                            return _PeerList(
+                              peers: visiblePeers,
+                              peerTransferRates: peerTransferRates,
+                              compact: layout == _NodesLayout.compact,
+                              onTap: (peer) => _openPeer(peer, layout),
+                            );
+                          },
+                        ),
                     ],
-                  ),
-                ],
-                const SizedBox(height: AppTokens.space14),
-                _LocalNodePanel(
-                  snapshot: snapshot,
-                  settings: settings,
-                  daemonReachable: widget.statusStore.daemonReachable,
-                  onEdit: () => _editLocalNode(snapshot),
-                ),
-                const SizedBox(height: AppTokens.space12),
-                if (allPeers.isEmpty)
-                  _NodesEmptyState(
-                    icon: Icons.devices_other_rounded,
-                    title: stringsOf(context).noPeersTitle,
-                    body: stringsOf(context).noPeersBody,
-                  )
-                else if (visiblePeers.isEmpty)
-                  _NodesEmptyState(
-                    icon: query.trim().isNotEmpty
-                        ? Icons.search_off_rounded
-                        : Icons.filter_alt_off_rounded,
-                    title: query.trim().isNotEmpty
-                        ? stringsOf(context).noSearchResultsTitle
-                        : stringsOf(context).noFilterResultsTitle,
-                    body: query.trim().isNotEmpty
-                        ? stringsOf(context).noSearchResultsBody
-                        : stringsOf(context).noFilterResultsBody,
-                    actionLabel: query.trim().isNotEmpty
-                        ? stringsOf(context).clearSearch
-                        : stringsOf(context).clearFilter,
-                    onAction: query.trim().isNotEmpty
-                        ? () => setState(_searchController.clear)
-                        : () => setState(() => _filter = _NodeFilter.all),
-                  )
-                else
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      final layout =
-                          constraints.maxWidth >= nodesInspectorMinWidth
-                          ? _NodesLayout.expanded
-                          : constraints.maxWidth <
-                                AppBreakpoints.compactMaxWidth
-                          ? _NodesLayout.compact
-                          : _NodesLayout.medium;
-                      return _PeerList(
-                        peers: visiblePeers,
-                        peerTransferRates: peerTransferRates,
-                        compact: layout == _NodesLayout.compact,
-                        onTap: (peer) => _openPeer(peer, layout),
-                      );
-                    },
-                  ),
-              ],
             );
           },
         ),

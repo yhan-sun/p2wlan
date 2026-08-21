@@ -191,7 +191,7 @@ void main() {
     expect(find.textContaining('TUN'), findsNothing);
   });
 
-  testWidgets('mobile platforms get remote-management subtitle copy', (
+  testWidgets('iOS keeps the remote-management subtitle copy', (
     tester,
   ) async {
     final stores = (await tester.runAsync(_makeStores))!;
@@ -200,7 +200,7 @@ void main() {
     await _pumpLogin(
       tester,
       stores,
-      capabilities: PlatformCapabilities.fromPlatform('android'),
+      capabilities: PlatformCapabilities.fromPlatform('ios'),
     );
 
     expect(

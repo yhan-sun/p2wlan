@@ -108,8 +108,9 @@ void main() {
     // Mobile: no top-bar status badge; only the hero carries one.
     expect(find.byType(StatusBadge), findsOneWidget);
 
-    // Medium tablet / small window: a labeled rail with the four primary
-    // sections.
+    // Medium tablet / small window: a labeled rail with the three primary
+    // sections. Troubleshooting stays contextual and is not a permanent
+    // sidebar destination.
     tester.view.physicalSize = const Size(700, 1000);
     await tester.pump();
     await tester.pump();
@@ -122,7 +123,7 @@ void main() {
     expect(find.byType(NavigationBar), findsNothing);
     expect(find.text('首页'), findsOneWidget);
     expect(find.text('设备'), findsOneWidget);
-    expect(find.text('故障排查'), findsOneWidget);
+    expect(find.text('故障排查'), findsNothing);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
     // Medium has no sidebar footer; Home itself carries the strong status, so
@@ -146,7 +147,7 @@ void main() {
     expect(find.text('P2WLAN'), findsWidgets);
     expect(find.text('首页'), findsOneWidget);
     expect(find.text('设备'), findsOneWidget);
-    expect(find.text('故障排查'), findsOneWidget);
+    expect(find.text('故障排查'), findsNothing);
     expect(find.text('设置'), findsOneWidget);
     expect(find.text('隧道'), findsNothing);
     // Sidebar status footer renders (daemon is offline in this harness), and
@@ -184,7 +185,7 @@ void main() {
       ),
       findsOneWidget,
     );
-    for (final label in const ['首页', '设备', '故障排查', '设置']) {
+    for (final label in const ['首页', '设备', '设置']) {
       expect(
         find.descendant(of: sidebar, matching: find.text(label)),
         findsOneWidget,
@@ -345,8 +346,13 @@ void main() {
     expect(find.byType(NodesPage), findsOneWidget);
     expect(find.byType(AppNavRail), findsOneWidget);
 
-    // 700 → 1280: Troubleshooting via the rail, then back to Home via the
-    // sidebar.
+    // Open Troubleshooting contextually from the mobile overflow, then verify
+    // it remains available across the desktop viewport changes.
+    tester.view.physicalSize = const Size(390, 844);
+    await tester.pump();
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('故障排查'));
     await tester.pumpAndSettle();
     expect(find.byType(DiagnosticsPage), findsOneWidget);

@@ -162,7 +162,9 @@ void _registerDesignSystemTests() {
     expect(find.text('Home'), findsOneWidget);
     // Sidebar item and the Home section title share the Devices label.
     expect(find.text('Devices'), findsWidgets);
-    expect(find.text('Troubleshooting'), findsOneWidget);
+    // Troubleshooting is contextual (status footer / overflow), not a
+    // permanent left-sidebar destination.
+    expect(find.text('Troubleshooting'), findsNothing);
     expect(find.text('Settings'), findsOneWidget);
     // Footer: the smoke store reports a healthy snapshot with peers.
     expect(find.text('Network OK'), findsOneWidget);

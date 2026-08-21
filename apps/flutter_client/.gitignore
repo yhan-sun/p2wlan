@@ -31,6 +31,10 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+
+# Generated Rust JNI libraries; Gradle's native build task recreates these
+# for the requested Android ABIs before packaging.
+/android/app/src/main/jniLibs/
 /coverage/
 
 # Symbolication related

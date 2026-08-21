@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart' show AppLifecycleState;
@@ -428,6 +429,18 @@ class StatusStore extends ChangeNotifier {
         await refreshUntilPeerCatalogSettled();
       } else {
         await refresh();
+      }
+      if (result.ok && Platform.isAndroid) {
+        final assignedVirtualIp = _snapshot?.virtualIp.trim() ?? '';
+        if (settingsStore.settings.virtualIp.trim().isEmpty &&
+            assignedVirtualIp.isNotEmpty) {
+          // The first managed Android start may receive its VIP only after
+          // registration. Persist it so the next VPN establish() uses the
+          // same system-interface address without another provisional bind.
+          await settingsStore.updateSettings(
+            settingsStore.settings.copyWith(virtualIp: assignedVirtualIp),
+          );
+        }
       }
       return result;
     } catch (error) {

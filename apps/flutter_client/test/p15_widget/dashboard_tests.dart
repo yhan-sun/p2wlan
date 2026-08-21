@@ -550,7 +550,7 @@ void _registerDashboardTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Home hides daemon controls on mobile capabilities', (
+  testWidgets('Home uses remote-management state on mobile capabilities', (
     tester,
   ) async {
     final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -579,13 +579,19 @@ void _registerDashboardTests() {
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
           capabilities: mobileCapabilities,
+          onOpenDevices: () {},
         ),
       ),
     );
 
-    expect(find.text('10.20.0.10'), findsOneWidget);
+    expect(find.text('Mobile management mode'), findsOneWidget);
+    expect(
+      find.textContaining('does not start the desktop daemon'),
+      findsOneWidget,
+    );
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
+    expect(find.byKey(const Key('mobile-home-open-devices')), findsOneWidget);
   });
 
   testWidgets('Home with no local daemon control never offers Start', (
@@ -618,10 +624,11 @@ void _registerDashboardTests() {
       ),
     );
 
-    expect(find.text('Cannot reach P2WLAN'), findsOneWidget);
+    expect(find.text('Mobile management mode'), findsOneWidget);
+    expect(find.text('Cannot reach P2WLAN'), findsNothing);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.text('Start P2WLAN'), findsNothing);
-    expect(find.byKey(const Key('dashboard-check-button')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-check-button')), findsNothing);
   });
 
   testWidgets('Home adapts layout across breakpoints', (tester) async {

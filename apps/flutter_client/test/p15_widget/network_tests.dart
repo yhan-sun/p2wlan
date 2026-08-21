@@ -253,7 +253,7 @@ void _registerNetworkTests() {
     await pumpNetworkPage(
       tester,
       api: api,
-      capabilities: PlatformCapabilities.fromPlatform('android'),
+      capabilities: PlatformCapabilities.fromPlatform('ios'),
     );
 
     expect(find.text('Check routes'), findsNothing);

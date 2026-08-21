@@ -18,16 +18,24 @@ void main() {
       }
     });
 
-    test('mobile keeps remote management but disables local VPN ops', () {
-      for (final os in ['android', 'ios']) {
-        final c = PlatformCapabilities.fromPlatform(os);
-        expect(c.canControlLocalDaemon, isFalse);
-        expect(c.canVerifyRoutes, isFalse);
-        expect(c.canRepairRoutes, isFalse);
-        expect(c.canOpenLocalLogs, isFalse);
-        expect(c.canActAsLocalVpnNode, isFalse);
-        expect(c.canManageRemoteDevices, isTrue, reason: 'remote mgmt allowed');
-      }
+    test('Android enables the native VpnService local node', () {
+      final c = PlatformCapabilities.fromPlatform('android');
+      expect(c.canControlLocalDaemon, isTrue);
+      expect(c.canVerifyRoutes, isTrue);
+      expect(c.canRepairRoutes, isFalse);
+      expect(c.canOpenLocalLogs, isFalse);
+      expect(c.canActAsLocalVpnNode, isTrue);
+      expect(c.canManageRemoteDevices, isTrue, reason: 'remote mgmt allowed');
+    });
+
+    test('iOS keeps remote management but disables local VPN ops', () {
+      final c = PlatformCapabilities.fromPlatform('ios');
+      expect(c.canControlLocalDaemon, isFalse);
+      expect(c.canVerifyRoutes, isFalse);
+      expect(c.canRepairRoutes, isFalse);
+      expect(c.canOpenLocalLogs, isFalse);
+      expect(c.canActAsLocalVpnNode, isFalse);
+      expect(c.canManageRemoteDevices, isTrue, reason: 'remote mgmt allowed');
     });
 
     test('web is remote-management only', () {
@@ -47,7 +55,7 @@ void main() {
     });
 
     test('daemon cannot turn a platform-incompatible one on', () {
-      final base = PlatformCapabilities.fromPlatform('android');
+      final base = PlatformCapabilities.fromPlatform('ios');
       final c = base.withDaemonCapabilities({'canControlLocalDaemon': true});
       expect(
         c.canControlLocalDaemon,

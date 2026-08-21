@@ -128,10 +128,13 @@ extension DaemonControllerElevation on DaemonController {
     final argLine = args.map(_windowsCommandLineArgQuote).join(' ');
     final script =
         'Start-Process -Verb RunAs -WindowStyle Hidden '
+        '-WorkingDirectory ${_powershellSingleQuoted(binary.parent.path)} '
         '-FilePath ${_powershellSingleQuoted(binary.path)} '
         '-ArgumentList ${_powershellSingleQuoted(argLine)}';
     final result = await Process.run('powershell', [
       '-NoProfile',
+      '-WindowStyle',
+      'Hidden',
       '-ExecutionPolicy',
       'Bypass',
       '-Command',

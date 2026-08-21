@@ -372,6 +372,12 @@ impl PeerConnection {
             self.first_usable_at = None;
             self.first_usable_path = None;
         }
+        if self.relay_first.business_gate_completed_generation != Some(local_generation) {
+            // The relay-first proof is scoped to the network generation. A
+            // relay ticket renewal keeps this marker, but a real network
+            // handover starts a new first-business contract.
+            self.relay_first.business_gate_completed_generation = None;
+        }
         // A true network handover invalidates the local relay transport
         // milestone as well as the encrypted peer confirmation. Keeping the
         // old ready timestamp would make a new generation look relay-ready

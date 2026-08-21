@@ -19,6 +19,9 @@ pub mod windows;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(target_os = "android")]
+pub mod android;
+
 // Re-export the platform-specific device as `PlatformTun`
 #[cfg(target_os = "linux")]
 pub use linux::LinuxTun as PlatformTun;
@@ -29,5 +32,13 @@ pub use windows::WintunDevice as PlatformTun;
 #[cfg(target_os = "macos")]
 pub use macos::UtunDevice as PlatformTun;
 
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-compile_error!("p2pnet-tun is only supported on Linux, Windows, and macOS");
+#[cfg(target_os = "android")]
+pub use android::AndroidTun as PlatformTun;
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "android"
+)))]
+compile_error!("p2pnet-tun is only supported on Linux, Windows, macOS, and Android");

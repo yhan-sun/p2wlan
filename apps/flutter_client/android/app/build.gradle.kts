@@ -34,6 +34,28 @@ android {
     }
 }
 
+val buildP2wlanNative by tasks.registering(Exec::class) {
+    inputs.files(
+        rootProject.file("../../../Cargo.toml"),
+        rootProject.file("../../../Cargo.lock"),
+        rootProject.file("../../../client"),
+        rootProject.file("../../../scripts/build_android_native.sh"),
+    )
+    outputs.files(
+        project.file("src/main/jniLibs/arm64-v8a/libp2wlan_android.so"),
+        project.file("src/main/jniLibs/armeabi-v7a/libp2wlan_android.so"),
+        project.file("src/main/jniLibs/x86_64/libp2wlan_android.so"),
+    )
+    commandLine(
+        "bash",
+        rootProject.file("../../../scripts/build_android_native.sh").absolutePath,
+    )
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(buildP2wlanNative)
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

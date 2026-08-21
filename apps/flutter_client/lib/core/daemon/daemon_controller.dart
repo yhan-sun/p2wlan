@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/services.dart';
+
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
 
@@ -11,6 +13,7 @@ part 'daemon_controller/elevation.dart';
 part 'daemon_controller/diagnostics_paths.dart';
 part 'daemon_controller/launch_token.dart';
 part 'daemon_controller/pids.dart';
+part 'daemon_controller/android_vpn.dart';
 
 class DaemonCommandResult {
   const DaemonCommandResult({
@@ -37,6 +40,7 @@ class DaemonController {
   final DiagnosticsApi _diagnosticsApi;
 
   Future<DaemonCommandResult> start(AppSettings settings) async {
+    if (Platform.isAndroid) return _startAndroidVpn(settings);
     if (!_supportsProcessControl) {
       return const DaemonCommandResult(
         ok: false,
@@ -215,6 +219,14 @@ class DaemonController {
           manualCommand: manualCommand,
         );
       }
+      if (Platform.isWindows && await _logShowsWintunMissing(logPath)) {
+        return DaemonCommandResult(
+          ok: false,
+          message:
+              'Windows 运行组件缺失：找不到 wintun.dll。请重新安装包含 Wintun 的 P2WLAN 安装包，或把 wintun.dll 放到 p2wlan-daemon.exe 同级目录。',
+          manualCommand: manualCommand,
+        );
+      }
       return DaemonCommandResult(
         ok: false,
         message:
@@ -231,6 +243,7 @@ class DaemonController {
   }
 
   Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
+    if (Platform.isAndroid) return _stopAndroidVpn(diagnosticsUrl);
     if (!_supportsProcessControl) {
       return const DaemonCommandResult(
         ok: false,

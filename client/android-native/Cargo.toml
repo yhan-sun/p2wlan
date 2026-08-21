@@ -1,0 +1,21 @@
+[package]
+name = "p2wlan-android-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JNI bridge for the P2WLAN Android VPN service"
+
+[lib]
+name = "p2wlan_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+p2wlan-daemon = { path = "../daemon" }
+jni = "0.21"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }

@@ -100,6 +100,25 @@ Future<PermissionPreflight> runPermissionPreflight() async {
   if (Platform.isWindows) return _checkWindowsPermissions();
   if (Platform.isLinux) return _checkLinuxPermissions();
   if (Platform.isMacOS) return _checkMacosPermissions();
+  if (Platform.isAndroid) {
+    return const PermissionPreflight(
+      platform: 'Android',
+      state: PermissionPreflightState.runtimeVerificationRequired,
+      canCreateTun: null,
+      canModifyRoutes: null,
+      elevationSupported: false,
+      reasonCode: 'vpn_consent',
+      message: 'Android 会在启动本地节点时请求系统 VPN 授权；无需 root 或管理员密码。',
+      checks: [
+        PermissionCheck(
+          label: 'Android VPN consent',
+          status: 'warn',
+          detail: 'verified when the VpnService starts',
+          code: 'vpn_consent',
+        ),
+      ],
+    );
+  }
   return const PermissionPreflight(
     platform: 'other',
     state: PermissionPreflightState.unsupported,

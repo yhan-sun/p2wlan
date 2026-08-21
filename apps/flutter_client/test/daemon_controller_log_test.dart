@@ -57,6 +57,24 @@ void main() {
     expect(await logTailShowsPermanentAuthFailure(log.path), isFalse);
   });
 
+  test('detects a missing Wintun runtime marker', () async {
+    final log = await writeLog(
+      'ERROR p2pnet_tun::windows: wintun.dll not found or not loadable. '
+      'Tried: C:\\Program Files\\P2WLAN\\wintun.dll\n',
+    );
+    expect(await logTailShowsWintunMissing(log.path), isTrue);
+  });
+
+  test(
+    'a healthy Windows runtime log is not a missing Wintun marker',
+    () async {
+      final log = await writeLog(
+        'INFO p2pnet_tun::windows: Loaded Wintun runtime from wintun.dll\n',
+      );
+      expect(await logTailShowsWintunMissing(log.path), isFalse);
+    },
+  );
+
   test('a missing log file is not an auth failure', () async {
     expect(
       await logTailShowsPermanentAuthFailure('${tempDir.path}/missing.log'),

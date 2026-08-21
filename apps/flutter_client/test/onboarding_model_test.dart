@@ -7,7 +7,7 @@ void main() {
     capabilities: PlatformCapabilities.fromPlatform('macos'),
   );
   final mobile = OnboardingModel(
-    capabilities: PlatformCapabilities.fromPlatform('android'),
+    capabilities: PlatformCapabilities.fromPlatform('ios'),
   );
   final web = OnboardingModel(
     capabilities: PlatformCapabilities.fromPlatform('web'),

@@ -257,6 +257,13 @@ impl PeerConnection {
         local_generation: u64,
         relay_available: bool,
     ) -> bool {
+        // Relay ticket renewal is make-before-break.  Once this generation
+        // has completed the initial relay-first business exchange, a fresh
+        // relay incarnation must not pause an already established Direct
+        // path while its fallback proof is renewed in the background.
+        if self.relay_first.business_gate_completed_generation == Some(local_generation) {
+            return false;
+        }
         let gate_started_at = if self.relay_ready_generation == Some(local_generation) {
             self.relay_ready_at
         } else if self.relay_first.gate_generation == Some(local_generation) {
@@ -283,6 +290,7 @@ impl PeerConnection {
         if !relay_available
             || self.relay_ready_generation != Some(local_generation)
             || !self.relay_peer_confirmed_for_generation(local_generation)
+            || self.relay_first.business_gate_completed_generation == Some(local_generation)
             || self.relay_first.business_exchange_generation == Some(local_generation)
             || self.relay_first.business_pathcommit_generation == Some(local_generation)
         {

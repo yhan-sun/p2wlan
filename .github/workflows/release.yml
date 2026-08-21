@@ -50,6 +50,19 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Set up Rust Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Configure Android NDK for Rust bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
@@ -441,6 +454,7 @@ jobs:
           }
           $sourceDir = $releaseDir.FullName
           Copy-Item "target\release\p2wlan-daemon.exe" (Join-Path $sourceDir "p2wlan-daemon.exe") -Force
+          & "apps\flutter_client\scripts\fetch_wintun.ps1" -DestinationDirectory $sourceDir -Architecture amd64
           python3 scripts/release/verify_release_identity.py --release --daemon (Join-Path $sourceDir "p2wlan-daemon.exe") --expected-commit $env:GITHUB_SHA
           $outputDir = (Resolve-Path "dist-release").Path
           $iss = Join-Path $env:RUNNER_TEMP "p2wlan-flutter-windows.iss"

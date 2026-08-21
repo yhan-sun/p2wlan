@@ -77,9 +77,17 @@ pub(crate) struct RelayFirstBusinessState {
     /// closing the relay-first business gate; it does not itself activate
     /// Direct.
     pub business_pathcommit_generation: Option<u64>,
+    /// Generation in which the relay-first business gate completed at least
+    /// once.  Unlike the per-transport business markers above, this survives
+    /// a make-before-break relay ticket renewal: the replacement transport
+    /// still needs a fresh encrypted relay confirmation for fallback, but an
+    /// already-established Direct path must not be demoted and forced to
+    /// repeat the initial relay-first gate.
+    pub business_gate_completed_generation: Option<u64>,
     /// Real relay business ingress observed before local RelayPeerConfirmed.
     /// It is promoted only when the later confirmation matches generation,
-    /// endpoint and transport incarnation; any lifecycle reset clears it.
+    /// endpoint and transport incarnation; relay transport renewal clears the
+    /// pending tuple, while a generation/session reset clears all gate state.
     pub(crate) preconfirmation: Option<PendingRelayBusinessEvidence>,
 }
 

@@ -1,5 +1,70 @@
 part of '../dashboard_page.dart';
 
+/// Mobile/web home state. These builds are remote-management clients and do
+/// not own a local desktop daemon or diagnostics endpoint. Keep that boundary
+/// explicit instead of rendering the desktop "service unavailable" recovery
+/// state against a localhost URL that can never exist on the phone.
+class _RemoteOnlyHero extends StatelessWidget {
+  const _RemoteOnlyHero({this.onOpenDevices});
+
+  final VoidCallback? onOpenDevices;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final theme = Theme.of(context);
+    return _HeroSurface(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  strings.mobileModeTitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSurface,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: AppTokens.space12),
+              StatusBadge(
+                label: strings.mobileModeBadge,
+                tone: StatusTone.neutral,
+              ),
+            ],
+          ),
+          const SizedBox(height: AppTokens.space12),
+          Text(
+            strings.mobileModeDetail,
+            style: TextStyle(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontSize: 13,
+              height: 1.45,
+            ),
+          ),
+          if (onOpenDevices != null) ...[
+            const SizedBox(height: AppTokens.space14),
+            Align(
+              alignment: Alignment.centerRight,
+              child: OutlinedButton.icon(
+                key: const Key('mobile-home-open-devices'),
+                onPressed: onOpenDevices,
+                icon: const Icon(Icons.devices_other_rounded, size: 17),
+                label: Text(strings.mobileModeOpenDevices),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 /// Home hero: quiet status, Virtual IP, key metrics, and daemon recovery
 /// actions. One surface — the only strong container on Home.
 class _NetworkHero extends StatelessWidget {

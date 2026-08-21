@@ -544,6 +544,7 @@ impl PeerManager {
                 conn.relay_first.business_received_generation = Some(generation);
                 if conn.relay_first.business_sent_generation == Some(generation) {
                     conn.relay_first.business_exchange_generation = Some(generation);
+                    conn.relay_first.business_gate_completed_generation = Some(generation);
                 }
             }
             if result.0 {
@@ -698,6 +699,7 @@ impl PeerManager {
                     } else if path == NetworkPath::Direct
                         && (conn.relay_confirmed_generation == Some(generation)
                             && conn.relay_confirmed_endpoint.is_some())
+                        && conn.relay_first.business_gate_completed_generation != Some(generation)
                         && conn.relay_first.business_exchange_generation != Some(generation)
                     {
                         // A confirmed relay remains the business safety path
@@ -1100,6 +1102,7 @@ impl PeerManager {
                         .relay_confirmed_endpoint
                         .as_deref()
                         .is_some_and(|endpoint| !endpoint.is_empty())
+                    && conn.relay_first.business_gate_completed_generation != Some(generation)
                     && conn.relay_first.business_exchange_generation != Some(generation)
                     && conn.relay_first.business_pathcommit_generation != Some(generation)
             })
@@ -1215,6 +1218,7 @@ impl PeerManager {
                 && conn.relay_first.business_exchange_generation != Some(generation);
             if exchange_confirmed {
                 conn.relay_first.business_exchange_generation = Some(generation);
+                conn.relay_first.business_gate_completed_generation = Some(generation);
             }
             (
                 true,
@@ -1348,6 +1352,7 @@ impl PeerManager {
                         && conn.relay_first.business_exchange_generation != Some(generation);
                 if exchange_confirmed {
                     conn.relay_first.business_exchange_generation = Some(generation);
+                    conn.relay_first.business_gate_completed_generation = Some(generation);
                 }
                 if !first_receive && !exchange_confirmed {
                     (false, false, None, false)
@@ -1448,6 +1453,7 @@ impl PeerManager {
                 return false;
             }
             conn.relay_first.business_pathcommit_generation = Some(generation);
+            conn.relay_first.business_gate_completed_generation = Some(generation);
             (
                 true,
                 conn.relay_confirmed_endpoint.clone().unwrap_or_else(|| {
