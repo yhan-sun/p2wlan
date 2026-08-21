@@ -318,9 +318,17 @@ async fn test_peer_manager_candidates() {
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(conn.candidates.len(), 2);
     assert_eq!(conn.candidate_pairs.len(), 3);
+    assert_eq!(
+        conn.candidate_pairs
+            .iter()
+            .find(|pair| pair.remote_endpoint == "1.2.3.4:5000".parse().unwrap())
+            .map(|pair| pair.state),
+        Some(CandidatePairState::Degraded)
+    );
     assert!(conn
         .candidate_pairs
         .iter()
+        .filter(|pair| pair.remote_endpoint != "1.2.3.4:5000".parse().unwrap())
         .all(|pair| pair.local_generation == 0 && pair.state == CandidatePairState::Waiting));
 }
 

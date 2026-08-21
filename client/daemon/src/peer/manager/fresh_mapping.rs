@@ -765,6 +765,7 @@ impl PeerManager {
             .iter()
             .filter(|pair| {
                 pair.local_generation == generation
+                    && conn.pair_belongs_to_current_remote_epoch(pair)
                     && matches!(
                         pair.source,
                         CandidatePairSource::PeerReflexive | CandidatePairSource::Learned
@@ -825,6 +826,7 @@ impl PeerManager {
                 conn.candidate_pairs.iter().find(|pair| {
                     pair.local_generation == generation
                         && pair.remote_endpoint == endpoint
+                        && conn.pair_belongs_to_current_remote_epoch(pair)
                         && pair.source == CandidatePairSource::Predicted
                 })
             })

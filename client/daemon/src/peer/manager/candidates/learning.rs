@@ -78,6 +78,7 @@ impl PeerManager {
         conn.candidate_pairs.iter().any(|pair| {
             pair.remote_endpoint == endpoint
                 && pair.local_generation == generation
+                && conn.pair_belongs_to_current_remote_epoch(pair)
                 && matches!(
                     pair.source,
                     CandidatePairSource::PeerReflexive | CandidatePairSource::Learned
@@ -142,8 +143,10 @@ impl PeerManager {
                 .candidates
                 .iter()
                 .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
-                .any(|candidate| candidate == endpoint);
-            let matches_current = conn.endpoint == Some(endpoint);
+                .any(|candidate| candidate == endpoint)
+                && conn.is_current_remote_endpoint(endpoint);
+            let matches_current =
+                conn.endpoint == Some(endpoint) && conn.is_current_remote_endpoint(endpoint);
 
             if matches_candidate || matches_current {
                 conn.endpoint = Some(endpoint);

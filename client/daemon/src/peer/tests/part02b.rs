@@ -92,7 +92,8 @@ async fn candidate_pair_selection_prefers_selected_endpoint_for_send() {
 
     assert_eq!(
         manager.direct_endpoint_for_send("peer1").await,
-        Some(old_endpoint)
+        Some(new_endpoint),
+        "a remote candidate refresh must fence the previous registry endpoint"
     );
 
     assert!(

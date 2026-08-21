@@ -204,6 +204,97 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
 }
 
 #[tokio::test]
+async fn remote_candidate_refresh_cancels_direct_validation_owner() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.2", None))
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let old_endpoint: SocketAddr = "198.51.100.20:51820".parse().unwrap();
+    let fresh_endpoint: SocketAddr = "198.51.100.20:51821".parse().unwrap();
+
+    assert!(matches!(
+        peers
+            .add_candidates_with_metadata(
+                "peer-b",
+                &[old_endpoint.to_string()],
+                &HashMap::new(),
+                10,
+                Some(u64::MAX),
+            )
+            .await,
+        crate::peer::CandidateSetApplyResult::Applied
+    ));
+    let generation = peers.current_network_generation().await;
+    let owner = match udp
+        .begin_or_merge_direct_validation("peer-b", old_endpoint, generation)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("expected a validation owner"),
+    };
+    assert!(udp
+        .expect_direct_validation_ack_owned(
+            "peer-b",
+            0x5101,
+            generation,
+            owner,
+            old_endpoint,
+        )
+        .await);
+
+    assert!(matches!(
+        peers
+            .add_candidates_with_metadata(
+                "peer-b",
+                &[fresh_endpoint.to_string()],
+                &HashMap::new(),
+                11,
+                Some(u64::MAX),
+            )
+            .await,
+        crate::peer::CandidateSetApplyResult::Applied
+    ));
+
+    // ABA handover: the peer can receive the same endpoint again after the
+    // cellular mapping is replaced.  The wire generation/remote epoch, not
+    // SocketAddr equality, is authoritative; the old owner must stay
+    // cancelled even when endpoint A is advertised again.
+    assert!(matches!(
+        peers
+            .add_candidates_with_metadata(
+                "peer-b",
+                &[old_endpoint.to_string()],
+                &HashMap::new(),
+                12,
+                Some(u64::MAX),
+            )
+            .await,
+        crate::peer::CandidateSetApplyResult::Applied
+    ));
+
+    assert!(udp.direct_validation_target("peer-b").await.is_none());
+    assert!(!udp.has_direct_validation_expectation("peer-b").await);
+    assert!(udp
+        .consume_direct_validation_ack(
+            "peer-b",
+            0x5101,
+            generation,
+            owner,
+            generation,
+            old_endpoint,
+            Some(0),
+            true,
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn stale_udp_offline_and_key_change_cleanup_cancel_replacement_validation_owner() {
     // Offline and public-key-change events use the same lifecycle cleanup
     // with `remove_connection = false`. Exercise both after a rebind so the

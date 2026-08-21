@@ -1117,9 +1117,7 @@ async fn fresh_public_candidate_ranks_before_stale_peer_reflexive_without_succes
         .await;
 
     let targets = manager.direct_probe_targets_for("peer1").await;
-    assert!(targets.len() >= 2);
-    assert_eq!(targets[0], fresh_stable);
-    assert_eq!(targets[1], stale_peer_reflexive);
+    assert_eq!(targets, vec![fresh_stable]);
 }
 
 #[tokio::test]

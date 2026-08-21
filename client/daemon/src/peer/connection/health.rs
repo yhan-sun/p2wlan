@@ -43,9 +43,12 @@ impl PeerConnection {
         local_endpoint: Option<SocketAddr>,
     ) -> (CandidatePairSource, bool) {
         let peer_id = self.node_id.clone();
+        let remote_epoch = self.remote_candidate_epoch;
         if selected {
             for pair in self.candidate_pairs.iter_mut().filter(|pair| {
-                pair.local_generation == local_generation && pair.remote_endpoint != endpoint
+                pair.local_generation == local_generation
+                    && pair.remote_candidate_epoch == remote_epoch
+                    && pair.remote_endpoint != endpoint
             }) {
                 let was_selected = pair.state == CandidatePairState::Selected
                     || pair.selected_at.is_some()
@@ -91,9 +94,12 @@ impl PeerConnection {
         local_endpoint: Option<SocketAddr>,
     ) -> (CandidatePairSource, bool) {
         let peer_id = self.node_id.clone();
+        let remote_epoch = self.remote_candidate_epoch;
         if selected {
             for pair in self.candidate_pairs.iter_mut().filter(|pair| {
-                pair.local_generation == local_generation && pair.remote_endpoint != endpoint
+                pair.local_generation == local_generation
+                    && pair.remote_candidate_epoch == remote_epoch
+                    && pair.remote_endpoint != endpoint
             }) {
                 let was_selected = pair.state == CandidatePairState::Selected
                     || pair.selected_at.is_some()
@@ -168,6 +174,7 @@ impl PeerConnection {
         self.candidate_pairs.iter().any(|pair| {
             pair.remote_endpoint == endpoint
                 && pair.local_generation == local_generation
+                && pair.remote_candidate_epoch == self.remote_candidate_epoch
                 && pair.slow_validation_is_recent_at(now, SLOW_DIRECT_RELAY_RETRY_COOLDOWN)
         })
     }
@@ -180,8 +187,11 @@ impl PeerConnection {
         reason: &str,
     ) -> Option<CandidatePairSource> {
         let peer_id = self.node_id.clone();
+        let remote_epoch = self.remote_candidate_epoch;
         let pair = self.candidate_pairs.iter_mut().find(|pair| {
-            pair.remote_endpoint == endpoint && pair.local_generation == local_generation
+            pair.remote_endpoint == endpoint
+                && pair.local_generation == local_generation
+                && pair.remote_candidate_epoch == remote_epoch
         })?;
         let nominated = pair.nominate(local_endpoint);
         if nominated {
@@ -204,7 +214,10 @@ impl PeerConnection {
         for pair in self
             .candidate_pairs
             .iter_mut()
-            .filter(|pair| pair.local_generation == local_generation)
+            .filter(|pair| {
+                pair.local_generation == local_generation
+                    && pair.remote_candidate_epoch == self.remote_candidate_epoch
+            })
         {
             let old_state = pair.state;
             if pair.expire_stale_nomination(DIRECT_TRIAL_WINDOW, reason.clone(), local_endpoint) {
@@ -244,13 +257,19 @@ impl PeerConnection {
         let has_probed_pair = self
             .candidate_pairs
             .iter()
-            .any(|pair| pair.local_generation == local_generation && pair.last_probe_at.is_some());
+            .any(|pair| {
+                pair.local_generation == local_generation
+                    && pair.remote_candidate_epoch == self.remote_candidate_epoch
+                    && pair.last_probe_at.is_some()
+            });
         if has_probed_pair {
             let probed_transient_endpoints = self
                 .candidate_pairs
                 .iter()
                 .filter(|pair| {
-                    pair.local_generation == local_generation && pair.last_probe_at.is_some()
+                    pair.local_generation == local_generation
+                        && pair.remote_candidate_epoch == self.remote_candidate_epoch
+                        && pair.last_probe_at.is_some()
                 })
                 .map(|pair| pair.remote_endpoint)
                 .collect::<Vec<_>>();
@@ -318,6 +337,7 @@ impl PeerConnection {
 
             let Some(pair) = self.candidate_pairs.iter_mut().find(|pair| {
                 pair.local_generation == local_generation
+                    && pair.remote_candidate_epoch == self.remote_candidate_epoch
                     && pair.remote_endpoint == endpoint
                     && pair.last_probe_at.is_some()
             }) else {
@@ -444,6 +464,52 @@ impl PeerConnection {
             local_generation,
             reason,
         );
+    }
+
+    /// Invalidate all Direct evidence when the remote publishes a newer
+    /// candidate set. The old pairs remain in the bounded history for
+    /// diagnostics, but their remote epoch no longer matches the active set.
+    pub(super) fn mark_remote_candidate_generation_changed(
+        &mut self,
+        local_generation: u64,
+        reason: impl Into<String>,
+    ) -> u64 {
+        let reason = reason.into();
+        let peer_id = self.node_id.clone();
+        let previous_epoch = self.remote_candidate_epoch;
+        let next_epoch = self.remote_candidate_epoch.wrapping_add(1).max(1);
+        self.remote_candidate_epoch = next_epoch;
+
+        for pair in &mut self.candidate_pairs {
+            if pair.remote_candidate_epoch != next_epoch {
+                let old_state = pair.state;
+                pair.record_remote_candidate_generation_change(reason.clone());
+                log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
+            }
+        }
+
+        if self.first_usable_path == Some(NetworkPath::Direct) {
+            self.first_usable_generation = None;
+            self.first_usable_at = None;
+            self.first_usable_path = None;
+        }
+        self.endpoint = None;
+        self.direct_reclaim_until = None;
+        self.last_path_selection = None;
+        if self.state == ConnectionState::Direct {
+            self.transition(ConnectionState::FallbackToRelay);
+        }
+        self.record_direct_event(
+            local_generation,
+            "remote_candidates_invalidated",
+            None,
+            Some(self.candidate_pairs.len()),
+            None,
+            format!(
+                "remote candidate epoch advanced from {previous_epoch} to {next_epoch}; old Direct evidence fenced: {reason}"
+            ),
+        );
+        next_epoch
     }
 
     fn mark_candidate_refresh_generation_changed(
@@ -581,6 +647,7 @@ impl PeerConnection {
         }
         self.candidate_pairs.iter().any(|pair| {
             pair.selected_at.is_some() && pair.state != CandidatePairState::Frozen
+                && pair.remote_candidate_epoch == self.remote_candidate_epoch
         })
     }
 

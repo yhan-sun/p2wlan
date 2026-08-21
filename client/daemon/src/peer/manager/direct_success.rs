@@ -121,6 +121,21 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
+            let selected_endpoint = endpoint.or(conn.endpoint);
+            let Some(selected_endpoint_value) = selected_endpoint else {
+                return false;
+            };
+            if !conn.is_current_remote_endpoint(selected_endpoint_value) {
+                conn.record_direct_event(
+                    generation,
+                    "direct_confirmation_stale_remote_candidate",
+                    Some(selected_endpoint_value),
+                    None,
+                    None,
+                    "ignored encrypted Direct confirmation for an old remote candidate epoch",
+                );
+                return false;
+            }
             let was_direct = conn.state == ConnectionState::Direct;
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
@@ -141,27 +156,26 @@ impl PeerManager {
                     )),
                 );
             }
-            let selected_endpoint = endpoint.or(conn.endpoint);
-            let pair_success = selected_endpoint.map(|endpoint| {
-                    conn.endpoint = Some(endpoint);
-                    if let Some(latency) = validation_latency {
-                        conn.mark_candidate_pair_authoritative_success(
-                            endpoint,
-                            generation,
-                            latency,
-                            true,
-                            local_endpoint,
-                        )
-                    } else {
-                        conn.mark_candidate_pair_success(
-                            endpoint,
-                            generation,
-                            None,
-                            true,
-                            local_endpoint,
-                        )
-                    }
-                });
+            let pair_success = Some({
+                conn.endpoint = Some(selected_endpoint_value);
+                if let Some(latency) = validation_latency {
+                    conn.mark_candidate_pair_authoritative_success(
+                        selected_endpoint_value,
+                        generation,
+                        latency,
+                        true,
+                        local_endpoint,
+                    )
+                } else {
+                    conn.mark_candidate_pair_success(
+                        selected_endpoint_value,
+                        generation,
+                        None,
+                        true,
+                        local_endpoint,
+                    )
+                }
+            });
             let direct_confirmation_changed = !was_direct
                 || previous_endpoint != selected_endpoint
                 || previous_generation != generation;
@@ -414,6 +428,17 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
+            if !conn.is_current_remote_endpoint(endpoint) {
+                conn.record_direct_event(
+                    generation,
+                    "direct_probe_stale_remote_candidate",
+                    Some(endpoint),
+                    None,
+                    None,
+                    "ignored probe ACK for an old remote candidate epoch",
+                );
+                return false;
+            }
             let ack_confirmed = latency.is_some();
             let slow_probe_retained = ack_confirmed
                 && latency.is_some_and(|latency| {

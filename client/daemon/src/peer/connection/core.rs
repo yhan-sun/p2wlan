@@ -147,6 +147,10 @@ pub struct PeerConnection {
     /// Newer candidate sets replace older ones; generation 0 remains valid for
     /// legacy peers that have not yet been upgraded.
     last_candidate_generation: u64,
+    /// Local monotonic epoch for the accepted remote candidate set. This is
+    /// intentionally separate from the wire generation because legacy peers
+    /// may repeatedly publish generation `0`.
+    remote_candidate_epoch: u64,
     last_candidates_expires_at_ms: Option<u64>,
     /// Local-only source metadata keyed by candidate endpoint string.
     pub candidate_sources: HashMap<String, CandidatePairSource>,
@@ -254,6 +258,7 @@ impl PeerConnection {
             candidates: Vec::new(),
             signaled_candidates: HashSet::new(),
             last_candidate_generation: 0,
+            remote_candidate_epoch: 0,
             last_candidates_expires_at_ms: None,
             candidate_sources: HashMap::new(),
             direct_health: PathHealth::default(),
@@ -293,6 +298,7 @@ impl PeerConnection {
         self.candidates.clear();
         self.signaled_candidates.clear();
         self.last_candidate_generation = 0;
+        self.remote_candidate_epoch = 0;
         self.last_candidates_expires_at_ms = None;
         self.candidate_sources.clear();
         self.state = ConnectionState::Idle;

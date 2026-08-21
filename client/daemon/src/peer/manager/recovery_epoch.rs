@@ -994,11 +994,40 @@ impl PeerManager {
     /// Take the newest pending target for the running session's next stage
     /// boundary, if any.
     pub(crate) async fn take_recovery_target(&self, peer_id: &str) -> Option<PendingRecoveryTarget> {
-        self.recovery_epochs
+        let target = self
+            .recovery_epochs
             .write()
             .await
             .get_mut(peer_id)
-            .and_then(|state| state.pending_target.take())
+            .and_then(|state| state.pending_target.take());
+        let mut target = target?;
+
+        // A pending target can outlive the remote candidate publication that
+        // created it.  Do not let newest-wins scheduling turn that historical
+        // snapshot back into an outbound probe after a remote handover.  The
+        // connection keeps retired pairs for diagnostics, while
+        // `is_current_remote_endpoint` only accepts the current signaled or
+        // current-epoch learned endpoint set.
+        let connections = self.connections.read().await;
+        let conn = connections.get(peer_id)?;
+        target
+            .candidates
+            .retain(|endpoint| conn.is_current_remote_endpoint(*endpoint));
+        target
+            .preferred_fast_candidates
+            .retain(|endpoint| conn.is_current_remote_endpoint(*endpoint));
+        if let Some(frozen_targets) = target.frozen_targets.as_mut() {
+            frozen_targets.retain(|endpoint| conn.is_current_remote_endpoint(*endpoint));
+        }
+        if target.candidates.is_empty()
+            && target
+                .frozen_targets
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+        {
+            return None;
+        }
+        Some(target)
     }
 
     /// Synchronous per-peer direct-commit sequence mirror.  The mirror is

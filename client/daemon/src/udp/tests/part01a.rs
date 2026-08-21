@@ -94,19 +94,32 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
         "203.0.113.10:40123".parse().unwrap(),
         7,
         2,
+        0,
     ));
     assert!(!legacy_ack_matches_pending(
         &pending,
         "203.0.113.11:40123".parse().unwrap(),
         7,
         2,
+        0,
     ));
     assert!(!legacy_ack_matches_pending(
         &pending,
         "203.0.113.10:40123".parse().unwrap(),
         8,
         2,
+        0,
     ));
+    assert!(
+        !legacy_ack_matches_pending(
+            &pending,
+            "203.0.113.10:40123".parse().unwrap(),
+            7,
+            2,
+            1,
+        ),
+        "a pending probe from before a Direct/candidate commit must not match after the commit sequence advances"
+    );
 }
 
 #[test]

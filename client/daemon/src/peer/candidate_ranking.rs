@@ -131,10 +131,11 @@ pub(super) fn birthday_base_rank(
     endpoint: SocketAddr,
     local_generation: u64,
 ) -> (u8, u8, std::cmp::Reverse<Option<Instant>>, u64) {
-    let pair = conn
-        .candidate_pairs
-        .iter()
-        .find(|pair| pair.local_generation == local_generation && pair.remote_endpoint == endpoint);
+    let pair = conn.candidate_pairs.iter().find(|pair| {
+        pair.local_generation == local_generation
+            && pair.remote_endpoint == endpoint
+            && conn.pair_belongs_to_current_remote_epoch(pair)
+    });
     let source = conn.candidate_source_for_endpoint(endpoint);
     let active_rank = if conn.endpoint == Some(endpoint) {
         0
@@ -161,10 +162,11 @@ pub(super) fn peer_reflexive_retention_rank(
     fresh_endpoint: SocketAddr,
     local_generation: u64,
 ) -> (u8, std::cmp::Reverse<Option<Instant>>, u64) {
-    let pair = conn
-        .candidate_pairs
-        .iter()
-        .find(|pair| pair.local_generation == local_generation && pair.remote_endpoint == endpoint);
+    let pair = conn.candidate_pairs.iter().find(|pair| {
+        pair.local_generation == local_generation
+            && pair.remote_endpoint == endpoint
+            && conn.pair_belongs_to_current_remote_epoch(pair)
+    });
     let fresh_rank = if endpoint == fresh_endpoint { 0 } else { 1 };
     let observed_key = pair
         .map(candidate_pair_source_observed_sort_key)

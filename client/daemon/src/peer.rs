@@ -242,6 +242,8 @@ pub(crate) struct BirthdayProbePlan {
 
 /// Stable reason code emitted when a local network generation changes.
 pub const REASON_NETWORK_GENERATION_CHANGED: &str = "network_generation_changed";
+/// Stable reason code emitted when a peer publishes a newer remote candidate set.
+pub const REASON_REMOTE_CANDIDATE_GENERATION_CHANGED: &str = "remote_candidate_generation_changed";
 /// Stable reason code for direct path probe timeout/failure.
 pub const REASON_DIRECT_PROBE_FAILED: &str = "direct_probe_failed";
 /// Stable reason code for direct path send failure.

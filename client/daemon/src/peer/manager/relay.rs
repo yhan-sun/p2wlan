@@ -118,7 +118,10 @@ impl PeerManager {
                         candidate_source = ?conn.endpoint.and_then(|endpoint| {
                             conn.candidate_pairs
                                 .iter()
-                                .find(|pair| pair.remote_endpoint == endpoint)
+                                .find(|pair| {
+                                    pair.remote_endpoint == endpoint
+                                        && conn.pair_belongs_to_current_remote_epoch(pair)
+                                })
                                 .map(|pair| pair.source)
                         }),
                         rtt_ms = ?conn.relay_health.rtt_ewma_ms.or(conn.relay_health.latency_ms),

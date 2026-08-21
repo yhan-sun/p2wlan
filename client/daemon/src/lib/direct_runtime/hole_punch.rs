@@ -440,6 +440,9 @@ async fn spawn_hole_punch_task(
             .map(|target| target.candidates)
             .unwrap_or_default(),
     };
+    let trigger_candidates = peers
+        .current_remote_endpoints_for(&peer_id, trigger_candidates)
+        .await;
     let trigger_snapshot = punch_candidate_snapshot(&peers, &peer_id, trigger_candidates).await;
     let network_generation = peers.current_network_generation().await;
     let claimed = punch_deduplicator
@@ -861,7 +864,7 @@ async fn spawn_hole_punch_task(
                 None => peers.direct_probe_target_set_for(&peer_id).await,
             },
         };
-        let Some(target) = target else {
+        let Some(mut target) = target else {
             if peers.is_direct(&peer_id).await {
                 peers
                     .record_direct_event(
@@ -894,6 +897,19 @@ async fn spawn_hole_punch_task(
                 .await;
             return;
         };
+        // The target may have crossed another await boundary since it was
+        // selected. Re-check the remote epoch immediately before deriving the
+        // actual send vectors so a retired frozen prediction cannot be merged
+        // back into the running session.
+        target.candidates = peers
+            .current_remote_endpoints_for(&peer_id, target.candidates)
+            .await;
+        target.preferred_fast_candidates = peers
+            .current_remote_endpoints_for(&peer_id, target.preferred_fast_candidates)
+            .await;
+        fast_prediction_candidates = peers
+            .current_remote_endpoints_for(&peer_id, fast_prediction_candidates)
+            .await;
         let mut candidates = target.candidates;
         if fast_prediction_candidates.is_empty() {
             fast_prediction_candidates = target.preferred_fast_candidates;
@@ -1187,11 +1203,28 @@ async fn spawn_hole_punch_task(
             && peers.peer_online(&peer_id).await
         {
             if let Some(pending) = peers.take_recovery_target(&peer_id).await {
-                let frozen_targets = pending.frozen_targets;
-                let mut preferred = frozen_targets
-                    .clone()
-                    .unwrap_or(pending.preferred_fast_candidates);
-                let mut pending_candidates = pending.candidates;
+                let frozen_targets = match pending.frozen_targets {
+                    Some(frozen) => Some(
+                        peers
+                            .current_remote_endpoints_for(&peer_id, frozen)
+                            .await,
+                    ),
+                    None => None,
+                };
+                let mut preferred = match frozen_targets.as_ref() {
+                    Some(frozen) => frozen.clone(),
+                    None => {
+                        peers
+                            .current_remote_endpoints_for(
+                                &peer_id,
+                                pending.preferred_fast_candidates,
+                            )
+                            .await
+                    }
+                };
+                let mut pending_candidates = peers
+                    .current_remote_endpoints_for(&peer_id, pending.candidates)
+                    .await;
                 if !preferred.is_empty() {
                     // A fresh prediction carries only its immutable window.
                     // Keep the current ordinary candidates in the same

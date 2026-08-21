@@ -35,7 +35,9 @@ impl PeerManager {
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
     ) -> CandidateSetApplyResult {
-        let generation = self.current_network_generation().await;
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let generation = self.current_network_generation_sync();
         let mut connections = self.connections.write().await;
         let Some(conn) = connections.get_mut(node_id) else {
             return CandidateSetApplyResult::PeerMissing;
@@ -90,101 +92,108 @@ impl PeerManager {
             conn.last_candidate_generation = candidate_generation;
         }
         conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
-            let old_signaled_endpoint = conn.signaled_endpoint;
-            let previous_signaled = std::mem::take(&mut conn.signaled_candidates);
-            let endpoint_was_previous_signaled = conn.endpoint.is_some_and(|endpoint| {
-                previous_signaled.contains(&endpoint.to_string())
-            });
-            for candidate in previous_signaled {
-                let learned = matches!(
-                    conn.candidate_sources.get(&candidate),
-                    Some(CandidatePairSource::Learned | CandidatePairSource::PeerReflexive)
-                );
-                if !learned {
-                    conn.candidates.retain(|existing| existing != &candidate);
-                    conn.candidate_sources.remove(&candidate);
-                }
-            }
 
-            if endpoint_was_previous_signaled
-                && conn.endpoint.is_some_and(|endpoint| {
-                    !valid_candidates
-                        .iter()
-                        .any(|candidate| candidate == &endpoint.to_string())
-                })
+        // A versioned signal is an explicit remote incarnation of the
+        // candidate set, even when an endpoint string happens to be reused.
+        // Legacy unversioned signals are common during periodic refreshes, so
+        // an identical endpoint set must not reset the birthday cursor or
+        // invalidate a healthy pair merely because the control heartbeat was
+        // repeated.
+        let incoming_signaled = valid_candidates.iter().cloned().collect::<HashSet<_>>();
+        let remote_candidate_set_changed = candidate_generation != 0
+            || conn.signaled_candidates != incoming_signaled;
+        if remote_candidate_set_changed {
+            // Candidate publication is a remote transport handover. Advance
+            // the local epoch before touching the new set so old pair proofs
+            // and in-flight punch tasks cannot be mistaken for the new remote
+            // socket.
+            conn.mark_remote_candidate_generation_changed(
+                generation,
+                "accepted newer remote candidate set",
+            );
+            conn.direct_commit_seq = conn.direct_commit_seq.wrapping_add(1);
+            self.bump_direct_commit_seq(node_id);
+        }
+
+        let old_signaled_endpoint = conn.signaled_endpoint;
+        let previous_signaled = std::mem::take(&mut conn.signaled_candidates);
+        for candidate in previous_signaled {
+            let learned = matches!(
+                conn.candidate_sources.get(&candidate),
+                Some(CandidatePairSource::Learned | CandidatePairSource::PeerReflexive)
+            );
+            if !learned {
+                conn.candidates.retain(|existing| existing != &candidate);
+                conn.candidate_sources.remove(&candidate);
+            }
+        }
+
+        // A current trickled signal is authoritative. Keeping the node
+        // registry's old endpoint forever causes port churn to accumulate
+        // stale public targets and wastes each synchronized punch window.
+        if let Some(endpoint) = old_signaled_endpoint {
+            if !valid_candidates
+                .iter()
+                .any(|candidate| candidate == &endpoint.to_string())
             {
-                conn.endpoint = None;
-            }
-
-            // A current trickled signal is authoritative.  Keeping the node
-            // registry's old endpoint forever causes port churn to accumulate
-            // stale public targets and wastes each synchronized punch window.
-            if !valid_candidates.is_empty() {
-                if let Some(endpoint) = old_signaled_endpoint {
-                    if !valid_candidates
-                        .iter()
-                        .any(|candidate| candidate == &endpoint.to_string())
-                    {
-                        conn.signaled_endpoint = None;
-                        if conn.endpoint == Some(endpoint) {
-                            conn.endpoint = None;
-                        }
-                        let endpoint = endpoint.to_string();
-                        if conn.candidate_sources.get(&endpoint)
-                            == Some(&CandidatePairSource::Signaled)
-                        {
-                            conn.candidates.retain(|candidate| candidate != &endpoint);
-                            conn.candidate_sources.remove(&endpoint);
-                        }
-                    }
+                conn.signaled_endpoint = None;
+                let endpoint = endpoint.to_string();
+                if conn.candidate_sources.get(&endpoint) == Some(&CandidatePairSource::Signaled) {
+                    conn.candidates.retain(|candidate| candidate != &endpoint);
+                    conn.candidate_sources.remove(&endpoint);
                 }
             }
+        }
 
-            for (rank, c) in valid_candidates.iter().enumerate() {
-                if !conn.candidates.contains(c) {
-                    conn.candidates.push(c.clone());
+        for (rank, c) in valid_candidates.iter().enumerate() {
+            if !conn.candidates.contains(c) {
+                conn.candidates.push(c.clone());
+            }
+            conn.signaled_candidates.insert(c.clone());
+            // Old peers did not send candidate_sources. Classifying their
+            // literal socket address keeps a private LAN candidate from
+            // taking precedence over a public server-reflexive one.
+            let source = candidate_sources
+                .get(c)
+                .and_then(|value| candidate_pair_source_from_label(value))
+                .unwrap_or_else(|| infer_unlabeled_candidate_source(c));
+            conn.candidate_sources.insert(c.clone(), source);
+            if let Ok(endpoint) = c.parse::<SocketAddr>() {
+                let pair =
+                    conn.ensure_candidate_pair_with_observed_source(endpoint, generation, source);
+                // The sender ordered its predicted window by priority;
+                // preserve that order for stable-side probing.
+                if source == CandidatePairSource::Predicted {
+                    pair.signal_rank = Some(rank as u32);
                 }
-                conn.signaled_candidates.insert(c.clone());
-                // Old peers did not send candidate_sources.  Classifying
-                // their literal socket address keeps a private LAN candidate
-                // from taking precedence over a public server-reflexive one.
-                let source = candidate_sources
-                    .get(c)
-                    .and_then(|value| candidate_pair_source_from_label(value))
-                    .unwrap_or_else(|| infer_unlabeled_candidate_source(c));
-                conn.candidate_sources.insert(c.clone(), source);
-                if let Ok(endpoint) = c.parse::<SocketAddr>() {
-                    let pair =
-                        conn.ensure_candidate_pair_with_observed_source(endpoint, generation, source);
-                    // The sender ordered its predicted window by priority;
-                    // preserve that order for stable-side probing.
-                    if source == CandidatePairSource::Predicted {
-                        pair.signal_rank = Some(rank as u32);
-                    }
-                }
             }
+        }
 
-            if !valid_candidates.is_empty() {
-                conn.record_direct_event(
-                    generation,
-                    "candidates_received",
-                    None,
-                    Some(valid_candidates.len()),
-                    None,
-                    format!(
-                        "received {} signaled UDP candidates with {} source labels",
-                        valid_candidates.len(),
-                        candidate_sources.len()
-                    ),
-                );
-            }
+        if !valid_candidates.is_empty() {
+            conn.record_direct_event(
+                generation,
+                "candidates_received",
+                None,
+                Some(valid_candidates.len()),
+                None,
+                format!(
+                    "received {} signaled UDP candidates with {} source labels",
+                    valid_candidates.len(),
+                    candidate_sources.len()
+                ),
+            );
+        }
 
-            if conn.endpoint.is_none() {
-                conn.endpoint = conn
-                    .candidates
-                    .iter()
-                    .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
-            }
+        if conn.endpoint.is_none() {
+            conn.endpoint = valid_candidates
+                .iter()
+                .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
+        }
+        drop(connections);
+        if remote_candidate_set_changed {
+            self.cancel_direct_validation_for_remote_candidate_change(node_id)
+                .await;
+        }
         CandidateSetApplyResult::Applied
     }
 

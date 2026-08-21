@@ -1349,7 +1349,7 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
                 peer_id,
                 "10.20.0.9",
                 hex::encode(local_identity.public_key()),
-                None,
+                Some("198.51.100.9:41000".parse().unwrap()),
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
@@ -1934,7 +1934,7 @@ async fn dynamic_socket_cap_rejects_when_all_entries_nonevictable() {
                 peer_id,
                 "10.20.0.9",
                 hex::encode(local_identity.public_key()),
-                None,
+                Some("198.51.100.9:41000".parse().unwrap()),
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
@@ -1981,7 +1981,7 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
                 peer_id,
                 "10.20.0.9",
                 hex::encode(local_identity.public_key()),
-                None,
+                Some("198.51.100.9:41000".parse().unwrap()),
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();

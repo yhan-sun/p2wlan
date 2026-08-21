@@ -23,7 +23,9 @@ impl PeerConnection {
         let previous_path = previous.and_then(|selection| selection.path);
         let pair = selection.direct_endpoint.and_then(|endpoint| {
             self.candidate_pairs.iter().find(|pair| {
-                pair.local_generation == local_generation && pair.remote_endpoint == endpoint
+                pair.local_generation == local_generation
+                    && pair.remote_endpoint == endpoint
+                    && self.pair_belongs_to_current_remote_epoch(pair)
             })
         });
         let remote_endpoint = selection.direct_endpoint;
