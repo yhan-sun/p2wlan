@@ -249,7 +249,11 @@ impl Daemon {
                 .read()
                 .await
                 .as_ref()
-                .map(p2pnet_nat::NatProfile::control_label)
+                .map(|profile| {
+                    profile.control_label_with_generation(
+                        self.peers.current_network_generation_sync(),
+                    )
+                })
                 .unwrap_or_else(|| "unknown".to_string());
             // The endpoint publish travels the handshake control lane with a
             // short caller budget: the ordinary lane may be congested by

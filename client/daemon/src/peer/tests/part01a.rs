@@ -360,6 +360,8 @@ fn diagnostics_keeps_non_current_peer_reflexive_pair_provisional() {
         0,
         Some(local),
         None,
+        false,
+        None,
         None,
     );
     let selected = diagnostics.selected_pair.as_ref().unwrap();

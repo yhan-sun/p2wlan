@@ -7,6 +7,19 @@ pub struct PeerDiagnostics {
     pub virtual_ip: String,
     pub endpoint: Option<String>,
     pub nat_type: String,
+    /// Normalized remote NAT evidence decoded from the existing control label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_nat_capabilities: Option<NatCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_nat_profile_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_nat_profile_received_at_ms: Option<u64>,
+    #[serde(default)]
+    pub remote_nat_profile_fresh: bool,
+    /// Explainable attempt plan only; active path ownership remains with the
+    /// existing candidate proof and selector state machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traversal_plan: Option<TraversalPlan>,
     pub online: bool,
     pub last_seen: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +148,8 @@ impl PeerDiagnostics {
         direct_retry_after: Option<Duration>,
         local_generation: u64,
         local_endpoint: Option<SocketAddr>,
+        local_nat_capabilities: Option<&NatCapabilities>,
+        relay_available: bool,
         traversal_history: Option<&TraversalHistory>,
         fresh_mapping_history: Option<&HashMap<String, VecDeque<FreshMappingPredictionResult>>>,
     ) -> Self {
@@ -313,6 +328,95 @@ impl PeerDiagnostics {
         let warning = is_overlay_direct
             .then(|| "direct path is overlay/utun, not public NAT traversal".to_string());
 
+        let default_local_capabilities = NatCapabilities::default();
+        let local_capabilities = local_nat_capabilities.unwrap_or(&default_local_capabilities);
+        let remote_nat_capabilities = conn
+            .remote_nat_profile
+            .as_ref()
+            .map(|profile| profile.capabilities.clone());
+        let default_remote_capabilities = NatCapabilities::default();
+        let remote_capabilities = remote_nat_capabilities
+            .as_ref()
+            .unwrap_or(&default_remote_capabilities);
+        let remote_nat_profile_fresh = conn.remote_nat_profile_is_fresh();
+        let remote_profile_mapping_known = conn.remote_nat_profile.as_ref().is_some_and(|profile| {
+            profile.capabilities.mapping_behavior != MappingBehavior::Unknown
+        });
+        let remote_candidate_endpoints = conn
+            .candidates
+            .iter()
+            .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+            .collect::<Vec<_>>();
+        let on_link_lan = remote_candidate_endpoints
+            .iter()
+            .any(|endpoint| conn.is_on_link_host_candidate(*endpoint));
+        let global_ipv6_direct_available = local_endpoint.is_some_and(|endpoint| endpoint.is_ipv6())
+            && remote_candidate_endpoints.iter().any(|endpoint| {
+                endpoint.is_ipv6() && is_public_probe_endpoint(*endpoint)
+            });
+        let peer_reflexive_evidence = conn.candidate_pairs.iter().any(|pair| {
+            matches!(pair.source, CandidatePairSource::PeerReflexive)
+                && matches!(
+                    pair.state,
+                    CandidatePairState::Succeeded | CandidatePairState::Selected
+                )
+        });
+        let learned_endpoint_evidence = conn.candidate_pairs.iter().any(|pair| {
+            matches!(pair.source, CandidatePairSource::Learned)
+                && matches!(
+                    pair.state,
+                    CandidatePairState::Succeeded | CandidatePairState::Selected
+                )
+        });
+        let remote_stable_endpoint_available = remote_capabilities.is_stable_endpoint()
+            || (!remote_profile_mapping_known
+                && conn.endpoint.is_some_and(is_public_probe_endpoint));
+        let fresh_mapping_available = fresh_mapping_history
+            .and_then(|history| history.get(&conn.node_id))
+            .is_some_and(|results| !results.is_empty());
+        let traversal_context = TraversalContext {
+            on_link_lan,
+            global_ipv6_direct_available,
+            peer_reflexive_evidence,
+            learned_endpoint_evidence,
+            local_stable_endpoint_available: local_capabilities.is_stable_endpoint(),
+            remote_stable_endpoint_available,
+            fresh_mapping_available,
+            remote_profile_fresh: remote_nat_profile_fresh,
+            relay_available,
+            bounded_birthday_allowed: local_capabilities.birthday_candidate
+                || remote_capabilities.birthday_candidate,
+            ..TraversalContext::default()
+        };
+        let traversal_plan = Some(plan_traversal(
+            local_capabilities,
+            remote_capabilities,
+            &traversal_context,
+        ));
+        if let Some(plan) = traversal_plan.as_ref() {
+            debug!(
+                event = "traversal_plan_selected",
+                peer = %conn.node_id,
+                network_generation = local_generation,
+                remote_profile_generation = ?conn
+                    .remote_nat_profile
+                    .as_ref()
+                    .and_then(|profile| profile.generation),
+                mapping_behavior = ?local_capabilities.mapping_behavior,
+                filtering_behavior = ?local_capabilities.filtering_behavior,
+                allocation_model = ?local_capabilities.allocation_model,
+                prediction_confidence = local_capabilities.prediction_confidence,
+                plan = plan.strategy_label(),
+                capability = ?plan.capability,
+                reason = %plan.reason,
+                fallback = plan.fallback_label(),
+                relay_available,
+                remote_profile_fresh = remote_nat_profile_fresh,
+                network_hint = plan.network_hint.label(),
+                "selected pairwise traversal plan for diagnostics"
+            );
+        }
+
         Self {
             node_id: conn.node_id.clone(),
             device_name: conn.device_name.clone(),
@@ -320,6 +424,17 @@ impl PeerDiagnostics {
             virtual_ip: conn.virtual_ip.clone(),
             endpoint: conn.endpoint.map(|endpoint| endpoint.to_string()),
             nat_type: conn.nat_type.clone(),
+            remote_nat_capabilities,
+            remote_nat_profile_generation: conn
+                .remote_nat_profile
+                .as_ref()
+                .and_then(|profile| profile.generation),
+            remote_nat_profile_received_at_ms: conn
+                .remote_nat_profile
+                .as_ref()
+                .map(|profile| profile.received_at_ms),
+            remote_nat_profile_fresh,
+            traversal_plan,
             online: conn.online,
             last_seen: conn.last_seen,
             remote_relay_latency_ms: conn.remote_relay_rtt_ms,
@@ -449,6 +564,8 @@ impl From<&PeerConnection> for PeerDiagnostics {
             None,
             conn.direct_generation,
             None,
+            None,
+            false,
             None,
             None,
         )

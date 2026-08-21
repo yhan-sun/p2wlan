@@ -250,6 +250,19 @@ impl PeerManager {
 
     /// Update the latest local NAT profile used by adaptive probe scheduling.
     pub async fn update_nat_profile(&self, profile: NatProfile) {
+        let generation = self.current_network_generation_sync();
+        let capabilities = NatCapabilities::from_profile(&profile)
+            .with_profile_generation(generation);
+        debug!(
+            event = "nat_profile_updated",
+            network_generation = generation,
+            mapping_behavior = ?capabilities.mapping_behavior,
+            filtering_behavior = ?capabilities.filtering_behavior,
+            allocation_model = ?capabilities.allocation_model,
+            prediction_confidence = capabilities.prediction_confidence,
+            prediction_window = capabilities.prediction_window,
+            "updated local NAT capability evidence"
+        );
         *self.local_nat_profile.write().await = Some(profile);
     }
 

@@ -502,7 +502,9 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let should_update_endpoint = should_advance_generation
             || should_update_stable_control_endpoint(published_endpoint.as_deref(), &endpoint);
         if should_update_endpoint {
-            let nat_type = report.nat_profile.control_label();
+            let nat_type = report
+                .nat_profile
+                .control_label_with_generation(peers.current_network_generation_sync());
             if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
                 warn!("Failed to publish refreshed UDP endpoint '{endpoint}': {err}");
             } else if !endpoint.is_empty() {

@@ -212,6 +212,25 @@ fn test_parse_roundtrip_recovers_mapping_allocation_filtering_hairpin() {
     }
 }
 
+#[test]
+fn test_profile_generation_is_additive_and_bounded() {
+    let profile = fingerprint_profile(
+        MappingBehavior::AddressOrPortDependent,
+        FilteringBehavior::AddressDependent,
+        HairpinBehavior::Unsupported,
+        false,
+        true,
+        Some(12345),
+        Some(true),
+        100,
+    );
+    let label = profile.control_label_with_generation(u64::MAX);
+    assert!(label.len() <= 128, "label exceeds server cap: {label}");
+    let hint = parse_nat_hint(&label);
+    assert!(hint.parsed);
+    assert_eq!(hint.profile_generation, Some(u64::MAX));
+}
+
 /// Mirror of `control_label`'s allocation derivation, used only to assert the
 /// round-tripped `a=` equals the source profile's derived allocation.
 fn expected_allocation(p: &NatProfile) -> NatAllocation {

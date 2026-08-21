@@ -21,6 +21,7 @@ pub mod mapping;
 pub mod outbound_liveness;
 pub mod punch;
 pub mod stun;
+pub mod traversal;
 
 // Re-export key types
 pub use adaptive::{DirectionPattern, ReverseDetector, StepLearner};
@@ -51,6 +52,11 @@ pub use punch::{
 pub use stun::{
     compute_fingerprint, crc32, StunAttribute, StunMessage, BINDING_ERROR_RESPONSE,
     BINDING_REQUEST, BINDING_RESPONSE, MAGIC_COOKIE,
+};
+pub use traversal::{
+    confirmed_on_link_lan, plan_traversal, NatCapabilities, NatProfileEvidence, NetworkHint,
+    RemoteNatProfile, TraversalCapability, TraversalContext, TraversalFallback, TraversalPlan,
+    TraversalReason, TraversalStrategy, MIN_PREDICTION_CONFIDENCE,
 };
 
 use std::net::{IpAddr, SocketAddr};

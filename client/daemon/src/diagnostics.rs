@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use p2pnet_nat::NatProfile;
+use p2pnet_nat::{NatCapabilities, NatProfile, NetworkHint};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

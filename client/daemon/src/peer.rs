@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use p2pnet_crypto::{hmac, NodeIdentity};
-use p2pnet_nat::{LocalNetwork, MappingBehavior, NatProfile, ProbeMacKey};
+use p2pnet_nat::{
+    parse_nat_hint, plan_traversal, LocalNetwork, MappingBehavior, NatCapabilities, NatProfile,
+    ProbeMacKey, RemoteNatProfile, TraversalContext, TraversalPlan,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -58,6 +61,7 @@ pub(crate) const RELAY_FIRST_CONFIRMATION_GRACE: Duration = Duration::from_secs(
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
+const REMOTE_NAT_PROFILE_MAX_AGE: Duration = Duration::from_secs(60);
 const PRIVATE_DIRECT_RETAIN_MAX_RTT_MS: u64 = 250;
 const DIRECT_KEEPALIVE_FAILURE_THRESHOLD: u32 = 3;
 const PEER_REFLEXIVE_SAME_IP_RETAINED_PORTS: usize = 3;

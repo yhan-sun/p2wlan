@@ -245,6 +245,11 @@ impl PeerManager {
             conn.endpoint = signaled_endpoint;
         }
         conn.signaled_endpoint = signaled_endpoint;
+        // The structured NAT label rides the existing peer metadata path. It
+        // is parsed into an advisory capability snapshot, fenced by the
+        // producer's profile generation; actual candidate/ACK evidence keeps
+        // ownership of Direct-path promotion.
+        conn.update_remote_nat_profile(&info.nat_type, signaled_endpoint);
         if let Some(addr) = signaled_endpoint {
             conn.ensure_candidate_pair(addr, generation);
         }

@@ -279,6 +279,15 @@ impl NatProfile {
         )
     }
 
+    /// Add the local evidence generation to the compact control-plane hint.
+    ///
+    /// `control_label` remains byte-compatible for existing callers and
+    /// tests.  The generation is an additive fence used by newer peers to
+    /// reject delayed profile updates after a network transition.
+    pub fn control_label_with_generation(&self, generation: u64) -> String {
+        format!("{};g={generation}", self.control_label())
+    }
+
     fn unknown(local_addr: SocketAddr) -> Self {
         Self {
             local_addr: local_addr.to_string(),
@@ -319,7 +328,7 @@ pub enum NatAllocation {
 }
 
 /// Structured view of a peer `nat_type` control label
-/// (`p2:`/`p2v2:m=..;a=..;d=..;c=..;f=..;h=..`).
+/// (`p2:`/`p2v2:m=..;a=..;d=..;c=..;f=..;h=..[;g=..]`).
 ///
 /// Receiver-side counterpart to [`NatProfile::control_label`]: the daemon
 /// advertises the label through the relay and the peer parses it back into
@@ -341,6 +350,8 @@ pub struct NatFingerprintHint {
     pub filtering: FilteringBehavior,
     /// Parsed `h=` (hairpin behavior); `Unknown` for old `p2:` labels.
     pub hairpin: HairpinBehavior,
+    /// Parsed `g=` profile/evidence generation, if advertised.
+    pub profile_generation: Option<u64>,
     /// `true` only when a well-formed `p2:`/`p2v2:` label was recognized.
     pub parsed: bool,
     /// The trimmed, lower-cased input, retained for the legacy fallback.
@@ -427,7 +438,7 @@ pub fn parse_nat_hint(input: &str) -> NatFingerprintHint {
         return unparsed_hint(&raw);
     };
     // A well-formed label is one or more `key=value` fields joined by `;`,
-    // each with a recognized key (m/a/d/c/f/h) AND a recognized value
+    // each with a recognized key (m/a/d/c/f/h/g) AND a recognized value
     // (d/c numeric where applicable).  Being strict here is the conservative
     // direction: any malformed segment (no `=`), unrecognized key, or bad
     // value yields `parsed == false` and the caller falls back to the legacy
@@ -443,6 +454,7 @@ pub fn parse_nat_hint(input: &str) -> NatFingerprintHint {
     let mut confidence: Option<u8> = None;
     let mut filtering = FilteringBehavior::Unknown;
     let mut hairpin = HairpinBehavior::Unknown;
+    let mut profile_generation: Option<u64> = None;
     let mut fields = 0u8;
     for field in payload.split(';') {
         if field.is_empty() {
@@ -502,6 +514,13 @@ pub fn parse_nat_hint(input: &str) -> NatFingerprintHint {
                 };
                 fields += 1;
             }
+            "g" => {
+                profile_generation = match value.parse::<u64>() {
+                    Ok(generation) => Some(generation),
+                    Err(_) => return unparsed_hint(&raw),
+                };
+                fields += 1;
+            }
             _ => return unparsed_hint(&raw), // unrecognized key → corrupted
         }
     }
@@ -515,6 +534,7 @@ pub fn parse_nat_hint(input: &str) -> NatFingerprintHint {
         confidence,
         filtering,
         hairpin,
+        profile_generation,
         parsed: true,
         raw,
     }
@@ -530,6 +550,7 @@ fn unparsed_hint(raw: &str) -> NatFingerprintHint {
         confidence: None,
         filtering: FilteringBehavior::Unknown,
         hairpin: HairpinBehavior::Unknown,
+        profile_generation: None,
         parsed: false,
         raw: raw.to_string(),
     }

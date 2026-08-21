@@ -514,7 +514,9 @@ async fn refresh_candidate_cache_for_maintenance_signal(
 
     if let Some(endpoint) = control_udp_endpoint_from_candidates(&candidates, &candidate_sources) {
         drop(refresh_guard);
-        let nat_type = report.nat_profile.control_label();
+        let nat_type = report
+            .nat_profile
+            .control_label_with_generation(peers.current_network_generation_sync());
         if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
             warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
         }

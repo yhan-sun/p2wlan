@@ -91,6 +91,11 @@ pub struct DiagnosticsSnapshot {
     pub virtual_ip: String,
     pub network_id: String,
     pub network_generation: u64,
+    /// Best-effort transport hint. NAT measurement remains authoritative;
+    /// this is `unknown` when the host/Android integration does not expose a
+    /// Wi-Fi/cellular classification.
+    #[serde(default, skip_serializing_if = "NetworkHint::is_unknown")]
+    pub network_hint: NetworkHint,
     /// Monotonic milliseconds since this daemon process started (matches the
     /// timeline events' `at_ms` clock).
     pub uptime_ms: u64,
@@ -119,6 +124,10 @@ pub struct DiagnosticsSnapshot {
     pub candidate_snapshot_version: Option<u64>,
     pub candidate_snapshot_hash: Option<u64>,
     pub nat_profile: Option<NatProfile>,
+    /// Normalized NAT truth used by the traversal planner. This is additive
+    /// to the historical profile so older clients can continue to ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat_capabilities: Option<NatCapabilities>,
     pub gateway_mapping: GatewayMappingDiagnostics,
     pub relay_servers: Vec<String>,
     pub relay_connected: bool,

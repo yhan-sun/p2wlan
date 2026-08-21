@@ -124,6 +124,11 @@ pub struct PeerConnection {
     pub signaled_endpoint: Option<SocketAddr>,
     /// Peer's NAT type.
     pub nat_type: String,
+    /// Structured remote NAT evidence carried by the compatibility control
+    /// label. This is advisory until its generation and receive age pass the
+    /// freshness fence; authenticated candidate/path evidence remains the
+    /// authority for promotion.
+    pub remote_nat_profile: Option<RemoteNatProfile>,
     /// Whether the control plane currently reports this peer online.
     pub online: bool,
     /// Last seen timestamp reported by the control plane.
@@ -242,6 +247,58 @@ impl PeerConnection {
         self.local_interface_networks = networks;
     }
 
+    /// Accept a remote NAT hint only when it does not move the profile
+    /// generation backwards. Unversioned legacy labels remain useful as
+    /// display/diagnostic data, but cannot replace a versioned profile.
+    pub(crate) fn update_remote_nat_profile(
+        &mut self,
+        nat_type: &str,
+        stable_endpoint: Option<SocketAddr>,
+    ) -> bool {
+        let hint = parse_nat_hint(nat_type);
+        let incoming_generation = hint.profile_generation;
+        let current_generation = self
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.generation);
+        let accepts = match (current_generation, incoming_generation) {
+            (Some(current), Some(incoming)) => incoming >= current,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !accepts {
+            debug!(
+                peer = %self.node_id,
+                current_generation = ?current_generation,
+                incoming_generation = ?incoming_generation,
+                "ignored stale or unversioned remote NAT profile"
+            );
+            return false;
+        }
+        let stable_endpoint = stable_endpoint.filter(|endpoint| is_public_probe_endpoint(*endpoint));
+        self.remote_nat_profile = Some(RemoteNatProfile {
+            capabilities: NatCapabilities::from_fingerprint_hint(&hint, stable_endpoint),
+            generation: incoming_generation,
+            received_at_ms: nat_profile_now_ms(),
+        });
+        debug!(
+            event = "remote_nat_profile_updated",
+            peer = %self.node_id,
+            remote_profile_generation = ?incoming_generation,
+            mapping_behavior = ?hint.mapping,
+            filtering_behavior = ?hint.filtering,
+            prediction_confidence = ?hint.confidence,
+            "accepted remote NAT capability hint"
+        );
+        true
+    }
+
+    pub(crate) fn remote_nat_profile_is_fresh(&self) -> bool {
+        self.remote_nat_profile.as_ref().is_some_and(|profile| {
+            profile.is_fresh(nat_profile_now_ms(), REMOTE_NAT_PROFILE_MAX_AGE)
+        })
+    }
+
     /// Create a new peer connection in Idle state.
     pub fn new(node_id: &str, virtual_ip: &str) -> Self {
         Self {
@@ -259,6 +316,7 @@ impl PeerConnection {
             endpoint: None,
             signaled_endpoint: None,
             nat_type: String::new(),
+            remote_nat_profile: None,
             online: true,
             last_seen: 0,
             remote_relay_rtt_ms: None,
@@ -303,6 +361,7 @@ impl PeerConnection {
 
     fn reset_for_identity_change(&mut self) {
         self.endpoint = self.signaled_endpoint;
+        self.remote_nat_profile = None;
         self.probe_session_id = None;
         self.probe_ephemeral_shared = None;
         self.probe_binding_token = None;
@@ -456,4 +515,11 @@ impl PeerConnection {
         self.first_usable_path = Some(path);
         true
     }
+}
+
+fn nat_profile_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }

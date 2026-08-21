@@ -83,6 +83,16 @@ impl PeerManager {
         // atomic mirror is published in the same critical section and is the
         // value already used by the dataplane-safe diagnostics path below.
         let generation = self.current_network_generation_sync();
+        let local_nat_capabilities = self
+            .local_nat_profile
+            .try_read()
+            .ok()
+            .and_then(|profile| {
+                profile.as_ref().map(|profile| {
+                    NatCapabilities::from_profile(profile).with_profile_generation(generation)
+                })
+            });
+        let relay_available = self.relay_first_required();
         let traversal_history = self
             .traversal_history
             .try_read()
@@ -107,6 +117,8 @@ impl PeerManager {
                             None,
                             generation,
                             None,
+                            local_nat_capabilities.as_ref(),
+                            relay_available,
                             Some(&traversal_history),
                             Some(&fresh_mapping_history),
                         );
@@ -135,6 +147,15 @@ impl PeerManager {
         // Use the lock-free generation mirror so a busy handover cannot make
         // /status or /peers wait until the diagnostics timeout.
         let generation = self.current_network_generation_sync();
+        let local_nat_capabilities = self
+            .local_nat_profile
+            .try_read()
+            .ok()
+            .and_then(|profile| {
+                profile.as_ref().map(|profile| {
+                    NatCapabilities::from_profile(profile).with_profile_generation(generation)
+                })
+            });
         let traversal_history = self
             .traversal_history
             .try_read()
@@ -161,6 +182,8 @@ impl PeerManager {
                             Some(direct_retry_after),
                             generation,
                             local_endpoint,
+                            local_nat_capabilities.as_ref(),
+                            relay_available,
                             Some(&traversal_history),
                             Some(&fresh_mapping_history),
                         );
@@ -203,6 +226,15 @@ impl PeerManager {
             .unwrap_or_default();
         let recovery = self.recovery_epoch_diagnostics().remove(node_id);
         let generation = self.current_network_generation_sync();
+        let local_nat_capabilities = self
+            .local_nat_profile
+            .try_read()
+            .ok()
+            .and_then(|profile| {
+                profile.as_ref().map(|profile| {
+                    NatCapabilities::from_profile(profile).with_profile_generation(generation)
+                })
+            });
         let conns = self.connections.try_read().ok()?;
         let conn = conns.get(node_id)?;
         let current_selection =
@@ -213,6 +245,8 @@ impl PeerManager {
             Some(direct_retry_after),
             generation,
             local_endpoint,
+            local_nat_capabilities.as_ref(),
+            relay_available,
             Some(&traversal_history),
             Some(&fresh_mapping_history),
         );

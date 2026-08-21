@@ -391,7 +391,9 @@ async fn run_udp_direct_instance(
             .await
         {
             Ok(report) => {
-                advertised_nat_type = report.nat_profile.control_label();
+                advertised_nat_type = report
+                    .nat_profile
+                    .control_label_with_generation(peers.current_network_generation_sync());
                 let (endpoints, sources) = candidate_endpoints_from_report(&report);
                 info!(
                             "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={} egress={}",

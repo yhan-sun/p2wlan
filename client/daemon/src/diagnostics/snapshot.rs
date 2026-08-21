@@ -34,6 +34,11 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     let (local_candidates, candidate_snapshot_version, candidate_snapshot_hash) = candidate_snapshot
         .map(|snapshot| (snapshot.candidates, Some(snapshot.version), Some(snapshot.hash)))
         .unwrap_or_else(|| (Vec::new(), None, None));
+    let network_generation = context.peers.current_network_generation_sync();
+    let nat_profile = context.nat_profile.read().await.clone();
+    let nat_capabilities = nat_profile.as_ref().map(|profile| {
+        NatCapabilities::from_profile(profile).with_profile_generation(network_generation)
+    });
 
     DiagnosticsSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -41,7 +46,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         node_id: context.config.node.node_id.clone(),
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),
-        network_generation: context.peers.current_network_generation_sync(),
+        network_generation,
+        network_hint: NetworkHint::Unknown,
         uptime_ms: context.timeline.uptime_ms(),
         revision: context.status_events.current_seq(),
         ready_phase: derive_ready_phase(
@@ -63,7 +69,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         local_candidates,
         candidate_snapshot_version,
         candidate_snapshot_hash,
-        nat_profile: context.nat_profile.read().await.clone(),
+        nat_profile,
+        nat_capabilities,
         gateway_mapping: context.gateway_mapping.read().await.clone(),
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
