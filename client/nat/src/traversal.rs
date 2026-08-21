@@ -378,6 +378,7 @@ pub enum TraversalReason {
     BothPredictableHardNat,
     MixedHardNatBoundedSpeculation,
     BothUnpredictableHardNat,
+    HardNatWithoutBoundedEvidence,
     UnknownRemoteProfile,
     UnknownCapabilitiesSafeAttempt,
 }
@@ -395,6 +396,7 @@ impl TraversalReason {
             Self::BothPredictableHardNat => "both_predictable_hard_nat",
             Self::MixedHardNatBoundedSpeculation => "mixed_hard_nat_bounded_speculation",
             Self::BothUnpredictableHardNat => "both_unpredictable_hard_nat",
+            Self::HardNatWithoutBoundedEvidence => "hard_nat_without_bounded_evidence",
             Self::UnknownRemoteProfile => "unknown_or_stale_remote_profile",
             Self::UnknownCapabilitiesSafeAttempt => "unknown_capabilities_safe_attempt",
         }
@@ -602,6 +604,16 @@ pub fn plan_traversal(
     }
 
     if local_hard && remote_hard {
+        if !local_predictable && !remote_predictable {
+            return plan(
+                TraversalStrategy::RelayWithBackgroundReclaim,
+                TraversalCapability::RelayPreferred,
+                vec![TraversalStrategy::RelayWithBackgroundReclaim],
+                TraversalReason::BothUnpredictableHardNat,
+                context,
+                true,
+            );
+        }
         let bounded = context.bounded_birthday_allowed
             && (local.birthday_candidate || remote_for_decision.birthday_candidate);
         if bounded {
@@ -618,7 +630,7 @@ pub fn plan_traversal(
             TraversalStrategy::RelayWithBackgroundReclaim,
             TraversalCapability::RelayPreferred,
             vec![TraversalStrategy::RelayWithBackgroundReclaim],
-            TraversalReason::BothUnpredictableHardNat,
+            TraversalReason::HardNatWithoutBoundedEvidence,
             context,
             true,
         );
@@ -826,14 +838,7 @@ mod tests {
 
     #[test]
     fn random_hard_pair_is_relay_preferred_or_bounded_speculative() {
-        let plan = plan_traversal(
-            &random_hard(),
-            &random_hard(),
-            &TraversalContext {
-                bounded_birthday_allowed: false,
-                ..Default::default()
-            },
-        );
+        let plan = plan_traversal(&random_hard(), &random_hard(), &TraversalContext::default());
         assert_eq!(plan.strategy, TraversalStrategy::RelayWithBackgroundReclaim);
         assert_eq!(plan.capability, TraversalCapability::RelayPreferred);
     }
