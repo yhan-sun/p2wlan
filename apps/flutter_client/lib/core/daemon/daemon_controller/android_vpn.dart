@@ -10,6 +10,12 @@ const _androidProvisionalVirtualIp = '10.20.0.1';
 
 extension DaemonControllerAndroidVpn on DaemonController {
   Future<DaemonCommandResult> _startAndroidVpn(AppSettings settings) async {
+    if (!settings.manualMode && isAuthTokenExpired(settings.authToken)) {
+      return const DaemonCommandResult(
+        ok: false,
+        message: 'Android VPN 启动失败：登录状态已过期，请重新登录。',
+      );
+    }
     // Stop a previous service/runtime first. This makes repeated starts safe
     // across hot restart, debug/release installs, and stale foreground
     // services holding the previous TUN fd.

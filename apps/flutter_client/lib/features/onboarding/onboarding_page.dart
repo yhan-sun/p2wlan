@@ -167,6 +167,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
       '已完成启动授权',
       '管理员认证失败',
       '已取消管理员授权',
+      'Android VPN',
     ];
     return safePrefixes.any(detail.startsWith);
   }

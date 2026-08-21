@@ -28,7 +28,11 @@ Future<void> _configureDesktopWindowChrome() async {
   } else if (Platform.isWindows) {
     await windowManager.setTitle('P2WLAN');
     await windowManager.setTitleBarStyle(
-      TitleBarStyle.normal,
+      // Keep the native Windows caption buttons, but use the same frameless
+      // content chrome as macOS.  The in-app close button was a duplicate of
+      // this native control and made the settings/login pages look unlike the
+      // Mac build.
+      TitleBarStyle.hidden,
       windowButtonVisibility: true,
     );
     await windowManager.setResizable(true);

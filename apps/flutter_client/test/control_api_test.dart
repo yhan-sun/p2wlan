@@ -12,6 +12,27 @@ void main() {
     expect(defaultControlServer, 'http://47.109.40.237:18080');
   });
 
+  test(
+    'JWT expiry guard identifies expired tokens without rejecting opaque tokens',
+    () {
+      final now = DateTime.utc(2026, 8, 21, 16);
+      String tokenFor(int exp) {
+        final payload = base64Url
+            .encode(utf8.encode(jsonEncode({'exp': exp})))
+            .replaceAll('=', '');
+        return 'header.$payload.signature';
+      }
+
+      final nowSeconds = now.millisecondsSinceEpoch ~/ 1000;
+      expect(
+        isAuthTokenExpired(tokenFor(nowSeconds + 3600), now: now),
+        isFalse,
+      );
+      expect(isAuthTokenExpired(tokenFor(nowSeconds - 3600), now: now), isTrue);
+      expect(isAuthTokenExpired('custom-deployment-token', now: now), isFalse);
+    },
+  );
+
   test('settings load migrates the old placeholder control host', () async {
     final tempDir = await Directory.systemTemp.createTemp(
       'p2wlan_control_migration_test_',
@@ -39,6 +60,37 @@ void main() {
 
     expect(store.settings.controlServer, defaultControlServer);
   });
+
+  test(
+    'settings load migrates the legacy host even with a stored token',
+    () async {
+      final tempDir = await Directory.systemTemp.createTemp(
+        'p2wlan_control_token_migration_test_',
+      );
+      addTearDown(() {
+        if (tempDir.existsSync()) {
+          tempDir.deleteSync(recursive: true);
+        }
+      });
+      final settingsFile = File('${tempDir.path}/settings.json');
+      await settingsFile.writeAsString('''
+{
+  "controlServer": "$legacyControlServer",
+  "authToken": "expired-or-legacy-token",
+  "manualMode": false
+}
+''');
+
+      final store = SettingsStore(
+        settingsFile: settingsFile,
+        tokenRepository: InMemorySecureTokenRepository(),
+      );
+      await store.load();
+      addTearDown(store.dispose);
+
+      expect(store.settings.controlServer, defaultControlServer);
+    },
+  );
 
   test('settings load replaces ip-like default device names', () async {
     final tempDir = await Directory.systemTemp.createTemp(

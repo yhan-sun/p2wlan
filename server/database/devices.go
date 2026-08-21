@@ -275,10 +275,21 @@ const DeviceOnlineTTL = 90
 // Devices whose last_seen is older than DeviceOnlineTTL are reported as offline
 // even if the online flag is still set (lease / TTL semantics).
 func (db *DB) ListDevicesByNetwork(networkID string) ([]Device, error) {
+	return db.listDevices(`FROM devices WHERE network_id = ?`, networkID)
+}
+
+// ListDevicesByUserAndNetwork returns only the devices owned by userID in the
+// requested network. Network membership is not ownership: the control-plane
+// user API must not expose another account's device roster just because both
+// accounts are members of the legacy shared default network.
+func (db *DB) ListDevicesByUserAndNetwork(userID, networkID string) ([]Device, error) {
+	return db.listDevices(`FROM devices WHERE user_id = ? AND network_id = ?`, userID, networkID)
+}
+
+func (db *DB) listDevices(fromClause string, args ...interface{}) ([]Device, error) {
 	now := time.Now().Unix()
 
-	rows, err := db.Query(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at
-		FROM devices WHERE network_id = ?`, networkID)
+	rows, err := db.Query(`SELECT id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, endpoint, relay_rtt_ms, last_seen, COALESCE(app_version, ''), online, created_at `+fromClause, args...)
 	if err != nil {
 		return nil, err
 	}

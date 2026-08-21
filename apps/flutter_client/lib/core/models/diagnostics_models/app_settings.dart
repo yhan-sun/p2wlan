@@ -15,6 +15,32 @@ const defaultUdpBind = '0.0.0.0:0';
 const defaultSocketPool = '3';
 const defaultCloseBehavior = 'keep-running';
 
+/// Return whether a JWT-shaped user token is expired.
+///
+/// This is only a local UX guard; the control server remains authoritative.
+/// Opaque/manual credentials and malformed tokens are left alone so custom
+/// deployments are not rejected before the server can validate them.
+bool isAuthTokenExpired(String token, {DateTime? now}) {
+  final parts = token.trim().split('.');
+  if (parts.length != 3) return false;
+  try {
+    final payload = jsonDecode(
+      utf8.decode(base64Url.decode(base64Url.normalize(parts[1]))),
+    );
+    if (payload is! Map<String, dynamic>) return false;
+    final exp = payload['exp'];
+    if (exp is! num) return false;
+    final expiresAt = DateTime.fromMillisecondsSinceEpoch(
+      (exp * 1000).round(),
+      isUtc: true,
+    );
+    final reference = (now ?? DateTime.now()).toUtc();
+    return !expiresAt.isAfter(reference.add(const Duration(seconds: 30)));
+  } catch (_) {
+    return false;
+  }
+}
+
 String get defaultTunInterface => Platform.isWindows ? 'p2wlan' : 'p2wlan0';
 
 typedef JsonMap = Map<String, dynamic>;

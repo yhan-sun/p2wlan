@@ -212,6 +212,24 @@ mod tests {
     }
 
     #[test]
+    fn test_null_control_credentials_load_as_empty_strings() {
+        let json = r#"{
+            "node": {"node_id": "n1", "public_key": "p", "private_key": "k", "device_name": "d", "platform": "android"},
+            "network": {"network_id": "net1", "virtual_ip": "10.20.0.1", "cidr": "10.20.0.0/16"},
+            "control": {"server_url": "http://ctrl.test", "auth_token": null, "device_credential": null},
+            "relay": {"servers": []}
+        }"#;
+
+        let decoded: Config = serde_json::from_str(json).unwrap();
+        assert!(decoded.control.auth_token.is_empty());
+        assert!(decoded.control.device_credential.is_empty());
+
+        let serialized = serde_json::to_string(&decoded).unwrap();
+        assert!(serialized.contains("\"auth_token\":\"\""));
+        assert!(serialized.contains("\"device_credential\":\"\""));
+    }
+
+    #[test]
     fn test_network_config_serializes_new_overlay_and_startup_timeout_fields() {
         let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
         let json = serde_json::to_string(&config).unwrap();

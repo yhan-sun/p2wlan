@@ -74,7 +74,9 @@ async fn run_control_loop(
                         }
                         if config_changed {
                             if let Some(ref path) = config_path {
-                                if let Err(e) = config.save_to_file(path) {
+                                let mut persisted = config.clone();
+                                persisted.control.auth_token.clear();
+                                if let Err(e) = persisted.save_to_file(path) {
                                     warn!("Failed to save control-assigned network config: {e}");
                                 }
                             }
@@ -132,7 +134,9 @@ async fn run_control_loop(
                                     config.control.credential_issued = true;
                                     token = device_credential;
                                     if let Some(ref path) = config_path {
-                                        if let Err(e) = config.save_to_file(path) {
+                                        let mut persisted = config.clone();
+                                        persisted.control.auth_token.clear();
+                                        if let Err(e) = persisted.save_to_file(path) {
                                             warn!(
                                                 "Failed to save config with device credential: {e}"
                                             );

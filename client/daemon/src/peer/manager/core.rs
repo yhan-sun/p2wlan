@@ -281,7 +281,10 @@ impl PeerManager {
 
     /// Serializable local traversal history diagnostics.
     pub async fn traversal_history_diagnostics(&self) -> TraversalHistoryDiagnostics {
-        self.traversal_history.read().await.diagnostics()
+        self.traversal_history
+            .try_read()
+            .map(|history| history.diagnostics())
+            .unwrap_or_else(|_| TraversalHistoryDiagnostics { sources: Vec::new() })
     }
 
     async fn record_traversal_success(&self, source: CandidatePairSource) {

@@ -153,6 +153,10 @@ class DaemonController {
 
     await configPath.parent.create(recursive: true);
     await logDir.create(recursive: true);
+    // Pre-create the log as the interactive user.  Elevated macOS/Windows
+    // launches must append to this file rather than creating a root/admin-owned
+    // file that the Flutter UI cannot read for startup diagnostics.
+    await File(logPath).create(recursive: true);
 
     final elevatedShell = _buildElevatedShell(
       binary: binary,

@@ -224,6 +224,57 @@ func TestUpdateDeviceEndpointStoresRelayRTT(t *testing.T) {
 	}
 }
 
+func TestListNodesIsolatedByAccountForUserAndDeviceAuth(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	owner, _ := db.CreateUser("nodes-owner-isolation@example.com", "hash")
+	other, _ := db.CreateUser("nodes-other-isolation@example.com", "hash")
+	owned, _ := db.CreateDevice(owner.ID, "default", "nodes-owner-key", "owner-device", "macos", "")
+	foreign, _ := db.CreateDevice(other.ID, "default", "nodes-other-key", "other-device", "linux", "")
+
+	server := NewServer(nil, nil, db)
+	userReq := httptest.NewRequest(http.MethodGet, "/api/v1/nodes?network_id=default", nil)
+	userReq = userReq.WithContext(context.WithValue(userReq.Context(), auth.UserClaimsKey, &auth.Claims{UserID: owner.ID}))
+	userRecorder := httptest.NewRecorder()
+	server.ListNodes(userRecorder, userReq)
+	if userRecorder.Code != http.StatusOK {
+		t.Fatalf("user list expected 200, got %d: %s", userRecorder.Code, userRecorder.Body.String())
+	}
+	assertOnlyNode(t, userRecorder, owned.ID, foreign.ID)
+
+	deviceReq := httptest.NewRequest(http.MethodGet, "/api/v1/nodes?network_id=default", nil)
+	deviceReq = deviceReq.WithContext(context.WithValue(deviceReq.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID: owned.ID, NetworkID: owned.NetworkID, UserID: owner.ID,
+	}))
+	deviceRecorder := httptest.NewRecorder()
+	server.ListNodes(deviceRecorder, deviceReq)
+	if deviceRecorder.Code != http.StatusOK {
+		t.Fatalf("device list expected 200, got %d: %s", deviceRecorder.Code, deviceRecorder.Body.String())
+	}
+	assertOnlyNode(t, deviceRecorder, owned.ID, foreign.ID)
+}
+
+func assertOnlyNode(t *testing.T, recorder *httptest.ResponseRecorder, expectedID, forbiddenID string) {
+	t.Helper()
+	var response struct {
+		Nodes []database.Device `json:"nodes"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode nodes: %v", err)
+	}
+	if len(response.Nodes) != 1 || response.Nodes[0].ID != expectedID {
+		t.Fatalf("expected only %q, got %+v", expectedID, response.Nodes)
+	}
+	for _, node := range response.Nodes {
+		if node.ID == forbiddenID {
+			t.Fatalf("response leaked foreign device %q", forbiddenID)
+		}
+	}
+}
+
 func TestUserJWTEndpointUpdateCannotReviveCredentialedDevice(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {

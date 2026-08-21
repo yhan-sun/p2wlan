@@ -343,7 +343,6 @@ class SettingsStore extends ChangeNotifier {
 
 Future<AppSettings> _migrateSettings(AppSettings settings) async {
   final controlServer = settings.controlServer.trim();
-  final hasAuthToken = settings.authToken.trim().isNotEmpty;
   final legacyLocalControl =
       controlServer == 'http://127.0.0.1:8080' ||
       controlServer == 'http://localhost:8080';
@@ -351,10 +350,9 @@ Future<AppSettings> _migrateSettings(AppSettings settings) async {
       controlServer == legacyPlaceholderControlServer;
   final currentDeviceName = settings.deviceName.trim();
   var migrated = settings;
-  if (!hasAuthToken &&
-      (controlServer == legacyControlServer ||
-          legacyLocalControl ||
-          legacyPlaceholderControl)) {
+  if (controlServer == legacyControlServer ||
+      legacyLocalControl ||
+      legacyPlaceholderControl) {
     migrated = migrated.copyWith(controlServer: defaultControlServer);
   }
   if (_shouldReplaceDefaultDeviceName(currentDeviceName)) {

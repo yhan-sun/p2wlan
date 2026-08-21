@@ -93,7 +93,7 @@ func TestDeleteDeviceAcceptsUserTokenForOwnedDevice(t *testing.T) {
 	}
 }
 
-func TestDeleteDeviceAcceptsNetworkMember(t *testing.T) {
+func TestDeleteDeviceRejectsNetworkMember(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
 	if err != nil {
 		t.Fatalf("database.New: %v", err)
@@ -110,11 +110,35 @@ func TestDeleteDeviceAcceptsNetworkMember(t *testing.T) {
 	recorder := httptest.NewRecorder()
 
 	server.DeleteDevice(recorder, req)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", recorder.Code, recorder.Body.String())
 	}
-	if _, err := db.GetDevice(device.ID); err == nil {
-		t.Fatal("expected network-member delete to remove the device")
+	if _, err := db.GetDevice(device.ID); err != nil {
+		t.Fatal("network member must not delete another account's device")
+	}
+}
+
+func TestCreateSignalRejectsCrossAccountTarget(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	owner, _ := db.CreateUser("signal-owner-isolation@example.com", "hash")
+	other, _ := db.CreateUser("signal-other-isolation@example.com", "hash")
+	source, _ := db.CreateDevice(owner.ID, "default", "signal-isolation-source-key", "source", "macos", "")
+	target, _ := db.CreateDevice(other.ID, "default", "signal-isolation-target-key", "target", "linux", "")
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signals", strings.NewReader(`{"to_node_id":"`+target.ID+`","type":"peer_reflexive","candidates":["203.0.113.10:51820"]}`))
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID: source.ID, NetworkID: source.NetworkID, UserID: owner.ID,
+	}))
+	recorder := httptest.NewRecorder()
+
+	server.CreateSignal(recorder, req)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

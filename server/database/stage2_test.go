@@ -116,15 +116,16 @@ func TestDatabase_UserACannotModifyUserBDevice(t *testing.T) {
 		t.Fatal("Alice should not own Bob's device")
 	}
 
-	// Check DeviceAccessibleByUser
+	// Network membership remains a separate, broader capability for legacy
+	// network-level operations; the API's device roster and management paths
+	// must use the strict ownership check above instead.
 	accessible, err := db.DeviceAccessibleByUser(bobDev.ID, alice.ID)
 	if err != nil {
 		t.Fatalf("DeviceAccessibleByUser: %v", err)
 	}
 	// Bob's device is in the "default" network, which Alice also has access to.
-	// DeviceAccessibleByUser checks ownership OR shared network membership — so Alice
-	// naturally "has access" to Bob's device because they share the default network.
-	// The strict ownership check (DeviceBelongsToUser) correctly rejects it.
+	// DeviceAccessibleByUser therefore reports network-level access, while the
+	// strict ownership check correctly rejects account-level device access.
 	t.Logf("Alice has network-level access to Bob's device (expected): %v", accessible)
 
 	// Alice should own her own device though

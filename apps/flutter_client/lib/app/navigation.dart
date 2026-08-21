@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -179,7 +178,6 @@ class _P2WlanShellState extends State<P2WlanShell> {
                 onOpenTroubleshooting: () =>
                     _select(P2WlanSection.troubleshooting),
               ),
-              if (_showsInAppCloseButton) const _WindowsCloseButton(),
               const SizedBox(width: 8),
             ],
     );
@@ -323,8 +321,6 @@ bool get _canDragWindowFromAppBar {
   return !kIsWeb && (Platform.isMacOS || Platform.isWindows);
 }
 
-bool get _showsInAppCloseButton => !kIsWeb && Platform.isWindows;
-
 /// Compact mobile only: low-weight overflow menu in the top bar. Keeps the
 /// shell quiet — the bottom bar stays at exactly three destinations and
 /// troubleshooting is entered from here and from Home's issue banner.
@@ -387,25 +383,6 @@ class _MobileShellMenu extends StatelessWidget {
 }
 
 enum _MobileMenuAction { troubleshooting, refresh }
-
-class _WindowsCloseButton extends StatelessWidget {
-  const _WindowsCloseButton();
-
-  @override
-  Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
-    return IconButton(
-      tooltip: strings.closeWindow,
-      onPressed: () => unawaited(_destroyWindow()),
-      icon: const Icon(Icons.close_rounded),
-    );
-  }
-}
-
-Future<void> _destroyWindow() async {
-  await windowManager.setPreventClose(false);
-  await windowManager.destroy();
-}
 
 class _ShellStatusActions extends StatelessWidget {
   const _ShellStatusActions({

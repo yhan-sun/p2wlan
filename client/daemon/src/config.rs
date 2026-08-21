@@ -7,7 +7,7 @@
 //! - Relay servers
 //! - Port mappings
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Deserializer, Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
 

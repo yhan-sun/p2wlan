@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "android")]
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -14,7 +15,10 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use std::{fs::OpenOptions, io::Write};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+};
 
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, jstring};
@@ -76,9 +80,28 @@ struct RuntimeHandle {
 }
 
 static RUNTIME: OnceLock<Mutex<Option<RuntimeHandle>>> = OnceLock::new();
+static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn runtime_slot() -> &'static Mutex<Option<RuntimeHandle>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+fn last_error_slot() -> &'static Mutex<Option<String>> {
+    LAST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+fn set_last_error(error: Option<String>) {
+    let mut guard = last_error_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = error;
+}
+
+fn last_error() -> Option<String> {
+    last_error_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn runtime_running() -> bool {
@@ -141,17 +164,38 @@ fn write_diagnostics_auth(path: &Path) -> Result<String, String> {
     std::fs::write(path, token.as_bytes())
         .map_err(|error| format!("failed to write diagnostics auth token: {error}"))?;
 
+    protect_private_file(path)
+        .map_err(|error| format!("failed to protect diagnostics auth token: {error}"))?;
+    Ok(token)
+}
+
+/// Android's app directory is private by default, but files created by a
+/// native process still inherit the process umask.  Explicitly enforce
+/// owner-only permissions for every daemon log/auth file, including files
+/// created by an older release with broader permissions.
+fn protect_private_file(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)
-            .map_err(|error| format!("failed to inspect diagnostics auth token: {error}"))?
-            .permissions();
+        let mut permissions = std::fs::metadata(path)?.permissions();
         permissions.set_mode(0o600);
-        std::fs::set_permissions(path, permissions)
-            .map_err(|error| format!("failed to protect diagnostics auth token: {error}"))?;
+        std::fs::set_permissions(path, permissions)?;
     }
-    Ok(token)
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn open_private_append(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    if let Err(error) = protect_private_file(path) {
+        drop(file);
+        return Err(error);
+    }
+    Ok(file)
 }
 
 fn prepare_config(request: &AndroidStartRequest) -> Result<(Config, PathBuf), String> {
@@ -168,7 +212,6 @@ fn prepare_config(request: &AndroidStartRequest) -> Result<(Config, PathBuf), St
     let network_id = non_empty(&request.network_id, "default");
     let mut config = if config_path.exists() {
         Config::load_from_file(&config_path)
-            .or_else(|_| Config::generate_default(&control_server, &network_id))
             .map_err(|error| format!("failed to load Android daemon config: {error}"))?
     } else {
         Config::generate_default(&control_server, &network_id)
@@ -193,7 +236,9 @@ fn prepare_config(request: &AndroidStartRequest) -> Result<(Config, PathBuf), St
     config.control.auth_token = request.auth_token.trim().to_string();
     config.control.proxy_mode = ControlProxyMode::Direct;
     config.network.network_id = network_id;
-    config.network.manual = request.manual_mode || config.control.auth_token.trim().is_empty();
+    let has_control_credential = !config.control.auth_token.trim().is_empty()
+        || !config.control.device_credential.trim().is_empty();
+    config.network.manual = request.manual_mode || !has_control_credential;
     config.network.virtual_ip = configured_vip;
     config.network.cidr = cidr;
     config.network.netmask = netmask;
@@ -275,7 +320,7 @@ fn prepare_config(request: &AndroidStartRequest) -> Result<(Config, PathBuf), St
 }
 
 fn append_log(path: &Path, message: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = open_private_append(path) {
         let _ = writeln!(file, "{message}");
     }
 }
@@ -287,13 +332,7 @@ fn append_log(path: &Path, message: &str) {
 fn init_logging(path: &Path) {
     static LOGGING: OnceLock<()> = OnceLock::new();
     LOGGING.get_or_init(|| {
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
+        let Ok(file) = open_private_append(path) else {
             return;
         };
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -330,31 +369,43 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
         .unwrap_or_else(|| config_path.with_file_name("p2wlan-daemon.log"));
     let running = Arc::new(AtomicBool::new(true));
     let running_for_thread = Arc::clone(&running);
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<watch::Sender<bool>, String>>(1);
 
     thread::Builder::new()
         .name("p2wlan-daemon".to_string())
         .spawn(move || {
-            init_logging(&log_path);
-            let runtime = match Builder::new_multi_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    append_log(
-                        &log_path,
-                        &format!("failed to create Tokio runtime: {error}"),
-                    );
-                    running_for_thread.store(false, Ordering::Release);
-                    return;
+            let startup_result = catch_unwind(AssertUnwindSafe(|| {
+                init_logging(&log_path);
+                let runtime = Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("failed to create Tokio runtime: {error}"))?;
+                let mut daemon = Daemon::new_with_android_tun(config, tun_fd);
+                let shutdown_tx = daemon.shutdown_sender();
+                ready_tx
+                    .send(Ok(shutdown_tx))
+                    .map_err(|_| "Android daemon startup waiter disconnected".to_string())?;
+                if let Err(error) = runtime.block_on(daemon.run()) {
+                    let message = format!("Android daemon exited with error: {error}");
+                    set_last_error(Some(message.clone()));
+                    append_log(&log_path, &message);
                 }
-            };
-            let mut daemon = Daemon::new_with_android_tun(config, tun_fd);
-            let shutdown_tx = daemon.shutdown_sender();
-            let _ = ready_tx.send(shutdown_tx);
-            if let Err(error) = runtime.block_on(daemon.run()) {
-                append_log(
-                    &log_path,
-                    &format!("Android daemon exited with error: {error}"),
-                );
+                Ok::<(), String>(())
+            }));
+
+            match startup_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    set_last_error(Some(error.clone()));
+                    append_log(&log_path, &error);
+                    let _ = ready_tx.send(Err(error));
+                }
+                Err(_) => {
+                    let error = "Android daemon thread panicked during startup".to_string();
+                    set_last_error(Some(error.clone()));
+                    append_log(&log_path, &error);
+                    let _ = ready_tx.send(Err(error));
+                }
             }
             running_for_thread.store(false, Ordering::Release);
             let mut guard = runtime_slot()
@@ -371,7 +422,7 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
 
     let shutdown_tx = ready_rx
         .recv_timeout(Duration::from_secs(2))
-        .map_err(|error| format!("Android daemon did not initialize: {error}"))?;
+        .map_err(|error| format!("Android daemon did not initialize: {error}"))??;
     let handle = RuntimeHandle {
         shutdown_tx,
         running,
@@ -415,8 +466,12 @@ pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nat
     tun_fd: jint,
     request_json: JString<'_>,
 ) -> jstring {
+    set_last_error(None);
     let result =
         read_request(&mut env, request_json).and_then(|request| start_runtime(tun_fd, request));
+    if let Err(error) = &result {
+        set_last_error(Some(error.clone()));
+    }
     new_string_or_null(&mut env, result.err())
 }
 
@@ -442,4 +497,12 @@ pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nat
     } else {
         0
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeLastError(
+    mut env: JNIEnv<'_>,
+    _object: JObject<'_>,
+) -> jstring {
+    new_string_or_null(&mut env, last_error())
 }

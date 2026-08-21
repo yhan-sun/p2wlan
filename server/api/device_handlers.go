@@ -162,7 +162,11 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 func (s *Server) ListNodes(w http.ResponseWriter, r *http.Request) {
 	// Try device claims first, then user claims
 	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
-		devices, err := s.db.ListDevicesByNetwork(deviceClaims.NetworkID)
+		// Device credentials are used by the daemon to build its peer roster.
+		// The current account-scoped product model keeps that roster private to
+		// the account that owns the credential, even when the legacy `default`
+		// network is shared by multiple accounts.
+		devices, err := s.db.ListDevicesByUserAndNetwork(deviceClaims.UserID, deviceClaims.NetworkID)
 		if err != nil {
 			http.Error(w, `{"error":"failed to list nodes"}`, http.StatusInternalServerError)
 			return
@@ -172,7 +176,7 @@ func (s *Server) ListNodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if userClaims, err := auth.GetClaims(r.Context()); err == nil {
-		networkID := r.URL.Query().Get("network_id")
+		networkID := strings.TrimSpace(r.URL.Query().Get("network_id"))
 		if networkID == "" {
 			http.Error(w, `{"error":"network_id is required"}`, http.StatusBadRequest)
 			return
@@ -181,12 +185,16 @@ func (s *Server) ListNodes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"network_id too long"}`, http.StatusBadRequest)
 			return
 		}
-		hasAccess, _ := s.db.UserHasNetworkAccess(userClaims.UserID, networkID)
+		hasAccess, err := s.db.UserHasNetworkAccess(userClaims.UserID, networkID)
+		if err != nil {
+			http.Error(w, `{"error":"failed to check network access"}`, http.StatusInternalServerError)
+			return
+		}
 		if !hasAccess {
 			http.Error(w, `{"error":"access denied"}`, http.StatusForbidden)
 			return
 		}
-		devices, err := s.db.ListDevicesByNetwork(networkID)
+		devices, err := s.db.ListDevicesByUserAndNetwork(userClaims.UserID, networkID)
 		if err != nil {
 			http.Error(w, `{"error":"failed to list nodes"}`, http.StatusInternalServerError)
 			return
@@ -380,8 +388,8 @@ func (s *Server) DeleteDevice(w http.ResponseWriter, r *http.Request) {
 	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
 		authorized = pathDeviceID == deviceClaims.DeviceID
 	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
-		accessible, err := s.db.DeviceAccessibleByUser(pathDeviceID, userClaims.UserID)
-		authorized = err == nil && accessible
+		owned, err := s.db.DeviceBelongsToUser(pathDeviceID, userClaims.UserID)
+		authorized = err == nil && owned
 	}
 	if !authorized {
 		http.Error(w, `{"error":"device not found or access denied"}`, http.StatusForbidden)

@@ -61,6 +61,18 @@ fn redacted_presence(value: &str) -> &'static str {
     }
 }
 
+/// Older desktop and Android config writers used JSON `null` for credentials
+/// that had not been issued yet. Keep loading those files safe and
+/// backwards-compatible while continuing to serialize canonical strings.
+fn deserialize_string_or_empty<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 impl std::fmt::Debug for NodeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeConfig")
@@ -329,10 +341,11 @@ pub struct ControlConfig {
     /// Control server URL (e.g. "https://control.p2wlan.io:443").
     pub server_url: String,
     /// User authentication token (JWT) obtained after login/register.
+    #[serde(default, deserialize_with = "deserialize_string_or_empty")]
     pub auth_token: String,
     /// Device credential token for API authentication (replaces user JWT
     /// for device-level operations after Ed25519 challenge is completed).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_empty")]
     pub device_credential: String,
     /// Whether the device credential has been issued.
     #[serde(default)]

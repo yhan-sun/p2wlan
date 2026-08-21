@@ -230,8 +230,8 @@ pub(crate) async fn select_relay_with_cooldowns(
                         connected.sort_by_key(|connected| {
                             (
                                 connected.candidate.preference_rank,
-                                connected.transport.connect_latency_ms,
                                 connected.candidate.index,
+                                connected.transport.connect_latency_ms,
                             )
                         });
                         if first_success_at.is_none() {

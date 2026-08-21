@@ -9,6 +9,7 @@ import '../app/p2wlan_colors.dart';
 import '../core/api/diagnostics_api.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/daemon/daemon_controller.dart';
+import '../core/models/diagnostics_models.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../features/auth/login_page.dart';
@@ -66,9 +67,10 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
 
   Future<void> _bootstrap() async {
     await _settingsStore.load();
+    final authToken = _settingsStore.settings.authToken.trim();
     _authenticated =
-        _settingsStore.settings.authToken.trim().isNotEmpty ||
-        _settingsStore.settings.manualMode;
+        _settingsStore.settings.manualMode ||
+        (authToken.isNotEmpty && !isAuthTokenExpired(authToken));
     if (mounted) {
       setState(() => _ready = true);
     }

@@ -7,7 +7,9 @@ import android.content.Intent
 import android.content.Context
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import org.json.JSONObject
@@ -32,7 +34,12 @@ class P2wlanVpnService : VpnService() {
         @Volatile
         private var serviceRunning = false
 
+        @Volatile
+        private var serviceError: String? = null
+
         fun isRunning(): Boolean = serviceRunning && P2wlanNative.isRunning()
+
+        fun lastError(): String? = serviceError ?: P2wlanNative.lastError()
 
         fun diagnosticsAuthPath(context: Context): File {
             return File(File(context.filesDir, "p2wlan"), "p2wlan-daemon.diag-auth")
@@ -40,6 +47,10 @@ class P2wlanVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
+    private var monitorGeneration = 0L
+    private var monitorThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -62,6 +73,8 @@ class P2wlanVpnService : VpnService() {
     private fun startVpn(requestJson: String) {
         var detachedFd = -1
         try {
+            stopMonitor()
+            serviceError = null
             createNotificationChannel()
             val notification = buildNotification()
             if (Build.VERSION.SDK_INT >= 34) {
@@ -103,9 +116,12 @@ class P2wlanVpnService : VpnService() {
             }
             detachedFd = -1
             serviceRunning = true
+            startNativeMonitor()
             Log.i(TAG, "P2WLAN Android VPN started")
         } catch (error: Throwable) {
-            Log.e(TAG, "Failed to start P2WLAN Android VPN", error)
+            val message = "Android VPN 服务启动失败：${error.message ?: error::class.java.simpleName}"
+            serviceError = message
+            Log.e(TAG, message, error)
             if (detachedFd >= 0) closeDetachedFd(detachedFd)
             vpnInterface?.close()
             vpnInterface = null
@@ -116,6 +132,8 @@ class P2wlanVpnService : VpnService() {
     }
 
     private fun stopVpn() {
+        serviceRunning = false
+        stopMonitor()
         try {
             if (P2wlanNative.isRunning()) {
                 P2wlanNative.stop()
@@ -123,7 +141,6 @@ class P2wlanVpnService : VpnService() {
         } catch (error: Throwable) {
             Log.w(TAG, "Failed to request Rust daemon shutdown", error)
         }
-        serviceRunning = false
         vpnInterface?.close()
         vpnInterface = null
         stopForeground(true)
@@ -136,16 +153,56 @@ class P2wlanVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        serviceRunning = false
+        stopMonitor()
         if (P2wlanNative.isRunning()) {
             P2wlanNative.stop()
         }
-        serviceRunning = false
         vpnInterface?.close()
         vpnInterface = null
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
+
+    /**
+     * A Rust daemon can fail after JNI has successfully accepted the TUN fd
+     * (for example, when a stored control token is rejected). Keep the
+     * foreground service and VPN interface from looking alive in that case,
+     * and retain a useful error for Flutter's status call.
+     */
+    private fun startNativeMonitor() {
+        val generation = ++monitorGeneration
+        val thread = Thread({
+            try {
+                while (serviceRunning && P2wlanNative.isRunning()) {
+                    Thread.sleep(250)
+                }
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            if (!serviceRunning || generation != monitorGeneration) return@Thread
+
+            val error = P2wlanNative.lastError()
+                ?: "Android VPN 本地 daemon 已退出，请查看诊断日志。"
+            mainHandler.post {
+                if (!serviceRunning || generation != monitorGeneration) return@post
+                serviceError = error
+                serviceRunning = false
+                Log.e(TAG, error)
+                stopForeground(true)
+                stopSelf()
+            }
+        }, "p2wlan-native-monitor")
+        monitorThread = thread
+        thread.start()
+    }
+
+    private fun stopMonitor() {
+        monitorGeneration += 1
+        monitorThread?.interrupt()
+        monitorThread = null
+    }
 
     private fun enrichRequest(request: JSONObject): JSONObject {
         val directory = File(filesDir, "p2wlan")

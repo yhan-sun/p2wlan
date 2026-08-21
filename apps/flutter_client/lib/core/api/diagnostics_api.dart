@@ -15,6 +15,11 @@ class DiagnosticsApi {
   }
 
   static const _requestTimeout = Duration(milliseconds: 3500);
+  // A full snapshot may briefly contend with a network handover.  Keep the
+  // health probe fast, but give `/status` enough time to retry the structured
+  // snapshot-timeout response instead of turning a live daemon into a network
+  // error in the UI.
+  static const _statusTimeout = Duration(seconds: 8);
   static const _speedTestTimeout = Duration(seconds: 45);
   // The daemon holds `/events` for up to ~25s (long-poll); give it margin.
   static const _eventsTimeout = Duration(seconds: 30);
@@ -36,9 +41,10 @@ class DiagnosticsApi {
   }
 
   Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
-    final body = await _getText(
+    final body = await _getTextWithTimeout(
       _endpoint(diagnosticsUrl, '/status'),
       'application/json',
+      _statusTimeout,
     );
     final decoded = jsonDecode(body);
     if (decoded is! Map<String, dynamic>) {
@@ -265,8 +271,23 @@ class DiagnosticsApi {
         continue;
       }
       if (response.statusCode < 200 || response.statusCode >= 300) {
+        final error = _tryJsonObject(body);
+        final reasonCode = error?['reason_code']?.toString();
+        final serverMessage = error?['error']?.toString();
+        // The daemon deliberately uses a structured 503 when a complete
+        // snapshot cannot be materialized before its lock budget expires.
+        // Retry that condition once; it is not equivalent to /health being
+        // offline.
+        if (reasonCode == 'status_snapshot_timeout' && attempt == 0) {
+          await Future<void>.delayed(const Duration(milliseconds: 120));
+          continue;
+        }
         throw DiagnosticsApiException(
-          'GET ${uri.path} returned HTTP ${response.statusCode}',
+          serverMessage == null || serverMessage.isEmpty
+              ? 'GET ${uri.path} returned HTTP ${response.statusCode}'
+              : 'GET ${uri.path} returned HTTP ${response.statusCode}: $serverMessage',
+          statusCode: response.statusCode,
+          reasonCode: reasonCode,
         );
       }
       return body;
@@ -302,9 +323,15 @@ Map<String, dynamic>? _tryJsonObject(String body) {
 }
 
 class DiagnosticsApiException implements Exception {
-  const DiagnosticsApiException(this.message);
+  const DiagnosticsApiException(
+    this.message, {
+    this.statusCode,
+    this.reasonCode,
+  });
 
   final String message;
+  final int? statusCode;
+  final String? reasonCode;
 
   @override
   String toString() => message;

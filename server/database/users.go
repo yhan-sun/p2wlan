@@ -35,7 +35,10 @@ func (db *DB) CreateUser(email, passwordHash string) (*User, error) {
 		return nil, err
 	}
 
-	// Auto-join the user to the default network (for backward compatibility)
+	// Keep the legacy default-network membership so existing clients can
+	// register without a migration. Membership grants network registration
+	// access; it does not grant visibility or management rights over another
+	// account's devices.
 	db.CreateNetworkMembership(id, "default", "member")
 	return &User{ID: id, Email: email, PasswordHash: passwordHash, CreatedAt: now}, nil
 }

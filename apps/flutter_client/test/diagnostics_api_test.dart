@@ -117,4 +117,43 @@ void main() {
       expect(headers, ['Bearer diag-test-token', 'Bearer diag-test-token']);
     },
   );
+
+  test('retries a structured diagnostics snapshot timeout', () async {
+    final fixture = await File(
+      '../../contracts/fixtures/status.json',
+    ).readAsString();
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    var statusRequests = 0;
+    server.listen((request) async {
+      if (request.uri.path != '/status') return;
+      statusRequests++;
+      if (statusRequests == 1) {
+        request.response
+          ..statusCode = HttpStatus.serviceUnavailable
+          ..headers.contentType = ContentType.json
+          ..write(
+            '{"error":"diagnostics snapshot timed out",'
+            '"reason_code":"status_snapshot_timeout"}',
+          );
+      } else {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..headers.contentType = ContentType.json
+          ..write(fixture);
+      }
+      await request.response.close();
+    });
+
+    final api = DiagnosticsApi(
+      authTokenReader: () async => 'diag-test-token',
+    );
+    addTearDown(api.close);
+
+    final status = await api.fetchStatus(
+      'http://127.0.0.1:${server.port}/status',
+    );
+    expect(status.nodeId, 'node-a');
+    expect(statusRequests, 2);
+  });
 }

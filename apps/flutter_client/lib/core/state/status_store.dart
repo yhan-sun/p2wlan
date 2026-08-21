@@ -58,6 +58,7 @@ class StatusStore extends ChangeNotifier {
   var _autoRefreshEnabled = false;
   var _appInForeground = true;
   var _snapshotStale = false;
+  var _statusSnapshotTimedOut = false;
   var _refreshPending = false;
   var _refreshGeneration = 0;
   Future<void>? _refreshFuture;
@@ -89,6 +90,7 @@ class StatusStore extends ChangeNotifier {
   bool get autoRefreshEnabled => _autoRefreshEnabled;
   bool get appInForeground => _appInForeground;
   bool get snapshotStale => _snapshotStale;
+  bool get statusSnapshotTimedOut => _statusSnapshotTimedOut;
   String? get lastError => _lastError;
   String? get lastHealthError => _lastHealthError;
   String? get lastStatusError => _lastStatusError;
@@ -195,8 +197,10 @@ class StatusStore extends ChangeNotifier {
 
       _lastHealthError = null;
       _lastStatusError = null;
+      _statusSnapshotTimedOut = false;
       _healthReachable = health;
       if (!health) {
+        _statusSnapshotTimedOut = false;
         _clearSnapshot();
         _routeHealthy = false;
         _lastHealthError = 'GET /health is offline or unreadable';
@@ -213,6 +217,7 @@ class StatusStore extends ChangeNotifier {
           return;
         }
         final fetchedAt = DateTime.now();
+        _statusSnapshotTimedOut = false;
         _updatePeerTrafficRates(snapshot, fetchedAt);
         _snapshot = snapshot;
         try {
@@ -229,9 +234,22 @@ class StatusStore extends ChangeNotifier {
           _refreshPending = true;
           return;
         }
-        _clearSnapshot();
-        _lastStatusError = 'GET /status failed: $error';
-        _lastError = _lastStatusError;
+        final snapshotTimedOut =
+            error is DiagnosticsApiException &&
+            error.reasonCode == 'status_snapshot_timeout';
+        _statusSnapshotTimedOut = snapshotTimedOut;
+        if (!snapshotTimedOut) {
+          _clearSnapshot();
+          _lastStatusError = 'GET /status failed: $error';
+          _lastError = _lastStatusError;
+        } else {
+          // /health has already succeeded. A snapshot timeout means the
+          // daemon is alive but its hot peer locks are busy; keep the last
+          // known snapshot and let the next poll retry without presenting a
+          // false "network issue" banner.
+          _lastStatusError = null;
+          _lastError = null;
+        }
         _lastFetchedAt = DateTime.now();
       }
     } catch (error) {
@@ -240,6 +258,7 @@ class StatusStore extends ChangeNotifier {
         return;
       }
       _healthReachable = false;
+      _statusSnapshotTimedOut = false;
       _clearSnapshot();
       _lastHealthError = 'GET /health failed: $error';
       _lastStatusError = 'GET /status skipped because /health failed';

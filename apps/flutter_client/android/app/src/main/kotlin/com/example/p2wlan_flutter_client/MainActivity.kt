@@ -34,7 +34,7 @@ class MainActivity : FlutterActivity() {
                 mapOf(
                     "serviceRunning" to P2wlanVpnService.isRunning(),
                     "nativeRunning" to P2wlanNative.isRunning(),
-                    "nativeError" to P2wlanNative.lastError(),
+                    "nativeError" to P2wlanVpnService.lastError(),
                 ),
             )
             "diagnosticsAuthToken" -> result.success(readDiagnosticsAuthToken())
@@ -78,7 +78,11 @@ class MainActivity : FlutterActivity() {
             }
             result.success(true)
         } catch (error: Throwable) {
-            result.error("vpn_start_failed", error.message, null)
+            result.error(
+                "vpn_start_failed",
+                "Android VPN 服务启动失败：${error.message ?: error::class.java.simpleName}",
+                null,
+            )
         }
     }
 

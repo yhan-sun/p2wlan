@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -333,12 +332,6 @@ class _LoginPageState extends State<LoginPage> {
               ),
             ),
           ),
-          if (_usesWindowsWindowControls)
-            const Positioned(
-              top: 6,
-              right: 8,
-              child: SafeArea(child: _LoginWindowCloseButton()),
-            ),
         ],
       ),
     );
@@ -503,31 +496,6 @@ _LoginError _errorTextFor(AppStrings strings, Object error) {
 }
 
 bool get _usesWindowsWindowControls => !kIsWeb && Platform.isWindows;
-
-Future<void> _destroyWindow() async {
-  await windowManager.setPreventClose(false);
-  await windowManager.destroy();
-}
-
-class _LoginWindowCloseButton extends StatelessWidget {
-  const _LoginWindowCloseButton();
-
-  @override
-  Widget build(BuildContext context) {
-    final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
-    return IconButton(
-      tooltip: strings.closeWindow,
-      style: IconButton.styleFrom(
-        backgroundColor: theme.colorScheme.surface,
-        foregroundColor: theme.colorScheme.onSurfaceVariant,
-        side: BorderSide(color: theme.colorScheme.outlineVariant),
-      ),
-      onPressed: () => unawaited(_destroyWindow()),
-      icon: const Icon(Icons.close_rounded),
-    );
-  }
-}
 
 class _LoginError {
   const _LoginError({required this.title, this.body});

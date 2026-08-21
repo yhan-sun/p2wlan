@@ -77,33 +77,45 @@ impl PeerManager {
 
     /// Get serializable diagnostics for every peer.
     pub async fn diagnostics(&self) -> Vec<PeerDiagnostics> {
-        let generation = self.current_network_generation().await;
-        let traversal_history = self.traversal_history.read().await.clone();
+        // Diagnostics is a read-only fast path.  Do not wait behind the
+        // network-generation write lock here: a generation transition may
+        // legitimately hold that lock while it invalidates live paths.  The
+        // atomic mirror is published in the same critical section and is the
+        // value already used by the dataplane-safe diagnostics path below.
+        let generation = self.current_network_generation_sync();
+        let traversal_history = self
+            .traversal_history
+            .try_read()
+            .map(|history| history.clone())
+            .unwrap_or_default();
         let fresh_mapping_history = self
             .fresh_mapping_history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let recovery_reports = self.recovery_epoch_diagnostics().await;
+            .try_lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let recovery_reports = self.recovery_epoch_diagnostics();
         let mut peers: Vec<_> = self
             .connections
-            .read()
-            .await
-            .values()
-            .map(|conn| {
-                let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
-                    conn,
-                    None,
-                    None,
-                    generation,
-                    None,
-                    Some(&traversal_history),
-                    Some(&fresh_mapping_history),
-                );
-                diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
-                diagnostics
+            .try_read()
+            .map(|connections| {
+                connections
+                    .values()
+                    .map(|conn| {
+                        let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+                            conn,
+                            None,
+                            None,
+                            generation,
+                            None,
+                            Some(&traversal_history),
+                            Some(&fresh_mapping_history),
+                        );
+                        diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                        diagnostics
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         peers
     }
@@ -120,35 +132,44 @@ impl PeerManager {
         direct_retry_after: Duration,
         local_endpoint: Option<SocketAddr>,
     ) -> Vec<PeerDiagnostics> {
-        let generation = self.current_network_generation().await;
-        let traversal_history = self.traversal_history.read().await.clone();
+        // Use the lock-free generation mirror so a busy handover cannot make
+        // /status or /peers wait until the diagnostics timeout.
+        let generation = self.current_network_generation_sync();
+        let traversal_history = self
+            .traversal_history
+            .try_read()
+            .map(|history| history.clone())
+            .unwrap_or_default();
         let fresh_mapping_history = self
             .fresh_mapping_history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let recovery_reports = self.recovery_epoch_diagnostics().await;
+            .try_lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let recovery_reports = self.recovery_epoch_diagnostics();
         let mut peers: Vec<_> = self
             .connections
-            .read()
-            .await
-            .values()
-            .map(|conn| {
-                let current_selection =
-                    conn.select_path_for_data(generation, prefer_direct, relay_available);
-                let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
-                    conn,
-                    Some(&current_selection),
-                    Some(direct_retry_after),
-                    generation,
-                    local_endpoint,
-                    Some(&traversal_history),
-                    Some(&fresh_mapping_history),
-                );
-                diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
-                diagnostics
+            .try_read()
+            .map(|connections| {
+                connections
+                    .values()
+                    .map(|conn| {
+                        let current_selection =
+                            conn.select_path_for_data(generation, prefer_direct, relay_available);
+                        let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+                            conn,
+                            Some(&current_selection),
+                            Some(direct_retry_after),
+                            generation,
+                            local_endpoint,
+                            Some(&traversal_history),
+                            Some(&fresh_mapping_history),
+                        );
+                        diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                        diagnostics
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         peers
     }
@@ -170,15 +191,19 @@ impl PeerManager {
         direct_retry_after: Duration,
         local_endpoint: Option<SocketAddr>,
     ) -> Option<(u64, PeerDiagnostics)> {
-        let traversal_history = self.traversal_history.read().await.clone();
+        let traversal_history = self
+            .traversal_history
+            .try_read()
+            .map(|history| history.clone())
+            .unwrap_or_default();
         let fresh_mapping_history = self
             .fresh_mapping_history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let recovery = self.recovery_epoch_diagnostics().await.remove(node_id);
+            .try_lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let recovery = self.recovery_epoch_diagnostics().remove(node_id);
         let generation = self.current_network_generation_sync();
-        let conns = self.connections.read().await;
+        let conns = self.connections.try_read().ok()?;
         let conn = conns.get(node_id)?;
         let current_selection =
             conn.select_path_for_data(generation, prefer_direct, relay_available);
@@ -209,9 +234,11 @@ impl PeerManager {
     /// Serialized recovery-epoch budget reports for every peer with an active
     /// recovery epoch: the hard per-epoch ceilings (probe credit,
     /// fresh-mapping generations, HTTP publishes) are surfaced in status.
-    async fn recovery_epoch_diagnostics(&self) -> HashMap<String, RecoveryEpochDiagnostics> {
+    fn recovery_epoch_diagnostics(&self) -> HashMap<String, RecoveryEpochDiagnostics> {
         let now = Instant::now();
-        let epochs = self.recovery_epochs.read().await;
+        let Ok(epochs) = self.recovery_epochs.try_read() else {
+            return HashMap::new();
+        };
         let mut reports = HashMap::new();
         for (peer_id, state) in epochs.iter() {
             reports.insert(
@@ -257,5 +284,32 @@ impl PeerManager {
             outbound_send_failures: HashMap::new(),
             outbound_loss_events: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn full_diagnostics_does_not_wait_for_generation_writer() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        let _generation_writer = manager.network_generation.write().await;
+        let _connection_writer = manager.connections.write().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.diagnostics_with_path_selection(
+                true,
+                false,
+                DIRECT_RETRY_BASE_INTERVAL,
+                None,
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 }

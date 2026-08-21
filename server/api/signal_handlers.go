@@ -331,6 +331,13 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"target device is in a different network"}`, http.StatusForbidden)
 		return
 	}
+	if targetDevice.UserID != senderDevice.UserID {
+		// A shared network membership is not sufficient to exchange control
+		// signals in the account-scoped product model. This prevents a device
+		// credential from targeting another account's node by guessing its ID.
+		http.Error(w, `{"error":"target device not found or access denied"}`, http.StatusForbidden)
+		return
+	}
 	if err := verifyProbeEphemeralSignature(senderDevice, req.Type, fromNodeID, req.ToNodeID, req.SessionID, req.ProbeEphemeralPublicKey, req.ProbeEphemeralSignature, req.CandidateGeneration, req.CandidatesExpiresAtMS); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
 		return

@@ -65,6 +65,12 @@ async fn main() -> p2pnet_daemon::Result<()> {
                     log_file.display()
                 ))
             })?;
+        restrict_log_file_permissions(log_file).map_err(|e| {
+            DaemonError::Config(format!(
+                "failed to protect log file {}: {e}",
+                log_file.display()
+            ))
+        })?;
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_ansi(false)
@@ -346,10 +352,29 @@ fn append_early_startup_error(log_path: Option<&PathBuf>, error: &dyn std::fmt::
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
+    if restrict_log_file_permissions(path).is_err() {
+        return;
+    }
     let _ = std::io::Write::write_fmt(
         &mut file,
         format_args!("ERROR p2wlan-daemon startup before logging: {error}\n"),
     );
+}
+
+/// Keep daemon logs private on Unix hosts.  Windows uses the user's inherited
+/// ACL, while macOS/Linux otherwise honor the process umask only at creation
+/// time and would leave an old broad-permission log unchanged.
+fn restrict_log_file_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn read_launch_token_file(path: &std::path::Path) -> p2pnet_daemon::Result<String> {

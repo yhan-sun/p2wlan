@@ -66,7 +66,9 @@ func (db *DB) DeviceBelongsToUser(deviceID, userID string) (bool, error) {
 	return count > 0, nil
 }
 
-// DeviceAccessibleByUser checks ownership or network membership access.
+// DeviceAccessibleByUser checks ownership or network membership access for
+// explicit network-level operations. Account-scoped device listings and
+// management must use DeviceBelongsToUser instead.
 func (db *DB) DeviceAccessibleByUser(deviceID, userID string) (bool, error) {
 	owned, err := db.DeviceBelongsToUser(deviceID, userID)
 	if err != nil {

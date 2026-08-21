@@ -70,7 +70,14 @@ internal object P2wlanNative {
         }
     }
 
-    fun lastError(): String? = loadError
+    fun lastError(): String? {
+        if (!ensureLoaded()) return loadError
+        return try {
+            nativeLastError()?.trim()?.ifEmpty { null } ?: loadError
+        } catch (error: Throwable) {
+            loadError ?: formatError("无法读取 Android 原生 daemon 错误", error)
+        }
+    }
 
     private fun formatError(prefix: String, error: Throwable): String {
         val detail = error.message?.trim().orEmpty()
@@ -86,4 +93,6 @@ internal object P2wlanNative {
     private external fun nativeStop(): Boolean
 
     private external fun nativeIsRunning(): Boolean
+
+    private external fun nativeLastError(): String?
 }
