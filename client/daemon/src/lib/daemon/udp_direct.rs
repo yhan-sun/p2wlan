@@ -391,9 +391,6 @@ async fn run_udp_direct_instance(
             .await
         {
             Ok(report) => {
-                advertised_nat_type = report
-                    .nat_profile
-                    .control_label_with_generation(peers.current_network_generation_sync());
                 let (endpoints, sources) = candidate_endpoints_from_report(&report);
                 info!(
                             "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={} egress={}",
@@ -408,8 +405,11 @@ async fn run_udp_direct_instance(
                             report.nat_profile.observations.len(),
                             report.nat_profile.confidence,
                             proxy_env.label(),
-                        );
+                );
                 peers.update_nat_profile(report.nat_profile.clone()).await;
+                advertised_nat_type = report
+                    .nat_profile
+                    .control_label_with_generation(peers.current_local_profile_generation_sync());
                 let pool_eligible = socket_pool_enabled
                     && report.nat_profile.mapping_behavior
                         == MappingBehavior::AddressOrPortDependent

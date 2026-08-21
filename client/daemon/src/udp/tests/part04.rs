@@ -514,6 +514,87 @@ async fn fresh_mapping_generation_predicts_step1_and_ack_returns_on_same_socket(
 }
 
 #[tokio::test]
+async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
+    let (peers, transport, nat) = generation_env().await;
+    let key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    let generation = peers.current_network_generation().await;
+    let peer_socket = Arc::new(UdpSocket::bind(nat.peer_private).await.unwrap());
+    let listener_socket = peer_socket.clone();
+    let listener = tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let Ok(Ok((len, source))) =
+                timeout(Duration::from_secs(3), listener_socket.recv_from(&mut buf)).await
+            else {
+                break;
+            };
+            let data = &buf[..len];
+            let Some(packet) = decode_authenticated_punch_packet(data, &key) else {
+                continue;
+            };
+            if packet.kind == PunchPacketKind::Punch {
+                let ack = build_authenticated_punch_ack(
+                    packet.nonce,
+                    "peer-b",
+                    "peer-a",
+                    generation,
+                    &key,
+                );
+                let _ = peer_socket.send_to(&ack, source).await;
+            }
+        }
+    });
+
+    let outcome = transport
+        .run_hard_hard_fresh_mapping_generation(
+            "peer-b",
+            &nat.observers,
+            Duration::from_millis(500),
+            None,
+        )
+        .await;
+    let result = match outcome {
+        FreshMappingOutcome::Accepted(result, handoff) => {
+            assert!(handoff.finalize().await);
+            *result
+        }
+        FreshMappingOutcome::Rejected(reason) => {
+            panic!("expected measure-only Hard↔Hard generation, got {reason:?}")
+        }
+    };
+
+    // The measurement phase has no peer-directed send; the first mapping for
+    // the peer is created only by the exact-index synchronized sweep below.
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index(
+            "peer-b",
+            result.socket_index,
+            vec![nat.peer_public],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.packets_sent, 1);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if transport.probe_rx_snapshot().await.probe_acks_received >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the exact-socket synchronized sweep must receive its ACK");
+    assert_eq!(
+        nat.assigned_punch_port(result.socket_local_endpoint).await,
+        result.predicted_ports[0]
+    );
+
+    listener.abort();
+}
+
+#[tokio::test]
 async fn fresh_mapping_consumed_mapping_hits_successor_window() {
     let (outcome, _peers, _transport, nat, seen) = run_generation_roundtrip(1, true).await;
 
@@ -1928,6 +2009,7 @@ async fn dynamic_socket_cap_rejects_when_all_entries_nonevictable() {
     let transport = transport.with_inbound_channel(tx);
 
     // All 8 sockets belong to Direct peers: nothing is evictable.
+    let mut socket_guards = Vec::new();
     for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8"] {
         peers
             .add_peer(&peer_with_public_key(
@@ -1938,10 +2020,14 @@ async fn dynamic_socket_cap_rejects_when_all_entries_nonevictable() {
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
-        transport
+        let guard = transport
             .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1, None)
             .await
             .unwrap();
+        // Keep the provisional ownership guards alive for the duration of
+        // the cap assertion.  The test is about nonevictable entries; a
+        // dropped guard is allowed to asynchronously detach its socket.
+        socket_guards.push(guard);
         peers.record_direct_success_for_generation(peer_id, None, 0).await;
     }
     assert_eq!(transport.dynamic_socket_count().await, 8);
@@ -3114,6 +3200,19 @@ async fn resolve_then_detach_ack_still_matches() {
         .await
         .expect("committed dynamic socket must resolve");
     assert_eq!(resolved_index, index);
+    let (exact_index, _, exact_lease) = transport
+        .resolve_dynamic_socket_index_for_send("peer-b", index)
+        .await
+        .expect("the measured dynamic socket must resolve by exact index");
+    assert_eq!(exact_index, index);
+    drop(exact_lease);
+    assert!(
+        transport
+            .resolve_dynamic_socket_index_for_send("peer-b", index + 1)
+            .await
+            .is_none(),
+        "an exact Hard↔Hard resolver must not fall back to another dynamic or pool socket"
+    );
     let detach_transport = transport.clone();
     let detach_task = tokio::spawn(async move {
         detach_transport

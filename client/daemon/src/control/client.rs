@@ -317,12 +317,39 @@ impl ControlClient {
         punch_at_ms: Option<u64>,
         fresh_ownership: Arc<crate::PunchSessionCancellation>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        self.send_fresh_peer_offer_with_session_and_punch_at(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            None,
+            fresh_ownership,
+        )
+        .await
+    }
+
+    /// Send a fresh-mapping prediction with an optional traversal session
+    /// envelope.  `session_id` uses the existing signal field and remains
+    /// opaque to older servers/clients, so Hard↔Hard coordination does not
+    /// require a second protocol or a schema migration.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_fresh_peer_offer_with_session_and_punch_at(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        session_id: Option<String>,
+        fresh_ownership: Arc<crate::PunchSessionCancellation>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
         let (response_tx, response_rx) = oneshot::channel();
         self.candidate_offer_tx
             .try_send(CandidateOfferCommand {
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
-                session_id: None,
+                session_id,
                 probe_ephemeral_public_key: None,
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),

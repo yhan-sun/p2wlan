@@ -355,6 +355,17 @@ impl Daemon {
         candidate_apply_result: CandidateSetApplyResult,
         fresh_punch: FreshPunchDecision,
     ) {
+        if self
+            .handle_hard_hard_fresh_offer(
+                &offer.from_node_id,
+                offer.session_id.as_deref(),
+                offer.punch_at_ms,
+                fresh_punch.clone(),
+            )
+            .await
+        {
+            return;
+        }
         match fresh_punch {
             FreshPunchDecision::Fresh(id, frozen_targets) => {
                 self.start_hole_punch_at(
@@ -389,6 +400,97 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Route a valid `hh1` fresh signal into the two-sided synchronized
+    /// rendezvous.  A malformed envelope is consumed and rejected rather than
+    /// silently degrading into an ordinary one-sided Hard↔Hard punch.
+    async fn handle_hard_hard_fresh_offer(
+        &self,
+        peer_id: &str,
+        session_id: Option<&str>,
+        punch_at_ms: Option<u64>,
+        fresh_punch: FreshPunchDecision,
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        if !HardHardCoordination::looks_like(session_id) {
+            return false;
+        }
+        let Some(coordination) = HardHardCoordination::parse(session_id) else {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "hard_hard_session_rejected",
+                    None,
+                    None,
+                    None,
+                    "malformed Hard↔Hard session envelope; no fallback punch started",
+                )
+                .await;
+            return true;
+        };
+        let FreshPunchDecision::Fresh(_id, frozen_targets) = fresh_punch else {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "hard_hard_session_rejected",
+                    None,
+                    None,
+                    None,
+                    "Hard↔Hard session did not carry an admitted, unexpired fresh prediction window",
+                )
+                .await;
+            return true;
+        };
+        let Some(punch_at_ms) = punch_at_ms else {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "hard_hard_session_rejected",
+                    frozen_targets.first().copied(),
+                    Some(frozen_targets.len()),
+                    None,
+                    "Hard↔Hard session had no canonical punch_at_ms; Relay remains usable",
+                )
+                .await;
+            return true;
+        };
+        let Some(udp) = self.udp_transport.read().await.clone() else {
+            return true;
+        };
+        let Some(signal) = self.hole_punch_signal_context().await else {
+            return true;
+        };
+        match coordination.role {
+            HardHardRole::Initiator => {
+                spawn_hard_hard_responder(
+                    udp,
+                    self.peers.clone(),
+                    self.punch_attempts.clone(),
+                    signal,
+                    peer_id.to_string(),
+                    coordination,
+                    punch_at_ms,
+                    frozen_targets,
+                )
+                .await;
+            }
+            HardHardRole::Responder => {
+                spawn_hard_hard_initiator_response(
+                    udp,
+                    self.peers.clone(),
+                    self.punch_attempts.clone(),
+                    peer_id.to_string(),
+                    coordination,
+                    frozen_targets,
+                    punch_at_ms,
+                )
+                .await;
+            }
+        }
+        true
     }
 
     /// Coordinate the C=0 fresh-fresh synchronized pair on the receiver side
@@ -485,6 +587,7 @@ impl Daemon {
             self.punch_attempts.clone(),
             peer_id.clone(),
             plan.local_fresh_endpoint,
+            local_fresh.socket_index,
             plan.bounded_targets.clone(),
             Some(plan.canonical_punch_at_ms),
             Some(id),
@@ -2224,6 +2327,17 @@ impl Daemon {
                             FreshPunchDecision::None,
                         )
                     };
+                    if self
+                        .handle_hard_hard_fresh_offer(
+                            &from_node_id,
+                            session_id.as_deref(),
+                            punch_at_ms,
+                            fresh_punch.clone(),
+                        )
+                        .await
+                    {
+                        continue;
+                    }
                     match fresh_punch {
                         // A valid fresh snapshot punches its frozen targets at
                         // FRESH priority, always.

@@ -406,6 +406,45 @@ async fn spawn_hole_punch_task(
         debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
         return;
     }
+    // Hard↔Hard is a planner-gated replacement for the ordinary first punch
+    // only on the deterministic initiator side.  The initiator measures a
+    // fresh socket and publishes the first prediction; the responder is
+    // entered exclusively by the matching `hh1` fresh signal.  Other NAT
+    // strategies continue through the existing scheduler below.
+    if fresh_prediction.is_none()
+        && frozen_targets.is_none()
+        && peers.local_node_id_for_traversal() < peer_id.as_str()
+    {
+        if let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await {
+            if let Some(signal) = signal.clone() {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "hard_hard_initiator_selected",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "planner authorized Hard↔Hard synchronized fresh mapping local_network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={}",
+                            plan.local_network_generation,
+                            plan.remote_candidate_epoch,
+                            plan.local_profile_generation,
+                            plan.remote_profile_generation,
+                        ),
+                    )
+                    .await;
+                spawn_hard_hard_initiator(
+                    udp,
+                    peers,
+                    punch_deduplicator,
+                    peer_id,
+                    signal,
+                )
+                .await;
+                return;
+            }
+        }
+    }
     // Every trigger enters the authoritative recovery-epoch scheduler: one
     // traversal plan per (peer_id, generation, epoch) with shared hard
     // budgets.  A trigger inside the current epoch can never spawn a parallel

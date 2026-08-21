@@ -58,6 +58,7 @@ async fn spawn_c0_synchronized_fresh_pair(
     punch_deduplicator: PunchAttemptDeduplicator,
     peer_id: String,
     local_fresh_endpoint: SocketAddr,
+    local_fresh_socket_index: usize,
     remote_fresh_targets: Vec<SocketAddr>,
     punch_at_ms: Option<u64>,
     c0_generation: Option<crate::FreshPredictionId>,
@@ -184,20 +185,18 @@ async fn spawn_c0_synchronized_fresh_pair(
             return;
         }
         let dispatch_at_ms = session.mark_first_send_started();
-        let cancellation = session.cancellation_handle();
         let mut send_result = None;
         let outcome = run_owned_punch_session_with_deadline(
             &session,
             C0_RENDEZVOUS_DEADLINE,
             async {
-                let owner_gate = || !cancellation.is_cancelled();
                 send_result = Some(
-                    udp.punch_candidates_primary_socket_until_not_direct_gated_report(
+                    udp.punch_candidates_from_dynamic_socket_index(
                         &peer_id,
+                        local_fresh_socket_index,
                         targets.clone(),
                         PEER_REFLEXIVE_MICRO_WINDOW_INTERVAL,
                         C0_RENDEZVOUS_ATTEMPTS,
-                        &owner_gate,
                     )
                     .await,
                 );

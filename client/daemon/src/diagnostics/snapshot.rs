@@ -37,7 +37,8 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     let network_generation = context.peers.current_network_generation_sync();
     let nat_profile = context.nat_profile.read().await.clone();
     let nat_capabilities = nat_profile.as_ref().map(|profile| {
-        NatCapabilities::from_profile(profile).with_profile_generation(network_generation)
+        NatCapabilities::from_profile(profile)
+            .with_profile_generation(context.peers.current_local_profile_generation_sync())
     });
 
     DiagnosticsSnapshot {

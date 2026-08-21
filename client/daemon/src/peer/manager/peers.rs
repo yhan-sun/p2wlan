@@ -108,6 +108,7 @@ impl PeerManager {
             }
             (had_relay_confirmation, old_incarnation, new_incarnation)
         };
+        self.clear_hard_hard_sessions(Some(node_id)).await;
         self.emit_timeline(
             "peer_restart_detected",
             None,
@@ -138,6 +139,7 @@ impl PeerManager {
         let mut cancel_heartbeat_after_lock = false;
         let mut revoke_relay_after_lock = false;
         let mut reset_remote_fresh_after_lock: Option<&'static str> = None;
+        let mut clear_hard_hard_after_lock = false;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
 
@@ -177,6 +179,7 @@ impl PeerManager {
         if public_key_changed {
             conn.reset_for_identity_change();
             cancel_heartbeat_after_lock = true;
+            clear_hard_hard_after_lock = true;
         }
         // The remote fresh-prediction space is bound to the peer's identity
         // (public key): a rejoin with a NEW key — including a PeerLeft
@@ -197,6 +200,7 @@ impl PeerManager {
             changed
         };
         if identity_changed {
+            clear_hard_hard_after_lock = true;
             // Fresh-generation cleanup takes its own mutexes and emits a
             // diagnostic event. Defer it until the peer/ip write guards are
             // released so a slow cleanup can never stop control-event intake.
@@ -249,11 +253,26 @@ impl PeerManager {
         // is parsed into an advisory capability snapshot, fenced by the
         // producer's profile generation; actual candidate/ACK evidence keeps
         // ownership of Direct-path promotion.
-        conn.update_remote_nat_profile(&info.nat_type, signaled_endpoint);
+        let previous_remote_profile_generation = conn
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.generation);
+        let remote_profile_accepted =
+            conn.update_remote_nat_profile(&info.nat_type, signaled_endpoint);
+        let remote_profile_generation = conn
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.generation);
+        if remote_profile_accepted
+            && previous_remote_profile_generation != remote_profile_generation
+        {
+            clear_hard_hard_after_lock = true;
+        }
         if let Some(addr) = signaled_endpoint {
             conn.ensure_candidate_pair(addr, generation);
         }
         if !info.online {
+            clear_hard_hard_after_lock = true;
             conn.transition(ConnectionState::Closed);
             conn.relay_server = None;
             cancel_heartbeat_after_lock = true;
@@ -301,6 +320,9 @@ impl PeerManager {
         drop(epoch_guard);
         if let Some(reason) = reset_remote_fresh_after_lock {
             self.reset_remote_fresh_generation(&info.node_id, reason).await;
+        }
+        if clear_hard_hard_after_lock {
+            self.clear_hard_hard_sessions(Some(&info.node_id)).await;
         }
         if revoke_relay_after_lock {
             self.revoke_relay_peer_confirmation(&info.node_id).await;
@@ -372,6 +394,7 @@ impl PeerManager {
             .remove(node_id);
         self.recovery_epoch_end(node_id, "peer_removed").await;
         self.clear_fresh_mapping(node_id, "peer_removed").await;
+        self.clear_hard_hard_sessions(Some(node_id)).await;
     }
 
     /// Get a peer connection by node ID.

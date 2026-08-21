@@ -10,6 +10,10 @@ pub(crate) struct LocalFreshMapping {
     pub network_generation: u64,
     /// Dedicated punch socket local endpoint.
     pub socket_local_endpoint: SocketAddr,
+    /// Dedicated dynamic socket that produced the endpoint.  The endpoint
+    /// alone is not a socket identity: Hard↔Hard rendezvous must send its
+    /// synchronized sweep through this exact measured socket.
+    pub socket_index: usize,
     /// Port-allocation model inferred from the send-ordered STUN sequence.
     pub model: PortModel,
     /// Rank-ordered predicted public ports (rank 0 = top-1).
@@ -213,6 +217,7 @@ impl PeerManager {
     }
 
     /// Record the outcome of a successful fresh-mapping generation.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_fresh_mapping(
         &self,
@@ -220,6 +225,34 @@ impl PeerManager {
         model: PortModel,
         predicted_ports: Vec<u16>,
         socket_local_endpoint: SocketAddr,
+        public_ip: Option<IpAddr>,
+        punch_generation: u64,
+        network_generation: u64,
+    ) {
+        self.record_fresh_mapping_with_socket(
+            peer_id,
+            model,
+            predicted_ports,
+            socket_local_endpoint,
+            0,
+            public_ip,
+            punch_generation,
+            network_generation,
+        )
+        .await;
+    }
+
+    /// Record a fresh mapping together with the dynamic socket that owns it.
+    /// The compatibility wrapper above is retained for focused manager tests
+    /// and older callers that only model endpoint state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_fresh_mapping_with_socket(
+        &self,
+        peer_id: &str,
+        model: PortModel,
+        predicted_ports: Vec<u16>,
+        socket_local_endpoint: SocketAddr,
+        socket_index: usize,
         public_ip: Option<IpAddr>,
         punch_generation: u64,
         network_generation: u64,
@@ -239,6 +272,7 @@ impl PeerManager {
                 punch_generation,
                 network_generation,
                 socket_local_endpoint,
+                socket_index,
                 model,
                 predicted_ports,
                 public_ip,

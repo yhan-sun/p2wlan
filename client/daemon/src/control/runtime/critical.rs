@@ -201,10 +201,15 @@ async fn run_candidate_offer_worker(
             continue;
         }
 
+        let signal_type = if fresh_ownership.is_some() {
+            "peer_offer_fresh"
+        } else {
+            "peer_offer"
+        };
         let payload = match prepare_signal_payload(
             &auth.self_node_id,
             &to_node_id,
-            "peer_offer",
+            signal_type,
             &candidates,
             &candidate_sources,
             &handshake_init,

@@ -83,13 +83,14 @@ impl PeerManager {
         // atomic mirror is published in the same critical section and is the
         // value already used by the dataplane-safe diagnostics path below.
         let generation = self.current_network_generation_sync();
+        let profile_generation = self.current_local_profile_generation_sync();
         let local_nat_capabilities = self
             .local_nat_profile
             .try_read()
             .ok()
             .and_then(|profile| {
                 profile.as_ref().map(|profile| {
-                    NatCapabilities::from_profile(profile).with_profile_generation(generation)
+                    NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
                 })
             });
         let relay_available = self.relay_first_required();
@@ -147,13 +148,14 @@ impl PeerManager {
         // Use the lock-free generation mirror so a busy handover cannot make
         // /status or /peers wait until the diagnostics timeout.
         let generation = self.current_network_generation_sync();
+        let profile_generation = self.current_local_profile_generation_sync();
         let local_nat_capabilities = self
             .local_nat_profile
             .try_read()
             .ok()
             .and_then(|profile| {
                 profile.as_ref().map(|profile| {
-                    NatCapabilities::from_profile(profile).with_profile_generation(generation)
+                    NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
                 })
             });
         let traversal_history = self
@@ -226,13 +228,14 @@ impl PeerManager {
             .unwrap_or_default();
         let recovery = self.recovery_epoch_diagnostics().remove(node_id);
         let generation = self.current_network_generation_sync();
+        let profile_generation = self.current_local_profile_generation_sync();
         let local_nat_capabilities = self
             .local_nat_profile
             .try_read()
             .ok()
             .and_then(|profile| {
                 profile.as_ref().map(|profile| {
-                    NatCapabilities::from_profile(profile).with_profile_generation(generation)
+                    NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
                 })
             });
         let conns = self.connections.try_read().ok()?;

@@ -771,6 +771,56 @@ impl UdpTransport {
         attempts: u32,
         cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
     ) -> FreshMappingOutcome {
+        self.run_fresh_mapping_generation_internal(
+            peer_id,
+            observers,
+            stun_timeout,
+            stable_targets,
+            probe_interval,
+            attempts,
+            cancellation,
+            false,
+        )
+        .await
+    }
+
+    /// Measure and commit a fresh mapping without sending a peer-directed
+    /// probe before the synchronized rendezvous.  The returned dynamic socket
+    /// is the exact socket that produced the STUN sequence; the Hard↔Hard
+    /// coordinator later sweeps that same index and fails closed if it is gone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_hard_hard_fresh_mapping_generation(
+        &self,
+        peer_id: &str,
+        observers: &[SocketAddr],
+        stun_timeout: Duration,
+        cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
+    ) -> FreshMappingOutcome {
+        self.run_fresh_mapping_generation_internal(
+            peer_id,
+            observers,
+            stun_timeout,
+            &[],
+            Duration::ZERO,
+            0,
+            cancellation,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_fresh_mapping_generation_internal(
+        &self,
+        peer_id: &str,
+        observers: &[SocketAddr],
+        stun_timeout: Duration,
+        stable_targets: &[SocketAddr],
+        probe_interval: Duration,
+        attempts: u32,
+        cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
+        measure_only: bool,
+    ) -> FreshMappingOutcome {
         if !self.peers.local_nat_requires_fresh_mapping_punch().await {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat);
         }
@@ -783,7 +833,7 @@ impl UdpTransport {
             .copied()
             .filter(|endpoint| fresh_mapping_target_eligible(*endpoint, allow_loopback))
             .collect::<Vec<_>>();
-        if stable_targets.is_empty() {
+        if !measure_only && stable_targets.is_empty() {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::NoStablePeerEndpoint);
         }
         if self.local_node_id.is_none() || self.peers.probe_key_for_peer(peer_id).await.is_none() {
@@ -1206,8 +1256,16 @@ impl UdpTransport {
         // The peer-facing punch loop: only sends from the dedicated socket
         // may claim success.  The mapping is fixed when the first peer-facing
         // probe enters the kernel send queue.
-        let first_punch_sent_at_ms = monotonic_millis();
+        // In measure-only mode there is deliberately no peer-directed send at
+        // this point.  Keep the result timestamps meaningful by anchoring the
+        // handoff to the final STUN request rather than inventing a punch.
+        let first_punch_sent_at_ms = if measure_only {
+            first_sent_at_ms
+        } else {
+            monotonic_millis()
+        };
         let mut sent = 0u32;
+        if !measure_only {
         for round in 0..attempts {
             if cancellation.is_some_and(|c| c.is_cancelled()) {
                 debug!(
@@ -1260,12 +1318,13 @@ impl UdpTransport {
                 }
             }
         }
+        }
         let last_punch_sent_at_ms = monotonic_millis();
 
         // No peer-facing probe ever entered the kernel queue: the generation
         // must not claim success.  The provisional socket is detached while
         // the previous generation's socket (the peer's working path) stays.
-        if sent == 0 {
+        if !measure_only && sent == 0 {
             let cancelled = cancellation.is_some_and(|c| c.is_cancelled());
             self.peers
                 .record_direct_event(
@@ -1386,11 +1445,12 @@ impl UdpTransport {
             )
             .await;
         self.peers
-            .record_fresh_mapping(
+            .record_fresh_mapping_with_socket(
                 peer_id,
                 p2pnet_nat::mapping::PortModel::clone(&model),
                 predicted_ports.clone(),
                 local_endpoint,
+                socket_index,
                 public_ip,
                 punch_generation,
                 network_generation,
@@ -1400,12 +1460,16 @@ impl UdpTransport {
         self.peers
             .record_direct_event(
                 peer_id,
-                "fresh_mapping_punch_sent",
+                if measure_only {
+                    "fresh_mapping_measurement_ready"
+                } else {
+                    "fresh_mapping_punch_sent"
+                },
                 stable_targets.first().copied(),
                 Some(stable_targets.len()),
                 Some(sent),
                 format!(
-                    "punch_generation={punch_generation} socket_local={local_endpoint} first_sent_ms={first_punch_sent_at_ms} last_sent_ms={last_punch_sent_at_ms} targets={} sent={sent}",
+                    "punch_generation={punch_generation} socket_local={local_endpoint} socket_index={socket_index} first_sent_ms={first_punch_sent_at_ms} last_sent_ms={last_punch_sent_at_ms} targets={} sent={sent} measure_only={measure_only}",
                     stable_targets.len()
                 ),
             )
@@ -1457,6 +1521,83 @@ impl UdpTransport {
         else {
             return Ok(PunchSendReport::default());
         };
+        self.punch_candidates_from_dynamic_socket_resolved(
+            peer_id,
+            index,
+            socket,
+            candidates,
+            probe_interval,
+            attempts,
+            None,
+        )
+        .await
+    }
+
+    /// Sweep an explicitly named committed dynamic socket.  This is the
+    /// fail-closed variant used by Hard↔Hard sessions: if the measured socket
+    /// is no longer available, the caller receives an empty report instead of
+    /// silently sending the prediction from a different socket.
+    pub(crate) async fn punch_candidates_from_dynamic_socket_index(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+    ) -> Result<PunchSendReport> {
+        self.punch_candidates_from_dynamic_socket_index_with_profile_fence(
+            peer_id,
+            socket_index,
+            candidates,
+            probe_interval,
+            attempts,
+            None,
+        )
+        .await
+    }
+
+    /// Exact-index sweep with an optional Hard↔Hard profile-generation fence.
+    /// The ordinary dynamic helper leaves the fence unset; the synchronized
+    /// path supplies both profile generations so a remote profile refresh
+    /// cancels the old session before another datagram is emitted.
+    pub(crate) async fn punch_candidates_from_dynamic_socket_index_with_profile_fence(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        profile_fence: Option<(u64, u64)>,
+    ) -> Result<PunchSendReport> {
+        let Some((index, socket, _lease)) = self
+            .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
+            .await
+        else {
+            return Ok(PunchSendReport::default());
+        };
+        self.punch_candidates_from_dynamic_socket_resolved(
+            peer_id,
+            index,
+            socket,
+            candidates,
+            probe_interval,
+            attempts,
+            profile_fence,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn punch_candidates_from_dynamic_socket_resolved(
+        &self,
+        peer_id: &str,
+        index: usize,
+        socket: Arc<UdpSocket>,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        profile_fence: Option<(u64, u64)>,
+    ) -> Result<PunchSendReport> {
         let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
         let mut packets_sent = 0u32;
         let mut budget_skipped = 0u32;
@@ -1465,11 +1606,58 @@ impl UdpTransport {
         let mut first_send_at_ms = None;
         let mut per_socket_sent = 0u32;
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
+        let network_generation_at_start = self.peers.current_network_generation_sync();
+        let remote_candidate_epoch_at_start = self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or_default();
         for round in schedule {
+            if self.peers.current_network_generation_sync() != network_generation_at_start {
+                trace!(
+                    "Aborting dynamic-socket punch for peer {peer_id}: network generation changed mid-session"
+                );
+                break;
+            }
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
             }
             for candidate in round.endpoints {
+                if self.peers.current_network_generation_sync() != network_generation_at_start {
+                    trace!(
+                        "Aborting dynamic-socket punch for peer {peer_id}: network generation changed before candidate send"
+                    );
+                    break;
+                }
+                if self
+                    .peers
+                    .current_remote_candidate_epoch(peer_id)
+                    .await
+                    .unwrap_or_default()
+                    != remote_candidate_epoch_at_start
+                {
+                    trace!(
+                        "Aborting dynamic-socket punch for peer {peer_id}: remote candidate epoch changed before candidate send"
+                    );
+                    break;
+                }
+                if let Some((local_profile_generation, remote_profile_generation)) = profile_fence
+                {
+                    let profile_current = self
+                        .peers
+                        .hard_hard_plan_for_peer(peer_id)
+                        .await
+                        .is_some_and(|plan| {
+                            plan.local_profile_generation == local_profile_generation
+                                && plan.remote_profile_generation == remote_profile_generation
+                        });
+                    if !profile_current {
+                        trace!(
+                            "Aborting dynamic-socket punch for peer {peer_id}: Hard↔Hard profile generation changed before candidate send"
+                        );
+                        break;
+                    }
+                }
                 if self.peers.is_direct_sync(peer_id) {
                     // Direct was confirmed while this dedicated-socket sweep
                     // was in flight: stop emitting peer-directed probes.

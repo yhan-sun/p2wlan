@@ -920,6 +920,50 @@ async fn candidate_offer_workers_are_fair_and_fifo() {
     server.task.abort();
 }
 
+#[tokio::test]
+async fn fresh_candidate_offer_uses_fresh_signal_queue_and_keeps_session_envelope() {
+    let server = MockControlServer::spawn(|_, _| MockAction::Ok).await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
+    server.wait_registered().await;
+
+    client
+        .send_fresh_peer_offer_with_session_and_punch_at(
+            "peer-fresh",
+            &["203.0.113.20:45000".to_string()],
+            &HashMap::from([(
+                "203.0.113.20:45000".to_string(),
+                "predicted_fresh:7:3".to_string(),
+            )]),
+            &[],
+            Some(123_456),
+            Some("hh1:i:deadbeef:1:2:3:4".to_string()),
+            Arc::new(crate::PunchSessionCancellation::default()),
+        )
+        .await
+        .expect("fresh prediction offer must be accepted");
+
+    let posts = server.signal_posts.lock().unwrap().clone();
+    let body = posts
+        .iter()
+        .find(|body| body.contains("peer-fresh"))
+        .expect("fresh prediction offer must reach control");
+    assert!(body.contains("\"type\":\"peer_offer_fresh\""));
+    assert!(body.contains("\"session_id\":\"hh1:i:deadbeef:1:2:3:4\""));
+
+    drop(client);
+    server.task.abort();
+}
+
 /// Critical offers fill their own lane budget (4 in flight + queued) and are
 /// stalled forever; a later answer for a different peer must still be
 /// delivered promptly because answers never wait behind offers.

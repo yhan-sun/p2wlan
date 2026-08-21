@@ -251,7 +251,7 @@ impl Daemon {
                 .as_ref()
                 .map(|profile| {
                     profile.control_label_with_generation(
-                        self.peers.current_network_generation_sync(),
+                        self.peers.current_local_profile_generation_sync(),
                     )
                 })
                 .unwrap_or_else(|| "unknown".to_string());

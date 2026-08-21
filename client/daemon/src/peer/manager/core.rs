@@ -27,11 +27,13 @@ impl PeerManager {
             network_epoch_gate: Arc::new(tokio::sync::Mutex::new(())),
             direct_validation_registry: Arc::new(RwLock::new(None)),
             local_nat_profile: Arc::new(RwLock::new(None)),
+            local_profile_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_interface_networks: Arc::new(RwLock::new(Vec::new())),
             traversal_history: Arc::new(RwLock::new(traversal_history)),
             traversal_history_path,
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
+            hard_hard_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_snapshots: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -250,12 +252,30 @@ impl PeerManager {
 
     /// Update the latest local NAT profile used by adaptive probe scheduling.
     pub async fn update_nat_profile(&self, profile: NatProfile) {
-        let generation = self.current_network_generation_sync();
+        let (profile_generation, profile_changed) = {
+            let mut current = self.local_nat_profile.write().await;
+            if current.as_ref() == Some(&profile) {
+                (self.current_local_profile_generation_sync(), false)
+            } else {
+                *current = Some(profile.clone());
+                let previous = self
+                    .local_profile_generation
+                    .fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |generation| Some(generation.saturating_add(1)),
+                    )
+                    .unwrap_or(u64::MAX);
+                (previous.saturating_add(1), true)
+            }
+        };
+        let network_generation = self.current_network_generation_sync();
         let capabilities = NatCapabilities::from_profile(&profile)
-            .with_profile_generation(generation);
+            .with_profile_generation(profile_generation);
         debug!(
             event = "nat_profile_updated",
-            network_generation = generation,
+            network_generation,
+            local_profile_generation = profile_generation,
             mapping_behavior = ?capabilities.mapping_behavior,
             filtering_behavior = ?capabilities.filtering_behavior,
             allocation_model = ?capabilities.allocation_model,
@@ -263,7 +283,14 @@ impl PeerManager {
             prediction_window = capabilities.prediction_window,
             "updated local NAT capability evidence"
         );
-        *self.local_nat_profile.write().await = Some(profile);
+        if profile_changed {
+            self.clear_hard_hard_sessions(None).await;
+        }
+    }
+
+    pub(crate) fn current_local_profile_generation_sync(&self) -> u64 {
+        self.local_profile_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Publish the currently enumerated physical interface prefixes used by
@@ -510,6 +537,7 @@ impl PeerManager {
             self.bump_relay_confirm_seq(&peer_id);
         }
         self.clear_all_fresh_mappings("network_generation_changed").await;
+        self.clear_hard_hard_sessions(None).await;
 
         info!(
             "Local network generation advanced to {generation}: {reason}; opened {direct_reclaim_count} Direct reclaim window(s)"
@@ -578,6 +606,7 @@ impl PeerManager {
         let peer_count = conns.len();
         drop(conns);
         self.clear_all_fresh_mappings("candidate_refresh_generation_changed").await;
+        self.clear_hard_hard_sessions(None).await;
 
         info!(
             "Local network generation advanced to {generation}: {reason}; retained {retained_confirmed_direct_count} confirmed direct path(s); opened {direct_reclaim_count} Direct reclaim window(s)"

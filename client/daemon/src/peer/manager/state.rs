@@ -2,6 +2,36 @@
 // Peer Manager
 // ============================================================
 
+/// The local, non-wire identity fence for one Hard↔Hard rendezvous.
+///
+/// The session id alone is not sufficient: a late response from an older
+/// network/profile/candidate epoch must never be allowed to reuse a currently
+/// attached dynamic socket.  All four domains are captured independently and
+/// checked by the runtime before every synchronized send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardHardSessionState {
+    AwaitingPeer,
+    Sweeping,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HardHardSessionRecord {
+    pub(crate) session_id: String,
+    pub(crate) peer_id: String,
+    pub(crate) initiator: bool,
+    pub(crate) local_network_generation: u64,
+    pub(crate) remote_candidate_epoch: u64,
+    pub(crate) local_profile_generation: u64,
+    pub(crate) remote_profile_generation: u64,
+    pub(crate) socket_index: Option<usize>,
+    pub(crate) punch_generation: Option<u64>,
+    pub(crate) punch_at_ms: u64,
+    pub(crate) expires_at_ms: u64,
+    pub(crate) state: HardHardSessionState,
+    pub(crate) attempt_count: u8,
+    pub(crate) created_at: Instant,
+}
+
 /// Manages all peer connections.
 pub struct PeerManager {
     /// Active peer connections, indexed by node ID.
@@ -37,6 +67,10 @@ pub struct PeerManager {
     direct_validation_registry: Arc<RwLock<Option<crate::udp::DirectValidationRegistry>>>,
     /// Latest local NAT profile used to decide whether bounded birthday probing is suitable.
     local_nat_profile: Arc<RwLock<Option<NatProfile>>>,
+    /// Monotonic generation of the local NAT profile itself.  This is a
+    /// separate domain from the local network generation: a profile refresh
+    /// can invalidate a Hard↔Hard session without implying a link handover.
+    local_profile_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Directly-connected local interface prefixes used by the Host fast lane.
     local_interface_networks: Arc<RwLock<Vec<LocalNetwork>>>,
     /// Anonymous local traversal outcome history.
@@ -47,6 +81,13 @@ pub struct PeerManager {
     punch_generations: Arc<RwLock<HashMap<String, u64>>>,
     /// Per-peer fresh-mapping state produced by measure-then-punch generations.
     local_fresh_mappings: Arc<RwLock<HashMap<String, LocalFreshMapping>>>,
+    /// Active Hard↔Hard rendezvous fences.  The control signal carries the
+    /// session identity, but the receiver also needs a local record tying it
+    /// to the four generation domains and the exact dynamic socket that was
+    /// measured.  Entries are short-lived and bounded; they are not a path
+    /// selector or a Direct authority.
+    hard_hard_sessions:
+        Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
     /// Time-limited prediction-error fingerprint per peer.
     fresh_mapping_history: Arc<std::sync::Mutex<HashMap<String, VecDeque<FreshMappingPredictionResult>>>>,
     /// Per-peer high-water of the remote's fresh-mapping prediction identity.

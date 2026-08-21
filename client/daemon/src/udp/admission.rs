@@ -506,6 +506,44 @@ impl UdpTransport {
         })
     }
 
+    /// Resolve exactly `socket_index` for a peer-directed send.
+    ///
+    /// Unlike [`Self::socket_for_index_or_dynamic`], this method never falls
+    /// back to a pool socket and never follows the peer's affinity pin.  A
+    /// synchronized fresh-mapping session must fail closed if the socket that
+    /// produced its measured mapping has been detached or superseded: sending
+    /// the same predicted window from another socket would invalidate the
+    /// measurement rather than provide a safe retry.
+    pub(crate) async fn resolve_dynamic_socket_index_for_send(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
+        if socket_index < DYNAMIC_SOCKET_INDEX_BASE {
+            return None;
+        }
+        let state = self.socket_state.lock().await;
+        let dynamic = state.dynamic.get(&socket_index)?;
+        if dynamic.peer_id != peer_id
+            || !dynamic.phase.is_usable()
+            || dynamic.network_generation != self.peers.current_network_generation_sync()
+        {
+            return None;
+        }
+        let leases = dynamic.send_leases.clone();
+        let socket = dynamic.socket.clone();
+        leases.acquire();
+        drop(state);
+        Some((
+            socket_index,
+            socket,
+            DynamicSocketSendLease {
+                state: leases,
+                socket_index,
+            },
+        ))
+    }
+
     /// Send one authenticated/legacy probe from an explicit socket.
     ///
     /// This is the shared core for pool sockets and dedicated punch sockets:
