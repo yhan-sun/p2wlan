@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -25,27 +27,54 @@ android {
         versionName = flutter.versionName
     }
 
+    // Release builds must use the same private key for the lifetime of the
+    // app. CI writes this file from GitHub Actions secrets; local developers
+    // can omit it and still use the debug-key fallback for `flutter run`.
+    val releaseSigningPropertiesFile = rootProject.file("key.properties")
+    val releaseSigningProperties = Properties()
+    if (releaseSigningPropertiesFile.isFile) {
+        releaseSigningPropertiesFile.inputStream().use {
+            releaseSigningProperties.load(it)
+        }
+    }
+    val hasReleaseSigning = releaseSigningPropertiesFile.isFile
+
+    signingConfigs {
+        create("release") {
+            if (hasReleaseSigning) {
+                storeFile = rootProject.file(
+                    releaseSigningProperties.getProperty("storeFile"),
+                )
+                storePassword = releaseSigningProperties.getProperty("storePassword")
+                keyAlias = releaseSigningProperties.getProperty("keyAlias")
+                keyPassword = releaseSigningProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                // Keep local release builds usable until the developer has
+                // configured a private release key. The release workflow
+                // fails closed when this file is absent.
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }
 
 val buildP2wlanNative by tasks.registering(Exec::class) {
+    inputs.property("P2WLAN_ANDROID_ABIS", System.getenv("P2WLAN_ANDROID_ABIS") ?: "all")
     inputs.files(
         rootProject.file("../../../Cargo.toml"),
         rootProject.file("../../../Cargo.lock"),
         rootProject.file("../../../client"),
         rootProject.file("../../../scripts/build_android_native.sh"),
     )
-    outputs.files(
-        project.file("src/main/jniLibs/arm64-v8a/libp2wlan_android.so"),
-        project.file("src/main/jniLibs/armeabi-v7a/libp2wlan_android.so"),
-        project.file("src/main/jniLibs/x86_64/libp2wlan_android.so"),
-    )
+    outputs.dir(project.file("src/main/jniLibs"))
     commandLine(
         "bash",
         rootProject.file("../../../scripts/build_android_native.sh").absolutePath,

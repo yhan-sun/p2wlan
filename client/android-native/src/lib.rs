@@ -28,6 +28,7 @@ use p2pnet_daemon::config::{Config, ControlProxyMode};
 use p2pnet_daemon::Daemon;
 
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
+const DEFAULT_CONTROL_SERVER: &str = "https://control.p2wlan.io";
 const DEFAULT_OVERLAY_CIDR: &str = "10.20.0.0/16";
 const DEFAULT_INTERFACE: &str = "p2wlan-vpn";
 const DEFAULT_VIRTUAL_IP: &str = "10.20.0.1";
@@ -163,7 +164,7 @@ fn prepare_config(request: &AndroidStartRequest) -> Result<(Config, PathBuf), St
             .map_err(|error| format!("failed to create Android config directory: {error}"))?;
     }
 
-    let control_server = non_empty(&request.control_server, "http://control.example.com:18080");
+    let control_server = non_empty(&request.control_server, DEFAULT_CONTROL_SERVER);
     let network_id = non_empty(&request.network_id, "default");
     let mut config = if config_path.exists() {
         Config::load_from_file(&config_path)
@@ -408,7 +409,7 @@ fn new_string_or_null(env: &mut JNIEnv<'_>, error: Option<String>) -> jstring {
 /// daemon thread was launched; a non-null string is a user-visible startup
 /// error and ownership of the fd remains with the caller.
 #[no_mangle]
-pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_start(
+pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeStart(
     mut env: JNIEnv<'_>,
     _object: JObject<'_>,
     tun_fd: jint,
@@ -420,7 +421,7 @@ pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_sta
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_stop(
+pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeStop(
     _env: JNIEnv<'_>,
     _object: JObject<'_>,
 ) -> jboolean {
@@ -432,7 +433,7 @@ pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_sto
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_isRunning(
+pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeIsRunning(
     _env: JNIEnv<'_>,
     _object: JObject<'_>,
 ) -> jboolean {

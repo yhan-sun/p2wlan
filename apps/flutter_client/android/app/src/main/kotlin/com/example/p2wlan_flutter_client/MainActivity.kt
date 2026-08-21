@@ -34,6 +34,7 @@ class MainActivity : FlutterActivity() {
                 mapOf(
                     "serviceRunning" to P2wlanVpnService.isRunning(),
                     "nativeRunning" to P2wlanNative.isRunning(),
+                    "nativeError" to P2wlanNative.lastError(),
                 ),
             )
             "diagnosticsAuthToken" -> result.success(readDiagnosticsAuthToken())

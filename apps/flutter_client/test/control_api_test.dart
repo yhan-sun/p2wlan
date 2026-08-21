@@ -9,10 +9,10 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 void main() {
   test('default control server matches the desktop client default', () {
-    expect(defaultControlServer, 'http://control.example.com:18080');
+    expect(defaultControlServer, 'https://control.p2wlan.io');
   });
 
-  test('settings load migrates the stale p2wlan.io control host', () async {
+  test('settings load migrates the old placeholder control host', () async {
     final tempDir = await Directory.systemTemp.createTemp(
       'p2wlan_control_migration_test_',
     );
@@ -24,7 +24,7 @@ void main() {
     final settingsFile = File('${tempDir.path}/settings.json');
     await settingsFile.writeAsString('''
 {
-  "controlServer": "$legacyControlServer",
+  "controlServer": "$legacyPlaceholderControlServer",
   "authToken": "",
   "manualMode": false
 }

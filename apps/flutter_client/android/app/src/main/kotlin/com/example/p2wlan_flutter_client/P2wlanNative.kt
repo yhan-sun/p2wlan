@@ -1,14 +1,89 @@
 package com.example.p2wlan_flutter_client
 
+import android.util.Log
+
 /** JNI entry points implemented by client/android-native. */
 internal object P2wlanNative {
-    init {
-        System.loadLibrary("p2wlan_android")
+    private const val TAG = "P2wlanNative"
+
+    @Volatile
+    private var loaded = false
+
+    @Volatile
+    private var loadError: String? = null
+
+    @Synchronized
+    private fun ensureLoaded(): Boolean {
+        if (loaded) return true
+        if (loadError != null) return false
+        return try {
+            System.loadLibrary("p2wlan_android")
+            loaded = true
+            true
+        } catch (error: Throwable) {
+            val message = formatError(
+                "无法加载 Android 原生库 libp2wlan_android.so；请确认安装包包含当前设备 ABI",
+                error,
+            )
+            loadError = message
+            Log.e(TAG, message, error)
+            false
+        }
     }
 
-    external fun start(tunFd: Int, requestJson: String): String?
+    fun start(tunFd: Int, requestJson: String): String? {
+        if (!ensureLoaded()) return loadError
+        return try {
+            val error = nativeStart(tunFd, requestJson)
+            loadError = error
+            if (error != null) Log.e(TAG, error)
+            error
+        } catch (error: Throwable) {
+            val message = formatError("Android 原生 daemon 启动失败", error)
+            loadError = message
+            Log.e(TAG, message, error)
+            message
+        }
+    }
 
-    external fun stop(): Boolean
+    fun stop(): Boolean {
+        if (!ensureLoaded()) return false
+        return try {
+            nativeStop()
+        } catch (error: Throwable) {
+            val message = formatError("Android 原生 daemon 停止失败", error)
+            loadError = message
+            Log.w(TAG, message, error)
+            false
+        }
+    }
 
-    external fun isRunning(): Boolean
+    fun isRunning(): Boolean {
+        if (!ensureLoaded()) return false
+        return try {
+            nativeIsRunning()
+        } catch (error: Throwable) {
+            val message = formatError("无法读取 Android 原生 daemon 状态", error)
+            loadError = message
+            Log.w(TAG, message, error)
+            false
+        }
+    }
+
+    fun lastError(): String? = loadError
+
+    private fun formatError(prefix: String, error: Throwable): String {
+        val detail = error.message?.trim().orEmpty()
+        return if (detail.isEmpty()) {
+            "$prefix（${error::class.java.simpleName}）"
+        } else {
+            "$prefix：$detail"
+        }
+    }
+
+    private external fun nativeStart(tunFd: Int, requestJson: String): String?
+
+    private external fun nativeStop(): Boolean
+
+    private external fun nativeIsRunning(): Boolean
 }

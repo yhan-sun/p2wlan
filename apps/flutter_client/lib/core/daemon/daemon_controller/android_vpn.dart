@@ -49,9 +49,12 @@ extension DaemonControllerAndroidVpn on DaemonController {
       const Duration(seconds: 30),
     );
     if (!ready) {
-      return const DaemonCommandResult(
+      final nativeError = await _androidNativeError();
+      return DaemonCommandResult(
         ok: false,
-        message: 'Android VPN 服务已启动，但 Rust 本地 daemon 未在 30 秒内就绪。请查看本地诊断日志。',
+        message: nativeError == null
+            ? 'Android VPN 服务已启动，但 Rust 本地 daemon 未在 30 秒内就绪。请查看本地诊断日志。'
+            : 'Android VPN 启动失败：$nativeError',
       );
     }
 
@@ -65,8 +68,7 @@ extension DaemonControllerAndroidVpn on DaemonController {
     final requestedVirtualIp = settings.virtualIp.trim().isEmpty
         ? _androidProvisionalVirtualIp
         : settings.virtualIp.trim();
-    if (assignedVirtualIp != null &&
-        assignedVirtualIp != requestedVirtualIp) {
+    if (assignedVirtualIp != null && assignedVirtualIp != requestedVirtualIp) {
       final rebound = await _restartAndroidVpnWithVirtualIp(
         settings,
         assignedVirtualIp,
@@ -130,9 +132,12 @@ extension DaemonControllerAndroidVpn on DaemonController {
       const Duration(seconds: 30),
     );
     if (!ready) {
-      return const DaemonCommandResult(
+      final nativeError = await _androidNativeError();
+      return DaemonCommandResult(
         ok: false,
-        message: 'Android VPN 服务已启动，但 Rust 本地 daemon 未在 30 秒内就绪。请查看本地诊断日志。',
+        message: nativeError == null
+            ? 'Android VPN 服务已启动，但 Rust 本地 daemon 未在 30 秒内就绪。请查看本地诊断日志。'
+            : 'Android VPN 启动失败：$nativeError',
       );
     }
     return const DaemonCommandResult(
@@ -186,6 +191,17 @@ extension DaemonControllerAndroidVpn on DaemonController {
       return status?['nativeRunning'] == true;
     } catch (_) {
       return false;
+    }
+  }
+
+  Future<String?> _androidNativeError() async {
+    try {
+      final status = await _androidVpnChannel
+          .invokeMethod<Map<Object?, Object?>>('status');
+      final value = status?['nativeError']?.toString().trim();
+      return value == null || value.isEmpty ? null : value;
+    } catch (_) {
+      return null;
     }
   }
 

@@ -2,9 +2,10 @@ part of '../diagnostics_models.dart';
 
 const defaultDiagnosticsUrl = 'http://127.0.0.1:39277/status';
 const legacyControlServer = 'https://control.p2wlan.io';
+const legacyPlaceholderControlServer = 'http://control.example.com:18080';
 const defaultControlServer = String.fromEnvironment(
   'P2WLAN_DEFAULT_CONTROL_SERVER',
-  defaultValue: 'http://control.example.com:18080',
+  defaultValue: legacyControlServer,
 );
 const defaultNetworkId = 'default';
 const defaultLanguageCode = 'zh-Hans';

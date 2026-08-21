@@ -78,10 +78,48 @@ build_native() {
     "$app_root/android/app/src/main/jniLibs/$abi/libp2wlan_android.so"
 }
 
+requested_abis="${P2WLAN_ANDROID_ABIS:-all}"
+abi_enabled() {
+  local requested="$1"
+  if [[ "$requested_abis" == "all" ]]; then
+    return 0
+  fi
+  local candidate
+  IFS=', ' read -r -a selected_abis <<< "$requested_abis"
+  for candidate in "${selected_abis[@]}"; do
+    if [[ "$candidate" == "$requested" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Gradle does not consistently filter raw `jniLibs` directories when the
+# source contains stale ABIs from an earlier build. Remove only the generated
+# P2WLAN library for ABIs excluded by this invocation; this keeps a local
+# arm64 release from silently shipping old emulator/32-bit copies.
+if [[ "$requested_abis" != "all" ]]; then
+  for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+    if ! abi_enabled "$abi"; then
+      rm -f "$app_root/android/app/src/main/jniLibs/$abi/libp2wlan_android.so"
+      rmdir "$app_root/android/app/src/main/jniLibs/$abi" 2>/dev/null || true
+    fi
+  done
+fi
+
+build_native_if_enabled() {
+  local abi="$2"
+  if abi_enabled "$abi"; then
+    build_native "$@"
+  else
+    echo "Skipping Android ABI $abi (P2WLAN_ANDROID_ABIS=$requested_abis)"
+  fi
+}
+
 # Keep the app useful on the common 64-bit Android devices and emulators. ABI
 # directories are generated only when their Rust target is installed, so a
 # local arm64-only toolchain can still build an arm64 APK.
-build_native "aarch64-linux-android" "arm64-v8a" "aarch64-linux-android23-clang" true
-build_native "x86_64-linux-android" "x86_64" "x86_64-linux-android23-clang"
-build_native "armv7-linux-androideabi" "armeabi-v7a" "armv7a-linux-androideabi23-clang"
-build_native "i686-linux-android" "x86" "i686-linux-android23-clang"
+build_native_if_enabled "aarch64-linux-android" "arm64-v8a" "aarch64-linux-android23-clang" true
+build_native_if_enabled "x86_64-linux-android" "x86_64" "x86_64-linux-android23-clang"
+build_native_if_enabled "armv7-linux-androideabi" "armeabi-v7a" "armv7a-linux-androideabi23-clang"
+build_native_if_enabled "i686-linux-android" "x86" "i686-linux-android23-clang"

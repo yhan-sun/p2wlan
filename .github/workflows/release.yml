@@ -74,19 +74,45 @@ jobs:
       - name: Restore SDK-migrated files (pre-build)
         run: bash scripts/release/hermetic_build.sh restore
 
+      - name: Configure stable Android release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_BASE64:?Missing repository secret ANDROID_KEYSTORE_BASE64}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Missing repository secret ANDROID_KEYSTORE_PASSWORD}"
+          : "${ANDROID_KEY_ALIAS:?Missing repository secret ANDROID_KEY_ALIAS}"
+          : "${ANDROID_KEY_PASSWORD:?Missing repository secret ANDROID_KEY_PASSWORD}"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode \
+            > apps/flutter_client/android/app/release-keystore.jks
+          chmod 600 apps/flutter_client/android/app/release-keystore.jks
+          cat > apps/flutter_client/android/key.properties <<EOF
+          storeFile=app/release-keystore.jks
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          EOF
+          chmod 600 apps/flutter_client/android/key.properties
+
       - name: Build Android arm64 release APK
         working-directory: apps/flutter_client
+        env:
+          P2WLAN_ANDROID_ABIS: arm64-v8a
         run: >
           flutter build apk
           --release
           --target-platform android-arm64
+          --split-per-abi
           --split-debug-info build/symbols/android-arm64
 
       - name: Assemble Android release artifact
         run: |
           set -euo pipefail
           mkdir -p dist-release
-          cp apps/flutter_client/build/app/outputs/flutter-apk/app-release.apk \
+          cp apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
             dist-release/p2wlan-flutter-android-arm64-release.apk
 
       - name: Upload artifact
