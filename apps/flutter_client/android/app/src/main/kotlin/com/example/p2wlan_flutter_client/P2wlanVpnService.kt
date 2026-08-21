@@ -108,7 +108,7 @@ class P2wlanVpnService : VpnService() {
             vpnInterface = null
 
             val enrichedRequest = enrichRequest(request)
-            val nativeError = P2wlanNative.start(detachedFd, enrichedRequest.toString())
+            val nativeError = P2wlanNative.start(this, detachedFd, enrichedRequest.toString())
             // Ownership of the detached fd is transferred to P2wlanNative as
             // soon as nativeStart is invoked. Native startup/error paths (and
             // the Kotlin library-load fallback) close it; Kotlin must not

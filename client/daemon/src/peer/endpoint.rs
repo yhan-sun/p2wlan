@@ -142,11 +142,42 @@ pub(super) fn classify_candidate_pair_path(
     }
 }
 
+/// Classify a validated Host pair after the caller has proven that its remote
+/// address is on one of the local interface prefixes. This source/context
+/// check is important for deployments where a physical LAN reuses 10.20/16,
+/// 100.64/10, or IPv6 ULA space that is otherwise reserved for the overlay.
+pub(super) fn classify_candidate_pair_path_with_on_link_host(
+    active_path: Option<NetworkPath>,
+    pair: Option<&CandidatePair>,
+    direct_confirmed: bool,
+    on_link_host: bool,
+) -> DirectPathType {
+    if active_path == Some(NetworkPath::Direct)
+        && direct_confirmed
+        && on_link_host
+        && pair.is_some_and(|pair| pair.source == CandidatePairSource::Host)
+    {
+        return DirectPathType::Lan;
+    }
+    classify_candidate_pair_path(active_path, pair, direct_confirmed)
+}
+
+#[cfg(test)]
 pub(super) fn classify_confirmed_direct_endpoint(
     endpoint: SocketAddr,
     source: CandidatePairSource,
 ) -> DirectPathType {
-    if is_overlay_endpoint(endpoint) {
+    classify_confirmed_direct_endpoint_with_on_link_host(endpoint, source, false)
+}
+
+pub(super) fn classify_confirmed_direct_endpoint_with_on_link_host(
+    endpoint: SocketAddr,
+    source: CandidatePairSource,
+    on_link_host: bool,
+) -> DirectPathType {
+    if on_link_host && source == CandidatePairSource::Host {
+        DirectPathType::Lan
+    } else if is_overlay_endpoint(endpoint) {
         DirectPathType::Overlay
     } else if is_private_direct_endpoint(endpoint) {
         DirectPathType::Lan

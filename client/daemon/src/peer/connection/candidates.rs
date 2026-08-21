@@ -121,11 +121,52 @@ impl PeerConnection {
         &self,
         candidates: &[SocketAddr],
     ) -> Vec<SocketAddr> {
-        let mut preferred = self.preferred_fast_candidates_from_sources(candidates);
+        let on_link_hosts = candidates
+            .iter()
+            .copied()
+            .filter(|endpoint| self.is_on_link_host_candidate(*endpoint))
+            .take(ON_LINK_HOST_FAST_LANE_MAX_CANDIDATES)
+            .collect::<Vec<_>>();
+        let public_authoritative = candidates
+            .iter()
+            .copied()
+            .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            .filter(|endpoint| {
+                matches!(
+                    self.candidate_source_for_endpoint(*endpoint),
+                    CandidatePairSource::StunObserved
+                        | CandidatePairSource::Signaled
+                        | CandidatePairSource::Upnp
+                        | CandidatePairSource::Pcp
+                        | CandidatePairSource::NatPmp
+                )
+            })
+            .take(1)
+            .collect::<Vec<_>>();
+        let reserve = on_link_hosts.len() + public_authoritative.len();
+        let trusted_budget = PREFERRED_FAST_CANDIDATE_CAP.saturating_sub(reserve);
+        let mut preferred = self
+            .preferred_fast_candidates_from_sources(candidates)
+            .into_iter()
+            .take(trusted_budget)
+            .collect::<Vec<_>>();
+        for endpoint in public_authoritative.into_iter().chain(on_link_hosts) {
+            if !preferred.contains(&endpoint) {
+                preferred.push(endpoint);
+            }
+        }
         if !self.has_explicit_predicted_window() {
             self.merge_advertised_neighborhood_into(&mut preferred, candidates);
         }
         preferred
+    }
+
+    pub(super) fn is_on_link_host_candidate(&self, endpoint: SocketAddr) -> bool {
+        self.candidate_source_for_endpoint(endpoint) == CandidatePairSource::Host
+            && self
+                .local_interface_networks
+                .iter()
+                .any(|network| network.contains(endpoint.ip()))
     }
 
     fn preferred_fast_candidates_from_sources(

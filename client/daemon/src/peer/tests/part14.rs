@@ -180,3 +180,50 @@ async fn advertised_neighborhood_merge_skipped_when_predicted_window_exists() {
     assert_eq!(candidates.first(), Some(&predicted));
     assert!(!candidates.contains(&"8.8.8.8:42002".parse().unwrap()));
 }
+
+#[tokio::test]
+async fn host_candidate_is_not_starved_by_predicted_fast_window() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let host: SocketAddr = "192.168.31.20:51820".parse().unwrap();
+    let predicted = (40_000..40_040)
+        .map(|port| format!("203.0.113.10:{port}"))
+        .collect::<Vec<_>>();
+    let mut candidates = vec![host.to_string()];
+    candidates.extend(predicted.clone());
+    let sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let source = if endpoint == host.to_string() {
+                "host"
+            } else {
+                "predicted"
+            };
+            (endpoint, source.to_string())
+        })
+        .collect::<HashMap<_, _>>();
+
+    manager.add_peer(&test_peer("peer1", host)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.31.10".parse().unwrap(),
+            24,
+        )])
+        .await;
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    let parsed = candidates
+        .iter()
+        .map(|candidate| candidate.parse::<SocketAddr>().unwrap())
+        .collect::<Vec<_>>();
+    let preferred = conn.preferred_fast_candidates(&parsed);
+
+    assert!(
+        preferred.contains(&host),
+        "a physical Host candidate must have a bounded fast-lane slot even when predictions are present"
+    );
+}

@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "android")]
 
+use std::os::fd::RawFd;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -21,9 +22,9 @@ use std::{
     io::{self, Write},
 };
 
-use jni::objects::{JObject, JString};
+use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jstring};
-use jni::JNIEnv;
+use jni::{JNIEnv, JavaVM};
 use rand::RngCore;
 use serde::Deserialize;
 use tokio::runtime::Builder;
@@ -83,6 +84,12 @@ struct RuntimeHandle {
 
 static RUNTIME: OnceLock<Mutex<Option<RuntimeHandle>>> = OnceLock::new();
 static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static ANDROID_SOCKET_PROTECTOR: OnceLock<Mutex<Option<AndroidSocketProtector>>> = OnceLock::new();
+
+struct AndroidSocketProtector {
+    vm: JavaVM,
+    service: GlobalRef,
+}
 
 fn runtime_slot() -> &'static Mutex<Option<RuntimeHandle>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
@@ -90,6 +97,72 @@ fn runtime_slot() -> &'static Mutex<Option<RuntimeHandle>> {
 
 fn last_error_slot() -> &'static Mutex<Option<String>> {
     LAST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+fn android_socket_protector_slot() -> &'static Mutex<Option<AndroidSocketProtector>> {
+    ANDROID_SOCKET_PROTECTOR.get_or_init(|| Mutex::new(None))
+}
+
+fn protect_android_socket(fd: RawFd) -> io::Result<()> {
+    let guard = android_socket_protector_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let protector = guard.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Android VpnService protector is not installed",
+        )
+    })?;
+    let mut env = protector.vm.attach_current_thread().map_err(|error| {
+        io::Error::other(format!("failed to attach socket thread to JVM: {error}"))
+    })?;
+    let protected = env
+        .call_method(
+            protector.service.as_obj(),
+            "protect",
+            "(I)Z",
+            &[JValue::Int(fd as jint)],
+        )
+        .map_err(|error| io::Error::other(format!("VpnService.protect(fd) failed: {error}")))?
+        .z()
+        .map_err(|error| {
+            io::Error::other(format!(
+                "VpnService.protect(fd) returned an invalid value: {error}"
+            ))
+        })?;
+    if protected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("VpnService.protect({fd}) returned false"),
+        ))
+    }
+}
+
+fn install_android_socket_protector(
+    env: &mut JNIEnv<'_>,
+    service: JObject<'_>,
+) -> Result<(), String> {
+    let vm = env
+        .get_java_vm()
+        .map_err(|error| format!("failed to acquire Android JavaVM: {error}"))?;
+    let service = env
+        .new_global_ref(service)
+        .map_err(|error| format!("failed to retain Android VpnService: {error}"))?;
+    *android_socket_protector_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(AndroidSocketProtector { vm, service });
+    p2pnet_netbind::set_android_socket_protector(protect_android_socket);
+    Ok(())
+}
+
+fn clear_android_socket_protector() {
+    p2pnet_netbind::clear_android_socket_protector();
+    *android_socket_protector_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 fn set_last_error(error: Option<String>) {
@@ -470,6 +543,7 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
             {
                 *guard = None;
             }
+            clear_android_socket_protector();
         })
         .map_err(|error| format!("failed to start Android daemon thread: {error}"));
     if let Err(error) = thread_result {
@@ -524,12 +598,23 @@ fn new_string_or_null(env: &mut JNIEnv<'_>, error: Option<String>) -> jstring {
 pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeStart(
     mut env: JNIEnv<'_>,
     _object: JObject<'_>,
+    service: JObject<'_>,
     tun_fd: jint,
     request_json: JString<'_>,
 ) -> jstring {
     set_last_error(None);
     let result = match read_request(&mut env, request_json) {
-        Ok(request) => start_runtime(tun_fd, request),
+        Ok(_request) if runtime_running() => {
+            close_raw_fd(tun_fd);
+            Err("an existing Android P2WLAN daemon is still running".to_string())
+        }
+        Ok(request) => match install_android_socket_protector(&mut env, service) {
+            Ok(()) => start_runtime(tun_fd, request),
+            Err(error) => {
+                close_raw_fd(tun_fd);
+                Err(error)
+            }
+        },
         Err(error) => {
             // The fd is still owned by Kotlin when JSON parsing fails, so
             // close it here before returning the JNI error. Once
@@ -541,6 +626,9 @@ pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nat
     };
     if let Err(error) = &result {
         set_last_error(Some(error.clone()));
+        if !runtime_running() {
+            clear_android_socket_protector();
+        }
     }
     new_string_or_null(&mut env, result.err())
 }

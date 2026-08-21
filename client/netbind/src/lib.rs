@@ -8,12 +8,42 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
+#[cfg(target_os = "android")]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "android")]
+use std::sync::{Mutex, OnceLock};
+
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+
+#[cfg(target_os = "android")]
+pub type AndroidSocketProtector = fn(RawFd) -> io::Result<()>;
+
+#[cfg(target_os = "android")]
+static ANDROID_SOCKET_PROTECTOR: OnceLock<Mutex<Option<AndroidSocketProtector>>> = OnceLock::new();
+
+/// Install the Android `VpnService.protect(fd)` bridge before the daemon opens
+/// any physical-network sockets.  Android's overlay route can overlap a real
+/// LAN (for example, a router using 10.20.0.0/16), so source-address selection
+/// alone is not enough to keep Direct UDP outside the VPN.
+#[cfg(target_os = "android")]
+pub fn set_android_socket_protector(protector: AndroidSocketProtector) {
+    let slot = ANDROID_SOCKET_PROTECTOR.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(protector);
+}
+
+/// Remove the Android protector after the native daemon runtime has stopped.
+#[cfg(target_os = "android")]
+pub fn clear_android_socket_protector() {
+    if let Some(slot) = ANDROID_SOCKET_PROTECTOR.get() {
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
 
 /// Bind a nonblocking Tokio UDP socket, optionally pinned to `interface`.
 pub async fn bind_udp(addr: SocketAddr, interface: Option<&str>) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    protect_android_socket(&socket)?;
     if let Some(interface) = normalized_interface(interface) {
         bind_socket_to_interface(&socket, addr.is_ipv4(), interface)?;
     }
@@ -28,6 +58,7 @@ pub async fn bind_udp(addr: SocketAddr, interface: Option<&str>) -> io::Result<U
 /// and test servers remain reachable.
 pub async fn connect_tcp_addr(addr: SocketAddr, interface: Option<&str>) -> io::Result<TcpStream> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    protect_android_socket(&socket)?;
     if !addr.ip().is_loopback() {
         if let Some(interface) = normalized_interface(interface) {
             bind_socket_to_interface(&socket, addr.is_ipv4(), interface)?;
@@ -36,6 +67,24 @@ pub async fn connect_tcp_addr(addr: SocketAddr, interface: Option<&str>) -> io::
     socket.set_nonblocking(true)?;
     let stream: std::net::TcpStream = socket.into();
     TcpSocket::from_std_stream(stream).connect(addr).await
+}
+
+#[cfg(target_os = "android")]
+fn protect_android_socket(socket: &Socket) -> io::Result<()> {
+    let slot = ANDROID_SOCKET_PROTECTOR.get_or_init(|| Mutex::new(None));
+    let protector =
+        (*slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Android VPN socket protector is not installed",
+            )
+        })?;
+    protector(socket.as_raw_fd())
+}
+
+#[cfg(not(target_os = "android"))]
+fn protect_android_socket(_socket: &Socket) -> io::Result<()> {
+    Ok(())
 }
 
 /// Resolve and connect to a host, trying every address in resolver order.

@@ -135,6 +135,90 @@ fn shared_cgn_and_ula_endpoints_are_overlay_direct() {
 }
 
 #[tokio::test]
+async fn on_link_host_can_use_project_overlay_range_without_being_misclassified() {
+    let manager = PeerManager::new(test_config());
+    let remote: SocketAddr = "10.20.0.13:56251".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", remote)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "10.20.0.2".parse().unwrap(),
+            24,
+        )])
+        .await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[remote.to_string()],
+            &HashMap::from([(remote.to_string(), "host".to_string())]),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(remote)).await;
+
+    assert_eq!(manager.direct_endpoint_for_send("peer1").await, Some(remote));
+    let peer = manager.diagnostics().await.pop().unwrap();
+    assert_eq!(peer.active_path, Some(NetworkPath::Direct));
+    assert_eq!(peer.direct_type, DirectPathType::Lan);
+    assert!(!peer.is_overlay_direct);
+}
+
+#[tokio::test]
+async fn validated_on_link_overlay_host_replaces_slow_public_direct() {
+    let manager = PeerManager::new(test_config());
+    let public: SocketAddr = "8.8.8.8:51857".parse().unwrap();
+    let host: SocketAddr = "10.20.0.13:56252".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", public)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "10.20.0.2".parse().unwrap(),
+            24,
+        )])
+        .await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[public.to_string(), host.to_string()],
+            &HashMap::from([
+                (public.to_string(), "stun_observed".to_string()),
+                (host.to_string(), "host".to_string()),
+            ]),
+        )
+        .await;
+    let epoch_gate = manager.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    let generation = manager.current_network_generation_sync();
+    assert!(
+        manager
+            .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
+                &epoch_guard,
+                "peer1",
+                Some(public),
+                generation,
+                None,
+                Some(Duration::from_millis(100)),
+            )
+            .await
+    );
+    assert!(
+        manager
+            .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
+                &epoch_guard,
+                "peer1",
+                Some(host),
+                generation,
+                None,
+                Some(Duration::from_millis(2)),
+            )
+            .await
+    );
+    drop(epoch_guard);
+
+    assert_eq!(manager.direct_endpoint_for_send("peer1").await, Some(host));
+    let peer = manager.diagnostics().await.pop().unwrap();
+    assert_eq!(peer.direct_type, DirectPathType::Lan);
+    assert_eq!(peer.current_direct_pair.unwrap().remote_endpoint, host.to_string());
+}
+
+#[tokio::test]
 async fn diagnostics_classifies_lan_direct_for_private_remote_endpoint() {
     let manager = PeerManager::new(test_config());
     let remote: SocketAddr = "192.168.2.11:56250".parse().unwrap();

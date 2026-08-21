@@ -398,6 +398,7 @@ impl DirectValidationRegistry {
 pub(crate) struct DirectValidationTarget {
     pub(crate) endpoint: SocketAddr,
     pub(crate) generation: u64,
+    pub(crate) remote_candidate_epoch: u64,
     pub(crate) owner_token: u64,
     pub(crate) cancelled: bool,
 }
@@ -446,6 +447,7 @@ pub(crate) enum DirectValidationAckRejectReason {
     SessionMissing,
     TargetCancelled,
     TargetGenerationMismatch,
+    TargetRemoteCandidateEpochMismatch,
     TargetOwnerMismatch,
 }
 
@@ -465,6 +467,9 @@ impl DirectValidationAckRejectReason {
             Self::SessionMissing => "direct_validation_ack_session_missing",
             Self::TargetCancelled => "direct_validation_ack_target_cancelled",
             Self::TargetGenerationMismatch => "direct_validation_ack_target_generation_mismatch",
+            Self::TargetRemoteCandidateEpochMismatch => {
+                "direct_validation_ack_target_remote_candidate_epoch_mismatch"
+            }
             Self::TargetOwnerMismatch => "direct_validation_ack_target_owner_mismatch",
         }
     }
@@ -488,6 +493,7 @@ impl DirectValidationAckRejectReason {
 pub(crate) struct DirectValidationExpectation {
     pub(crate) request_id: u16,
     pub(crate) generation: u64,
+    pub(crate) remote_candidate_epoch: u64,
     /// The validation worker that registered this request.  Conditional
     /// cleanup prevents an old worker from deleting a newer worker's slot.
     pub(crate) owner_token: u64,
@@ -1193,6 +1199,9 @@ struct PendingProbe {
     local_endpoint: Option<SocketAddr>,
     socket_index: usize,
     generation: u64,
+    /// Remote candidate set epoch at the moment this probe was sent. A late
+    /// ACK must not become proof for a newer remote endpoint set.
+    remote_candidate_epoch: u64,
     /// Active Probe session at send time. It binds receive diagnostics to the
     /// same handshake generation without changing protocol matching rules.
     probe_session_id: Option<String>,

@@ -27,6 +27,7 @@ impl PeerManager {
             network_epoch_gate: Arc::new(tokio::sync::Mutex::new(())),
             direct_validation_registry: Arc::new(RwLock::new(None)),
             local_nat_profile: Arc::new(RwLock::new(None)),
+            local_interface_networks: Arc::new(RwLock::new(Vec::new())),
             traversal_history: Arc::new(RwLock::new(traversal_history)),
             traversal_history_path,
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
@@ -250,6 +251,26 @@ impl PeerManager {
     /// Update the latest local NAT profile used by adaptive probe scheduling.
     pub async fn update_nat_profile(&self, profile: NatProfile) {
         *self.local_nat_profile.write().await = Some(profile);
+    }
+
+    /// Publish the currently enumerated physical interface prefixes used by
+    /// the bounded on-link Host fast lane. The snapshot is copied into every
+    /// live connection so candidate ordering and diagnostics use one coherent
+    /// local-network view.
+    pub(crate) async fn set_local_interface_networks(&self, networks: Vec<LocalNetwork>) {
+        *self.local_interface_networks.write().await = networks.clone();
+        let mut connections = self.connections.write().await;
+        for connection in connections.values_mut() {
+            connection.set_local_interface_networks(networks.clone());
+        }
+    }
+
+    pub(crate) async fn current_remote_candidate_epoch(&self, node_id: &str) -> Option<u64> {
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .map(PeerConnection::remote_candidate_epoch)
     }
 
     /// Bound probe rounds from the observed local NAT behavior.  Endpoint-

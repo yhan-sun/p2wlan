@@ -251,6 +251,10 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                     .take_latest_for_peer(&observation.peer_id)
                     .unwrap_or(observation);
                 let generation = peers.current_network_generation().await;
+                let remote_candidate_epoch = peers
+                    .current_remote_candidate_epoch(&observation.peer_id)
+                    .await
+                    .unwrap_or(0);
                 let slow_relay_suppressed = udp
                     .direct_validation_suppressed_by_slow_relay(
                         &observation.peer_id,
@@ -258,10 +262,11 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                     )
                     .await;
                 match udp
-                    .begin_or_merge_direct_validation(
+                    .begin_or_merge_direct_validation_with_remote_epoch(
                         &observation.peer_id,
                         observation.observed_endpoint,
                         generation,
+                        remote_candidate_epoch,
                     )
                     .await
                 {
@@ -343,7 +348,8 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                             peer_id = %observation.peer_id,
                             remote_endpoint = %observation.observed_endpoint,
                             generation,
-                            "ignored stale direct-validation observation after network generation advance"
+                            remote_candidate_epoch,
+                            "ignored stale direct-validation observation after network or remote-candidate generation advance"
                         );
                     }
                     crate::udp::DirectValidationSessionStart::IgnoredInactive => {
@@ -494,11 +500,16 @@ async fn wait_for_validation_update(
 
 async fn current_validation_target(
     peers: &PeerManager,
+    peer_id: &str,
     target_rx: &watch::Receiver<crate::udp::DirectValidationTarget>,
     owner_token: u64,
 ) -> Option<crate::udp::DirectValidationTarget> {
     let target = active_direct_validation_target(target_rx, owner_token)?;
-    (peers.current_network_generation().await == target.generation).then_some(target)
+    if peers.current_network_generation().await != target.generation {
+        return None;
+    }
+    (peers.current_remote_candidate_epoch(peer_id).await == Some(target.remote_candidate_epoch))
+        .then_some(target)
 }
 
 async fn run_direct_encrypted_validation_session(
@@ -577,7 +588,8 @@ async fn run_direct_encrypted_validation_session(
         return;
     };
 
-    let Some(initial_target) = current_validation_target(&peers, &target_rx, owner_token).await
+    let Some(initial_target) =
+        current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
     else {
         let observed_target = *target_rx.borrow();
         let direct = peers.is_direct_for_generation(&peer_id, generation).await;
@@ -662,7 +674,8 @@ async fn run_direct_encrypted_validation_session(
     let session_wait_started = Instant::now();
     let mut waiting_for_session = false;
     loop {
-        let Some(target) = current_validation_target(&peers, &target_rx, owner_token).await
+        let Some(target) =
+            current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
         else {
             let observed_target = *target_rx.borrow();
             let direct = peers.is_direct_for_generation(&peer_id, generation).await;
@@ -820,7 +833,8 @@ async fn run_direct_encrypted_validation_session(
     let mut emit_lock_timeouts = 0u32;
     for (sequence, delay) in DIRECT_VALIDATION_REQUEST_DELAYS.into_iter().enumerate() {
         let _ = wait_for_validation_update(&mut target_rx, delay).await;
-        let Some(target) = current_validation_target(&peers, &target_rx, owner_token).await
+        let Some(target) =
+            current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
         else {
             let observed_target = *target_rx.borrow();
             if peers.is_direct_for_generation(&peer_id, generation).await {
@@ -862,6 +876,7 @@ async fn run_direct_encrypted_validation_session(
                 &peer_id,
                 request_id,
                 generation,
+                target.remote_candidate_epoch,
                 owner_token,
                 target.endpoint,
             )
@@ -1042,7 +1057,8 @@ async fn run_direct_encrypted_validation_session(
 
                 let ack_wait_started = Instant::now();
                 while ack_wait_started.elapsed() < DIRECT_VALIDATION_ACK_WAIT {
-                    let Some(current) = current_validation_target(&peers, &target_rx, owner_token)
+                    let Some(current) =
+                        current_validation_target(&peers, &peer_id, &target_rx, owner_token)
                         .await
                     else {
                         if peers.is_direct_for_generation(&peer_id, generation).await {

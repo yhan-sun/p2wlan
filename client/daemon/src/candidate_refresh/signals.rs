@@ -262,7 +262,7 @@ pub(super) fn truncate_signal_candidates(
         // whole window (bounded by the model's widest window) so a full
         // ordinary candidate set cannot crowd them out.  The window keeps its
         // sender order (top-1 first, then the successor window).
-        let fresh_window = candidates
+        let fresh_candidates = candidates
             .iter()
             .filter(|endpoint| {
                 candidate_sources
@@ -273,12 +273,27 @@ pub(super) fn truncate_signal_candidates(
             .take(MAX_SIGNAL_FRESH_WINDOW_CANDIDATES)
             .cloned()
             .collect::<Vec<_>>();
+        let fresh_host_reservation = retained_lan_hosts.len();
+        let fresh_window = fresh_candidates
+            .into_iter()
+            .take(
+                MAX_SIGNAL_CANDIDATES
+                    .saturating_sub(fresh_host_reservation),
+            )
+            .collect::<Vec<_>>();
         let fresh_window_set = fresh_window.iter().cloned().collect::<HashSet<_>>();
         let fresh_budget = fresh_window.len();
-        // The reservations share one signaling budget: a full fresh window may
-        // consume the whole budget, in which case LAN hosts must yield before
-        // ordinary candidates.  Never emit more than MAX_SIGNAL_CANDIDATES.
-        retained_lan_hosts.truncate(MAX_SIGNAL_CANDIDATES.saturating_sub(fresh_budget));
+        // The reservations share one signaling budget, but a bounded Host
+        // prefix is deliberately reserved even when the fresh prediction
+        // window reaches its maximum. The remote can only prove on-link status
+        // after receiving these candidates and comparing them with its own
+        // interfaces; dropping every Host here makes same-LAN recovery depend
+        // on the public/NAT path.
+        retained_lan_hosts.truncate(
+            MAX_SIGNAL_CANDIDATES
+                .saturating_sub(fresh_budget)
+                .min(fresh_host_reservation),
+        );
         let retained_lan_host_set = retained_lan_hosts.iter().cloned().collect::<HashSet<_>>();
 
         let mut others = candidates

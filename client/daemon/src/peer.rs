@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use p2pnet_crypto::{hmac, NodeIdentity};
-use p2pnet_nat::{MappingBehavior, NatProfile, ProbeMacKey};
+use p2pnet_nat::{LocalNetwork, MappingBehavior, NatProfile, ProbeMacKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -86,6 +86,13 @@ const BIRTHDAY_PROBE_NEAR_MAX_DELTA: i32 = 96;
 /// makes the first post-hole probe land the hit instead of waiting for the
 /// slow birthday wide sweep.
 const FAST_PREFIX_ADVERTISED_NEAR_DELTA: i32 = 8;
+/// Reserve a small portion of the immediate probe prefix for a Host candidate
+/// that is proven to be on one of this daemon's directly-connected networks.
+const ON_LINK_HOST_FAST_LANE_MAX_CANDIDATES: usize = 4;
+/// The largest immediate prefix used by the direct runtime when a trusted
+/// prediction/learned window is present. Keeping the reserve inside this
+/// bound prevents a large prediction window from crowding out Public + LAN.
+const PREFERRED_FAST_CANDIDATE_CAP: usize = 32;
 const BIRTHDAY_PROBE_PORT_SPACE: usize = u16::MAX as usize;
 const BIRTHDAY_PROBE_WIDE_STRIDE: usize = 251;
 /// Stable/easy peers should spend the remote-scatter session cap on distinct
@@ -344,13 +351,16 @@ pub use diagnostics::{
     PathHealthDiagnostics, PathSelectionEventDiagnostics, PeerDiagnostics, PeerManagerStats,
     RecoveryEpochDiagnostics,
 };
+#[cfg(test)]
+use endpoint::classify_confirmed_direct_endpoint;
 pub(crate) use endpoint::is_overlay_endpoint;
 pub(crate) use endpoint::is_public_probe_endpoint;
 use endpoint::{
     candidate_pair_failure_cooldown, candidate_pair_probe_allowed_at, candidate_pair_probe_due,
-    candidate_pair_probe_rank_for_mode, classify_candidate_pair_path,
-    classify_confirmed_direct_endpoint, endpoint_probe_rank, is_low_latency_direct_endpoint,
-    should_retain_confirmed_direct_pair_on_candidate_refresh, should_retain_private_direct_pair,
+    candidate_pair_probe_rank_for_mode, classify_candidate_pair_path_with_on_link_host,
+    classify_confirmed_direct_endpoint_with_on_link_host, endpoint_probe_rank,
+    is_low_latency_direct_endpoint, should_retain_confirmed_direct_pair_on_candidate_refresh,
+    should_retain_private_direct_pair,
 };
 #[cfg(test)]
 use probe_budget::birthday_probe_budget_for_base_count;

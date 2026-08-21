@@ -26,6 +26,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+#[cfg(test)]
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
@@ -91,12 +92,14 @@ impl NatDetector {
         }
 
         let bind_addr = if self.config.local_port > 0 {
-            format!("0.0.0.0:{}", self.config.local_port)
+            SocketAddr::from(([0, 0, 0, 0], self.config.local_port))
         } else {
-            "0.0.0.0:0".to_string()
+            SocketAddr::from(([0, 0, 0, 0], 0))
         };
 
-        let socket = UdpSocket::bind(&bind_addr).await.map_err(NatError::Io)?;
+        let socket = p2pnet_netbind::bind_udp(bind_addr, None)
+            .await
+            .map_err(NatError::Io)?;
         let local_addr = socket.local_addr()?;
 
         info!("Starting NAT detection from {}", local_addr);
@@ -211,7 +214,7 @@ impl NatDetector {
             ));
         }
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = p2pnet_netbind::bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)), None).await?;
         let local_addr = socket.local_addr()?;
         let server1 = self.config.stun_servers[0];
 

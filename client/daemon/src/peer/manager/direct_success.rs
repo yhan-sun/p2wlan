@@ -104,6 +104,29 @@ impl PeerManager {
         local_endpoint: Option<SocketAddr>,
         validation_latency: Option<Duration>,
     ) -> bool {
+        self.record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch_for_remote_epoch(
+            _epoch_guard,
+            node_id,
+            endpoint,
+            generation,
+            local_endpoint,
+            validation_latency,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch_for_remote_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        node_id: &str,
+        endpoint: Option<SocketAddr>,
+        generation: u64,
+        local_endpoint: Option<SocketAddr>,
+        validation_latency: Option<Duration>,
+        expected_remote_candidate_epoch: Option<u64>,
+    ) -> bool {
         // The lock-free mirror is written while this very gate is held by a
         // generation advance.  Reading it here therefore cannot race an
         // advance between validation and mutation.
@@ -121,6 +144,19 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
+            if expected_remote_candidate_epoch
+                .is_some_and(|expected| conn.remote_candidate_epoch() != expected)
+            {
+                conn.record_direct_event(
+                    generation,
+                    "direct_confirmation_stale_remote_candidate",
+                    endpoint,
+                    None,
+                    None,
+                    "ignored encrypted Direct confirmation because the remote candidate epoch changed",
+                );
+                return false;
+            }
             let selected_endpoint = endpoint.or(conn.endpoint);
             let Some(selected_endpoint_value) = selected_endpoint else {
                 return false;
@@ -224,7 +260,11 @@ impl PeerManager {
                 conn.last_path_selection = Some(direct_selection);
             }
             if let (Some(endpoint), Some((source, _))) = (selected_endpoint, pair_success) {
-                let direct_type = classify_confirmed_direct_endpoint(endpoint, source);
+                let direct_type = classify_confirmed_direct_endpoint_with_on_link_host(
+                    endpoint,
+                    source,
+                    conn.is_on_link_host_candidate(endpoint),
+                );
                 let local_endpoint_text = format_log_endpoint(local_endpoint);
                 if direct_confirmation_changed {
                     info!(
@@ -418,6 +458,26 @@ impl PeerManager {
         generation: u64,
         local_endpoint: Option<SocketAddr>,
     ) -> bool {
+        self.record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(
+            node_id,
+            endpoint,
+            latency,
+            generation,
+            local_endpoint,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+        latency: Option<Duration>,
+        generation: u64,
+        local_endpoint: Option<SocketAddr>,
+        expected_remote_candidate_epoch: Option<u64>,
+    ) -> bool {
         if generation != self.current_network_generation().await {
             return false;
         }
@@ -428,6 +488,19 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
+            if expected_remote_candidate_epoch
+                .is_some_and(|expected| conn.remote_candidate_epoch() != expected)
+            {
+                conn.record_direct_event(
+                    generation,
+                    "direct_probe_stale_remote_candidate",
+                    Some(endpoint),
+                    None,
+                    None,
+                    "ignored probe ACK for a retired remote candidate epoch",
+                );
+                return false;
+            }
             if !conn.is_current_remote_endpoint(endpoint) {
                 conn.record_direct_event(
                     generation,

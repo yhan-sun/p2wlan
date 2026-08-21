@@ -317,6 +317,15 @@ async fn run_udp_direct_instance(
         async move { udp.run_inbound(inbound_tx).await }
     });
 
+    let local_interface_networks = p2pnet_nat::gather_local_networks();
+    info!(
+        count = local_interface_networks.len(),
+        "Updated local directly-connected networks for on-link Host probing"
+    );
+    peers
+        .set_local_interface_networks(local_interface_networks)
+        .await;
+
     // Publish host candidates as soon as the socket has a port.  The full
     // report below may spend seconds probing an unreachable STUN observer;
     // that delay is useful for NAT classification but must not delay the

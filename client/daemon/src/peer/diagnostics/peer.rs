@@ -142,11 +142,12 @@ impl PeerDiagnostics {
         // same peer lock.  Once that snapshot says confirmed Direct, an older
         // selector result (usually a Relay decision captured before the ACK)
         // is stale and must not be allowed to describe the active path.
-        let snapshot_direct_pair = conn.current_direct_pair_for_diagnostics(local_generation, None);
+        let snapshot_direct_pair =
+            conn.current_direct_pair_for_diagnostics(local_generation, current_selection);
         let confirmed_direct_snapshot = conn.state == ConnectionState::Direct
             && snapshot_direct_pair.is_some_and(|pair| {
                 pair.state == CandidatePairState::Selected
-                    && !is_overlay_endpoint(pair.remote_endpoint)
+                    && !conn.is_overlay_candidate_pair(pair)
             });
         // Relay health is only a local observation (for example, a writer
         // completion or a validation packet). It is deliberately not enough
@@ -180,7 +181,7 @@ impl PeerDiagnostics {
                         && !relay_first_business_pending
                         && selection
                             .direct_endpoint
-                            .is_some_and(|endpoint| !is_overlay_endpoint(endpoint)) =>
+                            .is_some_and(|endpoint| !conn.is_overlay_direct_endpoint(endpoint)) =>
                     Some(NetworkPath::Direct),
                 Some(NetworkPath::Direct)
                     if relay_peer_confirmed
@@ -216,7 +217,7 @@ impl PeerDiagnostics {
             && !relay_first_pending
             && !relay_first_business_pending
             && conn.state == ConnectionState::Direct
-            && selected_pair.is_some_and(|pair| !is_overlay_endpoint(pair.remote_endpoint))
+            && selected_pair.is_some_and(|pair| !conn.is_overlay_candidate_pair(pair))
             && conn.direct_health.consecutive_failures == 0
             && conn
                 .direct_health
@@ -239,7 +240,12 @@ impl PeerDiagnostics {
                 .unwrap_or(conn.state == ConnectionState::Direct));
         let direct_confirmed = direct_selection_confirmed
             && current_pair.is_some_and(|pair| pair.state == CandidatePairState::Selected);
-        let direct_type = classify_candidate_pair_path(active_path, current_pair, direct_confirmed);
+        let direct_type = classify_candidate_pair_path_with_on_link_host(
+            active_path,
+            current_pair,
+            direct_confirmed,
+            current_pair.is_some_and(|pair| conn.is_on_link_host_candidate(pair.remote_endpoint)),
+        );
         let selected_pair = selected_pair.map(|pair| {
             let is_current = Some(pair.remote_endpoint) == current_pair_endpoint;
             let pair_direct_confirmed =
@@ -254,10 +260,17 @@ impl PeerDiagnostics {
                 local_endpoint,
                 pair_active_path,
                 pair_direct_confirmed,
+                conn.is_on_link_host_candidate(pair.remote_endpoint),
             )
         });
         let current_direct_pair = current_pair.map(|pair| {
-            CandidatePairDiagnostics::from_pair(pair, local_endpoint, active_path, direct_confirmed)
+            CandidatePairDiagnostics::from_pair(
+                pair,
+                local_endpoint,
+                active_path,
+                direct_confirmed,
+                conn.is_on_link_host_candidate(pair.remote_endpoint),
+            )
         });
         let mut candidate_pairs = conn
             .candidate_pairs
@@ -276,6 +289,7 @@ impl PeerDiagnostics {
                     local_endpoint,
                     pair_active_path,
                     pair_direct_confirmed,
+                    conn.is_on_link_host_candidate(pair.remote_endpoint),
                 )
             })
             .collect::<Vec<_>>();

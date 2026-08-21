@@ -81,6 +81,18 @@ impl UdpTransport {
                 pending.cleanup_epoch
             );
             false
+        } else if self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or(0)
+            != pending.remote_candidate_epoch
+        {
+            debug!(
+                "remote candidate epoch mismatch for peer {peer_id}; pending ACK stamped epoch {} but the peer is now on a newer candidate set; adoption skipped",
+                pending.remote_candidate_epoch
+            );
+            false
         } else {
             true
         }
@@ -561,6 +573,11 @@ impl UdpTransport {
                         let _adoption_guard = adoption.lock().await;
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
+                            let remote_candidate_epoch = self
+                                .peers
+                                .current_remote_candidate_epoch(&identity.source_node_id)
+                                .await
+                                .unwrap_or(0);
                             let direct_commit_seq = self
                                 .peers
                                 .direct_commit_seq_sync(&identity.source_node_id)
@@ -586,6 +603,7 @@ impl UdpTransport {
                                     && pending.socket_index == socket_index
                                     && pending.peer_id.as_deref()
                                         == Some(identity.source_node_id.as_str())
+                                    && pending.remote_candidate_epoch == remote_candidate_epoch
                                     && pending.cleanup_epoch == cleanup_epoch
                                     && pending.direct_commit_seq == direct_commit_seq
                                     && pending.accepts_authenticated_ack
@@ -741,12 +759,13 @@ impl UdpTransport {
                                 .await;
                             let accepted = self
                                 .peers
-                                .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
-                                    &identity.source_node_id,
-                                    source,
-                                    Some(latency),
-                                    generation,
-                                    local_endpoint,
+                                .record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(
+                                        &identity.source_node_id,
+                                        source,
+                                        Some(latency),
+                                        generation,
+                                        local_endpoint,
+                                        Some(pending.remote_candidate_epoch),
                                 )
                                 .await;
                             if accepted {

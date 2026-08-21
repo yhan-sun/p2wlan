@@ -79,7 +79,9 @@ use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
 use p2pnet_crypto::{DhKeyPair, NodeIdentity};
 use p2pnet_nat::{CandidateGatherReport, CandidateSource, MappingBehavior, NatProfile};
 use rand::RngCore;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::lookup_host;
+#[cfg(test)]
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, error, info, warn};

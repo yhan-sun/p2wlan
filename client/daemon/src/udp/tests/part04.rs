@@ -2201,6 +2201,7 @@ async fn public_key_change_detaches_every_dynamic_socket_and_clears_probes() {
             local_endpoint: Some(transport.local_addr().unwrap()),
             socket_index: 0,
             generation: peers.current_network_generation().await,
+            remote_candidate_epoch: 0,
             probe_session_id: None,
             peer_id: Some("peer-b".to_string()),
             purpose: PendingProbePurpose::ConnectivityCheck,

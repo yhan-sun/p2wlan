@@ -50,8 +50,14 @@ impl CandidatePairDiagnostics {
         local_endpoint: Option<SocketAddr>,
         active_path: Option<NetworkPath>,
         direct_confirmed: bool,
+        on_link_host: bool,
     ) -> Self {
-        let direct_type = classify_candidate_pair_path(active_path, Some(pair), direct_confirmed);
+        let direct_type = classify_candidate_pair_path_with_on_link_host(
+            active_path,
+            Some(pair),
+            direct_confirmed,
+            on_link_host,
+        );
         let selected = pair.state == CandidatePairState::Selected;
         let nominated = pair.nominated || selected;
         // A peer-reflexive pair over a real public endpoint is public UDP
@@ -118,7 +124,7 @@ impl CandidatePairDiagnostics {
 
 impl From<&CandidatePair> for CandidatePairDiagnostics {
     fn from(pair: &CandidatePair) -> Self {
-        Self::from_pair(pair, None, None, false)
+        Self::from_pair(pair, None, None, false, false)
     }
 }
 

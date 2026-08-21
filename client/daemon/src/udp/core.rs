@@ -1043,11 +1043,33 @@ impl UdpTransport {
     /// generation revokes the old owner before installing the new one, so an
     /// old worker can neither continue emitting packets nor remove the new
     /// owner's expectation during cleanup.
+    #[cfg(test)]
     pub(crate) async fn begin_or_merge_direct_validation(
         &self,
         peer_id: &str,
         endpoint: SocketAddr,
         generation: u64,
+    ) -> DirectValidationSessionStart {
+        let remote_candidate_epoch = self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or(0);
+        self.begin_or_merge_direct_validation_with_remote_epoch(
+            peer_id,
+            endpoint,
+            generation,
+            remote_candidate_epoch,
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_or_merge_direct_validation_with_remote_epoch(
+        &self,
+        peer_id: &str,
+        endpoint: SocketAddr,
+        generation: u64,
+        remote_candidate_epoch: u64,
     ) -> DirectValidationSessionStart {
         // Generation lookup + registry insertion must share the same epoch
         // boundary as `PeerManager::advance_*`: otherwise a scheduler could
@@ -1065,6 +1087,24 @@ impl UdpTransport {
                 current_generation,
                 reason_code = "direct_validation_stale_generation",
                 "direct validation admission rejected before registry lookup"
+            );
+            return DirectValidationSessionStart::IgnoredStaleGeneration;
+        }
+        let current_remote_candidate_epoch = self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or(0);
+        if current_remote_candidate_epoch != remote_candidate_epoch {
+            debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_admission_rejected",
+                peer_id = %peer_id,
+                remote_endpoint = %endpoint,
+                generation,
+                requested_remote_candidate_epoch = remote_candidate_epoch,
+                current_remote_candidate_epoch,
+                reason_code = "direct_validation_stale_remote_candidate_epoch",
+                "direct validation admission rejected for a retired remote candidate epoch"
             );
             return DirectValidationSessionStart::IgnoredStaleGeneration;
         }
@@ -1122,7 +1162,10 @@ impl UdpTransport {
             .get(peer_id)
             .map(|session| (session.target_tx.clone(), *session.target_tx.borrow()))
         {
-            if !current.cancelled && current.generation == generation {
+            if !current.cancelled
+                && current.generation == generation
+                && current.remote_candidate_epoch == remote_candidate_epoch
+            {
                 // Newest-wins selects the target for the next request. An
                 // already-sent request keeps its exact expectation until it
                 // is ACKed, times out, or is cancelled by owner/generation
@@ -1140,6 +1183,7 @@ impl UdpTransport {
                     remote_endpoint = %endpoint,
                     previous_endpoint = %current.endpoint,
                     generation,
+                    remote_candidate_epoch,
                     "merged newest direct-validation endpoint into existing worker"
                 );
                 return DirectValidationSessionStart::Merged;
@@ -1157,8 +1201,10 @@ impl UdpTransport {
                 peer_id = %peer_id,
                 previous_endpoint = %current.endpoint,
                 previous_generation = current.generation,
+                previous_remote_candidate_epoch = current.remote_candidate_epoch,
                 replacement_endpoint = %endpoint,
                 replacement_generation = generation,
+                replacement_remote_candidate_epoch = remote_candidate_epoch,
                 "replaced stale direct-validation worker before spawning the new generation"
             );
             let mut expectations = self.direct_validation.expectations.lock().await;
@@ -1174,6 +1220,7 @@ impl UdpTransport {
         let target = DirectValidationTarget {
             endpoint,
             generation,
+            remote_candidate_epoch,
             owner_token,
             cancelled: false,
         };
@@ -1184,6 +1231,7 @@ impl UdpTransport {
             peer_id = %peer_id,
             remote_endpoint = %endpoint,
             generation,
+            remote_candidate_epoch,
             "created one owned direct-validation worker"
         );
         DirectValidationSessionStart::Spawn(DirectValidationSessionLease {
@@ -1289,6 +1337,7 @@ impl UdpTransport {
             DirectValidationExpectation {
                 request_id,
                 generation,
+                remote_candidate_epoch: 0,
                 owner_token: 0,
                 endpoint: None,
                 socket_index: None,
@@ -1332,11 +1381,17 @@ impl UdpTransport {
         endpoint: SocketAddr,
         socket_index: Option<usize>,
     ) -> bool {
+        let remote_candidate_epoch = self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or(0);
         self.register_direct_validation_expectation(
             peer_id,
             DirectValidationExpectation {
                 request_id,
                 generation,
+                remote_candidate_epoch,
                 owner_token,
                 endpoint: Some(endpoint),
                 socket_index,
@@ -1368,6 +1423,7 @@ impl UdpTransport {
             let target = *session.target_tx.borrow();
             !target.cancelled
                 && target.generation == expectation.generation
+                && target.remote_candidate_epoch == expectation.remote_candidate_epoch
                 && target.owner_token == expectation.owner_token
                 && expectation.endpoint == Some(target.endpoint)
         });
@@ -1398,6 +1454,7 @@ impl UdpTransport {
         peer_id: &str,
         request_id: u16,
         generation: u64,
+        remote_candidate_epoch: u64,
         owner_token: u64,
         endpoint: SocketAddr,
     ) -> std::result::Result<PreparedDirectValidationSend, DirectValidationSendError> {
@@ -1411,6 +1468,7 @@ impl UdpTransport {
                 DirectValidationExpectation {
                     request_id,
                     generation,
+                    remote_candidate_epoch,
                     owner_token,
                     endpoint: Some(endpoint),
                     socket_index: Some(socket_index),
@@ -1596,6 +1654,16 @@ impl UdpTransport {
         }
         if target.generation != current_generation {
             return Err(crate::udp::DirectValidationAckRejectReason::TargetGenerationMismatch);
+        }
+        if target.remote_candidate_epoch
+            != expectations
+                .get(peer_id)
+                .map(|expectation| expectation.remote_candidate_epoch)
+                .unwrap_or(target.remote_candidate_epoch)
+        {
+            return Err(
+                crate::udp::DirectValidationAckRejectReason::TargetRemoteCandidateEpochMismatch,
+            );
         }
         if target.owner_token != token_owner {
             return Err(crate::udp::DirectValidationAckRejectReason::TargetOwnerMismatch);

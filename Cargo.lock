@@ -2073,6 +2073,7 @@ version = "0.1.128"
 dependencies = [
  "if-addrs",
  "p2pnet-crypto",
+ "p2pnet-netbind",
  "rand 0.8.7",
  "serde",
  "thiserror 2.0.20",
@@ -2148,6 +2149,7 @@ version = "0.1.128"
 dependencies = [
  "hex",
  "jni",
+ "p2pnet-netbind",
  "p2wlan-daemon",
  "rand 0.8.7",
  "serde",

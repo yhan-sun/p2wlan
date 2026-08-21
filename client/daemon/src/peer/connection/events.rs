@@ -44,7 +44,12 @@ impl PeerConnection {
         let candidate_source = pair.map(|pair| pair.source);
         let rtt_ms = pair.and_then(|pair| pair.rtt_ewma_ms.or(pair.rtt_ms));
         let direct_type =
-            classify_candidate_pair_path(selection.path, pair, selection.direct_confirmed);
+            classify_candidate_pair_path_with_on_link_host(
+                selection.path,
+                pair,
+                selection.direct_confirmed,
+                pair.is_some_and(|pair| self.is_on_link_host_candidate(pair.remote_endpoint)),
+            );
 
         // Emit one compact state snapshot for every selector transition.  The
         // individual path events below describe the user-visible transition;

@@ -37,6 +37,8 @@ pub struct PeerManager {
     direct_validation_registry: Arc<RwLock<Option<crate::udp::DirectValidationRegistry>>>,
     /// Latest local NAT profile used to decide whether bounded birthday probing is suitable.
     local_nat_profile: Arc<RwLock<Option<NatProfile>>>,
+    /// Directly-connected local interface prefixes used by the Host fast lane.
+    local_interface_networks: Arc<RwLock<Vec<LocalNetwork>>>,
     /// Anonymous local traversal outcome history.
     traversal_history: Arc<RwLock<TraversalHistory>>,
     /// Optional persistent history path.

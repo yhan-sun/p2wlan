@@ -32,13 +32,13 @@ internal object P2wlanNative {
         }
     }
 
-    fun start(tunFd: Int, requestJson: String): String? {
+    fun start(service: P2wlanVpnService, tunFd: Int, requestJson: String): String? {
         if (!ensureLoaded()) {
             closeOwnedFd(tunFd)
             return loadError
         }
         return try {
-            val error = nativeStart(tunFd, requestJson)
+            val error = nativeStart(service, tunFd, requestJson)
             loadError = error
             if (error != null) Log.e(TAG, error)
             error
@@ -114,7 +114,11 @@ internal object P2wlanNative {
         }
     }
 
-    private external fun nativeStart(tunFd: Int, requestJson: String): String?
+    private external fun nativeStart(
+        service: P2wlanVpnService,
+        tunFd: Int,
+        requestJson: String,
+    ): String?
 
     private external fun nativeStop(): Boolean
 

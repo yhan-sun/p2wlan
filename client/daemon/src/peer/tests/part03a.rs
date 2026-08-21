@@ -480,6 +480,113 @@ async fn remote_candidate_refresh_does_not_resurrect_retired_endpoint_from_raw_u
 }
 
 #[tokio::test]
+async fn stale_direct_validation_result_cannot_promote_reused_endpoint_after_remote_handover() {
+    let manager = PeerManager::new(test_config());
+    let reused_endpoint: SocketAddr = "203.0.113.10:41020".parse().unwrap();
+    manager
+        .add_peer(&test_peer("peer1", reused_endpoint))
+        .await;
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[reused_endpoint.to_string()],
+            &HashMap::new(),
+            10,
+            Some(u64::MAX),
+        )
+        .await;
+    let retired_remote_epoch = manager
+        .current_remote_candidate_epoch("peer1")
+        .await
+        .unwrap();
+
+    // The endpoint string is intentionally reused by the new remote candidate
+    // set. Endpoint equality alone must not make an in-flight old validation
+    // look like proof for the new remote socket.
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[reused_endpoint.to_string()],
+            &HashMap::new(),
+            11,
+            Some(u64::MAX),
+        )
+        .await;
+    let current_remote_epoch = manager
+        .current_remote_candidate_epoch("peer1")
+        .await
+        .unwrap();
+    assert_ne!(retired_remote_epoch, current_remote_epoch);
+
+    let epoch_gate = manager.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    assert!(!manager
+        .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch_for_remote_epoch(
+            &epoch_guard,
+            "peer1",
+            Some(reused_endpoint),
+            manager.current_network_generation_sync(),
+            None,
+            Some(Duration::from_millis(4)),
+            Some(retired_remote_epoch),
+        )
+        .await);
+    drop(epoch_guard);
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_ne!(connection.state, ConnectionState::Direct);
+    assert_eq!(connection.endpoint, Some(reused_endpoint));
+}
+
+#[tokio::test]
+async fn stale_probe_result_cannot_promote_reused_endpoint_after_remote_handover() {
+    let manager = PeerManager::new(test_config());
+    let reused_endpoint: SocketAddr = "203.0.113.10:41021".parse().unwrap();
+    manager
+        .add_peer(&test_peer("peer1", reused_endpoint))
+        .await;
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[reused_endpoint.to_string()],
+            &HashMap::new(),
+            20,
+            Some(u64::MAX),
+        )
+        .await;
+    let retired_remote_epoch = manager
+        .current_remote_candidate_epoch("peer1")
+        .await
+        .unwrap();
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[reused_endpoint.to_string()],
+            &HashMap::new(),
+            21,
+            Some(u64::MAX),
+        )
+        .await;
+
+    let epoch_gate = manager.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    assert!(!manager
+        .record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(
+            "peer1",
+            reused_endpoint,
+            Some(Duration::from_millis(3)),
+            manager.current_network_generation_sync(),
+            None,
+            Some(retired_remote_epoch),
+        )
+        .await);
+    drop(epoch_guard);
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_ne!(connection.state, ConnectionState::Direct);
+}
+
+#[tokio::test]
 async fn versioned_candidates_reject_stale_and_expired_sets() {
     let manager = PeerManager::new(test_config());
     let initial: SocketAddr = "203.0.113.10:42000".parse().unwrap();

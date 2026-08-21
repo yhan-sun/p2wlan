@@ -1,4 +1,16 @@
 impl PeerConnection {
+    pub(super) fn is_overlay_candidate_pair(&self, pair: &CandidatePair) -> bool {
+        is_overlay_endpoint(pair.remote_endpoint)
+            && !self.is_on_link_host_candidate(pair.remote_endpoint)
+    }
+
+    pub(super) fn is_overlay_direct_endpoint(&self, endpoint: SocketAddr) -> bool {
+        self.candidate_pairs
+            .iter()
+            .filter(|pair| pair.remote_endpoint == endpoint)
+            .all(|pair| self.is_overlay_candidate_pair(pair))
+    }
+
     fn candidate_pairs_for_send(&self, local_generation: u64) -> Vec<&CandidatePair> {
         let now = Instant::now();
         let mut pairs = self
@@ -7,7 +19,7 @@ impl PeerConnection {
             .filter(|pair| {
                 pair.local_generation == local_generation
                     && self.pair_belongs_to_current_remote_epoch(pair)
-                    && !is_overlay_endpoint(pair.remote_endpoint)
+                    && !self.is_overlay_candidate_pair(pair)
                     && (matches!(
                         pair.state,
                         CandidatePairState::Selected
@@ -18,8 +30,12 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
-            candidate_pair_send_rank_at(a, now)
-                .cmp(&candidate_pair_send_rank_at(b, now))
+            candidate_pair_send_rank_at(a, now, self.is_on_link_host_candidate(a.remote_endpoint))
+                .cmp(&candidate_pair_send_rank_at(
+                    b,
+                    now,
+                    self.is_on_link_host_candidate(b.remote_endpoint),
+                ))
                 .then_with(|| candidate_pair_last_success_sort_key(a).cmp(&candidate_pair_last_success_sort_key(b)))
                 .then_with(|| {
                     candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
@@ -52,7 +68,7 @@ impl PeerConnection {
             .or_else(|| {
                 self.endpoint
                     .filter(|endpoint| {
-                        !is_overlay_endpoint(*endpoint)
+                        !self.is_overlay_direct_endpoint(*endpoint)
                             && self.is_current_remote_endpoint(*endpoint)
                     })
             })
@@ -64,7 +80,7 @@ impl PeerConnection {
             .filter(|pair| {
                 pair.local_generation == local_generation
                     && self.pair_belongs_to_current_remote_epoch(pair)
-                    && !is_overlay_endpoint(pair.remote_endpoint)
+                    && !self.is_overlay_candidate_pair(pair)
                     && pair.selected_at.is_some()
                     && pair.state != CandidatePairState::Frozen
             })
@@ -93,8 +109,12 @@ impl PeerConnection {
             })
             .collect::<Vec<_>>();
         pairs.sort_by(|a, b| {
-            candidate_pair_send_rank_at(a, now)
-                .cmp(&candidate_pair_send_rank_at(b, now))
+            candidate_pair_send_rank_at(a, now, self.is_on_link_host_candidate(a.remote_endpoint))
+                .cmp(&candidate_pair_send_rank_at(
+                    b,
+                    now,
+                    self.is_on_link_host_candidate(b.remote_endpoint),
+                ))
                 .then_with(|| {
                     candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
                 })
@@ -114,25 +134,6 @@ impl PeerConnection {
         local_generation: u64,
         current_selection: Option<&PathSelection>,
     ) -> Option<&CandidatePair> {
-        // A confirmed public selected pair is the durable Direct proof for
-        // this generation.  A late host/private candidate may be a valid
-        // future probe target, but it must never displace that proof in
-        // diagnostics merely because a concurrent selector snapshot saw it.
-        if self.state == ConnectionState::Direct {
-            if let Some(pair) = self
-                .candidate_pairs
-                .iter()
-                .filter(|pair| {
-                    pair.local_generation == local_generation
-                        && self.pair_belongs_to_current_remote_epoch(pair)
-                        && pair.state == CandidatePairState::Selected
-                        && is_public_probe_endpoint(pair.remote_endpoint)
-                })
-                .max_by_key(|pair| pair.selected_at)
-            {
-                return Some(pair);
-            }
-        }
         if let Some(endpoint) = current_selection.and_then(|selection| selection.direct_endpoint) {
             if let Some(pair) = self.candidate_pairs.iter().find(|pair| {
                 pair.local_generation == local_generation

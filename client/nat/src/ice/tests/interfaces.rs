@@ -51,6 +51,22 @@ fn test_gather_local_addresses() {
 }
 
 #[test]
+fn local_network_matches_only_same_prefix_and_address_family() {
+    let network = LocalNetwork::new("192.168.31.10".parse().unwrap(), 24);
+    assert!(network.contains("192.168.31.20".parse().unwrap()));
+    assert!(!network.contains("192.168.32.20".parse().unwrap()));
+    assert!(!network.contains("fd00::20".parse().unwrap()));
+}
+
+#[test]
+fn local_network_does_not_treat_overlay_ranges_as_on_link_without_a_matching_interface() {
+    let physical = LocalNetwork::new("192.168.31.10".parse().unwrap(), 24);
+    assert!(!physical.contains("10.20.0.13".parse().unwrap()));
+    assert!(!physical.contains("100.64.0.13".parse().unwrap()));
+    assert!(!physical.contains("fd12:3456::13".parse().unwrap()));
+}
+
+#[test]
 fn route_probe_cannot_reintroduce_filtered_vpn_address() {
     let physical = IpAddr::V4(Ipv4Addr::new(192, 168, 2, 4));
     let vpn = IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2));

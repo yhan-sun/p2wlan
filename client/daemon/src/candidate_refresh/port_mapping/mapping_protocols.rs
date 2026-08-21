@@ -30,7 +30,7 @@ async fn discover_nat_pmp_udp_candidate(
 ) -> std::result::Result<PortMappingCandidate, String> {
     let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
     let bind_addr = SocketAddr::new(IpAddr::V4(local_ip), 0);
-    let socket = match UdpSocket::bind(bind_addr).await {
+    let socket = match p2pnet_netbind::bind_udp(bind_addr, None).await {
         Ok(socket) => socket,
         Err(error) => {
             debug!("NAT-PMP bind failed on {bind_addr}: {error}");
@@ -106,7 +106,7 @@ async fn discover_pcp_udp_candidate(
 ) -> std::result::Result<PortMappingCandidate, String> {
     let gateway_addr = SocketAddr::new(IpAddr::V4(gateway), NAT_MAPPING_CONTROL_PORT);
     let bind_addr = SocketAddr::new(IpAddr::V4(local_ip), 0);
-    let socket = match UdpSocket::bind(bind_addr).await {
+    let socket = match p2pnet_netbind::bind_udp(bind_addr, None).await {
         Ok(socket) => socket,
         Err(error) => {
             debug!("PCP bind failed on {bind_addr}: {error}");

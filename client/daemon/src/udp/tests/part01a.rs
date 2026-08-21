@@ -79,6 +79,7 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
         local_endpoint: None,
         socket_index: 2,
         generation: 7,
+        remote_candidate_epoch: 0,
         probe_session_id: None,
         peer_id: Some("peer-b".to_string()),
         purpose: PendingProbePurpose::ConnectivityCheck,

@@ -62,6 +62,38 @@ fn signal_candidate_cap_prefers_public_traversal_candidates_over_private_hosts()
 }
 
 #[test]
+fn signal_candidate_cap_keeps_host_when_fresh_prediction_window_fills_capacity() {
+    let host = "192.168.31.20:51820".to_string();
+    let fresh_label = fresh_prediction_source_label(FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation: 99,
+    });
+    let mut candidates = vec![host.clone()];
+    candidates.extend((40_000..40_096).map(|port| format!("203.0.113.10:{port}")));
+    let mut sources = candidates
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let source = if endpoint == host {
+                "host".to_string()
+            } else {
+                fresh_label.clone()
+            };
+            (endpoint, source)
+        })
+        .collect::<HashMap<_, _>>();
+
+    truncate_signal_candidates(&mut candidates, &mut sources);
+
+    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
+    assert!(
+        candidates.contains(&host),
+        "a full fresh prediction window must not crowd every Host candidate out of signaling"
+    );
+    assert_eq!(sources.len(), candidates.len());
+}
+
+#[test]
 fn canonical_network_identity_is_computed_before_air_sized_signal_cap() {
     let physical_host = "192.168.0.239:56255".to_string();
     let shared_lan_host = "100.64.0.10:56255".to_string();
@@ -823,22 +855,26 @@ fn fresh_window_mixes_with_lan_hosts_and_multiple_public_ips() {
 
     assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
     assert_eq!(sources.len(), MAX_SIGNAL_CANDIDATES);
-    // LAN hosts yield when the fresh window reserves the whole budget: the
-    // prediction window is time-sensitive and the peer already learned LAN
-    // hosts from earlier signals.
+    // A small Host prefix remains even when the fresh window reaches its
+    // maximum: the receiver still needs a chance to discover an on-link path.
     for endpoint in ["192.168.1.10:51820", "192.168.1.11:51820", "10.0.0.5:51820"] {
         assert!(
-            !candidates.contains(&endpoint.to_string()),
-            "LAN host {endpoint} must yield to the full fresh window"
+            candidates.contains(&endpoint.to_string()),
+            "LAN host {endpoint} must survive the bounded fresh-window reservation"
         );
     }
-    // Whole fresh window preserved, ordered top-1 first, and leading.
+    // The retained fresh prefix stays ordered top-1 first and remains ahead of
+    // ordinary candidates; the final slots carry the Host reservation.
     let window_ports = candidates
         .iter()
-        .take(MAX_SIGNAL_FRESH_WINDOW_CANDIDATES)
+        .filter(|endpoint| sources.get(*endpoint) == Some(&fresh_label))
         .map(|endpoint| endpoint.parse::<SocketAddr>().unwrap().port())
         .collect::<Vec<_>>();
-    assert_eq!(window_ports, (45393u16..45393u16 + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES as u16).collect::<Vec<_>>());
+    assert_eq!(
+        window_ports,
+        (45393u16..45393u16 + (MAX_SIGNAL_FRESH_WINDOW_CANDIDATES - 3) as u16)
+            .collect::<Vec<_>>()
+    );
     // Ordinary predicted may or may not survive the STUN-filled budget; if it
     // does it stays an ordinary predicted candidate.
     if candidates.contains(&ordinary_predicted) {
@@ -858,10 +894,9 @@ fn fresh_window_mixes_with_lan_hosts_and_multiple_public_ips() {
             .is_some()
         })
         .count();
-    assert_eq!(fresh_kept, MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
-    // A full fresh window reserves the whole wire budget: ordinary STUN
-    // candidates and LAN hosts yield (the peer already learned them from the
-    // offer), and the payload is exactly the prediction window.
+    assert_eq!(fresh_kept, MAX_SIGNAL_FRESH_WINDOW_CANDIDATES - 3);
+    // The reserved Host prefix consumes the remaining three slots; ordinary
+    // STUN candidates still yield to the fresh window.
     assert!(candidates
         .iter()
         .all(|c| !c.starts_with("198.51.100.10:") && !c.starts_with("198.51.100.20:")));

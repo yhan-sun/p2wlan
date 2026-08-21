@@ -1418,6 +1418,74 @@ async fn diagnostics_current_pair_prefers_confirmed_public_pair() {
 }
 
 #[tokio::test]
+async fn diagnostics_reports_the_same_validated_pair_used_for_outbound_direct() {
+    let manager = PeerManager::new(test_config());
+    let public: SocketAddr = "8.8.8.8:51855".parse().unwrap();
+    let host: SocketAddr = "192.168.31.20:51820".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", public)).await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[public.to_string(), host.to_string()],
+            &HashMap::from([
+                (public.to_string(), "stun_observed".to_string()),
+                (host.to_string(), "host".to_string()),
+            ]),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(public)).await;
+    manager.record_direct_success("peer1", Some(host)).await;
+
+    let peer = manager.diagnostics().await.pop().unwrap();
+    assert_eq!(peer.state, ConnectionState::Direct);
+    assert_eq!(peer.endpoint, Some(host.to_string()));
+    assert_eq!(
+        peer.current_direct_pair.unwrap().remote_endpoint,
+        host.to_string(),
+        "diagnostics must describe the pair that the direct selector currently sends to"
+    );
+}
+
+#[tokio::test]
+async fn diagnostics_does_not_keep_reporting_public_pair_after_host_pair_wins() {
+    let manager = PeerManager::new(test_config());
+    let public: SocketAddr = "8.8.8.8:51856".parse().unwrap();
+    let host: SocketAddr = "192.168.31.20:51821".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", public)).await;
+
+    {
+        let mut connections = manager.connections.write().await;
+        let connection = connections.get_mut("peer1").unwrap();
+        connection.state = ConnectionState::Direct;
+        connection.endpoint = Some(host);
+
+        let mut public_pair = CandidatePair::new_with_source(
+            public,
+            0,
+            CandidatePairSource::StunObserved,
+        );
+        public_pair.record_success(Some(Duration::from_millis(100)), true, None);
+        let mut host_pair =
+            CandidatePair::new_with_source(host, 0, CandidatePairSource::Host);
+        host_pair.record_success(Some(Duration::from_millis(2)), true, None);
+        connection.candidate_pairs = vec![public_pair, host_pair];
+    }
+
+    let peer = manager
+        .diagnostics_with_path_selection(true, false, Duration::from_secs(5), None)
+        .await
+        .pop()
+        .unwrap();
+    assert_eq!(peer.active_path, Some(NetworkPath::Direct));
+    assert_eq!(peer.endpoint, Some(host.to_string()));
+    assert_eq!(
+        peer.current_direct_pair.unwrap().remote_endpoint,
+        host.to_string(),
+        "diagnostics must not pin the old public proof after outbound selection moves to Host"
+    );
+}
+
+#[tokio::test]
 async fn diagnostics_direct_state_overrides_stale_relay_selection() {
     let manager = PeerManager::new(test_config());
     let public: SocketAddr = "8.8.8.8:51846".parse().unwrap();

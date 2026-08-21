@@ -3865,13 +3865,14 @@ impl WireGuardTransport {
                 // owner initiated the request, and the promotion remains
                 // inside the epoch guard that made the check atomic.
                 let promoted = peers
-                    .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
+                    .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch_for_remote_epoch(
                         &epoch_guard,
                         peer_id,
                         Some(source),
                         expectation.generation,
                         local_endpoint,
                         validation_latency,
+                        Some(expectation.remote_candidate_epoch),
                     )
                     .await;
                 let affinity_adopted = if promoted {

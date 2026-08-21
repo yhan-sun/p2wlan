@@ -552,6 +552,14 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeSendResult> {
+        let remote_candidate_epoch = match peer_id {
+            Some(peer_id) => self
+                .peers
+                .current_remote_candidate_epoch(peer_id)
+                .await
+                .unwrap_or(0),
+            None => 0,
+        };
         // Consistent peer snapshot under one lock acquisition: generation
         // (lock-free mirror), affinity evidence epoch and cleanup epoch.
         let (generation, socket_epoch, cleanup_epoch) = {
@@ -646,6 +654,19 @@ impl UdpTransport {
         // probe can never be registered once the generation moved on.
         let send_lease = {
             let _epoch_gate = self.network_epoch_gate.lock().await;
+            let current_remote_candidate_epoch = match peer_id {
+                Some(peer_id) => self
+                    .peers
+                    .current_remote_candidate_epoch(peer_id)
+                    .await
+                    .unwrap_or(0),
+                None => 0,
+            };
+            if current_remote_candidate_epoch != remote_candidate_epoch {
+                return Err(DaemonError::Network(
+                    "probe invalidated: remote candidate generation changed".to_string(),
+                ));
+            }
             let state = self.socket_state.lock().await;
             if self.peers.current_network_generation_sync() != generation {
                 debug!(
@@ -698,6 +719,7 @@ impl UdpTransport {
                     local_endpoint: socket.local_addr().ok(),
                     socket_index,
                     generation,
+                    remote_candidate_epoch,
                     probe_session_id,
                     peer_id: peer_id.map(str::to_string),
                     purpose,

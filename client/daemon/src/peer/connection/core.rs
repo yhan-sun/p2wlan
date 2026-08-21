@@ -151,6 +151,10 @@ pub struct PeerConnection {
     /// intentionally separate from the wire generation because legacy peers
     /// may repeatedly publish generation `0`.
     remote_candidate_epoch: u64,
+    /// Directly-connected local interface prefixes used to identify a remote
+    /// Host candidate as genuinely on-link. This prevents RFC1918/ULA or
+    /// overlay addresses from being treated as LAN merely by address class.
+    local_interface_networks: Vec<LocalNetwork>,
     last_candidates_expires_at_ms: Option<u64>,
     /// Local-only source metadata keyed by candidate endpoint string.
     pub candidate_sources: HashMap<String, CandidatePairSource>,
@@ -230,6 +234,14 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
+    pub(crate) fn remote_candidate_epoch(&self) -> u64 {
+        self.remote_candidate_epoch
+    }
+
+    pub(crate) fn set_local_interface_networks(&mut self, networks: Vec<LocalNetwork>) {
+        self.local_interface_networks = networks;
+    }
+
     /// Create a new peer connection in Idle state.
     pub fn new(node_id: &str, virtual_ip: &str) -> Self {
         Self {
@@ -259,6 +271,7 @@ impl PeerConnection {
             signaled_candidates: HashSet::new(),
             last_candidate_generation: 0,
             remote_candidate_epoch: 0,
+            local_interface_networks: Vec::new(),
             last_candidates_expires_at_ms: None,
             candidate_sources: HashMap::new(),
             direct_health: PathHealth::default(),

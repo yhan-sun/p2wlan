@@ -127,8 +127,10 @@ impl PeerManager {
         } else {
             0
         };
+        let local_interface_networks = self.local_interface_networks.read().await.clone();
         let mut conns = self.connections.write().await;
         let conn = conns.get_mut(node_id)?;
+        conn.set_local_interface_networks(local_interface_networks);
         if !conn.online {
             return None;
         }

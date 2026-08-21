@@ -53,8 +53,10 @@ fn candidate_pair_probe_retry_remaining(pair: &CandidatePair) -> Option<Duration
     Some(retry_after.saturating_sub(failure_age))
 }
 
-fn candidate_pair_send_rank_at(pair: &CandidatePair, now: Instant) -> u8 {
-    if is_successful_low_latency_private_pair_at(pair, now) {
+fn candidate_pair_send_rank_at(pair: &CandidatePair, now: Instant, on_link_host: bool) -> u8 {
+    if is_successful_low_latency_private_pair_at(pair, now)
+        || (on_link_host && is_successful_low_latency_on_link_host_pair_at(pair, now))
+    {
         return 0;
     }
 
@@ -105,6 +107,22 @@ fn is_successful_low_latency_private_pair_at(pair: &CandidatePair, now: Instant)
         pair.state,
         CandidatePairState::Selected | CandidatePairState::Succeeded
     ) && is_low_latency_direct_endpoint(pair.remote_endpoint)
+        && pair.consecutive_failures == 0
+        && pair
+            .last_success_at
+            .is_some_and(|last_success| now.saturating_duration_since(last_success) <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+        && pair
+            .rtt_ewma_ms
+            .or(pair.rtt_ms)
+            .is_some_and(|rtt| rtt <= PRIVATE_DIRECT_RETAIN_MAX_RTT_MS)
+}
+
+fn is_successful_low_latency_on_link_host_pair_at(pair: &CandidatePair, now: Instant) -> bool {
+    pair.source == CandidatePairSource::Host
+        && matches!(
+            pair.state,
+            CandidatePairState::Selected | CandidatePairState::Succeeded
+        )
         && pair.consecutive_failures == 0
         && pair
             .last_success_at
