@@ -145,9 +145,7 @@ void main() {
       await request.response.close();
     });
 
-    final api = DiagnosticsApi(
-      authTokenReader: () async => 'diag-test-token',
-    );
+    final api = DiagnosticsApi(authTokenReader: () async => 'diag-test-token');
     addTearDown(api.close);
 
     final status = await api.fetchStatus(

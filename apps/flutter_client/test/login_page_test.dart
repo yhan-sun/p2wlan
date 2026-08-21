@@ -191,9 +191,7 @@ void main() {
     expect(find.textContaining('TUN'), findsNothing);
   });
 
-  testWidgets('iOS keeps the remote-management subtitle copy', (
-    tester,
-  ) async {
+  testWidgets('iOS keeps the remote-management subtitle copy', (tester) async {
     final stores = (await tester.runAsync(_makeStores))!;
     addTearDown(stores.dispose);
 
