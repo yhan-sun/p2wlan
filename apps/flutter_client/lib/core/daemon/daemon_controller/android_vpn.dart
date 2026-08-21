@@ -6,7 +6,6 @@ part of '../daemon_controller.dart';
 /// TUN permission and foreground lifecycle; the existing DiagnosticsApi still
 /// remains the readiness/status contract for the UI.
 const _androidVpnChannel = MethodChannel('p2wlan/android_vpn');
-const _androidProvisionalVirtualIp = '10.20.0.1';
 
 extension DaemonControllerAndroidVpn on DaemonController {
   Future<DaemonCommandResult> _startAndroidVpn(AppSettings settings) async {
@@ -64,31 +63,13 @@ extension DaemonControllerAndroidVpn on DaemonController {
       );
     }
 
-    // On a first managed start the control plane may assign a VIP only after
-    // the native daemon has registered. Re-establish the Android VPN with
-    // that real address; otherwise the system interface would keep the
-    // provisional 10.20.0.1 while Rust correctly expects the assigned VIP.
-    final assignedVirtualIp = await _androidAssignedVirtualIp(
-      settings.diagnosticsUrl,
-    );
-    final requestedVirtualIp = settings.virtualIp.trim().isEmpty
-        ? _androidProvisionalVirtualIp
-        : settings.virtualIp.trim();
-    if (assignedVirtualIp != null && assignedVirtualIp != requestedVirtualIp) {
-      final rebound = await _restartAndroidVpnWithVirtualIp(
-        settings,
-        assignedVirtualIp,
-      );
-      if (!rebound.ok) return rebound;
-    }
-
     return const DaemonCommandResult(
       ok: true,
       message: 'Android P2WLAN VPN 已启动。',
     );
   }
 
-  String _androidRequestJson(AppSettings settings, {String? virtualIp}) {
+  String _androidRequestJson(AppSettings settings) {
     return jsonEncode({
       'control_server': settings.controlServer,
       'network_id': settings.networkId.trim().isEmpty
@@ -96,7 +77,7 @@ extension DaemonControllerAndroidVpn on DaemonController {
           : settings.networkId.trim(),
       'auth_token': settings.authToken,
       'device_name': settings.deviceName,
-      'virtual_ip': virtualIp ?? settings.virtualIp,
+      'virtual_ip': settings.virtualIp,
       'manual_mode': settings.manualMode,
       'overlay_cidr': settings.overlayCidr,
       'mtu': settings.mtu,
@@ -106,50 +87,6 @@ extension DaemonControllerAndroidVpn on DaemonController {
       'socket_pool': settings.socketPool,
       'diagnostics_bind': _androidDiagnosticsBind(settings.diagnosticsUrl),
     });
-  }
-
-  Future<DaemonCommandResult> _restartAndroidVpnWithVirtualIp(
-    AppSettings settings,
-    String virtualIp,
-  ) async {
-    final stopped = await _stopAndroidVpn(settings.diagnosticsUrl);
-    if (!stopped.ok) return stopped;
-    if (!await _prepareAndroidVpn()) {
-      return const DaemonCommandResult(
-        ok: false,
-        message: 'Android VPN 权限已失效，无法按已分配的虚拟 IP 重建 VPN。',
-      );
-    }
-    try {
-      await _androidVpnChannel.invokeMethod<bool>('start', {
-        'requestJson': _androidRequestJson(settings, virtualIp: virtualIp),
-      });
-    } on PlatformException catch (error) {
-      return DaemonCommandResult(
-        ok: false,
-        message: error.message ?? 'Android VPN 启动失败。',
-      );
-    } catch (error) {
-      return DaemonCommandResult(ok: false, message: 'Android VPN 启动失败：$error');
-    }
-
-    final ready = await _waitForAndroidHealth(
-      settings.diagnosticsUrl,
-      const Duration(seconds: 30),
-    );
-    if (!ready) {
-      final nativeError = await _androidNativeError();
-      return DaemonCommandResult(
-        ok: false,
-        message: nativeError == null
-            ? 'Android VPN 服务已启动，但 Rust 本地 daemon 未在 30 秒内就绪。请查看本地诊断日志。'
-            : 'Android VPN 启动失败：$nativeError',
-      );
-    }
-    return const DaemonCommandResult(
-      ok: true,
-      message: 'Android P2WLAN VPN 已启动。',
-    );
   }
 
   Future<DaemonCommandResult> _stopAndroidVpn(String diagnosticsUrl) async {
@@ -227,21 +164,6 @@ extension DaemonControllerAndroidVpn on DaemonController {
       await Future<void>.delayed(DaemonController._readyPoll);
     }
     return _diagnosticsApi.fetchHealth(diagnosticsUrl);
-  }
-
-  Future<String?> _androidAssignedVirtualIp(String diagnosticsUrl) async {
-    for (var attempt = 0; attempt < 6; attempt++) {
-      try {
-        final snapshot = await _diagnosticsApi.fetchStatus(diagnosticsUrl);
-        final virtualIp = snapshot.virtualIp.trim();
-        if (virtualIp.isNotEmpty) return virtualIp;
-      } catch (_) {
-        // The diagnostics listener and its per-process token can become
-        // visible a fraction later than /health during the first start.
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 400));
-    }
-    return null;
   }
 
   String _androidDiagnosticsBind(String diagnosticsUrl) {

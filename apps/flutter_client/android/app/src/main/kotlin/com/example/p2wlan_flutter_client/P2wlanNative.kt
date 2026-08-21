@@ -1,5 +1,6 @@
 package com.example.p2wlan_flutter_client
 
+import android.os.ParcelFileDescriptor
 import android.util.Log
 
 /** JNI entry points implemented by client/android-native. */
@@ -32,13 +33,17 @@ internal object P2wlanNative {
     }
 
     fun start(tunFd: Int, requestJson: String): String? {
-        if (!ensureLoaded()) return loadError
+        if (!ensureLoaded()) {
+            closeOwnedFd(tunFd)
+            return loadError
+        }
         return try {
             val error = nativeStart(tunFd, requestJson)
             loadError = error
             if (error != null) Log.e(TAG, error)
             error
         } catch (error: Throwable) {
+            closeOwnedFd(tunFd)
             val message = formatError("Android 原生 daemon 启动失败", error)
             loadError = message
             Log.e(TAG, message, error)
@@ -70,6 +75,18 @@ internal object P2wlanNative {
         }
     }
 
+    fun isReady(): Boolean {
+        if (!ensureLoaded()) return false
+        return try {
+            nativeIsReady()
+        } catch (error: Throwable) {
+            val message = formatError("无法读取 Android 原生 daemon 就绪状态", error)
+            loadError = message
+            Log.w(TAG, message, error)
+            false
+        }
+    }
+
     fun lastError(): String? {
         if (!ensureLoaded()) return loadError
         return try {
@@ -88,11 +105,22 @@ internal object P2wlanNative {
         }
     }
 
+    private fun closeOwnedFd(fd: Int) {
+        if (fd < 0) return
+        try {
+            ParcelFileDescriptor.adoptFd(fd).close()
+        } catch (error: Throwable) {
+            Log.w(TAG, "关闭 Android VPN fd 失败", error)
+        }
+    }
+
     private external fun nativeStart(tunFd: Int, requestJson: String): String?
 
     private external fun nativeStop(): Boolean
 
     private external fun nativeIsRunning(): Boolean
+
+    private external fun nativeIsReady(): Boolean
 
     private external fun nativeLastError(): String?
 }

@@ -109,12 +109,14 @@ class P2wlanVpnService : VpnService() {
 
             val enrichedRequest = enrichRequest(request)
             val nativeError = P2wlanNative.start(detachedFd, enrichedRequest.toString())
+            // Ownership of the detached fd is transferred to P2wlanNative as
+            // soon as nativeStart is invoked. Native startup/error paths (and
+            // the Kotlin library-load fallback) close it; Kotlin must not
+            // close the integer a second time after this call returns.
+            detachedFd = -1
             if (!nativeError.isNullOrBlank()) {
-                closeDetachedFd(detachedFd)
-                detachedFd = -1
                 throw IllegalStateException(nativeError)
             }
-            detachedFd = -1
             serviceRunning = true
             startNativeMonitor()
             Log.i(TAG, "P2WLAN Android VPN started")

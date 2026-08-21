@@ -34,6 +34,7 @@ class MainActivity : FlutterActivity() {
                 mapOf(
                     "serviceRunning" to P2wlanVpnService.isRunning(),
                     "nativeRunning" to P2wlanNative.isRunning(),
+                    "nativeReady" to P2wlanNative.isReady(),
                     "nativeError" to P2wlanVpnService.lastError(),
                 ),
             )

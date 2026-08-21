@@ -505,6 +505,20 @@ impl Daemon {
             )
             .await;
 
+        // On Android, the JNI thread acknowledges the daemon launch as soon
+        // as the runtime handle is installed so the VpnService can remain
+        // responsive. Report the separate, meaningful readiness transition
+        // only after registration, TUN attachment, diagnostics, and all
+        // initial core task handles have been installed. If any of the
+        // fallible setup above fails, this flag stays false and the native
+        // bridge surfaces the recorded error instead of presenting a
+        // briefly-live VPN that immediately disappears without context.
+        #[cfg(target_os = "android")]
+        if let Some(ready) = self.android_startup_ready.take() {
+            ready.store(true, std::sync::atomic::Ordering::Release);
+            info!("Android daemon startup completed; VPN dataplane is ready");
+        }
+
         self.run_control_event_loop(&mut relay_started, network_inbound_tx.clone())
             .await;
 

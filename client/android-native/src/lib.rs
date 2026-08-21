@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "android")]
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -77,6 +78,7 @@ struct AndroidStartRequest {
 struct RuntimeHandle {
     shutdown_tx: watch::Sender<bool>,
     running: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
 }
 
 static RUNTIME: OnceLock<Mutex<Option<RuntimeHandle>>> = OnceLock::new();
@@ -110,6 +112,23 @@ fn runtime_running() -> bool {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .is_some_and(|handle| handle.running.load(Ordering::Acquire))
+}
+
+fn runtime_ready() -> bool {
+    runtime_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|handle| handle.ready.load(Ordering::Acquire))
+}
+
+fn close_raw_fd(fd: jint) {
+    if fd >= 0 {
+        // Safety: this is only called on startup paths where ownership has
+        // not yet been transferred into AndroidTun. Once Daemon takes the fd,
+        // its OwnedFd is responsible for closing it.
+        unsafe { drop(OwnedFd::from_raw_fd(fd)) };
+    }
 }
 
 fn read_request(
@@ -357,34 +376,63 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
             .as_ref()
             .is_some_and(|handle| handle.running.load(Ordering::Acquire))
         {
+            close_raw_fd(tun_fd);
             return Err("an existing Android P2WLAN daemon is still running".to_string());
         }
     }
 
-    let (config, config_path) = prepare_config(&request)?;
+    let (config, config_path) = match prepare_config(&request) {
+        Ok(value) => value,
+        Err(error) => {
+            close_raw_fd(tun_fd);
+            return Err(error);
+        }
+    };
     let log_path = config
         .diagnostics
         .log_path
         .clone()
         .unwrap_or_else(|| config_path.with_file_name("p2wlan-daemon.log"));
     let running = Arc::new(AtomicBool::new(true));
+    let ready = Arc::new(AtomicBool::new(false));
     let running_for_thread = Arc::clone(&running);
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<watch::Sender<bool>, String>>(1);
+    let ready_for_thread = Arc::clone(&ready);
+    // This channel acknowledges only that the runtime handle has been
+    // installed. Actual daemon readiness is published separately through
+    // `ready_for_thread` by Daemon::run after registration, TUN attachment,
+    // diagnostics, and dataplane setup have completed.
+    let (handle_tx, handle_rx) = mpsc::sync_channel::<Result<RuntimeHandle, String>>(1);
 
-    thread::Builder::new()
+    let thread_result = thread::Builder::new()
         .name("p2wlan-daemon".to_string())
         .spawn(move || {
+            let mut fd_owned_by_thread = true;
             let startup_result = catch_unwind(AssertUnwindSafe(|| {
                 init_logging(&log_path);
                 let runtime = Builder::new_multi_thread()
                     .enable_all()
                     .build()
                     .map_err(|error| format!("failed to create Tokio runtime: {error}"))?;
-                let mut daemon = Daemon::new_with_android_tun(config, tun_fd);
-                let shutdown_tx = daemon.shutdown_sender();
-                ready_tx
-                    .send(Ok(shutdown_tx))
-                    .map_err(|_| "Android daemon startup waiter disconnected".to_string())?;
+                // Daemon::new creates the managed control workers with
+                // tokio::spawn. JNI threads do not automatically enter the
+                // runtime they just built, so construct the daemon inside an
+                // explicit runtime context or managed Android starts panic
+                // before the first control request is sent.
+                let mut daemon = {
+                    let _runtime_guard = runtime.enter();
+                    let mut daemon = Daemon::new_with_android_tun(config, tun_fd);
+                    fd_owned_by_thread = false;
+                    daemon.set_android_startup_ready(Arc::clone(&ready_for_thread));
+                    let handle = RuntimeHandle {
+                        shutdown_tx: daemon.shutdown_sender(),
+                        running: Arc::clone(&running_for_thread),
+                        ready: Arc::clone(&ready_for_thread),
+                    };
+                    handle_tx
+                        .send(Ok(handle))
+                        .map_err(|_| "Android daemon launch waiter disconnected".to_string())?;
+                    daemon
+                };
                 if let Err(error) = runtime.block_on(daemon.run()) {
                     let message = format!("Android daemon exited with error: {error}");
                     set_last_error(Some(message.clone()));
@@ -393,20 +441,25 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
                 Ok::<(), String>(())
             }));
 
+            if fd_owned_by_thread {
+                close_raw_fd(tun_fd);
+            }
+
             match startup_result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     set_last_error(Some(error.clone()));
                     append_log(&log_path, &error);
-                    let _ = ready_tx.send(Err(error));
+                    let _ = handle_tx.send(Err(error));
                 }
                 Err(_) => {
                     let error = "Android daemon thread panicked during startup".to_string();
                     set_last_error(Some(error.clone()));
                     append_log(&log_path, &error);
-                    let _ = ready_tx.send(Err(error));
+                    let _ = handle_tx.send(Err(error));
                 }
             }
+            ready_for_thread.store(false, Ordering::Release);
             running_for_thread.store(false, Ordering::Release);
             let mut guard = runtime_slot()
                 .lock()
@@ -418,15 +471,20 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
                 *guard = None;
             }
         })
-        .map_err(|error| format!("failed to start Android daemon thread: {error}"))?;
+        .map_err(|error| format!("failed to start Android daemon thread: {error}"));
+    if let Err(error) = thread_result {
+        close_raw_fd(tun_fd);
+        return Err(error);
+    }
 
-    let shutdown_tx = ready_rx
+    let handle = handle_rx
         .recv_timeout(Duration::from_secs(2))
-        .map_err(|error| format!("Android daemon did not initialize: {error}"))??;
-    let handle = RuntimeHandle {
-        shutdown_tx,
-        running,
-    };
+        .map_err(|error| format!("Android daemon runtime did not start: {error}"))??;
+    if !handle.running.load(Ordering::Acquire) {
+        return Err(last_error().unwrap_or_else(|| {
+            "Android daemon exited before its runtime handle became active".to_string()
+        }));
+    }
     let mut guard = runtime_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -457,8 +515,11 @@ fn new_string_or_null(env: &mut JNIEnv<'_>, error: Option<String>) -> jstring {
 }
 
 /// Start the Rust daemon around the Android VPN fd. A null return means the
-/// daemon thread was launched; a non-null string is a user-visible startup
-/// error and ownership of the fd remains with the caller.
+/// daemon runtime handle was installed; actual readiness is reported by the
+/// diagnostics endpoint and `nativeIsReady`. A non-null string means the
+/// runtime could not be launched. Before the startup thread is created the
+/// caller still owns the fd; after that handoff Rust closes or drops it on
+/// every startup/error path.
 #[no_mangle]
 pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeStart(
     mut env: JNIEnv<'_>,
@@ -467,8 +528,17 @@ pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nat
     request_json: JString<'_>,
 ) -> jstring {
     set_last_error(None);
-    let result =
-        read_request(&mut env, request_json).and_then(|request| start_runtime(tun_fd, request));
+    let result = match read_request(&mut env, request_json) {
+        Ok(request) => start_runtime(tun_fd, request),
+        Err(error) => {
+            // The fd is still owned by Kotlin when JSON parsing fails, so
+            // close it here before returning the JNI error. Once
+            // start_runtime has spawned the daemon, ownership is transferred
+            // to the Rust startup thread and its error paths close/drop it.
+            close_raw_fd(tun_fd);
+            Err(error)
+        }
+    };
     if let Err(error) = &result {
         set_last_error(Some(error.clone()));
     }
@@ -493,6 +563,18 @@ pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nat
     _object: JObject<'_>,
 ) -> jboolean {
     if runtime_running() {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeIsReady(
+    _env: JNIEnv<'_>,
+    _object: JObject<'_>,
+) -> jboolean {
+    if runtime_ready() {
         1
     } else {
         0

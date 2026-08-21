@@ -96,6 +96,13 @@ pub struct Daemon {
     /// Android's VpnService establishes the TUN before the Rust daemon starts.
     #[cfg(target_os = "android")]
     android_tun_fd: Option<std::os::fd::RawFd>,
+    /// Set by the Android JNI bridge once the daemon has completed control
+    /// registration, attached the supplied TUN, and started its core tasks.
+    /// The JNI launch acknowledgement must not be confused with this state:
+    /// the former only means a runtime thread exists, while this flag means
+    /// the VPN dataplane is actually ready for diagnostics traffic.
+    #[cfg(target_os = "android")]
+    android_startup_ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Daemon {
@@ -226,6 +233,8 @@ impl Daemon {
             relay_available_tx,
             #[cfg(target_os = "android")]
             android_tun_fd: None,
+            #[cfg(target_os = "android")]
+            android_startup_ready: None,
         }
     }
 
@@ -235,6 +244,17 @@ impl Daemon {
         let mut daemon = Self::new(config);
         daemon.android_tun_fd = Some(tun_fd);
         daemon
+    }
+
+    /// Attach the readiness flag used by the Android JNI lifecycle. This is
+    /// deliberately separate from `new_with_android_tun`: constructing the
+    /// daemon is not proof that its async control/TUN/dataplane setup worked.
+    #[cfg(target_os = "android")]
+    pub fn set_android_startup_ready(
+        &mut self,
+        ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.android_startup_ready = Some(ready);
     }
 
     /// Return a clone of the shutdown sender so main can signal SIGTERM/SIGINT.
