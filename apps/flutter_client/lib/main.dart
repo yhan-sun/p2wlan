@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'app/desktop_window_operations.dart';
 import 'app/p2wlan_app.dart';
 
 Future<void> main() async {
@@ -12,9 +13,6 @@ Future<void> main() async {
   if (_supportsDesktopHost) {
     await windowManager.ensureInitialized();
     await _configureDesktopWindowChrome();
-    if (enableFlutterTray) {
-      await windowManager.setPreventClose(true);
-    }
   }
   runApp(
     P2WlanApp(
@@ -25,31 +23,27 @@ Future<void> main() async {
 }
 
 Future<void> _configureDesktopWindowChrome() async {
-  // Keep the main Flutter window discoverable on every desktop platform.
-  // The tray controller may temporarily hide it when the user chooses a
-  // background/tray close behavior.
-  await windowManager.setSkipTaskbar(false);
-  await windowManager.setTitle('P2WLAN');
+  await DesktopWindowOperations.run(() async {
+    // Windows already owns a normal taskbar entry for the Flutter window.
+    // window_manager's Windows setSkipTaskbar implementation requires an
+    // internal ITaskbarList3 that is only created by its optional
+    // waitUntilReadyToShow flow. Do not enter that fragile path: hiding the
+    // native window already removes it from the taskbar when needed.
+    if (!Platform.isWindows) {
+      await windowManager.setSkipTaskbar(false);
+    }
+    await windowManager.setTitle('P2WLAN');
 
-  if (Platform.isMacOS) {
-    await windowManager.setTitleBarStyle(
-      TitleBarStyle.hidden,
-      windowButtonVisibility: true,
-    );
-  } else if (Platform.isWindows) {
-    await windowManager.setTitleBarStyle(
-      // Windows keeps its native title bar so the system close, minimize, and
-      // maximize controls remain available and behave consistently with other
-      // Windows applications. macOS uses the separate hidden-titlebar style
-      // above to retain its traffic-light controls and content layout.
-      TitleBarStyle.normal,
-      windowButtonVisibility: true,
-    );
-    await windowManager.setResizable(true);
-    await windowManager.setMinimizable(true);
-    await windowManager.setMaximizable(true);
-    await windowManager.setClosable(true);
-  }
+    if (Platform.isMacOS) {
+      await windowManager.setTitleBarStyle(
+        TitleBarStyle.hidden,
+        windowButtonVisibility: true,
+      );
+    }
+    // Windows deliberately keeps the runner's native frame. This preserves
+    // the system minimize/maximize/close buttons and avoids changing window
+    // styles while a virtual or remote display is being initialized.
+  });
 }
 
 bool get _supportsDesktopHost {

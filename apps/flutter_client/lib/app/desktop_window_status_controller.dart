@@ -7,6 +7,7 @@ import '../core/models/diagnostics_models.dart';
 import '../core/state/status_store.dart';
 import '../shared/formatters.dart';
 import 'app_constants.dart';
+import 'desktop_window_operations.dart';
 
 class DesktopWindowStatusController {
   DesktopWindowStatusController({required this.statusStore});
@@ -14,7 +15,8 @@ class DesktopWindowStatusController {
   final StatusStore statusStore;
 
   bool _initialized = false;
-  bool _updateQueued = false;
+  bool _updateRequested = false;
+  Future<void>? _updateInFlight;
   String? _lastTitle;
   String? _lastDockBadge;
 
@@ -29,7 +31,7 @@ class DesktopWindowStatusController {
     if (_initialized || !isSupported) return;
     _initialized = true;
     statusStore.addListener(_scheduleUpdate);
-    await _update();
+    await _queueUpdate();
   }
 
   void dispose() {
@@ -39,33 +41,66 @@ class DesktopWindowStatusController {
   }
 
   void _scheduleUpdate() {
-    if (_updateQueued) return;
-    _updateQueued = true;
-    scheduleMicrotask(() {
-      _updateQueued = false;
-      if (_initialized) unawaited(_update());
-    });
+    unawaited(_queueUpdate());
+  }
+
+  Future<void> _queueUpdate() {
+    if (!_initialized) return Future<void>.value();
+    _updateRequested = true;
+    final inFlight = _updateInFlight;
+    if (inFlight != null) return inFlight;
+
+    final future = _drainUpdates();
+    _updateInFlight = future;
+    return future;
+  }
+
+  Future<void> _drainUpdates() async {
+    try {
+      while (_initialized && _updateRequested) {
+        _updateRequested = false;
+        try {
+          await _update();
+        } catch (error) {
+          debugPrint('Failed to update P2WLAN desktop indicators: $error');
+        }
+      }
+    } finally {
+      _updateInFlight = null;
+      if (_initialized && _updateRequested) {
+        unawaited(_queueUpdate());
+      }
+    }
   }
 
   Future<void> _update() async {
     final title = taskbarTitleForTesting();
-    if (_lastTitle != title) {
-      try {
-        await windowManager.setTitle(title);
-        _lastTitle = title;
-      } catch (error) {
-        debugPrint('Failed to update P2WLAN desktop title: $error');
-      }
-    }
+    final shouldUpdateTitle = _lastTitle != title;
+    final badge = defaultTargetPlatform == TargetPlatform.macOS
+        ? dockBadgeForTesting()
+        : '';
+    final shouldUpdateBadge =
+        defaultTargetPlatform == TargetPlatform.macOS &&
+        _lastDockBadge != badge;
+    if (!shouldUpdateTitle && !shouldUpdateBadge) return;
 
-    if (defaultTargetPlatform != TargetPlatform.macOS) return;
-    final badge = dockBadgeForTesting();
-    if (_lastDockBadge == badge) return;
     try {
-      await windowManager.setBadgeLabel(badge.isEmpty ? null : badge);
-      _lastDockBadge = badge;
+      await DesktopWindowOperations.run(() async {
+        if (shouldUpdateTitle) {
+          await windowManager.setTitle(title);
+          _lastTitle = title;
+        }
+        if (shouldUpdateBadge) {
+          await windowManager.setBadgeLabel(badge.isEmpty ? null : badge);
+          _lastDockBadge = badge;
+        }
+      });
     } catch (error) {
-      debugPrint('Failed to update P2WLAN Dock badge: $error');
+      if (shouldUpdateTitle) {
+        debugPrint('Failed to update P2WLAN desktop title: $error');
+      } else {
+        debugPrint('Failed to update P2WLAN Dock badge: $error');
+      }
     }
   }
 
