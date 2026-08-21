@@ -588,6 +588,7 @@ async fn matched_ack_alone_never_promotes_direct_without_encrypted_confirmation(
             &HashMap::from([(endpoint.to_string(), "stun_observed".to_string())]),
         )
         .await;
+    let commit_seq_before_probe = manager.direct_commit_seq_sync("peer1");
 
     // A matched authenticated ACK proves bidirectional UDP reachability but
     // must NEVER promote Direct: the encrypted data path is unconfirmed.
@@ -610,9 +611,10 @@ async fn matched_ack_alone_never_promotes_direct_without_encrypted_confirmation(
         }),
         "the matched ACK must mark the pair reachable"
     );
-    assert!(
-        manager.direct_commit_seq_sync("peer1").is_none(),
-        "no direct-commit sequence may exist before encrypted confirmation"
+    assert_eq!(
+        manager.direct_commit_seq_sync("peer1"),
+        commit_seq_before_probe,
+        "a probe ACK must not advance the remote-candidate handover fence"
     );
 
     // Only the encrypted-data-path confirmation promotes Direct.

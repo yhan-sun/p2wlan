@@ -561,6 +561,10 @@ impl UdpTransport {
                         let _adoption_guard = adoption.lock().await;
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
+                            let direct_commit_seq = self
+                                .peers
+                                .direct_commit_seq_sync(&identity.source_node_id)
+                                .unwrap_or(0);
                             // The cleanup epoch is read under the socket-state
                             // lock and the pending match runs under it: an ACK
                             // can only match a pending probe whose stamped
@@ -583,6 +587,7 @@ impl UdpTransport {
                                     && pending.peer_id.as_deref()
                                         == Some(identity.source_node_id.as_str())
                                     && pending.cleanup_epoch == cleanup_epoch
+                                    && pending.direct_commit_seq == direct_commit_seq
                                     && pending.accepts_authenticated_ack
                             };
                             let expired = pending
@@ -923,6 +928,11 @@ impl UdpTransport {
                             let mut pending_probes = self.pending_probes.lock().await;
                             let now = Instant::now();
                             let pending = pending_probes.get(&packet.nonce).cloned();
+                            let direct_commit_seq = pending
+                                .as_ref()
+                                .and_then(|pending| pending.peer_id.as_deref())
+                                .and_then(|peer_id| self.peers.direct_commit_seq_sync(peer_id))
+                                .unwrap_or(0);
                             let expired = pending
                                 .as_ref()
                                 .filter(|pending| {
@@ -931,6 +941,7 @@ impl UdpTransport {
                                         source,
                                         generation,
                                         socket_index,
+                                        direct_commit_seq,
                                     ) && pending.is_expired(now)
                                 })
                                 .cloned();
@@ -941,6 +952,7 @@ impl UdpTransport {
                                         source,
                                         generation,
                                         socket_index,
+                                        direct_commit_seq,
                                     ) && !pending.is_expired(now)
                                 })
                                 .map(|pending| {

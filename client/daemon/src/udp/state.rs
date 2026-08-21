@@ -1369,9 +1369,11 @@ fn legacy_ack_matches_pending(
     source: SocketAddr,
     generation: u64,
     socket_index: usize,
+    direct_commit_seq: u64,
 ) -> bool {
     pending.generation == generation
         && pending.socket_index == socket_index
+        && pending.direct_commit_seq == direct_commit_seq
         && pending.accepts_legacy_ack
         && (pending.endpoint == source
             || (pending.peer_id.is_some() && pending.endpoint.ip() == source.ip()))

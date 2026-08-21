@@ -33,7 +33,7 @@ async fn previous_direct_success_fast_retries_even_when_nat_now_looks_hard() {
         .await;
     manager.update_nat_profile(birthday_nat_profile()).await;
     manager
-        .record_direct_success("peer1", Some(endpoint_a))
+        .record_direct_success("peer1", Some(endpoint_b))
         .await;
     manager
         .record_direct_failure_with_code("peer1", REASON_DIRECT_PROBE_FAILED, "lost direct")
@@ -56,7 +56,7 @@ async fn previous_direct_success_fast_retries_even_when_nat_now_looks_hard() {
         .await;
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].peer_id, "peer1");
-    assert!(targets[0].candidates.contains(&endpoint_a));
+    assert!(targets[0].candidates.contains(&endpoint_b));
 }
 
 #[tokio::test]

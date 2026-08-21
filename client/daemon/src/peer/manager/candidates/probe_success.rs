@@ -14,6 +14,7 @@ impl PeerManager {
                 .is_some_and(|conn| {
                     conn.candidate_pairs.iter().any(|pair| {
                         pair.local_generation == generation
+                            && conn.pair_belongs_to_current_remote_epoch(pair)
                             && matches!(
                                 pair.state,
                                 CandidatePairState::Succeeded | CandidatePairState::Selected
@@ -33,18 +34,17 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return 0;
         }
-        self.connections
-            .read()
-            .await
-            .get(node_id)
-            .map(|conn| {
-                conn.candidate_pairs
-                    .iter()
-                    .filter(|pair| pair.local_generation == generation)
-                    .map(|pair| pair.success_count)
-                    .sum()
+        let connections = self.connections.read().await;
+        let Some(conn) = connections.get(node_id) else {
+            return 0;
+        };
+        conn.candidate_pairs
+            .iter()
+            .filter(|pair| {
+                pair.local_generation == generation
+                    && conn.pair_belongs_to_current_remote_epoch(pair)
             })
-            .unwrap_or(0)
+            .map(|pair| pair.success_count)
+            .sum()
     }
-
 }

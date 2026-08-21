@@ -6,6 +6,7 @@ impl PeerConnection {
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
                     && !is_overlay_endpoint(pair.remote_endpoint)
                     && (matches!(
                         pair.state,
@@ -50,7 +51,10 @@ impl PeerConnection {
             .map(|pair| pair.remote_endpoint)
             .or_else(|| {
                 self.endpoint
-                    .filter(|endpoint| !is_overlay_endpoint(*endpoint))
+                    .filter(|endpoint| {
+                        !is_overlay_endpoint(*endpoint)
+                            && self.is_current_remote_endpoint(*endpoint)
+                    })
             })
     }
 
@@ -59,6 +63,7 @@ impl PeerConnection {
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
                     && !is_overlay_endpoint(pair.remote_endpoint)
                     && pair.selected_at.is_some()
                     && pair.state != CandidatePairState::Frozen
@@ -83,6 +88,7 @@ impl PeerConnection {
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
                     && pair.state == CandidatePairState::Selected
             })
             .collect::<Vec<_>>();
@@ -118,6 +124,7 @@ impl PeerConnection {
                 .iter()
                 .filter(|pair| {
                     pair.local_generation == local_generation
+                        && self.pair_belongs_to_current_remote_epoch(pair)
                         && pair.state == CandidatePairState::Selected
                         && is_public_probe_endpoint(pair.remote_endpoint)
                 })
@@ -128,7 +135,9 @@ impl PeerConnection {
         }
         if let Some(endpoint) = current_selection.and_then(|selection| selection.direct_endpoint) {
             if let Some(pair) = self.candidate_pairs.iter().find(|pair| {
-                pair.local_generation == local_generation && pair.remote_endpoint == endpoint
+                pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
+                    && pair.remote_endpoint == endpoint
             }) {
                 return Some(pair);
             }
@@ -147,7 +156,9 @@ impl PeerConnection {
     ) -> Option<PathScore> {
         let direct_endpoint = direct_endpoint?;
         let pair = self.candidate_pairs.iter().find(|pair| {
-            pair.local_generation == local_generation && pair.remote_endpoint == direct_endpoint
+            pair.local_generation == local_generation
+                && self.pair_belongs_to_current_remote_epoch(pair)
+                && pair.remote_endpoint == direct_endpoint
         });
 
         let reachable = confirmed || trial;
@@ -348,7 +359,9 @@ impl PeerConnection {
         };
 
         let selected_pair = self.candidate_pairs.iter().find(|pair| {
-            pair.local_generation == local_generation && pair.remote_endpoint == endpoint
+            pair.local_generation == local_generation
+                && self.pair_belongs_to_current_remote_epoch(pair)
+                && pair.remote_endpoint == endpoint
         });
         let selected_pair_state = selected_pair.map(|pair| pair.state);
         let confirmed_direct = self.state == ConnectionState::Direct

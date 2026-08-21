@@ -7,17 +7,41 @@ impl PeerConnection {
         true
     }
 
+    fn pair_belongs_to_current_remote_epoch(&self, pair: &CandidatePair) -> bool {
+        pair.remote_candidate_epoch == self.remote_candidate_epoch
+    }
+
+    /// Whether an endpoint is valid for the currently accepted remote
+    /// candidate set. Before the first candidate set is received, preserve the
+    /// legacy `PeerInfo.endpoint` behavior and accept any endpoint; after a
+    /// refresh, only signaled or current-epoch learned endpoints are valid.
+    pub(crate) fn is_current_remote_endpoint(&self, endpoint: SocketAddr) -> bool {
+        if self.remote_candidate_epoch == 0 {
+            return true;
+        }
+        let candidate = endpoint.to_string();
+        self.signaled_candidates.contains(&candidate)
+            || self.candidate_pairs.iter().any(|pair| {
+                pair.remote_endpoint == endpoint && self.pair_belongs_to_current_remote_epoch(pair)
+            })
+    }
+
     fn candidate_endpoints(&self) -> Vec<SocketAddr> {
         let mut endpoints = Vec::new();
         for candidate in &self.candidates {
             if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
+                if self.remote_candidate_epoch != 0
+                    && !self.is_current_remote_endpoint(endpoint)
+                {
+                    continue;
+                }
                 if !endpoints.contains(&endpoint) {
                     endpoints.push(endpoint);
                 }
             }
         }
         if let Some(endpoint) = self.endpoint {
-            if !endpoints.contains(&endpoint) {
+            if self.is_current_remote_endpoint(endpoint) && !endpoints.contains(&endpoint) {
                 endpoints.push(endpoint);
             }
         }
@@ -28,18 +52,29 @@ impl PeerConnection {
         let mut endpoints = Vec::new();
         for candidate in &self.candidates {
             if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
+                if self.remote_candidate_epoch != 0
+                    && !self.is_current_remote_endpoint(endpoint)
+                {
+                    continue;
+                }
                 if !endpoints.contains(&endpoint) {
                     endpoints.push(endpoint);
                 }
             }
         }
         if endpoints.is_empty() {
-            if let Some(endpoint) = self.endpoint {
+            if let Some(endpoint) = self.endpoint.filter(|endpoint| {
+                self.is_current_remote_endpoint(*endpoint)
+            }) {
                 endpoints.push(endpoint);
             }
         } else if let Some(endpoint) = self.endpoint {
+            if !self.is_current_remote_endpoint(endpoint) {
+                return endpoints;
+            }
             let has_current_or_recent_success = self.candidate_pairs.iter().any(|pair| {
                 pair.remote_endpoint == endpoint
+                    && self.pair_belongs_to_current_remote_epoch(pair)
                     && (pair.last_success_at.is_some()
                         || matches!(
                             pair.state,
@@ -60,7 +95,10 @@ impl PeerConnection {
             .or_else(|| {
                 self.candidate_pairs
                     .iter()
-                    .filter(|pair| pair.remote_endpoint == endpoint)
+                    .filter(|pair| {
+                        pair.remote_endpoint == endpoint
+                            && self.pair_belongs_to_current_remote_epoch(pair)
+                    })
                     .min_by_key(|pair| candidate_pair_source_rank(pair.source))
                     .map(|pair| pair.source)
             })
@@ -184,7 +222,9 @@ impl PeerConnection {
         local_generation: u64,
     ) -> &mut CandidatePair {
         if let Some(index) = self.candidate_pairs.iter().position(|pair| {
-            pair.remote_endpoint == endpoint && pair.local_generation == local_generation
+            pair.remote_endpoint == endpoint
+                && pair.local_generation == local_generation
+                && self.pair_belongs_to_current_remote_epoch(pair)
         }) {
             return &mut self.candidate_pairs[index];
         }
@@ -202,19 +242,29 @@ impl PeerConnection {
         source: CandidatePairSource,
     ) -> &mut CandidatePair {
         if let Some(index) = self.candidate_pairs.iter().position(|pair| {
-            pair.remote_endpoint == endpoint && pair.local_generation == local_generation
+            pair.remote_endpoint == endpoint
+                && pair.local_generation == local_generation
+                && self.pair_belongs_to_current_remote_epoch(pair)
         }) {
             self.candidate_pairs[index].promote_source(source);
             return &mut self.candidate_pairs[index];
         }
-        self.candidate_pairs.push(CandidatePair::new_with_source(
+        let mut pair = CandidatePair::new_with_source(
             endpoint,
             local_generation,
             source,
-        ));
-        self.candidate_pairs
-            .last_mut()
-            .expect("candidate pair inserted")
+        );
+        pair.remote_candidate_epoch = self.remote_candidate_epoch;
+        let insertion_index = self
+            .candidate_pairs
+            .iter()
+            .position(|existing| {
+                existing.remote_endpoint == endpoint
+                    && existing.local_generation == local_generation
+            })
+            .unwrap_or(self.candidate_pairs.len());
+        self.candidate_pairs.insert(insertion_index, pair);
+        &mut self.candidate_pairs[insertion_index]
     }
 
     fn ensure_candidate_pair_with_observed_source(
@@ -224,19 +274,29 @@ impl PeerConnection {
         source: CandidatePairSource,
     ) -> &mut CandidatePair {
         if let Some(index) = self.candidate_pairs.iter().position(|pair| {
-            pair.remote_endpoint == endpoint && pair.local_generation == local_generation
+            pair.remote_endpoint == endpoint
+                && pair.local_generation == local_generation
+                && self.pair_belongs_to_current_remote_epoch(pair)
         }) {
             self.candidate_pairs[index].observe_source(source);
             return &mut self.candidate_pairs[index];
         }
-        self.candidate_pairs.push(CandidatePair::new_with_source(
+        let mut pair = CandidatePair::new_with_source(
             endpoint,
             local_generation,
             source,
-        ));
-        self.candidate_pairs
-            .last_mut()
-            .expect("candidate pair inserted")
+        );
+        pair.remote_candidate_epoch = self.remote_candidate_epoch;
+        let insertion_index = self
+            .candidate_pairs
+            .iter()
+            .position(|existing| {
+                existing.remote_endpoint == endpoint
+                    && existing.local_generation == local_generation
+            })
+            .unwrap_or(self.candidate_pairs.len());
+        self.candidate_pairs.insert(insertion_index, pair);
+        &mut self.candidate_pairs[insertion_index]
     }
 
     fn ensure_current_candidate_pairs(&mut self, local_generation: u64) {
@@ -377,6 +437,7 @@ impl PeerConnection {
                 .is_none_or(|age| age > RELAY_PEER_CONFIRMATION_MAX_AGE)
             || !self.candidate_pairs.iter().any(|pair| {
                 pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
                     && pair.state == CandidatePairState::Selected
                     && pair.consecutive_failures == 0
                     && pair
@@ -390,8 +451,10 @@ impl PeerConnection {
         let mut pruned_predicted = 0usize;
         let mut pruned_birthday = 0usize;
         let mut pruned_stun = 0usize;
+        let remote_epoch = self.remote_candidate_epoch;
         for pair in self.candidate_pairs.iter_mut() {
             if pair.local_generation != local_generation
+                || pair.remote_candidate_epoch != remote_epoch
                 || pair.state == CandidatePairState::Frozen
                 || pair.state == CandidatePairState::Selected
                 || pair.last_success_at.is_some()
@@ -471,6 +534,7 @@ impl PeerConnection {
             .iter()
             .filter(|pair| {
                 pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
                     && endpoints.contains(&pair.remote_endpoint)
                     && candidate_pair_probe_allowed_at(pair, mode, now)
             })
@@ -730,6 +794,7 @@ impl PeerConnection {
             if !self.candidate_pairs.iter().any(|pair| {
                 pair.local_generation == local_generation
                     && pair.remote_endpoint == endpoint
+                    && self.pair_belongs_to_current_remote_epoch(pair)
                     && pair.failure_count > 0
             }) {
                 return false;
@@ -750,6 +815,7 @@ impl PeerConnection {
                     && self.candidate_pairs.iter().any(|pair| {
                         pair.local_generation == local_generation
                             && pair.remote_endpoint == *endpoint
+                            && self.pair_belongs_to_current_remote_epoch(pair)
                             && (pair.last_success_at.is_some()
                                 || matches!(
                                     pair.state,
@@ -869,6 +935,7 @@ impl PeerConnection {
                 .filter(|pair| {
                     pair.local_generation == local_generation
                         && pair.source == CandidatePairSource::Birthday
+                        && self.pair_belongs_to_current_remote_epoch(pair)
                 })
                 .map(|pair| pair.probe_count as usize)
                 .min()
@@ -1003,6 +1070,7 @@ impl PeerConnection {
 
         for pair in &self.candidate_pairs {
             if pair.local_generation == local_generation
+                && self.pair_belongs_to_current_remote_epoch(pair)
                 && pair.source == CandidatePairSource::PeerReflexive
                 && pair.remote_endpoint.ip() == fresh_endpoint.ip()
                 && should_retain_peer_reflexive_pair(pair)
@@ -1029,6 +1097,7 @@ impl PeerConnection {
         }
         self.candidate_pairs.retain(|pair| {
             !(pair.local_generation == local_generation
+                && pair.remote_candidate_epoch == self.remote_candidate_epoch
                 && pair.source == CandidatePairSource::PeerReflexive
                 && removed.contains(&pair.remote_endpoint)
                 && !should_retain_peer_reflexive_pair(pair))

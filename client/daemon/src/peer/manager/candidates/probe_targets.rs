@@ -70,6 +70,29 @@ impl PeerManager {
             .unwrap_or_default()
     }
 
+    /// Keep an already-created asynchronous probe snapshot bounded to the
+    /// remote candidate set that is current at the moment it is consumed.
+    ///
+    /// Recovery workers intentionally hold snapshots across await points, so
+    /// filtering only when the snapshot is first built is insufficient: a
+    /// remote handover may arrive while the worker is waiting for its shared
+    /// punch deadline.  A missing connection is also a hard invalidation —
+    /// there is no authoritative remote endpoint to probe.
+    pub(crate) async fn current_remote_endpoints_for(
+        &self,
+        node_id: &str,
+        endpoints: Vec<SocketAddr>,
+    ) -> Vec<SocketAddr> {
+        let connections = self.connections.read().await;
+        let Some(conn) = connections.get(node_id) else {
+            return Vec::new();
+        };
+        endpoints
+            .into_iter()
+            .filter(|endpoint| conn.is_current_remote_endpoint(*endpoint))
+            .collect()
+    }
+
     pub(crate) async fn direct_probe_target_set_for(
         &self,
         node_id: &str,
@@ -366,6 +389,7 @@ impl PeerManager {
             let authenticated_or_successful = conn.candidate_pairs.iter().any(|pair| {
                 pair.local_generation == generation
                     && pair.remote_endpoint == endpoint
+                    && conn.pair_belongs_to_current_remote_epoch(pair)
                     && (matches!(
                         pair.source,
                         CandidatePairSource::PeerReflexive | CandidatePairSource::Learned

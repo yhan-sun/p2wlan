@@ -1,7 +1,9 @@
 /// Reachability state for one direct candidate pair.
 ///
-/// The daemon currently has a single local UDP socket per network generation,
-/// so the pair key is represented as `(local network generation, remote endpoint)`.
+/// The daemon currently has a single local UDP socket per network generation.
+/// A pair is scoped by both the local network generation and the remote
+/// candidate epoch; an endpoint can be reused after a peer handover, but its
+/// old proof must not be treated as proof for the new remote socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidatePairState {
@@ -89,6 +91,8 @@ pub struct CandidatePair {
     pub source_observed_at: Option<Instant>,
     /// Local network generation this pair belongs to.
     pub local_generation: u64,
+    /// Monotonic remote candidate-set epoch this pair belongs to.
+    pub remote_candidate_epoch: u64,
     /// Current reachability state.
     pub state: CandidatePairState,
     /// Whether the selector has nominated this pair for direct data trials.
@@ -145,6 +149,7 @@ impl CandidatePair {
             signal_rank: None,
             source_observed_at: Some(Instant::now()),
             local_generation,
+            remote_candidate_epoch: 0,
             state: CandidatePairState::Waiting,
             nominated: false,
             nominated_at: None,
@@ -351,6 +356,11 @@ impl CandidatePair {
 
     pub(super) fn record_generation_change(&mut self, reason: impl Into<String>) {
         self.record_failure(REASON_NETWORK_GENERATION_CHANGED, reason, None);
+        self.state = CandidatePairState::Degraded;
+    }
+
+    pub(super) fn record_remote_candidate_generation_change(&mut self, reason: impl Into<String>) {
+        self.record_failure(REASON_REMOTE_CANDIDATE_GENERATION_CHANGED, reason, None);
         self.state = CandidatePairState::Degraded;
     }
 

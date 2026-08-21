@@ -397,6 +397,21 @@ impl PeerManager {
         }
     }
 
+    /// Cancel a peer's Direct-validation ownership after an accepted remote
+    /// candidate-set handover. The caller already holds `network_epoch_gate`,
+    /// so this helper deliberately does not acquire it again; that keeps the
+    /// candidate publication and validation cancellation one transaction.
+    pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(
+        &self,
+        peer_id: &str,
+    ) {
+        if let Some(registry) = self.direct_validation_registry.read().await.clone() {
+            registry
+                .cancel_peer_with_reason(peer_id, "remote_candidate_generation_changed")
+                .await;
+        }
+    }
+
     /// Whether a peer connection currently exists, readable without awaiting.
     ///
     /// Used under the UDP adoption lock to refuse ACK/punch adoption for a

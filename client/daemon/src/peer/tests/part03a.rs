@@ -296,6 +296,190 @@ async fn fresh_candidate_signal_replaces_stale_registry_endpoint() {
 }
 
 #[tokio::test]
+async fn remote_candidate_refresh_invalidates_old_direct_pair_and_ack() {
+    let manager = PeerManager::new(test_config());
+    let old_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let fresh_endpoint: SocketAddr = "203.0.113.10:42000".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", old_endpoint)).await;
+
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[old_endpoint.to_string()],
+                &HashMap::new(),
+                10,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            old_endpoint,
+            Some(Duration::from_millis(7)),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(old_endpoint)).await;
+    assert_eq!(
+        manager.direct_endpoint_for_send("peer1").await,
+        Some(old_endpoint)
+    );
+
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[fresh_endpoint.to_string()],
+                &HashMap::new(),
+                11,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    // A remote candidate handover must fence both the selected pair and any
+    // delayed ACK from the old candidate set.  The old endpoint may remain in
+    // diagnostics/history, but it must not remain an active Direct target.
+    assert_ne!(
+        manager.direct_endpoint_for_send("peer1").await,
+        Some(old_endpoint)
+    );
+    assert_eq!(
+        manager
+            .get_connection("peer1")
+            .await
+            .expect("peer must remain present")
+            .state,
+        ConnectionState::FallbackToRelay,
+        "remote handover must retain relay fallback while Direct is invalidated"
+    );
+    assert!(!manager
+        .record_direct_success_for_generation(
+            "peer1",
+            Some(old_endpoint),
+            manager.current_network_generation().await,
+        )
+        .await);
+    let conn = manager.get_connection("peer1").await.unwrap();
+    let old_pair = conn
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == old_endpoint)
+        .expect("old pair should remain available for diagnostics");
+    assert_ne!(old_pair.state, CandidatePairState::Selected);
+    assert_ne!(conn.endpoint, Some(old_endpoint));
+    assert_eq!(conn.signaled_endpoint, None);
+    assert!(conn.candidates.contains(&fresh_endpoint.to_string()));
+    let diagnostics = manager
+        .diagnostics_with_path_selection(true, false, Duration::from_secs(5), None)
+        .await
+        .into_iter()
+        .find(|diagnostics| diagnostics.node_id == "peer1")
+        .expect("peer diagnostics must remain available after handover");
+    assert_ne!(
+        diagnostics.active_path,
+        Some(NetworkPath::Direct),
+        "diagnostics must not expose the retired Direct path"
+    );
+    assert!(!diagnostics
+        .selected_pair
+        .as_ref()
+        .is_some_and(|pair| pair.remote_endpoint == old_endpoint.to_string()));
+}
+
+#[tokio::test]
+async fn remote_candidate_refresh_drops_stale_pending_probe_target() {
+    let manager = PeerManager::new(test_config());
+    let old_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let fresh_endpoint: SocketAddr = "203.0.113.10:41001".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", old_endpoint)).await;
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[old_endpoint.to_string()],
+            &HashMap::new(),
+            10,
+            Some(u64::MAX),
+        )
+        .await;
+
+    manager.recovery_epoch_admit("peer1").await;
+    manager
+        .stash_recovery_target(PendingRecoveryTarget {
+            peer_id: "peer1".to_string(),
+            candidates: vec![old_endpoint],
+            preferred_fast_candidates: vec![old_endpoint],
+            frozen_targets: Some(vec![old_endpoint]),
+            fresh_prediction: None,
+            punch_at_ms: None,
+            seen_at: Instant::now(),
+        })
+        .await;
+
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[fresh_endpoint.to_string()],
+            &HashMap::new(),
+            11,
+            Some(u64::MAX),
+        )
+        .await;
+
+    assert!(
+        manager.take_recovery_target("peer1").await.is_none(),
+        "a pending target from the retired remote candidate set must not be sent"
+    );
+}
+
+#[tokio::test]
+async fn remote_candidate_refresh_does_not_resurrect_retired_endpoint_from_raw_udp() {
+    let manager = PeerManager::new(test_config());
+    let old_endpoint: SocketAddr = "203.0.113.10:41010".parse().unwrap();
+    let fresh_endpoint: SocketAddr = "203.0.113.10:42010".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", old_endpoint)).await;
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[old_endpoint.to_string()],
+            &HashMap::new(),
+            10,
+            Some(u64::MAX),
+        )
+        .await;
+
+    // Model a historical candidate that was previously observed on the wire
+    // and therefore remains in the bounded candidate registry.
+    assert!(manager.learn_endpoint_from_addr(old_endpoint).await.is_some());
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[fresh_endpoint.to_string()],
+            &HashMap::new(),
+            11,
+            Some(u64::MAX),
+        )
+        .await;
+
+    assert_eq!(
+        manager.learn_endpoint_from_addr(old_endpoint).await,
+        None,
+        "raw UDP from a retired candidate must not restore endpoint affinity"
+    );
+    assert_eq!(
+        manager.learn_endpoint_from_addr(fresh_endpoint).await,
+        Some("peer1".to_string())
+    );
+    assert_eq!(
+        manager.get_connection("peer1").await.unwrap().endpoint,
+        Some(fresh_endpoint)
+    );
+}
+
+#[tokio::test]
 async fn versioned_candidates_reject_stale_and_expired_sets() {
     let manager = PeerManager::new(test_config());
     let initial: SocketAddr = "203.0.113.10:42000".parse().unwrap();

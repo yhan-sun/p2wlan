@@ -103,6 +103,7 @@ impl PeerManager {
                             .find(|pair| {
                                 pair.local_generation == generation
                                     && pair.remote_endpoint == endpoint
+                                    && conn.pair_belongs_to_current_remote_epoch(pair)
                             })
                             .map(|pair| pair.source)
                     }),
