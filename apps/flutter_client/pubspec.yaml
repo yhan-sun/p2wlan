@@ -30,9 +30,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # v10 supports the project's Android SDK while retaining Keychain,
-  # Keystore, Windows secure storage, and Linux Secret Service backends.
-  flutter_secure_storage: ^10.0.0
   tray_manager: ^0.5.3
   window_manager: ^0.5.2
 

@@ -26,6 +26,9 @@ type WintunCreateAdapterFunc = unsafe extern "C" fn(
     requested_guid: *const Guid,
 ) -> *mut std::ffi::c_void;
 
+type WintunOpenAdapterFunc =
+    unsafe extern "C" fn(name: *const u16) -> *mut std::ffi::c_void;
+
 type WintunCloseAdapterFunc = unsafe extern "C" fn(adapter: *mut std::ffi::c_void);
 
 type WintunStartSessionFunc =
@@ -61,6 +64,7 @@ type WintunGetRunningDriverVersionFunc = unsafe extern "C" fn() -> u32;
 struct WintunApi {
     _lib: Library,
     create_adapter: WintunCreateAdapterFunc,
+    open_adapter: WintunOpenAdapterFunc,
     close_adapter: WintunCloseAdapterFunc,
     start_session: WintunStartSessionFunc,
     end_session: WintunEndSessionFunc,
@@ -120,6 +124,11 @@ impl WintunApi {
                 .map_err(|_| Error::SymbolNotFound("WintunCreateAdapter".to_string()))?
         };
 
+        let open_adapter = unsafe {
+            *lib.get::<WintunOpenAdapterFunc>(b"WintunOpenAdapter\0")
+                .map_err(|_| Error::SymbolNotFound("WintunOpenAdapter".to_string()))?
+        };
+
         let close_adapter = unsafe {
             *lib.get::<WintunCloseAdapterFunc>(b"WintunCloseAdapter\0")
                 .map_err(|_| Error::SymbolNotFound("WintunCloseAdapter".to_string()))?
@@ -168,6 +177,7 @@ impl WintunApi {
         Ok(Self {
             _lib: lib,
             create_adapter,
+            open_adapter,
             close_adapter,
             start_session,
             end_session,

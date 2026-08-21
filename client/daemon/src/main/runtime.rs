@@ -14,7 +14,17 @@ async fn main() -> p2pnet_daemon::Result<()> {
     // line. It is the only supported way to supply a control-plane token (the
     // old `--token` flag was removed).
     let token_file_value = if let Some(path) = cli.token_file.as_ref() {
-        Some(read_launch_token_file(path)?)
+        match read_launch_token_file(path) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                // Token-file parsing happens before tracing is initialized.
+                // Persist the failure to the requested log so a hidden UAC
+                // launch remains diagnosable instead of looking like a
+                // generic permission timeout in the GUI.
+                append_early_startup_error(cli.log_file.as_ref(), &error);
+                return Err(error);
+            }
+        }
     } else if cli.token_stdin {
         Some(read_launch_token_stdin()?)
     } else {
@@ -327,9 +337,29 @@ async fn print_status(
 
 const MAX_LAUNCH_TOKEN_BYTES: usize = 16 * 1024;
 
+fn append_early_startup_error(log_path: Option<&PathBuf>, error: &dyn std::fmt::Display) {
+    let Some(path) = log_path else { return };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = std::io::Write::write_fmt(
+        &mut file,
+        format_args!("ERROR p2wlan-daemon startup before logging: {error}\n"),
+    );
+}
+
 fn read_launch_token_file(path: &std::path::Path) -> p2pnet_daemon::Result<String> {
     let result = (|| -> std::io::Result<String> {
-        restrict_auth_file(path)?;
+        // The Flutter launcher has already applied the one-shot ACL. Do not
+        // rewrite it from the elevated daemon: when UAC is completed with a
+        // different administrator identity, that account may not match the
+        // interactive user's USERNAME and the pre-logging ACL repair would
+        // make an otherwise valid launch fail with a misleading permission
+        // error. The token is still deleted below after this read.
         let metadata = std::fs::metadata(path)?;
         #[cfg(unix)]
         {

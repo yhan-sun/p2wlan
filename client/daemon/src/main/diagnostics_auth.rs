@@ -128,7 +128,16 @@ fn restrict_auth_file(path: &AuthPath) -> std::io::Result<()> {
         )
     })?;
     let account = format!(r"{username}:F");
-    let status = std::process::Command::new("icacls")
+    use std::os::windows::process::CommandExt;
+
+    // The daemon is normally launched from the GUI and has no console of its
+    // own. CREATE_NO_WINDOW is required here because icacls is a console
+    // executable; without it Windows can briefly show a terminal during
+    // daemon startup.
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut command = std::process::Command::new("icacls");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let status = command
         .args([
             path.as_os_str(),
             std::ffi::OsStr::new("/inheritance:r"),

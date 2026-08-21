@@ -10,7 +10,7 @@ import '../security/secure_token_repository.dart';
 class SettingsStore extends ChangeNotifier {
   SettingsStore({File? settingsFile, SecureTokenRepository? tokenRepository})
     : _settingsFileOverride = settingsFile {
-    _tokenRepository = tokenRepository ?? PlatformSecureTokenRepository();
+    _tokenRepository = tokenRepository ?? LocalTokenRepository();
   }
 
   final File? _settingsFileOverride;
@@ -224,8 +224,8 @@ class SettingsStore extends ChangeNotifier {
     try {
       final file = _settingsFile();
       _configPath = file.path;
-      // Keep the credential in the secure store in lockstep with the
-      // in-memory value. A blank token clears the secure store.
+      // Keep the credential in the local token file in lockstep with the
+      // in-memory value. A blank token clears the local token file.
       await _tokenRepository.write(_settings.authToken);
       await _writeSettingsFile(file);
       _lastError = null;

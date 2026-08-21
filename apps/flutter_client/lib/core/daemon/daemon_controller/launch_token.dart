@@ -56,18 +56,17 @@ extension DaemonControllerLaunchToken on DaemonController {
     bool directory = false,
   }) async {
     if (Platform.isWindows) {
-      final username = Platform.environment['USERNAME'];
-      if (username == null || username.trim().isEmpty) {
-        throw StateError(
-          'Windows account name is unavailable; refusing an unprotected launch token',
-        );
-      }
-      final result = await Process.run('icacls', [
-        path,
-        '/inheritance:r',
-        '/grant:r',
-        '$username:F',
-      ]);
+      // Resolve the account from the Windows security token instead of the
+      // USERNAME environment variable. The latter can differ after UAC
+      // elevation (and is not reliable for domain/Microsoft accounts). Run
+      // icacls through the shared hidden PowerShell helper so ACL repair does
+      // not flash a console window in the GUI app.
+      final quotedPath = _powershellSingleQuoted(path);
+      final result = await _runWindowsPowerShell(
+        '\$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; '
+        '& icacls.exe $quotedPath /inheritance:r /grant:r (\$account + \':F\'); '
+        'exit \$LASTEXITCODE',
+      );
       if (result.exitCode != 0) {
         throw StateError(
           'Windows ACL protection failed for the launch ${directory ? 'directory' : 'file'}',

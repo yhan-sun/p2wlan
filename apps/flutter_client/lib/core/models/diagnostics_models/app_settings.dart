@@ -5,7 +5,7 @@ const legacyControlServer = 'https://control.p2wlan.io';
 const legacyPlaceholderControlServer = 'http://control.example.com:18080';
 const defaultControlServer = String.fromEnvironment(
   'P2WLAN_DEFAULT_CONTROL_SERVER',
-  defaultValue: legacyControlServer,
+  defaultValue: 'http://47.109.40.237:18080',
 );
 const defaultNetworkId = 'default';
 const defaultLanguageCode = 'zh-Hans';

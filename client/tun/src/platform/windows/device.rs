@@ -58,20 +58,47 @@ impl WintunDevice {
         let name_wide = to_wide_string(&config.name);
         let tunnel_type = to_wide_string("P2PNet");
 
-        // Create the adapter (no requested GUID, let Wintun generate one)
-        let adapter_ptr = unsafe {
-            (api.create_adapter)(name_wide.as_ptr(), tunnel_type.as_ptr(), std::ptr::null())
+        // Create the adapter (no requested GUID, let Wintun generate one).
+        // Wintun removes adapters created through a normal close, but an
+        // abrupt daemon termination can leave the named adapter registered.
+        // Re-open that adapter instead of treating ERROR_ALREADY_EXISTS as a
+        // generic permission failure on the next start.
+        let adapter_ptr = {
+            let created = unsafe {
+                (api.create_adapter)(name_wide.as_ptr(), tunnel_type.as_ptr(), std::ptr::null())
+            };
+
+            if created.is_null() {
+                let err = io::Error::last_os_error();
+                const ERROR_ALREADY_EXISTS: i32 = 183;
+                if err.raw_os_error() == Some(ERROR_ALREADY_EXISTS) {
+                    let existing = unsafe { (api.open_adapter)(name_wide.as_ptr()) };
+                    if existing.is_null() {
+                        let open_err = io::Error::last_os_error();
+                        error!(
+                            "WintunCreateAdapter found an existing adapter, but WintunOpenAdapter failed: {open_err}"
+                        );
+                        return Err(Error::WintunCreateFailed(
+                            open_err.raw_os_error().unwrap_or(ERROR_ALREADY_EXISTS) as u32,
+                        ));
+                    }
+                    info!(
+                        "Reusing existing Wintun adapter after a previous daemon instance: {}",
+                        config.name
+                    );
+                    existing
+                } else {
+                    error!("WintunCreateAdapter failed: {err}");
+                    return Err(Error::WintunCreateFailed(
+                        err.raw_os_error().unwrap_or(0) as u32
+                    ));
+                }
+            } else {
+                created
+            }
         };
 
-        if adapter_ptr.is_null() {
-            let err = io::Error::last_os_error();
-            error!("WintunCreateAdapter failed: {err}");
-            return Err(Error::WintunCreateFailed(
-                err.raw_os_error().unwrap_or(0) as u32
-            ));
-        }
-
-        info!("Wintun adapter created: {}", config.name);
+        info!("Wintun adapter ready: {}", config.name);
 
         // Get the adapter LUID for IP configuration
         let mut luid: u64 = 0;

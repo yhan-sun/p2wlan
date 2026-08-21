@@ -9,7 +9,7 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
-const DEFAULT_CONTROL_SERVER: &str = "https://control.p2wlan.io";
+const DEFAULT_CONTROL_SERVER: &str = "http://47.109.40.237:18080";
 const DEFAULT_NETWORK_ID: &str = "default";
 
 include!("main/cli.rs");

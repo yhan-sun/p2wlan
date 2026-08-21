@@ -9,7 +9,7 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 void main() {
   test('default control server matches the desktop client default', () {
-    expect(defaultControlServer, 'https://control.p2wlan.io');
+    expect(defaultControlServer, 'http://47.109.40.237:18080');
   });
 
   test('settings load migrates the old placeholder control host', () async {

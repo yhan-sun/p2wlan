@@ -127,19 +127,12 @@ extension DaemonControllerElevation on DaemonController {
   }) async {
     final argLine = args.map(_windowsCommandLineArgQuote).join(' ');
     final script =
+        '\$ErrorActionPreference = \'Stop\'; '
         'Start-Process -Verb RunAs -WindowStyle Hidden '
         '-WorkingDirectory ${_powershellSingleQuoted(binary.parent.path)} '
         '-FilePath ${_powershellSingleQuoted(binary.path)} '
-        '-ArgumentList ${_powershellSingleQuoted(argLine)}';
-    final result = await Process.run('powershell', [
-      '-NoProfile',
-      '-WindowStyle',
-      'Hidden',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      script,
-    ]);
+        '-ArgumentList ${_powershellSingleQuoted(argLine)} | Out-Null';
+    final result = await _runWindowsPowerShell(script);
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
       throw stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr;
@@ -160,6 +153,14 @@ extension DaemonControllerElevation on DaemonController {
         raw.contains('已取消') ||
         normalized.contains('cancel')) {
       return '已取消管理员授权，p2wlan-daemon 未启动。';
+    }
+    if (Platform.isWindows) {
+      if (normalized.contains('access denied') ||
+          normalized.contains('permission') ||
+          normalized.contains('elevation')) {
+        return 'Windows UAC 启动失败：当前账户没有启动虚拟网卡所需的权限，请确认已允许管理员授权。';
+      }
+      return 'Windows UAC 启动失败：请确认 P2WLAN 安装包完整，并允许一次管理员授权。';
     }
     if (normalized.contains('operation not permitted') ||
         normalized.contains('not permitted') ||

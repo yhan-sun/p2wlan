@@ -28,7 +28,7 @@ use p2pnet_daemon::config::{Config, ControlProxyMode};
 use p2pnet_daemon::Daemon;
 
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
-const DEFAULT_CONTROL_SERVER: &str = "https://control.p2wlan.io";
+const DEFAULT_CONTROL_SERVER: &str = "http://47.109.40.237:18080";
 const DEFAULT_OVERLAY_CIDR: &str = "10.20.0.0/16";
 const DEFAULT_INTERFACE: &str = "p2wlan-vpn";
 const DEFAULT_VIRTUAL_IP: &str = "10.20.0.1";

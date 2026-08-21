@@ -7,6 +7,23 @@ import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 void main() {
+  group('LocalTokenRepository', () {
+    test('round-trips and clears a local token file', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_local_token_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final file = File('${tmp.path}/nested/p2wlan-auth-token');
+      final repo = LocalTokenRepository(file: file);
+
+      expect(await repo.read(), isNull);
+      await repo.write(' local-token ');
+      expect(await repo.read(), 'local-token');
+      expect(await file.readAsString(), 'local-token');
+
+      await repo.clear();
+      expect(await repo.read(), isNull);
+    });
+  });
+
   group('InMemorySecureTokenRepository', () {
     test('round-trips and clears', () async {
       final repo = InMemorySecureTokenRepository();
@@ -40,7 +57,7 @@ void main() {
   });
 
   test(
-    'secure-store write failure preserves the legacy settings value',
+    'local token file write failure preserves the legacy settings value',
     () async {
       final tmp = await Directory.systemTemp.createTemp('p2wlan_migrate_fail_');
       addTearDown(() async => tmp.delete(recursive: true));
@@ -54,7 +71,7 @@ void main() {
       await store.load();
 
       expect(await settingsFile.readAsString(), contains('legacy-token'));
-      expect(store.lastError, contains('secure storage'));
+      expect(store.lastError, contains('local token file'));
     },
   );
 
@@ -105,7 +122,7 @@ void main() {
     });
 
     test(
-      'token is never persisted to the settings JSON; secure store holds it',
+      'token is never persisted to the settings JSON; local token file holds it',
       () async {
         final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
         addTearDown(() async => tmp.delete(recursive: true));
@@ -140,30 +157,33 @@ void main() {
       },
     );
 
-    test('legacy in-JSON token migrates to the secure store on load', () async {
-      final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
-      addTearDown(() async => tmp.delete(recursive: true));
-      final settingsFile = File('${tmp.path}/settings.json');
-      await settingsFile.writeAsString(
-        '{"authToken":"legacy-token","manualMode":false}',
-      );
-      final secure = InMemorySecureTokenRepository();
-      final store = SettingsStore(
-        settingsFile: settingsFile,
-        tokenRepository: secure,
-      );
-      await store.load();
-      // Migrated into secure storage...
-      expect(await secure.read(), 'legacy-token');
-      // ...and still available in-memory...
-      expect(store.settings.authToken, 'legacy-token');
-      // ...and the token is NOT re-persisted to the JSON on subsequent save.
-      await store.updateSettings(store.settings.copyWith(networkId: 'net1'));
-      final raw = await settingsFile.readAsString();
-      expect(raw.contains('legacy-token'), isFalse);
-    });
+    test(
+      'legacy in-JSON token migrates to the local token file on load',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
+        addTearDown(() async => tmp.delete(recursive: true));
+        final settingsFile = File('${tmp.path}/settings.json');
+        await settingsFile.writeAsString(
+          '{"authToken":"legacy-token","manualMode":false}',
+        );
+        final secure = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: secure,
+        );
+        await store.load();
+        // Migrated into the local token file...
+        expect(await secure.read(), 'legacy-token');
+        // ...and still available in-memory...
+        expect(store.settings.authToken, 'legacy-token');
+        // ...and the token is NOT re-persisted to the JSON on subsequent save.
+        await store.updateSettings(store.settings.copyWith(networkId: 'net1'));
+        final raw = await settingsFile.readAsString();
+        expect(raw.contains('legacy-token'), isFalse);
+      },
+    );
 
-    test('logout (blank token) clears the secure store', () async {
+    test('logout (blank token) clears the local token file', () async {
       final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
       addTearDown(() async => tmp.delete(recursive: true));
       final settingsFile = File('${tmp.path}/settings.json');
@@ -234,7 +254,7 @@ class _FailingSecureTokenRepository implements SecureTokenRepository {
 
   @override
   Future<void> write(String token) async {
-    throw const SecureTokenStorageException('secure storage write failed');
+    throw const SecureTokenStorageException('local token file write failed');
   }
 
   @override

@@ -32,7 +32,15 @@ fn default_ipv4_gateway_blocking() -> Option<Ipv4Addr> {
 
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("powershell")
+        use std::os::windows::process::CommandExt;
+
+        // This query runs during daemon startup. The daemon is launched from
+        // a GUI process, so PowerShell must not attach/create a console while
+        // it determines the host's default gateway.
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let mut command = Command::new("powershell.exe");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
             .args([
                 "-NoProfile",
                 "-Command",

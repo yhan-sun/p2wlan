@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod formatting;
 use formatting::*;
 
-const DEFAULT_CONTROL_SERVER: &str = "https://control.p2wlan.io";
+const DEFAULT_CONTROL_SERVER: &str = "http://47.109.40.237:18080";
 const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";

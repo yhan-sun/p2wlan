@@ -72,11 +72,9 @@ extension DaemonControllerPids on DaemonController {
   Future<String?> _processCommandLine(int pid) async {
     if (Platform.isWindows) {
       final escapedPid = pid.toString();
-      final result = await Process.run('powershell', [
-        '-NoProfile',
-        '-Command',
+      final result = await _runWindowsPowerShell(
         '(Get-CimInstance Win32_Process -Filter "ProcessId = $escapedPid").CommandLine',
-      ]);
+      );
       if (result.exitCode != 0) return null;
       final command = result.stdout.toString().trim();
       return command.isEmpty ? null : command;
@@ -91,13 +89,11 @@ extension DaemonControllerPids on DaemonController {
     final matches = <int>[];
     if (Platform.isWindows) {
       final escapedBind = _powershellSingleQuote(bind);
-      final result = await Process.run('powershell', [
-        '-NoProfile',
-        '-Command',
+      final result = await _runWindowsPowerShell(
         r'Get-CimInstance Win32_Process | '
-            'Where-Object { \$_.CommandLine -like \'*p2wlan-daemon*\' -and \$_.CommandLine -like \'*--diagnostics-bind*\' -and \$_.CommandLine -like \'*$escapedBind*\' } | '
-            r'Select-Object -ExpandProperty ProcessId',
-      ]);
+        'Where-Object { \$_.CommandLine -like \'*p2wlan-daemon*\' -and \$_.CommandLine -like \'*--diagnostics-bind*\' -and \$_.CommandLine -like \'*$escapedBind*\' } | '
+        r'Select-Object -ExpandProperty ProcessId',
+      );
       if (result.exitCode != 0) return null;
       for (final line in result.stdout.toString().split('\n')) {
         final pid = int.tryParse(line.trim());
@@ -133,13 +129,11 @@ extension DaemonControllerPids on DaemonController {
   Future<int?> _findSingleDaemonPid() async {
     final matches = <int>[];
     if (Platform.isWindows) {
-      final result = await Process.run('powershell', [
-        '-NoProfile',
-        '-Command',
+      final result = await _runWindowsPowerShell(
         r'Get-CimInstance Win32_Process | '
-            r"Where-Object { $_.CommandLine -like '*p2wlan-daemon*' } | "
-            r'Select-Object -ExpandProperty ProcessId',
-      ]);
+        r"Where-Object { $_.CommandLine -like '*p2wlan-daemon*' } | "
+        r'Select-Object -ExpandProperty ProcessId',
+      );
       if (result.exitCode != 0) return null;
       for (final line in result.stdout.toString().split('\n')) {
         final parsedPid = int.tryParse(line.trim());
@@ -172,13 +166,22 @@ extension DaemonControllerPids on DaemonController {
 
   Future<bool> _terminatePid(int pid) async {
     if (Platform.isWindows) {
-      final result = await Process.run('taskkill', [
-        '/PID',
-        '$pid',
-        '/T',
-        '/F',
-      ]);
-      return result.exitCode == 0;
+      // Keep taskkill hidden, then retry once through a hidden elevated
+      // PowerShell if the old daemon was started with a higher integrity
+      // level. This is what lets a normal P2WLAN launch clean up an older
+      // administrator-launched daemon before starting its replacement.
+      final result = await _runWindowsPowerShell(
+        '& taskkill.exe /PID $pid /T /F; exit \$LASTEXITCODE',
+      );
+      if (result.exitCode == 0) return true;
+      final elevated = await _runWindowsPowerShell(
+        '\$ErrorActionPreference = \'Stop\'; '
+        '\$killed = Start-Process -Verb RunAs -WindowStyle Hidden '
+        '-FilePath \'taskkill.exe\' '
+        '-ArgumentList \'/PID $pid /T /F\' -Wait -PassThru; '
+        'exit \$killed.ExitCode',
+      );
+      return elevated.exitCode == 0;
     }
     if (await _sendUnixSignal(pid, 'TERM')) {
       if (await _waitForDaemonPidExit(pid, const Duration(seconds: 2))) {
@@ -243,8 +246,36 @@ extension DaemonControllerPids on DaemonController {
 
   Future<bool> _isWindowsAdministrator() async {
     if (!Platform.isWindows) return false;
-    final result = await Process.run('net', ['session']);
-    return result.exitCode == 0;
+    final result = await _runWindowsPowerShell(
+      '[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
+    );
+    return result.exitCode == 0 &&
+        _equalsIgnoreCase(result.stdout.toString().trim(), 'true');
+  }
+
+  /// Run a Windows helper without creating a transient console window.
+  ///
+  /// Flutter's Windows runner is a GUI process. Launching console programs
+  /// such as PowerShell or net.exe with the default process mode can make a
+  /// black terminal flash during every daemon start/stop probe. PowerShell's
+  /// hidden window style keeps these short-lived probes invisible while still
+  /// allowing their stdout/stderr to be collected.
+  Future<ProcessResult> _runWindowsPowerShell(String script) {
+    final windir = Platform.environment['WINDIR']?.trim();
+    final executable = windir == null || windir.isEmpty
+        ? 'powershell.exe'
+        : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    return Process.run(executable, [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-WindowStyle',
+      'Hidden',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      script,
+    ]);
   }
 
   String _windowsCommandLineArgQuote(String value) {
@@ -288,6 +319,9 @@ extension DaemonControllerPids on DaemonController {
   String _powershellDoubleQuote(String value) {
     return '"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"';
   }
+
+  bool _equalsIgnoreCase(String left, String right) =>
+      left.toLowerCase() == right.toLowerCase();
 
   String _appleScriptQuote(String value) {
     return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');

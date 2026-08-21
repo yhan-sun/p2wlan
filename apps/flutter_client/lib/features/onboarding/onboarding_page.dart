@@ -143,11 +143,32 @@ class _OnboardingPageState extends State<OnboardingPage> {
       await widget.statusStore.refresh();
       await _refreshPreflight();
       if (!result.ok && mounted) {
-        setState(() => _error = strings.onboardingStartFailed);
+        final detail = result.message.trim();
+        setState(
+          () => _error = _isSafeStartupDetail(detail)
+              ? detail
+              : strings.onboardingStartFailed,
+        );
       }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  bool _isSafeStartupDetail(String detail) {
+    if (detail.isEmpty) return false;
+    // Controller-generated Windows diagnostics are already redacted and give
+    // the user a useful next action. Do not render arbitrary daemon/error
+    // strings here: they can contain tokens, socket details, or stack traces.
+    const safePrefixes = [
+      'Windows UAC',
+      'Windows 运行组件',
+      'Windows 虚拟网卡',
+      '已完成启动授权',
+      '管理员认证失败',
+      '已取消管理员授权',
+    ];
+    return safePrefixes.any(detail.startsWith);
   }
 
   Future<void> _onPrimaryAction(OnboardingStep step) async {

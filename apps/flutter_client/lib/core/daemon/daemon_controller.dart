@@ -89,7 +89,14 @@ class DaemonController {
         Platform.isWindows && !await _isWindowsAdministrator() ||
         Platform.isLinux && !_isRootUser();
     File? tokenFile;
-    if (!useManualMode && requiresElevation) {
+    // Windows console daemons cannot safely receive a managed token over a
+    // detached stdin: depending on the Windows process mode this can create
+    // a console window even when the Flutter app itself is GUI-only. Use the
+    // same one-shot protected file for both elevated and already-elevated
+    // Windows launches. It also makes the two Windows launch paths behave
+    // identically, which prevents a second fallback process from being
+    // started after UAC succeeds.
+    if (!useManualMode && (requiresElevation || Platform.isWindows)) {
       try {
         tokenFile = await createEphemeralLaunchTokenFile(logDir, authToken);
       } catch (error) {
@@ -176,7 +183,7 @@ class DaemonController {
         final process = await _startDetached(
           binary: binary,
           args: args,
-          stdinToken: useManualMode ? null : authToken,
+          stdinToken: tokenFile == null && !useManualMode ? authToken : null,
         );
         await _writePidMarker(pidPath, process.pid);
       }

@@ -290,8 +290,23 @@ int? _effectiveUserId() {
 bool _isWindowsAdministrator() {
   if (!Platform.isWindows) return false;
   try {
-    final result = Process.runSync('net', ['session']);
-    return result.exitCode == 0;
+    final windir = Platform.environment['WINDIR']?.trim();
+    final executable = windir == null || windir.isEmpty
+        ? 'powershell.exe'
+        : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    final result = Process.runSync(executable, [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-WindowStyle',
+      'Hidden',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      '[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
+    ]);
+    return result.exitCode == 0 &&
+        result.stdout.toString().trim().toLowerCase() == 'true';
   } catch (_) {
     return false;
   }
