@@ -1,6 +1,13 @@
 part of '../p15_widget_test.dart';
 
 void _registerDashboardTests() {
+  test('formats peer throughput in K/S, M/S, and G/S', () {
+    expect(formatTransferRate(null), '—');
+    expect(formatTransferRate(1024), '1 K/S');
+    expect(formatTransferRate(1024 * 1024), '1 M/S');
+    expect(formatTransferRate(1024 * 1024 * 1024), '1 G/S');
+  });
+
   testWidgets('Home renders stopped state with start action', (tester) async {
     final stores = (await tester.runAsync(
       () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
@@ -50,25 +57,27 @@ void _registerDashboardTests() {
       ),
     );
 
-    // Healthy hero: status + Virtual IP first.
+    // Healthy hero: status + Virtual IP first, with no redundant identity
+    // sentence or network-id line.
     expect(find.text('Network status'), findsOneWidget);
     expect(find.text('Normal'), findsWidgets);
-    expect(find.text('Your device is on the P2WLAN network'), findsOneWidget);
+    expect(find.text('Your device is on the P2WLAN network'), findsNothing);
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('Virtual IP address'), findsOneWidget);
-    expect(find.textContaining('Network ID'), findsOneWidget);
+    expect(find.textContaining('Network ID'), findsNothing);
 
     // Key metrics from peer state: online / direct / relay.
     expect(_heroCount(tester, 'dashboard-count-online'), '2');
     expect(_heroCount(tester, 'dashboard-count-direct'), '1');
     expect(_heroCount(tester, 'dashboard-count-relay'), '1');
 
-    // Device preview section is titled "Devices" (it may show offline peers).
+    // Device preview section is titled "Devices" and contains connected peers.
     expect(find.text('Devices'), findsOneWidget);
     expect(find.text('Online devices'), findsWidgets);
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('relay-nas'), findsOneWidget);
     expect(find.text('10.20.0.11'), findsOneWidget);
+    expect(find.text('offline-printer'), findsNothing);
 
     // Healthy hero: no duplicate inline refresh — the shell owns refresh.
     expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
@@ -191,7 +200,7 @@ void _registerDashboardTests() {
     expect(find.text('Online devices'), findsNothing);
   });
 
-  testWidgets('Home shows peer connection states with real latency', (
+  testWidgets('Home shows device path and latency in a compact preview', (
     tester,
   ) async {
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -216,17 +225,68 @@ void _registerDashboardTests() {
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('relay-nas'), findsOneWidget);
     expect(find.text('probing-phone'), findsOneWidget);
-    expect(find.text('offline-printer'), findsOneWidget);
+    expect(find.text('offline-printer'), findsNothing);
     // Metric labels add one more occurrence each.
     expect(find.text('Direct'), findsNWidgets(2));
     expect(find.text('Relay'), findsNWidgets(2));
     expect(find.text('probing'), findsOneWidget);
-    expect(find.text('Offline'), findsOneWidget);
-    // Verified latency, relay latency, and explicitly labeled probe RTT.
+    expect(find.text('Offline'), findsNothing);
+    // Useful connection facts stay on the cover; deeper metadata belongs in
+    // the opened detail surface.
     expect(find.text('12 ms'), findsOneWidget);
     expect(find.text('43 ms'), findsOneWidget);
-    expect(find.text('probe RTT 8 ms'), findsOneWidget);
+    expect(find.text('probe RTT 8 ms'), findsNothing);
     expect(find.text('8 ms'), findsNothing);
+  });
+
+  testWidgets('Device rows order speed, latency, then connection path', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final initialPeers = _fourPeerFixtures();
+    final initialSnapshot = _snapshotWithPeers(base, initialPeers);
+    final updatedPeers = _fourPeerFixtures();
+    final direct = updatedPeers.firstWhere(
+      (peer) => peer['node_id'] == 'node-direct',
+    );
+    direct['bytes_sent'] = 1024 * 1024;
+    final updatedSnapshot = _snapshotWithPeers(base, updatedPeers);
+    final api = _FakeDiagnosticsApi(health: true, snapshot: initialSnapshot);
+    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    api.snapshot = updatedSnapshot;
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 20)),
+    );
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    final row = find.byKey(const Key('home-device-row-node-direct'));
+    final labels = tester
+        .widgetList<Text>(find.descendant(of: row, matching: find.byType(Text)))
+        .map((text) => text.data)
+        .whereType<String>()
+        .toList();
+    final speedIndex = labels.indexWhere(
+      (label) =>
+          label.contains('K/S') ||
+          label.contains('M/S') ||
+          label.contains('G/S'),
+    );
+    final latencyIndex = labels.indexOf('12 ms');
+    final pathIndex = labels.indexOf('Direct');
+    expect(speedIndex, greaterThanOrEqualTo(0));
+    expect(latencyIndex, greaterThan(speedIndex));
+    expect(pathIndex, greaterThan(latencyIndex));
   });
 
   testWidgets('Home shows exact hero connection counts', (tester) async {
@@ -277,8 +337,8 @@ void _registerDashboardTests() {
       ),
     );
 
-    // Attention first, then relay, direct, offline last — the offline peer is
-    // the one pushed past the preview limit.
+    // Attention first, then relay and direct. Offline peers are excluded from
+    // the Home preview before the five-device cap is applied.
     expect(find.text('probing-phone'), findsOneWidget);
     expect(find.text('relay-nas'), findsOneWidget);
     expect(find.text('relay-server2'), findsOneWidget);
@@ -386,6 +446,14 @@ void _registerDashboardTests() {
 
     expect(find.byType(DashboardPage), findsOneWidget);
     expect(find.byType(DesktopSidebar), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('home-device-row-peer-direct-001')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.byType(NodesPage), findsNothing);
+    expect(find.text('24 ms'), findsWidgets);
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const Key('home-view-all-devices')));
     await tester.pumpAndSettle();
@@ -638,6 +706,7 @@ Map<String, dynamic> _peerJson({
   String? activePath,
   required String? relayConfirmedEndpoint,
   int? relayConfirmedGeneration,
+  int? remoteRelayLatencyMs,
   required Map<String, dynamic> direct,
   required Map<String, dynamic> relay,
   Map<String, dynamic>? currentPathSelection,
@@ -651,6 +720,7 @@ Map<String, dynamic> _peerJson({
     'nat_type': 'unknown',
     'online': online,
     'last_seen': 0,
+    'remote_relay_latency_ms': remoteRelayLatencyMs,
     'state': state,
     'active_path': activePath,
     'direct_type': 'unknown',
@@ -718,6 +788,7 @@ List<Map<String, dynamic>> _fourPeerFixtures() {
     activePath: 'relay',
     relayConfirmedEndpoint: '203.0.113.10:18081',
     relayConfirmedGeneration: 5,
+    remoteRelayLatencyMs: 43,
     direct: _emptyPathHealth(),
     relay: {
       'last_success_age_ms': 300,
@@ -725,7 +796,9 @@ List<Map<String, dynamic>> _fourPeerFixtures() {
       'consecutive_failures': 0,
       'last_error': null,
       'last_error_code': null,
-      'latency_ms': 43,
+      // Relay daemons may publish the usable RTT as
+      // remote_relay_latency_ms while this local path-health sample is empty.
+      'latency_ms': null,
       'rtt_ewma_ms': null,
     },
     currentPathSelection: {

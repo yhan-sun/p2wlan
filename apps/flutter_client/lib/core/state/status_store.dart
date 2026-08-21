@@ -73,6 +73,8 @@ class StatusStore extends ChangeNotifier {
   String? _lastSpeedTestError;
   String? _speedTestPeerVirtualIp;
   DateTime? _speedTestStartedAt;
+  var _peerTrafficSamples = <String, _PeerTrafficSample>{};
+  var _peerTransferRatesBytesPerSecond = <String, int>{};
   late String _lastDiagnosticsUrl;
 
   DiagnosticsSnapshot? get snapshot => _snapshot;
@@ -99,6 +101,11 @@ class StatusStore extends ChangeNotifier {
   String? get lastSpeedTestError => _lastSpeedTestError;
   String? get speedTestPeerVirtualIp => _speedTestPeerVirtualIp;
   DateTime? get speedTestStartedAt => _speedTestStartedAt;
+
+  /// Fresh combined sent + received rates, keyed by peer node ID. A peer is
+  /// absent until two successful status samples are available.
+  Map<String, int> get peerTransferRatesBytesPerSecond =>
+      Map.unmodifiable(_peerTransferRatesBytesPerSecond);
 
   void startPolling() {
     setAutoRefresh(enabled: true, refreshImmediately: true);
@@ -204,6 +211,8 @@ class StatusStore extends ChangeNotifier {
           _refreshPending = true;
           return;
         }
+        final fetchedAt = DateTime.now();
+        _updatePeerTrafficRates(snapshot, fetchedAt);
         _snapshot = snapshot;
         try {
           _routeHealthy = (await diagnosticsApi.verifyRoutes(url)).healthy;
@@ -211,7 +220,7 @@ class StatusStore extends ChangeNotifier {
           _routeHealthy = false;
         }
         _lastError = null;
-        _lastFetchedAt = DateTime.now();
+        _lastFetchedAt = fetchedAt;
         _lastSuccessfulStatusAt = _lastFetchedAt;
         _markSnapshotFresh();
       } catch (error) {
@@ -246,8 +255,41 @@ class StatusStore extends ChangeNotifier {
   void _clearSnapshot() {
     _snapshot = null;
     _snapshotStale = false;
+    _peerTrafficSamples = <String, _PeerTrafficSample>{};
+    _peerTransferRatesBytesPerSecond = <String, int>{};
     _staleTimer?.cancel();
     _staleTimer = null;
+  }
+
+  void _updatePeerTrafficRates(
+    DiagnosticsSnapshot snapshot,
+    DateTime fetchedAt,
+  ) {
+    final nextSamples = <String, _PeerTrafficSample>{};
+    final nextRates = <String, int>{};
+    for (final peer in snapshot.peers) {
+      final nodeId = peer.nodeId.trim();
+      if (nodeId.isEmpty) continue;
+      final totalBytes = peer.bytesSent + peer.bytesReceived;
+      final previous = _peerTrafficSamples[nodeId];
+      if (previous != null) {
+        final elapsedMicros = fetchedAt
+            .difference(previous.fetchedAt)
+            .inMicroseconds;
+        final deltaBytes = totalBytes - previous.totalBytes;
+        if (elapsedMicros > 0 && deltaBytes >= 0) {
+          nextRates[nodeId] =
+              (deltaBytes * Duration.microsecondsPerSecond / elapsedMicros)
+                  .round();
+        }
+      }
+      nextSamples[nodeId] = _PeerTrafficSample(
+        totalBytes: totalBytes,
+        fetchedAt: fetchedAt,
+      );
+    }
+    _peerTrafficSamples = nextSamples;
+    _peerTransferRatesBytesPerSecond = nextRates;
   }
 
   void _markSnapshotFresh() {
@@ -471,4 +513,11 @@ class StatusStore extends ChangeNotifier {
     diagnosticsApi.close();
     super.dispose();
   }
+}
+
+class _PeerTrafficSample {
+  const _PeerTrafficSample({required this.totalBytes, required this.fetchedAt});
+
+  final int totalBytes;
+  final DateTime fetchedAt;
 }

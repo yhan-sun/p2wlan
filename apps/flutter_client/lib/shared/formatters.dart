@@ -27,6 +27,26 @@ String formatBytes(int value) {
   return '$text ${units[index]}';
 }
 
+/// Formats an observed peer throughput using the compact units used by the
+/// device lists. The value is the combined sent + received rate in bytes per
+/// second; null means that two samples are not available yet.
+String formatTransferRate(int? bytesPerSecond) {
+  if (bytesPerSecond == null || bytesPerSecond < 0) return '—';
+
+  const kilo = 1024.0;
+  const mega = kilo * 1024;
+  const giga = mega * 1024;
+  final (value, unit) = switch (bytesPerSecond.toDouble()) {
+    >= giga => (bytesPerSecond / giga, 'G/S'),
+    >= mega => (bytesPerSecond / mega, 'M/S'),
+    _ => (bytesPerSecond / kilo, 'K/S'),
+  };
+  final text = value == value.roundToDouble()
+      ? value.toStringAsFixed(0)
+      : value.toStringAsFixed(value >= 100 ? 0 : 1);
+  return '$text $unit';
+}
+
 String formatLatency(int? latencyMs) {
   if (latencyMs == null) return '—';
   return '$latencyMs ms';

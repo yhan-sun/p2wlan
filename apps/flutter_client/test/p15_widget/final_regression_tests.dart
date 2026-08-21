@@ -148,6 +148,7 @@ void _registerFinalRegressionTests() {
     expect(find.textContaining('SUPER_SECRET'), findsNothing);
     expect(find.textContaining('FileSystemException'), findsNothing);
     expect(find.textContaining('Exception'), findsNothing);
+    expect(stores.settingsStore.settings.onboardingCompleted, isFalse);
     expect(tester.takeException(), isNull);
   });
 

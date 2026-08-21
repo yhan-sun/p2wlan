@@ -26,6 +26,7 @@ class _GeneralSection extends StatelessWidget {
           label: strings.language,
           subtitle: strings.languageHelper,
           trailing: DropdownButton<String>(
+            isExpanded: MediaQuery.sizeOf(context).width < 520,
             key: ValueKey('language-$languageCode'),
             value: AppLanguage.fromCode(languageCode).code,
             underline: const SizedBox.shrink(),
@@ -47,6 +48,7 @@ class _GeneralSection extends StatelessWidget {
           label: strings.themeMode,
           subtitle: strings.themeModeHelper,
           trailing: DropdownButton<String>(
+            isExpanded: MediaQuery.sizeOf(context).width < 520,
             key: ValueKey('theme-$themeCode'),
             value: AppThemeMode.fromCode(themeCode).code,
             underline: const SizedBox.shrink(),

@@ -10,6 +10,7 @@ class PeerSnapshot {
     required this.natType,
     required this.online,
     required this.lastSeen,
+    required this.remoteRelayLatencyMs,
     required this.state,
     required this.activePath,
     required this.directType,
@@ -34,6 +35,11 @@ class PeerSnapshot {
   final String natType;
   final bool online;
   final int lastSeen;
+
+  /// RTT to the selected relay reported by the remote peer. Some daemon
+  /// versions expose this value while the local relay path health is still
+  /// missing a sample.
+  final int? remoteRelayLatencyMs;
   final String state;
   final String? activePath;
   final String directType;
@@ -67,6 +73,7 @@ class PeerSnapshot {
       natType: _string(json['nat_type'], 'unknown'),
       online: _bool(json['online'], true),
       lastSeen: _int(json['last_seen']),
+      remoteRelayLatencyMs: _intOrNull(json['remote_relay_latency_ms']),
       state: _string(json['state'], 'unknown'),
       activePath: _nullableString(json['active_path']),
       directType: _string(json['direct_type'], 'unknown'),
@@ -147,7 +154,9 @@ class PeerSnapshot {
       return isDirectVerified ? direct.displayLatencyMs : null;
     }
     if (path == 'relay') {
-      return isRelayVerified ? relay.displayLatencyMs : null;
+      return isRelayVerified
+          ? relay.displayLatencyMs ?? remoteRelayLatencyMs
+          : null;
     }
     return null;
   }

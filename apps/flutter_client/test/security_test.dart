@@ -86,6 +86,24 @@ void main() {
   );
 
   group('SettingsStore token handling', () {
+    test('onboarding completion rolls back when persistence fails', () async {
+      final tmp = await Directory.systemTemp.createTemp(
+        'p2wlan_onboarding_rollback_',
+      );
+      addTearDown(() async => tmp.delete(recursive: true));
+      final store = SettingsStore(
+        settingsFile: File('${tmp.path}/settings.json'),
+        tokenRepository: _FailingSecureTokenRepository(),
+      );
+      await store.load();
+
+      await expectLater(
+        store.markOnboardingCompleted(),
+        throwsA(isA<Exception>()),
+      );
+      expect(store.settings.onboardingCompleted, isFalse);
+    });
+
     test(
       'token is never persisted to the settings JSON; secure store holds it',
       () async {

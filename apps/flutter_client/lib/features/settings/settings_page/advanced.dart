@@ -63,6 +63,7 @@ class _AdvancedNetworkSection extends StatelessWidget {
           label: strings.socketPool,
           subtitle: strings.socketPoolHelper,
           trailing: DropdownButton<String>(
+            isExpanded: MediaQuery.sizeOf(context).width < 520,
             key: ValueKey('socket-pool-${state._socketPool}'),
             value: state._socketPool,
             underline: const SizedBox.shrink(),

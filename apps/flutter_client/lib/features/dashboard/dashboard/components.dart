@@ -45,7 +45,7 @@ class _NetworkComponentsSection extends StatelessWidget {
     ];
 
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Text(
           strings.networkComponents,
@@ -60,7 +60,7 @@ class _NetworkComponentsSection extends StatelessWidget {
         ),
         const SizedBox(height: AppTokens.space12),
         for (var index = 0; index < rows.length; index++) ...[
-          if (index > 0) const Divider(height: 17),
+          if (index > 0) const SizedBox(height: AppTokens.space10),
           rows[index],
         ],
       ],
@@ -105,43 +105,66 @@ class _ComponentRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final text = _tonePanelColors(context, tone).text;
-    return Row(
-      children: [
-        Expanded(
-          child: Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-              height: 1.3,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // Keep the status group anchored to the same right edge for every row.
+        // It stays compact on a narrow window while remaining flush with the
+        // section's right content edge on desktop.
+        final statusWidth = constraints.maxWidth < 340 ? 104.0 : 124.0;
+        return Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  height: 1.3,
+                ),
+              ),
             ),
-          ),
-        ),
-        const SizedBox(width: AppTokens.space12),
-        Container(
-          width: 7,
-          height: 7,
-          decoration: BoxDecoration(color: text, shape: BoxShape.circle),
-        ),
-        const SizedBox(width: 7),
-        Flexible(
-          child: Text(
-            value,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: text,
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-              height: 1.3,
-              fontFeatures: AppTokens.tabularFontFeatures,
+            const SizedBox(width: AppTokens.space16),
+            SizedBox(
+              width: statusWidth,
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 7,
+                      height: 7,
+                      decoration: BoxDecoration(
+                        color: text,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 7),
+                    ConstrainedBox(
+                      constraints: BoxConstraints(maxWidth: statusWidth - 14),
+                      child: Text(
+                        value,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: text,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          height: 1.3,
+                          fontFeatures: AppTokens.tabularFontFeatures,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
-          ),
-        ),
-      ],
+          ],
+        );
+      },
     );
   }
 }

@@ -53,35 +53,34 @@ class _PreferenceRow extends StatelessWidget {
       ],
     );
 
-    final Widget trailingWidget;
+    final Widget trailingContent;
     if (hasTrailing) {
-      trailingWidget = trailing!;
+      trailingContent = trailing!;
     } else {
-      trailingWidget = Flexible(
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Flexible(
-              child: Text(
-                value ?? '',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 14,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
+      trailingContent = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Text(
+              value ?? '',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.end,
+              style: TextStyle(
+                fontSize: 14,
+                color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
-            if (onTap != null) ...[
-              const SizedBox(width: AppTokens.space4),
-              Icon(
-                Icons.chevron_right_rounded,
-                size: 20,
-                color: theme.colorScheme.outline,
-              ),
-            ],
+          ),
+          if (onTap != null) ...[
+            const SizedBox(width: AppTokens.space4),
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 20,
+              color: theme.colorScheme.outline,
+            ),
           ],
-        ),
+        ],
       );
     }
 
@@ -99,12 +98,57 @@ class _PreferenceRow extends StatelessWidget {
             horizontal: AppTokens.space8,
             vertical: AppTokens.space6,
           ),
-          child: Row(
-            children: [
-              Expanded(child: leading),
-              const SizedBox(width: AppTokens.space12),
-              trailingWidget,
-            ],
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              if (constraints.maxWidth < 460) {
+                final trailingWidth = constraints.maxWidth < 220
+                    ? constraints.maxWidth
+                    : 220.0;
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    leading,
+                    const SizedBox(height: AppTokens.space4),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: SizedBox(
+                        width: hasTrailing
+                            ? trailingWidth
+                            : constraints.maxWidth,
+                        child: Align(
+                          alignment: Alignment.centerRight,
+                          child: trailingContent,
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              }
+              if (hasTrailing) {
+                return Row(
+                  children: [
+                    Expanded(child: leading),
+                    const SizedBox(width: AppTokens.space12),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: trailingContent,
+                    ),
+                  ],
+                );
+              }
+              return Row(
+                children: [
+                  Expanded(child: leading),
+                  const SizedBox(width: AppTokens.space12),
+                  Flexible(
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: trailingContent,
+                    ),
+                  ),
+                ],
+              );
+            },
           ),
         ),
       ),

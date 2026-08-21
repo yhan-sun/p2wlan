@@ -3,9 +3,9 @@ part of '../p15_widget_test.dart';
 /// Full-shell Devices responsive-boundary tests.
 ///
 /// These run through the real [P2WlanShell] (sidebar + page scaffold), not a
-/// standalone [NodesPage], so the inspector threshold is measured against the
-/// actual content width left after the shell chrome. Regression guard for the
-/// 1280px window falling back to the List + Dialog presentation.
+/// standalone [NodesPage], so the interaction is measured through the actual
+/// shell chrome at each responsive boundary. All widths use the same compact
+/// list-first interaction: tap a device to open its details.
 void _registerNodesShellTests() {
   Future<void> pumpShell(WidgetTester tester, Size size) async {
     await tester.binding.setSurfaceSize(size);
@@ -48,7 +48,7 @@ void _registerNodesShellTests() {
     await tester.pumpAndSettle();
   }
 
-  testWidgets('full shell at 1280x800 shows Devices list + inspector', (
+  testWidgets('full shell at 1280x800 opens device details on demand', (
     tester,
   ) async {
     await pumpShell(tester, const Size(1280, 800));
@@ -57,22 +57,28 @@ void _registerNodesShellTests() {
 
     await goToDevices(tester);
 
-    // 1280 - 216 sidebar - 1 divider - 48 page padding ≈ 1015 content width,
-    // which clears the page-specific inspector threshold.
-    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
     expect(find.byType(Dialog), findsNothing);
+
+    await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('full shell at 1440x900 shows Devices list + inspector', (
+  testWidgets('full shell at 1440x900 opens device details on demand', (
     tester,
   ) async {
     await pumpShell(tester, const Size(1440, 900));
     await goToDevices(tester);
 
     expect(find.byType(DesktopSidebar), findsOneWidget);
-    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
     expect(find.byType(Dialog), findsNothing);
+
+    await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -82,8 +88,7 @@ void _registerNodesShellTests() {
     await pumpShell(tester, const Size(900, 1000));
     await goToDevices(tester);
 
-    // Medium shell at 900: page content is 900 - 88 rail - 1 - 48 = 763px,
-    // inside the page's medium band [600, 960) → list + detail dialog.
+    // Medium shell at 900 uses the list + detail dialog presentation.
     expect(find.byType(AppNavRail), findsOneWidget);
     expect(find.byType(DesktopSidebar), findsNothing);
     expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
@@ -101,12 +106,11 @@ void _registerNodesShellTests() {
     await pumpShell(tester, const Size(1200, 800));
     await goToDevices(tester);
 
-    // 1200 - 216 - 1 - 48 ≈ 935 content width: below the inspector threshold,
-    // so no inspector is forced into a too-narrow area.
+    // The wide shell still keeps the first level quiet.
     expect(find.byType(DesktopSidebar), findsOneWidget);
     expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
 
-    // Selecting a peer opens the medium detail dialog instead.
+    // Selecting a peer opens the detail dialog.
     await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsWidgets);
@@ -120,10 +124,8 @@ void _registerNodesShellTests() {
     await pumpShell(tester, const Size(700, 1000));
     await goToDevices(tester);
 
-    // Medium shell: labeled rail, no sidebar, no inspector. The page content
-    // itself is 700 - 88 rail - 1 divider - 48 padding = 563px, which is below
-    // the page's own 600px compact threshold, so the page behaves compact:
-    // selecting a peer opens the full-screen detail, not an inspector.
+    // Medium shell: labeled rail, no sidebar, no inspector. The page behaves
+    // compact, so selecting a peer opens the full-screen detail.
     expect(find.byType(AppNavRail), findsOneWidget);
     expect(find.byType(DesktopSidebar), findsNothing);
     expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);

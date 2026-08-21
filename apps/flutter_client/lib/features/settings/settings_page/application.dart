@@ -18,6 +18,7 @@ class _ApplicationSection extends StatelessWidget {
           label: strings.closeBehavior,
           subtitle: strings.closeBehaviorHelper,
           trailing: DropdownButton<String>(
+            isExpanded: MediaQuery.sizeOf(context).width < 520,
             key: ValueKey('close-behavior-${state._closeBehavior}'),
             value: state._closeBehavior,
             underline: const SizedBox.shrink(),

@@ -39,7 +39,16 @@ class SecureTokenStorageException implements Exception {
 /// (Linux). Errors are propagated: no plaintext-file fallback is permitted.
 class PlatformSecureTokenRepository implements SecureTokenRepository {
   PlatformSecureTokenRepository({FlutterSecureStorage? storage})
-    : _storage = storage ?? FlutterSecureStorage();
+    : _storage =
+          storage ??
+          const FlutterSecureStorage(
+            // The app is distributed with adhoc signing, so the macOS data
+            // protection keychain would require a development entitlement
+            // that cannot be embedded in this build. The traditional macOS
+            // Keychain is still OS-managed secure storage and works without
+            // that entitlement.
+            mOptions: MacOsOptions(usesDataProtectionKeychain: false),
+          );
 
   static const _key = 'p2wlan.control.auth_token';
   final FlutterSecureStorage _storage;

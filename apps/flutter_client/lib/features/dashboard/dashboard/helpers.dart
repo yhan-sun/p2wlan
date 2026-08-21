@@ -101,14 +101,16 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
   );
 }
 
-/// Most relevant peers for the home overview: attention first, then relay,
-/// direct, remaining online, offline last. Capped so offline devices never
-/// fill the page.
+/// Most relevant connected peers for the home overview: attention first, then
+/// relay and direct. Offline devices belong in the Devices section, not this
+/// compact Home preview. The result is capped to keep the page quiet.
 List<PeerSnapshot> _topOverviewPeers(
   List<PeerSnapshot> peers, {
   int limit = 5,
 }) {
-  final sorted = [...peers]..sort(_compareDashboardPeers);
+  final sorted =
+      peers.where((peer) => peer.online && peer.path != 'offline').toList()
+        ..sort(_compareDashboardPeers);
   if (sorted.length <= limit) return sorted;
   return sorted.sublist(0, limit);
 }
@@ -156,16 +158,6 @@ Color _peerStatusColor(BuildContext context, PeerSnapshot peer) {
     'probing' || 'direct_trial' => c.probing,
     _ => c.offline,
   };
-}
-
-/// Verified path latency, else probe RTT explicitly labeled as a probe, else
-/// no data. A candidate probe RTT is never shown as the connection latency.
-String _peerLatencyLabel(AppStrings strings, PeerSnapshot peer) {
-  final latency = peer.latencyMs;
-  if (latency != null) return formatLatency(latency);
-  final probe = peer.probeLatencyMs;
-  if (probe != null) return strings.probeRtt(probe);
-  return '—';
 }
 
 String? _dashboardIssueMessage({

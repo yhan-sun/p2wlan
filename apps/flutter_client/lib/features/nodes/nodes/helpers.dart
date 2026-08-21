@@ -88,13 +88,6 @@ String _rowPathLabel(AppStrings strings, PeerSnapshot peer) {
   return strings.probing;
 }
 
-/// Compact "path · latency" summary used on mobile rows and the detail header.
-String _pathSummaryLabel(AppStrings strings, PeerSnapshot peer) {
-  final path = _rowPathLabel(strings, peer);
-  final latency = formatLatency(peer.latencyMs);
-  return '$path · $latency';
-}
-
 /// Semantic but low-saturation dot color: direct=good, relay=neutral accent,
 /// probing=warn, offline=neutral. Text always accompanies the dot.
 Color _rowStatusColor(BuildContext context, PeerSnapshot peer) {

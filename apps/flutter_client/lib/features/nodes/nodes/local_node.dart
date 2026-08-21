@@ -150,7 +150,6 @@ class _LocalNodePanel extends StatelessWidget {
             ),
           ),
         ),
-        const Divider(height: 1),
       ],
     );
   }

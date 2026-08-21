@@ -141,8 +141,18 @@ void _registerNodesTests() {
     );
 
     expect(find.text('relay-nas'), findsOneWidget);
+    // The cover keeps the useful path and latency visible.
+    expect(find.text('Relay'), findsOneWidget);
     expect(find.text('52 ms'), findsOneWidget);
     expect(find.text('25 ms'), findsNothing);
+
+    await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('52 ms')),
+      findsOneWidget,
+    );
     expect(tester.takeException(), isNull);
   });
 
@@ -222,10 +232,11 @@ void _registerNodesTests() {
     expect(find.text('offline-with-error'), findsOneWidget);
     expect(find.text('offline-plain'), findsOneWidget);
 
-    // Offline wins: path column says Offline and latency is —, never a stale
-    // Direct/Relay claim or a fabricated latency.
+    // Offline wins: the cover never carries a stale Direct/Relay claim or a
+    // fabricated latency.
     expect(find.text('Offline'), findsNWidgets(2));
-    expect(find.text('—'), findsNWidgets(2));
+    // Each offline row has unknown speed and latency.
+    expect(find.text('—'), findsNWidgets(6));
     expect(find.text('Direct'), findsOneWidget);
     expect(find.text('Relay'), findsOneWidget);
     expect(find.text('10 ms'), findsNothing);
@@ -237,6 +248,15 @@ void _registerNodesTests() {
       findsNothing,
     );
     expect(find.byIcon(Icons.warning_amber_rounded), findsWidgets);
+
+    await tester.tap(find.byKey(const Key('node-row-offline-errored-001')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.text('Offline'), findsWidgets);
+    expect(
+      find.text('no direct probe ACK after 320 background UDP retry probes'),
+      findsOneWidget,
+    );
     expect(tester.takeException(), isNull);
   });
 
@@ -266,7 +286,7 @@ void _registerNodesTests() {
       ),
     );
 
-    await tester.tap(find.byTooltip('Device actions').first);
+    await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Remove device').last);
     await tester.pumpAndSettle();
@@ -310,9 +330,13 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
 
     expect(find.byType(Dialog), findsOneWidget);
-    // Common info first: connection type and the summary line.
+    // Common connection facts are promoted to the detail header.
     expect(find.text('Connection type'), findsOneWidget);
-    expect(find.text('Direct · 24 ms'), findsOneWidget);
+    expect(find.text('Public direct'), findsOneWidget);
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('24 ms')),
+      findsOneWidget,
+    );
     // Advanced is collapsed: no Node ID, version, or state on the first
     // level of the detail.
     expect(find.text('Node ID'), findsNothing);
@@ -365,12 +389,11 @@ void _registerNodesTests() {
       ),
     );
 
-    // The relay peer carries the "direct probe timed out" note, so it ranks
-    // first (needs attention) and its menu is the first on screen.
-    await tester.tap(find.byTooltip('Device actions').first);
+    // Actions live inside the explicitly opened detail surface.
+    await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
     await tester.pumpAndSettle();
     await tester.tap(
-      find.byKey(const Key('node-speedtest-action-peer-relay-002')),
+      find.byKey(const Key('node-detail-speedtest-peer-relay-002')),
     );
     await tester.pumpAndSettle();
 
@@ -417,10 +440,10 @@ void _registerNodesTests() {
       ),
     );
 
-    await tester.tap(find.byTooltip('Device actions').first);
+    await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
     await tester.pumpAndSettle();
     await tester.tap(
-      find.byKey(const Key('node-speedtest-action-peer-relay-002')),
+      find.byKey(const Key('node-detail-speedtest-peer-relay-002')),
     );
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('node-speedtest-start')));
@@ -610,7 +633,7 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Nodes expanded layout keeps selection across refresh', (
+  testWidgets('Nodes wide layout opens details without a persistent pane', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -637,24 +660,25 @@ void _registerNodesTests() {
       ),
     );
 
-    // Master/detail exists and the recommended-first peer is selected by
-    // default: the probing peer needs attention and ranks first.
-    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
-    expect(find.text('probing-phone'), findsWidgets);
-
-    // Clicking the second row updates the detail pane in place.
-    await tester.tap(find.byKey(const Key('node-row-node-relay')));
-    await tester.pump();
-    expect(find.text('relay-nas'), findsWidgets);
+    // The wide layout keeps the first level compact and quiet.
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
     expect(find.byType(Dialog), findsNothing);
 
-    // StatusStore refresh keeps the selection.
+    // Clicking a row opens the detail surface on demand.
+    await tester.tap(find.byKey(const Key('node-row-node-relay')));
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.text('relay-nas'), findsWidgets);
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
+
+    // Refresh does not leave an implicit detail selection behind.
     await stores.statusStore.refresh();
     await tester.pump();
-    expect(find.text('relay-nas'), findsWidgets);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
+    expect(find.byType(Dialog), findsNothing);
 
-    // Removing the selected peer hides it and falls back to the first visible
-    // peer instead of showing stale details.
+    // Removing a peer only updates the list; no stale detail surface remains.
     final api = stores.statusStore;
     final pruned = _snapshotWithPeers(
       base,
@@ -664,11 +688,11 @@ void _registerNodesTests() {
     await api.refresh();
     await tester.pump();
     expect(find.text('relay-nas'), findsNothing);
-    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Nodes expanded rows hide Node ID and version until Advanced', (
+  testWidgets('Nodes wide rows reveal technical fields only in Advanced', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -695,29 +719,34 @@ void _registerNodesTests() {
       ),
     );
 
-    final pane = find.byKey(const Key('nodes-detail-pane'));
-    Finder paneText(String text) =>
-        find.descendant(of: pane, matching: find.text(text));
+    final detail = find.byType(Dialog);
 
-    // Rows and collapsed inspector: no Node ID, no version, no state.
+    // The first level has no technical metadata and no inspector.
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
     expect(find.text('Node ID'), findsNothing);
     expect(find.text('Version'), findsNothing);
     expect(find.text('1.0.0'), findsNothing);
-    expect(paneText('Node ID'), findsNothing);
 
-    // Inspector header answers who/online/how without technical fields.
-    expect(paneText('probing-phone'), findsOneWidget);
-    expect(paneText('10.20.0.13'), findsWidgets); // header + network section
+    await tester.tap(find.byKey(const Key('node-row-node-probing')));
+    await tester.pumpAndSettle();
+    expect(detail, findsOneWidget);
+
+    // Detail header answers who/online/how without technical fields.
+    Finder detailText(String text) =>
+        find.descendant(of: detail, matching: find.text(text));
+    expect(detailText('probing-phone'), findsWidgets);
+    expect(detailText('10.20.0.13'), findsWidgets);
+    expect(detailText('Node ID'), findsNothing);
 
     // Expanding Advanced reveals the technical metadata.
     await tester.tap(find.byKey(const Key('nodes-advanced-toggle')));
     await tester.pumpAndSettle();
-    expect(paneText('Node ID'), findsOneWidget);
-    expect(paneText('Version'), findsOneWidget);
-    expect(paneText('1.0.0'), findsOneWidget);
-    expect(paneText('State'), findsOneWidget);
-    // List rows themselves never show version even after expansion.
-    expect(find.text('1.0.0'), findsOneWidget);
+    expect(detailText('Node ID'), findsOneWidget);
+    expect(detailText('Version'), findsOneWidget);
+    expect(detailText('1.0.0'), findsOneWidget);
+    expect(detailText('State'), findsOneWidget);
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
 
@@ -782,7 +811,7 @@ void _registerNodesTests() {
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
 
-    // Expanded: master-detail, no dialog on row tap.
+    // Expanded: no persistent pane; row tap still opens the dialog.
     tester.view.physicalSize = const Size(1280, 900);
     tester.view.devicePixelRatio = 1;
     await tester.pumpWidget(
@@ -794,11 +823,13 @@ void _registerNodesTests() {
       ),
     );
     await tester.pump();
-    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
     await tester.tap(find.byKey(const Key('node-row-node-relay')));
-    await tester.pump();
-    expect(find.byType(Dialog), findsNothing);
-    expect(find.byKey(const Key('nodes-detail-pane')), findsOneWidget);
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
@@ -862,7 +893,7 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Nodes detail selection always follows search/filter results', (
+  testWidgets('Nodes filters keep the compact list free of stale details', (
     tester,
   ) async {
     tester.view.physicalSize = const Size(1280, 900);
@@ -888,47 +919,41 @@ void _registerNodesTests() {
       ),
     );
 
-    final pane = find.byKey(const Key('nodes-detail-pane'));
-    Finder paneText(String text) =>
-        find.descendant(of: pane, matching: find.text(text));
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
 
-    // Select the Relay peer; the detail pane shows it.
+    // Details are explicitly opened and dismissed; the list has no persistent
+    // selection to become stale when its contents change.
     await tester.tap(find.byKey(const Key('node-row-node-relay')));
-    await tester.pump();
-    expect(paneText('relay-nas'), findsOneWidget);
+    await tester.pumpAndSettle();
+    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.text('relay-nas'), findsWidgets);
+    await tester.tap(find.byTooltip('Cancel'));
+    await tester.pumpAndSettle();
 
-    // Filter to Direct via the menu: the Relay row disappears and the detail
-    // must switch to a Direct peer instead of showing the hidden Relay.
+    // Filter to Direct via the menu: the Relay row disappears cleanly.
     await tester.tap(find.byKey(const Key('nodes-filter-button')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('nodes-filter-direct')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-relay')), findsNothing);
-    expect(paneText('direct-laptop'), findsOneWidget);
-    expect(paneText('relay-nas'), findsNothing);
+    expect(find.byKey(const Key('node-row-node-direct')), findsOneWidget);
+    expect(find.byType(Dialog), findsNothing);
 
-    // Clearing the filter restores the list without exceptions; the stale
-    // selection must not resurrect a hidden peer.
+    // Clearing the filter restores the list without an old detail surface.
     await tester.tap(find.byKey(const Key('nodes-filter-button')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('nodes-filter-all')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-relay')), findsOneWidget);
-    expect(tester.takeException(), isNull);
-
-    // Search for the Direct device's name while Relay is selected: the detail
-    // must follow the search results, not the persistent selection.
-    await tester.tap(find.byKey(const Key('node-row-node-relay')));
-    await tester.pump();
-    expect(paneText('relay-nas'), findsOneWidget);
     await tester.enterText(
       find.byKey(const Key('nodes-search-field')),
       'direct-laptop',
     );
     await tester.pump();
     expect(find.byKey(const Key('node-row-node-relay')), findsNothing);
-    expect(paneText('direct-laptop'), findsOneWidget);
-    expect(paneText('relay-nas'), findsNothing);
+    expect(find.byKey(const Key('node-row-node-direct')), findsOneWidget);
+    expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('Nodes closes detail surfaces only on successful removal', (

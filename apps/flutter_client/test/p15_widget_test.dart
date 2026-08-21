@@ -29,6 +29,7 @@ import 'package:p2wlan_flutter_client/features/settings/settings_page.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_nav_rail.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/desktop_sidebar.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/status_badge.dart';
+import 'package:p2wlan_flutter_client/shared/formatters.dart';
 
 part 'p15_widget/dashboard_tests.dart';
 part 'p15_widget/settings_tests.dart';

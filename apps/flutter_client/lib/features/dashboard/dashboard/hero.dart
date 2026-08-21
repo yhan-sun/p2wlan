@@ -1,7 +1,7 @@
 part of '../dashboard_page.dart';
 
-/// Home hero: quiet status, Virtual IP, identity line, key metrics, and the
-/// daemon recovery actions. One surface — the only strong container on Home.
+/// Home hero: quiet status, Virtual IP, key metrics, and daemon recovery
+/// actions. One surface — the only strong container on Home.
 class _NetworkHero extends StatelessWidget {
   const _NetworkHero({
     required this.snapshot,
@@ -76,31 +76,40 @@ class _NetworkHero extends StatelessWidget {
             ),
           ),
         ] else if (hasSnapshot) ...[
-          Text(
-            strings.homeJoinedSubtitle,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontSize: 13,
-              height: 1.3,
-            ),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final virtualIp = _VirtualIpBlock(virtualIp: snapshot!.virtualIp);
+
+              // On desktop the two pieces of primary information share one
+              // baseline. Narrow windows keep the same order but stack them
+              // so neither the IP nor the counts becomes cramped.
+              if (status != _NetworkStatus.stale &&
+                  constraints.maxWidth >= 560) {
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Expanded(child: virtualIp),
+                    const SizedBox(width: AppTokens.space24),
+                    SizedBox(width: 300, child: _HomeMetrics(counts: counts)),
+                  ],
+                );
+              }
+
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  virtualIp,
+                  if (status == _NetworkStatus.stale) ...[
+                    const SizedBox(height: AppTokens.space14),
+                    _StaleNote(refreshing: refreshing, onRefresh: onRefresh),
+                  ] else ...[
+                    const SizedBox(height: AppTokens.space16),
+                    _HomeMetrics(counts: counts),
+                  ],
+                ],
+              );
+            },
           ),
-          const SizedBox(height: AppTokens.space14),
-          _VirtualIpBlock(
-            virtualIp: snapshot!.virtualIp,
-            networkId: snapshot!.networkId,
-          ),
-          if (status == _NetworkStatus.stale) ...[
-            const SizedBox(height: AppTokens.space14),
-            _StaleNote(refreshing: refreshing, onRefresh: onRefresh),
-          ],
-          if (status != _NetworkStatus.stale) ...[
-            const SizedBox(height: AppTokens.space16),
-            const Divider(height: 1),
-            const SizedBox(height: AppTokens.space14),
-            _HomeMetrics(counts: counts),
-          ],
         ] else ...[
           Text(
             showStartGuide
@@ -153,7 +162,7 @@ class _NetworkHero extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           header,
-          const SizedBox(height: AppTokens.space14),
+          const SizedBox(height: AppTokens.space16),
           infoBlock,
           if (showActions) ...[
             if (hasSnapshot) ...[
@@ -222,10 +231,9 @@ class _HeroSurface extends StatelessWidget {
 
 /// Virtual IP with tap-to-copy (tooltip + lightweight snackbar).
 class _VirtualIpBlock extends StatelessWidget {
-  const _VirtualIpBlock({required this.virtualIp, required this.networkId});
+  const _VirtualIpBlock({required this.virtualIp});
 
   final String virtualIp;
-  final String networkId;
 
   @override
   Widget build(BuildContext context) {
@@ -280,19 +288,6 @@ class _VirtualIpBlock extends StatelessWidget {
                 ],
               ),
             ),
-          ),
-        ),
-        const SizedBox(height: AppTokens.space6),
-        Text(
-          '${strings.networkId}  ${dash(networkId)}',
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: theme.colorScheme.onSurfaceVariant,
-            fontSize: 11.5,
-            fontWeight: FontWeight.w500,
-            height: 1.2,
-            fontFeatures: AppTokens.tabularFontFeatures,
           ),
         ),
       ],
@@ -361,7 +356,7 @@ class _StaleNote extends StatelessWidget {
   }
 }
 
-/// Online / Direct / Relay — one quiet row, subtle dividers, no metric cards.
+/// Online / Direct / Relay — one quiet row, no metric cards or separators.
 class _HomeMetrics extends StatelessWidget {
   const _HomeMetrics({required this.counts});
 
@@ -377,13 +372,13 @@ class _HomeMetrics extends StatelessWidget {
           value: counts.online,
           label: strings.onlineDevices,
         ),
-        _MetricDivider(),
+        const SizedBox(width: AppTokens.space12),
         _MetricCell(
           key: const Key('dashboard-count-direct'),
           value: counts.direct,
           label: strings.direct,
         ),
-        _MetricDivider(),
+        const SizedBox(width: AppTokens.space12),
         _MetricCell(
           key: const Key('dashboard-count-relay'),
           value: counts.relay,
@@ -431,17 +426,6 @@ class _MetricCell extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _MetricDivider extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 1,
-      height: 30,
-      color: P2WlanColors.of(context).divider,
     );
   }
 }

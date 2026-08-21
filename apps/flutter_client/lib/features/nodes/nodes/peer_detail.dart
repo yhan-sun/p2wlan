@@ -48,6 +48,93 @@ class _DetailLine extends StatelessWidget {
   }
 }
 
+/// The two pieces of information needed to judge a connection stay together
+/// near the top of the detail surface. The first level remains quiet; opening
+/// a device is what reveals its path and verified latency.
+class _ConnectionSummary extends StatelessWidget {
+  const _ConnectionSummary({required this.peer, required this.strings});
+
+  final PeerSnapshot peer;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final metrics = [
+          _DetailMetric(
+            label: strings.connectionType,
+            value: _connectionLabel(strings, peer),
+          ),
+          _DetailMetric(
+            label: strings.latency,
+            value: formatLatency(peer.latencyMs),
+          ),
+        ];
+        if (constraints.maxWidth < 300) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              metrics[0],
+              const SizedBox(height: AppTokens.space12),
+              metrics[1],
+            ],
+          );
+        }
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: metrics[0]),
+            const SizedBox(width: AppTokens.space16),
+            Expanded(child: metrics[1]),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _DetailMetric extends StatelessWidget {
+  const _DetailMetric({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.2,
+          ),
+        ),
+        const SizedBox(height: AppTokens.space4),
+        Text(
+          value,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: theme.colorScheme.onSurface,
+            fontSize: 16,
+            fontWeight: FontWeight.w700,
+            height: 1.2,
+            fontFeatures: AppTokens.tabularFontFeatures,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 /// Shared device detail content used by the expanded detail pane, the medium
 /// dialog, and the compact full-screen detail. Common information first
 /// (connection, network), technical metadata behind the Advanced disclosure.
@@ -79,26 +166,13 @@ class _PeerDetailsContent extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _DetailHeader(peer: peer, strings: strings),
-        const SizedBox(height: AppTokens.space12),
-        const Divider(height: 1),
-        const SizedBox(height: AppTokens.space12),
-        _DetailSection(
-          title: strings.sectionConnection,
-          rows: [
-            _DetailLine(
-              label: strings.connectionType,
-              value: _connectionLabel(strings, peer),
-            ),
-            _DetailLine(
-              label: strings.latency,
-              value: formatLatency(peer.latencyMs),
-            ),
-            _DetailLine(label: strings.lastSeen, value: _formatLastSeen(peer)),
-          ],
-        ),
+        const SizedBox(height: AppTokens.space16),
+        _ConnectionSummary(peer: peer, strings: strings),
+        const SizedBox(height: AppTokens.space16),
         _DetailSection(
           title: strings.sectionNetwork,
           rows: [
+            _DetailLine(label: strings.lastSeen, value: _formatLastSeen(peer)),
             _DetailLine(label: strings.virtualIp, value: dash(peer.virtualIp)),
             _DetailLine(label: strings.endpoint, value: dash(peer.endpoint)),
             _DetailLine(label: strings.relay, value: dash(peer.relayServer)),
@@ -116,9 +190,7 @@ class _PeerDetailsContent extends StatelessWidget {
           copiedKey: copiedKey,
           onCopy: onCopy,
         ),
-        const SizedBox(height: AppTokens.space4),
-        const Divider(height: 1),
-        const SizedBox(height: AppTokens.space12),
+        const SizedBox(height: AppTokens.space8),
         _DetailActions(
           peer: peer,
           strings: strings,
@@ -198,18 +270,6 @@ class _DetailHeader extends StatelessWidget {
           overflow: TextOverflow.ellipsis,
           style: TextStyle(
             color: theme.colorScheme.onSurfaceVariant,
-            fontSize: 12.5,
-            fontWeight: FontWeight.w600,
-            fontFeatures: AppTokens.tabularFontFeatures,
-          ),
-        ),
-        const SizedBox(height: AppTokens.space4),
-        Text(
-          _pathSummaryLabel(strings, peer),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: theme.colorScheme.onSurface,
             fontSize: 12.5,
             fontWeight: FontWeight.w600,
             fontFeatures: AppTokens.tabularFontFeatures,
@@ -451,6 +511,12 @@ class _DetailActions extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (onCopy == null &&
+        onEdit == null &&
+        onDelete == null &&
+        onSpeedTest == null) {
+      return const SizedBox.shrink();
+    }
     final theme = Theme.of(context);
     final ipKey = '${peer.nodeId}:ip';
     final ipCopied = copiedKey == ipKey;
@@ -517,63 +583,8 @@ class _DetailActions extends StatelessWidget {
   }
 }
 
-/// Expanded-layout right-hand detail pane.
-class _PeerDetailPane extends StatelessWidget {
-  const _PeerDetailPane({
-    super.key,
-    required this.peer,
-    required this.strings,
-    this.copiedKey,
-    this.busyPeerId,
-    this.onCopy,
-    this.onEdit,
-    this.onDelete,
-    this.onSpeedTest,
-  });
-
-  final PeerSnapshot? peer;
-  final AppStrings strings;
-  final String? copiedKey;
-  final String? busyPeerId;
-  final Future<void> Function(String value, String key)? onCopy;
-  final Future<void> Function(PeerSnapshot peer)? onEdit;
-  final Future<bool> Function(PeerSnapshot peer)? onDelete;
-  final Future<void> Function(PeerSnapshot peer)? onSpeedTest;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final current = peer;
-    if (current == null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(AppTokens.space24),
-          child: Text(
-            strings.noSelectionHint,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontSize: 13,
-            ),
-          ),
-        ),
-      );
-    }
-    return _PeerDetailsContent(
-      peer: current,
-      strings: strings,
-      copiedKey: copiedKey,
-      busy: busyPeerId == current.nodeId,
-      onCopy: onCopy,
-      onEdit: onEdit,
-      onDelete: onDelete,
-      onSpeedTest: onSpeedTest,
-    );
-  }
-}
-
-/// Medium-layout detail dialog (also the desktop fallback from the actions
-/// menu). Shares the same content as the expanded pane and mobile detail.
+/// Detail dialog used by medium and wide layouts. Shares the same content as
+/// the compact full-screen detail.
 class _PeerDetailsDialog extends StatelessWidget {
   const _PeerDetailsDialog({
     required this.peer,
@@ -620,7 +631,6 @@ class _PeerDetailsDialog extends StatelessWidget {
           decoration: BoxDecoration(
             color: theme.colorScheme.surface,
             borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-            border: Border.all(color: theme.colorScheme.outlineVariant),
             boxShadow: AppTokens.shadowBorder,
           ),
           child: ClipRRect(
@@ -652,7 +662,6 @@ class _PeerDetailsDialog extends StatelessWidget {
                     ],
                   ),
                 ),
-                const Divider(height: 1),
                 Flexible(
                   child: SingleChildScrollView(
                     padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),

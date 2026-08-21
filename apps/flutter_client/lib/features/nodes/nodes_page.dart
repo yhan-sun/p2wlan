@@ -55,7 +55,6 @@ class _NodesPageState extends State<NodesPage> {
   final _searchFocusNode = FocusNode();
   var _filter = _NodeFilter.all;
   var _sort = _NodeSort.recommended;
-  String? _selectedPeerId;
   String? _copiedKey;
   String? _busyPeerId;
 
@@ -91,10 +90,6 @@ class _NodesPageState extends State<NodesPage> {
     final before = _hiddenPeerIds.length;
     _hiddenPeerIds.removeWhere((nodeId) => !currentPeerIds.contains(nodeId));
     var changed = _hiddenPeerIds.length != before;
-    if (_selectedPeerId != null && !currentPeerIds.contains(_selectedPeerId)) {
-      _selectedPeerId = null;
-      changed = true;
-    }
     if (changed) setState(() {});
   }
 
@@ -128,7 +123,9 @@ class _NodesPageState extends State<NodesPage> {
               _applySearch(allPeers, query),
               _sort,
             ).where((peer) => _filterMatches(_filter, peer)).toList();
-            final selectedPeer = _resolveSelectedPeer(visiblePeers);
+            final peerTransferRates = widget.statusStore.snapshotStale
+                ? const <String, int>{}
+                : widget.statusStore.peerTransferRatesBytesPerSecond;
             final settings = widget.settingsStore.settings;
             return PageScaffold(
               title: stringsOf(context).nodes,
@@ -213,54 +210,10 @@ class _NodesPageState extends State<NodesPage> {
                                 AppBreakpoints.compactMaxWidth
                           ? _NodesLayout.compact
                           : _NodesLayout.medium;
-                      if (layout == _NodesLayout.expanded) {
-                        return Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Expanded(
-                              flex: 6,
-                              child: _PeerList(
-                                peers: visiblePeers,
-                                selectedPeerId: selectedPeer?.nodeId,
-                                copiedKey: _copiedKey,
-                                busyPeerId: _busyPeerId,
-                                compact: false,
-                                onCopy: _copy,
-                                onEdit: _editPeer,
-                                onDelete: _deletePeer,
-                                onSpeedTest: _showSpeedTest,
-                                onTap: (peer) => _openPeer(peer, layout),
-                              ),
-                            ),
-                            const VerticalDivider(width: 1),
-                            const SizedBox(width: AppTokens.space12),
-                            Expanded(
-                              flex: 4,
-                              child: _PeerDetailPane(
-                                key: const Key('nodes-detail-pane'),
-                                peer: selectedPeer,
-                                strings: stringsOf(context),
-                                copiedKey: _copiedKey,
-                                busyPeerId: _busyPeerId,
-                                onCopy: _copy,
-                                onEdit: _editPeer,
-                                onDelete: _deletePeer,
-                                onSpeedTest: _showSpeedTest,
-                              ),
-                            ),
-                          ],
-                        );
-                      }
                       return _PeerList(
                         peers: visiblePeers,
-                        selectedPeerId: null,
-                        copiedKey: _copiedKey,
-                        busyPeerId: _busyPeerId,
+                        peerTransferRates: peerTransferRates,
                         compact: layout == _NodesLayout.compact,
-                        onCopy: _copy,
-                        onEdit: _editPeer,
-                        onDelete: _deletePeer,
-                        onSpeedTest: _showSpeedTest,
                         onTap: (peer) => _openPeer(peer, layout),
                       );
                     },
@@ -273,30 +226,8 @@ class _NodesPageState extends State<NodesPage> {
     );
   }
 
-  /// Derived selection: the effective detail peer must always belong to the
-  /// current search/filter results. `_selectedPeerId` stays as a persistent
-  /// preference so clearing the filter can restore it, but a hidden peer is
-  /// never rendered as selected.
-  PeerSnapshot? _resolveSelectedPeer(List<PeerSnapshot> visiblePeers) {
-    final id = _selectedPeerId;
-    if (id != null) {
-      for (final peer in visiblePeers) {
-        if (peer.nodeId == id) return peer;
-      }
-    }
-    return visiblePeers.isEmpty ? null : visiblePeers.first;
-  }
-
   void _openPeer(PeerSnapshot peer, _NodesLayout layout) {
-    setState(() => _selectedPeerId = peer.nodeId);
-    switch (layout) {
-      case _NodesLayout.expanded:
-        break;
-      case _NodesLayout.medium:
-        _showPeerDetails(peer, mobile: false);
-      case _NodesLayout.compact:
-        _showPeerDetails(peer, mobile: true);
-    }
+    _showPeerDetails(peer, mobile: layout == _NodesLayout.compact);
   }
 
   Future<void> _copy(String value, String key) async {
@@ -651,3 +582,26 @@ class _NodesPageState extends State<NodesPage> {
 }
 
 AppStrings stringsOf(BuildContext context) => AppStringsScope.of(context);
+
+/// Opens the same read-only device detail surface used by the Home preview.
+/// Keeping this entry point next to the detail widgets avoids navigating to
+/// the Devices section just to inspect one peer.
+Future<void> showPeerDetailsSurface(
+  BuildContext context,
+  PeerSnapshot peer,
+) async {
+  final strings = stringsOf(context);
+  if (MediaQuery.sizeOf(context).width < AppBreakpoints.compactMaxWidth) {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        fullscreenDialog: true,
+        builder: (_) => _MobilePeerDetails(peer: peer, strings: strings),
+      ),
+    );
+    return;
+  }
+  await showDialog<void>(
+    context: context,
+    builder: (_) => _PeerDetailsDialog(peer: peer, strings: strings),
+  );
+}

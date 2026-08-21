@@ -200,8 +200,17 @@ class SettingsStore extends ChangeNotifier {
   /// Persist that the local-node onboarding flow is complete. Idempotent.
   Future<void> markOnboardingCompleted() async {
     if (_settings.onboardingCompleted) return;
-    _settings = _settings.copyWith(onboardingCompleted: true);
-    await _save();
+    final previous = _settings;
+    _settings = previous.copyWith(onboardingCompleted: true);
+    try {
+      await _save();
+    } catch (_) {
+      // Do not leave the in-memory state ahead of disk. Otherwise a failed
+      // completion can appear to succeed on the next tap but will reappear
+      // after the next app restart.
+      _settings = previous;
+      rethrow;
+    }
     notifyListeners();
   }
 

@@ -176,6 +176,26 @@ void main() {
     },
   );
 
+  test('relay peer latency falls back to remote relay RTT', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'relay-peer',
+      'device_name': 'relay-device',
+      'virtual_ip': '10.20.0.50',
+      'online': true,
+      'state': 'relay',
+      'active_path': 'relay',
+      'direct_type': 'relay',
+      'is_relay': true,
+      'remote_relay_latency_ms': 38,
+      'relay_confirmed_endpoint': 'relay.test:443',
+      'relay_confirmed_generation': 1,
+      'direct': <String, dynamic>{},
+      'relay': <String, dynamic>{},
+    });
+
+    expect(peer.latencyMs, 38);
+  });
+
   test('network generation refresh is not surfaced as peer error', () {
     final peer = PeerSnapshot.fromJson({
       'node_id': 'relay-peer',

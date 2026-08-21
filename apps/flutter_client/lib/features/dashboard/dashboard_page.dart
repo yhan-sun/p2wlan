@@ -11,7 +11,6 @@ import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
-import '../../shared/layout/app_breakpoints.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 
@@ -34,6 +33,7 @@ class DashboardPage extends StatelessWidget {
     this.showHeader = true,
     this.capabilities,
     this.onOpenDevices,
+    this.onOpenPeer,
     this.onOpenTroubleshooting,
   });
 
@@ -47,6 +47,9 @@ class DashboardPage extends StatelessWidget {
 
   /// Opens the Devices section (supplied by the shell).
   final VoidCallback? onOpenDevices;
+
+  /// Opens one device's detail surface directly from the Home preview.
+  final ValueChanged<PeerSnapshot>? onOpenPeer;
 
   /// Opens Troubleshooting for a reported issue (supplied by the shell).
   final VoidCallback? onOpenTroubleshooting;
@@ -73,6 +76,9 @@ class DashboardPage extends StatelessWidget {
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);
         final overviewPeers = _topOverviewPeers(peers);
+        final peerTransferRates = statusStore.snapshotStale
+            ? const <String, int>{}
+            : statusStore.peerTransferRatesBytesPerSecond;
         final issueMessage = _dashboardIssueMessage(
           strings: strings,
           daemonAvailable: daemonAvailable,
@@ -120,45 +126,18 @@ class DashboardPage extends StatelessWidget {
             ],
             if (snapshot != null) ...[
               const SizedBox(height: AppTokens.space20),
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  if (constraints.maxWidth >= AppBreakpoints.expandedMinWidth) {
-                    return Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          flex: 2,
-                          child: _OnlineDevicesSection(
-                            peers: overviewPeers,
-                            onOpenDevices: onOpenDevices,
-                          ),
-                        ),
-                        const SizedBox(width: AppTokens.space16),
-                        Expanded(
-                          flex: 1,
-                          child: _NetworkComponentsSection(
-                            snapshot: snapshot,
-                            counts: counts,
-                          ),
-                        ),
-                      ],
-                    );
-                  }
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _OnlineDevicesSection(
-                        peers: overviewPeers,
-                        onOpenDevices: onOpenDevices,
-                      ),
-                      const SizedBox(height: AppTokens.space20),
-                      _NetworkComponentsSection(
-                        snapshot: snapshot,
-                        counts: counts,
-                      ),
-                    ],
-                  );
-                },
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _OnlineDevicesSection(
+                    peers: overviewPeers,
+                    peerTransferRates: peerTransferRates,
+                    onOpenDevices: onOpenDevices,
+                    onOpenPeer: onOpenPeer,
+                  ),
+                  const SizedBox(height: AppTokens.space20),
+                  _NetworkComponentsSection(snapshot: snapshot, counts: counts),
+                ],
               ),
             ],
             if (manualCommand != null) ...[

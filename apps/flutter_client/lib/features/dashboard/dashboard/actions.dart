@@ -2,7 +2,7 @@ part of '../dashboard_page.dart';
 
 /// Daemon recovery actions. Weight follows state: Start is the primary action
 /// only when the daemon is stopped and locally controllable; a healthy
-/// network gets only a secondary Stop plus refresh. Never two equal-weight
+/// network gets only a compact secondary Stop action. Never two equal-weight
 /// buttons, and no fake "connected" primary.
 class _HomeActions extends StatelessWidget {
   const _HomeActions({
@@ -30,6 +30,7 @@ class _HomeActions extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
+    final colors = P2WlanColors.of(context);
     final busy = daemonBusy || refreshing;
 
     final Widget start = FilledButton.icon(
@@ -41,30 +42,27 @@ class _HomeActions extends StatelessWidget {
       label: Text(daemonBusy ? strings.daemonWorking : strings.startP2wlan),
     );
 
-    final Widget stop =
-        (status == _NetworkStatus.healthy ||
-            status == _NetworkStatus.degraded ||
-            status == _NetworkStatus.stale)
-        ? TextButton.icon(
-            key: const Key('dashboard-stop-button'),
-            onPressed: daemonBusy ? null : onStopDaemon,
-            icon: daemonBusy
-                ? const _TextSpinner()
-                : const Icon(Icons.stop_rounded, size: 17),
-            label: Text(
-              daemonBusy ? strings.daemonWorking : strings.stopP2wlan,
-            ),
-          )
-        : OutlinedButton.icon(
-            key: const Key('dashboard-stop-button'),
-            onPressed: daemonBusy ? null : onStopDaemon,
-            icon: daemonBusy
-                ? const _ButtonSpinner()
-                : const Icon(Icons.stop_rounded, size: 17),
-            label: Text(
-              daemonBusy ? strings.daemonWorking : strings.stopP2wlan,
-            ),
-          );
+    // Stop is destructive but common enough to remain visible. A compact
+    // tinted outline gives it a clear danger signal without making it look
+    // like the primary action for a healthy network.
+    final Widget stop = OutlinedButton.icon(
+      key: const Key('dashboard-stop-button'),
+      onPressed: daemonBusy ? null : onStopDaemon,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: colors.dangerText,
+        backgroundColor: colors.dangerSurface,
+        side: BorderSide(color: colors.dangerBorder),
+        minimumSize: const Size(0, 40),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+        ),
+      ),
+      icon: daemonBusy
+          ? _ButtonSpinner(color: colors.dangerText)
+          : const Icon(Icons.stop_rounded, size: 17),
+      label: Text(daemonBusy ? strings.daemonWorking : strings.stopP2wlan),
+    );
 
     final Widget checkAgain = OutlinedButton.icon(
       key: const Key('dashboard-check-button'),
@@ -108,12 +106,14 @@ class _HomeActions extends StatelessWidget {
     final actions = switch (status) {
       _NetworkStatus.stopped when canControlLocalDaemon => [start, refresh],
       _NetworkStatus.stopped || _NetworkStatus.unavailable => [checkAgain],
-      // Healthy: the shell already owns refresh; only Stop stays as a quiet
-      // secondary action. Degraded / stale keep an inline refresh because it
-      // is a contextual recovery action there.
+      // Healthy: the shell already owns refresh; only the red Stop action
+      // remains. Degraded / stale keep an inline refresh because it is a
+      // contextual recovery action there.
       _NetworkStatus.healthy => [if (canControlLocalDaemon) stop],
       _ => [if (canControlLocalDaemon) stop, refresh],
     };
+
+    if (actions.isEmpty) return const SizedBox.shrink();
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -140,20 +140,10 @@ class _HomeActions extends StatelessWidget {
   }
 }
 
-class _TextSpinner extends StatelessWidget {
-  const _TextSpinner();
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox.square(
-      dimension: 14,
-      child: CircularProgressIndicator(strokeWidth: 2),
-    );
-  }
-}
-
 class _ButtonSpinner extends StatelessWidget {
-  const _ButtonSpinner();
+  const _ButtonSpinner({this.color});
+
+  final Color? color;
 
   @override
   Widget build(BuildContext context) {
@@ -162,7 +152,7 @@ class _ButtonSpinner extends StatelessWidget {
       child: CircularProgressIndicator(
         strokeWidth: 2,
         valueColor: AlwaysStoppedAnimation<Color>(
-          Theme.of(context).colorScheme.onPrimary,
+          color ?? Theme.of(context).colorScheme.onPrimary,
         ),
       ),
     );
