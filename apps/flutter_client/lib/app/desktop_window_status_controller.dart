@@ -18,7 +18,7 @@ class DesktopWindowStatusController {
   bool _updateRequested = false;
   Future<void>? _updateInFlight;
   String? _lastTitle;
-  String? _lastDockBadge;
+  bool _macosDockBadgeCleared = false;
 
   static bool get isSupported {
     return !kIsWeb &&
@@ -76,13 +76,10 @@ class DesktopWindowStatusController {
   Future<void> _update() async {
     final title = taskbarTitleForTesting();
     final shouldUpdateTitle = _lastTitle != title;
-    final badge = defaultTargetPlatform == TargetPlatform.macOS
-        ? dockBadgeForTesting()
-        : '';
-    final shouldUpdateBadge =
+    final shouldClearMacosDockBadge =
         defaultTargetPlatform == TargetPlatform.macOS &&
-        _lastDockBadge != badge;
-    if (!shouldUpdateTitle && !shouldUpdateBadge) return;
+        !_macosDockBadgeCleared;
+    if (!shouldUpdateTitle && !shouldClearMacosDockBadge) return;
 
     try {
       await DesktopWindowOperations.run(() async {
@@ -90,15 +87,18 @@ class DesktopWindowStatusController {
           await windowManager.setTitle(title);
           _lastTitle = title;
         }
-        if (shouldUpdateBadge) {
-          await windowManager.setBadgeLabel(badge.isEmpty ? null : badge);
-          _lastDockBadge = badge;
+        if (shouldClearMacosDockBadge) {
+          // Keep the macOS Dock icon free of live metric badges. This also
+          // removes a badge persisted by a previous client version.
+          await windowManager.setBadgeLabel();
+          _macosDockBadgeCleared = true;
         }
       });
     } catch (error) {
       if (shouldUpdateTitle) {
         debugPrint('Failed to update P2WLAN desktop title: $error');
-      } else {
+      }
+      if (shouldClearMacosDockBadge) {
         debugPrint('Failed to update P2WLAN Dock badge: $error');
       }
     }
@@ -109,20 +109,6 @@ class DesktopWindowStatusController {
     final snapshot = _metricsSnapshot;
     if (snapshot == null) return p2wlanAppName;
     return '$p2wlanAppName · ${formatLatency(_averageLatency(snapshot))} · ${formatTransferRate(_aggregateSpeed(snapshot))}';
-  }
-
-  @visibleForTesting
-  String dockBadgeForTesting() {
-    final snapshot = _metricsSnapshot;
-    if (snapshot == null) return '';
-    final latency = _averageLatency(snapshot);
-    final speed = _aggregateSpeed(snapshot);
-    if (latency == null && speed == null) return '';
-    final latencyLabel = latency == null ? '—' : '${latency}ms';
-    final speedLabel = speed == null
-        ? '—'
-        : formatTransferRate(speed).replaceAll(' ', '');
-    return '$latencyLabel/$speedLabel';
   }
 
   DiagnosticsSnapshot? get _metricsSnapshot {

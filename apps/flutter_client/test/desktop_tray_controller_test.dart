@@ -93,7 +93,10 @@ void main() {
     );
 
     expect(controller.trayTitleForTesting(), 'P2WLAN');
-    expect(controller.dockBadgeForTesting(), isEmpty);
+    expect(
+      controller.trayTitleForPlatformForTesting(),
+      Platform.isMacOS ? isEmpty : 'P2WLAN',
+    );
   });
 
   test('desktop tray title includes verified latency', () async {
@@ -112,7 +115,10 @@ void main() {
 
     expect(controller.trayTitleForTesting(), contains('34 ms'));
     expect(controller.trayTitleForTesting(), contains('—'));
-    expect(controller.dockBadgeForTesting(), '34ms/—');
+    expect(
+      controller.trayTitleForPlatformForTesting(),
+      Platform.isMacOS ? isEmpty : contains('34 ms'),
+    );
   });
 
   test('desktop taskbar status includes verified latency', () async {
@@ -129,8 +135,51 @@ void main() {
     );
 
     expect(controller.taskbarTitleForTesting(), contains('34 ms'));
-    expect(controller.dockBadgeForTesting(), '34ms/—');
   });
+
+  test(
+    'desktop tray lists every online device and hides offline devices',
+    () async {
+      final snapshot = await _loadFixtureSnapshot();
+      final raw = jsonDecode(snapshot.prettyJson) as Map<String, dynamic>;
+      final peerMaps = [
+        for (final peer in raw['peers'] as List<dynamic>)
+          Map<String, dynamic>.from(peer as Map),
+      ];
+
+      peerMaps[1]['online'] = false;
+      for (var index = 0; index < 12; index++) {
+        final extra = Map<String, dynamic>.from(peerMaps.first);
+        extra['node_id'] = 'peer-extra-${index + 1}';
+        extra['device_name'] = 'extra-${index + 1}';
+        extra['virtual_ip'] = '10.20.1.${index + 1}';
+        peerMaps.add(extra);
+      }
+      raw['peers'] = peerMaps;
+      (raw['stats'] as Map<String, dynamic>)['total_peers'] = peerMaps.length;
+
+      final stores = await _makeStores(
+        api: _FakeDiagnosticsApi(snapshot: DiagnosticsSnapshot.fromJson(raw)),
+      );
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+
+      final labels = _labels(
+        DesktopTrayController(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      );
+      final deviceLabels = labels
+          .where((label) => label.contains(' · 10.20.'))
+          .toList();
+
+      expect(deviceLabels, hasLength(13));
+      expect(labels, contains('direct-laptop · 10.20.0.11'));
+      expect(labels, contains('extra-12 · 10.20.1.12'));
+      expect(labels, isNot(contains('relay-nas · 10.20.0.12')));
+    },
+  );
 
   test(
     'desktop tray icon exposes healthy state without opening the menu',
