@@ -188,7 +188,9 @@ class _ReadyDiagnosticsApi extends _OfflineDiagnosticsApi {
 }
 
 /// A daemon controller whose start/stop always succeed (no real binary needed).
-class _FakeDaemonController implements DaemonController {
+class _FakeDaemonController extends DaemonController {
+  _FakeDaemonController() : super(diagnosticsApi: DiagnosticsApi());
+
   @override
   Future<DaemonCommandResult> start(AppSettings settings) async {
     return const DaemonCommandResult(ok: true, message: 'started');

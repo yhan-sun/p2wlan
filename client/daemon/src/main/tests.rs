@@ -48,6 +48,7 @@ use super::*;
             proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
+            diagnostics_client_sid: None,
             log_file: None,
         }
     }
@@ -159,6 +160,7 @@ use super::*;
             proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
+            diagnostics_client_sid: None,
             log_file: None,
         };
 
@@ -228,6 +230,7 @@ use super::*;
             proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
+            diagnostics_client_sid: None,
             log_file: None,
         };
 
@@ -364,6 +367,7 @@ use super::*;
             proxy_mode: None,
             device_name: None,
             diagnostics_url: None,
+            diagnostics_client_sid: None,
             log_file: None,
         };
 
@@ -463,7 +467,8 @@ use super::*;
 
         let first_lock = DaemonInstanceLock::acquire(&config_path).unwrap();
         let mut first_config = diagnostics_test_config(&directory);
-        let first_guard = DiagnosticsAuthGuard::prepare(&mut first_config, &config_path)
+        let first_guard =
+            DiagnosticsAuthGuard::prepare(&mut first_config, &config_path, None)
             .unwrap()
             .expect("diagnostics enabled");
         let auth_path = first_guard.path.clone();
@@ -488,7 +493,7 @@ use super::*;
 
         let mut config = diagnostics_test_config(&directory);
         let path = {
-            let guard = DiagnosticsAuthGuard::prepare(&mut config, &config_path)
+            let guard = DiagnosticsAuthGuard::prepare(&mut config, &config_path, None)
                 .unwrap()
                 .expect("diagnostics enabled");
             let path = guard.path.clone();
@@ -505,7 +510,7 @@ use super::*;
         let mut config = diagnostics_test_config(&directory);
         let path = directory.join("p2wlan-daemon.diag-auth");
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = DiagnosticsAuthGuard::prepare(&mut config, &config_path)
+            let _guard = DiagnosticsAuthGuard::prepare(&mut config, &config_path, None)
                 .unwrap()
                 .expect("diagnostics enabled");
             assert!(path.exists());
@@ -527,7 +532,7 @@ use super::*;
         std::fs::write(&config_path, b"{}").unwrap();
 
         let mut config = diagnostics_test_config(&invalid_parent);
-        let result = DiagnosticsAuthGuard::prepare(&mut config, &config_path);
+        let result = DiagnosticsAuthGuard::prepare(&mut config, &config_path, None);
         assert!(result.is_err());
         assert!(config.diagnostics.auth_token.is_none());
         assert!(config.diagnostics.auth_token_path.is_none());
@@ -594,7 +599,7 @@ use super::*;
         config: &mut Config,
         config_path: &std::path::Path,
     ) -> (p2pnet_daemon::Result<()>, std::path::PathBuf) {
-        let guard = DiagnosticsAuthGuard::prepare(config, config_path)
+        let guard = DiagnosticsAuthGuard::prepare(config, config_path, None)
             .unwrap()
             .expect("diagnostics enabled");
         let path = guard.path.clone();

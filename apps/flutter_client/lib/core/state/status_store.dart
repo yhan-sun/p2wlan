@@ -23,7 +23,13 @@ class StatusStore extends ChangeNotifier {
     this.routeVerificationInterval = Duration.zero,
   }) : daemonController =
            daemonController ??
-           DaemonController(diagnosticsApi: diagnosticsApi) {
+           DaemonController(
+             diagnosticsApi: diagnosticsApi,
+             readMacosAdminPassword: () =>
+                 settingsStore.settings.macosAdminPassword,
+             saveMacosAdminPassword: settingsStore.updateMacosAdminPassword,
+             clearMacosAdminPassword: settingsStore.clearMacosAdminPassword,
+           ) {
     _lastDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
     settingsStore.addListener(_handleSettingsChanged);
   }

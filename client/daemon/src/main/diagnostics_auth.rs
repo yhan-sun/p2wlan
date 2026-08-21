@@ -17,6 +17,7 @@ impl DiagnosticsAuthGuard {
     fn prepare(
         config: &mut Config,
         config_path: &AuthPath,
+        diagnostics_client_sid: Option<&str>,
     ) -> p2pnet_daemon::Result<Option<Self>> {
         if !config.diagnostics.enabled {
             return Ok(None);
@@ -56,7 +57,7 @@ impl DiagnosticsAuthGuard {
             let mut file = options.open(&temp_path)?;
             file.write_all(token.as_bytes())?;
             file.flush()?;
-            restrict_auth_file(&temp_path)?;
+            restrict_auth_file(&temp_path, diagnostics_client_sid)?;
             file.sync_all()?;
             drop(file);
 
@@ -70,7 +71,7 @@ impl DiagnosticsAuthGuard {
                 Err(error) => return Err(error),
             }
             auth_fs::rename(&temp_path, &path)?;
-            if let Err(error) = restrict_auth_file(&path) {
+            if let Err(error) = restrict_auth_file(&path, diagnostics_client_sid) {
                 let _ = auth_fs::remove_file(&path);
                 return Err(error);
             }
@@ -111,7 +112,10 @@ impl Drop for DiagnosticsAuthGuard {
 }
 
 #[cfg(unix)]
-fn restrict_auth_file(path: &AuthPath) -> std::io::Result<()> {
+fn restrict_auth_file(
+    path: &AuthPath,
+    _diagnostics_client_sid: Option<&str>,
+) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = auth_fs::metadata(path)?.permissions();
@@ -120,14 +124,21 @@ fn restrict_auth_file(path: &AuthPath) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn restrict_auth_file(path: &AuthPath) -> std::io::Result<()> {
-    let username = std::env::var("USERNAME").map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "USERNAME is unavailable; refusing an unprotected diagnostics auth file",
-        )
-    })?;
-    let account = format!(r"{username}:F");
+fn restrict_auth_file(
+    path: &AuthPath,
+    diagnostics_client_sid: Option<&str>,
+) -> std::io::Result<()> {
+    let daemon_sid = current_windows_sid()?;
+    let mut grants = vec![
+        format!("*{daemon_sid}:F"),
+        "*S-1-5-32-544:F".to_string(),
+    ];
+    if let Some(client_sid) = diagnostics_client_sid.filter(|sid| is_windows_sid(sid)) {
+        let grant = format!("*{client_sid}:F");
+        if !grants.contains(&grant) {
+            grants.push(grant);
+        }
+    }
     use std::os::windows::process::CommandExt;
 
     // The daemon is normally launched from the GUI and has no console of its
@@ -137,14 +148,14 @@ fn restrict_auth_file(path: &AuthPath) -> std::io::Result<()> {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut command = std::process::Command::new("icacls");
     command.creation_flags(CREATE_NO_WINDOW);
-    let status = command
-        .args([
-            path.as_os_str(),
-            std::ffi::OsStr::new("/inheritance:r"),
-            std::ffi::OsStr::new("/grant:r"),
-            account.as_ref(),
-        ])
-        .status()?;
+    command
+        .arg(path.as_os_str())
+        .arg("/inheritance:r")
+        .arg("/grant:r");
+    for grant in &grants {
+        command.arg(grant);
+    }
+    let status = command.status()?;
     if status.success() {
         Ok(())
     } else {
@@ -153,4 +164,46 @@ fn restrict_auth_file(path: &AuthPath) -> std::io::Result<()> {
             format!("icacls exited with {status}"),
         ))
     }
+}
+
+#[cfg(windows)]
+fn current_windows_sid() -> std::io::Result<String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let output = std::process::Command::new("powershell.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "could not resolve the Windows daemon SID",
+        ));
+    }
+    let sid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if is_windows_sid(&sid) {
+        Ok(sid)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Windows returned an invalid daemon SID",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_sid(value: &str) -> bool {
+    let mut parts = value.split('-');
+    matches!(parts.next(), Some("S"))
+        && parts.next().is_some_and(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        && parts.all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }

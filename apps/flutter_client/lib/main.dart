@@ -65,6 +65,11 @@ bool get _enableFlutterTray {
 @visibleForTesting
 bool enableFlutterTrayForEnvironment(Map<String, String> environment) {
   final value = environment['P2WLAN_ENABLE_FLUTTER_TRAY']?.trim().toLowerCase();
-  if (value == null || value.isEmpty) return false;
+  // The Flutter tray is the tray implementation that is actually bundled
+  // with the desktop release app. The standalone Rust tray remains useful for
+  // low-memory/headless experiments, but it is not launched by the packaged
+  // macOS/Windows/Linux client. Keep the release path visible by default and
+  // allow developers to opt out explicitly when running the native tray.
+  if (value == null || value.isEmpty) return true;
   return value != '0' && value != 'false' && value != 'no' && value != 'off';
 }

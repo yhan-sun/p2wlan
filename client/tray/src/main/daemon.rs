@@ -100,24 +100,12 @@ fn start_daemon() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "macos")]
-const MACOS_ADMIN_KEYCHAIN_SERVICE: &str = "com.p2wlan.client.macos-admin";
-
-#[cfg(target_os = "macos")]
-const MACOS_ADMIN_KEYCHAIN_ACCOUNT: &str = "p2wlan-daemon";
-
-#[cfg(target_os = "macos")]
 fn macos_admin_password() -> Result<Vec<u8>, Box<dyn Error>> {
-    let keychain = SecKeychain::default()?;
-    if let Ok((password, _item)) = keychain.find_generic_password(
-        MACOS_ADMIN_KEYCHAIN_SERVICE,
-        MACOS_ADMIN_KEYCHAIN_ACCOUNT,
-    ) {
-        if !password.is_empty() {
-            return Ok(password.as_ref().to_vec());
-        }
-    }
-
-    let script = r#"text returned of (display dialog "P2WLAN 需要管理员密码来创建虚拟网卡。首次输入后会加密保存在 macOS 登录钥匙串中。" default answer "" with hidden answer buttons {"取消", "保存并继续"} default button "保存并继续" cancel button "取消")"#;
+    // The standalone native tray is an opt-in experiment. Keep its
+    // credential lifetime limited to this start operation instead of calling
+    // Keychain or writing a plaintext password. The normal Flutter client
+    // owns the encrypted local-config flow.
+    let script = r#"text returned of (display dialog "P2WLAN 需要管理员密码来创建虚拟网卡。本次启动不会保存密码；常规客户端会将密码加密保存在本地配置文件中。" default answer "" with hidden answer buttons {"取消", "继续"} default button "继续" cancel button "取消")"#;
     let output = Command::new("/usr/bin/osascript")
         .args(["-e", script])
         .output()?;
@@ -136,24 +124,7 @@ fn macos_admin_password() -> Result<Vec<u8>, Box<dyn Error>> {
     if password.is_empty() {
         return Err("administrator password is empty".into());
     }
-    keychain.set_generic_password(
-        MACOS_ADMIN_KEYCHAIN_SERVICE,
-        MACOS_ADMIN_KEYCHAIN_ACCOUNT,
-        &password,
-    )?;
     Ok(password)
-}
-
-#[cfg(target_os = "macos")]
-fn clear_macos_admin_password() {
-    if let Ok(keychain) = SecKeychain::default() {
-        if let Ok((_password, item)) = keychain.find_generic_password(
-            MACOS_ADMIN_KEYCHAIN_SERVICE,
-            MACOS_ADMIN_KEYCHAIN_ACCOUNT,
-        ) {
-            item.delete();
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -188,9 +159,8 @@ fn run_macos_elevated(command: &str) -> Result<(), Box<dyn Error>> {
         return Err("administrator launch failed".into());
     }
 
-    // The saved password may have changed outside P2WLAN. Replace it once;
-    // never loop on a bad credential or keep showing prompts indefinitely.
-    clear_macos_admin_password();
+    // The password is intentionally not persisted by this optional native
+    // tray, so one retry means one fresh prompt and never an endless loop.
     password = macos_admin_password()?;
     let (success, _) = run_macos_sudo_once(command, &password)?;
     if success {

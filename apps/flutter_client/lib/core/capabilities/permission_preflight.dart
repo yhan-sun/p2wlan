@@ -6,6 +6,7 @@
 // never from an in-memory boolean or an optimistic click. The daemon start
 // itself is the authoritative elevation grant: once the daemon is reachable
 // with a TUN, permission is real regardless of what this static probe reports.
+import 'dart:async';
 import 'dart:io';
 
 /// One real permission check (label + status + human detail).
@@ -97,7 +98,7 @@ class PermissionPreflight {
 
 /// Run the live permission preflight for the current platform.
 Future<PermissionPreflight> runPermissionPreflight() async {
-  if (Platform.isWindows) return _checkWindowsPermissions();
+  if (Platform.isWindows) return await _checkWindowsPermissions();
   if (Platform.isLinux) return _checkLinuxPermissions();
   if (Platform.isMacOS) return _checkMacosPermissions();
   if (Platform.isAndroid) {
@@ -155,7 +156,7 @@ PermissionPreflight _checkMacosPermissions() {
     reasonCode: isRoot ? 'tun_runtime_verification' : 'elevation_required',
     message: isRoot
         ? '已获得 root 权限；macOS utun 创建需要 daemon 运行时验证。'
-        : '需要管理员授权启动 TUN；首次输入后密码会加密保存在 macOS 登录钥匙串中。',
+        : '需要管理员授权启动 TUN；首次输入后密码会加密保存在本地配置文件中。',
     sudoCommand: isRoot ? null : _suggestedSudoCommand(),
     checks: [
       PermissionCheck(
@@ -236,8 +237,8 @@ PermissionPreflight _checkLinuxPermissions() {
   );
 }
 
-PermissionPreflight _checkWindowsPermissions() {
-  final isAdmin = _isWindowsAdministrator();
+Future<PermissionPreflight> _checkWindowsPermissions() async {
+  final isAdmin = await _isWindowsAdministrator();
   final wintun = _findWintunDll();
   return PermissionPreflight(
     platform: 'Windows',
@@ -287,14 +288,15 @@ int? _effectiveUserId() {
   }
 }
 
-bool _isWindowsAdministrator() {
+Future<bool> _isWindowsAdministrator() async {
   if (!Platform.isWindows) return false;
+  Process? process;
   try {
     final windir = Platform.environment['WINDIR']?.trim();
     final executable = windir == null || windir.isEmpty
         ? 'powershell.exe'
         : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-    final result = Process.runSync(executable, [
+    process = await Process.start(executable, [
       '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
@@ -304,9 +306,19 @@ bool _isWindowsAdministrator() {
       'Bypass',
       '-Command',
       '[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
-    ]);
-    return result.exitCode == 0 &&
-        result.stdout.toString().trim().toLowerCase() == 'true';
+    ], mode: ProcessStartMode.detachedWithStdio);
+    final output = await Future.wait<Object>([
+      process.stdout.transform(systemEncoding.decoder).join(),
+      process.stderr.transform(systemEncoding.decoder).join(),
+      process.exitCode,
+    ]).timeout(const Duration(seconds: 5));
+    return output[2] == 0 &&
+        (output[0] as String).trim().toLowerCase() == 'true';
+  } on TimeoutException {
+    try {
+      process?.kill();
+    } catch (_) {}
+    return false;
   } catch (_) {
     return false;
   }

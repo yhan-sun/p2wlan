@@ -2,11 +2,48 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/security/local_config_secret.dart';
 import 'package:p2wlan_flutter_client/core/security/redactor.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 
 void main() {
+  group('LocalConfigSecret', () {
+    test('round-trips without writing the plaintext to disk', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_admin_secret_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final keyFile = File('${tmp.path}/settings.json.key');
+
+      final encoded = await LocalConfigSecret.encrypt(
+        'admin-password-42',
+        keyFile: keyFile,
+      );
+
+      expect(encoded, startsWith('p2wlan-config-v1:'));
+      expect(encoded, isNot(contains('admin-password-42')));
+      expect(
+        await LocalConfigSecret.decrypt(encoded, keyFile: keyFile),
+        'admin-password-42',
+      );
+    });
+
+    test('rejects a modified local ciphertext', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_admin_secret_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final keyFile = File('${tmp.path}/settings.json.key');
+      final encoded = await LocalConfigSecret.encrypt(
+        'admin-password-42',
+        keyFile: keyFile,
+      );
+      final changed = '${encoded}x';
+
+      expect(
+        () => LocalConfigSecret.decrypt(changed, keyFile: keyFile),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
+
   group('LocalTokenRepository', () {
     test('round-trips and clears a local token file', () async {
       final tmp = await Directory.systemTemp.createTemp('p2wlan_local_token_');
@@ -103,6 +140,40 @@ void main() {
   );
 
   group('SettingsStore token handling', () {
+    test(
+      'persists the macOS administrator password only as ciphertext',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_admin_settings_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final settingsFile = File('${tmp.path}/settings.json');
+        final tokenRepository = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: tokenRepository,
+        );
+        await store.load();
+        await store.updateMacosAdminPassword('admin-password-42');
+
+        final raw = await settingsFile.readAsString();
+        expect(raw, isNot(contains('admin-password-42')));
+        expect(
+          (jsonDecode(raw)
+              as Map<String, dynamic>)['macosAdminPasswordCiphertext'],
+          startsWith('p2wlan-config-v1:'),
+        );
+        expect(await File('${settingsFile.path}.key').exists(), isTrue);
+
+        final restored = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: tokenRepository,
+        );
+        await restored.load();
+        expect(restored.settings.macosAdminPassword, 'admin-password-42');
+      },
+    );
+
     test('onboarding completion rolls back when persistence fails', () async {
       final tmp = await Directory.systemTemp.createTemp(
         'p2wlan_onboarding_rollback_',

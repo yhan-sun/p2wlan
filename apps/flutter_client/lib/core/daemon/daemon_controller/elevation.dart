@@ -65,32 +65,46 @@ extension DaemonControllerElevation on DaemonController {
     return user;
   }
 
-  Future<void> _startMacosElevated(String command) async {
+  Future<void> _startMacosElevated(String command, {String? password}) async {
     final credentials = _MacosElevationCredentials();
     try {
-      if (!await credentials.hasStoredPassword()) {
-        final saved = await credentials.promptAndStorePassword();
-        if (!saved) throw '已取消保存管理员密码。';
+      var activePassword = password;
+      var shouldPersistPassword = false;
+      activePassword ??= readMacosAdminPassword?.call();
+      if (activePassword == null || activePassword.isEmpty) {
+        final promptedPassword = await credentials.promptPassword();
+        if (promptedPassword == null || promptedPassword.isEmpty) {
+          throw '已取消保存管理员密码。';
+        }
+        activePassword = promptedPassword;
+        shouldPersistPassword = true;
       }
 
-      var run = await credentials.runWithStoredPassword(command);
+      var run = await credentials.runWithPassword(command, activePassword);
       if (run.missingCredential || run.authenticationFailed) {
-        // A password can be removed from Keychain or changed outside P2WLAN.
-        // Forget the stale item and allow exactly one fresh secure prompt.
-        await credentials.clearStoredPassword();
-        final saved = await credentials.promptAndStorePassword();
-        if (!saved) throw '已取消保存管理员密码。';
-        run = await credentials.runWithStoredPassword(command);
+        // The locally saved password may have changed. Forget the encrypted
+        // config value and allow exactly one fresh prompt; never loop.
+        await clearMacosAdminPassword?.call();
+        final freshPassword = await credentials.promptPassword();
+        if (freshPassword == null || freshPassword.isEmpty) {
+          throw '已取消保存管理员密码。';
+        }
+        activePassword = freshPassword;
+        shouldPersistPassword = true;
+        run = await credentials.runWithPassword(command, freshPassword);
       }
       if (!run.ok) {
         throw run.error ?? '管理员权限启动失败。';
       }
+      if (shouldPersistPassword) {
+        await saveMacosAdminPassword?.call(activePassword);
+      }
     } on MissingPluginException {
-      throw '当前 macOS 构建不支持安全管理员凭据存储，请重新安装 P2WLAN。';
+      throw '当前 macOS 构建不支持本地管理员凭据存储，请重新安装 P2WLAN。';
     } on PlatformException catch (error) {
       throw error.message?.trim().isNotEmpty == true
           ? error.message!.trim()
-          : '无法访问 macOS 登录钥匙串。';
+          : '无法访问本地管理员凭据配置。';
     }
   }
 
@@ -132,19 +146,35 @@ extension DaemonControllerElevation on DaemonController {
   Future<void> _startWindowsElevated({
     required File binary,
     required List<String> args,
+    required String pidPath,
   }) async {
     final argLine = args.map(_windowsCommandLineArgQuote).join(' ');
     final script =
         '\$ErrorActionPreference = \'Stop\'; '
-        'Start-Process -Verb RunAs -WindowStyle Hidden '
+        '\$child = Start-Process -Verb RunAs -WindowStyle Hidden '
         '-WorkingDirectory ${_powershellSingleQuoted(binary.parent.path)} '
         '-FilePath ${_powershellSingleQuoted(binary.path)} '
-        '-ArgumentList ${_powershellSingleQuoted(argLine)} | Out-Null';
+        '-ArgumentList ${_powershellSingleQuoted(argLine)} -PassThru; '
+        // Best effort only. The ACL grants the local Administrators group
+        // access to this directory, so an alternate UAC account can still
+        // publish the marker for the interactive client to verify and clean.
+        'try { Set-Content -LiteralPath ${_powershellSingleQuoted(pidPath)} '
+        '-Value \$child.Id -Encoding ascii } catch { }';
     final result = await _runWindowsPowerShell(script);
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
       throw stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr;
     }
+  }
+
+  Future<String?> _windowsCurrentUserSid() async {
+    if (!Platform.isWindows) return null;
+    final result = await _runWindowsPowerShell(
+      '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+    );
+    if (result.exitCode != 0) return null;
+    final sid = result.stdout.toString().trim();
+    return RegExp(r'^S-\d-\d+(?:-\d+)+$').hasMatch(sid) ? sid : null;
   }
 
   String _startFailureMessage(Object error) {
@@ -155,7 +185,7 @@ extension DaemonControllerElevation on DaemonController {
         normalized.contains('user name or password') ||
         normalized.contains('username or password') ||
         normalized.contains('password was incorrect')) {
-      return '管理员认证失败：已保存的 macOS 管理员密码无效，请重新启动并输入当前管理员密码。';
+      return '管理员认证失败：配置文件中的 macOS 管理员密码无效，请重新启动并输入当前管理员密码。';
     }
     if (raw.contains('-128') ||
         raw.contains('已取消') ||
@@ -179,25 +209,24 @@ extension DaemonControllerElevation on DaemonController {
   }
 }
 
-/// The macOS implementation deliberately keeps the password inside the
-/// native Keychain/privilege boundary. Dart receives only a success result;
-/// the password is never put in a Dart string, process argument, environment
-/// variable, settings file, or log.
+/// The native bridge only displays the secure input field and pipes the
+/// password to sudo. Persistence is owned by [SettingsStore], which writes
+/// authenticated ciphertext to the local settings file; no Keychain API is
+/// involved.
 class _MacosElevationCredentials {
   static const _channel = MethodChannel('p2wlan/macos_elevation');
 
-  Future<bool> hasStoredPassword() async {
-    return await _channel.invokeMethod<bool>('hasStoredPassword') ?? false;
+  Future<String?> promptPassword() async {
+    return _channel.invokeMethod<String>('promptPassword');
   }
 
-  Future<bool> promptAndStorePassword() async {
-    return await _channel.invokeMethod<bool>('promptAndStorePassword') ?? false;
-  }
-
-  Future<_MacosElevationRunResult> runWithStoredPassword(String command) async {
+  Future<_MacosElevationRunResult> runWithPassword(
+    String command,
+    String password,
+  ) async {
     final result = await _channel.invokeMapMethod<String, dynamic>(
-      'runWithStoredPassword',
-      <String, Object>{'command': command},
+      'runWithPassword',
+      <String, Object>{'command': command, 'password': password},
     );
     if (result == null) {
       return const _MacosElevationRunResult(
@@ -211,10 +240,6 @@ class _MacosElevationCredentials {
       authenticationFailed: result['authenticationFailed'] == true,
       error: (result['error'] as String?)?.trim(),
     );
-  }
-
-  Future<void> clearStoredPassword() async {
-    await _channel.invokeMethod<void>('clearStoredPassword');
   }
 }
 

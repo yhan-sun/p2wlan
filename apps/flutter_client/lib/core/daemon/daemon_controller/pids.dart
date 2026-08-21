@@ -56,8 +56,13 @@ extension DaemonControllerPids on DaemonController {
 
   Future<bool> _processLooksLikeDaemon(int pid) async {
     final command = await _processCommandLine(pid);
-    return command != null &&
-        command.contains(DaemonController.daemonBinaryName);
+    if (command != null &&
+        command.contains(DaemonController.daemonBinaryName)) {
+      return true;
+    }
+    return Platform.isWindows &&
+        await _windowsProcessName(pid) ==
+            '${DaemonController.daemonBinaryName}.exe';
   }
 
   Future<bool> _waitForDaemonPidExit(int pid, Duration timeout) async {
@@ -67,9 +72,10 @@ extension DaemonControllerPids on DaemonController {
       // verified PID in-process, which removes a large source of UI stalls.
       final timeoutMs = timeout.inMilliseconds.clamp(1, 60000);
       final result = await _runWindowsPowerShell(
+        '\$targetPid = $pid; '
         '\$deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs); '
         'while ([DateTime]::UtcNow -lt \$deadline) { '
-        'if (\$null -eq (Get-Process -Id $pid -ErrorAction SilentlyContinue)) { '
+        'if (\$null -eq (Get-Process -Id \$targetPid -ErrorAction SilentlyContinue)) { '
         'return '
         '} '
         'Start-Sleep -Milliseconds 100 '
@@ -167,9 +173,9 @@ extension DaemonControllerPids on DaemonController {
   Future<List<int>> _findWindowsDaemonPids() async {
     if (!Platform.isWindows) return const <int>[];
     final result = await _runWindowsPowerShell(
-      r'Get-CimInstance Win32_Process | '
-      r"Where-Object { $_.CommandLine -like '*p2wlan-daemon*' } | "
-      r'Select-Object -ExpandProperty ProcessId',
+      r'''$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue); '''
+      r'''if ($processes.Count -eq 0) { $processes = @(Get-Process -Name p2wlan-daemon -ErrorAction SilentlyContinue) }; '''
+      r'''$processes | Select-Object -ExpandProperty ProcessId''',
     );
     if (result.exitCode != 0) return const <int>[];
     return result.stdout
@@ -184,9 +190,9 @@ extension DaemonControllerPids on DaemonController {
     final matches = <int>[];
     if (Platform.isWindows) {
       final result = await _runWindowsPowerShell(
-        r'Get-CimInstance Win32_Process | '
-        r"Where-Object { $_.CommandLine -like '*p2wlan-daemon*' } | "
-        r'Select-Object -ExpandProperty ProcessId',
+        r'''$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue); '''
+        r'''if ($processes.Count -eq 0) { $processes = @(Get-Process -Name p2wlan-daemon -ErrorAction SilentlyContinue) }; '''
+        r'''$processes | Select-Object -ExpandProperty ProcessId''',
       );
       if (result.exitCode != 0) return null;
       for (final line in result.stdout.toString().split('\n')) {
@@ -216,6 +222,20 @@ extension DaemonControllerPids on DaemonController {
       }
     }
     return matches.length == 1 ? matches.single : null;
+  }
+
+  Future<String?> _windowsProcessName(int processId) async {
+    if (!Platform.isWindows) return null;
+    final result = await _runWindowsPowerShell(
+      '\$process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" '
+      '-ErrorAction SilentlyContinue; '
+      'if (\$null -ne \$process) { \$process.Name } '
+      'else { (Get-Process -Id $processId '
+      '-ErrorAction SilentlyContinue).ProcessName + ".exe" }',
+    );
+    if (result.exitCode != 0) return null;
+    final name = result.stdout.toString().trim();
+    return name.isEmpty ? null : name;
   }
 
   Future<bool> _terminatePid(int pid) async {

@@ -3,9 +3,12 @@ import 'package:p2wlan_flutter_client/main.dart';
 
 void main() {
   group('enableFlutterTrayForEnvironment', () {
-    test('defaults to disabled so the native tray owns release lifecycle', () {
-      expect(enableFlutterTrayForEnvironment({}), isFalse);
-    });
+    test(
+      'defaults to enabled because the Flutter tray is bundled in releases',
+      () {
+        expect(enableFlutterTrayForEnvironment({}), isTrue);
+      },
+    );
 
     test('disables tray for explicit false-like values', () {
       for (final value in ['0', 'false', 'no', 'off']) {

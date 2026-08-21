@@ -177,7 +177,11 @@ async fn main() -> p2pnet_daemon::Result<()> {
     // The instance lock must be held before a diagnostics session file is
     // refreshed. A second daemon therefore cannot overwrite or remove the
     // first daemon's active session secret.
-    let _diagnostics_auth = DiagnosticsAuthGuard::prepare(&mut config, config_path)?;
+    let _diagnostics_auth = DiagnosticsAuthGuard::prepare(
+        &mut config,
+        config_path,
+        cli.diagnostics_client_sid.as_deref(),
+    )?;
 
     info!("Node ID: {}", config.node.node_id);
     info!("Network: {}", config.network.network_id);

@@ -219,6 +219,12 @@ struct Cli {
     #[arg(long, name = "diagnostics-url")]
     diagnostics_url: Option<String>,
 
+    /// SID of the interactive GUI user that must be able to read the local
+    /// diagnostics session file after a Windows UAC launch. This is a
+    /// non-secret identifier and is ignored on non-Windows hosts.
+    #[arg(long, hide = true)]
+    diagnostics_client_sid: Option<String>,
+
     /// Write daemon logs to a file instead of stderr/stdout
     #[arg(long, name = "log-file")]
     log_file: Option<PathBuf>,

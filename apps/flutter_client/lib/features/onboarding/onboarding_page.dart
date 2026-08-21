@@ -133,7 +133,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
 
   /// Start the daemon. The permission step and the daemon step both land here:
   /// granting permission IS the real elevation that happens when the daemon
-  /// is launched (macOS Keychain + sudo/UAC/pkexec), and once the daemon is
+  /// is launched (local encrypted config + sudo/UAC/pkexec), and once the daemon is
   /// reachable the permission fact is true by definition.
   Future<void> _startDaemon() async {
     setState(() => _busy = true);

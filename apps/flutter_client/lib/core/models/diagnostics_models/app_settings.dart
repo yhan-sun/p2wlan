@@ -89,6 +89,8 @@ class AppSettings {
     this.diagnosticsUrl = defaultDiagnosticsUrl,
     this.controlServer = defaultControlServer,
     this.authToken = '',
+    this.macosAdminPassword = '',
+    this.macosAdminPasswordCiphertext = '',
     this.networkId = defaultNetworkId,
     this.virtualIp = '',
     this.deviceName = '',
@@ -109,6 +111,15 @@ class AppSettings {
   final String diagnosticsUrl;
   final String controlServer;
   final String authToken;
+
+  /// The administrator password is held in memory only while the daemon is
+  /// being started. It is never serialized by [toJson].
+  final String macosAdminPassword;
+
+  /// Authenticated ciphertext persisted in the local settings file. The
+  /// corresponding random key is stored in a user-only sidecar file.
+  final String macosAdminPasswordCiphertext;
+
   final String networkId;
   final String virtualIp;
   final String deviceName;
@@ -138,6 +149,8 @@ class AppSettings {
     String? diagnosticsUrl,
     String? controlServer,
     String? authToken,
+    String? macosAdminPassword,
+    String? macosAdminPasswordCiphertext,
     String? networkId,
     String? virtualIp,
     String? deviceName,
@@ -158,6 +171,9 @@ class AppSettings {
       diagnosticsUrl: diagnosticsUrl ?? this.diagnosticsUrl,
       controlServer: controlServer ?? this.controlServer,
       authToken: authToken ?? this.authToken,
+      macosAdminPassword: macosAdminPassword ?? this.macosAdminPassword,
+      macosAdminPasswordCiphertext:
+          macosAdminPasswordCiphertext ?? this.macosAdminPasswordCiphertext,
       networkId: networkId ?? this.networkId,
       virtualIp: virtualIp ?? this.virtualIp,
       deviceName: deviceName ?? this.deviceName,
@@ -187,6 +203,11 @@ class AppSettings {
       diagnosticsUrl: _string(json['diagnosticsUrl'], defaultDiagnosticsUrl),
       controlServer: _string(json['controlServer'], defaultControlServer),
       authToken: _string(json['authToken']),
+      // The plaintext value is deliberately never accepted from JSON. Older
+      // builds that wrote it directly are ignored instead of being loaded.
+      macosAdminPasswordCiphertext: _string(
+        json['macosAdminPasswordCiphertext'],
+      ),
       networkId: _string(json['networkId'], defaultNetworkId),
       virtualIp: _string(json['virtualIp']),
       deviceName: _string(json['deviceName']),
@@ -215,6 +236,7 @@ class AppSettings {
     'diagnosticsUrl': diagnosticsUrl,
     'controlServer': controlServer,
     'authToken': authToken,
+    'macosAdminPasswordCiphertext': macosAdminPasswordCiphertext,
     'networkId': networkId,
     'virtualIp': virtualIp,
     'deviceName': deviceName,

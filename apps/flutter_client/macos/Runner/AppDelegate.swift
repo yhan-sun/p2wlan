@@ -7,8 +7,11 @@ class AppDelegate: FlutterAppDelegate {
     let raw = ProcessInfo.processInfo.environment["P2WLAN_ENABLE_FLUTTER_TRAY"]?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .lowercased()
-    guard let raw, !raw.isEmpty else { return false }
-    return raw != "0" && raw != "false" && raw != "no"
+    // The Flutter tray is bundled with the desktop app and is enabled by
+    // default. Only an explicit false-like environment value selects the
+    // standalone/native-tray development path.
+    guard let raw, !raw.isEmpty else { return true }
+    return raw != "0" && raw != "false" && raw != "no" && raw != "off"
   }
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

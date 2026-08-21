@@ -19,9 +19,6 @@ use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
 
-#[cfg(target_os = "macos")]
-use security_framework::os::macos::keychain::SecKeychain;
-
 use tao::{
     event::{Event, StartCause},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},

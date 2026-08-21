@@ -8,8 +8,7 @@ extension DaemonControllerLaunchToken on DaemonController {
     Directory runtimeDir,
     String token,
   ) async {
-    await runtimeDir.create(recursive: true);
-    await _restrictLaunchPath(runtimeDir.path, directory: true);
+    await protectRuntimeDirectory(runtimeDir);
     await cleanupStaleLaunchTokenFiles(runtimeDir);
 
     final random = math.Random.secure();
@@ -32,6 +31,11 @@ extension DaemonControllerLaunchToken on DaemonController {
     }
   }
 
+  Future<void> protectRuntimeDirectory(Directory runtimeDir) async {
+    await runtimeDir.create(recursive: true);
+    await _restrictLaunchPath(runtimeDir.path, directory: true);
+  }
+
   Future<void> deleteEphemeralLaunchTokenFile(File? file) async {
     if (file == null) return;
     if (await file.exists()) await file.delete();
@@ -44,9 +48,16 @@ extension DaemonControllerLaunchToken on DaemonController {
       if (entity is! File) continue;
       final name = entity.uri.pathSegments.last;
       if (!_launchTokenName.hasMatch(name)) continue;
-      final modified = await entity.lastModified();
-      if (now.difference(modified) > const Duration(minutes: 10)) {
-        await entity.delete();
+      try {
+        final modified = await entity.lastModified();
+        if (now.difference(modified) > const Duration(minutes: 10)) {
+          await entity.delete();
+        }
+      } catch (_) {
+        // A stale token may have been created by a prior elevated Windows
+        // instance. It must not prevent the next launch from reaching UAC;
+        // the protected runtime directory will be reused and the new token
+        // gets a fresh random name.
       }
     }
   }
@@ -56,15 +67,19 @@ extension DaemonControllerLaunchToken on DaemonController {
     bool directory = false,
   }) async {
     if (Platform.isWindows) {
-      // Resolve the account from the Windows security token instead of the
-      // USERNAME environment variable. The latter can differ after UAC
-      // elevation (and is not reliable for domain/Microsoft accounts). Run
-      // icacls through the shared hidden PowerShell helper so ACL repair does
-      // not flash a console window in the GUI app.
+      // Use SIDs rather than USERNAME/domain strings: a UAC prompt can be
+      // completed with another administrator account, and name resolution is
+      // locale/domain dependent. Include the local Administrators group so an
+      // alternate UAC account can consume the one-shot token. It is deleted
+      // immediately after startup and is never a credential store.
       final quotedPath = _powershellSingleQuoted(path);
+      final rights = directory ? '(OI)(CI)F' : 'F';
       final result = await _runWindowsPowerShell(
-        '\$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; '
-        '& icacls.exe $quotedPath /inheritance:r /grant:r (\$account + \':F\'); '
+        '\$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; '
+        '\$rights = \'$rights\'; '
+        '\$rules = @(\'*\' + \$sid + \':\' + \$rights, '
+        '\'*S-1-5-32-544:\' + \$rights); '
+        '& icacls.exe $quotedPath /inheritance:r /grant:r \$rules; '
         '\$global:LASTEXITCODE = \$LASTEXITCODE',
       );
       if (result.exitCode != 0) {

@@ -25,8 +25,10 @@ Menu actions:
 
 - `Refresh Status`: polls `http://127.0.0.1:39277/health` and `/status`.
 - `Start Daemon`: launches `p2wlan-daemon` with the default config path.
-  On macOS the administrator password is requested once and then encrypted in
-  the user's login Keychain for later starts.
+  The normal Flutter client stores the macOS administrator password as
+  encrypted local configuration. The optional standalone native tray does not
+  persist a password and asks only when it starts a daemon, so it never calls
+  the macOS Keychain.
 - `Stop Daemon`: sends `POST /shutdown`.
 - `Open P2WLAN`: opens the Flutter frontend when deeper settings or
   diagnostics are needed.

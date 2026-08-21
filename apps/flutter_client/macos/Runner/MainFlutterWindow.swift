@@ -1,106 +1,5 @@
 import Cocoa
 import FlutterMacOS
-import Security
-
-private enum P2wlanAdminPasswordKeychain {
-  private static let service = "com.p2wlan.client.macos-admin"
-  private static let account = "p2wlan-daemon"
-
-  private static var baseQuery: [String: Any] {
-    [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: service,
-      kSecAttrAccount as String: account,
-    ]
-  }
-
-  static func hasStoredPassword() throws -> Bool {
-    var query = baseQuery
-    query[kSecMatchLimit as String] = kSecMatchLimitOne
-    query[kSecReturnData as String] = false
-    let status = SecItemCopyMatching(query as CFDictionary, nil)
-    switch status {
-    case errSecSuccess:
-      return true
-    case errSecItemNotFound:
-      return false
-    default:
-      throw KeychainError.status(status)
-    }
-  }
-
-  static func readPassword() throws -> String {
-    var query = baseQuery
-    query[kSecMatchLimit as String] = kSecMatchLimitOne
-    query[kSecReturnData as String] = true
-
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    guard status == errSecSuccess else {
-      if status == errSecItemNotFound {
-        throw KeychainError.missing
-      }
-      throw KeychainError.status(status)
-    }
-    guard
-      let data = result as? Data,
-      let password = String(data: data, encoding: .utf8),
-      !password.isEmpty
-    else {
-      throw KeychainError.invalidValue
-    }
-    return password
-  }
-
-  static func store(password: String) throws {
-    guard !password.isEmpty else {
-      throw KeychainError.invalidValue
-    }
-
-    let data = Data(password.utf8)
-    let updateStatus = SecItemUpdate(
-      baseQuery as CFDictionary,
-      [kSecValueData as String: data] as CFDictionary
-    )
-    if updateStatus == errSecSuccess {
-      return
-    }
-    guard updateStatus == errSecItemNotFound else {
-      throw KeychainError.status(updateStatus)
-    }
-
-    let attributes: [String: Any] = [
-      kSecValueData as String: data,
-      // Do not sync this item to iCloud or other devices. The credential is
-      // only useful for the local macOS account that authorized this daemon.
-      kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-      kSecAttrLabel as String: "P2WLAN administrator credential",
-      kSecAttrIsInvisible as String: true,
-    ]
-
-    var item = baseQuery
-    for (key, value) in attributes {
-      item[key] = value
-    }
-    let addStatus = SecItemAdd(item as CFDictionary, nil)
-    guard addStatus == errSecSuccess else {
-      throw KeychainError.status(addStatus)
-    }
-  }
-
-  static func clear() throws {
-    let status = SecItemDelete(baseQuery as CFDictionary)
-    guard status == errSecSuccess || status == errSecItemNotFound else {
-      throw KeychainError.status(status)
-    }
-  }
-
-  enum KeychainError: Error {
-    case missing
-    case invalidValue
-    case status(OSStatus)
-  }
-}
 
 private final class P2wlanMacosElevationBridge {
   private let channel: FlutterMethodChannel
@@ -117,58 +16,30 @@ private final class P2wlanMacosElevationBridge {
 
   private func handle(call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
-    case "hasStoredPassword":
-      do {
-        result(try P2wlanAdminPasswordKeychain.hasStoredPassword())
-      } catch {
-        result(FlutterError(
-          code: "keychain_unavailable",
-          message: "Unable to inspect the macOS login Keychain.",
-          details: nil
-        ))
-      }
+    case "promptPassword":
+      result(promptPassword())
 
-    case "promptAndStorePassword":
-      do {
-        result(try promptAndStorePassword())
-      } catch {
-        result(FlutterError(
-          code: "keychain_write_failed",
-          message: "Unable to save the administrator credential in the macOS login Keychain.",
-          details: nil
-        ))
-      }
-
-    case "clearStoredPassword":
-      do {
-        try P2wlanAdminPasswordKeychain.clear()
-        result(nil)
-      } catch {
-        result(FlutterError(
-          code: "keychain_delete_failed",
-          message: "Unable to remove the saved administrator credential.",
-          details: nil
-        ))
-      }
-
-    case "runWithStoredPassword":
+    case "runWithPassword":
       guard
         let arguments = call.arguments as? [String: Any],
         let command = arguments["command"] as? String,
-        !command.isEmpty
+        !command.isEmpty,
+        let password = arguments["password"] as? String,
+        !password.isEmpty
       else {
         result(FlutterError(
-          code: "invalid_command",
-          message: "Missing elevated command.",
+          code: "invalid_elevation_arguments",
+          message: "Missing elevated command or administrator password.",
           details: nil
         ))
         return
       }
 
-      // Password retrieval and sudo execution happen natively. The command
-      // contains no password; only the native process pipe receives it.
+      // The password is passed only through this in-memory method call and
+      // the sudo stdin pipe. It is never placed in a process argument, log,
+      // or native persistent store.
       DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-        let response = self?.runWithStoredPassword(command) ?? [
+        let response = self?.runWithPassword(command, password) ?? [
           "ok": false,
           "error": "macOS 提权桥接层不可用。",
         ]
@@ -182,14 +53,16 @@ private final class P2wlanMacosElevationBridge {
     }
   }
 
-  private func promptAndStorePassword() throws -> Bool {
+  private func promptPassword() -> String? {
     let isChinese = Locale.preferredLanguages.first?.lowercased().hasPrefix("zh") == true
     let alert = NSAlert()
     alert.alertStyle = .informational
-    alert.messageText = isChinese ? "保存 P2WLAN 管理员密码" : "Save the P2WLAN administrator password"
+    alert.messageText = isChinese
+      ? "保存 P2WLAN 管理员密码"
+      : "Save the P2WLAN administrator password"
     alert.informativeText = isChinese
-      ? "密码会加密存储在当前用户的 macOS 登录钥匙串中，仅用于启动 P2WLAN 的虚拟网卡。以后启动不再询问。"
-      : "The password is encrypted in this Mac user's login Keychain and is only used to start P2WLAN's virtual adapter. It will not be requested again."
+      ? "密码会加密保存在 P2WLAN 本地配置文件中，仅当前用户可读取；不会使用 macOS 钥匙串。以后启动不再询问。"
+      : "The password is encrypted in P2WLAN's local configuration file, readable only by this user. The macOS Keychain is not used."
 
     let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
     field.placeholderString = isChinese ? "管理员密码" : "Administrator password"
@@ -200,32 +73,13 @@ private final class P2wlanMacosElevationBridge {
     NSApp.activate(ignoringOtherApps: true)
     alert.window.initialFirstResponder = field
     let response = alert.runModal()
-    guard response == .alertFirstButtonReturn else {
-      return false
+    guard response == .alertFirstButtonReturn, !field.stringValue.isEmpty else {
+      return nil
     }
-    let password = field.stringValue
-    guard !password.isEmpty else {
-      return false
-    }
-    try P2wlanAdminPasswordKeychain.store(password: password)
-    return true
+    return field.stringValue
   }
 
-  private func runWithStoredPassword(_ command: String) -> [String: Any] {
-    let password: String
-    do {
-      password = try P2wlanAdminPasswordKeychain.readPassword()
-    } catch P2wlanAdminPasswordKeychain.KeychainError.missing {
-      return ["ok": false, "missingCredential": true]
-    } catch P2wlanAdminPasswordKeychain.KeychainError.invalidValue {
-      return ["ok": false, "missingCredential": true]
-    } catch {
-      return [
-        "ok": false,
-        "error": "无法读取 macOS 登录钥匙串中的管理员凭据。",
-      ]
-    }
-
+  private func runWithPassword(_ command: String, _ password: String) -> [String: Any] {
     let task = Process()
     let standardInput = Pipe()
     let standardError = Pipe()

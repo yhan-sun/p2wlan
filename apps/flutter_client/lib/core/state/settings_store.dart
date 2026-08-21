@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
+import '../security/local_config_secret.dart';
 import '../security/secure_token_repository.dart';
 
 class SettingsStore extends ChangeNotifier {
@@ -52,9 +53,30 @@ class SettingsStore extends ChangeNotifier {
             }
             effectiveToken = legacyToken;
           }
-          _settings = (await _migrateSettings(
+          var restoredSettings = (await _migrateSettings(
             loadedSettings,
           )).copyWith(authToken: effectiveToken);
+          final encryptedAdminPassword = loadedSettings
+              .macosAdminPasswordCiphertext
+              .trim();
+          if (encryptedAdminPassword.isNotEmpty) {
+            // A missing/invalid sidecar key must not prevent the rest of the
+            // settings from loading. The next macOS daemon start will ask for
+            // the password again and replace the invalid local credential.
+            try {
+              final password = await LocalConfigSecret.decrypt(
+                encryptedAdminPassword,
+                keyFile: _adminPasswordKeyFile(sourceFile),
+              );
+              restoredSettings = restoredSettings.copyWith(
+                macosAdminPassword: password,
+              );
+            } catch (_) {
+              // Keep the ciphertext in place so a transient file-permission
+              // problem does not destroy the user's saved value.
+            }
+          }
+          _settings = restoredSettings;
           final migrated =
               jsonEncode(_persistedSettings().toJson()) !=
               jsonEncode(_stripToken(loadedSettings.toJson()));
@@ -184,6 +206,48 @@ class SettingsStore extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Encrypt and persist the macOS administrator password in the local
+  /// settings file. The plaintext remains in memory only for daemon startup.
+  Future<void> updateMacosAdminPassword(String password) async {
+    if (password.isEmpty) {
+      throw const FormatException('管理员密码不能为空。');
+    }
+    final previous = _settings;
+    try {
+      final file = _settingsFile();
+      final ciphertext = await LocalConfigSecret.encrypt(
+        password,
+        keyFile: _adminPasswordKeyFile(file),
+      );
+      _settings = previous.copyWith(
+        macosAdminPassword: password,
+        macosAdminPasswordCiphertext: ciphertext,
+      );
+      await _save();
+    } catch (_) {
+      _settings = previous;
+      rethrow;
+    }
+    notifyListeners();
+  }
+
+  /// Forget the local macOS administrator credential without touching the
+  /// P2WLAN login token or the rest of the settings.
+  Future<void> clearMacosAdminPassword() async {
+    final previous = _settings;
+    _settings = previous.copyWith(
+      macosAdminPassword: '',
+      macosAdminPasswordCiphertext: '',
+    );
+    try {
+      await _save();
+    } catch (_) {
+      _settings = previous;
+      rethrow;
+    }
+    notifyListeners();
+  }
+
   Future<void> updateLanguageCode(String languageCode) async {
     _settings = _settings.copyWith(languageCode: languageCode);
     notifyListeners();
@@ -252,9 +316,11 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> _writeSettingsFile(File file) async {
     await file.parent.create(recursive: true);
-    // Persist non-credential settings only. The auth token lives in the secure
-    // repository, never in this JSON (it can be backed up or shipped in support
-    // bundles), so it is always written blank.
+    await _restrictDirectory(file.parent);
+    // The auth token lives in the separate local token file, never in this
+    // JSON, so it is always written blank. The macOS administrator password is
+    // represented here only by authenticated ciphertext; its random key is in
+    // the protected sidecar file next to this JSON.
     final temp = File(
       '${file.path}.${DateTime.now().microsecondsSinceEpoch}.tmp',
     );
@@ -265,6 +331,7 @@ class SettingsStore extends ChangeNotifier {
         ).convert(_persistedSettings().toJson()),
         flush: true,
       );
+      await _restrictFile(temp);
       try {
         await temp.rename(file.path);
       } on FileSystemException {
@@ -274,14 +341,35 @@ class SettingsStore extends ChangeNotifier {
         if (await file.exists()) await file.delete();
         await temp.rename(file.path);
       }
+      await _restrictFile(file);
     } finally {
       if (await temp.exists()) await temp.delete();
     }
   }
 
-  /// Settings as they should be written to disk: identical to the in-memory
-  /// settings except the auth token is blanked (it is stored separately).
-  AppSettings _persistedSettings() => _settings.copyWith(authToken: '');
+  /// Settings as they should be written to disk: the auth token and plaintext
+  /// administrator password are blanked (only their protected stores remain).
+  AppSettings _persistedSettings() =>
+      _settings.copyWith(authToken: '', macosAdminPassword: '');
+
+  File _adminPasswordKeyFile(File settingsFile) =>
+      File('${settingsFile.path}.key');
+
+  Future<void> _restrictDirectory(Directory directory) async {
+    if (!Platform.isMacOS && !Platform.isLinux) return;
+    final result = await Process.run('/bin/chmod', ['700', directory.path]);
+    if (result.exitCode != 0) {
+      throw const SecureTokenStorageException('无法限制本地配置目录权限。');
+    }
+  }
+
+  Future<void> _restrictFile(File file) async {
+    if (!Platform.isMacOS && !Platform.isLinux) return;
+    final result = await Process.run('/bin/chmod', ['600', file.path]);
+    if (result.exitCode != 0) {
+      throw const SecureTokenStorageException('无法限制本地配置文件权限。');
+    }
+  }
 
   /// The token field in [json] blanked, for comparing persisted content.
   Map<String, dynamic> _stripToken(Map<String, dynamic> json) {

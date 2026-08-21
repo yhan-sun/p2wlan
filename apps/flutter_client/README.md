@@ -29,9 +29,10 @@ cd apps/flutter_client
 flutter run -d macos
 ```
 
-For debugging only, set `P2WLAN_ENABLE_FLUTTER_TRAY=1` before launching Flutter
-to use its in-process tray. The normal low-idle-memory path keeps tray and
-Flutter as separate processes.
+The packaged desktop app uses the in-process Flutter tray by default, so the
+macOS menu bar, Windows notification area, and Linux panel always have a
+visible P2WLAN entry. For the low-idle-memory native-tray experiment, set
+`P2WLAN_ENABLE_FLUTTER_TRAY=0` and launch `p2wlan-tray` separately.
 
 The client looks for `p2wlan-daemon` in this order:
 
@@ -114,8 +115,8 @@ cargo check -p p2wlan-daemon
 - [x] Flutter exposes `p2wlan-daemon` start from Dashboard.
 - [x] Flutter exposes daemon stop through `/shutdown` with PID fallback.
 - [x] Dashboard, Diagnostics, and Nodes update from `/status`.
-- [x] Flutter in-process tray remains available behind
-  `P2WLAN_ENABLE_FLUTTER_TRAY=1` for debugging.
+- [x] Flutter in-process tray is enabled by default in packaged desktop apps;
+  `P2WLAN_ENABLE_FLUTTER_TRAY=0` selects the separate native tray experiment.
 - [x] Rust `p2wlan-tray` builds as a lightweight idle tray companion.
 - [ ] macOS release app bundles `p2wlan-daemon` in Resources and passes local
   notarization/signing smoke.

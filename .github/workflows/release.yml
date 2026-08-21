@@ -481,6 +481,12 @@ jobs:
           $sourceDir = $releaseDir.FullName
           Copy-Item "target\release\p2wlan-daemon.exe" (Join-Path $sourceDir "p2wlan-daemon.exe") -Force
           & "apps\flutter_client\scripts\fetch_wintun.ps1" -DestinationDirectory $sourceDir -Architecture amd64
+          & "apps\flutter_client\scripts\bundle_msvc_runtime.ps1" -DestinationDirectory $sourceDir
+          foreach ($requiredFile in @("p2wlan_flutter_client.exe", "p2wlan-daemon.exe", "wintun.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
+            if (-not (Test-Path (Join-Path $sourceDir $requiredFile))) {
+              throw "Windows release bundle is missing $requiredFile"
+            }
+          }
           python3 scripts/release/verify_release_identity.py --release --daemon (Join-Path $sourceDir "p2wlan-daemon.exe") --expected-commit $env:GITHUB_SHA
           $outputDir = (Resolve-Path "dist-release").Path
           $iss = Join-Path $env:RUNNER_TEMP "p2wlan-flutter-windows.iss"

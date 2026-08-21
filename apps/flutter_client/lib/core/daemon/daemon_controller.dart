@@ -28,8 +28,12 @@ class DaemonCommandResult {
 }
 
 class DaemonController {
-  DaemonController({required DiagnosticsApi diagnosticsApi})
-    : _diagnosticsApi = diagnosticsApi;
+  DaemonController({
+    required DiagnosticsApi diagnosticsApi,
+    this.readMacosAdminPassword,
+    this.saveMacosAdminPassword,
+    this.clearMacosAdminPassword,
+  }) : _diagnosticsApi = diagnosticsApi;
 
   static const daemonBinaryName = 'p2wlan-daemon';
   static const envDaemonBin = 'P2WLAN_DAEMON_BIN';
@@ -38,6 +42,14 @@ class DaemonController {
   static const _directReadyTimeout = Duration(seconds: 20);
 
   final DiagnosticsApi _diagnosticsApi;
+
+  /// These callbacks are supplied by [SettingsStore] for the normal app
+  /// path. Keeping them as callbacks also lets the PID cleanup path reuse the
+  /// same config-file credential without reading Keychain or another broker.
+  final String? Function()? readMacosAdminPassword;
+  final Future<void> Function(String password)? saveMacosAdminPassword;
+  final Future<void> Function()? clearMacosAdminPassword;
+
   DateTime? _lastLaunchExitProbeAt;
   bool? _lastLaunchExitProbeResult;
 
@@ -57,6 +69,14 @@ class DaemonController {
         ok: false,
         message:
             'Could not find p2wlan-daemon. Build it with cargo or set P2WLAN_DAEMON_BIN.',
+      );
+    }
+
+    final windowsProbeError = await _probeWindowsDaemonBinary(binary);
+    if (windowsProbeError != null) {
+      return DaemonCommandResult(
+        ok: false,
+        message: 'Windows 守护进程无法加载，发布包可能缺少运行库或文件不完整：$windowsProbeError',
       );
     }
 
@@ -90,6 +110,9 @@ class DaemonController {
         Platform.isMacOS && !_isRootUser() ||
         Platform.isWindows && !await _isWindowsAdministrator() ||
         Platform.isLinux && !_isRootUser();
+    final windowsClientSid = Platform.isWindows
+        ? await _windowsCurrentUserSid()
+        : null;
     File? tokenFile;
     // Windows console daemons cannot safely receive a managed token over a
     // detached stdin: depending on the Windows process mode this can create
@@ -101,6 +124,18 @@ class DaemonController {
     if (!useManualMode && (requiresElevation || Platform.isWindows)) {
       try {
         tokenFile = await createEphemeralLaunchTokenFile(logDir, authToken);
+      } catch (error) {
+        return DaemonCommandResult(
+          ok: false,
+          message: _startFailureMessage(error),
+        );
+      }
+    } else if (Platform.isWindows) {
+      try {
+        // Manual/offline mode has no launch token, but an elevated daemon
+        // still needs the same user/admin ACL on the runtime directory for
+        // its log, PID marker, and diagnostics session file.
+        await protectRuntimeDirectory(logDir);
       } catch (error) {
         return DaemonCommandResult(
           ok: false,
@@ -141,6 +176,10 @@ class DaemonController {
         settings.socketPool.trim(),
       ],
       if (relayServers.isNotEmpty) ...['--relay', relayServers],
+      if (windowsClientSid != null) ...[
+        '--diagnostics-client-sid',
+        windowsClientSid,
+      ],
       if (useManualMode)
         '--manual'
       else if (tokenFile != null) ...[
@@ -180,9 +219,16 @@ class DaemonController {
 
     try {
       if (requiresElevation && Platform.isMacOS) {
-        await _startMacosElevated(elevatedShell);
+        await _startMacosElevated(
+          elevatedShell,
+          password: settings.macosAdminPassword,
+        );
       } else if (requiresElevation && Platform.isWindows) {
-        await _startWindowsElevated(binary: binary, args: args);
+        await _startWindowsElevated(
+          binary: binary,
+          args: args,
+          pidPath: pidPath,
+        );
       } else if (requiresElevation && Platform.isLinux) {
         await _startLinuxElevated(binary: binary, args: args);
       } else {

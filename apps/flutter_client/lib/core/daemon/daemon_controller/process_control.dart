@@ -52,6 +52,41 @@ extension DaemonControllerProcessControl on DaemonController {
     return null;
   }
 
+  /// Load the Windows daemon in its side-effect-free identity mode before
+  /// asking UAC to start the real instance. Start-Process -Verb RunAs can
+  /// report success even when Windows immediately rejects a missing DLL, so
+  /// without this probe the UI waits for the health timeout and only shows a
+  /// misleading generic permission error.
+  Future<String?> _probeWindowsDaemonBinary(File binary) async {
+    if (!Platform.isWindows) return null;
+    Process? process;
+    try {
+      process = await Process.start(binary.path, const [
+        '--build-info',
+      ], mode: ProcessStartMode.detachedWithStdio);
+      final output = await Future.wait<Object>([
+        process.stdout.transform(systemEncoding.decoder).join(),
+        process.stderr.transform(systemEncoding.decoder).join(),
+        process.exitCode,
+      ]).timeout(const Duration(seconds: 6));
+      final exitCode = output[2] as int;
+      if (exitCode == 0) return null;
+      final stderr = (output[1] as String).trim();
+      final stdout = (output[0] as String).trim();
+      final detail = stderr.isNotEmpty ? stderr : stdout;
+      return detail.isEmpty
+          ? 'daemon identity probe exited with code $exitCode'
+          : detail;
+    } on TimeoutException {
+      try {
+        process?.kill();
+      } catch (_) {}
+      return 'daemon identity probe timed out after 6 seconds';
+    } on Object catch (error) {
+      return error.toString();
+    }
+  }
+
   List<String> get _binaryNames {
     final extension = Platform.isWindows ? '.exe' : '';
     return ['${DaemonController.daemonBinaryName}$extension'];
