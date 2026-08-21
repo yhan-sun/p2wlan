@@ -149,12 +149,12 @@ fn checksum_replace_ipv4_addr(checksum: u16, old_src: Ipv4Addr, new_src: Ipv4Add
 
 fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for chunk in chunks {
         sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
         sum = fold_checksum_sum(sum);
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(*last) << 8;
     }
     !fold_checksum_sum(sum) as u16

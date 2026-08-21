@@ -23,7 +23,7 @@ impl Daemon {
                 tun.address(),
                 tun.mtu()
             );
-            return Ok(Some(tun));
+            Ok(Some(tun))
         }
 
         #[cfg(not(target_os = "android"))]
@@ -37,7 +37,7 @@ impl Daemon {
                 tun.address(),
                 tun.mtu()
             );
-            return Ok(Some(tun));
+            Ok(Some(tun))
         }
     }
 

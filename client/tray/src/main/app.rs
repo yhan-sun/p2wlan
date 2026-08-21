@@ -31,9 +31,7 @@ impl TrayApp {
             total_bytes,
             observed_at: now,
         });
-        let Some(previous) = previous else {
-            return None;
-        };
+        let previous = previous?;
         if total_bytes < previous.total_bytes {
             return None;
         }
@@ -76,7 +74,7 @@ impl TrayApp {
         } else {
             self.last_state.tooltip.clone()
         };
-        let _ = self.tray_icon.set_title(Some(title.as_str()));
+        self.tray_icon.set_title(Some(title.as_str()));
         let _ = self.tray_icon.set_tooltip(Some(tooltip.as_str()));
         let _ = self.tray_icon.set_icon(Some(
             tray_icon_image(self.last_state.running).expect("static tray icon should be valid"),
@@ -201,9 +199,7 @@ fn format_tray_rate(bytes_per_second: Option<u64>) -> String {
     } else {
         (value / 1024.0, "K/S")
     };
-    let text = if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else if value >= 100.0 {
+    let text = if value.fract() == 0.0 || value >= 100.0 {
         format!("{value:.0}")
     } else {
         format!("{value:.1}")
