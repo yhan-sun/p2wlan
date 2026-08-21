@@ -13,6 +13,7 @@ import '../core/state/status_store.dart';
 import '../shared/formatters.dart';
 import 'app_constants.dart';
 import 'app_strings.dart';
+import 'desktop_window_operations.dart';
 
 class DesktopTrayController with TrayListener, WindowListener {
   DesktopTrayController({
@@ -40,7 +41,8 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   bool _initialized = false;
   bool _quitting = false;
-  bool _menuUpdateQueued = false;
+  bool _menuUpdateRequested = false;
+  Future<void>? _menuUpdateInFlight;
   String? _lastTrayIconAsset;
   String? _lastDesktopTitle;
   String? _lastDockBadge;
@@ -60,12 +62,15 @@ class DesktopTrayController with TrayListener, WindowListener {
     statusStore.addListener(_scheduleMenuUpdate);
 
     try {
-      await windowManager.setPreventClose(true);
+      await DesktopWindowOperations.run(
+        () => windowManager.setPreventClose(true),
+      );
+      if (!_initialized) return;
       if (Platform.isMacOS || Platform.isLinux) {
         await trayManager.setTitle(trayTitleForTesting());
       }
       await _updateTrayIcon(force: true);
-      await _updateMenu();
+      await _queueMenuUpdate();
     } catch (error) {
       debugPrint('Failed to initialize P2WLAN tray: $error');
     }
@@ -73,16 +78,21 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   Future<void> dispose() async {
     if (!_initialized) return;
+    _initialized = false;
+    _menuUpdateRequested = false;
     settingsStore.removeListener(_scheduleMenuUpdate);
     statusStore.removeListener(_scheduleMenuUpdate);
     windowManager.removeListener(this);
     trayManager.removeListener(this);
+    final pendingUpdate = _menuUpdateInFlight;
+    if (pendingUpdate != null) {
+      await pendingUpdate;
+    }
     try {
       await trayManager.destroy();
     } catch (_) {
       // Best effort cleanup on app shutdown.
     }
-    _initialized = false;
   }
 
   @override
@@ -114,14 +124,36 @@ class DesktopTrayController with TrayListener, WindowListener {
   }
 
   void _scheduleMenuUpdate() {
-    if (_menuUpdateQueued) return;
-    _menuUpdateQueued = true;
-    scheduleMicrotask(() async {
-      _menuUpdateQueued = false;
-      if (_initialized) {
-        await _updateMenu();
+    unawaited(_queueMenuUpdate());
+  }
+
+  Future<void> _queueMenuUpdate() {
+    if (!_initialized) return Future<void>.value();
+    _menuUpdateRequested = true;
+    final inFlight = _menuUpdateInFlight;
+    if (inFlight != null) return inFlight;
+
+    final future = _drainMenuUpdates();
+    _menuUpdateInFlight = future;
+    return future;
+  }
+
+  Future<void> _drainMenuUpdates() async {
+    try {
+      while (_initialized && _menuUpdateRequested) {
+        _menuUpdateRequested = false;
+        try {
+          await _updateMenu();
+        } catch (error) {
+          debugPrint('Failed to update P2WLAN tray: $error');
+        }
       }
-    });
+    } finally {
+      _menuUpdateInFlight = null;
+      if (_initialized && _menuUpdateRequested) {
+        unawaited(_queueMenuUpdate());
+      }
+    }
   }
 
   Future<void> _updateMenu() async {
@@ -140,23 +172,27 @@ class DesktopTrayController with TrayListener, WindowListener {
   }
 
   Future<void> _updateDesktopWindowIndicators(String title) async {
-    if (_lastDesktopTitle != title) {
-      try {
-        await windowManager.setTitle(title);
-        _lastDesktopTitle = title;
-      } catch (error) {
-        debugPrint('Failed to update P2WLAN taskbar title: $error');
-      }
-    }
-    if (!Platform.isMacOS) return;
+    final shouldUpdateTitle = _lastDesktopTitle != title;
+    final badge = Platform.isMacOS ? dockBadgeForTesting() : '';
+    final shouldUpdateBadge = Platform.isMacOS && _lastDockBadge != badge;
+    if (!shouldUpdateTitle && !shouldUpdateBadge) return;
 
-    final badge = dockBadgeForTesting();
-    if (_lastDockBadge == badge) return;
     try {
-      await windowManager.setBadgeLabel(badge.isEmpty ? null : badge);
-      _lastDockBadge = badge;
+      await DesktopWindowOperations.run(() async {
+        if (shouldUpdateTitle) {
+          await windowManager.setTitle(title);
+          _lastDesktopTitle = title;
+        }
+        if (!shouldUpdateBadge) return;
+        await windowManager.setBadgeLabel(badge.isEmpty ? null : badge);
+        _lastDockBadge = badge;
+      });
     } catch (error) {
-      debugPrint('Failed to update P2WLAN Dock badge: $error');
+      if (shouldUpdateTitle) {
+        debugPrint('Failed to update P2WLAN taskbar title: $error');
+      } else {
+        debugPrint('Failed to update P2WLAN Dock badge: $error');
+      }
     }
   }
 
@@ -335,18 +371,26 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   Future<void> _showWindow() async {
     if (!isSupported) return;
-    await windowManager.setSkipTaskbar(false);
-    await windowManager.show();
-    if (await windowManager.isMinimized()) {
-      await windowManager.restore();
-    }
-    await windowManager.focus();
+    await DesktopWindowOperations.run(() async {
+      if (!Platform.isWindows) {
+        await windowManager.setSkipTaskbar(false);
+      }
+      await windowManager.show();
+      if (await windowManager.isMinimized()) {
+        await windowManager.restore();
+      }
+      await windowManager.focus();
+    });
   }
 
   Future<void> _hideWindow() async {
     if (!isSupported) return;
-    await windowManager.hide();
-    await windowManager.setSkipTaskbar(true);
+    await DesktopWindowOperations.run(() async {
+      await windowManager.hide();
+      if (!Platform.isWindows) {
+        await windowManager.setSkipTaskbar(true);
+      }
+    });
   }
 
   Future<void> _startDaemon() async {
@@ -443,8 +487,10 @@ class DesktopTrayController with TrayListener, WindowListener {
       // Ignore best effort tray teardown.
     }
     try {
-      await windowManager.setPreventClose(false);
-      await windowManager.destroy();
+      await DesktopWindowOperations.run(() async {
+        await windowManager.setPreventClose(false);
+        await windowManager.destroy();
+      });
     } finally {
       Timer(const Duration(milliseconds: 400), () => exit(0));
     }
