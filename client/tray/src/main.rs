@@ -4,7 +4,7 @@ use std::{
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -15,6 +15,9 @@ use std::{
 
 #[cfg(target_os = "macos")]
 use std::io::Write;
+
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
