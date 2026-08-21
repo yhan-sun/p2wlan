@@ -121,7 +121,11 @@ fn shared_cgn_and_ula_endpoints_are_overlay_direct() {
         let endpoint: SocketAddr = endpoint.parse().unwrap();
         assert!(is_overlay_endpoint(endpoint));
         assert_eq!(
-            classify_confirmed_direct_endpoint(endpoint, CandidatePairSource::Host),
+            classify_confirmed_direct_endpoint_with_on_link_host(
+                endpoint,
+                CandidatePairSource::Host,
+                false,
+            ),
             DirectPathType::Overlay
         );
     }
@@ -129,7 +133,7 @@ fn shared_cgn_and_ula_endpoints_are_overlay_direct() {
     let lan: SocketAddr = "192.168.2.11:56250".parse().unwrap();
     assert!(!is_overlay_endpoint(lan));
     assert_eq!(
-        classify_confirmed_direct_endpoint(lan, CandidatePairSource::Host),
+        classify_confirmed_direct_endpoint_with_on_link_host(lan, CandidatePairSource::Host, true),
         DirectPathType::Lan
     );
 }
@@ -226,6 +230,19 @@ async fn diagnostics_classifies_lan_direct_for_private_remote_endpoint() {
 
     manager.add_peer(&test_peer("peer1", remote)).await;
     manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.14".parse().unwrap(),
+            24,
+        )])
+        .await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[remote.to_string()],
+            &HashMap::from([(remote.to_string(), "host".to_string())]),
+        )
+        .await;
+    manager
         .record_direct_probe_success_with_latency_and_local_endpoint(
             "peer1",
             remote,
@@ -251,6 +268,48 @@ async fn diagnostics_classifies_lan_direct_for_private_remote_endpoint() {
         peer.selected_pair.as_ref().unwrap().direct_type,
         DirectPathType::Lan
     );
+}
+
+#[tokio::test]
+async fn off_link_private_host_is_not_reported_as_lan_or_fast_lane() {
+    let manager = PeerManager::new(test_config());
+    let remote: SocketAddr = "192.168.50.20:56250".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", remote)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.14".parse().unwrap(),
+            24,
+        )])
+        .await;
+    manager
+        .add_candidates_with_sources(
+            "peer1",
+            &[remote.to_string()],
+            &HashMap::from([(remote.to_string(), "host".to_string())]),
+        )
+        .await;
+    manager
+        .record_direct_probe_success_with_latency_and_local_endpoint(
+            "peer1",
+            remote,
+            Some(Duration::from_millis(7)),
+            Some("192.168.2.14:59435".parse().unwrap()),
+        )
+        .await;
+    manager
+        .record_direct_success_with_local_endpoint(
+            "peer1",
+            Some(remote),
+            Some("192.168.2.14:59435".parse().unwrap()),
+        )
+        .await;
+
+    let peer = manager.diagnostics().await.pop().unwrap();
+    assert_eq!(peer.direct_type, DirectPathType::Unknown);
+    assert!(!peer.is_overlay_direct);
+
+    let conn = manager.get_connection("peer1").await.unwrap();
+    assert!(!conn.preferred_fast_candidates(&[remote]).contains(&remote));
 }
 
 #[tokio::test]

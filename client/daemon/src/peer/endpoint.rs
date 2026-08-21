@@ -125,8 +125,11 @@ pub(super) fn classify_candidate_pair_path(
         return DirectPathType::Overlay;
     }
 
+    // A private address is not enough to prove a physical LAN path.  The
+    // contextual wrapper below only returns Lan after the source is Host and
+    // the endpoint is inside a directly-connected local interface prefix.
     if is_private_direct_endpoint(pair.remote_endpoint) {
-        return DirectPathType::Lan;
+        return DirectPathType::Unknown;
     }
 
     if is_public_probe_endpoint(pair.remote_endpoint)
@@ -162,14 +165,6 @@ pub(super) fn classify_candidate_pair_path_with_on_link_host(
     classify_candidate_pair_path(active_path, pair, direct_confirmed)
 }
 
-#[cfg(test)]
-pub(super) fn classify_confirmed_direct_endpoint(
-    endpoint: SocketAddr,
-    source: CandidatePairSource,
-) -> DirectPathType {
-    classify_confirmed_direct_endpoint_with_on_link_host(endpoint, source, false)
-}
-
 pub(super) fn classify_confirmed_direct_endpoint_with_on_link_host(
     endpoint: SocketAddr,
     source: CandidatePairSource,
@@ -180,7 +175,7 @@ pub(super) fn classify_confirmed_direct_endpoint_with_on_link_host(
     } else if is_overlay_endpoint(endpoint) {
         DirectPathType::Overlay
     } else if is_private_direct_endpoint(endpoint) {
-        DirectPathType::Lan
+        DirectPathType::Unknown
     } else if is_public_probe_endpoint(endpoint) && source == CandidatePairSource::PeerReflexive {
         DirectPathType::PeerReflexive
     } else if is_public_probe_endpoint(endpoint) && is_public_udp_direct_source(source) {

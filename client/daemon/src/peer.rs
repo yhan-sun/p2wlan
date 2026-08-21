@@ -351,8 +351,6 @@ pub use diagnostics::{
     PathHealthDiagnostics, PathSelectionEventDiagnostics, PeerDiagnostics, PeerManagerStats,
     RecoveryEpochDiagnostics,
 };
-#[cfg(test)]
-use endpoint::classify_confirmed_direct_endpoint;
 pub(crate) use endpoint::is_overlay_endpoint;
 pub(crate) use endpoint::is_public_probe_endpoint;
 use endpoint::{

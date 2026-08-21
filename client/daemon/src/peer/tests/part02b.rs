@@ -179,6 +179,12 @@ async fn low_latency_private_candidate_beats_selected_public_direct() {
     let private_endpoint: SocketAddr = "192.168.2.11:51843".parse().unwrap();
 
     manager.add_peer(&test_peer("peer1", public_endpoint)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.14".parse().unwrap(),
+            24,
+        )])
+        .await;
     let candidates = vec![public_endpoint.to_string(), private_endpoint.to_string()];
     let sources = HashMap::from([
         (public_endpoint.to_string(), "peer_reflexive".to_string()),
