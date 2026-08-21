@@ -100,6 +100,107 @@ fn start_daemon() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_ADMIN_KEYCHAIN_SERVICE: &str = "com.p2wlan.client.macos-admin";
+
+#[cfg(target_os = "macos")]
+const MACOS_ADMIN_KEYCHAIN_ACCOUNT: &str = "p2wlan-daemon";
+
+#[cfg(target_os = "macos")]
+fn macos_admin_password() -> Result<Vec<u8>, Box<dyn Error>> {
+    let keychain = SecKeychain::default()?;
+    if let Ok((password, _item)) = keychain.find_generic_password(
+        MACOS_ADMIN_KEYCHAIN_SERVICE,
+        MACOS_ADMIN_KEYCHAIN_ACCOUNT,
+    ) {
+        if !password.is_empty() {
+            return Ok(password.as_ref().to_vec());
+        }
+    }
+
+    let script = r#"text returned of (display dialog "P2WLAN 需要管理员密码来创建虚拟网卡。首次输入后会加密保存在 macOS 登录钥匙串中。" default answer "" with hidden answer buttons {"取消", "保存并继续"} default button "保存并继续" cancel button "取消")"#;
+    let output = Command::new("/usr/bin/osascript")
+        .args(["-e", script])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("-128") {
+            return Err("administrator password save cancelled".into());
+        }
+        return Err("administrator password prompt failed".into());
+    }
+
+    let mut password = output.stdout;
+    while matches!(password.last(), Some(b'\n' | b'\r')) {
+        password.pop();
+    }
+    if password.is_empty() {
+        return Err("administrator password is empty".into());
+    }
+    keychain.set_generic_password(
+        MACOS_ADMIN_KEYCHAIN_SERVICE,
+        MACOS_ADMIN_KEYCHAIN_ACCOUNT,
+        &password,
+    )?;
+    Ok(password)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_admin_password() {
+    if let Ok(keychain) = SecKeychain::default() {
+        if let Ok((_password, item)) = keychain.find_generic_password(
+            MACOS_ADMIN_KEYCHAIN_SERVICE,
+            MACOS_ADMIN_KEYCHAIN_ACCOUNT,
+        ) {
+            item.delete();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_sudo_once(command: &str, password: &[u8]) -> Result<(bool, bool), Box<dyn Error>> {
+    let mut child = Command::new("/usr/bin/sudo")
+        .args(["-S", "-p", "", "/bin/sh", "-c", command])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(password)?;
+        stdin.write_all(b"\n")?;
+    }
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    let authentication_failed =
+        stderr.contains("incorrect password") ||
+        stderr.contains("sorry, try again") ||
+        stderr.contains("authentication failure");
+    Ok((output.status.success(), authentication_failed))
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_elevated(command: &str) -> Result<(), Box<dyn Error>> {
+    let mut password = macos_admin_password()?;
+    let (success, authentication_failed) = run_macos_sudo_once(command, &password)?;
+    if success {
+        return Ok(());
+    }
+    if !authentication_failed {
+        return Err("administrator launch failed".into());
+    }
+
+    // The saved password may have changed outside P2WLAN. Replace it once;
+    // never loop on a bad credential or keep showing prompts indefinitely.
+    clear_macos_admin_password();
+    password = macos_admin_password()?;
+    let (success, _) = run_macos_sudo_once(command, &password)?;
+    if success {
+        Ok(())
+    } else {
+        Err("administrator authentication failed".into())
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn start_daemon_platform(
     daemon: &Path,
     args: &[String],
@@ -140,24 +241,7 @@ fn start_daemon_platform(
         pid = shell_quote(&pid_path.display().to_string()),
         daemon = shell_quote(&daemon.display().to_string()),
     );
-    let script = format!(
-        "do shell script \"{}\" with administrator privileges with prompt \"{}\"",
-        applescript_quote(&command),
-        applescript_quote("p2wlan-tray needs administrator permission to start p2wlan-daemon.")
-    );
-    let output = Command::new("osascript").arg("-e").arg(script).output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.contains("-128") {
-            "administrator authorization cancelled".into()
-        } else if stderr.is_empty() {
-            "administrator launch failed".into()
-        } else {
-            stderr.into()
-        })
-    }
+    run_macos_elevated(&command)
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/desktop_tray_controller.dart';
+import 'package:p2wlan_flutter_client/app/desktop_window_status_controller.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
@@ -48,6 +49,8 @@ void main() {
 
     expect(labels, contains('停止 P2WLAN'));
     expect(labels, isNot(contains('启动 P2WLAN')));
+    expect(labels.any((label) => label.contains('延迟: 34 ms')), isTrue);
+    expect(labels.any((label) => label.contains('速度: —')), isTrue);
   });
 
   test(
@@ -80,7 +83,7 @@ void main() {
     expect(controller.trayIconUsesTemplateForTesting(), Platform.isMacOS);
   });
 
-  test('desktop tray title stays empty so only the icon is visible', () async {
+  test('desktop tray title keeps the app visible when offline', () async {
     final stores = await _makeStores(api: DiagnosticsApi());
     addTearDown(stores.dispose);
 
@@ -89,7 +92,44 @@ void main() {
       statusStore: stores.statusStore,
     );
 
-    expect(controller.trayTitleForTesting(), isEmpty);
+    expect(controller.trayTitleForTesting(), 'P2WLAN');
+    expect(controller.dockBadgeForTesting(), isEmpty);
+  });
+
+  test('desktop tray title includes verified latency', () async {
+    final snapshot = await _loadFixtureSnapshot();
+    final stores = await _makeStores(
+      api: _FakeDiagnosticsApi(snapshot: snapshot),
+    );
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+
+    final controller = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    );
+
+    expect(controller.trayTitleForTesting(), contains('34 ms'));
+    expect(controller.trayTitleForTesting(), contains('—'));
+    expect(controller.dockBadgeForTesting(), '34ms/—');
+  });
+
+  test('desktop taskbar status includes verified latency', () async {
+    final snapshot = await _loadFixtureSnapshot();
+    final stores = await _makeStores(
+      api: _FakeDiagnosticsApi(snapshot: snapshot),
+    );
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+
+    final controller = DesktopWindowStatusController(
+      statusStore: stores.statusStore,
+    );
+
+    expect(controller.taskbarTitleForTesting(), contains('34 ms'));
+    expect(controller.dockBadgeForTesting(), '34ms/—');
   });
 
   test(

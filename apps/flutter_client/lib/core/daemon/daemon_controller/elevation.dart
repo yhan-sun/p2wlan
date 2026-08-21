@@ -66,24 +66,31 @@ extension DaemonControllerElevation on DaemonController {
   }
 
   Future<void> _startMacosElevated(String command) async {
-    await _runMacosElevated(
-      command,
-      'p2wlan 需要管理员权限以创建虚拟网卡并安装 Overlay 路由。p2wlan 不会读取或保存你的密码。',
-    );
-  }
-
-  Future<void> _runMacosElevated(String command, String prompt) async {
-    final script =
-        'do shell script "${_appleScriptQuote(command)}" '
-        'with administrator privileges '
-        'with prompt "${_appleScriptQuote(prompt)}"';
-    final result = await Process.run('osascript', ['-e', script]);
-    if (result.exitCode != 0) {
-      final stderr = result.stderr.toString().trim();
-      if (stderr.contains('-128')) {
-        throw '已取消管理员授权。';
+    final credentials = _MacosElevationCredentials();
+    try {
+      if (!await credentials.hasStoredPassword()) {
+        final saved = await credentials.promptAndStorePassword();
+        if (!saved) throw '已取消保存管理员密码。';
       }
-      throw stderr.isEmpty ? '管理员授权启动失败。' : stderr;
+
+      var run = await credentials.runWithStoredPassword(command);
+      if (run.missingCredential || run.authenticationFailed) {
+        // A password can be removed from Keychain or changed outside P2WLAN.
+        // Forget the stale item and allow exactly one fresh secure prompt.
+        await credentials.clearStoredPassword();
+        final saved = await credentials.promptAndStorePassword();
+        if (!saved) throw '已取消保存管理员密码。';
+        run = await credentials.runWithStoredPassword(command);
+      }
+      if (!run.ok) {
+        throw run.error ?? '管理员权限启动失败。';
+      }
+    } on MissingPluginException {
+      throw '当前 macOS 构建不支持安全管理员凭据存储，请重新安装 P2WLAN。';
+    } on PlatformException catch (error) {
+      throw error.message?.trim().isNotEmpty == true
+          ? error.message!.trim()
+          : '无法访问 macOS 登录钥匙串。';
     }
   }
 
@@ -148,12 +155,12 @@ extension DaemonControllerElevation on DaemonController {
         normalized.contains('user name or password') ||
         normalized.contains('username or password') ||
         normalized.contains('password was incorrect')) {
-      return '管理员认证失败：请在 macOS 系统弹窗中输入当前 Mac 的管理员账号和密码；如果当前账号不是管理员，请使用管理员账号授权。';
+      return '管理员认证失败：已保存的 macOS 管理员密码无效，请重新启动并输入当前管理员密码。';
     }
     if (raw.contains('-128') ||
         raw.contains('已取消') ||
         normalized.contains('cancel')) {
-      return '已取消管理员授权，p2wlan-daemon 未启动。';
+      return '已取消管理员密码保存，p2wlan-daemon 未启动。';
     }
     if (Platform.isWindows) {
       if (normalized.contains('access denied') ||
@@ -170,4 +177,57 @@ extension DaemonControllerElevation on DaemonController {
     }
     return '无法启动 p2wlan-daemon：$raw';
   }
+}
+
+/// The macOS implementation deliberately keeps the password inside the
+/// native Keychain/privilege boundary. Dart receives only a success result;
+/// the password is never put in a Dart string, process argument, environment
+/// variable, settings file, or log.
+class _MacosElevationCredentials {
+  static const _channel = MethodChannel('p2wlan/macos_elevation');
+
+  Future<bool> hasStoredPassword() async {
+    return await _channel.invokeMethod<bool>('hasStoredPassword') ?? false;
+  }
+
+  Future<bool> promptAndStorePassword() async {
+    return await _channel.invokeMethod<bool>('promptAndStorePassword') ?? false;
+  }
+
+  Future<_MacosElevationRunResult> runWithStoredPassword(String command) async {
+    final result = await _channel.invokeMapMethod<String, dynamic>(
+      'runWithStoredPassword',
+      <String, Object>{'command': command},
+    );
+    if (result == null) {
+      return const _MacosElevationRunResult(
+        ok: false,
+        error: 'macOS 提权执行没有返回结果。',
+      );
+    }
+    return _MacosElevationRunResult(
+      ok: result['ok'] == true,
+      missingCredential: result['missingCredential'] == true,
+      authenticationFailed: result['authenticationFailed'] == true,
+      error: (result['error'] as String?)?.trim(),
+    );
+  }
+
+  Future<void> clearStoredPassword() async {
+    await _channel.invokeMethod<void>('clearStoredPassword');
+  }
+}
+
+class _MacosElevationRunResult {
+  const _MacosElevationRunResult({
+    required this.ok,
+    this.missingCredential = false,
+    this.authenticationFailed = false,
+    this.error,
+  });
+
+  final bool ok;
+  final bool missingCredential;
+  final bool authenticationFailed;
+  final String? error;
 }

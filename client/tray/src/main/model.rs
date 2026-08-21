@@ -2,6 +2,17 @@
 enum UserEvent {
     Menu(MenuEvent),
     Refresh,
+    State(DaemonState),
+    DaemonActionFinished {
+        action: DaemonAction,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DaemonAction {
+    Start,
+    Stop,
 }
 
 #[derive(Clone)]
@@ -19,7 +30,12 @@ struct TrayMenu {
 impl TrayMenu {
     fn new() -> Result<(Self, Menu), Box<dyn Error>> {
         let status = MenuItem::with_id("status", "状态：未启动", false, None);
-        let network = MenuItem::with_id("network", "虚拟 IP：— · 在线设备：—", false, None);
+        let network = MenuItem::with_id(
+            "network",
+            "虚拟 IP：— · 在线设备：— · 延迟：— · 速度：—",
+            false,
+            None,
+        );
         let open_client = MenuItem::with_id("open-client", "打开控制台", true, None);
         let start_daemon = MenuItem::with_id("start-daemon", "启动 TUN", true, None);
         let stop_daemon = MenuItem::with_id("stop-daemon", "停止 TUN", false, None);
@@ -107,6 +123,9 @@ struct DaemonState {
     status_label: String,
     virtual_ip: String,
     online: Option<u64>,
+    latency_ms: Option<u64>,
+    total_bytes: Option<u64>,
+    speed_bytes_per_second: Option<u64>,
     devices: TrayDeviceMenu,
     tooltip: String,
 }
@@ -119,6 +138,9 @@ impl DaemonState {
             status_label: "未启动".to_string(),
             virtual_ip: "—".to_string(),
             online: None,
+            latency_ms: None,
+            total_bytes: None,
+            speed_bytes_per_second: None,
             devices: TrayDeviceMenu::default(),
             tooltip: "p2wlan：未启动".to_string(),
         }
@@ -131,6 +153,9 @@ impl DaemonState {
             status_label: "诊断会话不可用".to_string(),
             virtual_ip: "—".to_string(),
             online: None,
+            latency_ms: None,
+            total_bytes: None,
+            speed_bytes_per_second: None,
             devices: TrayDeviceMenu::default(),
             tooltip: format!("p2wlan：{message}"),
         }

@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 //! # P2WLAN Daemon
 //!
 //! The main client daemon that runs the P2P virtual network.

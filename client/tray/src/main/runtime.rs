@@ -15,9 +15,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     }));
 
     let proxy = event_loop.create_proxy();
+    let refresh_in_flight = Arc::new(AtomicBool::new(false));
+    let refresh_proxy = proxy.clone();
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(5));
-        if proxy.send_event(UserEvent::Refresh).is_err() {
+        if refresh_proxy.send_event(UserEvent::Refresh).is_err() {
             break;
         }
     });
@@ -26,6 +28,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("P2WLAN")
+        .with_title("P2WLAN")
         .with_icon(tray_icon_image(false)?)
         .with_icon_as_template(false)
         .build()?;
@@ -34,18 +37,32 @@ fn run() -> Result<(), Box<dyn Error>> {
         menu: menu_items,
         tray_icon,
         last_state: DaemonState::offline(),
+        previous_traffic: None,
     };
-    app.refresh_state();
+    app.apply_state();
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::NewEvents(StartCause::Init) | Event::UserEvent(UserEvent::Refresh) => {
-                app.refresh_state();
+                spawn_state_refresh(
+                    proxy.clone(),
+                    refresh_in_flight.clone(),
+                );
+            }
+            Event::UserEvent(UserEvent::State(state)) => {
+                app.apply_state_update(state);
+            }
+            Event::UserEvent(UserEvent::DaemonActionFinished { action, error }) => {
+                app.finish_daemon_action(action, error);
+                spawn_state_refresh(
+                    proxy.clone(),
+                    refresh_in_flight.clone(),
+                );
             }
             Event::UserEvent(UserEvent::Menu(event)) => match app.menu.id_for(&event) {
-                MenuAction::StartDaemon => app.start_daemon(),
-                MenuAction::StopDaemon => app.stop_daemon(),
+                MenuAction::StartDaemon => app.start_daemon(proxy.clone()),
+                MenuAction::StopDaemon => app.stop_daemon(proxy.clone()),
                 MenuAction::OpenClient => app.open_client(),
                 MenuAction::OpenLogs => app.open_logs(),
                 MenuAction::CopyPeerIp(ip) => app.copy_peer_ip(&ip),
@@ -57,6 +74,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             },
             _ => {}
         }
+    });
+}
+
+fn spawn_state_refresh(proxy: EventLoopProxy<UserEvent>, in_flight: Arc<AtomicBool>) {
+    if in_flight.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    thread::spawn(move || {
+        let state = query_daemon_state();
+        let _ = proxy.send_event(UserEvent::State(state));
+        in_flight.store(false, Ordering::Release);
     });
 }
 

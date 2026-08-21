@@ -16,28 +16,39 @@ Future<void> main() async {
       await windowManager.setPreventClose(true);
     }
   }
-  runApp(P2WlanApp(enableDesktopTray: enableFlutterTray));
+  runApp(
+    P2WlanApp(
+      enableDesktopTray: enableFlutterTray,
+      enableDesktopTaskbarStatus: _supportsDesktopHost && !enableFlutterTray,
+    ),
+  );
 }
 
 Future<void> _configureDesktopWindowChrome() async {
+  // Keep the main Flutter window discoverable on every desktop platform.
+  // The tray controller may temporarily hide it when the user chooses a
+  // background/tray close behavior.
+  await windowManager.setSkipTaskbar(false);
+  await windowManager.setTitle('P2WLAN');
+
   if (Platform.isMacOS) {
     await windowManager.setTitleBarStyle(
       TitleBarStyle.hidden,
       windowButtonVisibility: true,
     );
   } else if (Platform.isWindows) {
-    await windowManager.setTitle('P2WLAN');
     await windowManager.setTitleBarStyle(
-      // Keep the native Windows caption buttons, but use the same frameless
-      // content chrome as macOS.  The in-app close button was a duplicate of
-      // this native control and made the settings/login pages look unlike the
-      // Mac build.
-      TitleBarStyle.hidden,
+      // Windows keeps its native title bar so the system close, minimize, and
+      // maximize controls remain available and behave consistently with other
+      // Windows applications. macOS uses the separate hidden-titlebar style
+      // above to retain its traffic-light controls and content layout.
+      TitleBarStyle.normal,
       windowButtonVisibility: true,
     );
     await windowManager.setResizable(true);
     await windowManager.setMinimizable(true);
     await windowManager.setMaximizable(true);
+    await windowManager.setClosable(true);
   }
 }
 

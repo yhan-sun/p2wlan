@@ -65,7 +65,7 @@ extension DaemonControllerLaunchToken on DaemonController {
       final result = await _runWindowsPowerShell(
         '\$account = [Security.Principal.WindowsIdentity]::GetCurrent().Name; '
         '& icacls.exe $quotedPath /inheritance:r /grant:r (\$account + \':F\'); '
-        'exit \$LASTEXITCODE',
+        '\$global:LASTEXITCODE = \$LASTEXITCODE',
       );
       if (result.exitCode != 0) {
         throw StateError(

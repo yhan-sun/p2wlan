@@ -155,7 +155,7 @@ PermissionPreflight _checkMacosPermissions() {
     reasonCode: isRoot ? 'tun_runtime_verification' : 'elevation_required',
     message: isRoot
         ? '已获得 root 权限；macOS utun 创建需要 daemon 运行时验证。'
-        : '启动 TUN 时需要管理员授权；P2WLAN 会使用系统授权弹窗，不读取或保存密码。',
+        : '需要管理员授权启动 TUN；首次输入后密码会加密保存在 macOS 登录钥匙串中。',
     sudoCommand: isRoot ? null : _suggestedSudoCommand(),
     checks: [
       PermissionCheck(

@@ -4,14 +4,24 @@ use std::{
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[cfg(target_os = "macos")]
+use std::io::Write;
+
+#[cfg(target_os = "macos")]
+use security_framework::os::macos::keychain::SecKeychain;
 
 use tao::{
     event::{Event, StartCause},
-    event_loop::{ControlFlow, EventLoopBuilder},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
 };
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},

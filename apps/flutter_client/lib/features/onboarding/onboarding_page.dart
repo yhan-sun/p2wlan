@@ -133,8 +133,8 @@ class _OnboardingPageState extends State<OnboardingPage> {
 
   /// Start the daemon. The permission step and the daemon step both land here:
   /// granting permission IS the real elevation that happens when the daemon
-  /// is launched (osascript/UAC/pkexec), and once the daemon is reachable the
-  /// permission fact is true by definition.
+  /// is launched (macOS Keychain + sudo/UAC/pkexec), and once the daemon is
+  /// reachable the permission fact is true by definition.
   Future<void> _startDaemon() async {
     setState(() => _busy = true);
     try {
@@ -167,6 +167,7 @@ class _OnboardingPageState extends State<OnboardingPage> {
       '已完成启动授权',
       '管理员认证失败',
       '已取消管理员授权',
+      '已取消管理员密码保存',
       'Android VPN',
     ];
     return safePrefixes.any(detail.startsWith);

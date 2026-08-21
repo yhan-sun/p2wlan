@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 
 import '../app/desktop_tray_controller.dart';
+import '../app/desktop_window_status_controller.dart';
 import '../app/app_strings.dart';
 import '../app/app_theme.dart';
 import '../app/p2wlan_colors.dart';
@@ -26,6 +28,7 @@ class P2WlanApp extends StatefulWidget {
     this.diagnosticsApi,
     this.daemonController,
     this.enableDesktopTray = false,
+    this.enableDesktopTaskbarStatus = false,
   });
 
   final bool initialRefresh;
@@ -34,6 +37,7 @@ class P2WlanApp extends StatefulWidget {
   final DiagnosticsApi? diagnosticsApi;
   final DaemonController? daemonController;
   final bool enableDesktopTray;
+  final bool enableDesktopTaskbarStatus;
 
   @override
   State<P2WlanApp> createState() => _P2WlanAppState();
@@ -43,6 +47,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   late final SettingsStore _settingsStore;
   late final StatusStore _statusStore;
   DesktopTrayController? _desktopTrayController;
+  DesktopWindowStatusController? _desktopWindowStatusController;
   var _ready = false;
   var _authenticated = false;
 
@@ -55,6 +60,18 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       diagnosticsApi: widget.diagnosticsApi ?? DiagnosticsApi(),
       daemonController: widget.daemonController,
       enableFreshnessTimer: true,
+      autoRefreshInterval: Platform.isWindows
+          ? const Duration(seconds: 8)
+          : StatusStore.defaultActivePollingInterval,
+      startupCatalogRefreshTimeout: Platform.isWindows
+          ? StatusStore.defaultWindowsStartupCatalogRefreshTimeout
+          : StatusStore.defaultStartupCatalogRefreshTimeout,
+      startupCatalogRefreshInterval: Platform.isWindows
+          ? StatusStore.defaultWindowsStartupCatalogRefreshInterval
+          : StatusStore.defaultStartupCatalogRefreshInterval,
+      routeVerificationInterval: Platform.isWindows
+          ? StatusStore.defaultWindowsRouteVerificationInterval
+          : Duration.zero,
     );
     WidgetsBinding.instance.addObserver(this);
     _bootstrap();
@@ -80,6 +97,12 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
         statusStore: _statusStore,
       );
       unawaited(_desktopTrayController!.initialize());
+    } else if (widget.enableDesktopTaskbarStatus &&
+        DesktopWindowStatusController.isSupported) {
+      _desktopWindowStatusController = DesktopWindowStatusController(
+        statusStore: _statusStore,
+      );
+      unawaited(_desktopWindowStatusController!.initialize());
     }
     // Mobile/web builds are remote-management clients. They do not ship a
     // local diagnostics daemon, so polling the desktop default
@@ -110,6 +133,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     unawaited(_desktopTrayController?.dispose());
+    _desktopWindowStatusController?.dispose();
     _statusStore.dispose();
     _settingsStore.dispose();
     super.dispose();

@@ -11,6 +11,13 @@ extension DaemonControllerPids on DaemonController {
   /// hand the situation to the verified `stop()` path instead of silently
   /// skipping elevation.
   Future<bool> _hasExistingDaemonForStart(String diagnosticsUrl) async {
+    if (Platform.isWindows) {
+      // One WMI query is enough to find the old daemon. The previous flow
+      // performed a status lookup plus separate exact-bind and single-process
+      // PowerShell scans before it even attempted to stop anything.
+      if ((await _findWindowsDaemonPids()).isNotEmpty) return true;
+      return _diagnosticsApi.fetchHealth(diagnosticsUrl);
+    }
     if (await _diagnosticsProcessId(diagnosticsUrl) != null) return true;
 
     final bind = _diagnosticsBindFromStatusUrl(diagnosticsUrl);
@@ -54,6 +61,23 @@ extension DaemonControllerPids on DaemonController {
   }
 
   Future<bool> _waitForDaemonPidExit(int pid, Duration timeout) async {
+    if (Platform.isWindows) {
+      // Do not start a new PowerShell process every 400 ms while a Windows
+      // daemon is shutting down. One hidden PowerShell can poll the already
+      // verified PID in-process, which removes a large source of UI stalls.
+      final timeoutMs = timeout.inMilliseconds.clamp(1, 60000);
+      final result = await _runWindowsPowerShell(
+        '\$deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs); '
+        'while ([DateTime]::UtcNow -lt \$deadline) { '
+        'if (\$null -eq (Get-Process -Id $pid -ErrorAction SilentlyContinue)) { '
+        'return '
+        '} '
+        'Start-Sleep -Milliseconds 100 '
+        '} '
+        '\$global:LASTEXITCODE = 1',
+      );
+      return result.exitCode == 0;
+    }
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {
       if (!await _processLooksLikeDaemon(pid)) return true;
@@ -62,7 +86,21 @@ extension DaemonControllerPids on DaemonController {
     return !await _processLooksLikeDaemon(pid);
   }
 
+  Future<bool> _waitForWindowsDaemonPidsExit(
+    Iterable<int> pids,
+    Duration timeout,
+  ) async {
+    for (final pid in pids.toSet()) {
+      if (!await _waitForDaemonPidExit(pid, timeout)) return false;
+    }
+    return true;
+  }
+
   Future<bool> _anyDaemonPidStillRunning(Iterable<int> pids) async {
+    if (Platform.isWindows) {
+      final running = (await _findWindowsDaemonPids()).toSet();
+      return pids.any(running.contains);
+    }
     for (final pid in pids.toSet()) {
       if (await _processLooksLikeDaemon(pid)) return true;
     }
@@ -126,6 +164,22 @@ extension DaemonControllerPids on DaemonController {
     return matches.length == 1 ? matches.single : null;
   }
 
+  Future<List<int>> _findWindowsDaemonPids() async {
+    if (!Platform.isWindows) return const <int>[];
+    final result = await _runWindowsPowerShell(
+      r'Get-CimInstance Win32_Process | '
+      r"Where-Object { $_.CommandLine -like '*p2wlan-daemon*' } | "
+      r'Select-Object -ExpandProperty ProcessId',
+    );
+    if (result.exitCode != 0) return const <int>[];
+    return result.stdout
+        .toString()
+        .split('\n')
+        .map((line) => int.tryParse(line.trim()))
+        .whereType<int>()
+        .toList();
+  }
+
   Future<int?> _findSingleDaemonPid() async {
     final matches = <int>[];
     if (Platform.isWindows) {
@@ -171,7 +225,7 @@ extension DaemonControllerPids on DaemonController {
       // level. This is what lets a normal P2WLAN launch clean up an older
       // administrator-launched daemon before starting its replacement.
       final result = await _runWindowsPowerShell(
-        '& taskkill.exe /PID $pid /T /F; exit \$LASTEXITCODE',
+        '& taskkill.exe /PID $pid /T /F',
       );
       if (result.exitCode == 0) return true;
       final elevated = await _runWindowsPowerShell(
@@ -179,7 +233,7 @@ extension DaemonControllerPids on DaemonController {
         '\$killed = Start-Process -Verb RunAs -WindowStyle Hidden '
         '-FilePath \'taskkill.exe\' '
         '-ArgumentList \'/PID $pid /T /F\' -Wait -PassThru; '
-        'exit \$killed.ExitCode',
+        '\$global:LASTEXITCODE = \$killed.ExitCode',
       );
       return elevated.exitCode == 0;
     }
@@ -193,14 +247,13 @@ extension DaemonControllerPids on DaemonController {
     }
     if (Platform.isMacOS && !_isRootUser()) {
       try {
-        await _runMacosElevated(
+        await _startMacosElevated(
           '/bin/kill -TERM ${_shellQuote('$pid')}; '
-              '/bin/sleep 2; '
-              'if /bin/ps -p ${_shellQuote('$pid')} -o command= 2>/dev/null | '
-              '/usr/bin/grep -q p2wlan-daemon; then '
-              '/bin/kill -KILL ${_shellQuote('$pid')}; '
-              'fi',
-          'p2wlan 需要管理员权限停止后台 p2wlan-daemon。',
+          '/bin/sleep 2; '
+          'if /bin/ps -p ${_shellQuote('$pid')} -o command= 2>/dev/null | '
+          '/usr/bin/grep -q p2wlan-daemon; then '
+          '/bin/kill -KILL ${_shellQuote('$pid')}; '
+          'fi',
         );
         return await _waitForDaemonPidExit(pid, const Duration(seconds: 3));
       } catch (_) {
@@ -257,25 +310,65 @@ extension DaemonControllerPids on DaemonController {
   ///
   /// Flutter's Windows runner is a GUI process. Launching console programs
   /// such as PowerShell or net.exe with the default process mode can make a
-  /// black terminal flash during every daemon start/stop probe. PowerShell's
-  /// hidden window style keeps these short-lived probes invisible while still
-  /// allowing their stdout/stderr to be collected.
-  Future<ProcessResult> _runWindowsPowerShell(String script) {
+  /// black terminal flash during every daemon start/stop probe. A detached
+  /// process with piped stdio uses the Windows detached-process creation mode,
+  /// so the helper is invisible from the moment it is created (unlike
+  /// `-WindowStyle Hidden`, which can still flash before PowerShell applies
+  /// the style).
+  Future<ProcessResult> _runWindowsPowerShell(String script) async {
     final windir = Platform.environment['WINDIR']?.trim();
     final executable = windir == null || windir.isEmpty
         ? 'powershell.exe'
         : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-    return Process.run(executable, [
+    const marker = '__P2WLAN_HELPER_EXIT__';
+    final wrappedScript =
+        '\$ErrorActionPreference = \'Stop\'; '
+        'try { & { $script }; '
+        '\$exitCode = if (\$null -ne \$LASTEXITCODE) { '
+        '[int]\$LASTEXITCODE } else { 0 } '
+        '} catch { '
+        '[Console]::Error.WriteLine(\$_.Exception.Message); '
+        '\$exitCode = 1 '
+        '} '
+        'Write-Output (\'$marker\' + \$exitCode)';
+    final process = await Process.start(executable, [
       '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
-      '-WindowStyle',
-      'Hidden',
       '-ExecutionPolicy',
       'Bypass',
       '-Command',
-      script,
-    ]);
+      wrappedScript,
+    ], mode: ProcessStartMode.detachedWithStdio);
+
+    try {
+      final captured = await Future.wait<String>([
+        process.stdout.transform(systemEncoding.decoder).join(),
+        process.stderr.transform(systemEncoding.decoder).join(),
+      ]).timeout(const Duration(seconds: 10));
+      final stdout = captured[0];
+      final stderr = captured[1];
+      final lines = stdout.split('\n');
+      final markerIndex = lines.lastIndexWhere(
+        (line) => line.trimLeft().startsWith(marker),
+      );
+      if (markerIndex < 0) {
+        return ProcessResult(process.pid, 1, stdout, stderr);
+      }
+      final markerLine = lines.removeAt(markerIndex).trim();
+      final exitCode = int.tryParse(markerLine.substring(marker.length)) ?? 1;
+      return ProcessResult(process.pid, exitCode, lines.join('\n'), stderr);
+    } on TimeoutException {
+      process.kill();
+      unawaited(process.stdout.drain<void>());
+      unawaited(process.stderr.drain<void>());
+      return ProcessResult(
+        process.pid,
+        1,
+        '',
+        'Windows helper timed out after 10 seconds',
+      );
+    }
   }
 
   String _windowsCommandLineArgQuote(String value) {
@@ -322,8 +415,4 @@ extension DaemonControllerPids on DaemonController {
 
   bool _equalsIgnoreCase(String left, String right) =>
       left.toLowerCase() == right.toLowerCase();
-
-  String _appleScriptQuote(String value) {
-    return value.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-  }
 }

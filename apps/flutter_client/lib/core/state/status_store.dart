@@ -20,6 +20,7 @@ class StatusStore extends ChangeNotifier {
     this.enableFreshnessTimer = false,
     this.startupCatalogRefreshTimeout = defaultStartupCatalogRefreshTimeout,
     this.startupCatalogRefreshInterval = defaultStartupCatalogRefreshInterval,
+    this.routeVerificationInterval = Duration.zero,
   }) : daemonController =
            daemonController ??
            DaemonController(diagnosticsApi: diagnosticsApi) {
@@ -35,6 +36,17 @@ class StatusStore extends ChangeNotifier {
   static const defaultStartupCatalogRefreshInterval = Duration(
     milliseconds: 500,
   );
+
+  /// Windows route inspection starts a PowerShell process inside the daemon.
+  /// Keep the normal snapshot cadence, but do not repeat this expensive read
+  /// on every foreground refresh.
+  static const defaultWindowsRouteVerificationInterval = Duration(seconds: 30);
+  static const defaultWindowsStartupCatalogRefreshTimeout = Duration(
+    seconds: 3,
+  );
+  static const defaultWindowsStartupCatalogRefreshInterval = Duration(
+    milliseconds: 750,
+  );
   static const _startupCatalogMaxRefreshes = 14;
   static const _startupCatalogMinRefreshes = 12;
 
@@ -47,6 +59,7 @@ class StatusStore extends ChangeNotifier {
   final bool enableFreshnessTimer;
   final Duration startupCatalogRefreshTimeout;
   final Duration startupCatalogRefreshInterval;
+  final Duration routeVerificationInterval;
 
   Timer? _timer;
   Timer? _staleTimer;
@@ -69,6 +82,7 @@ class StatusStore extends ChangeNotifier {
   String? _lastDaemonManualCommand;
   DateTime? _lastFetchedAt;
   DateTime? _lastSuccessfulStatusAt;
+  DateTime? _lastRouteVerificationAt;
   Duration? _lastRequestDuration;
   var _speedTestRunning = false;
   SpeedTestResult? _lastSpeedTestResult;
@@ -220,10 +234,14 @@ class StatusStore extends ChangeNotifier {
         _statusSnapshotTimedOut = false;
         _updatePeerTrafficRates(snapshot, fetchedAt);
         _snapshot = snapshot;
-        try {
-          _routeHealthy = (await diagnosticsApi.verifyRoutes(url)).healthy;
-        } catch (_) {
-          _routeHealthy = false;
+        if (_shouldVerifyRoutes(fetchedAt)) {
+          try {
+            _routeHealthy = (await diagnosticsApi.verifyRoutes(url)).healthy;
+          } catch (_) {
+            _routeHealthy = false;
+          } finally {
+            _lastRouteVerificationAt = DateTime.now();
+          }
         }
         _lastError = null;
         _lastFetchedAt = fetchedAt;
@@ -279,6 +297,13 @@ class StatusStore extends ChangeNotifier {
     _peerTransferRatesBytesPerSecond = <String, int>{};
     _staleTimer?.cancel();
     _staleTimer = null;
+    _lastRouteVerificationAt = null;
+  }
+
+  bool _shouldVerifyRoutes(DateTime now) {
+    if (routeVerificationInterval <= Duration.zero) return true;
+    final last = _lastRouteVerificationAt;
+    return last == null || now.difference(last) >= routeVerificationInterval;
   }
 
   void _updatePeerTrafficRates(

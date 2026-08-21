@@ -38,6 +38,8 @@ class DaemonController {
   static const _directReadyTimeout = Duration(seconds: 20);
 
   final DiagnosticsApi _diagnosticsApi;
+  DateTime? _lastLaunchExitProbeAt;
+  bool? _lastLaunchExitProbeResult;
 
   Future<DaemonCommandResult> start(AppSettings settings) async {
     if (Platform.isAndroid) return _startAndroidVpn(settings);
@@ -209,6 +211,8 @@ class DaemonController {
     // temporary credential file is no longer needed. Delete it now so no
     // long-lived plaintext token file persists, and always clean it up on
     // failure/timeout below.
+    _lastLaunchExitProbeAt = null;
+    _lastLaunchExitProbeResult = null;
     final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
     final ready = await _waitForHealth(
       settings.diagnosticsUrl,
@@ -263,7 +267,16 @@ class DaemonController {
       );
     }
 
-    final statusPid = await _diagnosticsProcessId(diagnosticsUrl);
+    // The Windows start path already performs one verified WMI scan. Reuse
+    // the same cheap process identity check here instead of forcing a full
+    // /status snapshot (which can be the slowest endpoint when peer locks are
+    // busy). Fall back to /status only when WMI returned no safe candidate.
+    final windowsDaemonPids = Platform.isWindows
+        ? await _findWindowsDaemonPids()
+        : const <int>[];
+    final statusPid = Platform.isWindows && windowsDaemonPids.isNotEmpty
+        ? null
+        : await _diagnosticsProcessId(diagnosticsUrl);
     final shutdownRequested = await _diagnosticsApi.requestShutdown(
       diagnosticsUrl,
     );
@@ -272,9 +285,16 @@ class DaemonController {
         diagnosticsUrl,
         const Duration(seconds: 8),
       );
-      final processDown =
-          statusPid == null ||
-          await _waitForDaemonPidExit(statusPid, const Duration(seconds: 3));
+      final processDown = Platform.isWindows && windowsDaemonPids.isNotEmpty
+          ? await _waitForWindowsDaemonPidsExit(
+              windowsDaemonPids,
+              const Duration(seconds: 3),
+            )
+          : statusPid == null ||
+                await _waitForDaemonPidExit(
+                  statusPid,
+                  const Duration(seconds: 3),
+                );
       if (endpointDown && processDown) {
         await _removePidMarker();
         return const DaemonCommandResult(
@@ -284,12 +304,19 @@ class DaemonController {
       }
     }
 
-    final diagnosticsBind = _diagnosticsBindFromStatusUrl(diagnosticsUrl);
     final candidatePids = <int?>[
       statusPid,
       await _readVerifiedPid(),
-      await _findDaemonPidByDiagnosticsBind(diagnosticsBind),
-      await _findSingleDaemonPid(),
+      if (Platform.isWindows) ...[
+        ...(windowsDaemonPids.isNotEmpty
+            ? windowsDaemonPids
+            : await _findWindowsDaemonPids()),
+      ] else ...[
+        await _findDaemonPidByDiagnosticsBind(
+          _diagnosticsBindFromStatusUrl(diagnosticsUrl),
+        ),
+        await _findSingleDaemonPid(),
+      ],
     ];
     final attempted = <int>{};
     for (final pid in candidatePids.whereType<int>()) {

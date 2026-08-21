@@ -25,7 +25,8 @@ Menu actions:
 
 - `Refresh Status`: polls `http://127.0.0.1:39277/health` and `/status`.
 - `Start Daemon`: launches `p2wlan-daemon` with the default config path.
-  On macOS this uses the system administrator prompt.
+  On macOS the administrator password is requested once and then encrypted in
+  the user's login Keychain for later starts.
 - `Stop Daemon`: sends `POST /shutdown`.
 - `Open P2WLAN`: opens the Flutter frontend when deeper settings or
   diagnostics are needed.

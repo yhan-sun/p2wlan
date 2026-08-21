@@ -106,8 +106,8 @@ class AppStrings {
   String get macosAuthorizationTitle =>
       isZh ? '需要 macOS 管理员授权' : 'macOS administrator access required';
   String get macosAuthorizationBody => isZh
-      ? 'P2WLAN 需要启动 p2wlan-daemon 来创建虚拟网卡并安装路由。下一步会打开 macOS 系统密码弹窗；P2WLAN 不会读取或保存你的密码。'
-      : 'P2WLAN needs to start p2wlan-daemon to create the virtual adapter and install routes. macOS will ask for an administrator password next; P2WLAN does not read or store it.';
+      ? 'P2WLAN 需要管理员权限创建虚拟网卡和路由。首次输入后，密码会加密保存在 macOS 登录钥匙串中。'
+      : 'P2WLAN needs administrator access for the virtual adapter and routes. Enter the password once; it is encrypted in the macOS login Keychain.';
   String get manualLaunchCommand => isZh ? '手动启动命令' : 'Manual launch command';
   String get manualLaunchCommandBody => isZh
       ? '如果系统授权失败，可以复制下面的命令到终端执行，然后回到 P2WLAN 点击刷新。'
@@ -817,8 +817,8 @@ class AppStrings {
 
   // --- Permissions presentation ---
   String permActionElevationRequired() => isZh
-      ? '启动 TUN 时需要管理员授权；P2WLAN 会使用系统授权弹窗，不读取或保存密码。'
-      : 'Administrator authorization is required to create the TUN; P2WLAN uses the system prompt and never reads or stores your password.';
+      ? '需要管理员授权启动 TUN；首次输入后密码会加密保存在 macOS 登录钥匙串中。'
+      : 'Administrator authorization is required for the TUN; after the first entry, the password is encrypted in the macOS login Keychain.';
   String permActionTunRuntimeVerification() => isZh
       ? '已获得管理员权限；macOS utun 创建需要 daemon 运行时验证。'
       : 'Elevated privileges are active; macOS utun creation is verified at daemon runtime.';

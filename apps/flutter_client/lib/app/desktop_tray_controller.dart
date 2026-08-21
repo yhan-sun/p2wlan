@@ -10,6 +10,7 @@ import '../core/daemon/daemon_controller.dart';
 import '../core/models/diagnostics_models.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
+import '../shared/formatters.dart';
 import 'app_constants.dart';
 import 'app_strings.dart';
 
@@ -41,6 +42,8 @@ class DesktopTrayController with TrayListener, WindowListener {
   bool _quitting = false;
   bool _menuUpdateQueued = false;
   String? _lastTrayIconAsset;
+  String? _lastDesktopTitle;
+  String? _lastDockBadge;
   Future<DaemonCommandResult>? _stopDaemonFuture;
 
   static bool get isSupported {
@@ -58,7 +61,7 @@ class DesktopTrayController with TrayListener, WindowListener {
 
     try {
       await windowManager.setPreventClose(true);
-      if (Platform.isMacOS) {
+      if (Platform.isMacOS || Platform.isLinux) {
         await trayManager.setTitle(trayTitleForTesting());
       }
       await _updateTrayIcon(force: true);
@@ -124,14 +127,37 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void> _updateMenu() async {
     final strings = AppStrings.fromCode(settingsStore.settings.languageCode);
     final statusLabel = _statusLabel(strings);
+    final taskbarTitle = trayTitleForTesting();
 
     await _updateTrayIcon();
-    await trayManager.setToolTip('$p2wlanAppName - $statusLabel');
-    if (Platform.isMacOS) {
-      await trayManager.setTitle(trayTitleForTesting());
+    await trayManager.setToolTip('$taskbarTitle - $statusLabel');
+    if (Platform.isMacOS || Platform.isLinux) {
+      await trayManager.setTitle(taskbarTitle);
     }
+    await _updateDesktopWindowIndicators(taskbarTitle);
 
     await trayManager.setContextMenu(buildMenuForTesting());
+  }
+
+  Future<void> _updateDesktopWindowIndicators(String title) async {
+    if (_lastDesktopTitle != title) {
+      try {
+        await windowManager.setTitle(title);
+        _lastDesktopTitle = title;
+      } catch (error) {
+        debugPrint('Failed to update P2WLAN taskbar title: $error');
+      }
+    }
+    if (!Platform.isMacOS) return;
+
+    final badge = dockBadgeForTesting();
+    if (_lastDockBadge == badge) return;
+    try {
+      await windowManager.setBadgeLabel(badge.isEmpty ? null : badge);
+      _lastDockBadge = badge;
+    } catch (error) {
+      debugPrint('Failed to update P2WLAN Dock badge: $error');
+    }
   }
 
   Future<void> _updateTrayIcon({bool force = false}) async {
@@ -226,12 +252,61 @@ class DesktopTrayController with TrayListener, WindowListener {
   bool trayIconUsesTemplateForTesting() => Platform.isMacOS;
 
   @visibleForTesting
-  String trayTitleForTesting() => '';
+  String trayTitleForTesting() {
+    final snapshot = _metricsSnapshot;
+    if (snapshot == null) return p2wlanAppName;
+    return '$p2wlanAppName · ${formatLatency(_averageLatency(snapshot))} · ${formatTransferRate(_aggregateSpeed(snapshot))}';
+  }
+
+  @visibleForTesting
+  String dockBadgeForTesting() {
+    final snapshot = _metricsSnapshot;
+    if (snapshot == null) return '';
+    final latency = _averageLatency(snapshot);
+    final speed = _aggregateSpeed(snapshot);
+    if (latency == null && speed == null) return '';
+    final latencyLabel = latency == null ? '—' : '${latency}ms';
+    final speedLabel = speed == null
+        ? '—'
+        : formatTransferRate(speed).replaceAll(' ', '');
+    return '$latencyLabel/$speedLabel';
+  }
 
   String _networkLabel(AppStrings strings, DiagnosticsSnapshot? snapshot) {
     final virtualIp = snapshot?.virtualIp.trim();
     final peerCount = snapshot?.stats.totalPeers ?? 0;
-    return '${strings.virtualIp}: ${virtualIp == null || virtualIp.isEmpty ? '—' : virtualIp} · ${strings.peerCount}: $peerCount';
+    final metricsSnapshot = _metricsSnapshot;
+    return '${strings.virtualIp}: ${virtualIp == null || virtualIp.isEmpty ? '—' : virtualIp} · ${strings.peerCount}: $peerCount · 延迟: ${formatLatency(_averageLatency(metricsSnapshot))} · 速度: ${formatTransferRate(_aggregateSpeed(metricsSnapshot))}';
+  }
+
+  DiagnosticsSnapshot? get _metricsSnapshot {
+    if (!statusStore.daemonReachable || statusStore.snapshotStale) return null;
+    return statusStore.snapshot;
+  }
+
+  int? _averageLatency(DiagnosticsSnapshot? snapshot) {
+    if (snapshot == null) return null;
+    final latencies = [
+      for (final peer in snapshot.peers)
+        if (peer.online && peer.latencyMs != null) peer.latencyMs!,
+    ];
+    if (latencies.isEmpty) return null;
+    final total = latencies.fold<int>(0, (sum, value) => sum + value);
+    return (total / latencies.length).round();
+  }
+
+  int? _aggregateSpeed(DiagnosticsSnapshot? snapshot) {
+    if (snapshot == null) return null;
+    var total = 0;
+    var hasSample = false;
+    for (final peer in snapshot.peers) {
+      if (!peer.online) continue;
+      final rate = statusStore.peerTransferRatesBytesPerSecond[peer.nodeId];
+      if (rate == null) continue;
+      total += rate;
+      hasSample = true;
+    }
+    return hasSample ? total : null;
   }
 
   List<MenuItem> _deviceItems(

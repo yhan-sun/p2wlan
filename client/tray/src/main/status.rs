@@ -51,6 +51,10 @@ fn query_daemon_state() -> DaemonState {
         .and_then(|stats| stats.get("total_peers"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let latency_ms = status
+        .as_ref()
+        .and_then(average_verified_latency_ms);
+    let total_bytes = status.as_ref().and_then(total_bytes_from_status);
     let devices = status.as_ref().map(tray_device_menu).unwrap_or_default();
     DaemonState {
         running: true,
@@ -58,12 +62,82 @@ fn query_daemon_state() -> DaemonState {
         status_label: "已连接".to_string(),
         virtual_ip: virtual_ip.clone(),
         online,
+        latency_ms,
+        total_bytes,
+        speed_bytes_per_second: None,
         devices,
         tooltip: match online {
             Some(count) => format!("p2wlan：已连接 · {virtual_ip} · {count} 台在线"),
             None => format!("p2wlan：已连接 · {peer_count} 台设备"),
         },
     }
+}
+
+fn total_bytes_from_status(status: &serde_json::Value) -> Option<u64> {
+    let stats = status.get("stats")?;
+    let sent = stats
+        .get("total_bytes_sent")
+        .and_then(serde_json::Value::as_u64)?;
+    let received = stats
+        .get("total_bytes_received")
+        .and_then(serde_json::Value::as_u64)?;
+    Some(sent.saturating_add(received))
+}
+
+fn average_verified_latency_ms(status: &serde_json::Value) -> Option<u64> {
+    let peers = status.get("peers").and_then(serde_json::Value::as_array)?;
+    let latencies = peers
+        .iter()
+        .filter_map(verified_peer_latency_ms)
+        .collect::<Vec<_>>();
+    if latencies.is_empty() {
+        return None;
+    }
+    let count = latencies.len() as u128;
+    let sum = latencies.iter().copied().map(u128::from).sum::<u128>();
+    Some(((sum + count / 2) / count) as u64)
+}
+
+fn verified_peer_latency_ms(peer: &serde_json::Value) -> Option<u64> {
+    if peer.get("online").and_then(serde_json::Value::as_bool) == Some(false) {
+        return None;
+    }
+
+    let active_path = peer.get("active_path").and_then(serde_json::Value::as_str);
+    let state = peer.get("state").and_then(serde_json::Value::as_str);
+    let path_key = match (active_path, state) {
+        (Some("direct"), Some("direct")) => "direct",
+        (Some("relay"), _) => {
+            let confirmed = peer
+                .get("relay_confirmed_endpoint")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|endpoint| !endpoint.trim().is_empty())
+                && peer
+                    .get("relay_confirmed_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some();
+            if !confirmed {
+                return None;
+            }
+            "relay"
+        }
+        _ => return None,
+    };
+
+    peer.get(path_key)
+        .and_then(|path| path.get("rtt_ewma_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            peer.get(path_key)
+                .and_then(|path| path.get("latency_ms"))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .or_else(|| {
+            (path_key == "relay")
+                .then(|| peer.get("remote_relay_latency_ms"))
+                .flatten()
+                .and_then(serde_json::Value::as_u64)
+        })
 }
 
 fn fetch_status_with_auth(
@@ -192,4 +266,57 @@ fn rebuild_device_menu(submenu: &Submenu, device_menu: &TrayDeviceMenu) {
 fn copy_ip_from_menu_id(id: &str) -> Option<&str> {
     let ip = id.strip_prefix(COPY_PEER_IP_PREFIX)?;
     ip.parse::<IpAddr>().ok().map(|_| ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_uses_verified_active_paths_only() {
+        let status = serde_json::json!({
+            "peers": [
+                {
+                    "online": true,
+                    "active_path": "direct",
+                    "state": "direct",
+                    "direct": {"latency_ms": 24}
+                },
+                {
+                    "online": true,
+                    "active_path": "relay",
+                    "state": "relay",
+                    "relay_confirmed_endpoint": "relay.example:18081",
+                    "relay_confirmed_generation": 0,
+                    "relay": {"latency_ms": 43}
+                },
+                {
+                    "online": true,
+                    "active_path": "direct",
+                    "state": "hole_punching",
+                    "direct": {"latency_ms": 1}
+                },
+                {
+                    "online": true,
+                    "active_path": "relay",
+                    "state": "relay",
+                    "relay": {"latency_ms": 2}
+                }
+            ]
+        });
+
+        assert_eq!(average_verified_latency_ms(&status), Some(34));
+    }
+
+    #[test]
+    fn total_bytes_combines_sent_and_received_counters() {
+        let status = serde_json::json!({
+            "stats": {
+                "total_bytes_sent": 16248,
+                "total_bytes_received": 27428
+            }
+        });
+
+        assert_eq!(total_bytes_from_status(&status), Some(43676));
+    }
 }

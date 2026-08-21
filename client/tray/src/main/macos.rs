@@ -13,8 +13,3 @@ fn user_owner_for_paths() -> Option<String> {
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
-
-#[cfg(target_os = "macos")]
-fn applescript_quote(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}

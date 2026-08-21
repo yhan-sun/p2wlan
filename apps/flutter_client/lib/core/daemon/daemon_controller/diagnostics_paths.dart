@@ -27,12 +27,34 @@ extension DaemonControllerDiagnosticsPaths on DaemonController {
   /// never written because the elevated launcher died first) means the
   /// daemon is down.
   Future<bool> _daemonExitedAfterLaunch(String logPath) async {
+    if (Platform.isWindows) {
+      final lastProbeAt = _lastLaunchExitProbeAt;
+      final lastProbeResult = _lastLaunchExitProbeResult;
+      if (lastProbeAt != null &&
+          lastProbeResult != null &&
+          DateTime.now().difference(lastProbeAt) < const Duration(seconds: 2)) {
+        return lastProbeResult;
+      }
+    }
     final pid = await _readVerifiedPid();
-    if (pid != null) return false;
+    final exited =
+        pid == null && await _logShowsPermanentAuthFailure(logPath) == true;
+    if (pid != null) {
+      if (Platform.isWindows) {
+        _lastLaunchExitProbeAt = DateTime.now();
+        _lastLaunchExitProbeResult = false;
+      }
+      return false;
+    }
     final logFile = File(logPath);
-    if (!await logFile.exists()) return false;
-    return await _logShowsPermanentAuthFailure(logPath) ||
-        await _logShowsWintunMissing(logPath);
+    final result =
+        await logFile.exists() &&
+        (exited || await _logShowsWintunMissing(logPath));
+    if (Platform.isWindows) {
+      _lastLaunchExitProbeAt = DateTime.now();
+      _lastLaunchExitProbeResult = result;
+    }
+    return result;
   }
 
   /// Whether the daemon log tail carries a permanent control auth failure

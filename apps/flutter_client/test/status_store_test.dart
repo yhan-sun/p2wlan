@@ -55,6 +55,23 @@ void main() {
       expect(stores.statusStore.snapshot, isNotNull);
     },
   );
+
+  test(
+    'route verification interval avoids repeating expensive route reads',
+    () async {
+      final api = _SwitchingDiagnosticsApi(snapshot: await _loadFixture());
+      final stores = await _makeStores(
+        api,
+        routeVerificationInterval: const Duration(hours: 1),
+      );
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await stores.statusStore.refresh();
+
+      expect(api.verifyRoutesCount, 1);
+    },
+  );
 }
 
 Future<DiagnosticsSnapshot> _loadFixture() async {
@@ -69,6 +86,7 @@ Future<DiagnosticsSnapshot> _loadFixture() async {
 Future<_Stores> _makeStores(
   DiagnosticsApi api, {
   Duration maxSnapshotAge = StatusStore.defaultMaxSnapshotAge,
+  Duration routeVerificationInterval = Duration.zero,
 }) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_status_store_');
   final settingsStore = SettingsStore(
@@ -81,6 +99,7 @@ Future<_Stores> _makeStores(
     diagnosticsApi: api,
     maxSnapshotAge: maxSnapshotAge,
     enableFreshnessTimer: true,
+    routeVerificationInterval: routeVerificationInterval,
   );
   return _Stores(tempDir, settingsStore, statusStore);
 }
@@ -106,6 +125,7 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   final Completer<void>? oldHealth;
   final oldHealthStarted = Completer<void>();
   final healthUrls = <String>[];
+  var verifyRoutesCount = 0;
 
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async {
@@ -155,8 +175,17 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   }) async => throw UnimplementedError();
 
   @override
-  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async =>
-      throw UnimplementedError();
+  Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async {
+    verifyRoutesCount += 1;
+    return const RoutesResponse(
+      contractVersion: 1,
+      interfaceName: 'p2wlan',
+      mtu: 1500,
+      healthy: true,
+      conflictCount: 0,
+      entries: <RouteEntryResponse>[],
+    );
+  }
 
   @override
   Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async =>
