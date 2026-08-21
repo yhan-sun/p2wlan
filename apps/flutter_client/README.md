@@ -53,8 +53,9 @@ The macOS Runner has a build phase that runs:
 apps/flutter_client/scripts/bundle_daemon_macos.sh
 ```
 
-It builds `p2wlan-daemon` for Debug/Release when missing and copies it into the
-app bundle Resources directory.
+It rebuilds `p2wlan-daemon` for Debug/Release and verifies its version and git
+commit before copying it into the app bundle Resources directory. This avoids
+silently embedding a stale daemon from `target/`.
 
 Build the release Flutter DMG, including a freshly compiled Rust daemon, with:
 
