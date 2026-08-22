@@ -189,6 +189,7 @@ AIR_SSH="${SSH_RUN_PREFIX}ssh -i $AIR_SSH_KEY -p $AIR_SSH_PORT -o StrictHostKeyC
 # explicitly for every remote authorization call.  The value is only a UID;
 # credentials and command payloads remain inside the existing base64 fragment.
 AIR_LOGIN_UID=$($AIR_SSH 'id -u')
+AIR_LOGIN_GID=$($AIR_SSH 'id -g')
 AIR_CONSOLE_UID=$($AIR_SSH 'stat -f "%u" /dev/console' 2>/dev/null || true)
 if [[ ! "$AIR_CONSOLE_UID" =~ ^[0-9]+$ ]]; then
   AIR_CONSOLE_UID="$AIR_LOGIN_UID"
@@ -729,6 +730,10 @@ REMOTE_NODE_B_DEVICE=""
 REMOTE_NODE_B_TOKEN_FILE=""
 LOCAL_AUTH_HELPER_PIDS=""
 REMOTE_AUTH_HELPER_PIDS=""
+LOCAL_DIAG_AUTH_FILE=""
+LOCAL_DIAG_AUTH_USER_FILE=""
+REMOTE_DIAG_AUTH_FILE=""
+REMOTE_DIAG_AUTH_USER_FILE=""
 LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE=0
 REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE=0
 if [[ "$PERSIST_PRIVILEGED_SUPERVISOR" == "1" ]]; then
@@ -1263,17 +1268,91 @@ count_stage() {
 local_diag_curl() {
   local max_time=$1
   local url=$2
-  local token_file="$LOCAL_RUN_DIR/p2wlan-daemon.diag-auth"
+  local token_file="${LOCAL_DIAG_AUTH_FILE:-$LOCAL_RUN_DIR/p2wlan-daemon.diag-auth}"
   local token
   token=$(tr -d '\r\n' <"$token_file") || return 1
   [[ -n "$token" ]] || return 1
   curl -fsS --max-time "$max_time" -H "Authorization: Bearer $token" "$url"
 }
 
+# REAL_TUN starts the Mini daemon through the privileged supervisor.  macOS
+# intentionally keeps the daemon-owned auth file at mode 0600, so the normal
+# harness user cannot read it even though the local diagnostics endpoint is
+# loopback-only.  Copy the ephemeral token through the already-authorized
+# supervisor into a user-owned 0600 file; this is test-harness plumbing only
+# and does not weaken the daemon's production auth-file permissions.
+prepare_local_diag_auth_for_harness() {
+  local source="$LOCAL_RUN_DIR/p2wlan-daemon.diag-auth"
+  LOCAL_DIAG_AUTH_FILE=""
+  if [[ -r "$source" ]]; then
+    LOCAL_DIAG_AUTH_FILE="$source"
+    return 0
+  fi
+  if [[ "$LOCAL_DAEMON_NEEDS_OSASCRIPT" != "1" ||
+        "$LOCAL_PRIVILEGED_SUPERVISOR_ACTIVE" != "1" ]]; then
+    return 1
+  fi
+
+  local target="$LOCAL_RUN_DIR/p2wlan-daemon.diag-auth.user"
+  local owner_uid owner_gid owner_name
+  owner_uid=$(id -u)
+  owner_gid=$(id -g)
+  owner_name=$(id -un)
+  LOCAL_DIAG_AUTH_USER_FILE="$target"
+  rm -f "$target"
+  if ! local_privileged_exec \
+    "install -o '$owner_uid' -g '$owner_gid' -m 600 '$source' '$target'"; then
+    return 1
+  fi
+  for _ in $(seq 1 50); do
+    if [[ -s "$target" ]] &&
+       [[ "$(stat -f '%Su' "$target" 2>/dev/null || true)" == "$owner_name" ]] &&
+       [[ "$(stat -f '%Lp' "$target" 2>/dev/null || true)" == "600" ]]; then
+      LOCAL_DIAG_AUTH_FILE="$target"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 remote_diag_curl() {
   local max_time=$1
   local url=$2
-  $AIR_SSH "token=\$(tr -d '\\r\\n' < '$REMOTE_RUN_DIR/p2wlan-daemon.diag-auth'); test -n \"\$token\"; curl --noproxy '*' -fsS --max-time $max_time -H \"Authorization: Bearer \$token\" '$url'"
+  local token_file="${REMOTE_DIAG_AUTH_FILE:-$REMOTE_RUN_DIR/p2wlan-daemon.diag-auth}"
+  $AIR_SSH "token=\$(tr -d '\\r\\n' < '$token_file'); test -n \"\$token\"; curl --noproxy '*' -fsS --max-time $max_time -H \"Authorization: Bearer \$token\" '$url'"
+}
+
+# The Air daemon is also root-owned during REAL_TUN runs.  Mirror the Mini
+# token handoff through the already-authorized Air supervisor so the SSH-side
+# diagnostics client remains the unprivileged login user with a 0600 token.
+prepare_remote_diag_auth_for_harness() {
+  local source="$REMOTE_RUN_DIR/p2wlan-daemon.diag-auth"
+  REMOTE_DIAG_AUTH_FILE=""
+  if $AIR_SSH "test -r '$source'" >/dev/null 2>&1; then
+    REMOTE_DIAG_AUTH_FILE="$source"
+    return 0
+  fi
+  if [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" != "1" ||
+        "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" != "1" ]]; then
+    return 1
+  fi
+
+  local target="$REMOTE_RUN_DIR/p2wlan-daemon.diag-auth.user"
+  REMOTE_DIAG_AUTH_USER_FILE="$target"
+  $AIR_SSH "rm -f '$target'"
+  if ! remote_privileged_exec \
+    "install -o '$AIR_LOGIN_UID' -g '$AIR_LOGIN_GID' -m 600 '$source' '$target'"; then
+    return 1
+  fi
+  for _ in $(seq 1 50); do
+    if $AIR_SSH "test -s '$target' && test \"\$(stat -f '%u' '$target')\" = '$AIR_LOGIN_UID' && test \"\$(stat -f '%Lp' '$target')\" = 600" >/dev/null 2>&1; then
+      REMOTE_DIAG_AUTH_FILE="$target"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 status_reports_direct() {
@@ -1613,6 +1692,7 @@ redact_local_config() {
   local files=()
   [[ -n "$LOCAL_NODE_A_CONFIG" ]] && files+=("$LOCAL_NODE_A_CONFIG")
   [[ -n "$LOCAL_NODE_A_TOKEN_FILE" ]] && files+=("$LOCAL_NODE_A_TOKEN_FILE")
+  [[ -n "$LOCAL_DIAG_AUTH_USER_FILE" ]] && files+=("$LOCAL_DIAG_AUTH_USER_FILE")
   ((${#files[@]} > 0)) || return 0
   local cleanup_command=""
   for file in "${files[@]}"; do
@@ -1715,7 +1795,7 @@ remote_daemon_matches() {
 
 remote_daemon_cleanup() {
   [[ -n "$REMOTE_NODE_B_PID_FILE" ]] || return 0
-  local cleanup_command="pid_file='$REMOTE_NODE_B_PID_FILE'; config='$AIR_CONFIG'; token_file='$REMOTE_NODE_B_TOKEN_FILE'; device='$REMOTE_NODE_B_DEVICE'; bin='$REMOTE_DAEMON_BIN'; run_id='$RUN_ID'; case \"\$pid_file:\$config:\$device:\$bin\" in *\"\$run_id\"*) ;; *) exit 3 ;; esac; if [ ! -r \"\$pid_file\" ]; then exit 3; fi; pid=\$(cat \"\$pid_file\"); case \"\$pid\" in ''|*[!0-9]*) exit 3 ;; esac; cmd=\$(ps -ww -p \"\$pid\" -o command= 2>/dev/null) || exit 3; case \"\$cmd\" in *\"\$bin\"*\"\$config\"*\"\$device\"*) kill -TERM \"\$pid\" 2>/dev/null || true; sleep 1; if kill -0 \"\$pid\" 2>/dev/null; then kill -KILL \"\$pid\" 2>/dev/null || true; fi; for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 \"\$pid\" 2>/dev/null || break; sleep 0.1; done; kill -0 \"\$pid\" 2>/dev/null && exit 4; : >\"\$pid_file\"; : >\"\$token_file\"; : >\"\$config\" ;; *) exit 3 ;; esac"
+  local cleanup_command="pid_file='$REMOTE_NODE_B_PID_FILE'; config='$AIR_CONFIG'; token_file='$REMOTE_NODE_B_TOKEN_FILE'; diag_user_file='$REMOTE_DIAG_AUTH_USER_FILE'; device='$REMOTE_NODE_B_DEVICE'; bin='$REMOTE_DAEMON_BIN'; run_id='$RUN_ID'; case \"\$pid_file:\$config:\$device:\$bin\" in *\"\$run_id\"*) ;; *) exit 3 ;; esac; if [ ! -r \"\$pid_file\" ]; then exit 3; fi; pid=\$(cat \"\$pid_file\"); case \"\$pid\" in ''|*[!0-9]*) exit 3 ;; esac; cmd=\$(ps -ww -p \"\$pid\" -o command= 2>/dev/null) || exit 3; case \"\$cmd\" in *\"\$bin\"*\"\$config\"*\"\$device\"*) kill -TERM \"\$pid\" 2>/dev/null || true; sleep 1; if kill -0 \"\$pid\" 2>/dev/null; then kill -KILL \"\$pid\" 2>/dev/null || true; fi; for n in 1 2 3 4 5 6 7 8 9 10; do kill -0 \"\$pid\" 2>/dev/null || break; sleep 0.1; done; kill -0 \"\$pid\" 2>/dev/null && exit 4; : >\"\$pid_file\"; : >\"\$token_file\"; : >\"\$config\"; if [ -n \"\$diag_user_file\" ]; then : >\"\$diag_user_file\"; fi ;; *) exit 3 ;; esac"
   if { [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" == "1" ]] && remote_privileged_exec "$cleanup_command" >/dev/null 2>&1; } ||
      { [[ "$REMOTE_PRIVILEGED_SUPERVISOR_ACTIVE" != "1" && "$AIR_REMOTE_NEEDS_OSASCRIPT" == "1" ]] && remote_osascript_shell "$cleanup_command" >/dev/null 2>&1; } ||
      { [[ "$AIR_REMOTE_NEEDS_OSASCRIPT" != "1" ]] && $AIR_SSH "$cleanup_command" >/dev/null 2>&1; }; then
@@ -2133,6 +2213,26 @@ for round in $(seq 1 "$ROUNDS"); do
     echo "[mini-air] ROUND $round: FAIL (Air daemon diagnostics never became ready)" >&2
     overall=1
     collect_air_log || : >"$ROUND_DIR/node-b.log"
+    remote_daemon_cleanup || true
+    kill_remote_wrapper
+    local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+    continue
+  fi
+
+  if ! prepare_remote_diag_auth_for_harness; then
+    echo "[mini-air] ROUND $round: FAIL (Air diagnostics auth token is unavailable to the harness user)" >&2
+    overall=1
+    remote_daemon_cleanup || true
+    kill_remote_wrapper
+    local_daemon_cleanup || true
+    if ! delete_round_devices "$ROUND_DIR"; then exit 1; fi
+    continue
+  fi
+
+  if ! prepare_local_diag_auth_for_harness; then
+    echo "[mini-air] ROUND $round: FAIL (Mini diagnostics auth token is unavailable to the harness user)" >&2
+    overall=1
     remote_daemon_cleanup || true
     kill_remote_wrapper
     local_daemon_cleanup || true
