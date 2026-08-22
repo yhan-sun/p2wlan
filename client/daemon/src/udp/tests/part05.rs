@@ -204,6 +204,58 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
 }
 
 #[tokio::test]
+async fn direct_validation_allows_on_link_upgrade_but_rejects_public_alternate() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let public_endpoint: SocketAddr = "198.51.100.24:51820".parse().unwrap();
+    let lan_endpoint: SocketAddr = "192.168.2.24:51820".parse().unwrap();
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.2", Some(public_endpoint)))
+        .await;
+    peers
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.14".parse().unwrap(),
+            24,
+        )])
+        .await;
+    peers
+        .add_candidates_with_sources(
+            "peer-b",
+            &[public_endpoint.to_string(), lan_endpoint.to_string()],
+            &HashMap::from([
+                (public_endpoint.to_string(), "peer_reflexive".to_string()),
+                (lan_endpoint.to_string(), "host".to_string()),
+            ]),
+        )
+        .await;
+    peers
+        .record_direct_probe_success_with_latency(
+            "peer-b",
+            public_endpoint,
+            Some(Duration::from_millis(160)),
+        )
+        .await;
+    peers
+        .record_direct_success("peer-b", Some(public_endpoint))
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-b", public_endpoint, 0)
+            .await,
+        DirectValidationSessionStart::IgnoredInactive
+    ));
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-b", lan_endpoint, 0)
+            .await,
+        DirectValidationSessionStart::Spawn(_)
+    ));
+}
+
+#[tokio::test]
 async fn remote_candidate_refresh_cancels_direct_validation_owner() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),

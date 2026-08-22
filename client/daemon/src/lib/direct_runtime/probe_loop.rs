@@ -244,7 +244,14 @@ async fn run_direct_probe_loop(
                     // only an authenticated Direct validation ACK can make
                     // this return early; a send or ACK failure falls through
                     // to the existing complete sweep.
-                    let fast_candidates = direct_fast_probe_candidates(&candidates);
+                    let fast_candidates = if preferred_fast_candidates.is_empty() {
+                        direct_fast_probe_candidates(&candidates)
+                    } else {
+                        direct_fast_probe_candidates_with_preferred(
+                            &candidates,
+                            &preferred_fast_candidates,
+                        )
+                    };
                     if direct_fast_probe_is_allowed(
                         remote_scatter_pool,
                         stable_remote_scatter,

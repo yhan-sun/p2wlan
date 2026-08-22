@@ -126,8 +126,8 @@ pub(super) fn classify_candidate_pair_path(
     }
 
     // A private address is not enough to prove a physical LAN path.  The
-    // contextual wrapper below only returns Lan after the source is Host and
-    // the endpoint is inside a directly-connected local interface prefix.
+    // contextual wrapper below only returns Lan after the endpoint is inside
+    // a directly-connected local interface prefix.
     if is_private_direct_endpoint(pair.remote_endpoint) {
         return DirectPathType::Unknown;
     }
@@ -145,21 +145,18 @@ pub(super) fn classify_candidate_pair_path(
     }
 }
 
-/// Classify a validated Host pair after the caller has proven that its remote
-/// address is on one of the local interface prefixes. This source/context
-/// check is important for deployments where a physical LAN reuses 10.20/16,
-/// 100.64/10, or IPv6 ULA space that is otherwise reserved for the overlay.
+/// Classify a validated pair after the caller has proven that its remote
+/// address is on one of the local interface prefixes.  Prefix evidence is
+/// deliberately independent of the current learning label: authenticated
+/// traffic may reclassify a Host endpoint as PeerReflexive without changing
+/// the physical route.
 pub(super) fn classify_candidate_pair_path_with_on_link_host(
     active_path: Option<NetworkPath>,
     pair: Option<&CandidatePair>,
     direct_confirmed: bool,
     on_link_host: bool,
 ) -> DirectPathType {
-    if active_path == Some(NetworkPath::Direct)
-        && direct_confirmed
-        && on_link_host
-        && pair.is_some_and(|pair| pair.source == CandidatePairSource::Host)
-    {
+    if active_path == Some(NetworkPath::Direct) && direct_confirmed && on_link_host {
         return DirectPathType::Lan;
     }
     classify_candidate_pair_path(active_path, pair, direct_confirmed)
@@ -170,7 +167,7 @@ pub(super) fn classify_confirmed_direct_endpoint_with_on_link_host(
     source: CandidatePairSource,
     on_link_host: bool,
 ) -> DirectPathType {
-    if on_link_host && source == CandidatePairSource::Host {
+    if on_link_host {
         DirectPathType::Lan
     } else if is_overlay_endpoint(endpoint) {
         DirectPathType::Overlay

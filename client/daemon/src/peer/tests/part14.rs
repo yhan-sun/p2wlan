@@ -189,8 +189,11 @@ async fn host_candidate_is_not_starved_by_predicted_fast_window() {
     let predicted = (40_000..40_040)
         .map(|port| format!("203.0.113.10:{port}"))
         .collect::<Vec<_>>();
-    let mut candidates = vec![host.to_string()];
-    candidates.extend(predicted.clone());
+    // Put the public prediction first in the input deliberately.  The fast
+    // selector, not the caller's incidental ordering, must put a directly
+    // connected LAN endpoint ahead of the UU/public candidates.
+    let mut candidates = predicted.clone();
+    candidates.push(host.to_string());
     let sources = candidates
         .iter()
         .cloned()
@@ -225,5 +228,10 @@ async fn host_candidate_is_not_starved_by_predicted_fast_window() {
     assert!(
         preferred.contains(&host),
         "a physical Host candidate must have a bounded fast-lane slot even when predictions are present"
+    );
+    assert_eq!(
+        preferred.first(),
+        Some(&host),
+        "an on-link candidate must lead the latency-sensitive prefix"
     );
 }

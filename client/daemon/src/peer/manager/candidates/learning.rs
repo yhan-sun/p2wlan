@@ -17,18 +17,22 @@ impl PeerManager {
                 conn.candidates.push(previous_endpoint_text);
             }
         }
-        conn.endpoint = Some(endpoint);
+        let selected_endpoint = conn
+            .selected_direct_endpoint_for_consent(generation)
+            .or(conn.endpoint);
+        let alternate_direct_candidate = conn.state == ConnectionState::Direct
+            && selected_endpoint.is_some_and(|selected| selected != endpoint);
+        if !alternate_direct_candidate {
+            conn.endpoint = Some(endpoint);
+        }
         let endpoint_text = endpoint.to_string();
         if !conn.candidates.contains(&endpoint_text) {
             conn.candidates.push(endpoint_text.clone());
         }
+        let source = conn.learned_candidate_source(endpoint, CandidatePairSource::PeerReflexive);
         conn.candidate_sources
-            .insert(endpoint_text, CandidatePairSource::PeerReflexive);
-        conn.mark_candidate_pair_probing_with_source(
-            endpoint,
-            generation,
-            CandidatePairSource::PeerReflexive,
-        );
+            .insert(endpoint_text, source);
+        conn.mark_candidate_pair_probing_with_source(endpoint, generation, source);
         let pruned = conn.prune_stale_peer_reflexive_candidates_for_ip(endpoint, generation);
         if pruned > 0 {
             conn.record_direct_event(
@@ -114,18 +118,21 @@ impl PeerManager {
                 conn.candidates.push(previous_endpoint_text);
             }
         }
-        conn.endpoint = Some(endpoint);
+        let selected_endpoint = conn
+            .selected_direct_endpoint_for_consent(generation)
+            .or(conn.endpoint);
+        let alternate_direct_candidate = conn.state == ConnectionState::Direct
+            && selected_endpoint.is_some_and(|selected| selected != endpoint);
+        if !alternate_direct_candidate {
+            conn.endpoint = Some(endpoint);
+        }
         let endpoint_text = endpoint.to_string();
         if !conn.candidates.contains(&endpoint_text) {
             conn.candidates.push(endpoint_text.clone());
         }
-        conn.candidate_sources
-            .insert(endpoint_text, CandidatePairSource::Learned);
-        conn.mark_candidate_pair_probing_with_source(
-            endpoint,
-            generation,
-            CandidatePairSource::Learned,
-        );
+        let source = conn.learned_candidate_source(endpoint, CandidatePairSource::Learned);
+        conn.candidate_sources.insert(endpoint_text, source);
+        conn.mark_candidate_pair_probing_with_source(endpoint, generation, source);
         true
     }
 
@@ -149,14 +156,17 @@ impl PeerManager {
                 conn.endpoint == Some(endpoint) && conn.is_current_remote_endpoint(endpoint);
 
             if matches_candidate || matches_current {
-                conn.endpoint = Some(endpoint);
-                conn.candidate_sources
-                    .insert(endpoint.to_string(), CandidatePairSource::Learned);
-                conn.mark_candidate_pair_probing_with_source(
-                    endpoint,
-                    generation,
-                    CandidatePairSource::Learned,
-                );
+                let selected_endpoint = conn
+                    .selected_direct_endpoint_for_consent(generation)
+                    .or(conn.endpoint);
+                let alternate_direct_candidate = conn.state == ConnectionState::Direct
+                    && selected_endpoint.is_some_and(|selected| selected != endpoint);
+                if !alternate_direct_candidate {
+                    conn.endpoint = Some(endpoint);
+                }
+                let source = conn.learned_candidate_source(endpoint, CandidatePairSource::Learned);
+                conn.candidate_sources.insert(endpoint.to_string(), source);
+                conn.mark_candidate_pair_probing_with_source(endpoint, generation, source);
                 return Some(node_id.clone());
             }
         }

@@ -118,11 +118,10 @@ fn is_successful_low_latency_private_pair_at(pair: &CandidatePair, now: Instant)
 }
 
 fn is_successful_low_latency_on_link_host_pair_at(pair: &CandidatePair, now: Instant) -> bool {
-    pair.source == CandidatePairSource::Host
-        && matches!(
-            pair.state,
-            CandidatePairState::Selected | CandidatePairState::Succeeded
-        )
+    matches!(
+        pair.state,
+        CandidatePairState::Selected | CandidatePairState::Succeeded
+    )
         && pair.consecutive_failures == 0
         && pair
             .last_success_at

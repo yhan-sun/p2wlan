@@ -143,14 +143,24 @@ impl PeerConnection {
             })
             .take(1)
             .collect::<Vec<_>>();
+        // A directly-connected interface is a stronger latency signal than a
+        // public candidate's provenance.  Keep the LAN fast lane first so a
+        // peer that is also reachable through UU does not spend its first
+        // probe window on the Internet path.
         let reserve = on_link_hosts.len() + public_authoritative.len();
         let trusted_budget = PREFERRED_FAST_CANDIDATE_CAP.saturating_sub(reserve);
-        let mut preferred = self
+        let mut preferred = on_link_hosts.clone();
+        for endpoint in self
             .preferred_fast_candidates_from_sources(candidates)
             .into_iter()
+            .filter(|endpoint| !on_link_hosts.contains(endpoint))
             .take(trusted_budget)
-            .collect::<Vec<_>>();
-        for endpoint in public_authoritative.into_iter().chain(on_link_hosts) {
+        {
+            if !preferred.contains(&endpoint) {
+                preferred.push(endpoint);
+            }
+        }
+        for endpoint in public_authoritative {
             if !preferred.contains(&endpoint) {
                 preferred.push(endpoint);
             }
@@ -162,11 +172,32 @@ impl PeerConnection {
     }
 
     pub(super) fn is_on_link_host_candidate(&self, endpoint: SocketAddr) -> bool {
-        self.candidate_source_for_endpoint(endpoint) == CandidatePairSource::Host
-            && self
-                .local_interface_networks
-                .iter()
-                .any(|network| network.contains(endpoint.ip()))
+        // Route/prefix evidence is intentionally authoritative here.  A Host
+        // endpoint can become PeerReflexive/Learned after authenticated
+        // traffic, but it remains a physical LAN candidate when it is still
+        // inside one of this daemon's directly-connected interface prefixes.
+        self.local_interface_networks
+            .iter()
+            .any(|network| network.contains(endpoint.ip()))
+            && (!is_overlay_endpoint(endpoint)
+                || self.candidate_sources.get(&endpoint.to_string())
+                    == Some(&CandidatePairSource::Host)
+                || self.candidate_source_for_endpoint(endpoint) == CandidatePairSource::Host)
+    }
+
+    pub(super) fn learned_candidate_source(
+        &self,
+        endpoint: SocketAddr,
+        fallback: CandidatePairSource,
+    ) -> CandidatePairSource {
+        // Learning traffic must not erase an explicit Host classification.
+        // Keep the source metadata stable for diagnostics and fast ordering;
+        // on-link routing evidence remains the final LAN classification gate.
+        self.candidate_sources
+            .get(&endpoint.to_string())
+            .copied()
+            .filter(|source| *source == CandidatePairSource::Host)
+            .unwrap_or(fallback)
     }
 
     fn preferred_fast_candidates_from_sources(

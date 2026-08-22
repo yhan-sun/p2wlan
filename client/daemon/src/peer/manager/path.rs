@@ -216,6 +216,7 @@ impl PeerManager {
     /// peer retained for diagnostics from a live peer: lifecycle cleanup can
     /// cancel an old owner, and queued observations must not immediately
     /// recreate one for a Closed/offline connection.
+    #[allow(dead_code)]
     pub(crate) async fn is_direct_validation_eligible(&self, node_id: &str) -> bool {
         self.connections
             .read()
@@ -224,6 +225,52 @@ impl PeerManager {
             .is_some_and(|connection| {
                 connection.online && connection.state != ConnectionState::Closed
             })
+    }
+
+    /// Whether an encrypted validation may establish `endpoint` as a new
+    /// Direct path.  A confirmed public/UU path remains eligible for a
+    /// directly-connected LAN endpoint, but ordinary alternate public
+    /// candidates are still suppressed while Direct is healthy.
+    pub(crate) async fn is_direct_validation_eligible_for_endpoint(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+    ) -> bool {
+        let generation = self.current_network_generation().await;
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .is_some_and(|connection| {
+                connection.online
+                    && connection.state != ConnectionState::Closed
+                    && (connection.state != ConnectionState::Direct
+                        || connection.should_upgrade_direct_to_on_link(generation, endpoint))
+            })
+    }
+
+    /// Lock-free/try-lock counterpart used by the synchronous UDP ingress
+    /// gate.  A Direct peer's ordinary matched ACKs must be dropped before
+    /// they wake the scheduler; only an on-link alternate may pass through to
+    /// the async registry check.
+    pub(crate) fn is_direct_validation_eligible_for_endpoint_sync(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+    ) -> bool {
+        if !self.is_direct_sync(node_id) {
+            return true;
+        }
+        let Ok(connections) = self.connections.try_read() else {
+            return false;
+        };
+        let generation = self.current_network_generation_sync();
+        connections.get(node_id).is_some_and(|connection| {
+            connection.online
+                && connection.state != ConnectionState::Closed
+                && (connection.state != ConnectionState::Direct
+                    || connection.should_upgrade_direct_to_on_link(generation, endpoint))
+        })
     }
 
     /// Whether relay-assisted punching should be deferred for a peer that is

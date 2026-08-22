@@ -249,6 +249,102 @@ async fn low_latency_private_candidate_beats_selected_public_direct() {
 }
 
 #[tokio::test]
+async fn confirmed_public_direct_allows_on_link_peer_reflexive_upgrade() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let public_endpoint: SocketAddr = "8.8.8.8:51844".parse().unwrap();
+    let lan_endpoint: SocketAddr = "192.168.2.12:51844".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", public_endpoint)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.14".parse().unwrap(),
+            24,
+        )])
+        .await;
+    let candidates = vec![public_endpoint.to_string(), lan_endpoint.to_string()];
+    let sources = HashMap::from([
+        (public_endpoint.to_string(), "peer_reflexive".to_string()),
+        // Keep the original Host provenance even when the endpoint is later
+        // observed through authenticated traffic.
+        (lan_endpoint.to_string(), "host".to_string()),
+    ]);
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            public_endpoint,
+            Some(Duration::from_millis(180)),
+        )
+        .await;
+    manager
+        .record_direct_success("peer1", Some(public_endpoint))
+        .await;
+
+    assert!(manager
+        .learn_authenticated_endpoint("peer1", lan_endpoint)
+        .await);
+    let learned = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(
+        learned.candidate_sources.get(&lan_endpoint.to_string()),
+        Some(&CandidatePairSource::Host),
+        "authenticated learning must preserve the explicit Host provenance"
+    );
+    assert_eq!(
+        learned.endpoint,
+        Some(public_endpoint),
+        "learning an alternate LAN endpoint must not replace the active public path before encryption confirms it"
+    );
+
+    assert!(
+        manager
+            .is_direct_validation_eligible_for_endpoint("peer1", lan_endpoint)
+            .await,
+        "a confirmed public Direct path must admit an on-link LAN upgrade"
+    );
+    assert!(
+        !manager
+            .is_direct_validation_eligible_for_endpoint("peer1", public_endpoint)
+            .await,
+        "a confirmed Direct path must still reject ordinary alternate public validation"
+    );
+
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            lan_endpoint,
+            Some(Duration::from_millis(7)),
+        )
+        .await;
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(
+        connection.endpoint,
+        Some(public_endpoint),
+        "probe-only LAN evidence must not replace the active public endpoint before encryption confirms it"
+    );
+    assert_eq!(
+        manager.direct_endpoint_for_send("peer1").await,
+        Some(lan_endpoint),
+        "a successful low-latency on-link pair must outrank the public pair even when learned as peer-reflexive"
+    );
+
+    manager
+        .record_direct_success("peer1", Some(lan_endpoint))
+        .await;
+    let diagnostics = manager
+        .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
+        .await;
+    let peer = diagnostics
+        .iter()
+        .find(|peer| peer.node_id == "peer1")
+        .expect("peer diagnostics should be present");
+    assert_eq!(peer.direct_type, DirectPathType::Lan);
+    assert_eq!(peer.selected_pair.as_ref().unwrap().remote_endpoint, lan_endpoint.to_string());
+}
+
+#[tokio::test]
 async fn candidate_pair_stats_aggregate_real_outcomes_by_source() {
     let config = test_config();
     let manager = PeerManager::new(config);

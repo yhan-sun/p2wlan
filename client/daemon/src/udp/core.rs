@@ -1148,14 +1148,17 @@ impl UdpTransport {
         // therefore be suppressed instead of recreating the session it just
         // cancelled.
         let direct_confirmed = self.peers.is_direct_sync(peer_id);
-        let peer_eligible = self.peers.is_direct_validation_eligible(peer_id).await;
+        let peer_eligible = self
+            .peers
+            .is_direct_validation_eligible_for_endpoint(peer_id, endpoint)
+            .await;
         let transport_closed = self.direct_validation.is_closed();
         let slow_relay_suppressed = self
             .direct_validation
             .is_slow_relay_validation_suppressed(peer_id, generation)
             .await;
-        if direct_confirmed || !peer_eligible || transport_closed || slow_relay_suppressed {
-            let reason_code = if direct_confirmed {
+        if !peer_eligible || transport_closed || slow_relay_suppressed {
+            let reason_code = if direct_confirmed && !peer_eligible {
                 "direct_validation_peer_already_direct"
             } else if !peer_eligible {
                 "direct_validation_peer_ineligible"
@@ -1799,11 +1802,18 @@ impl UdpTransport {
         &self,
         observation: PeerReflexiveObservation,
     ) {
-        // The registry refuses Direct peers anyway (IgnoredInactive), but
-        // gating at the source keeps a converged peer's observations from
-        // waking the scheduler at all: after Direct confirmation no new scan,
-        // validation request or expectation may be created for the peer.
-        if self.peers.is_direct_sync(&observation.peer_id) {
+        // Endpoint-aware admission below still suppresses ordinary alternate
+        // candidates for a Direct peer.  Keep this ingress open so a matched
+        // LAN probe ACK can request a make-before-break validation while the
+        // current public/UU path remains active.
+        if self.peers.is_direct_sync(&observation.peer_id)
+            && !self
+                .peers
+                .is_direct_validation_eligible_for_endpoint_sync(
+                    &observation.peer_id,
+                    observation.observed_endpoint,
+                )
+        {
             return;
         }
         let Some(trigger) = self.validation_trigger.as_ref() else {

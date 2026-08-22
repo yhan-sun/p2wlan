@@ -538,7 +538,14 @@ impl PeerManager {
                     // the very endpoint we just quarantined and would cause
                     // delayed ACKs from other sockets to keep re-validating
                     // the same queue-prone mapping.
-                    conn.endpoint = Some(endpoint);
+                    let selected_endpoint = conn
+                        .selected_direct_endpoint_for_consent(generation)
+                        .or(conn.endpoint);
+                    let alternate_direct_candidate = conn.state == ConnectionState::Direct
+                        && selected_endpoint.is_some_and(|selected| selected != endpoint);
+                    if !alternate_direct_candidate {
+                        conn.endpoint = Some(endpoint);
+                    }
                     Some(conn.mark_candidate_pair_success(
                         endpoint,
                         generation,

@@ -74,7 +74,10 @@ impl PeerConnection {
             })
     }
 
-    fn selected_direct_endpoint_for_consent(&self, local_generation: u64) -> Option<SocketAddr> {
+    pub(crate) fn selected_direct_endpoint_for_consent(
+        &self,
+        local_generation: u64,
+    ) -> Option<SocketAddr> {
         self.candidate_pairs
             .iter()
             .filter(|pair| {
@@ -92,6 +95,38 @@ impl PeerConnection {
                 )
             })
             .map(|pair| pair.remote_endpoint)
+    }
+
+    pub(crate) fn should_upgrade_direct_to_on_link(
+        &self,
+        local_generation: u64,
+        endpoint: SocketAddr,
+    ) -> bool {
+        if self.state != ConnectionState::Direct
+            || !self.is_current_remote_endpoint(endpoint)
+            || !self.is_on_link_host_candidate(endpoint)
+        {
+            return false;
+        }
+
+        let selected_endpoint = self
+            .candidate_pairs
+            .iter()
+            .filter(|pair| {
+                pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
+                    && !self.is_overlay_candidate_pair(pair)
+                    && pair.state == CandidatePairState::Selected
+                    && pair.selected_at.is_some()
+            })
+            .max_by_key(|pair| pair.selected_at)
+            .map(|pair| pair.remote_endpoint)
+            .or(self.endpoint);
+
+        selected_endpoint != Some(endpoint)
+            && selected_endpoint.is_none_or(|selected| {
+                !self.is_on_link_host_candidate(selected)
+            })
     }
 
     fn selected_candidate_pair_for_diagnostics(
