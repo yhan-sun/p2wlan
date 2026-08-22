@@ -14,9 +14,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::connection_timeline::ConnectionTimeline;
@@ -84,6 +88,15 @@ include!("control/types.rs");
 include!("control/client.rs");
 include!("control/client/test_handlers.rs");
 include!("control/runtime.rs");
+
+#[cfg(test)]
+fn test_signal_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
 
 // ============================================================
 // Tests

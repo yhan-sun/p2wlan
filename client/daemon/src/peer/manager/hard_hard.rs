@@ -207,6 +207,24 @@ impl PeerManager {
         sessions.keys().any(|(owner, _)| owner == peer_id)
     }
 
+    /// Snapshot one live Hard↔Hard record for the deterministic two-peer
+    /// acceptance harness. Runtime callers use the narrower identity-fence
+    /// predicates below; this test-only view lets E2E assertions correlate the
+    /// measured socket with the session ledger without adding a production
+    /// data path.
+    #[cfg(test)]
+    pub(crate) async fn hard_hard_session_for_test(
+        &self,
+        peer_id: &str,
+    ) -> Option<HardHardSessionRecord> {
+        self.hard_hard_sessions
+            .lock()
+            .await
+            .values()
+            .find(|record| record.peer_id == peer_id)
+            .cloned()
+    }
+
     /// Look up a session by the stable token carried by either direction of
     /// the compact envelope.  The response swaps the directional generation
     /// fields, so reconstructing the initiator's full encoded string from the

@@ -465,6 +465,20 @@ impl UdpTransport {
         })
     }
 
+    /// Return the authenticated-evidence counter for one dynamic socket.
+    /// This is test-only observability for the exact-socket acceptance
+    /// harness; production callers use the identity-fenced proof above.
+    #[cfg(test)]
+    pub(crate) async fn authenticated_evidence_for_socket(&self, socket_index: usize) -> u64 {
+        self.socket_state
+            .lock()
+            .await
+            .dynamic
+            .get(&socket_index)
+            .map(|entry| entry.authenticated_evidence)
+            .unwrap_or_default()
+    }
+
     /// Detach a superseded generation's predecessor socket, unless the
     /// predecessor was re-pinned by authenticated traffic since the commit.
     ///

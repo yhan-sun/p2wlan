@@ -81,6 +81,7 @@ use p2pnet_nat::{CandidateGatherReport, CandidateSource, MappingBehavior, NatPro
 use rand::RngCore;
 use tokio::net::lookup_host;
 #[cfg(test)]
+#[allow(unused_imports)]
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::time::{interval, sleep, timeout};

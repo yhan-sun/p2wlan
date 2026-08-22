@@ -1046,6 +1046,23 @@ impl UdpTransport {
         self.socket_state.lock().await.dynamic.len()
     }
 
+    /// Number of Hard↔Hard-owned pending probe transactions for one peer.
+    /// Test-only lifecycle assertions use this to prove a failed synchronized
+    /// attempt did not leave an ACK admission lease behind; ordinary recovery
+    /// probes are intentionally outside this counter.
+    #[cfg(test)]
+    pub(crate) async fn hard_hard_pending_probe_count_for_test(&self, peer_id: &str) -> usize {
+        let pending = self.pending_probes.lock().await;
+        let hard_hard_bindings = self.hard_hard_probe_bindings.lock().await;
+        pending
+            .iter()
+            .filter(|(nonce, probe)| {
+                probe.peer_id.as_deref() == Some(peer_id)
+                    && hard_hard_bindings.contains_key(*nonce)
+            })
+            .count()
+    }
+
     /// Attach the local control-plane node ID used by authenticated UDP Probe v2.
     pub fn with_local_node_id(mut self, node_id: impl Into<String>) -> Self {
         self.local_node_id = Some(node_id.into());

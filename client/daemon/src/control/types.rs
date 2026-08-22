@@ -472,6 +472,40 @@ pub struct ControlClient {
     candidate_offer_tx: mpsc::Sender<CandidateOfferCommand>,
     /// Shared state.
     state: Arc<RwLock<ClientState>>,
+    /// Test-only in-process signaling adapter. It preserves the same
+    /// candidate-send API while delivering the resulting control event to a
+    /// second real daemon in an end-to-end harness instead of making HTTP.
+    #[cfg(test)]
+    test_signal_forwarder: Option<Arc<dyn Fn(TestControlSignal) + Send + Sync>>,
+    /// Test-only sender identity and monotonic candidate generation used by
+    /// the in-process signaling adapter. The production HTTP server owns
+    /// these values on the real signaling path.
+    #[cfg(test)]
+    test_signal_from_node_id: String,
+    #[cfg(test)]
+    test_signal_public_key: String,
+    #[cfg(test)]
+    test_signal_generation: Arc<AtomicU64>,
+}
+
+/// One signal delivered by the test-only control-plane adapter.
+///
+/// This is deliberately shaped like the normalized `ControlEvent::PeerOffer`
+/// ingress rather than a direct runtime command: two-peer tests still cross
+/// the same daemon control-event boundary as a real server delivery.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct TestControlSignal {
+    pub(crate) from_node_id: String,
+    pub(crate) sender_public_key: String,
+    pub(crate) to_node_id: String,
+    pub(crate) candidates: Vec<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) candidate_sources: HashMap<String, String>,
+    pub(crate) candidate_generation: u64,
+    pub(crate) candidates_expires_at_ms: Option<u64>,
+    pub(crate) punch_at_ms: Option<u64>,
+    pub(crate) handshake_init: Vec<u8>,
 }
 
 /// Hard cap for handshake work admitted to the independent control lanes.

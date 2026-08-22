@@ -131,7 +131,29 @@ impl HardHardCoordination {
     }
 }
 
+#[cfg(test)]
+static HARD_HARD_TEST_NOW_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Override only the Hard↔Hard rendezvous clock for deterministic integration
+/// tests. Production builds do not contain this state, and all other runtime
+/// deadlines continue to use their existing constants and timers.
+#[cfg(test)]
+pub(crate) fn set_hard_hard_test_now_ms(now_ms: Option<u64>) {
+    HARD_HARD_TEST_NOW_MS.store(
+        now_ms.unwrap_or(0),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
 fn hard_hard_now_ms() -> u64 {
+    #[cfg(test)]
+    {
+        let overridden = HARD_HARD_TEST_NOW_MS.load(std::sync::atomic::Ordering::Acquire);
+        if overridden != 0 {
+            return overridden;
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

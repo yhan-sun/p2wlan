@@ -41,6 +41,14 @@ impl ControlClient {
             critical_ctrl_tx,
             candidate_offer_tx,
             state: state.clone(),
+            #[cfg(test)]
+            test_signal_forwarder: None,
+            #[cfg(test)]
+            test_signal_from_node_id: String::new(),
+            #[cfg(test)]
+            test_signal_public_key: String::new(),
+            #[cfg(test)]
+            test_signal_generation: Arc::new(AtomicU64::new(0)),
         };
 
         if enabled && has_control_credential(config) {
@@ -129,7 +137,80 @@ impl ControlClient {
             critical_ctrl_tx,
             candidate_offer_tx,
             state,
+            #[cfg(test)]
+            test_signal_forwarder: None,
+            #[cfg(test)]
+            test_signal_from_node_id: String::new(),
+            #[cfg(test)]
+            test_signal_public_key: String::new(),
+            #[cfg(test)]
+            test_signal_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Install a test-only in-process signaling forwarder. The adapter is
+    /// intentionally attached to the existing send methods so a two-peer
+    /// harness exercises the same production control ingress and fresh
+    /// candidate payload construction without requiring an HTTP server.
+    #[cfg(test)]
+    pub(crate) fn set_test_signal_forwarder(
+        &mut self,
+        from_node_id: impl Into<String>,
+        public_key: impl Into<String>,
+        forwarder: Arc<dyn Fn(TestControlSignal) + Send + Sync>,
+    ) {
+        self.test_signal_from_node_id = from_node_id.into();
+        self.test_signal_public_key = public_key.into();
+        self.test_signal_forwarder = Some(forwarder);
+    }
+
+    /// Deliver a candidate signal through the test-only control boundary.
+    /// `None` means the normal production queue should be used.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_forward_test_signal(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        session_id: Option<&str>,
+        fresh_ownership: Option<&Arc<crate::PunchSessionCancellation>>,
+    ) -> Option<std::result::Result<(), PeerOfferSendFailure>> {
+        let forwarder = self.test_signal_forwarder.as_ref()?.clone();
+        if fresh_ownership.is_some_and(|ownership| ownership.is_cancelled()) {
+            return Some(Err(PeerOfferSendFailure::Cancelled));
+        }
+        // The initial ordinary offer in the two-peer harness represents a
+        // legacy candidate refresh over an already-seeded candidate set. Keep
+        // its generation at zero so the receiver exercises the real ingress
+        // without treating identical candidates as a new remote epoch before
+        // the Hard↔Hard planner runs. Fresh predictions still use the
+        // monotonic test-server generation below.
+        let candidate_generation = if session_id.is_none() && fresh_ownership.is_none() {
+            0
+        } else {
+            self.test_signal_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1)
+        };
+        let candidates_expires_at_ms = punch_at_ms
+            .map(|punch_at| punch_at.saturating_add(45_000))
+            .or_else(|| Some(test_signal_now_ms().saturating_add(45_000)));
+        forwarder(TestControlSignal {
+            from_node_id: self.test_signal_from_node_id.clone(),
+            sender_public_key: self.test_signal_public_key.clone(),
+            to_node_id: to_node_id.to_string(),
+            candidates: candidates.to_vec(),
+            session_id: session_id.map(str::to_string),
+            candidate_sources: candidate_sources.clone(),
+            candidate_generation,
+            candidates_expires_at_ms,
+            punch_at_ms,
+            handshake_init: handshake_init.to_vec(),
+        });
+        Some(Ok(()))
     }
 
     /// Get a snapshot of the known peers.
@@ -257,6 +338,18 @@ impl ControlClient {
         punch_at_ms: Option<u64>,
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        #[cfg(test)]
+        if let Some(result) = self.maybe_forward_test_signal(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            None,
+            fresh_ownership.as_ref(),
+        ) {
+            return result;
+        }
         // Candidate-only and fresh-mapping advertisements use the independent
         // bounded lane.  A payload carrying a WireGuard initiation is
         // latency-sensitive and uses the critical handshake lane below.
@@ -344,6 +437,18 @@ impl ControlClient {
         session_id: Option<String>,
         fresh_ownership: Arc<crate::PunchSessionCancellation>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        #[cfg(test)]
+        if let Some(result) = self.maybe_forward_test_signal(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            session_id.as_deref(),
+            Some(&fresh_ownership),
+        ) {
+            return result;
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.candidate_offer_tx
             .try_send(CandidateOfferCommand {
