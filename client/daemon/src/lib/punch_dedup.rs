@@ -116,7 +116,7 @@ const PUNCH_PRIORITY_SYNCHRONIZED: u8 = 1;
 /// prediction is used while it is still fresh.
 const PUNCH_PRIORITY_FRESH_PREDICTION: u8 = 2;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct PunchSessionCancellation {
     cancelled: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
@@ -175,6 +175,13 @@ impl PunchSessionCancellation {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Cancel a Hard↔Hard session from the bounded manager ledger.  The
+    /// manager cannot own the non-cloneable punch permit, but it can still
+    /// wake the measurement/sweep/cleanup workers through this shared handle.
+    pub(crate) fn cancel_for_hard_hard_cleanup(&self) {
+        self.cancel_with_reason(PunchCancellationReason::PeerLifecycle);
     }
 
     fn cancellation_reason(&self) -> Option<PunchCancellationReason> {

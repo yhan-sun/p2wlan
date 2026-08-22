@@ -37,3 +37,19 @@ fn legacy_remote_nat_label_cannot_downgrade_versioned_profile() {
         Some(2)
     );
 }
+
+#[test]
+fn remote_profile_is_invalidated_by_candidate_epoch_and_rebound_only_by_hh1_context() {
+    let mut connection = PeerConnection::new("peer-profile-context", "10.20.0.4");
+    let profile =
+        "p2v2:m=address_or_port_dependent;a=linear;d=4;c=90;f=address_dependent;h=unknown;g=7";
+
+    assert!(connection.update_remote_nat_profile(profile, None));
+    assert!(connection.remote_nat_profile_matches_candidate_epoch());
+
+    connection.mark_remote_candidate_generation_changed(1, "test remote handover");
+    assert!(!connection.remote_nat_profile_matches_candidate_epoch());
+    assert!(!connection.bind_remote_nat_profile_to_candidate_epoch(8));
+    assert!(connection.bind_remote_nat_profile_to_candidate_epoch(7));
+    assert!(connection.remote_nat_profile_matches_candidate_epoch());
+}

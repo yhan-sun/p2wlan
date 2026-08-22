@@ -1,5 +1,6 @@
 type ProbeNonce = [u8; 8];
 type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
+type HardHardProbeBindings = Arc<Mutex<HashMap<ProbeNonce, String>>>;
 type StunTransactionId = [u8; 12];
 type StunResponse = (Vec<u8>, SocketAddr);
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;

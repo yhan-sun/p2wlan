@@ -14,23 +14,48 @@ pub(crate) enum HardHardSessionState {
     Sweeping,
 }
 
+/// Exact identity of the dedicated socket that produced one synchronized
+/// mapping.  The dynamic index is monotonic, while the other fields prevent a
+/// future implementation from accidentally treating a reused or superseded
+/// entry as this session's socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HardHardFreshSocketIdentity {
+    pub(crate) peer_id: String,
+    pub(crate) session_token: String,
+    pub(crate) network_generation: u64,
+    pub(crate) remote_candidate_epoch: u64,
+    pub(crate) local_profile_generation: u64,
+    pub(crate) remote_profile_generation: u64,
+    pub(crate) punch_generation: u64,
+    pub(crate) socket_index: usize,
+    pub(crate) socket_local_endpoint: SocketAddr,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct HardHardSessionRecord {
     pub(crate) session_id: String,
+    pub(crate) session_token: String,
     pub(crate) peer_id: String,
     pub(crate) initiator: bool,
+    /// The network generation observed at the other endpoint.  The initiator
+    /// learns it from the responder envelope; zero means it was not known in
+    /// the first directional offer.
+    pub(crate) remote_network_generation: u64,
     pub(crate) local_network_generation: u64,
     pub(crate) remote_candidate_epoch: u64,
     pub(crate) local_profile_generation: u64,
     pub(crate) remote_profile_generation: u64,
     pub(crate) local_prediction_confidence: u8,
-    pub(crate) socket_index: Option<usize>,
-    pub(crate) punch_generation: Option<u64>,
+    pub(crate) remote_prediction_confidence: u8,
+    pub(crate) prediction_window: Vec<SocketAddr>,
+    pub(crate) remote_prediction: Vec<SocketAddr>,
+    pub(crate) fresh_socket: HardHardFreshSocketIdentity,
     pub(crate) punch_at_ms: u64,
     pub(crate) expires_at_ms: u64,
     pub(crate) state: HardHardSessionState,
     pub(crate) attempt_count: u8,
     pub(crate) created_at: Instant,
+    pub(crate) cancellation: Arc<crate::PunchSessionCancellation>,
 }
 
 /// Manages all peer connections.

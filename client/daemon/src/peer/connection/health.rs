@@ -479,6 +479,10 @@ impl PeerConnection {
         let previous_epoch = self.remote_candidate_epoch;
         let next_epoch = self.remote_candidate_epoch.wrapping_add(1).max(1);
         self.remote_candidate_epoch = next_epoch;
+        // The profile was captured for the previous remote candidate context.
+        // It must be published again before it can authorize a new
+        // synchronized fresh-mapping session.
+        self.remote_nat_profile_candidate_epoch = None;
 
         for pair in &mut self.candidate_pairs {
             if pair.remote_candidate_epoch != next_epoch {

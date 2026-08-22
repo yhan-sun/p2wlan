@@ -380,7 +380,7 @@ impl UdpTransport {
     /// the affinity is cleared so the next lookup falls back to the pool
     /// instead of resolving to a dead socket.  Idempotent: a socket that was
     /// already detached (e.g. by the provisional watcher) is a no-op.
-    async fn detach_dynamic_socket_by_index(&self, socket_index: usize, reason: &str) {
+    pub(crate) async fn detach_dynamic_socket_by_index(&self, socket_index: usize, reason: &str) {
         let entry = {
             let mut state = self.socket_state.lock().await;
             let Some(entry) = state.dynamic.remove(&socket_index) else {
@@ -396,6 +396,49 @@ impl UdpTransport {
             entry
         };
         self.detach_dynamic_entry(entry, reason).await;
+    }
+
+    /// Detach only when the live entry is still the exact socket identity that
+    /// belonged to a Hard↔Hard session.  Dynamic indices are monotonic, but
+    /// checking every stamped field makes cleanup fail closed even if a future
+    /// allocator ever reuses an index.
+    pub(crate) async fn detach_hard_hard_socket_if_identity(
+        &self,
+        identity: &crate::peer::HardHardFreshSocketIdentity,
+        reason: &str,
+    ) {
+        let matches = {
+            let state = self.socket_state.lock().await;
+            state.dynamic.get(&identity.socket_index).is_some_and(|entry| {
+                entry.peer_id == identity.peer_id
+                    && entry.network_generation == identity.network_generation
+                    && entry.punch_generation == identity.punch_generation
+                    && entry.phase.is_usable()
+                    && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
+            })
+        };
+        if matches {
+            self.detach_dynamic_socket_by_index(identity.socket_index, reason)
+                .await;
+        }
+    }
+
+    pub(crate) async fn hard_hard_socket_identity_is_current(
+        &self,
+        identity: &crate::peer::HardHardFreshSocketIdentity,
+    ) -> bool {
+        let state = self.socket_state.lock().await;
+        state.dynamic.get(&identity.socket_index).is_some_and(|entry| {
+            entry.peer_id == identity.peer_id
+                && entry.network_generation == identity.network_generation
+                && entry.punch_generation == identity.punch_generation
+                && entry.phase.is_usable()
+                && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
+                && state.affinity.get(&identity.peer_id).is_some_and(|pin| {
+                    pin.socket_index == identity.socket_index
+                })
+                && self.peers.current_network_generation_sync() == identity.network_generation
+        })
     }
 
     /// Detach a superseded generation's predecessor socket, unless the
@@ -1529,6 +1572,7 @@ impl UdpTransport {
             probe_interval,
             attempts,
             None,
+            None,
         )
         .await
     }
@@ -1569,6 +1613,29 @@ impl UdpTransport {
         attempts: u32,
         profile_fence: Option<(u64, u64)>,
     ) -> Result<PunchSendReport> {
+        self.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
+            peer_id,
+            socket_index,
+            candidates,
+            probe_interval,
+            attempts,
+            profile_fence,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        profile_fence: Option<(u64, u64)>,
+        hard_hard_session_token: Option<&str>,
+    ) -> Result<PunchSendReport> {
         let Some((index, socket, _lease)) = self
             .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
             .await
@@ -1583,6 +1650,7 @@ impl UdpTransport {
             probe_interval,
             attempts,
             profile_fence,
+            hard_hard_session_token,
         )
         .await
     }
@@ -1597,6 +1665,7 @@ impl UdpTransport {
         probe_interval: Duration,
         attempts: u32,
         profile_fence: Option<(u64, u64)>,
+        hard_hard_session_token: Option<&str>,
     ) -> Result<PunchSendReport> {
         let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
         let mut packets_sent = 0u32;
@@ -1658,6 +1727,18 @@ impl UdpTransport {
                         break;
                     }
                 }
+                if let Some(token) = hard_hard_session_token {
+                    if !self
+                        .peers
+                        .hard_hard_session_token_is_current(peer_id, token)
+                        .await
+                    {
+                        trace!(
+                            "Aborting dynamic-socket Hard↔Hard punch for peer {peer_id}: session token was retired"
+                        );
+                        break;
+                    }
+                }
                 if self.peers.is_direct_sync(peer_id) {
                     // Direct was confirmed while this dedicated-socket sweep
                     // was in flight: stop emitting peer-directed probes.
@@ -1704,13 +1785,14 @@ impl UdpTransport {
                     }
                 }
                 match self
-                    .send_probe_on_socket_result(
+                    .send_probe_on_socket_result_with_hard_hard_token(
                         index,
                         socket.clone(),
                         Some(peer_id),
                         candidate,
                         false,
                         PendingProbePurpose::ConnectivityCheck,
+                        hard_hard_session_token,
                     )
                     .await
                 {

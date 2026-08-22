@@ -129,6 +129,10 @@ pub struct PeerConnection {
     /// freshness fence; authenticated candidate/path evidence remains the
     /// authority for promotion.
     pub remote_nat_profile: Option<RemoteNatProfile>,
+    /// Remote profile context captured when the profile was accepted. Age
+    /// and profile generation alone cannot authorize Hard↔Hard after a newer
+    /// candidate set has been published.
+    remote_nat_profile_candidate_epoch: Option<u64>,
     /// Whether the control plane currently reports this peer online.
     pub online: bool,
     /// Last seen timestamp reported by the control plane.
@@ -243,6 +247,27 @@ impl PeerConnection {
         self.remote_candidate_epoch
     }
 
+    pub(crate) fn remote_nat_profile_matches_candidate_epoch(&self) -> bool {
+        self.remote_nat_profile_candidate_epoch == Some(self.remote_candidate_epoch)
+    }
+
+    pub(crate) fn bind_remote_nat_profile_to_candidate_epoch(
+        &mut self,
+        profile_generation: u64,
+    ) -> bool {
+        if !self.remote_nat_profile_is_fresh()
+            || self
+                .remote_nat_profile
+                .as_ref()
+                .and_then(|profile| profile.generation)
+                != Some(profile_generation)
+        {
+            return false;
+        }
+        self.remote_nat_profile_candidate_epoch = Some(self.remote_candidate_epoch);
+        true
+    }
+
     pub(crate) fn set_local_interface_networks(&mut self, networks: Vec<LocalNetwork>) {
         self.local_interface_networks = networks;
     }
@@ -281,6 +306,7 @@ impl PeerConnection {
             generation: incoming_generation,
             received_at_ms: nat_profile_now_ms(),
         });
+        self.remote_nat_profile_candidate_epoch = Some(self.remote_candidate_epoch);
         debug!(
             event = "remote_nat_profile_updated",
             peer = %self.node_id,
@@ -317,6 +343,7 @@ impl PeerConnection {
             signaled_endpoint: None,
             nat_type: String::new(),
             remote_nat_profile: None,
+            remote_nat_profile_candidate_epoch: None,
             online: true,
             last_seen: 0,
             remote_relay_rtt_ms: None,
@@ -362,6 +389,7 @@ impl PeerConnection {
     fn reset_for_identity_change(&mut self) {
         self.endpoint = self.signaled_endpoint;
         self.remote_nat_profile = None;
+        self.remote_nat_profile_candidate_epoch = None;
         self.probe_session_id = None;
         self.probe_ephemeral_shared = None;
         self.probe_binding_token = None;

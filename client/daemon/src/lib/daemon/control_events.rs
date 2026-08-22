@@ -316,6 +316,13 @@ enum FreshPunchDecision {
     Degraded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardHardOfferHandling {
+    NotHardHard,
+    Rejected,
+    Started,
+}
+
 impl Daemon {
     async fn wait_for_peer_offer_identity(
         &self,
@@ -355,15 +362,22 @@ impl Daemon {
         candidate_apply_result: CandidateSetApplyResult,
         fresh_punch: FreshPunchDecision,
     ) {
-        if self
+        let hard_hard_handling = self
             .handle_hard_hard_fresh_offer(
                 &offer.from_node_id,
                 offer.session_id.as_deref(),
                 offer.punch_at_ms,
                 fresh_punch.clone(),
             )
-            .await
+            .await;
+        if candidate_apply_result == CandidateSetApplyResult::Applied
+            && hard_hard_handling != HardHardOfferHandling::Started
         {
+            self.peers
+                .clear_hard_hard_sessions(Some(&offer.from_node_id))
+                .await;
+        }
+        if hard_hard_handling != HardHardOfferHandling::NotHardHard {
             return;
         }
         match fresh_punch {
@@ -411,12 +425,12 @@ impl Daemon {
         session_id: Option<&str>,
         punch_at_ms: Option<u64>,
         fresh_punch: FreshPunchDecision,
-    ) -> bool {
+    ) -> HardHardOfferHandling {
         let Some(session_id) = session_id else {
-            return false;
+            return HardHardOfferHandling::NotHardHard;
         };
         if !HardHardCoordination::looks_like(session_id) {
-            return false;
+            return HardHardOfferHandling::NotHardHard;
         }
         let Some(coordination) = HardHardCoordination::parse(session_id) else {
             self.peers
@@ -429,7 +443,7 @@ impl Daemon {
                     "malformed Hard↔Hard session envelope; no fallback punch started",
                 )
                 .await;
-            return true;
+            return HardHardOfferHandling::Rejected;
         };
         let FreshPunchDecision::Fresh(_id, frozen_targets) = fresh_punch else {
             self.peers
@@ -442,8 +456,28 @@ impl Daemon {
                     "Hard↔Hard session did not carry an admitted, unexpired fresh prediction window",
                 )
                 .await;
-            return true;
+            return HardHardOfferHandling::Rejected;
         };
+        if !self
+            .peers
+            .bind_remote_nat_profile_to_candidate_epoch(
+                peer_id,
+                coordination.local_profile_generation,
+            )
+            .await
+        {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "hard_hard_session_rejected",
+                    frozen_targets.first().copied(),
+                    Some(frozen_targets.len()),
+                    None,
+                    "Hard↔Hard profile generation was not current for the admitted candidate context",
+                )
+                .await;
+            return HardHardOfferHandling::Rejected;
+        }
         let Some(punch_at_ms) = punch_at_ms else {
             self.peers
                 .record_direct_event(
@@ -455,16 +489,23 @@ impl Daemon {
                     "Hard↔Hard session had no canonical punch_at_ms; Relay remains usable",
                 )
                 .await;
-            return true;
+            return HardHardOfferHandling::Rejected;
         };
         let Some(udp) = self.udp_transport.read().await.clone() else {
-            return true;
+            return HardHardOfferHandling::Rejected;
         };
         let Some(signal) = self.hole_punch_signal_context().await else {
-            return true;
+            return HardHardOfferHandling::Rejected;
         };
         match coordination.role {
             HardHardRole::Initiator => {
+                // A new remote initiator supersedes any older rendezvous on
+                // this peer. Clear it before the new responder measurement is
+                // launched; the new record is registered only after that
+                // bounded measurement completes.
+                self.peers
+                    .clear_hard_hard_sessions(Some(peer_id))
+                    .await;
                 spawn_hard_hard_responder(
                     udp,
                     self.peers.clone(),
@@ -476,8 +517,41 @@ impl Daemon {
                     frozen_targets,
                 )
                 .await;
+                HardHardOfferHandling::Started
             }
             HardHardRole::Responder => {
+                let current_remote_candidate_epoch = self
+                    .peers
+                    .current_remote_candidate_epoch(peer_id)
+                    .await
+                    .unwrap_or_default();
+                match self
+                    .peers
+                    .hard_hard_prepare_response(
+                        peer_id,
+                        &coordination.token,
+                        current_remote_candidate_epoch,
+                    )
+                    .await
+                {
+                    crate::peer::HardHardResponseAdmission::Rejected => {
+                        self.peers
+                            .record_direct_event(
+                                peer_id,
+                                "hard_hard_response_fenced",
+                                frozen_targets.first().copied(),
+                                Some(frozen_targets.len()),
+                                None,
+                                "Hard↔Hard response did not match the one live initiator session or its expected candidate epoch",
+                            )
+                            .await;
+                        return HardHardOfferHandling::Rejected;
+                    }
+                    crate::peer::HardHardResponseAdmission::AlreadySweeping => {
+                        return HardHardOfferHandling::Started;
+                    }
+                    crate::peer::HardHardResponseAdmission::Ready => {}
+                }
                 spawn_hard_hard_initiator_response(
                     udp,
                     self.peers.clone(),
@@ -488,9 +562,9 @@ impl Daemon {
                     punch_at_ms,
                 )
                 .await;
+                HardHardOfferHandling::Started
             }
         }
-        true
     }
 
     /// Coordinate the C=0 fresh-fresh synchronized pair on the receiver side
@@ -2327,15 +2401,22 @@ impl Daemon {
                             FreshPunchDecision::None,
                         )
                     };
-                    if self
+                    let hard_hard_handling = self
                         .handle_hard_hard_fresh_offer(
                             &from_node_id,
                             session_id.as_deref(),
                             punch_at_ms,
                             fresh_punch.clone(),
                         )
-                        .await
+                        .await;
+                    if candidate_apply_result == CandidateSetApplyResult::Applied
+                        && hard_hard_handling != HardHardOfferHandling::Started
                     {
+                        self.peers
+                            .clear_hard_hard_sessions(Some(&from_node_id))
+                            .await;
+                    }
+                    if hard_hard_handling != HardHardOfferHandling::NotHardHard {
                         continue;
                     }
                     match fresh_punch {

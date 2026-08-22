@@ -35,6 +35,11 @@ pub struct UdpTransport {
     outbound_interface: Option<Arc<str>>,
     peers: Arc<PeerManager>,
     pending_probes: PendingProbes,
+    /// Local-only binding from a Hard↔Hard probe nonce to its rendezvous
+    /// token. It never changes the UDP wire packet; the authenticated Probe
+    /// v2 nonce is simply refused if its bounded session has been removed or
+    /// superseded before the ACK arrives.
+    hard_hard_probe_bindings: HardHardProbeBindings,
     stun_waiters: StunWaiters,
     /// Merged socket ownership state: dynamic punch sockets, per-peer
     /// affinity pins and the affinity epoch counter live under one mutex so
@@ -163,6 +168,7 @@ impl UdpTransport {
             outbound_interface: outbound_interface.map(Arc::<str>::from),
             peers,
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
+            hard_hard_probe_bindings: Arc::new(Mutex::new(HashMap::new())),
             stun_waiters: Arc::new(Mutex::new(HashMap::new())),
             socket_state: Arc::new(Mutex::new(SocketState {
                 dynamic: HashMap::new(),
@@ -895,6 +901,7 @@ impl UdpTransport {
             .lock()
             .await
             .retain(|_, pending| pending.peer_id.as_deref() != Some(peer_id));
+        self.prune_hard_hard_probe_bindings().await;
         drop(state);
         debug!("Cleared pending probes for peer {peer_id} (cleanup_epoch={cleanup_epoch})");
     }
@@ -1021,6 +1028,17 @@ impl UdpTransport {
             .lock()
             .await
             .retain(|_, pending| pending.socket_index != socket_index);
+        self.prune_hard_hard_probe_bindings().await;
+    }
+
+    pub(crate) async fn clear_hard_hard_pending_probe_token(&self, nonce: ProbeNonce) {
+        self.hard_hard_probe_bindings.lock().await.remove(&nonce);
+    }
+
+    async fn prune_hard_hard_probe_bindings(&self) {
+        let pending = self.pending_probes.lock().await;
+        let mut bindings = self.hard_hard_probe_bindings.lock().await;
+        bindings.retain(|nonce, _| pending.contains_key(nonce));
     }
 
     /// Number of live dedicated fresh-mapping punch sockets.

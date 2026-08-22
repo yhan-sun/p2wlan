@@ -313,6 +313,23 @@ impl PeerManager {
             .map(PeerConnection::remote_candidate_epoch)
     }
 
+    /// Bind a fresh-prediction candidate transaction to the remote NAT
+    /// profile generation carried by the same authenticated Hard↔Hard
+    /// envelope. A profile that is merely young, but belongs to an older
+    /// candidate context, cannot be revived by this method.
+    pub(crate) async fn bind_remote_nat_profile_to_candidate_epoch(
+        &self,
+        node_id: &str,
+        profile_generation: u64,
+    ) -> bool {
+        let mut connections = self.connections.write().await;
+        connections
+            .get_mut(node_id)
+            .is_some_and(|connection| {
+                connection.bind_remote_nat_profile_to_candidate_epoch(profile_generation)
+            })
+    }
+
     /// Bound probe rounds from the observed local NAT behavior.  Endpoint-
     /// independent NATs benefit from a short synchronized burst; dependent
     /// mappings need a wider bounded window.  UDP-blocked networks retain one

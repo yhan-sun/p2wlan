@@ -5,6 +5,14 @@
 // fence that lets the direct-runtime rendezvous reject an older response.
 
 const MAX_HARD_HARD_SESSIONS: usize = 16;
+const MAX_HARD_HARD_PREDICTION_TARGETS: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardHardResponseAdmission {
+    Ready,
+    AlreadySweeping,
+    Rejected,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HardHardPlanSnapshot {
@@ -41,7 +49,9 @@ impl PeerManager {
             return None;
         }
         let remote_profile = conn.remote_nat_profile.as_ref()?;
-        if !conn.remote_nat_profile_is_fresh() {
+        if !conn.remote_nat_profile_is_fresh()
+            || !conn.remote_nat_profile_matches_candidate_epoch()
+        {
             return None;
         }
         let remote_profile_generation = remote_profile.generation?;
@@ -125,32 +135,76 @@ impl PeerManager {
         record: HardHardSessionRecord,
     ) -> bool {
         let now = unix_time_millis();
+        let mut cancelled = Vec::new();
+        let mut duplicate_result = None;
         let mut sessions = self.hard_hard_sessions.lock().await;
-        sessions.retain(|_, existing| existing.expires_at_ms >= now);
+        let expired_keys = sessions
+            .iter()
+            .filter(|(_, existing)| existing.expires_at_ms < now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired_keys {
+            if let Some(existing) = sessions.remove(&key) {
+                cancelled.push(existing.cancellation);
+            }
+        }
         let key = (record.peer_id.clone(), record.session_id.clone());
         if let Some(existing) = sessions.get(&key) {
-            return existing.initiator == record.initiator
+            duplicate_result = Some(existing.initiator == record.initiator
                 && existing.local_network_generation == record.local_network_generation
                 && existing.remote_candidate_epoch == record.remote_candidate_epoch
                 && existing.local_profile_generation == record.local_profile_generation
-                && existing.remote_profile_generation == record.remote_profile_generation;
-        }
-        // One live session per peer.  A newer fresh measurement supersedes
-        // every older response fence before it can reuse an exact socket.
-        sessions.retain(|(owner, session_id), _| {
-            owner != &record.peer_id || session_id == &record.session_id
-        });
-        if sessions.len() >= MAX_HARD_HARD_SESSIONS {
-            if let Some(oldest_key) = sessions
+                && existing.remote_profile_generation == record.remote_profile_generation
+                && existing.prediction_window == record.prediction_window);
+        } else {
+            // One live session per peer.  A newer fresh measurement supersedes
+            // every older response fence before it can reuse an exact socket.
+            let replaced_keys = sessions
                 .iter()
-                .min_by_key(|(_, session)| session.created_at)
+                .filter(|(key, _)| key.0 == record.peer_id)
                 .map(|(key, _)| key.clone())
-            {
-                sessions.remove(&oldest_key);
+                .collect::<Vec<_>>();
+            for old_key in replaced_keys {
+                if let Some(existing) = sessions.remove(&old_key) {
+                    cancelled.push(existing.cancellation);
+                }
+            }
+            if sessions.len() >= MAX_HARD_HARD_SESSIONS {
+                if let Some(oldest_key) = sessions
+                    .iter()
+                    .min_by_key(|(_, session)| session.created_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    if let Some(existing) = sessions.remove(&oldest_key) {
+                        cancelled.push(existing.cancellation);
+                    }
+                }
+            }
+            sessions.insert(key, record);
+        }
+        drop(sessions);
+        for cancellation in cancelled {
+            cancellation.cancel_for_hard_hard_cleanup();
+        }
+        duplicate_result.unwrap_or(true)
+    }
+
+    /// A live session suppresses a second initiator while its bounded socket
+    /// and pending ACK evidence are still authoritative.
+    pub(crate) async fn hard_hard_session_is_active(&self, peer_id: &str) -> bool {
+        let now = unix_time_millis();
+        let mut sessions = self.hard_hard_sessions.lock().await;
+        let expired_keys = sessions
+            .iter()
+            .filter(|((owner, _), record)| owner == peer_id && record.expires_at_ms < now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired_keys {
+            if let Some(record) = sessions.remove(&key) {
+                record.cancellation.cancel_for_hard_hard_cleanup();
             }
         }
-        sessions.insert(key, record);
-        true
+        sessions.keys().any(|(owner, _)| owner == peer_id)
     }
 
     /// Look up a session by the stable token carried by either direction of
@@ -164,17 +218,98 @@ impl PeerManager {
     ) -> Option<HardHardSessionRecord> {
         let now = unix_time_millis();
         let mut sessions = self.hard_hard_sessions.lock().await;
-        sessions.retain(|_, existing| existing.expires_at_ms >= now);
+        let expired_keys = sessions
+            .iter()
+            .filter(|(_, existing)| existing.expires_at_ms < now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired_keys {
+            if let Some(existing) = sessions.remove(&key) {
+                existing.cancellation.cancel_for_hard_hard_cleanup();
+            }
+        }
         sessions
             .iter()
-            .find(|((owner, session_id), _)| {
-                owner == peer_id
-                    && session_id
-                        .split(':')
-                        .nth(2)
-                        .is_some_and(|session_token| session_token == token)
-            })
+            .find(|((owner, _), record)| owner == peer_id && record.session_token == token)
             .map(|(_, record)| record.clone())
+    }
+
+    /// Admit the one expected reciprocal response after the remote candidate
+    /// epoch advances.  A fresh response is allowed to move the session's
+    /// remote-candidate fence by exactly one epoch; the socket identity is
+    /// updated with that same epoch before the runtime can sweep it.  A
+    /// retransmission after the sweep has started is harmless and does not
+    /// cancel the in-flight session.
+    pub(crate) async fn hard_hard_prepare_response(
+        &self,
+        peer_id: &str,
+        token: &str,
+        current_remote_candidate_epoch: u64,
+    ) -> HardHardResponseAdmission {
+        let now = unix_time_millis();
+        let mut sessions = self.hard_hard_sessions.lock().await;
+        let expired_keys = sessions
+            .iter()
+            .filter(|(_, existing)| existing.expires_at_ms < now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired_keys {
+            if let Some(existing) = sessions.remove(&key) {
+                existing.cancellation.cancel_for_hard_hard_cleanup();
+            }
+        }
+        let Some((_, record)) = sessions
+            .iter_mut()
+            .find(|((owner, _), record)| owner == peer_id && record.session_token == token)
+        else {
+            return HardHardResponseAdmission::Rejected;
+        };
+        if !record.initiator {
+            return HardHardResponseAdmission::Rejected;
+        }
+        if record.state == HardHardSessionState::Sweeping {
+            return HardHardResponseAdmission::AlreadySweeping;
+        }
+        if record.state != HardHardSessionState::AwaitingPeer || record.attempt_count >= 1 {
+            return HardHardResponseAdmission::Rejected;
+        }
+        let expected_next = record.remote_candidate_epoch.wrapping_add(1).max(1);
+        if current_remote_candidate_epoch != record.remote_candidate_epoch
+            && current_remote_candidate_epoch != expected_next
+        {
+            return HardHardResponseAdmission::Rejected;
+        }
+        record.remote_candidate_epoch = current_remote_candidate_epoch;
+        record.fresh_socket.remote_candidate_epoch = current_remote_candidate_epoch;
+        HardHardResponseAdmission::Ready
+    }
+
+    /// Probe ACKs carry this opaque token in a local-only binding.  The
+    /// manager is the authority that decides whether the token still belongs
+    /// to the current bounded rendezvous; a removed/superseded session cannot
+    /// be resurrected by a delayed authenticated ACK.
+    pub(crate) async fn hard_hard_session_token_is_current(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> bool {
+        let now = unix_time_millis();
+        let mut sessions = self.hard_hard_sessions.lock().await;
+        let expired_keys = sessions
+            .iter()
+            .filter(|(_, existing)| existing.expires_at_ms < now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired_keys {
+            if let Some(existing) = sessions.remove(&key) {
+                existing.cancellation.cancel_for_hard_hard_cleanup();
+            }
+        }
+        sessions.values().any(|record| {
+            record.peer_id == peer_id
+                && record.session_token == token
+                && record.expires_at_ms >= now
+        })
     }
 
     /// Atomically consume the one reciprocal-sweep slot for a session.  A
@@ -184,19 +319,44 @@ impl PeerManager {
         &self,
         peer_id: &str,
         token: &str,
+        remote_prediction: Vec<SocketAddr>,
+        remote_prediction_confidence: u8,
+        remote_network_generation: u64,
     ) -> Option<HardHardSessionRecord> {
+        if remote_prediction.is_empty()
+            || remote_prediction.len() > MAX_HARD_HARD_PREDICTION_TARGETS
+            || remote_prediction_confidence == 0
+        {
+            return None;
+        }
         let now = unix_time_millis();
         let mut sessions = self.hard_hard_sessions.lock().await;
-        sessions.retain(|_, existing| existing.expires_at_ms >= now);
-        let (_, record) = sessions.iter_mut().find(|((owner, session_id), _)| {
-            owner == peer_id
-                && session_id
-                    .split(':')
-                    .nth(2)
-                    .is_some_and(|session_token| session_token == token)
-        })?;
+        let expired_keys = sessions
+            .iter()
+            .filter(|(_, existing)| existing.expires_at_ms < now)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired_keys {
+            if let Some(existing) = sessions.remove(&key) {
+                existing.cancellation.cancel_for_hard_hard_cleanup();
+            }
+        }
+        let (_, record) = sessions
+            .iter_mut()
+            .find(|((owner, _), record)| owner == peer_id && record.session_token == token)?;
         if record.state != HardHardSessionState::AwaitingPeer || record.attempt_count >= 1 {
             return None;
+        }
+        if record.remote_network_generation != 0
+            && remote_network_generation != 0
+            && record.remote_network_generation != remote_network_generation
+        {
+            return None;
+        }
+        record.remote_prediction = remote_prediction;
+        record.remote_prediction_confidence = remote_prediction_confidence;
+        if record.remote_network_generation == 0 {
+            record.remote_network_generation = remote_network_generation;
         }
         record.state = HardHardSessionState::Sweeping;
         record.attempt_count = record.attempt_count.saturating_add(1);
@@ -204,17 +364,35 @@ impl PeerManager {
     }
 
     pub(crate) async fn hard_hard_remove_session(&self, peer_id: &str, session_id: &str) {
-        self.hard_hard_sessions
+        if let Some(record) = self
+            .hard_hard_sessions
             .lock()
             .await
-            .remove(&(peer_id.to_string(), session_id.to_string()));
+            .remove(&(peer_id.to_string(), session_id.to_string()))
+        {
+            record.cancellation.cancel_for_hard_hard_cleanup();
+        }
     }
 
     pub(crate) async fn clear_hard_hard_sessions(&self, peer_id: Option<&str>) {
         let mut sessions = self.hard_hard_sessions.lock().await;
-        match peer_id {
-            Some(peer_id) => sessions.retain(|(owner, _), _| owner != peer_id),
-            None => sessions.clear(),
+        let cancelled = match peer_id {
+            Some(peer_id) => sessions
+                .iter()
+                .filter(|((owner, _), _)| owner == peer_id)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            None => sessions.keys().cloned().collect::<Vec<_>>(),
+        };
+        let mut cancellations = Vec::with_capacity(cancelled.len());
+        for key in cancelled {
+            if let Some(record) = sessions.remove(&key) {
+                cancellations.push(record.cancellation);
+            }
+        }
+        drop(sessions);
+        for cancellation in cancellations {
+            cancellation.cancel_for_hard_hard_cleanup();
         }
     }
 }

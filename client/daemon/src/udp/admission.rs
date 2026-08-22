@@ -590,6 +590,29 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeSendResult> {
+        self.send_probe_on_socket_result_with_hard_hard_token(
+            socket_index,
+            socket,
+            peer_id,
+            peer_addr,
+            use_candidate,
+            purpose,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_probe_on_socket_result_with_hard_hard_token(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+        hard_hard_session_token: Option<&str>,
+    ) -> Result<ProbeSendResult> {
         let remote_candidate_epoch = match peer_id {
             Some(peer_id) => self
                 .peers
@@ -770,11 +793,21 @@ impl UdpTransport {
                         .unwrap_or(0),
                 },
             );
+            let mut hard_hard_bindings = self.hard_hard_probe_bindings.lock().await;
+            hard_hard_bindings.retain(|pending_nonce, _| pending.contains_key(pending_nonce));
+            // Keep the Hard↔Hard token in a local-only side table. The wire
+            // packet remains the existing authenticated Probe-v2 packet, but
+            // its ACK must still belong to the exact bounded rendezvous that
+            // created this nonce.
+            if let Some(token) = hard_hard_session_token {
+                hard_hard_bindings.insert(nonce, token.to_string());
+            }
             send_lease
         };
 
         if let Err(error) = socket.send_to(&bytes, peer_addr).await {
             self.pending_probes.lock().await.remove(&nonce);
+            self.clear_hard_hard_pending_probe_token(nonce).await;
             return Err(DaemonError::Network(format!(
                 "UDP probe send to {peer_addr} failed: {error}"
             )));

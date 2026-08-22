@@ -598,6 +598,12 @@ impl UdpTransport {
                             let mut pending_probes = self.pending_probes.lock().await;
                             let now = Instant::now();
                             let pending = pending_probes.get(&packet.nonce).cloned();
+                            let hard_hard_token = self
+                                .hard_hard_probe_bindings
+                                .lock()
+                                .await
+                                .get(&packet.nonce)
+                                .cloned();
                             let matches_identity = |pending: &PendingProbe| {
                                 pending.generation == generation
                                     && pending.socket_index == socket_index
@@ -617,11 +623,13 @@ impl UdpTransport {
                             if matched.is_some() || expired.is_some() {
                                 pending_probes.remove(&packet.nonce);
                             }
-                            (matched, expired)
+                            (matched, expired, hard_hard_token)
                         };
 
-                        let (ack_match, expired_pending) = ack_match;
+                        let (ack_match, expired_pending, hard_hard_token) = ack_match;
                         if let Some(expired) = expired_pending {
+                            self.clear_hard_hard_pending_probe_token(packet.nonce)
+                                .await;
                             self.update_socket_diagnostics(socket_index, |metrics| {
                                 metrics.authenticated_probe_acks_unmatched = metrics
                                     .authenticated_probe_acks_unmatched
@@ -674,6 +682,30 @@ impl UdpTransport {
                         }
 
                         if let Some(pending) = ack_match {
+                            if let Some(token) = hard_hard_token.as_deref() {
+                                if !self
+                                    .peers
+                                    .hard_hard_session_token_is_current(
+                                        &identity.source_node_id,
+                                        token,
+                                    )
+                                    .await
+                                {
+                                    self.clear_hard_hard_pending_probe_token(packet.nonce)
+                                        .await;
+                                    self.update_socket_diagnostics(socket_index, |metrics| {
+                                        metrics.authenticated_probe_acks_unmatched = metrics
+                                            .authenticated_probe_acks_unmatched
+                                            .saturating_add(1)
+                                    })
+                                    .await;
+                                    trace!(
+                                        "Ignored authenticated Hard↔Hard ACK for retired session token from {}",
+                                        identity.source_node_id
+                                    );
+                                    continue;
+                                }
+                            }
                             // The peer must still be clean (no offline /
                             // PeerLeft / endpoint / public-key change since
                             // the probe was sent) before ANY adoption.  Under
@@ -682,6 +714,8 @@ impl UdpTransport {
                             // still re-verified so a cleanup that won the
                             // lock first refuses the whole adoption.
                             if !self.peer_still_clean(&pending).await {
+                                self.clear_hard_hard_pending_probe_token(packet.nonce)
+                                    .await;
                                 continue;
                             }
                             if let Some(token) = pending_token.as_deref() {
@@ -716,6 +750,8 @@ impl UdpTransport {
                                     continue;
                                 }
                             }
+                            self.clear_hard_hard_pending_probe_token(packet.nonce)
+                                .await;
                             let latency = pending.sent_at.elapsed();
                             let generation = pending.generation;
                             let probe_session_id = pending.probe_session_id.as_deref();
