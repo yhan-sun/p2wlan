@@ -35,6 +35,10 @@ pub enum Error {
     #[error("dynamic library not found: {0}")]
     LibraryNotFound(String),
 
+    /// A required dynamic library exists but could not be loaded.
+    #[error("dynamic library load failed: {0}")]
+    LibraryLoadFailed(String),
+
     /// A required symbol was not found in the dynamic library.
     #[error("symbol not found in library: {0}")]
     SymbolNotFound(String),
@@ -47,6 +51,10 @@ pub enum Error {
     #[error("failed to create Wintun adapter: error code {0}")]
     WintunCreateFailed(u32),
 
+    /// An existing Wintun adapter could not be opened.
+    #[error("failed to open existing Wintun adapter: error code {0}")]
+    WintunOpenFailed(u32),
+
     /// The Wintun session could not be started.
     #[error("failed to start Wintun session: error code {0}")]
     WintunSessionFailed(u32),
@@ -58,6 +66,18 @@ pub enum Error {
     /// A platform-specific error with a descriptive message.
     #[error("{0}")]
     Platform(String),
+
+    /// A Windows command used for TUN setup returned a non-zero exit status.
+    #[error(
+        "{stage} failed for interface '{interface}' (exit code {exit_code:?}): stdout={stdout}; stderr={stderr}"
+    )]
+    WindowsCommandFailed {
+        stage: String,
+        interface: String,
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
 
     /// The operation is not supported on this platform.
     #[error("operation not supported on this platform")]

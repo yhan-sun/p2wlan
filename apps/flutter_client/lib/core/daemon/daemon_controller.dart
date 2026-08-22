@@ -76,7 +76,8 @@ class DaemonController {
     if (windowsProbeError != null) {
       return DaemonCommandResult(
         ok: false,
-        message: 'Windows 守护进程无法加载，发布包可能缺少运行库或文件不完整：$windowsProbeError',
+        message:
+            '[DAEMON_BINARY_LOAD_FAILED] Windows 守护进程无法加载，发布包可能缺少运行库或文件不完整：$windowsProbeError',
       );
     }
 
@@ -113,6 +114,13 @@ class DaemonController {
     final windowsClientSid = Platform.isWindows
         ? await _windowsCurrentUserSid()
         : null;
+    if (Platform.isWindows && windowsClientSid == null) {
+      return const DaemonCommandResult(
+        ok: false,
+        message:
+            '[TOKEN_ACCESS_FAILED] 无法读取当前 Windows 用户 SID，无法建立安全的跨账户启动 ACL。',
+      );
+    }
     File? tokenFile;
     // Windows console daemons cannot safely receive a managed token over a
     // detached stdin: depending on the Windows process mode this can create
@@ -192,12 +200,36 @@ class DaemonController {
       ],
     ];
 
-    await configPath.parent.create(recursive: true);
-    await logDir.create(recursive: true);
-    // Pre-create the log as the interactive user.  Elevated macOS/Windows
-    // launches must append to this file rather than creating a root/admin-owned
-    // file that the Flutter UI cannot read for startup diagnostics.
-    await File(logPath).create(recursive: true);
+    try {
+      await configPath.parent.create(recursive: true);
+      await logDir.create(recursive: true);
+      if (Platform.isWindows) {
+        // The daemon may run under the alternate administrator selected in
+        // the UAC prompt. Grant only the interactive SID and local
+        // Administrators (never Everyone) access to both runtime roots.
+        await protectRuntimeDirectory(configPath.parent);
+        await protectRuntimeDirectory(logDir);
+        if (await configPath.exists()) {
+          await _restrictLaunchPath(configPath.path);
+        }
+      }
+      // Pre-create and truncate the log as the interactive user. Elevated
+      // launches must append to this file rather than creating an
+      // admin-owned file or inheriting stale startup markers.
+      await File(logPath).writeAsString('', flush: true);
+      if (Platform.isWindows) {
+        await _restrictLaunchPath(logPath);
+      }
+      await _clearPidMarkerForStart(pidPath);
+    } catch (error) {
+      try {
+        await deleteEphemeralLaunchTokenFile(tokenFile);
+      } catch (_) {}
+      return DaemonCommandResult(
+        ok: false,
+        message: _startFailureMessage(error),
+      );
+    }
 
     final elevatedShell = _buildElevatedShell(
       binary: binary,
@@ -217,6 +249,7 @@ class DaemonController {
           )
         : null;
 
+    int? launchPid;
     try {
       if (requiresElevation && Platform.isMacOS) {
         await _startMacosElevated(
@@ -224,7 +257,7 @@ class DaemonController {
           password: settings.macosAdminPassword,
         );
       } else if (requiresElevation && Platform.isWindows) {
-        await _startWindowsElevated(
+        launchPid = await _startWindowsElevated(
           binary: binary,
           args: args,
           pidPath: pidPath,
@@ -237,11 +270,15 @@ class DaemonController {
           args: args,
           stdinToken: tokenFile == null && !useManualMode ? authToken : null,
         );
-        await _writePidMarker(pidPath, process.pid);
+        launchPid = process.pid;
+        await _writePidMarker(pidPath, launchPid);
       }
     } catch (error) {
       // The launch itself failed: never leave the temporary credential file
       // behind.
+      try {
+        await _cleanupFailedStartup(launchPid);
+      } catch (_) {}
       try {
         await deleteEphemeralLaunchTokenFile(tokenFile);
       } catch (_) {}
@@ -260,38 +297,35 @@ class DaemonController {
     _lastLaunchExitProbeAt = null;
     _lastLaunchExitProbeResult = null;
     final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
-    final ready = await _waitForHealth(
+    final startup = await _waitForHealth(
       settings.diagnosticsUrl,
       timeout,
       logPath,
+      launchPid,
     );
     try {
       await deleteEphemeralLaunchTokenFile(tokenFile);
     } catch (_) {}
-    if (!ready) {
-      // A daemon that exited right after an elevated launch usually failed
-      // for a definitive, actionable reason.  Detect a permanent control
-      // auth failure (expired token / revoked credential) from the log tail
-      // and surface it immediately instead of a generic "TUN failed" wait.
-      if (await _logShowsPermanentAuthFailure(logPath)) {
+    if (!startup.ready) {
+      try {
+        await _cleanupFailedStartup(launchPid);
+      } catch (_) {}
+      final failure =
+          startup.failure ??
+          const DaemonStartupFailure(
+            DaemonStartupFailureCode.startupTimeout,
+            'p2wlan-daemon 未在启动时限内完成诊断端点就绪。',
+          );
+      if (failure.code == DaemonStartupFailureCode.controlAuthFailed) {
         return DaemonCommandResult(
           ok: false,
-          message: '登录已过期，请重新登录。后台 p2wlan-daemon 因认证失败退出，启动过程未创建虚拟网卡。',
-          manualCommand: manualCommand,
-        );
-      }
-      if (Platform.isWindows && await _logShowsWintunMissing(logPath)) {
-        return DaemonCommandResult(
-          ok: false,
-          message:
-              'Windows 运行组件缺失：找不到 wintun.dll。请重新安装包含 Wintun 的 P2WLAN 安装包，或把 wintun.dll 放到 p2wlan-daemon.exe 同级目录。',
+          message: '登录已过期，请重新登录。${failure.message}',
           manualCommand: manualCommand,
         );
       }
       return DaemonCommandResult(
         ok: false,
-        message:
-            '已完成启动授权，但 p2wlan-daemon 没有在 ${timeout.inSeconds} 秒内响应诊断端点。请查看日志：$logPath',
+        message: '[${failure.codeValue}] ${failure.message} 请查看日志：$logPath',
         manualCommand: manualCommand,
       );
     }

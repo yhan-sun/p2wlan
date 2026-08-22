@@ -83,7 +83,7 @@ fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Resul
     let prefix_len = u32::from(netmask).count_ones();
     let cidr = format!("{addr}/{prefix_len}");
 
-    info!("Setting interface {name} address: {cidr}");
+    info!("[tun] configuring IPv4: interface={name} address={cidr}");
 
     let output = hidden_command("netsh")
         .args([
@@ -99,21 +99,21 @@ fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Resul
         .output()
         .map_err(|e| Error::Platform(format!("failed to run netsh: {e}")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        warn!("netsh address set failed: {stderr}{stdout}");
-        // Don't fail hard - the interface might still work with manual config
-    } else {
-        info!("IP address set: {addr}/{netmask}");
-    }
-
+    crate::windows_command::require_success(
+        "IPv4 configuration",
+        name,
+        output.status.success(),
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    )?;
+    info!("[tun] IPv4 configured: {addr}/{netmask}");
     Ok(())
 }
 
 /// Set the MTU on an interface using netsh.
 fn set_interface_mtu(name: &str, mtu: u32) -> Result<()> {
-    info!("Setting MTU for {name}: {mtu}");
+    info!("[tun] configuring MTU: interface={name} mtu={mtu}");
 
     let output = hidden_command("netsh")
         .args([
@@ -129,10 +129,38 @@ fn set_interface_mtu(name: &str, mtu: u32) -> Result<()> {
         .output()
         .map_err(|e| Error::Platform(format!("failed to run netsh: {e}")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("netsh MTU set failed: {stderr}");
-    }
-
+    crate::windows_command::require_success(
+        "MTU configuration",
+        name,
+        output.status.success(),
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    )?;
+    info!("[tun] MTU configured: {mtu}");
     Ok(())
+}
+
+/// Best-effort rollback for an address that this startup attempt may have
+/// applied. The adapter close path removes adapters created by this process;
+/// deleting the address also makes a stale adapter safe to reuse on the next
+/// launch when this attempt opened an older adapter.
+fn rollback_interface_address(name: &str, addr: Ipv4Addr) {
+    let output = hidden_command("netsh")
+        .args(["interface", "ipv4", "delete", "address", name, &addr.to_string()])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            info!("[tun] rollback removed IPv4 address from {name}");
+        }
+        Ok(output) => {
+            warn!(
+                "[tun] rollback could not remove IPv4 address from {name}: exit={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(error) => warn!("[tun] rollback could not run netsh for {name}: {error}"),
+    }
 }

@@ -44,10 +44,16 @@ impl WintunDevice {
     /// - Must be run as Administrator.
     /// - The Wintun driver will be auto-installed by the DLL on first use.
     pub fn create(config: &InterfaceConfig) -> Result<Self> {
-        info!("Creating Wintun interface: {}", config.name);
+        info!("[tun] creating/opening adapter: {}", config.name);
 
         // Load the Wintun API
-        let api = Arc::new(WintunApi::load()?);
+        let api = match WintunApi::load() {
+            Ok(api) => Arc::new(api),
+            Err(error) => {
+                error!("[tun] Wintun load failed: {error}");
+                return Err(error);
+            }
+        };
 
         // Log driver version (best-effort)
         if let Some(version) = WintunApi::try_get_driver_version() {
@@ -76,19 +82,19 @@ impl WintunDevice {
                     if existing.is_null() {
                         let open_err = io::Error::last_os_error();
                         error!(
-                            "WintunCreateAdapter found an existing adapter, but WintunOpenAdapter failed: {open_err}"
+                            "[tun] WintunCreateAdapter found an existing adapter, but WintunOpenAdapter failed: {open_err}"
                         );
-                        return Err(Error::WintunCreateFailed(
+                        return Err(Error::WintunOpenFailed(
                             open_err.raw_os_error().unwrap_or(ERROR_ALREADY_EXISTS) as u32,
                         ));
                     }
                     info!(
-                        "Reusing existing Wintun adapter after a previous daemon instance: {}",
+                        "[tun] reusing existing Wintun adapter after a previous daemon instance: {}",
                         config.name
                     );
                     existing
                 } else {
-                    error!("WintunCreateAdapter failed: {err}");
+                    error!("[tun] WintunCreateAdapter failed: {err}");
                     return Err(Error::WintunCreateFailed(
                         err.raw_os_error().unwrap_or(0) as u32
                     ));
@@ -98,33 +104,48 @@ impl WintunDevice {
             }
         };
 
-        info!("Wintun adapter ready: {}", config.name);
+        info!("[tun] adapter ready: {}", config.name);
 
         // Get the adapter LUID for IP configuration
         let mut luid: u64 = 0;
         unsafe { (api.get_adapter_luid)(adapter_ptr, &mut luid) };
         info!("Adapter LUID: 0x{luid:016x}");
 
-        // Set the IP address using netsh
-        set_interface_address(&config.name, config.address, config.netmask)?;
+        // Set the IP address using netsh. Any non-zero exit code is a startup
+        // failure: a live diagnostics endpoint without a configured address is
+        // not a usable TUN.
+        if let Err(error) = set_interface_address(&config.name, config.address, config.netmask) {
+            error!("[tun] IPv4 configuration failed: {error}");
+            rollback_interface_address(&config.name, config.address);
+            unsafe { (api.close_adapter)(adapter_ptr) };
+            return Err(error);
+        }
 
-        // Set the MTU
-        set_interface_mtu(&config.name, config.mtu).ok();
+        // Set the MTU. Do not turn a failed netsh command into a successful
+        // daemon startup.
+        if let Err(error) = set_interface_mtu(&config.name, config.mtu) {
+            error!("[tun] MTU configuration failed: {error}");
+            rollback_interface_address(&config.name, config.address);
+            unsafe { (api.close_adapter)(adapter_ptr) };
+            return Err(error);
+        }
 
         // Start a session with a 4MB ring buffer (0x400000)
         let ring_capacity: u32 = 0x400_000;
+        info!("[tun] starting session: interface={}", config.name);
         let session_ptr = unsafe { (api.start_session)(adapter_ptr, ring_capacity) };
 
         if session_ptr.is_null() {
             let err = io::Error::last_os_error();
-            error!("WintunStartSession failed: {err}");
+            error!("[tun] WintunStartSession failed: {err}");
+            rollback_interface_address(&config.name, config.address);
             unsafe { (api.close_adapter)(adapter_ptr) };
             return Err(Error::WintunSessionFailed(
                 err.raw_os_error().unwrap_or(0) as u32
             ));
         }
 
-        info!("Wintun session started (ring buffer: 4MB)");
+        info!("[tun] session started (ring buffer: 4MB)");
 
         // Set up the read thread + channel
         let (read_tx, read_rx) = mpsc::channel(256);

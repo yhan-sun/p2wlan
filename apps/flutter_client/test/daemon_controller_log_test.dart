@@ -65,6 +65,15 @@ void main() {
     expect(await logTailShowsWintunMissing(log.path), isTrue);
   });
 
+  test('detects the current Wintun missing marker', () async {
+    final log = await writeLog(
+      'ERROR [tun] Wintun load failed: dynamic library not found: '
+      'wintun.dll not found. Tried: C:\\Program Files\\P2WLAN\\wintun.dll\n',
+    );
+    final failure = await logTailClassifyStartupFailure(log.path);
+    expect(failure?.code, DaemonStartupFailureCode.wintunDllMissing);
+  });
+
   test(
     'a healthy Windows runtime log is not a missing Wintun marker',
     () async {
@@ -133,5 +142,122 @@ void main() {
       'error_code=peer_not_found\n',
     );
     expect(await logTailShowsPermanentAuthFailure(log.path), isFalse);
+  });
+
+  test(
+    'classifies actionable startup stages without exposing log contents',
+    () {
+      final cases = <String, DaemonStartupFailureCode>{
+        '[startup] windows_elevated=false':
+            DaemonStartupFailureCode.daemonNotElevated,
+        'Windows ACL protection failed': DaemonStartupFailureCode.aclFailure,
+        'failed to open existing Wintun adapter':
+            DaemonStartupFailureCode.wintunAdapterOpenFailed,
+        '[tun] IPv4 configuration failed':
+            DaemonStartupFailureCode.ipConfigFailed,
+        '[tun] MTU configuration failed':
+            DaemonStartupFailureCode.mtuConfigFailed,
+        'route install failed: access denied':
+            DaemonStartupFailureCode.routeInstallFailed,
+        'failed to bind diagnostics endpoint at 127.0.0.1:39277':
+            DaemonStartupFailureCode.diagnosticsBindFailed,
+      };
+      for (final entry in cases.entries) {
+        expect(classifyDaemonStartupLog(entry.key)?.code, entry.value);
+      }
+    },
+  );
+
+  test(
+    'startup probe fails fast on child exit and preserves stage details',
+    () {
+      final exited = classifyDaemonStartupProbe(
+        healthReady: false,
+        childAlive: false,
+        deadlineReached: false,
+      );
+      expect(
+        exited.failure?.code,
+        DaemonStartupFailureCode.daemonExitedDuringStartup,
+      );
+
+      final stageFailure = const DaemonStartupFailure(
+        DaemonStartupFailureCode.mtuConfigFailed,
+        'MTU failed',
+      );
+      final classified = classifyDaemonStartupProbe(
+        healthReady: false,
+        childAlive: false,
+        logFailure: stageFailure,
+        deadlineReached: false,
+      );
+      expect(
+        classified.failure?.code,
+        DaemonStartupFailureCode.mtuConfigFailed,
+      );
+
+      final ready = classifyDaemonStartupProbe(
+        healthReady: true,
+        childAlive: true,
+        deadlineReached: false,
+      );
+      expect(ready.ready, isTrue);
+
+      final pending = classifyDaemonStartupProbe(
+        healthReady: false,
+        childAlive: true,
+        deadlineReached: false,
+      );
+      expect(pending.ready, isFalse);
+      expect(pending.failure, isNull);
+
+      final timeout = classifyDaemonStartupProbe(
+        healthReady: false,
+        childAlive: true,
+        deadlineReached: true,
+      );
+      expect(timeout.failure?.code, DaemonStartupFailureCode.startupTimeout);
+    },
+  );
+
+  test('classifies UAC cancellation and launch failures', () {
+    expect(
+      classifyWindowsLaunchFailure(
+        'The operation was canceled by the user.',
+      ).code,
+      DaemonStartupFailureCode.uacCancelled,
+    );
+    expect(
+      classifyWindowsLaunchFailure('Start-Process failed: access denied').code,
+      DaemonStartupFailureCode.uacLaunchFailed,
+    );
+    expect(
+      classifyWindowsLaunchFailure('Windows ACL protection failed').code,
+      DaemonStartupFailureCode.aclFailure,
+    );
+  });
+
+  test('parses only the elevated child PID marker', () {
+    expect(
+      parseWindowsChildPidMarker(
+        'PowerShell noise\n__P2WLAN_CHILD_PID__=4242\n',
+      ),
+      4242,
+    );
+    expect(parseWindowsChildPidMarker('__P2WLAN_CHILD_PID__=0'), isNull);
+    expect(parseWindowsChildPidMarker('no marker'), isNull);
+  });
+
+  test('quotes Windows arguments across Start-Process ArgumentList', () {
+    expect(windowsCommandLineArgQuote(''), '""');
+    expect(
+      windowsCommandLineArgQuote('C:\\Program Files\\P2WLAN\\'),
+      '"C:\\Program Files\\P2WLAN\\\\"',
+    );
+    expect(windowsCommandLineArgQuote('a"b'), '"a\\"b"');
+    expect(
+      windowsCommandLineArgQuote('C:\\用户\\p2wlan-daemon.exe'),
+      contains('用户'),
+    );
   });
 }

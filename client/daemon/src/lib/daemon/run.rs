@@ -153,6 +153,13 @@ impl Daemon {
             udp_observers_from_sources(&relay_catalog, &resolved_config.network.udp_observers);
         self.config = Arc::new(resolved_config);
 
+        info!(
+            "[startup] initializing TUN: interface={} address={} netmask={} mtu={}",
+            self.config.network.interface,
+            virtual_ip,
+            netmask,
+            self.config.network.mtu
+        );
         // Initialize TUN using the resolved IP details
         let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.network.mtu)?;
         if let Some(ref tun) = tun {
@@ -199,8 +206,18 @@ impl Daemon {
             );
         }
 
-        // Install overlay route
-        self.route_manager.add_cidr_route(&cidr)?;
+        // Install overlay route. Route errors are startup-fatal and must not
+        // be hidden behind a later diagnostics timeout.
+        info!(
+            "[route] installing {cidr} via {}",
+            self.route_manager.current_interface()
+        );
+        if let Err(error) = self.route_manager.add_cidr_route(&cidr) {
+            error!("[route] install failed for {cidr}: {error}");
+            self.route_manager.cleanup();
+            return Err(DaemonError::Network(format!("route install failed: {error}")));
+        }
+        info!("[route] installed {cidr}");
 
         let Some(outbound_rx) = self.outbound_rx.take() else {
             return Err(DaemonError::Network(
@@ -402,6 +419,7 @@ impl Daemon {
             .await;
         if self.config.diagnostics.enabled {
             let diagnostics_bind = self.config.diagnostics.bind.clone();
+            info!("[diagnostics] starting on {diagnostics_bind}");
             let diagnostics_context = DiagnosticsContext::new(
                 self.config.clone(),
                 self.peers.clone(),
@@ -421,12 +439,15 @@ impl Daemon {
                 self.config.diagnostics.auth_token.clone(),
             );
             let shutdown_rx = self.shutdown_rx.clone();
+            let (diagnostics_ready_tx, diagnostics_ready_rx) =
+                tokio::sync::oneshot::channel();
             self.task_manager
                 .spawn("diagnostics", false, async move {
-                    if let Err(err) = run_diagnostics_server_with_retry(
+                    if let Err(err) = run_diagnostics_server_with_retry_ready(
                         diagnostics_bind,
                         diagnostics_context,
                         shutdown_rx,
+                        Some(diagnostics_ready_tx),
                     )
                     .await
                     {
@@ -434,6 +455,15 @@ impl Daemon {
                     }
                 })
                 .await;
+            let diagnostics_ready =
+                tokio::time::timeout(Duration::from_secs(5), diagnostics_ready_rx).await;
+            if !matches!(diagnostics_ready, Ok(Ok(()))) {
+                error!("[diagnostics] bind failed during startup");
+                self.task_manager.shutdown_all(Duration::from_secs(1)).await;
+                return Err(DaemonError::Network(
+                    "diagnostics bind failed during startup".to_string(),
+                ));
+            }
 
             if tun.is_some() {
                 let speed_test_virtual_ip = self.config.network.virtual_ip.clone();
@@ -520,6 +550,8 @@ impl Daemon {
                 }),
             )
             .await;
+
+        info!("[startup] ready");
 
         // On Android, the JNI thread acknowledges the daemon launch as soon
         // as the runtime handle is installed so the VpnService can remain

@@ -1,5 +1,58 @@
 part of '../daemon_controller.dart';
 
+const _windowsChildPidMarker = '__P2WLAN_CHILD_PID__=';
+
+/// Parse the marker emitted by the single elevated `Start-Process -PassThru`
+/// launch. Keeping this pure makes PID supervision testable without running
+/// UAC or PowerShell on the Dart test host.
+int? parseWindowsChildPidMarker(String output) {
+  for (final line in output.split(RegExp(r'[\r\n]+'))) {
+    final value = line.trim();
+    if (!value.startsWith(_windowsChildPidMarker)) continue;
+    final pid = int.tryParse(
+      value.substring(_windowsChildPidMarker.length).trim(),
+    );
+    if (pid != null && pid > 0) return pid;
+  }
+  return null;
+}
+
+DaemonStartupFailure classifyWindowsLaunchFailure(String rawError) {
+  final raw = rawError.trim();
+  final normalized = raw.toLowerCase();
+  final cancelled =
+      raw.contains('1223') ||
+      raw.contains('0x800704c7') ||
+      raw.contains('已取消') ||
+      normalized.contains('cancel') ||
+      normalized.contains('canceled') ||
+      normalized.contains('cancelled');
+  if (cancelled) {
+    return const DaemonStartupFailure(
+      DaemonStartupFailureCode.uacCancelled,
+      '已取消 Windows 管理员授权，p2wlan-daemon 未启动。',
+    );
+  }
+  if (raw.contains('PID_MARKER_FAILED')) {
+    return const DaemonStartupFailure(
+      DaemonStartupFailureCode.pidMarkerFailed,
+      '无法写入或验证 elevated daemon 的 PID 标记文件。',
+    );
+  }
+  if (raw.contains('ACL') ||
+      normalized.contains('icacls') ||
+      normalized.contains('permission')) {
+    return const DaemonStartupFailure(
+      DaemonStartupFailureCode.aclFailure,
+      '无法为当前用户和本地 Administrators 组设置安全运行目录权限。',
+    );
+  }
+  return const DaemonStartupFailure(
+    DaemonStartupFailureCode.uacLaunchFailed,
+    'Windows UAC 启动失败：请确认已允许管理员授权，并检查发布包完整性。',
+  );
+}
+
 extension DaemonControllerElevation on DaemonController {
   String _buildElevatedShell({
     required File binary,
@@ -143,28 +196,35 @@ extension DaemonControllerElevation on DaemonController {
     ], mode: ProcessStartMode.detached);
   }
 
-  Future<void> _startWindowsElevated({
+  Future<int> _startWindowsElevated({
     required File binary,
     required List<String> args,
     required String pidPath,
   }) async {
-    final argLine = args.map(_windowsCommandLineArgQuote).join(' ');
+    final argLine = args.map(windowsCommandLineArgQuote).join(' ');
     final script =
         '\$ErrorActionPreference = \'Stop\'; '
         '\$child = Start-Process -Verb RunAs -WindowStyle Hidden '
         '-WorkingDirectory ${_powershellSingleQuoted(binary.parent.path)} '
         '-FilePath ${_powershellSingleQuoted(binary.path)} '
         '-ArgumentList ${_powershellSingleQuoted(argLine)} -PassThru; '
-        // Best effort only. The ACL grants the local Administrators group
-        // access to this directory, so an alternate UAC account can still
-        // publish the marker for the interactive client to verify and clean.
-        'try { Set-Content -LiteralPath ${_powershellSingleQuoted(pidPath)} '
-        '-Value \$child.Id -Encoding ascii } catch { }';
+        // The ACL grants the local Administrators group access to this file,
+        // so an alternate UAC account can publish the marker. A marker write
+        // failure is launch-fatal: without the exact child PID, cleanup could
+        // target the wrong process.
+        'Set-Content -LiteralPath ${_powershellSingleQuoted(pidPath)} '
+        '-Value ([string]\$child.Id) -Encoding ascii -Force; '
+        'Write-Output \'$_windowsChildPidMarker\' + [string]\$child.Id';
     final result = await _runWindowsPowerShell(script);
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
-      throw stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr;
+      throw StateError(stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr);
     }
+    final pid = parseWindowsChildPidMarker(result.stdout.toString());
+    if (pid != null) return pid;
+    throw StateError(
+      'PID_MARKER_FAILED: Windows UAC did not return the elevated child PID.',
+    );
   }
 
   Future<String?> _windowsCurrentUserSid() async {
@@ -180,6 +240,10 @@ extension DaemonControllerElevation on DaemonController {
   String _startFailureMessage(Object error) {
     final raw = error.toString().trim();
     final normalized = raw.toLowerCase();
+    if (Platform.isWindows) {
+      final failure = classifyWindowsLaunchFailure(raw);
+      return '[${failure.codeValue}] ${failure.message}';
+    }
     if (raw.contains('1273') ||
         raw.contains('用户名或密码不正确') ||
         normalized.contains('user name or password') ||
@@ -191,14 +255,6 @@ extension DaemonControllerElevation on DaemonController {
         raw.contains('已取消') ||
         normalized.contains('cancel')) {
       return '已取消管理员密码保存，p2wlan-daemon 未启动。';
-    }
-    if (Platform.isWindows) {
-      if (normalized.contains('access denied') ||
-          normalized.contains('permission') ||
-          normalized.contains('elevation')) {
-        return 'Windows UAC 启动失败：当前账户没有启动虚拟网卡所需的权限，请确认已允许管理员授权。';
-      }
-      return 'Windows UAC 启动失败：请确认 P2WLAN 安装包完整，并允许一次管理员授权。';
     }
     if (normalized.contains('operation not permitted') ||
         normalized.contains('not permitted') ||

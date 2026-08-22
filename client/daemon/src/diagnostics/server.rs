@@ -4,6 +4,16 @@ pub async fn run_diagnostics_server(
     context: DiagnosticsContext,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut ready_tx = None;
+    run_diagnostics_server_once(bind, context, shutdown_rx, &mut ready_tx).await
+}
+
+async fn run_diagnostics_server_once(
+    bind: String,
+    context: DiagnosticsContext,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ready_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let listener = TcpListener::bind(&bind).await.map_err(|e| {
         DaemonError::Network(format!(
             "failed to bind diagnostics endpoint at {bind}: {e}"
@@ -12,7 +22,10 @@ pub async fn run_diagnostics_server(
     let local_addr = listener
         .local_addr()
         .map_err(|e| DaemonError::Network(format!("failed to read diagnostics local addr: {e}")))?;
-    info!("Diagnostics endpoint listening at http://{local_addr}/status");
+    info!("[diagnostics] listening at http://{local_addr}/status");
+    if let Some(sender) = ready_tx.take() {
+        let _ = sender.send(());
+    }
 
     serve_diagnostics(listener, context, shutdown_rx).await
 }
@@ -25,19 +38,46 @@ pub async fn run_diagnostics_server(
 pub async fn run_diagnostics_server_with_retry(
     bind: String,
     context: DiagnosticsContext,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    run_diagnostics_server_with_retry_ready(bind, context, shutdown_rx, None).await
+}
+
+/// Same retry loop as [`run_diagnostics_server_with_retry`], with an optional
+/// one-shot notification after the first listener is actually bound. The
+/// daemon uses this only during startup so `[startup] ready` cannot race a
+/// diagnostics bind failure.
+pub async fn run_diagnostics_server_with_retry_ready(
+    bind: String,
+    context: DiagnosticsContext,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
+    let mut ready_tx = ready_tx;
     let mut attempt = 0usize;
     loop {
         if *shutdown_rx.borrow() {
             return Ok(());
         }
 
-        match run_diagnostics_server(bind.clone(), context.clone(), shutdown_rx.clone()).await {
+        match run_diagnostics_server_once(
+            bind.clone(),
+            context.clone(),
+            shutdown_rx.clone(),
+            &mut ready_tx,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if *shutdown_rx.borrow() {
                     return Ok(());
+                }
+                if ready_tx.is_some() {
+                    // During startup a bind failure is fatal. Runtime
+                    // restarts still use the retry loop after the first
+                    // listener has successfully notified the daemon.
+                    return Err(err);
                 }
                 attempt = attempt.saturating_add(1);
                 warn!(

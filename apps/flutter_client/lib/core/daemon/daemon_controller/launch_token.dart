@@ -73,14 +73,27 @@ extension DaemonControllerLaunchToken on DaemonController {
       // alternate UAC account can consume the one-shot token. It is deleted
       // immediately after startup and is never a credential store.
       final quotedPath = _powershellSingleQuoted(path);
-      final rights = directory ? '(OI)(CI)F' : 'F';
       final result = await _runWindowsPowerShell(
-        '\$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; '
-        '\$rights = \'$rights\'; '
-        '\$rules = @(\'*\' + \$sid + \':\' + \$rights, '
-        '\'*S-1-5-32-544:\' + \$rights); '
-        '& icacls.exe $quotedPath /inheritance:r /grant:r \$rules; '
-        '\$global:LASTEXITCODE = \$LASTEXITCODE',
+        '\$acl = Get-Acl -LiteralPath $quotedPath; '
+        // Remove inherited and pre-existing explicit ACEs first.  `/grant:r`
+        // alone only replaces grants for the two named SIDs and can leave a
+        // stale explicit Everyone/Users entry behind on a directory created
+        // by an older build.
+        '\$acl.SetAccessRuleProtection(\$true, \$false); '
+        'foreach (\$rule in @(\$acl.Access)) { '
+        '[void]\$acl.RemoveAccessRuleSpecific(\$rule) }; '
+        '\$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User; '
+        '\$adminSid = [System.Security.Principal.SecurityIdentifier]::new(\'S-1-5-32-544\'); '
+        '\$rights = [System.Security.AccessControl.FileSystemRights]::FullControl; '
+        '\$inheritance = [System.Security.AccessControl.InheritanceFlags]::None; '
+        'if (\'$directory\' -eq \'True\') { '
+        '\$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor '
+        '[System.Security.AccessControl.InheritanceFlags]::ObjectInherit }; '
+        '\$propagation = [System.Security.AccessControl.PropagationFlags]::None; '
+        '\$allow = [System.Security.AccessControl.AccessControlType]::Allow; '
+        '\$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(\$currentSid, \$rights, \$inheritance, \$propagation, \$allow)); '
+        '\$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(\$adminSid, \$rights, \$inheritance, \$propagation, \$allow)); '
+        'Set-Acl -LiteralPath $quotedPath -AclObject \$acl',
       );
       if (result.exitCode != 0) {
         throw StateError(

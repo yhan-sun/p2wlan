@@ -29,10 +29,11 @@ impl Daemon {
         #[cfg(not(target_os = "android"))]
         {
             let tun = TunDevice::create(&config).map_err(|e| {
-                DaemonError::Network(format!("failed to create TUN interface: {e}"))
+                error!("[tun] startup failed: {e}");
+                DaemonError::Network(format!("TUN startup failed: {e}"))
             })?;
             info!(
-                "TUN interface {} is up at {} MTU {}",
+                "[tun] interface {} is up at {} MTU {}",
                 tun.name(),
                 tun.address(),
                 tun.mtu()

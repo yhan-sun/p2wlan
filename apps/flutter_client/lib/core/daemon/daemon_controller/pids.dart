@@ -42,6 +42,41 @@ extension DaemonControllerPids on DaemonController {
     return pid;
   }
 
+  Future<void> _clearPidMarkerForStart(String pidPath) async {
+    final file = File(pidPath);
+    if (!await file.exists()) return;
+    try {
+      await file.delete();
+    } catch (error) {
+      throw StateError(
+        'PID marker could not be cleared before startup: $error',
+      );
+    }
+  }
+
+  /// Clean up only the process returned by this launch attempt. The identity
+  /// check in `_terminatePid` prevents a stale/reused PID from being killed.
+  Future<void> _cleanupFailedStartup(int? pid) async {
+    final candidatePid = pid ?? await _readVerifiedPid();
+    if (candidatePid == null) {
+      await _removePidMarker();
+      return;
+    }
+    if (await _processLooksLikeDaemon(candidatePid)) {
+      // A failed startup must not trigger a second UAC prompt merely to
+      // clean up. If the normal token cannot terminate an already elevated
+      // child, leave the verified process for the next stale-daemon scan.
+      final terminated = await _terminatePid(
+        candidatePid,
+        allowElevation: false,
+      );
+      if (terminated) {
+        await _waitForDaemonPidExit(candidatePid, const Duration(seconds: 3));
+      }
+    }
+    await _removePidMarker();
+  }
+
   Future<int?> _diagnosticsProcessId(String diagnosticsUrl) async {
     try {
       final snapshot = await _diagnosticsApi.fetchStatus(diagnosticsUrl);
@@ -238,7 +273,7 @@ extension DaemonControllerPids on DaemonController {
     return name.isEmpty ? null : name;
   }
 
-  Future<bool> _terminatePid(int pid) async {
+  Future<bool> _terminatePid(int pid, {bool allowElevation = true}) async {
     if (Platform.isWindows) {
       // Keep taskkill hidden, then retry once through a hidden elevated
       // PowerShell if the old daemon was started with a higher integrity
@@ -248,6 +283,7 @@ extension DaemonControllerPids on DaemonController {
         '& taskkill.exe /PID $pid /T /F',
       );
       if (result.exitCode == 0) return true;
+      if (!allowElevation) return false;
       final elevated = await _runWindowsPowerShell(
         '\$ErrorActionPreference = \'Stop\'; '
         '\$killed = Start-Process -Verb RunAs -WindowStyle Hidden '
@@ -392,34 +428,8 @@ extension DaemonControllerPids on DaemonController {
   }
 
   String _windowsCommandLineArgQuote(String value) {
-    if (value.isNotEmpty && !value.contains(RegExp(r'[\s"]'))) {
-      return value;
-    }
-    final buffer = StringBuffer('"');
-    var backslashes = 0;
-    for (final codeUnit in value.codeUnits) {
-      final char = String.fromCharCode(codeUnit);
-      if (char == '\\') {
-        backslashes += 1;
-      } else if (char == '"') {
-        buffer
-          ..write(_repeat('\\', backslashes * 2 + 1))
-          ..write('"');
-        backslashes = 0;
-      } else {
-        buffer
-          ..write(_repeat('\\', backslashes))
-          ..write(char);
-        backslashes = 0;
-      }
-    }
-    buffer
-      ..write(_repeat('\\', backslashes * 2))
-      ..write('"');
-    return buffer.toString();
+    return windowsCommandLineArgQuote(value);
   }
-
-  String _repeat(String value, int count) => List.filled(count, value).join();
 
   String _powershellSingleQuote(String value) {
     return value.replaceAll("'", "''");
@@ -435,4 +445,36 @@ extension DaemonControllerPids on DaemonController {
 
   bool _equalsIgnoreCase(String left, String right) =>
       left.toLowerCase() == right.toLowerCase();
+}
+
+/// Quote one argument using the Windows CRT command-line grammar. PowerShell
+/// receives one `ArgumentList` string from `Start-Process`, so this preserves
+/// spaces, trailing backslashes, quotes, and non-ASCII paths across that
+/// boundary.
+String windowsCommandLineArgQuote(String value) {
+  if (value.isNotEmpty && !value.contains(RegExp(r'[\s"]'))) {
+    return value;
+  }
+  final buffer = StringBuffer('"');
+  var backslashes = 0;
+  for (final codeUnit in value.codeUnits) {
+    final char = String.fromCharCode(codeUnit);
+    if (char == '\\') {
+      backslashes += 1;
+    } else if (char == '"') {
+      buffer
+        ..write(List.filled(backslashes * 2 + 1, '\\').join())
+        ..write('"');
+      backslashes = 0;
+    } else {
+      buffer
+        ..write(List.filled(backslashes, '\\').join())
+        ..write(char);
+      backslashes = 0;
+    }
+  }
+  buffer
+    ..write(List.filled(backslashes * 2, '\\').join())
+    ..write('"');
+  return buffer.toString();
 }

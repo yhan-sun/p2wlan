@@ -93,6 +93,34 @@ async fn main() -> p2pnet_daemon::Result<()> {
     info!("P2WLAN daemon starting...");
     info!("Platform: {}", std::env::consts::OS);
 
+    #[cfg(target_os = "windows")]
+    {
+        let windows_elevated = match windows_elevated_token() {
+            Ok(elevated) => elevated,
+            Err(error) => {
+                let daemon_error = DaemonError::Network(format!(
+                    "TOKEN_ACCESS_FAILED: could not inspect the daemon access token: {error}"
+                ));
+                error!("[startup] {daemon_error}");
+                return Err(daemon_error);
+            }
+        };
+        info!(
+            "[startup] elevated token verified: windows_elevated={windows_elevated}"
+        );
+        if !windows_elevated && std::env::var("P2WLAN_DISABLE_TUN").as_deref() != Ok("1") {
+            let error = DaemonError::Network(
+                "DAEMON_NOT_ELEVATED: Windows TUN requires an elevated administrator token, but p2wlan-daemon is running without elevation.".to_string(),
+            );
+            error!("[startup] {error}");
+            return Err(error);
+        }
+    }
+
+    if token_file_value.is_some() {
+        info!("[startup] launch credential loaded");
+    }
+
     // Check for --init flag (generate new config)
     if cli.init {
         let mut config = Config::generate_default(cli.control_url(), cli.network_id())?;

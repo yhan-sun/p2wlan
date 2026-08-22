@@ -110,7 +110,7 @@ use control::RelayCatalogEntry;
 use control::{ControlClient, ControlEvent, PeerOfferSendFailure};
 use dataplane::{DataPlane, InboundPacket, OutboundPacket};
 use diagnostics::{
-    run_diagnostics_server_with_retry, run_speedtest_server_with_retry, DiagnosticsContext,
+    run_diagnostics_server_with_retry_ready, run_speedtest_server_with_retry, DiagnosticsContext,
 };
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};

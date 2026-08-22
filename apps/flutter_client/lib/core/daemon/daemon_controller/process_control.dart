@@ -128,8 +128,12 @@ extension DaemonControllerProcessControl on DaemonController {
     try {
       final file = File(pidPath);
       await file.parent.create(recursive: true);
-      await file.writeAsString('$pid');
-    } catch (_) {
+      await file.writeAsString('$pid', flush: true);
+      if (Platform.isWindows) await _restrictLaunchPath(pidPath);
+    } catch (error) {
+      if (Platform.isWindows) {
+        throw StateError('PID_MARKER_FAILED: could not write $pidPath: $error');
+      }
       // Best-effort only; stop() can still recover by diagnostics process id.
     }
   }

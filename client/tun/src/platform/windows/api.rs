@@ -98,10 +98,14 @@ impl WintunApi {
 
     fn load_library() -> Result<Library> {
         let mut errors = Vec::new();
+        let mut found_candidate = false;
         for candidate in Self::dll_candidates() {
+            if candidate.exists() {
+                found_candidate = true;
+            }
             match unsafe { Library::new(&candidate) } {
                 Ok(lib) => {
-                    info!("Loaded Wintun runtime from {}", candidate.display());
+                    info!("[tun] wintun loaded from {}", candidate.display());
                     return Ok(lib);
                 }
                 Err(err) => {
@@ -109,14 +113,22 @@ impl WintunApi {
                 }
             }
         }
-        Err(Error::LibraryNotFound(format!(
-            "wintun.dll not found or not loadable. Tried: {}",
-            errors.join("; ")
-        )))
+        if found_candidate {
+            Err(Error::LibraryLoadFailed(format!(
+                "wintun.dll is present but not loadable. Tried: {}",
+                errors.join("; ")
+            )))
+        } else {
+            Err(Error::LibraryNotFound(format!(
+                "wintun.dll not found. Tried: {}",
+                errors.join("; ")
+            )))
+        }
     }
 
     /// Load the Wintun DLL and resolve all required function pointers.
     fn load() -> Result<Self> {
+        info!("[tun] loading wintun.dll");
         let lib = Self::load_library()?;
 
         let create_adapter = unsafe {

@@ -32,6 +32,8 @@ pub mod interface;
 pub mod mock;
 pub mod packet;
 mod platform;
+#[cfg(any(target_os = "windows", test))]
+mod windows_command;
 
 // Re-export primary types
 pub use config::InterfaceConfig;
