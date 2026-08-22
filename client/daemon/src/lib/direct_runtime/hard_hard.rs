@@ -224,6 +224,100 @@ fn hard_hard_socket_identity(
     }
 }
 
+/// The single Hard↔Hard success proof.  Peer-global Direct is only one input:
+/// the same current session identity must have selected a Direct candidate on
+/// the expected local endpoint, and the exact dynamic socket must be the
+/// affinity pin with authenticated evidence of its own.
+async fn hard_hard_exact_direct_confirmation_is_current(
+    udp: &UdpTransport,
+    peers: &PeerManager,
+    identity: &crate::peer::HardHardFreshSocketIdentity,
+) -> bool {
+    peers
+        .hard_hard_direct_confirmation_is_current(identity)
+        .await
+        && udp
+            .hard_hard_socket_identity_has_authenticated_evidence(identity)
+            .await
+}
+
+/// Wait for the existing Direct commit sequence, then require the exact
+/// Hard↔Hard socket proof.  A Direct transition on another socket terminates
+/// immediately; a matching manager commit gets a short bounded opportunity for
+/// the ACK transaction to finish its affinity adoption under the same epoch
+/// fence.
+async fn hard_hard_wait_for_exact_direct_confirmation(
+    udp: &UdpTransport,
+    peers: &PeerManager,
+    session: &PunchSessionPermit,
+    identity: &crate::peer::HardHardFreshSocketIdentity,
+    from_commit_seq: Option<u64>,
+) -> bool {
+    let deadline = Instant::now() + HARD_HARD_DIRECT_CONFIRMATION_GRACE;
+    loop {
+        if session.is_cancelled()
+            || !peers
+                .hard_hard_session_identity_is_current(identity)
+                .await
+        {
+            return false;
+        }
+
+        let commit_advanced = peers.direct_commit_seq_sync(&identity.peer_id) != from_commit_seq;
+        let manager_pair_matches = peers.hard_hard_direct_pair_is_current(identity).await;
+        if commit_advanced
+            && manager_pair_matches
+            && udp
+                .hard_hard_socket_identity_has_authenticated_evidence(identity)
+                .await
+        {
+            return true;
+        }
+
+        // A peer-global Direct commit that selected another local endpoint is
+        // the competing ordinary-Direct case.  Do not wait for a misleading
+        // success on the Hard↔Hard socket.
+        if peers.is_direct_sync(&identity.peer_id) && !manager_pair_matches {
+            return false;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        if peers.is_direct_sync(&identity.peer_id) && manager_pair_matches {
+            tokio::select! {
+                _ = session.cancelled() => return false,
+                _ = sleep(remaining.min(Duration::from_millis(5))) => {}
+            }
+        } else {
+            tokio::select! {
+                _ = session.cancelled() => return false,
+                _ = peers.wait_for_direct_commit_or_timeout(
+                    &identity.peer_id,
+                    from_commit_seq,
+                    remaining,
+                ) => {}
+            }
+        }
+    }
+}
+
+/// Cleanup may run after the short rendezvous session has expired.  It still
+/// retains a socket only when the current Direct candidate pair and the exact
+/// socket's authenticated evidence agree; the expired session token itself is
+/// intentionally not required for this post-success retention decision.
+async fn hard_hard_exact_direct_socket_is_current_for_cleanup(
+    udp: &UdpTransport,
+    peers: &PeerManager,
+    identity: &crate::peer::HardHardFreshSocketIdentity,
+) -> bool {
+    peers.hard_hard_direct_pair_is_current(identity).await
+        && udp
+            .hard_hard_socket_identity_has_authenticated_evidence(identity)
+            .await
+}
+
 /// Start the local side of a Hard↔Hard rendezvous.  The task measures first,
 /// advertises the result, finalizes the exact dynamic socket only after the
 /// signal is accepted, then waits for the peer's reciprocal prediction.
@@ -452,8 +546,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "session_id={} punch_at_ms={} socket_index={} punch_generation={} local_network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} local_prediction_confidence={} attempts_bounded={HARD_HARD_SWEEP_ATTEMPTS}",
-                    session_id,
+                    "session_bound=true punch_at_ms={} socket_index={} punch_generation={} local_network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} local_prediction_confidence={} attempts_bounded={HARD_HARD_SWEEP_ATTEMPTS}",
                     punch_at_ms,
                     result.socket_index,
                     result.punch_generation,
@@ -485,8 +578,11 @@ pub(crate) async fn spawn_hard_hard_initiator(
     });
 }
 
-/// Start the responder half after an authenticated fresh prediction was
-/// admitted by the existing candidate transaction.
+/// Start the responder half after a fresh prediction was admitted by the
+/// existing control context and candidate transaction.  The compact `hh1`
+/// envelope is an epoch/session fence, not a cryptographic authenticator;
+/// Probe v2 MAC/nonce validation and encrypted Direct validation remain the
+/// authorities for peer identity and path promotion.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_hard_hard_responder(
     udp: UdpTransport,
@@ -713,10 +809,12 @@ pub(crate) async fn spawn_hard_hard_responder(
             "responder",
         )
         .await;
-        let direct_on_fresh_socket = peers.is_direct(&peer_id).await
-            && cleanup_udp
-                .hard_hard_socket_identity_is_current(&fresh_socket)
-                .await;
+        let direct_on_fresh_socket = hard_hard_exact_direct_confirmation_is_current(
+            &cleanup_udp,
+            &peers,
+            &fresh_socket,
+        )
+        .await;
         if swept {
             if direct_on_fresh_socket || !peers.is_direct(&peer_id).await {
                 spawn_hard_hard_expiry_cleanup(
@@ -731,6 +829,19 @@ pub(crate) async fn spawn_hard_hard_responder(
                     ),
                 );
             } else {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "hard_hard_superseded_by_other_direct",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "peer became Direct on another socket; detached Hard↔Hard socket index={} exact_socket=false",
+                            fresh_socket.socket_index
+                        ),
+                    )
+                    .await;
                 cleanup_udp
                     .detach_hard_hard_socket_if_identity(
                         &fresh_socket,
@@ -744,6 +855,21 @@ pub(crate) async fn spawn_hard_hard_responder(
                 cleanup_udp
                     .detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_sweep_failed")
                     .await;
+                if peers.is_direct(&peer_id).await {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "hard_hard_superseded_by_other_direct",
+                            None,
+                            None,
+                            None,
+                            format!(
+                                "peer became Direct on another socket after the sweep failed; detached Hard↔Hard socket index={} exact_socket=false",
+                                fresh_socket.socket_index
+                            ),
+                        )
+                        .await;
+                }
             }
             peers.hard_hard_remove_session(&peer_id, &session_id).await;
         }
@@ -898,10 +1024,12 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         "initiator",
     )
     .await;
-    let direct_on_fresh_socket = peers.is_direct(&peer_id).await
-        && cleanup_udp
-            .hard_hard_socket_identity_is_current(&fresh_socket)
-            .await;
+    let direct_on_fresh_socket = hard_hard_exact_direct_confirmation_is_current(
+        &cleanup_udp,
+        &peers,
+        &fresh_socket,
+    )
+    .await;
     if swept {
         if direct_on_fresh_socket || !peers.is_direct(&peer_id).await {
             spawn_hard_hard_expiry_cleanup(
@@ -914,6 +1042,19 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
                 record.expires_at_ms,
             );
         } else {
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "hard_hard_superseded_by_other_direct",
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "peer became Direct on another socket; detached Hard↔Hard socket index={} exact_socket=false",
+                        fresh_socket.socket_index
+                    ),
+                )
+                .await;
             cleanup_udp
                 .detach_hard_hard_socket_if_identity(
                     &fresh_socket,
@@ -929,6 +1070,21 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
             cleanup_udp
                 .detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_sweep_failed")
                 .await;
+            if peers.is_direct(&peer_id).await {
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "hard_hard_superseded_by_other_direct",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "peer became Direct on another socket after the sweep failed; detached Hard↔Hard socket index={} exact_socket=false",
+                            fresh_socket.socket_index
+                        ),
+                    )
+                    .await;
+            }
         }
         peers
             .hard_hard_remove_session(&record.peer_id, &record.session_id)
@@ -993,17 +1149,15 @@ async fn hard_hard_wait_and_sweep(
         (PunchSessionOutcome::Completed, Some(Ok(report))) => {
             let direct_confirmed = if report.packets_sent == 0 {
                 false
-            } else if peers.is_direct(&peer_id).await {
-                true
             } else {
-                tokio::select! {
-                    _ = session.cancelled() => peers.is_direct(&peer_id).await,
-                    _ = peers.wait_for_direct_commit_or_timeout(
-                        &peer_id,
-                        direct_commit_seq,
-                        HARD_HARD_DIRECT_CONFIRMATION_GRACE,
-                    ) => peers.is_direct(&peer_id).await,
-                }
+                hard_hard_wait_for_exact_direct_confirmation(
+                    &udp,
+                    &peers,
+                    &session,
+                    &fresh_socket,
+                    direct_commit_seq,
+                )
+                .await
             };
             if direct_confirmed {
                 peers
@@ -1087,10 +1241,12 @@ fn spawn_hard_hard_expiry_cleanup(
             _ = sleep(Duration::from_millis(delay)) => {}
             _ = cancellation.cancelled() => {}
         }
-        let retain_fresh_socket = peers.is_direct(&peer_id).await
-            && udp
-                .hard_hard_socket_identity_is_current(&fresh_socket)
-                .await;
+        let retain_fresh_socket = hard_hard_exact_direct_socket_is_current_for_cleanup(
+            &udp,
+            &peers,
+            &fresh_socket,
+        )
+        .await;
         if !retain_fresh_socket {
             udp.detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_session_expired").await;
         }
@@ -1101,6 +1257,227 @@ fn spawn_hard_hard_expiry_cleanup(
 #[cfg(test)]
 mod hard_hard_tests {
     use super::*;
+
+    async fn exact_socket_proof_fixture() -> (
+        Arc<PeerManager>,
+        UdpTransport,
+        crate::peer::HardHardFreshSocketIdentity,
+        SocketAddr,
+    ) {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "hard-hard-exact-proof")
+                .unwrap(),
+        ));
+        let remote: SocketAddr = "198.51.100.20:41000".parse().unwrap();
+        peers
+            .add_peer(&crate::control::PeerInfo {
+                node_id: "peer-exact-proof".to_string(),
+                device_name: String::new(),
+                app_version: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: remote.to_string(),
+                nat_type:
+                    "p2v2:m=address_or_port_dependent;a=linear;d=4;c=90;f=address_dependent;h=unknown;g=7"
+                        .to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 0,
+                relay_rtt_ms: None,
+            })
+            .await;
+        let sources = HashMap::from([(remote.to_string(), "stun_observed".to_string())]);
+        peers
+            .add_candidates_with_sources("peer-exact-proof", &[remote.to_string()], &sources)
+            .await;
+        let remote_candidate_epoch = peers
+            .current_remote_candidate_epoch("peer-exact-proof")
+            .await
+            .unwrap();
+        assert!(peers
+            .bind_remote_nat_profile_to_candidate_epoch("peer-exact-proof", 7)
+            .await);
+
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(8);
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_inbound_channel(inbound_tx);
+        let (socket_index, socket) = udp.bind_fresh_punch_socket().await.unwrap();
+        let socket_local_endpoint = socket.local_addr().unwrap();
+        let handoff = udp
+            .attach_dynamic_punch_socket(
+                "peer-exact-proof",
+                socket_index,
+                socket,
+                0,
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(handoff
+            .commit_and_pin_for_test(&udp, "peer-exact-proof", socket_index, 0, 1)
+            .await);
+        assert!(handoff.finalize().await);
+        udp.remember_peer_socket(
+            "peer-exact-proof",
+            socket_index,
+            crate::udp::SocketEvidence::Fresh,
+        )
+        .await;
+
+        let identity = crate::peer::HardHardFreshSocketIdentity {
+            peer_id: "peer-exact-proof".to_string(),
+            session_token: "proof-token".to_string(),
+            network_generation: 0,
+            remote_candidate_epoch,
+            local_profile_generation: 0,
+            remote_profile_generation: 7,
+            punch_generation: 1,
+            socket_index,
+            socket_local_endpoint,
+        };
+        let now = hard_hard_now_ms();
+        assert!(peers
+            .hard_hard_register_session(crate::peer::HardHardSessionRecord {
+                session_id: "proof-session".to_string(),
+                session_token: identity.session_token.clone(),
+                peer_id: identity.peer_id.clone(),
+                initiator: true,
+                remote_network_generation: 0,
+                local_network_generation: identity.network_generation,
+                remote_candidate_epoch: identity.remote_candidate_epoch,
+                local_profile_generation: identity.local_profile_generation,
+                remote_profile_generation: identity.remote_profile_generation,
+                local_prediction_confidence: 90,
+                remote_prediction_confidence: 90,
+                prediction_window: vec![remote],
+                remote_prediction: vec![remote],
+                fresh_socket: identity.clone(),
+                punch_at_ms: now.saturating_add(5_000),
+                expires_at_ms: now.saturating_add(30_000),
+                state: crate::peer::HardHardSessionState::AwaitingPeer,
+                attempt_count: 0,
+                created_at: Instant::now(),
+                cancellation: Arc::new(crate::PunchSessionCancellation::default()),
+            })
+            .await);
+        (peers, udp, identity, remote)
+    }
+
+    #[tokio::test]
+    async fn hard_hard_exact_proof_rejects_peer_global_direct_on_other_socket() {
+        let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
+        let other_local: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let commit_before = peers.direct_commit_seq_sync(&identity.peer_id);
+        assert!(peers
+            .record_direct_success_for_generation_with_local_endpoint(
+                &identity.peer_id,
+                Some(remote),
+                identity.network_generation,
+                Some(other_local),
+            )
+            .await);
+        assert!(peers.is_direct(&identity.peer_id).await);
+        assert_ne!(
+            peers.direct_commit_seq_sync(&identity.peer_id),
+            commit_before,
+            "the competing ordinary Direct path must have a distinct commit"
+        );
+        assert!(udp
+            .hard_hard_socket_identity_is_current(&identity)
+            .await);
+        assert!(udp
+            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
+            .await);
+        assert!(
+            !hard_hard_exact_direct_confirmation_is_current(&udp, &peers, &identity).await,
+            "peer-global Direct on another local socket must not be Hard↔Hard success"
+        );
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert!(
+            !events.iter().any(|event| event.stage == "hard_hard_sweep_completed"),
+            "a competing Direct path must not create a Hard↔Hard success event"
+        );
+        udp.detach_all_dynamic_punch_sockets("test_exact_proof").await;
+    }
+
+    #[tokio::test]
+    async fn hard_hard_exact_proof_requires_selected_pair_and_authenticated_evidence() {
+        let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
+        let commit_before = peers.direct_commit_seq_sync(&identity.peer_id);
+        assert!(peers
+            .record_direct_success_for_generation_with_local_endpoint(
+                &identity.peer_id,
+                Some(remote),
+                identity.network_generation,
+                Some(identity.socket_local_endpoint),
+            )
+            .await);
+        assert_ne!(
+            peers.direct_commit_seq_sync(&identity.peer_id),
+            commit_before,
+            "the exact Direct confirmation must advance the existing commit sequence"
+        );
+        assert!(
+            hard_hard_exact_direct_confirmation_is_current(&udp, &peers, &identity).await,
+            "selected pair, current generations, affinity, and authenticated evidence must agree"
+        );
+        assert!(udp
+            .hard_hard_socket_identity_is_current(&identity)
+            .await);
+        let (data_socket_index, data_socket) = udp
+            .socket_for_peer(Some(&identity.peer_id))
+            .await
+            .expect("the proven Hard↔Hard socket must remain the data socket");
+        assert_eq!(data_socket_index, identity.socket_index);
+        assert_eq!(data_socket.local_addr().unwrap(), identity.socket_local_endpoint);
+        let selection = peers
+            .select_path_for_data(&identity.peer_id, true, true)
+            .await;
+        assert_eq!(selection.path, Some(crate::peer::NetworkPath::Direct));
+        assert!(selection.direct_confirmed);
+
+        let mut mismatched_peer = identity.clone();
+        mismatched_peer.peer_id = "peer-other".to_string();
+        let mut mismatched_token = identity.clone();
+        mismatched_token.session_token = "retired-token".to_string();
+        let mut mismatched_network = identity.clone();
+        mismatched_network.network_generation += 1;
+        let mut mismatched_candidate_epoch = identity.clone();
+        mismatched_candidate_epoch.remote_candidate_epoch += 1;
+        let mut mismatched_local_profile = identity.clone();
+        mismatched_local_profile.local_profile_generation += 1;
+        let mut mismatched_remote_profile = identity.clone();
+        mismatched_remote_profile.remote_profile_generation += 1;
+        let mut mismatched_punch = identity.clone();
+        mismatched_punch.punch_generation += 1;
+        let mut mismatched_index = identity.clone();
+        mismatched_index.socket_index += 1;
+        let mut mismatched_endpoint = identity.clone();
+        mismatched_endpoint.socket_local_endpoint = SocketAddr::new(
+            identity.socket_local_endpoint.ip(),
+            identity.socket_local_endpoint.port().wrapping_add(1),
+        );
+        for mismatched in [
+            mismatched_peer,
+            mismatched_token,
+            mismatched_network,
+            mismatched_candidate_epoch,
+            mismatched_local_profile,
+            mismatched_remote_profile,
+            mismatched_punch,
+            mismatched_index,
+            mismatched_endpoint,
+        ] {
+            assert!(
+                !hard_hard_exact_direct_confirmation_is_current(&udp, &peers, &mismatched)
+                    .await,
+                "every HardHardFreshSocketIdentity field must be authoritative"
+            );
+        }
+        udp.detach_all_dynamic_punch_sockets("test_exact_proof").await;
+    }
 
     #[test]
     fn coordination_envelope_round_trips_directional_fences() {
@@ -1146,6 +1523,11 @@ mod hard_hard_tests {
         assert!(!HardHardCoordination::looks_like("peer-session"));
         assert!(HardHardCoordination::parse("hh1:x:token:1:2:1:2").is_none());
         assert!(HardHardCoordination::parse("hh1:i:not*hex:1:2:1:2").is_none());
+        assert!(HardHardCoordination::parse(&format!(
+            "hh1:i:{}:1:2:1:2",
+            "a".repeat(33)
+        ))
+        .is_none());
         assert!(HardHardCoordination::parse("hh1:i:token:1:2:1:2:bad").is_none());
         assert!(HardHardCoordination::parse("hh1:i:token:1:2:1:2:1:2:extra").is_none());
     }

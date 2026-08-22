@@ -441,6 +441,30 @@ impl UdpTransport {
         })
     }
 
+    /// Exact-socket ownership plus authenticated evidence observed on that
+    /// same dynamic entry.  A commit-time affinity pin alone is not enough for
+    /// Hard↔Hard success: it is installed before the first peer-directed
+    /// authenticated ACK, so the final proof must also see the entry's own
+    /// evidence counter advance.
+    pub(crate) async fn hard_hard_socket_identity_has_authenticated_evidence(
+        &self,
+        identity: &crate::peer::HardHardFreshSocketIdentity,
+    ) -> bool {
+        let state = self.socket_state.lock().await;
+        state.dynamic.get(&identity.socket_index).is_some_and(|entry| {
+            entry.peer_id == identity.peer_id
+                && entry.network_generation == identity.network_generation
+                && entry.punch_generation == identity.punch_generation
+                && entry.phase.is_usable()
+                && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
+                && entry.authenticated_evidence > 0
+                && state.affinity.get(&identity.peer_id).is_some_and(|pin| {
+                    pin.socket_index == identity.socket_index
+                })
+                && self.peers.current_network_generation_sync() == identity.network_generation
+        })
+    }
+
     /// Detach a superseded generation's predecessor socket, unless the
     /// predecessor was re-pinned by authenticated traffic since the commit.
     ///
@@ -2250,6 +2274,26 @@ impl ProvisionalSocketGuard {
             .expect("committed entry verified above")
             .phase = DynamicSocketPhase::CommittedPendingHandoff;
         outcome
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn commit_and_pin_for_test(
+        &self,
+        transport: &UdpTransport,
+        peer_id: &str,
+        socket_index: usize,
+        network_generation: u64,
+        punch_generation: u64,
+    ) -> bool {
+        self.commit_and_pin(
+            transport,
+            peer_id,
+            socket_index,
+            network_generation,
+            punch_generation,
+        )
+        .await
+        .committed
     }
 
     /// Hand the committed socket to the peer's long-term ownership.

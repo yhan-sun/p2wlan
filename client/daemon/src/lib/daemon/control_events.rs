@@ -416,9 +416,11 @@ impl Daemon {
         }
     }
 
-    /// Route a valid `hh1` fresh signal into the two-sided synchronized
-    /// rendezvous.  A malformed envelope is consumed and rejected rather than
-    /// silently degrading into an ordinary one-sided Hard↔Hard punch.
+    /// Route a well-formed, control-context-admitted `hh1` fresh signal into
+    /// the two-sided synchronized rendezvous.  The envelope is an epoch fence,
+    /// not a cryptographic authenticator: malformed or mismatched metadata is
+    /// consumed and rejected rather than silently degrading into an ordinary
+    /// one-sided Hard↔Hard punch.
     async fn handle_hard_hard_fresh_offer(
         &self,
         peer_id: &str,

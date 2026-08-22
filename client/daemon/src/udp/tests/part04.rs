@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use crate::peer::NetworkPath;
 use p2pnet_nat::{
     decode_authenticated_punch_packet, CandidateGatherReport, MappingBehavior, StunAttribute,
     StunMessage,
@@ -592,6 +593,46 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
     );
 
     listener.abort();
+}
+
+#[tokio::test]
+async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends() {
+    let (peers, transport, _nat) = generation_env().await;
+    let (socket_index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    let handoff = transport
+        .attach_dynamic_punch_socket("peer-b", socket_index, socket, 0, 1, None)
+        .await
+        .unwrap();
+    assert!(handoff
+        .commit_and_pin(&transport, "peer-b", socket_index, 0, 1)
+        .await
+        .committed);
+    assert!(handoff.finalize().await);
+    transport
+        .detach_dynamic_socket_by_index(socket_index, "test_exact_socket_detached")
+        .await;
+
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index(
+            "peer-b",
+            socket_index,
+            vec!["127.0.0.1:41000".parse().unwrap()],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.packets_sent, 0);
+    assert_eq!(report.unique_target_endpoints, 0);
+    assert!(!peers.is_direct("peer-b").await);
+    assert_eq!(
+        peers
+            .select_path_for_data("peer-b", true, true)
+            .await
+            .path,
+        Some(NetworkPath::Relay),
+        "a detached exact Hard↔Hard socket must leave Relay as the data path"
+    );
 }
 
 #[tokio::test]

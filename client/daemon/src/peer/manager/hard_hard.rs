@@ -309,7 +309,109 @@ impl PeerManager {
             record.peer_id == peer_id
                 && record.session_token == token
                 && record.expires_at_ms >= now
-        })
+            })
+    }
+
+    /// Return true only while every stamped identity fence of a Hard↔Hard
+    /// session still matches the live manager state.  This is deliberately
+    /// stronger than the token-only send fence: the final Direct verdict must
+    /// not be able to reuse a socket after a candidate/profile refresh or a
+    /// superseding session.
+    pub(crate) async fn hard_hard_session_identity_is_current(
+        &self,
+        identity: &HardHardFreshSocketIdentity,
+    ) -> bool {
+        let now = unix_time_millis();
+        let record = {
+            let mut sessions = self.hard_hard_sessions.lock().await;
+            let expired_keys = sessions
+                .iter()
+                .filter(|(_, existing)| existing.expires_at_ms < now)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            for key in expired_keys {
+                if let Some(existing) = sessions.remove(&key) {
+                    existing.cancellation.cancel_for_hard_hard_cleanup();
+                }
+            }
+            sessions
+                .values()
+                .find(|record| {
+                    record.peer_id == identity.peer_id
+                        && record.session_token == identity.session_token
+                        && record.expires_at_ms >= now
+                })
+                .cloned()
+        };
+        let Some(record) = record else {
+            return false;
+        };
+        if record.local_network_generation != identity.network_generation
+            || record.remote_candidate_epoch != identity.remote_candidate_epoch
+            || record.local_profile_generation != identity.local_profile_generation
+            || record.remote_profile_generation != identity.remote_profile_generation
+            || record.fresh_socket != *identity
+        {
+            return false;
+        }
+        if self.current_network_generation_sync() != identity.network_generation
+            || self.current_local_profile_generation_sync() != identity.local_profile_generation
+        {
+            return false;
+        }
+
+        let connections = self.connections.read().await;
+        let Some(conn) = connections.get(&identity.peer_id) else {
+            return false;
+        };
+        conn.online
+            && conn.remote_candidate_epoch() == identity.remote_candidate_epoch
+            && conn.remote_nat_profile_is_fresh()
+            && conn.remote_nat_profile_candidate_epoch == Some(identity.remote_candidate_epoch)
+            && conn
+                .remote_nat_profile
+                .as_ref()
+                .and_then(|profile| profile.generation)
+                == Some(identity.remote_profile_generation)
+    }
+
+    /// Return true when the current authoritative Direct state selected a pair
+    /// on this socket's exact local endpoint and current candidate epoch.  The
+    /// UDP layer separately proves affinity and authenticated socket evidence;
+    /// keeping this half in the manager reuses the existing Direct state and
+    /// candidate-pair authorities without introducing another Direct state.
+    pub(crate) async fn hard_hard_direct_pair_is_current(
+        &self,
+        identity: &HardHardFreshSocketIdentity,
+    ) -> bool {
+        if self.current_network_generation_sync() != identity.network_generation {
+            return false;
+        }
+        let connections = self.connections.read().await;
+        let Some(conn) = connections.get(&identity.peer_id) else {
+            return false;
+        };
+        conn.state == ConnectionState::Direct
+            && conn.direct_generation == identity.network_generation
+            && conn.candidate_pairs.iter().any(|pair| {
+                pair.local_generation == identity.network_generation
+                    && pair.remote_candidate_epoch == identity.remote_candidate_epoch
+                    && pair.state == CandidatePairState::Selected
+                    && pair.selected_at.is_some()
+                    && pair.local_endpoint == Some(identity.socket_local_endpoint)
+            })
+    }
+
+    /// Return true only when the authoritative Direct commit selected a pair
+    /// on this Hard↔Hard socket and the full session/generation/profile fence
+    /// is still current.  The UDP layer separately proves affinity and
+    /// authenticated socket evidence.
+    pub(crate) async fn hard_hard_direct_confirmation_is_current(
+        &self,
+        identity: &HardHardFreshSocketIdentity,
+    ) -> bool {
+        self.hard_hard_session_identity_is_current(identity).await
+            && self.hard_hard_direct_pair_is_current(identity).await
     }
 
     /// Atomically consume the one reciprocal-sweep slot for a session.  A
