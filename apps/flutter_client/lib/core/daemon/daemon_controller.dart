@@ -304,7 +304,7 @@ class DaemonController {
   }
 
   Future<DaemonCommandResult> stop(String diagnosticsUrl) async {
-    if (Platform.isAndroid) return _stopAndroidVpn(diagnosticsUrl);
+    if (Platform.isAndroid) return _stopAndroidVpn();
     if (!_supportsProcessControl) {
       return const DaemonCommandResult(
         ok: false,

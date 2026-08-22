@@ -14,6 +14,7 @@ import java.io.File
 class MainActivity : FlutterActivity() {
     companion object {
         private const val CHANNEL = "p2wlan/android_vpn"
+        private const val PLATFORM_CHANNEL = "p2wlan/platform"
         private const val VPN_PERMISSION_REQUEST = 39278
     }
 
@@ -23,6 +24,37 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result -> handleMethod(call, result) }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PLATFORM_CHANNEL)
+            .setMethodCallHandler { call, result -> handlePlatformMethod(call, result) }
+    }
+
+    private fun handlePlatformMethod(call: MethodCall, result: MethodChannel.Result) {
+        when (call.method) {
+            "applicationSupportDirectory" -> {
+                val directory = File(filesDir, "p2wlan")
+                if (!directory.exists() && !directory.mkdirs()) {
+                    result.error(
+                        "storage_unavailable",
+                        "无法创建 P2WLAN 持久化配置目录",
+                        null,
+                    )
+                    return
+                }
+                result.success(directory.absolutePath)
+            }
+            "deviceName" -> result.success(androidDeviceName())
+            else -> result.notImplemented()
+        }
+    }
+
+    private fun androidDeviceName(): String {
+        val manufacturer = Build.MANUFACTURER.trim()
+        val model = Build.MODEL.trim()
+        return listOf(manufacturer, model)
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString(" ")
+            .ifEmpty { "Android device" }
     }
 
     private fun handleMethod(call: MethodCall, result: MethodChannel.Result) {

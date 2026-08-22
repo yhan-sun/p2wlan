@@ -6,6 +6,16 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         info!("Daemon cleanup: removing routes...");
         self.route_manager.cleanup();
+        #[cfg(target_os = "android")]
+        if let Some(fd) = self.android_tun_fd.take() {
+            // Before registration succeeds, init_tun_with has not taken the
+            // raw fd yet. RawFd itself has no Drop implementation, so close
+            // that ownership explicitly on early shutdown/error paths. Once
+            // attached, android_tun_fd is None and TunDevice owns it instead.
+            unsafe {
+                drop(<std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd));
+            }
+        }
     }
 }
 

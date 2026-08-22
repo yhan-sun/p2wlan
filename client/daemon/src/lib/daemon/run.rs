@@ -46,8 +46,24 @@ impl Daemon {
 
         if !self.config.network.manual {
             info!("Running in managed mode. Waiting for control plane registration...");
-            // Wait for Registered event
-            while let Some(event) = self.control_rx.recv().await {
+            // The Android VPN fd is already owned by this Daemon while the
+            // control plane is registering. A disconnected/expired session
+            // used to leave this await uninterruptible, so STOP could not
+            // release the native runtime and the next START saw a stale TUN.
+            loop {
+                let event = tokio::select! {
+                    changed = self.shutdown_rx.changed() => {
+                        if changed.is_err() || *self.shutdown_rx.borrow() {
+                            info!("Shutdown requested while waiting for control plane registration");
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    event = self.control_rx.recv() => event,
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
                     ControlEvent::Registered {
                         node_id,

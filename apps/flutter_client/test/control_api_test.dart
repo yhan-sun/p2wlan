@@ -122,6 +122,36 @@ void main() {
     expect(store.settings.deviceName.trim(), isNotEmpty);
   });
 
+  test('settings load replaces localhost device names', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'p2wlan_localhost_device_name_migration_test_',
+    );
+    addTearDown(() {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    });
+    final settingsFile = File('${tempDir.path}/settings.json');
+    await settingsFile.writeAsString('''
+{
+  "controlServer": "$defaultControlServer",
+  "authToken": "token",
+  "deviceName": "localhost",
+  "manualMode": false
+}
+''');
+
+    final store = SettingsStore(
+      settingsFile: settingsFile,
+      tokenRepository: InMemorySecureTokenRepository(),
+    );
+    await store.load();
+    addTearDown(store.dispose);
+
+    expect(store.settings.deviceName.toLowerCase(), isNot('localhost'));
+    expect(store.settings.deviceName.trim(), isNotEmpty);
+  });
+
   test(
     'authenticate wraps connection failures as user-facing errors',
     () async {

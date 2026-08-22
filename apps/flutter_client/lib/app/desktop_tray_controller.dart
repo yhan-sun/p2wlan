@@ -67,7 +67,7 @@ class DesktopTrayController with TrayListener, WindowListener {
       );
       if (!_initialized) return;
       if (Platform.isMacOS || Platform.isLinux) {
-        await trayManager.setTitle(trayTitleForTesting());
+        await trayManager.setTitle(desktopVisibleTitleForTesting());
       }
       await _updateTrayIcon(force: true);
       await _queueMenuUpdate();
@@ -159,10 +159,12 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void> _updateMenu() async {
     final strings = AppStrings.fromCode(settingsStore.settings.languageCode);
     final statusLabel = _statusLabel(strings);
-    final taskbarTitle = trayTitleForTesting();
+    final taskbarTitle = desktopVisibleTitleForTesting();
 
     await _updateTrayIcon();
-    await trayManager.setToolTip('$taskbarTitle - $statusLabel');
+    await trayManager.setToolTip(
+      Platform.isMacOS ? p2wlanAppName : '$taskbarTitle - $statusLabel',
+    );
     if (Platform.isMacOS || Platform.isLinux) {
       await trayManager.setTitle(taskbarTitle);
     }
@@ -173,7 +175,7 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   Future<void> _updateDesktopWindowIndicators(String title) async {
     final shouldUpdateTitle = _lastDesktopTitle != title;
-    final badge = Platform.isMacOS ? dockBadgeForTesting() : '';
+    final badge = desktopVisibleBadgeForTesting();
     final shouldUpdateBadge = Platform.isMacOS && _lastDockBadge != badge;
     if (!shouldUpdateTitle && !shouldUpdateBadge) return;
 
@@ -286,6 +288,22 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   @visibleForTesting
   bool trayIconUsesTemplateForTesting() => Platform.isMacOS;
+
+  @visibleForTesting
+  String desktopVisibleTitleForTesting() {
+    // macOS renders this title beside the menu-bar icon and uses the window
+    // title for the Dock/taskbar item. Keep those stable; connection metrics
+    // remain available in the tray menu instead of changing OS chrome every
+    // polling cycle.
+    return Platform.isMacOS ? p2wlanAppName : trayTitleForTesting();
+  }
+
+  @visibleForTesting
+  String desktopVisibleBadgeForTesting() {
+    // A live latency/speed badge is also connection information in the Dock.
+    // Returning an empty value clears badges left by older client versions.
+    return Platform.isMacOS ? '' : dockBadgeForTesting();
+  }
 
   @visibleForTesting
   String trayTitleForTesting() {

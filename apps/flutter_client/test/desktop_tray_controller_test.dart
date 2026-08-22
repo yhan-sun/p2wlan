@@ -132,6 +132,31 @@ void main() {
     expect(controller.dockBadgeForTesting(), '34ms/—');
   });
 
+  test('macOS OS chrome does not expose live connection metrics', () async {
+    final snapshot = await _loadFixtureSnapshot();
+    final stores = await _makeStores(
+      api: _FakeDiagnosticsApi(snapshot: snapshot),
+    );
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+
+    final tray = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    );
+    final window = DesktopWindowStatusController(
+      statusStore: stores.statusStore,
+    );
+
+    if (Platform.isMacOS) {
+      expect(tray.desktopVisibleTitleForTesting(), 'P2WLAN');
+      expect(tray.desktopVisibleBadgeForTesting(), isEmpty);
+      expect(window.desktopVisibleTitleForTesting(), 'P2WLAN');
+      expect(window.desktopVisibleBadgeForTesting(), isEmpty);
+    }
+  });
+
   test(
     'desktop tray icon exposes healthy state without opening the menu',
     () async {

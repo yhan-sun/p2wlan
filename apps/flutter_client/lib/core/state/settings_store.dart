@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import '../api/diagnostics_api.dart';
 import '../models/diagnostics_models.dart';
+import '../platform/android_platform.dart';
 import '../security/local_config_secret.dart';
 import '../security/secure_token_repository.dart';
 
@@ -30,7 +31,9 @@ class SettingsStore extends ChangeNotifier {
   Future<void> load() async {
     AppSettings? parsedSettings;
     try {
-      final file = _settingsFile();
+      final file = Platform.isAndroid
+          ? await _settingsFile()
+          : _settingsFileSync();
       _configPath = file.path;
       final sourceFile = await _settingsSourceFile(file);
       if (sourceFile != null) {
@@ -214,7 +217,9 @@ class SettingsStore extends ChangeNotifier {
     }
     final previous = _settings;
     try {
-      final file = _settingsFile();
+      final file = Platform.isAndroid
+          ? await _settingsFile()
+          : _settingsFileSync();
       final ciphertext = await LocalConfigSecret.encrypt(
         password,
         keyFile: _adminPasswordKeyFile(file),
@@ -286,7 +291,9 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> _save() async {
     try {
-      final file = _settingsFile();
+      final file = Platform.isAndroid
+          ? await _settingsFile()
+          : _settingsFileSync();
       _configPath = file.path;
       // Keep the credential in the local token file in lockstep with the
       // in-memory value. A blank token clears the local token file.
@@ -299,11 +306,24 @@ class SettingsStore extends ChangeNotifier {
     }
   }
 
-  File _settingsFile() {
+  File _settingsFileSync() {
     final override = _settingsFileOverride;
     if (override != null) return override;
+    final directory = _configDirectorySync();
     return File(
-      '${_configDirectory().path}${Platform.pathSeparator}flutter-client-settings.json',
+      '${directory.path}${Platform.pathSeparator}flutter-client-settings.json',
+    );
+  }
+
+  Future<File> _settingsFile() async {
+    final override = _settingsFileOverride;
+    if (override != null) return override;
+    final applicationSupport = await resolveApplicationSupportDirectory();
+    if (applicationSupport == null) {
+      throw StateError('Android application support directory is unavailable.');
+    }
+    return File(
+      '${applicationSupport.path}${Platform.pathSeparator}flutter-client-settings.json',
     );
   }
 
@@ -357,7 +377,10 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> _restrictDirectory(Directory directory) async {
     if (!Platform.isMacOS && !Platform.isLinux) return;
-    final result = await Process.run('/bin/chmod', ['700', directory.path]);
+    // This is a tiny local metadata operation. Keep it synchronous so saves
+    // initiated from Flutter test/fake-async callbacks cannot strand a
+    // subprocess future outside the test event loop.
+    final result = Process.runSync('/bin/chmod', ['700', directory.path]);
     if (result.exitCode != 0) {
       throw const SecureTokenStorageException('无法限制本地配置目录权限。');
     }
@@ -365,7 +388,7 @@ class SettingsStore extends ChangeNotifier {
 
   Future<void> _restrictFile(File file) async {
     if (!Platform.isMacOS && !Platform.isLinux) return;
-    final result = await Process.run('/bin/chmod', ['600', file.path]);
+    final result = Process.runSync('/bin/chmod', ['600', file.path]);
     if (result.exitCode != 0) {
       throw const SecureTokenStorageException('无法限制本地配置文件权限。');
     }
@@ -394,7 +417,16 @@ class SettingsStore extends ChangeNotifier {
   }
 
   File? _legacySettingsFile() {
-    if (!Platform.isMacOS || _settingsFileOverride != null) return null;
+    if (_settingsFileOverride != null) return null;
+    if (Platform.isAndroid) {
+      // Builds before the persistent storage bridge used systemTemp (the
+      // Android cache directory). Migrate it when it is still available after
+      // an update; future reads use Context.filesDir instead.
+      return File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan${Platform.pathSeparator}flutter-client-settings.json',
+      );
+    }
+    if (!Platform.isMacOS) return null;
     final home = Platform.environment['HOME'];
     if (home == null || home.isEmpty) return null;
     return File(
@@ -402,7 +434,7 @@ class SettingsStore extends ChangeNotifier {
     );
   }
 
-  Directory _configDirectory() {
+  Directory _configDirectorySync() {
     if (Platform.isMacOS) {
       final home = Platform.environment['HOME'];
       if (home != null && home.isNotEmpty) {
@@ -451,6 +483,7 @@ Future<AppSettings> _migrateSettings(AppSettings settings) async {
 
 Future<String> resolveDefaultDeviceName() async {
   final candidates = <String>[
+    if (Platform.isAndroid) (await resolveAndroidDeviceName()) ?? '',
     if (Platform.isMacOS) ...await _macosDeviceNameCandidates(),
     Platform.environment['COMPUTERNAME'] ?? '',
     Platform.environment['HOSTNAME'] ?? '',
@@ -459,7 +492,9 @@ Future<String> resolveDefaultDeviceName() async {
   ];
   for (final candidate in candidates) {
     final normalized = _normalizeDeviceNameCandidate(candidate);
-    if (normalized.isNotEmpty && !_looksLikeIpAddress(normalized)) {
+    if (normalized.isNotEmpty &&
+        !_looksLikeIpAddress(normalized) &&
+        !_looksLikePlaceholderDeviceName(normalized)) {
       return normalized;
     }
   }
@@ -491,7 +526,25 @@ bool _shouldReplaceDefaultDeviceName(String value) {
   return normalized.isEmpty ||
       normalized == 'this-device' ||
       normalized == Platform.localHostname ||
-      _looksLikeIpAddress(normalized);
+      _looksLikeIpAddress(normalized) ||
+      _looksLikePlaceholderDeviceName(normalized);
+}
+
+bool _looksLikePlaceholderDeviceName(String value) {
+  switch (value.trim().toLowerCase()) {
+    case 'localhost':
+    case 'localhost.localdomain':
+    case 'android':
+    case 'android device':
+    case 'unknown':
+    case 'device':
+    case 'default':
+    case 'emulator':
+    case 'this-device':
+      return true;
+    default:
+      return false;
+  }
 }
 
 bool _looksLikeIpAddress(String value) {

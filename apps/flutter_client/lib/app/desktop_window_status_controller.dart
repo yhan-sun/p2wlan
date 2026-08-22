@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:window_manager/window_manager.dart';
@@ -74,14 +75,10 @@ class DesktopWindowStatusController {
   }
 
   Future<void> _update() async {
-    final title = taskbarTitleForTesting();
+    final title = desktopVisibleTitleForTesting();
     final shouldUpdateTitle = _lastTitle != title;
-    final badge = defaultTargetPlatform == TargetPlatform.macOS
-        ? dockBadgeForTesting()
-        : '';
-    final shouldUpdateBadge =
-        defaultTargetPlatform == TargetPlatform.macOS &&
-        _lastDockBadge != badge;
+    final badge = desktopVisibleBadgeForTesting();
+    final shouldUpdateBadge = Platform.isMacOS && _lastDockBadge != badge;
     if (!shouldUpdateTitle && !shouldUpdateBadge) return;
 
     try {
@@ -102,6 +99,20 @@ class DesktopWindowStatusController {
         debugPrint('Failed to update P2WLAN Dock badge: $error');
       }
     }
+  }
+
+  @visibleForTesting
+  String desktopVisibleTitleForTesting() {
+    // macOS displays this value in the Dock/taskbar. Keep OS chrome stable;
+    // detailed live metrics are still available inside the app/tray menu.
+    return Platform.isMacOS ? p2wlanAppName : taskbarTitleForTesting();
+  }
+
+  @visibleForTesting
+  String desktopVisibleBadgeForTesting() {
+    // Clear the live metric badge on macOS, including badges written by an
+    // older version of the client.
+    return Platform.isMacOS ? '' : dockBadgeForTesting();
   }
 
   @visibleForTesting

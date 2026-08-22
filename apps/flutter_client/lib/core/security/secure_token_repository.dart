@@ -11,6 +11,8 @@
 
 import 'dart:io';
 
+import '../platform/android_platform.dart';
+
 abstract interface class SecureTokenRepository {
   /// Read the stored token, or `null` when none is stored.
   Future<String?> read();
@@ -44,14 +46,27 @@ class LocalTokenRepository implements SecureTokenRepository {
   static const _fileName = 'p2wlan-auth-token';
   final File? _fileOverride;
 
-  File _tokenFile() {
+  File _tokenFileSync() {
     final override = _fileOverride;
     if (override != null) return override;
 
-    return File('${_localDirectory().path}${Platform.pathSeparator}$_fileName');
+    final directory = _localDirectorySync();
+    return File('${directory.path}${Platform.pathSeparator}$_fileName');
   }
 
-  Directory _localDirectory() {
+  Future<File> _tokenFile() async {
+    final override = _fileOverride;
+    if (override != null) return override;
+    final applicationSupport = await resolveApplicationSupportDirectory();
+    if (applicationSupport == null) {
+      throw StateError('Android application support directory is unavailable.');
+    }
+    return File(
+      '${applicationSupport.path}${Platform.pathSeparator}$_fileName',
+    );
+  }
+
+  Directory _localDirectorySync() {
     if (Platform.isMacOS || Platform.isIOS) {
       final home = Platform.environment['HOME'];
       if (home != null && home.isNotEmpty) {
@@ -75,11 +90,18 @@ class LocalTokenRepository implements SecureTokenRepository {
       }
     }
 
-    // Android's and other sandboxed runtimes' temporary directory is inside
-    // the application sandbox. It is a fallback only for platforms where a
-    // stable per-user application-data environment variable is unavailable.
+    // This is retained only for unsupported/sandboxed runtimes that do not
+    // expose a stable application-data directory. Android is handled above by
+    // the Context-backed application support directory.
     return Directory(
       '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan-client',
+    );
+  }
+
+  File? _legacyAndroidTokenFile() {
+    if (!Platform.isAndroid || _fileOverride != null) return null;
+    return File(
+      '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan-client${Platform.pathSeparator}$_fileName',
     );
   }
 
@@ -105,10 +127,21 @@ class LocalTokenRepository implements SecureTokenRepository {
   @override
   Future<String?> read() async {
     try {
-      final file = _tokenFile();
-      if (!await file.exists()) return null;
-      final value = await file.readAsString();
+      final file = Platform.isAndroid ? await _tokenFile() : _tokenFileSync();
+      var source = file;
+      if (!await source.exists()) {
+        final legacy = _legacyAndroidTokenFile();
+        if (legacy == null || !await legacy.exists()) return null;
+        source = legacy;
+      }
+      final value = await source.readAsString();
       final trimmed = value.trim();
+      if (trimmed.isNotEmpty && source.path != file.path) {
+        // One-time migration from the old cache/temp location used by older
+        // Android builds. Keep the old file untouched so an interrupted
+        // update remains recoverable.
+        await _writeFile(file, trimmed);
+      }
       return trimmed.isEmpty ? null : trimmed;
     } catch (_) {
       throw const SecureTokenStorageException('本地凭据文件不可用，无法读取 P2WLAN 登录凭据。');
@@ -122,28 +155,8 @@ class LocalTokenRepository implements SecureTokenRepository {
       if (trimmed.isEmpty) {
         await clear();
       } else {
-        final file = _tokenFile();
-        await file.parent.create(recursive: true);
-        await _restrictDirectory(file.parent);
-        final temp = File(
-          '${file.path}.${DateTime.now().microsecondsSinceEpoch}.tmp',
-        );
-        try {
-          await temp.writeAsString(trimmed, flush: true);
-          await _restrictFile(temp);
-          try {
-            await temp.rename(file.path);
-          } on FileSystemException {
-            // Windows cannot replace an existing file with rename on every
-            // filesystem. The temporary file is already flushed and contains
-            // only the token, so this narrow fallback remains recoverable.
-            if (await file.exists()) await file.delete();
-            await temp.rename(file.path);
-          }
-          await _restrictFile(file);
-        } finally {
-          if (await temp.exists()) await temp.delete();
-        }
+        final file = Platform.isAndroid ? await _tokenFile() : _tokenFileSync();
+        await _writeFile(file, trimmed);
       }
     } catch (_) {
       throw const SecureTokenStorageException(
@@ -155,10 +168,36 @@ class LocalTokenRepository implements SecureTokenRepository {
   @override
   Future<void> clear() async {
     try {
-      final file = _tokenFile();
+      final file = Platform.isAndroid ? await _tokenFile() : _tokenFileSync();
       if (await file.exists()) await file.delete();
+      final legacy = _legacyAndroidTokenFile();
+      if (legacy != null && await legacy.exists()) await legacy.delete();
     } catch (_) {
       throw const SecureTokenStorageException('本地凭据文件不可用，未能删除 P2WLAN 登录凭据。');
+    }
+  }
+
+  Future<void> _writeFile(File file, String token) async {
+    await file.parent.create(recursive: true);
+    await _restrictDirectory(file.parent);
+    final temp = File(
+      '${file.path}.${DateTime.now().microsecondsSinceEpoch}.tmp',
+    );
+    try {
+      await temp.writeAsString(token, flush: true);
+      await _restrictFile(temp);
+      try {
+        await temp.rename(file.path);
+      } on FileSystemException {
+        // Windows cannot replace an existing file with rename on every
+        // filesystem. The temporary file is already flushed and contains
+        // only the token, so this narrow fallback remains recoverable.
+        if (await file.exists()) await file.delete();
+        await temp.rename(file.path);
+      }
+      await _restrictFile(file);
+    } finally {
+      if (await temp.exists()) await temp.delete();
     }
   }
 }

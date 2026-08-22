@@ -18,7 +18,7 @@ extension DaemonControllerAndroidVpn on DaemonController {
     // Stop a previous service/runtime first. This makes repeated starts safe
     // across hot restart, debug/release installs, and stale foreground
     // services holding the previous TUN fd.
-    final stopped = await _stopAndroidVpn(settings.diagnosticsUrl);
+    final stopped = await _stopAndroidVpn();
     if (!stopped.ok && await _androidNativeRunning()) {
       return DaemonCommandResult(
         ok: false,
@@ -55,6 +55,11 @@ extension DaemonControllerAndroidVpn on DaemonController {
     );
     if (!ready) {
       final nativeError = await _androidNativeError();
+      // A failed readiness wait used to leave the foreground VPN/TUN alive.
+      // The next start then raced the old registration loop and appeared to
+      // work only after the user manually disabled TUN in Android settings.
+      // Always tear down the failed attempt before returning the error.
+      await _stopAndroidVpn();
       return DaemonCommandResult(
         ok: false,
         message: nativeError == null
@@ -89,7 +94,7 @@ extension DaemonControllerAndroidVpn on DaemonController {
     });
   }
 
-  Future<DaemonCommandResult> _stopAndroidVpn(String diagnosticsUrl) async {
+  Future<DaemonCommandResult> _stopAndroidVpn() async {
     try {
       await _androidVpnChannel.invokeMethod<bool>('stop');
     } on PlatformException catch (error) {
@@ -104,8 +109,11 @@ extension DaemonControllerAndroidVpn on DaemonController {
     final deadline = DateTime.now().add(const Duration(seconds: 10));
     while (DateTime.now().isBefore(deadline)) {
       final nativeRunning = await _androidNativeRunning();
-      final health = await _diagnosticsApi.fetchHealth(diagnosticsUrl);
-      if (!nativeRunning && !health) {
+      // The native runtime is the owner of the detached VPN fd. Once it has
+      // stopped, a briefly stale HTTP health response must not block a new
+      // VpnService start; requiring both states caused needless 10-second
+      // waits and made the manual TUN toggle look like the fix.
+      if (!nativeRunning) {
         return const DaemonCommandResult(
           ok: true,
           message: 'Android P2WLAN VPN 已停止。',
