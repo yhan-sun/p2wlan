@@ -33,6 +33,8 @@ pub(crate) struct HardHardCoordination {
     pub(crate) remote_candidate_epoch: u64,
     pub(crate) local_profile_generation: u64,
     pub(crate) remote_profile_generation: u64,
+    pub(crate) local_prediction_confidence: u8,
+    pub(crate) remote_prediction_confidence: u8,
 }
 
 impl HardHardCoordination {
@@ -63,6 +65,12 @@ impl HardHardCoordination {
         let remote_candidate_epoch = fields.next()?.parse().ok()?;
         let local_profile_generation = fields.next()?.parse().ok()?;
         let remote_profile_generation = fields.next()?.parse().ok()?;
+        // Confidence was added to the opaque envelope without changing the
+        // signaling schema.  Accept an older hh1 envelope as a bounded
+        // zero-confidence value, but newly generated sessions always carry
+        // both model confidences before they are admitted.
+        let local_prediction_confidence = fields.next().unwrap_or("0").parse().ok()?;
+        let remote_prediction_confidence = fields.next().unwrap_or("0").parse().ok()?;
         if fields.next().is_some() {
             return None;
         }
@@ -73,12 +81,14 @@ impl HardHardCoordination {
             remote_candidate_epoch,
             local_profile_generation,
             remote_profile_generation,
+            local_prediction_confidence,
+            remote_prediction_confidence,
         })
     }
 
     fn encode(&self) -> String {
         format!(
-            "{HARD_HARD_SESSION_PREFIX}:{}:{}:{}:{}:{}:{}",
+            "{HARD_HARD_SESSION_PREFIX}:{}:{}:{}:{}:{}:{}:{}:{}",
             match self.role {
                 HardHardRole::Initiator => "i",
                 HardHardRole::Responder => "r",
@@ -88,10 +98,16 @@ impl HardHardCoordination {
             self.remote_candidate_epoch,
             self.local_profile_generation,
             self.remote_profile_generation,
+            self.local_prediction_confidence,
+            self.remote_prediction_confidence,
         )
     }
 
-    fn as_response(&self, snapshot: crate::peer::HardHardPlanSnapshot) -> Self {
+    fn as_response(
+        &self,
+        snapshot: crate::peer::HardHardPlanSnapshot,
+        local_prediction_confidence: u8,
+    ) -> Self {
         Self {
             role: HardHardRole::Responder,
             token: self.token.clone(),
@@ -99,6 +115,8 @@ impl HardHardCoordination {
             remote_candidate_epoch: snapshot.remote_candidate_epoch,
             local_profile_generation: snapshot.local_profile_generation,
             remote_profile_generation: self.local_profile_generation,
+            local_prediction_confidence,
+            remote_prediction_confidence: self.local_prediction_confidence,
         }
     }
 }
@@ -126,6 +144,8 @@ fn hard_hard_coordination_from_plan(
         remote_candidate_epoch: plan.remote_candidate_epoch,
         local_profile_generation: plan.local_profile_generation,
         remote_profile_generation: plan.remote_profile_generation,
+        local_prediction_confidence: 0,
+        remote_prediction_confidence: 0,
     }
 }
 
@@ -238,7 +258,6 @@ pub(crate) async fn spawn_hard_hard_initiator(
     };
     let token = hard_hard_session_token(session.session_id());
     let coordination = hard_hard_coordination_from_plan(token, HardHardRole::Initiator, plan);
-    let session_id = coordination.encode();
     let cancellation = session.cancellation_handle();
     tokio::spawn(async move {
         let outcome = udp
@@ -260,7 +279,6 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     "Hard↔Hard fresh measurement/model failed; keeping Relay or the existing path",
                 )
                 .await;
-            peers.hard_hard_remove_session(&peer_id, &session_id).await;
             return;
         };
         if cancellation.is_cancelled()
@@ -280,7 +298,6 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     "Hard↔Hard measurement completed after a session/profile/network fence changed; socket was not advertised",
                 )
                 .await;
-            peers.hard_hard_remove_session(&peer_id, &session_id).await;
             return;
         }
         let Some((candidates, candidate_sources)) =
@@ -296,9 +313,11 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     "Hard↔Hard model produced no usable public prediction window; Relay remains available",
                 )
                 .await;
-            peers.hard_hard_remove_session(&peer_id, &session_id).await;
             return;
         };
+        let mut coordination = coordination;
+        coordination.local_prediction_confidence = result.model.confidence;
+        let session_id = coordination.encode();
         let record = HardHardSessionRecord {
             session_id: session_id.clone(),
             peer_id: peer_id.clone(),
@@ -307,6 +326,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             remote_candidate_epoch: plan.remote_candidate_epoch,
             local_profile_generation: plan.local_profile_generation,
             remote_profile_generation: plan.remote_profile_generation,
+            local_prediction_confidence: result.model.confidence,
             socket_index: Some(result.socket_index),
             punch_generation: Some(result.punch_generation),
             punch_at_ms,
@@ -375,7 +395,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "session_id={} punch_at_ms={} socket_index={} punch_generation={} local_network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} attempts_bounded={HARD_HARD_SWEEP_ATTEMPTS}",
+                    "session_id={} punch_at_ms={} socket_index={} punch_generation={} local_network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} local_prediction_confidence={} attempts_bounded={HARD_HARD_SWEEP_ATTEMPTS}",
                     session_id,
                     punch_at_ms,
                     result.socket_index,
@@ -384,6 +404,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     plan.remote_candidate_epoch,
                     plan.local_profile_generation,
                     plan.remote_profile_generation,
+                    result.model.confidence,
                 ),
             )
             .await;
@@ -426,6 +447,7 @@ pub(crate) async fn spawn_hard_hard_responder(
     if coordination.role != HardHardRole::Initiator
         || coordination.local_profile_generation != plan.remote_profile_generation
         || coordination.remote_profile_generation != plan.local_profile_generation
+        || coordination.local_prediction_confidence == 0
     {
         peers
             .record_direct_event(
@@ -519,7 +541,8 @@ pub(crate) async fn spawn_hard_hard_responder(
         else {
             return;
         };
-        let response_coordination = coordination.as_response(current_plan);
+        let response_coordination =
+            coordination.as_response(current_plan, result.model.confidence);
         let record = HardHardSessionRecord {
             session_id: session_id.clone(),
             peer_id: peer_id.clone(),
@@ -528,6 +551,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             remote_candidate_epoch: current_plan.remote_candidate_epoch,
             local_profile_generation: current_plan.local_profile_generation,
             remote_profile_generation: current_plan.remote_profile_generation,
+            local_prediction_confidence: result.model.confidence,
             socket_index: Some(result.socket_index),
             punch_generation: Some(result.punch_generation),
             punch_at_ms,
@@ -626,6 +650,8 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         || current_plan.remote_profile_generation != record.remote_profile_generation
         || coordination.local_profile_generation != record.remote_profile_generation
         || coordination.remote_profile_generation != record.local_profile_generation
+        || coordination.local_prediction_confidence == 0
+        || coordination.remote_prediction_confidence != record.local_prediction_confidence
         || punch_at_ms != record.punch_at_ms
         || record.punch_generation.is_none()
         || punch_at_ms.saturating_add(HARD_HARD_SWEEP_DEADLINE.as_millis() as u64)
@@ -822,6 +848,8 @@ mod hard_hard_tests {
             remote_candidate_epoch: 11,
             local_profile_generation: 13,
             remote_profile_generation: 19,
+            local_prediction_confidence: 83,
+            remote_prediction_confidence: 0,
         };
         let encoded = offer.encode();
         assert!(encoded.len() < 128);
@@ -829,18 +857,23 @@ mod hard_hard_tests {
 
         let response = HardHardCoordination::parse(&encoded)
             .expect("encoded offer must parse")
-            .as_response(crate::peer::HardHardPlanSnapshot {
-                local_network_generation: 23,
-                remote_candidate_epoch: 23,
-                local_profile_generation: 29,
-                remote_profile_generation: 13,
-            });
+            .as_response(
+                crate::peer::HardHardPlanSnapshot {
+                    local_network_generation: 23,
+                    remote_candidate_epoch: 23,
+                    local_profile_generation: 29,
+                    remote_profile_generation: 13,
+                },
+                71,
+            );
         assert_eq!(response.role, HardHardRole::Responder);
         assert_eq!(response.token, "deadbeef01");
         assert_eq!(response.local_network_generation, 23);
         assert_eq!(response.remote_candidate_epoch, 23);
         assert_eq!(response.local_profile_generation, 29);
         assert_eq!(response.remote_profile_generation, 13);
+        assert_eq!(response.local_prediction_confidence, 71);
+        assert_eq!(response.remote_prediction_confidence, 83);
         assert_eq!(HardHardCoordination::parse(&response.encode()), Some(response));
     }
 
@@ -849,7 +882,8 @@ mod hard_hard_tests {
         assert!(!HardHardCoordination::looks_like("peer-session"));
         assert!(HardHardCoordination::parse("hh1:x:token:1:2:1:2").is_none());
         assert!(HardHardCoordination::parse("hh1:i:not*hex:1:2:1:2").is_none());
-        assert!(HardHardCoordination::parse("hh1:i:token:1:2:1:2:extra").is_none());
+        assert!(HardHardCoordination::parse("hh1:i:token:1:2:1:2:bad").is_none());
+        assert!(HardHardCoordination::parse("hh1:i:token:1:2:1:2:1:2:extra").is_none());
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) remote_candidate_epoch: u64,
     pub(crate) local_profile_generation: u64,
     pub(crate) remote_profile_generation: u64,
+    pub(crate) local_prediction_confidence: u8,
     pub(crate) socket_index: Option<usize>,
     pub(crate) punch_generation: Option<u64>,
     pub(crate) punch_at_ms: u64,
