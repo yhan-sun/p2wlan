@@ -7,35 +7,28 @@ part of '../dashboard_page.dart';
 class _HomeActions extends StatelessWidget {
   const _HomeActions({
     required this.status,
-    required this.loading,
-    required this.daemonAvailable,
     required this.daemonBusy,
+    required this.initialProbePending,
     required this.canControlLocalDaemon,
-    required this.refreshing,
     required this.onStartDaemon,
     required this.onStopDaemon,
-    required this.onRefresh,
   });
 
   final _NetworkStatus status;
-  final bool loading;
-  final bool daemonAvailable;
   final bool daemonBusy;
+  final bool initialProbePending;
   final bool canControlLocalDaemon;
-  final bool refreshing;
   final Future<void> Function() onStartDaemon;
   final Future<void> Function() onStopDaemon;
-  final Future<void> Function() onRefresh;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final colors = P2WlanColors.of(context);
-    final busy = daemonBusy || refreshing;
 
     final Widget start = FilledButton.icon(
       key: const Key('dashboard-start-button'),
-      onPressed: daemonBusy ? null : onStartDaemon,
+      onPressed: daemonBusy || initialProbePending ? null : onStartDaemon,
       icon: daemonBusy
           ? const _ButtonSpinner()
           : const Icon(Icons.play_arrow_rounded, size: 18),
@@ -64,79 +57,16 @@ class _HomeActions extends StatelessWidget {
       label: Text(daemonBusy ? strings.daemonWorking : strings.stopP2wlan),
     );
 
-    final Widget checkAgain = OutlinedButton.icon(
-      key: const Key('dashboard-check-button'),
-      onPressed: refreshing ? null : onRefresh,
-      icon: refreshing
-          ? const SizedBox.square(
-              dimension: 16,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          : const Icon(Icons.refresh_rounded, size: 17),
-      label: Text(refreshing ? strings.refreshing : strings.checkAgain),
-    );
-
-    final Widget refresh =
-        (status == _NetworkStatus.healthy ||
-            status == _NetworkStatus.degraded ||
-            status == _NetworkStatus.stale)
-        ? TextButton.icon(
-            key: const Key('dashboard-refresh-button'),
-            onPressed: busy ? null : onRefresh,
-            icon: refreshing
-                ? const SizedBox.square(
-                    dimension: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh_rounded, size: 16),
-            label: Text(refreshing ? strings.refreshing : strings.refresh),
-          )
-        : OutlinedButton.icon(
-            key: const Key('dashboard-refresh-button'),
-            onPressed: busy ? null : onRefresh,
-            icon: refreshing
-                ? const SizedBox.square(
-                    dimension: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.refresh_rounded, size: 17),
-            label: Text(refreshing ? strings.refreshing : strings.refresh),
-          );
-
-    final actions = switch (status) {
-      _NetworkStatus.stopped when canControlLocalDaemon => [start, refresh],
-      _NetworkStatus.stopped || _NetworkStatus.unavailable => [checkAgain],
-      // Healthy: the shell already owns refresh; only the red Stop action
-      // remains. Degraded / stale keep an inline refresh because it is a
-      // contextual recovery action there.
-      _NetworkStatus.healthy => [if (canControlLocalDaemon) stop],
-      _ => [if (canControlLocalDaemon) stop, refresh],
+    // Status detection is automatic and intentionally has no foreground
+    // refresh action. Polling may rebuild this widget, but it never turns into
+    // a visible "syncing" task or asks the user to initiate data refresh.
+    return switch (status) {
+      _NetworkStatus.stopped when canControlLocalDaemon => start,
+      _NetworkStatus.healthy ||
+      _NetworkStatus.degraded ||
+      _NetworkStatus.stale when canControlLocalDaemon => stop,
+      _ => const SizedBox.shrink(),
     };
-
-    if (actions.isEmpty) return const SizedBox.shrink();
-
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        if (constraints.maxWidth < 320) {
-          return Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              actions.first,
-              if (actions.length > 1) ...[
-                const SizedBox(height: AppTokens.space8),
-                actions[1],
-              ],
-            ],
-          );
-        }
-        return Wrap(
-          spacing: 10,
-          runSpacing: 8,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: actions,
-        );
-      },
-    );
   }
 }
 

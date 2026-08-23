@@ -71,30 +71,22 @@ class _NetworkHero extends StatelessWidget {
   const _NetworkHero({
     required this.snapshot,
     required this.status,
-    required this.loading,
     required this.counts,
-    required this.daemonAvailable,
     required this.canControlLocalDaemon,
     required this.daemonBusy,
-    required this.refreshing,
+    required this.initialProbePending,
     required this.onStartDaemon,
     required this.onStopDaemon,
-    required this.onRefresh,
   });
 
   final DiagnosticsSnapshot? snapshot;
   final _NetworkStatus status;
-
-  /// First load / recovery in flight: the daemon state is not known yet.
-  final bool loading;
   final _PeerCounts counts;
-  final bool daemonAvailable;
   final bool canControlLocalDaemon;
   final bool daemonBusy;
-  final bool refreshing;
+  final bool initialProbePending;
   final Future<void> Function() onStartDaemon;
   final Future<void> Function() onStopDaemon;
-  final Future<void> Function() onRefresh;
 
   @override
   Widget build(BuildContext context) {
@@ -145,16 +137,7 @@ class _NetworkHero extends StatelessWidget {
     final infoBlock = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (loading) ...[
-          Text(
-            strings.homeLoading,
-            style: TextStyle(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontSize: 13,
-              height: 1.4,
-            ),
-          ),
-        ] else if (hasSnapshot) ...[
+        if (hasSnapshot) ...[
           LayoutBuilder(
             builder: (context, constraints) {
               final virtualIp = _VirtualIpBlock(virtualIp: snapshot!.virtualIp);
@@ -180,7 +163,7 @@ class _NetworkHero extends StatelessWidget {
                   virtualIp,
                   if (status == _NetworkStatus.stale) ...[
                     const SizedBox(height: AppTokens.space14),
-                    _StaleNote(refreshing: refreshing, onRefresh: onRefresh),
+                    const _StaleNote(),
                   ] else ...[
                     const SizedBox(height: AppTokens.space16),
                     _HomeMetrics(counts: counts),
@@ -220,21 +203,16 @@ class _NetworkHero extends StatelessWidget {
 
     final actions = _HomeActions(
       status: status,
-      loading: loading,
-      daemonAvailable: daemonAvailable,
       daemonBusy: daemonBusy,
+      initialProbePending: initialProbePending,
       canControlLocalDaemon: canControlLocalDaemon,
-      refreshing: refreshing,
       onStartDaemon: () => _handleStart(context),
       onStopDaemon: onStopDaemon,
-      onRefresh: onRefresh,
     );
 
     final showActions =
-        !loading &&
-        (status == _NetworkStatus.stopped ||
-            status == _NetworkStatus.unavailable ||
-            hasSnapshot);
+        canControlLocalDaemon &&
+        (status == _NetworkStatus.stopped || hasSnapshot);
 
     return _HeroSurface(
       child: Column(
@@ -387,12 +365,9 @@ class _VirtualIpBlock extends StatelessWidget {
   }
 }
 
-/// Last-known data kept, with an explicit stale note and refresh.
+/// Last-known data kept with an explicit stale note; polling stays automatic.
 class _StaleNote extends StatelessWidget {
-  const _StaleNote({required this.refreshing, required this.onRefresh});
-
-  final bool refreshing;
-  final Future<void> Function() onRefresh;
+  const _StaleNote();
 
   @override
   Widget build(BuildContext context) {
@@ -418,21 +393,6 @@ class _StaleNote extends StatelessWidget {
             fontSize: 12,
             fontWeight: FontWeight.w600,
             height: 1.2,
-          ),
-        ),
-        TextButton.icon(
-          key: const Key('home-stale-refresh'),
-          onPressed: refreshing ? null : onRefresh,
-          icon: refreshing
-              ? const SizedBox.square(
-                  dimension: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.refresh_rounded, size: 16),
-          label: Text(strings.refresh),
-          style: TextButton.styleFrom(
-            visualDensity: VisualDensity.compact,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
           ),
         ),
       ],

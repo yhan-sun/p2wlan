@@ -112,7 +112,7 @@ class _DiagnosticsPageState extends State<DiagnosticsPage> {
         final canLocal =
             _capabilities.canActAsLocalVpnNode &&
             _capabilities.canControlLocalDaemon;
-        final refreshing = statusStore.refreshing;
+        final refreshing = statusStore.refreshActivityVisible;
         return PageScaffold(
           title: strings.troubleshooting,
           subtitle: strings.diagnosticsSubtitle,

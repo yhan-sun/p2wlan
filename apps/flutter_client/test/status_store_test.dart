@@ -10,6 +10,58 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 
 void main() {
+  test('default polling cadence is 1s foreground and 10s background', () {
+    expect(
+      StatusStore.defaultActivePollingInterval,
+      const Duration(seconds: 1),
+    );
+    expect(
+      StatusStore.defaultBackgroundPollingInterval,
+      const Duration(seconds: 10),
+    );
+    expect(
+      StatusStore.defaultRouteVerificationInterval,
+      const Duration(seconds: 10),
+    );
+  });
+
+  test('automatic refresh stays silent while work is in flight', () async {
+    final fixture = await _loadFixture();
+    final health = Completer<void>();
+    final api = _SwitchingDiagnosticsApi(snapshot: fixture, oldHealth: health);
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    final refresh = stores.statusStore.refresh(silent: true);
+    await api.oldHealthStarted.future;
+
+    expect(stores.statusStore.refreshing, isTrue);
+    expect(stores.statusStore.refreshActivityVisible, isFalse);
+
+    health.complete();
+    await refresh;
+    expect(stores.statusStore.refreshing, isFalse);
+    expect(stores.statusStore.refreshActivityVisible, isFalse);
+  });
+
+  test('explicit refresh exposes progress while work is in flight', () async {
+    final fixture = await _loadFixture();
+    final health = Completer<void>();
+    final api = _SwitchingDiagnosticsApi(snapshot: fixture, oldHealth: health);
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    final refresh = stores.statusStore.refresh();
+    await api.oldHealthStarted.future;
+
+    expect(stores.statusStore.refreshing, isTrue);
+    expect(stores.statusStore.refreshActivityVisible, isTrue);
+
+    health.complete();
+    await refresh;
+    expect(stores.statusStore.refreshActivityVisible, isFalse);
+  });
+
   test(
     'refresh discards an old diagnostics URL response and retries the new URL',
     () async {

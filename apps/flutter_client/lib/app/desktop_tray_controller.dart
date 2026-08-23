@@ -300,7 +300,7 @@ class DesktopTrayController with TrayListener, WindowListener {
         ),
         MenuItem(
           label: strings.refreshNow,
-          disabled: busy || statusStore.refreshing,
+          disabled: busy || statusStore.refreshActivityVisible,
           onClick: (_) => unawaited(statusStore.refresh()),
         ),
         MenuItem.submenu(

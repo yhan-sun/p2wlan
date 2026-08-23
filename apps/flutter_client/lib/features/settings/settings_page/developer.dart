@@ -36,7 +36,9 @@ class _DeveloperSection extends StatelessWidget {
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             OutlinedButton.icon(
-              onPressed: statusStore.refreshing ? null : statusStore.refresh,
+              onPressed: statusStore.refreshActivityVisible
+                  ? null
+                  : statusStore.refresh,
               icon: const Icon(Icons.refresh, size: 16),
               label: Text(strings.refreshNow),
             ),

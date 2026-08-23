@@ -30,21 +30,21 @@ void _registerDashboardTests() {
     expect(find.text('Check issues'), findsNothing);
     expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
-    expect(find.byKey(const Key('dashboard-refresh-button')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
     // No snapshot: no data regions at all.
     expect(find.text('Online devices'), findsNothing);
     expect(find.text('Network components'), findsNothing);
   });
 
   testWidgets(
-    'Home leaves initial loading once and stays stopped during later polls',
+    'Home keeps initial and periodic status detection in the background',
     (tester) async {
       final api = _ControllableOfflineDiagnosticsApi();
       final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
       addTearDown(stores.dispose);
 
       final initialHealth = api.pauseNextHealth();
-      final initialRefresh = stores.statusStore.refresh();
+      final initialRefresh = stores.statusStore.refresh(silent: true);
       await tester.pumpWidget(
         _TestApp(
           child: DashboardPage(
@@ -54,25 +54,59 @@ void _registerDashboardTests() {
         ),
       );
 
-      // Before the first probe completes, the endpoint state is genuinely
-      // unknown and the one-time loading copy is appropriate.
-      expect(find.text('Fetching network status…'), findsOneWidget);
-      expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
+      // Detection starts immediately, but it is background state: Home keeps
+      // its stable default and never presents a foreground loading task.
+      expect(stores.statusStore.refreshing, isTrue);
+      expect(stores.statusStore.refreshActivityVisible, isFalse);
+      expect(find.text('Fetching network status…'), findsNothing);
+      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.byKey(const Key('dashboard-start-button')),
+            )
+            .onPressed,
+        isNull,
+      );
 
       initialHealth.complete(false);
       await initialRefresh;
       await tester.pump();
       expect(find.text('P2WLAN is not running'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.byKey(const Key('dashboard-start-button')),
+            )
+            .onPressed,
+        isNotNull,
+      );
 
       // A periodic poll must not send the confirmed stopped UI back to the
       // loading state while its health request is in flight.
       final nextHealth = api.pauseNextHealth();
-      final periodicRefresh = stores.statusStore.refresh();
+      final periodicRefresh = stores.statusStore.refresh(silent: true);
       await tester.pump();
+      expect(stores.statusStore.refreshing, isTrue);
+      expect(stores.statusStore.refreshActivityVisible, isFalse);
       expect(find.text('Fetching network status…'), findsNothing);
       expect(find.text('P2WLAN is not running'), findsOneWidget);
       expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
+      expect(find.text('Refreshing...'), findsNothing);
+      expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
+      expect(find.byKey(const Key('dashboard-check-button')), findsNothing);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expect(
+        tester
+            .widget<FilledButton>(
+              find.byKey(const Key('dashboard-start-button')),
+            )
+            .onPressed,
+        isNotNull,
+      );
 
       nextHealth.complete(false);
       await periodicRefresh;
@@ -125,7 +159,7 @@ void _registerDashboardTests() {
     expect(find.text('10.20.0.11'), findsOneWidget);
     expect(find.text('offline-printer'), findsNothing);
 
-    // Healthy hero: no duplicate inline refresh — the shell owns refresh.
+    // Healthy hero: no duplicate inline refresh; status polling is automatic.
     expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
 
     // Network components: only rows the fixture can judge. The fixture has no
@@ -201,10 +235,11 @@ void _registerDashboardTests() {
     );
     await tester.pump(const Duration(milliseconds: 120));
 
-    // Last-known data kept, stale note shown, refresh available.
+    // Last-known data and its stale note remain while polling retries in the
+    // background; Home does not expose a competing manual refresh task.
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.text('Data may be out of date'), findsOneWidget);
-    expect(find.byKey(const Key('home-stale-refresh')), findsOneWidget);
+    expect(find.byKey(const Key('home-stale-refresh')), findsNothing);
     expect(find.text('Stale'), findsOneWidget);
     // Staleness is not an issue banner.
     expect(find.text('Check issues'), findsNothing);
@@ -242,7 +277,7 @@ void _registerDashboardTests() {
     expect(find.text('Not running'), findsNothing);
     expect(find.text('Unavailable'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
-    expect(find.byKey(const Key('dashboard-check-button')), findsOneWidget);
+    expect(find.byKey(const Key('dashboard-check-button')), findsNothing);
     expect(find.text('Online devices'), findsNothing);
   });
 
@@ -591,7 +626,7 @@ void _registerDashboardTests() {
 
     expect(find.text('10.20.0.10'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
-    // Healthy: refresh stays in the shell; the hero does not repeat it.
+    // Healthy: status polling is automatic; the hero does not add a refresh.
     expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
     expect(tester.takeException(), isNull);
   });

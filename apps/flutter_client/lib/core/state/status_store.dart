@@ -35,8 +35,9 @@ class StatusStore extends ChangeNotifier {
   }
 
   /// A near-real-time view while the app is visible, without a push protocol.
-  static const defaultActivePollingInterval = Duration(seconds: 5);
-  static const defaultBackgroundPollingInterval = Duration(seconds: 60);
+  static const defaultActivePollingInterval = Duration(seconds: 1);
+  static const defaultBackgroundPollingInterval = Duration(seconds: 10);
+  static const defaultRouteVerificationInterval = Duration(seconds: 10);
   static const defaultMaxSnapshotAge = Duration(seconds: 90);
   static const defaultStartupCatalogRefreshTimeout = Duration(seconds: 6);
   static const defaultStartupCatalogRefreshInterval = Duration(
@@ -73,6 +74,7 @@ class StatusStore extends ChangeNotifier {
   var _healthReachable = false;
   var _routeHealthy = false;
   var _refreshing = false;
+  var _showRefreshActivity = false;
   var _daemonBusy = false;
   var _autoRefreshEnabled = false;
   var _appInForeground = true;
@@ -107,6 +109,7 @@ class StatusStore extends ChangeNotifier {
   bool get online => _healthReachable && _snapshot != null;
   bool get statusReachable => _snapshot != null;
   bool get refreshing => _refreshing;
+  bool get refreshActivityVisible => _refreshing && _showRefreshActivity;
   bool get daemonBusy => _daemonBusy;
   bool get autoRefreshEnabled => _autoRefreshEnabled;
   bool get appInForeground => _appInForeground;
@@ -142,14 +145,14 @@ class StatusStore extends ChangeNotifier {
   }) {
     if (_autoRefreshEnabled == enabled) {
       if (enabled && refreshImmediately) {
-        unawaited(refreshUntilPeerCatalogSettled());
+        unawaited(refreshUntilPeerCatalogSettled(silent: true));
       }
       return;
     }
     _autoRefreshEnabled = enabled;
     _schedulePolling();
     if (enabled && refreshImmediately) {
-      unawaited(refreshUntilPeerCatalogSettled());
+      unawaited(refreshUntilPeerCatalogSettled(silent: true));
     }
     notifyListeners();
   }
@@ -160,7 +163,7 @@ class StatusStore extends ChangeNotifier {
     _appInForeground = appInForeground;
     _schedulePolling();
     if (_autoRefreshEnabled && appInForeground) {
-      unawaited(refresh());
+      unawaited(refresh(silent: true));
     }
     notifyListeners();
   }
@@ -172,14 +175,23 @@ class StatusStore extends ChangeNotifier {
     final interval = _appInForeground
         ? autoRefreshInterval
         : backgroundRefreshInterval;
-    _timer = Timer.periodic(interval, (_) => unawaited(refresh()));
+    _timer = Timer.periodic(interval, (_) => unawaited(refresh(silent: true)));
   }
 
-  Future<void> refresh() {
+  /// Refreshes the daemon snapshot. Automatic polling passes [silent] so the
+  /// UI remains stable; an explicit user refresh keeps its progress feedback.
+  Future<void> refresh({bool silent = false}) {
     _refreshPending = true;
     final activeRefresh = _refreshFuture;
-    if (activeRefresh != null) return activeRefresh;
+    if (activeRefresh != null) {
+      if (!silent && !_showRefreshActivity) {
+        _showRefreshActivity = true;
+        notifyListeners();
+      }
+      return activeRefresh;
+    }
 
+    _showRefreshActivity = !silent;
     final completer = Completer<void>();
     _refreshFuture = completer.future;
     unawaited(_runRefreshLoop(completer));
@@ -204,6 +216,7 @@ class StatusStore extends ChangeNotifier {
         _refreshFuture = null;
       }
       _refreshing = false;
+      _showRefreshActivity = false;
       notifyListeners();
     }
   }
@@ -358,9 +371,10 @@ class StatusStore extends ChangeNotifier {
 
   Future<void> refreshUntilPeerCatalogSettled({
     bool skipInitialRefresh = false,
+    bool silent = false,
   }) async {
     if (!skipInitialRefresh) {
-      await refresh();
+      await refresh(silent: silent);
     }
     if (!_shouldSettlePeerCatalog()) return;
 
@@ -378,7 +392,7 @@ class StatusStore extends ChangeNotifier {
         await Future<void>.delayed(Duration.zero);
       }
 
-      await refresh();
+      await refresh(silent: silent);
       refreshCount += 1;
 
       final currentSnapshot = _snapshot;
@@ -570,7 +584,7 @@ class StatusStore extends ChangeNotifier {
     _lastSpeedTestResult = null;
     _lastSpeedTestError = null;
     notifyListeners();
-    unawaited(refresh());
+    unawaited(refresh(silent: true));
   }
 
   @override

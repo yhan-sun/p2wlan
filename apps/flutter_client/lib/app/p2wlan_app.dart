@@ -60,9 +60,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       diagnosticsApi: widget.diagnosticsApi ?? DiagnosticsApi(),
       daemonController: widget.daemonController,
       enableFreshnessTimer: true,
-      autoRefreshInterval: Platform.isWindows
-          ? const Duration(seconds: 8)
-          : StatusStore.defaultActivePollingInterval,
+      autoRefreshInterval: StatusStore.defaultActivePollingInterval,
       startupCatalogRefreshTimeout: Platform.isWindows
           ? StatusStore.defaultWindowsStartupCatalogRefreshTimeout
           : StatusStore.defaultStartupCatalogRefreshTimeout,
@@ -71,7 +69,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
           : StatusStore.defaultStartupCatalogRefreshInterval,
       routeVerificationInterval: Platform.isWindows
           ? StatusStore.defaultWindowsRouteVerificationInterval
-          : Duration.zero,
+          : StatusStore.defaultRouteVerificationInterval,
     );
     WidgetsBinding.instance.addObserver(this);
     _bootstrap();
@@ -112,7 +110,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     if (widget.autoStartPolling && canPollLocalDaemon) {
       _statusStore.startPolling();
     } else if (widget.initialRefresh && canPollLocalDaemon) {
-      unawaited(_statusStore.refreshUntilPeerCatalogSettled());
+      unawaited(_statusStore.refreshUntilPeerCatalogSettled(silent: true));
     }
   }
 

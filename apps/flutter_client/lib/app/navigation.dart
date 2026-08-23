@@ -391,7 +391,7 @@ class _MobileShellMenu extends StatelessWidget {
         PopupMenuItem(
           value: _MobileMenuAction.refresh,
           height: 44,
-          enabled: !statusStore.refreshing,
+          enabled: !statusStore.refreshActivityVisible,
           child: Row(
             children: [
               Icon(
@@ -451,8 +451,10 @@ class _ShellStatusActions extends StatelessWidget {
               ),
             IconButton(
               tooltip: strings.refresh,
-              onPressed: statusStore.refreshing ? null : statusStore.refresh,
-              icon: statusStore.refreshing
+              onPressed: statusStore.refreshActivityVisible
+                  ? null
+                  : statusStore.refresh,
+              icon: statusStore.refreshActivityVisible
                   ? SizedBox.square(
                       dimension: 16,
                       child: CircularProgressIndicator(

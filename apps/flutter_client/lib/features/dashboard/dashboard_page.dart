@@ -69,12 +69,8 @@ class DashboardPage extends StatelessWidget {
         );
         final daemonAvailable =
             statusStore.daemonReachable || statusStore.statusReachable;
-        final awaitingInitialProbe = statusStore.lastFetchedAt == null;
-        final loading =
-            snapshot == null &&
-            !daemonAvailable &&
-            awaitingInitialProbe &&
-            (statusStore.refreshing || statusStore.daemonBusy);
+        final initialProbePending =
+            statusStore.lastFetchedAt == null && statusStore.refreshing;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);
         final overviewPeers = _topOverviewPeers(peers);
@@ -105,15 +101,12 @@ class DashboardPage extends StatelessWidget {
               _NetworkHero(
                 snapshot: snapshot,
                 status: status,
-                loading: loading,
                 counts: counts,
-                daemonAvailable: daemonAvailable,
                 canControlLocalDaemon: capabilities.canControlLocalDaemon,
                 daemonBusy: statusStore.daemonBusy,
-                refreshing: statusStore.refreshing,
+                initialProbePending: initialProbePending,
                 onStartDaemon: statusStore.startDaemon,
                 onStopDaemon: statusStore.stopDaemon,
-                onRefresh: statusStore.refresh,
               )
             else
               _RemoteOnlyHero(onOpenDevices: onOpenDevices),
