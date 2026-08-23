@@ -12,6 +12,7 @@ pub(super) async fn poll_peers(
             "{base_url}/api/v1/nodes?network_id={}",
             config.network.network_id
         ))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
         .bearer_auth(token)
         .send()
         .await
@@ -138,6 +139,7 @@ pub(super) async fn create_tunnel(
 ) -> Result<(String, String)> {
     let res = http
         .post(format!("{base_url}/api/v1/tunnels"))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
         .bearer_auth(token)
         .json(&serde_json::json!({
             "device_id": device_id,

@@ -17,6 +17,7 @@ pub(super) async fn register_device(
 ) -> Result<(String, String, String, Vec<String>, Vec<RelayCatalogEntry>)> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
         .bearer_auth(token)
         .json(&register_device_payload(config))
         .send()
@@ -103,6 +104,7 @@ pub(super) async fn update_endpoint(
 ) -> Result<()> {
     let res = http
         .patch(format!("{base_url}/api/v1/devices/{device_id}/endpoint"))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
         .bearer_auth(token)
         .json(&serde_json::json!({
             "endpoint": endpoint,

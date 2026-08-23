@@ -179,6 +179,7 @@ pub(super) async fn poll_signals(
         .get(format!(
             "{base_url}/api/v1/signals?node_id={self_node_id}&wait_ms={wait_ms}&ack=1"
         ))
+        .timeout(signal_poll_timeout(wait_ms))
         .bearer_auth(token)
         .send()
         .await

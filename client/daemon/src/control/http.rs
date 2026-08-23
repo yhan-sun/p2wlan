@@ -29,10 +29,18 @@ use super::{
 static LAST_CANDIDATE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const SIGNAL_REST_PROTOCOL_VERSION: u8 = 1;
+/// Bound ordinary control-plane requests so a route change or a dead socket
+/// cannot stall the single control loop past the device lease TTL.  Signal
+/// long-polling adds its server wait interval to this budget below.
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// A responder answer must not be held behind a wedged HTTP request for most
 /// of its short receive-only key lifetime. Delivery remains ambiguous on
 /// timeout, so the daemon retains staged state for authenticated confirmation.
 const SIGNAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn signal_poll_timeout(wait_ms: u64) -> Duration {
+    CONTROL_REQUEST_TIMEOUT.saturating_add(Duration::from_millis(wait_ms))
+}
 
 include!("http/auth.rs");
 include!("http/device.rs");
@@ -43,6 +51,13 @@ include!("proxy.rs");
 #[cfg(test)]
 mod signal_send_timeout_tests {
     use super::*;
+
+    #[test]
+    fn ordinary_control_requests_are_bounded() {
+        assert_eq!(CONTROL_REQUEST_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(signal_poll_timeout(0), Duration::from_secs(10));
+        assert_eq!(signal_poll_timeout(30_000), Duration::from_secs(40));
+    }
 
     #[test]
     fn signal_send_timeout_is_bounded() {

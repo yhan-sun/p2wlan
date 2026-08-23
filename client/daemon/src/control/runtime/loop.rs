@@ -314,6 +314,7 @@ async fn run_control_loop(
         signal_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut poll_failures: u32 = 0;
         let mut signal_failures: u32 = 0;
+        let mut heartbeat_failures: u32 = 0;
         let mut advertised_endpoint = String::new();
         let mut advertised_nat_type = "unknown".to_string();
         loop {
@@ -334,8 +335,45 @@ async fn run_control_loop(
                         .await
                     }
                     .await;
-                    if let Err(err) = heartbeat_result {
-                        warn!("Device lease refresh failed: {err}");
+                    match heartbeat_result {
+                        Ok(()) => {
+                            if heartbeat_failures > 0 {
+                                info!(
+                                    "Device lease refresh recovered after {} failures",
+                                    heartbeat_failures
+                                );
+                            }
+                            heartbeat_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_control_success().await;
+                            }
+                            let _ = event_tx.send(ControlEvent::ControlHealthy);
+                        }
+                        Err(err) => {
+                            heartbeat_failures = heartbeat_failures.saturating_add(1);
+                            let err_str = err.to_string();
+                            warn!(
+                                "Device lease refresh failed (attempt {heartbeat_failures}): {err_str}"
+                            );
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_connected(false);
+                            }
+                            let _ = event_tx.send(ControlEvent::Disconnected);
+
+                            // The server uses the endpoint PATCH as the device
+                            // lease heartbeat. Merely continuing to poll the
+                            // node list can therefore leave this process looking
+                            // healthy locally while the server marks it offline
+                            // and the relay drops its registration. Re-register
+                            // after a short bounded run of failures so the
+                            // server-issued node/session is refreshed.
+                            if is_permanent_auth_error(&err_str) || heartbeat_failures >= 3 {
+                                warn!(
+                                    "Device lease refresh failed {heartbeat_failures} times; re-registering with control plane"
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
                 _ = peer_roster_tick.tick() => {

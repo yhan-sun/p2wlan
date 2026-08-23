@@ -27,6 +27,11 @@ class P2wlanVpnService : VpnService() {
         private const val TAG = "P2wlanVpnService"
         private const val CHANNEL_ID = "p2wlan_vpn"
         private const val NOTIFICATION_ID = 39277
+        private const val STATE_PREFERENCES = "p2wlan_vpn_state"
+        private const val STATE_START_REQUEST = "start_request_json"
+        private const val RESTART_INITIAL_DELAY_MS = 1_000L
+        private const val RESTART_MAX_DELAY_MS = 60_000L
+        private const val MAX_AUTOMATIC_RESTARTS = 8
         const val ACTION_START = "com.example.p2wlan_flutter_client.action.START"
         const val ACTION_STOP = "com.example.p2wlan_flutter_client.action.STOP"
         const val EXTRA_REQUEST_JSON = "request_json"
@@ -51,30 +56,47 @@ class P2wlanVpnService : VpnService() {
     @Volatile
     private var monitorGeneration = 0L
     private var monitorThread: Thread? = null
+    private var lastRequestJson: String? = null
+    private var restartRunnable: Runnable? = null
+    private var restartAttempts = 0
+    @Volatile
+    private var explicitStop = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            explicitStop = true
             stopVpn()
             return START_NOT_STICKY
         }
 
+        explicitStop = false
         val requestJson = intent?.getStringExtra(EXTRA_REQUEST_JSON)
+            ?.takeIf { it.isNotBlank() }
+            ?: loadPersistedStartRequest()
         if (requestJson.isNullOrBlank()) {
             Log.e(TAG, "VPN start request is empty")
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        lastRequestJson = requestJson
+        persistStartRequest(requestJson)
         if (!isRunning()) {
             startVpn(requestJson)
         }
-        return START_NOT_STICKY
+        // Android may recreate a foreground service after the process is
+        // reclaimed. Returning START_STICKY lets the service come back and
+        // the private persisted request above supplies the missing Intent.
+        return START_STICKY
     }
 
     private fun startVpn(requestJson: String) {
         var detachedFd = -1
         try {
             stopMonitor()
+            cancelAutomaticRestart()
             serviceError = null
+            lastRequestJson = requestJson
+            persistStartRequest(requestJson)
             createNotificationChannel()
             val notification = buildNotification()
             if (Build.VERSION.SDK_INT >= 34) {
@@ -118,6 +140,7 @@ class P2wlanVpnService : VpnService() {
                 throw IllegalStateException(nativeError)
             }
             serviceRunning = true
+            restartAttempts = 0
             startNativeMonitor()
             Log.i(TAG, "P2WLAN Android VPN started")
         } catch (error: Throwable) {
@@ -128,12 +151,20 @@ class P2wlanVpnService : VpnService() {
             vpnInterface?.close()
             vpnInterface = null
             serviceRunning = false
+            if (!explicitStop && scheduleAutomaticRestart(requestJson)) {
+                return
+            }
             stopForeground(true)
             stopSelf()
         }
     }
 
     private fun stopVpn() {
+        explicitStop = true
+        lastRequestJson = null
+        restartAttempts = 0
+        cancelAutomaticRestart()
+        clearPersistedStartRequest()
         serviceRunning = false
         stopMonitor()
         try {
@@ -156,6 +187,7 @@ class P2wlanVpnService : VpnService() {
 
     override fun onDestroy() {
         serviceRunning = false
+        cancelAutomaticRestart()
         stopMonitor()
         if (P2wlanNative.isRunning()) {
             P2wlanNative.stop()
@@ -192,6 +224,10 @@ class P2wlanVpnService : VpnService() {
                 serviceError = error
                 serviceRunning = false
                 Log.e(TAG, error)
+                val requestJson = lastRequestJson
+                if (!explicitStop && requestJson != null && scheduleAutomaticRestart(requestJson)) {
+                    return@post
+                }
                 stopForeground(true)
                 stopSelf()
             }
@@ -204,6 +240,58 @@ class P2wlanVpnService : VpnService() {
         monitorGeneration += 1
         monitorThread?.interrupt()
         monitorThread = null
+    }
+
+    /**
+     * Keep an unexpected Rust/VPN exit recoverable.  This is deliberately
+     * bounded and backoff-based: a transient control/relay failure gets a new
+     * TUN and registration, while a persistent bad token does not create a
+     * tight foreground-service restart loop.
+     */
+    private fun scheduleAutomaticRestart(requestJson: String): Boolean {
+        if (explicitStop || restartRunnable != null) return true
+        if (restartAttempts >= MAX_AUTOMATIC_RESTARTS) {
+            serviceError = "Android VPN 自动重启次数已达上限，请重新点击启动。"
+            Log.e(TAG, serviceError ?: "Android VPN automatic restart limit reached")
+            return false
+        }
+
+        restartAttempts += 1
+        val exponent = (restartAttempts - 1).coerceIn(0, 6)
+        val delayMs = (RESTART_INITIAL_DELAY_MS * (1L shl exponent))
+            .coerceAtMost(RESTART_MAX_DELAY_MS)
+        val restart = Runnable {
+            restartRunnable = null
+            if (explicitStop || isRunning()) return@Runnable
+            startVpn(requestJson)
+        }
+        restartRunnable = restart
+        Log.w(
+            TAG,
+            "Android VPN/native daemon exited; retrying in ${delayMs}ms " +
+                "(attempt $restartAttempts/$MAX_AUTOMATIC_RESTARTS)",
+        )
+        mainHandler.postDelayed(restart, delayMs)
+        return true
+    }
+
+    private fun cancelAutomaticRestart() {
+        restartRunnable?.let(mainHandler::removeCallbacks)
+        restartRunnable = null
+    }
+
+    private fun statePreferences() = getSharedPreferences(STATE_PREFERENCES, Context.MODE_PRIVATE)
+
+    private fun persistStartRequest(requestJson: String) {
+        statePreferences().edit().putString(STATE_START_REQUEST, requestJson).apply()
+    }
+
+    private fun loadPersistedStartRequest(): String? {
+        return statePreferences().getString(STATE_START_REQUEST, null)
+    }
+
+    private fun clearPersistedStartRequest() {
+        statePreferences().edit().remove(STATE_START_REQUEST).apply()
     }
 
     private fun enrichRequest(request: JSONObject): JSONObject {

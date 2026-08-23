@@ -9,6 +9,7 @@ pub(super) async fn obtain_device_credential(
     // Step 1: Request a challenge
     let challenge_resp = http
         .post(format!("{base_url}/api/v1/challenges"))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
         .bearer_auth(user_token)
         .json(&serde_json::json!({
             "device_id": device_id,
@@ -60,6 +61,7 @@ pub(super) async fn obtain_device_credential(
     // Step 3: Submit the signed challenge to get a device credential
     let cred_resp = http
         .post(format!("{base_url}/api/v1/devices/credential"))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
         .bearer_auth(user_token)
         .json(&serde_json::json!({
             "device_id": device_id,
@@ -118,6 +120,7 @@ pub(super) async fn fetch_relay_ticket_http(
 ) -> Result<FetchRelayTicketResponse> {
     let resp = http
         .post(format!("{base_url}/api/v1/relay/tickets"))
+        .timeout(CONTROL_REQUEST_TIMEOUT)
         .bearer_auth(token)
         .json(&serde_json::json!({
             "audience": audience,
