@@ -267,8 +267,9 @@ class _P2WlanShellState extends State<P2WlanShell> {
   }
 
   void _handleSystemBack() {
-    // Settings categories are in-place details, so they unwind before the
-    // shell moves between primary sections.
+    // Medium-width Settings categories are in-place details, so they unwind
+    // before the shell moves between primary sections. Compact mobile
+    // categories are real routes and are popped by Navigator first.
     if (_section == P2WlanSection.settings &&
         _settingsController.maybeGoBack()) {
       return;

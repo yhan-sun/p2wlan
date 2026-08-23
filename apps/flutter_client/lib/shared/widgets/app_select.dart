@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../../app/app_tokens.dart';
@@ -15,9 +16,10 @@ class AppSelectOption<T> {
 
 /// P2WLAN's consistent select control.
 ///
-/// This replaces the stock dropdown with a product-owned trigger and popup
-/// surface. The popup route closes before [onChanged] runs, which also makes
-/// immediate theme and language changes safe and visually deterministic.
+/// This replaces the stock dropdown with a product-owned trigger, a compact
+/// desktop popover, and a touch-friendly mobile bottom sheet. The selection
+/// route closes before [onChanged] runs, which also makes immediate theme and
+/// language changes safe and visually deterministic.
 class AppSelect<T> extends StatelessWidget {
   const AppSelect({
     super.key,
@@ -27,6 +29,7 @@ class AppSelect<T> extends StatelessWidget {
     this.expanded = false,
     this.width = 208,
     this.tooltip,
+    this.menuTitle,
   });
 
   final T value;
@@ -35,6 +38,7 @@ class AppSelect<T> extends StatelessWidget {
   final bool expanded;
   final double width;
   final String? tooltip;
+  final String? menuTitle;
 
   @override
   Widget build(BuildContext context) {
@@ -139,6 +143,44 @@ class AppSelect<T> extends StatelessWidget {
     required BuildContext anchorContext,
     required P2WlanColors colors,
   }) async {
+    final nextValue = _usesMobileSheet(context)
+        ? await _openMobileSheet(context)
+        : await _openPopover(
+            context: context,
+            anchorContext: anchorContext,
+            colors: colors,
+          );
+    if (nextValue != null && nextValue != value) onChanged?.call(nextValue);
+  }
+
+  bool _usesMobileSheet(BuildContext context) {
+    if (kIsWeb || MediaQuery.sizeOf(context).width >= 720) return false;
+    return switch (defaultTargetPlatform) {
+      TargetPlatform.android ||
+      TargetPlatform.iOS ||
+      TargetPlatform.fuchsia => true,
+      _ => false,
+    };
+  }
+
+  Future<T?> _openMobileSheet(BuildContext context) {
+    return showModalBottomSheet<T>(
+      context: context,
+      useRootNavigator: true,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.52),
+      builder: (sheetContext) =>
+          _AppSelectSheet<T>(title: menuTitle, value: value, options: options),
+    );
+  }
+
+  Future<T?> _openPopover({
+    required BuildContext context,
+    required BuildContext anchorContext,
+    required P2WlanColors colors,
+  }) async {
     final anchor = anchorContext.findRenderObject() as RenderBox?;
     final overlay =
         Navigator.of(
@@ -150,7 +192,7 @@ class AppSelect<T> extends StatelessWidget {
         overlay == null ||
         !anchor.hasSize ||
         !overlay.hasSize) {
-      return;
+      return null;
     }
 
     final anchorTopLeft = anchor.localToGlobal(Offset.zero, ancestor: overlay);
@@ -160,7 +202,7 @@ class AppSelect<T> extends StatelessWidget {
       Offset.zero & overlay.size,
     );
 
-    final nextValue = await showMenu<T>(
+    return showMenu<T>(
       context: context,
       useRootNavigator: true,
       position: position,
@@ -169,9 +211,13 @@ class AppSelect<T> extends StatelessWidget {
       surfaceTintColor: Colors.transparent,
       shadowColor: const Color(0x240F172A),
       elevation: 10,
-      constraints: BoxConstraints.tightFor(width: anchor.size.width),
+      menuPadding: const EdgeInsets.all(AppTokens.space6),
+      clipBehavior: Clip.antiAlias,
+      constraints: BoxConstraints.tightFor(
+        width: anchor.size.width < 220 ? 220 : anchor.size.width,
+      ),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
         side: BorderSide(color: colors.border),
       ),
       items: [
@@ -179,17 +225,20 @@ class AppSelect<T> extends StatelessWidget {
           PopupMenuItem<T>(
             key: ValueKey<Object>(('app-select-option', option.value)),
             value: option.value,
-            height: 42,
+            height: 48,
             padding: EdgeInsets.zero,
             mouseCursor: SystemMouseCursors.click,
             child: Container(
-              height: 42,
+              height: 44,
               padding: const EdgeInsets.symmetric(
                 horizontal: AppTokens.space12,
               ),
-              color: option.value == value
-                  ? colors.selectedSurface
-                  : Colors.transparent,
+              decoration: BoxDecoration(
+                color: option.value == value
+                    ? colors.selectedSurface
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
               child: Row(
                 children: [
                   if (option.icon != null) ...[
@@ -226,6 +275,210 @@ class AppSelect<T> extends StatelessWidget {
           ),
       ],
     );
-    if (nextValue != null && nextValue != value) onChanged?.call(nextValue);
+  }
+}
+
+class _AppSelectSheet<T> extends StatelessWidget {
+  const _AppSelectSheet({
+    required this.title,
+    required this.value,
+    required this.options,
+  });
+
+  final String? title;
+  final T value;
+  final List<AppSelectOption<T>> options;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
+    final media = MediaQuery.of(context);
+    return Container(
+      key: const Key('app-select-mobile-sheet'),
+      constraints: BoxConstraints(maxHeight: media.size.height * 0.72),
+      decoration: BoxDecoration(
+        color: colors.surfaceElevated,
+        borderRadius: const BorderRadius.vertical(
+          top: Radius.circular(AppTokens.radiusLg * 1.5),
+        ),
+        border: Border(top: BorderSide(color: colors.border)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x33000000),
+            blurRadius: 28,
+            offset: Offset(0, -8),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: AppTokens.space10),
+          Container(
+            width: 38,
+            height: 4,
+            decoration: BoxDecoration(
+              color: colors.borderStrong,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          if (title != null && title!.trim().isNotEmpty) ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(
+                AppTokens.space20,
+                AppTokens.space14,
+                AppTokens.space8,
+                AppTokens.space8,
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      title!,
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    key: const Key('app-select-sheet-close'),
+                    tooltip: MaterialLocalizations.of(
+                      context,
+                    ).closeButtonTooltip,
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close_rounded),
+                  ),
+                ],
+              ),
+            ),
+            Divider(height: 1, color: colors.divider),
+          ] else
+            const SizedBox(height: AppTokens.space10),
+          Flexible(
+            child: ListView.separated(
+              shrinkWrap: true,
+              padding: const EdgeInsets.fromLTRB(
+                AppTokens.space12,
+                AppTokens.space8,
+                AppTokens.space12,
+                AppTokens.space16,
+              ),
+              itemCount: options.length,
+              separatorBuilder: (_, _) =>
+                  const SizedBox(height: AppTokens.space6),
+              itemBuilder: (context, index) {
+                final option = options[index];
+                final selected = option.value == value;
+                return Semantics(
+                  selected: selected,
+                  button: true,
+                  child: Material(
+                    color: selected
+                        ? colors.selectedSurface
+                        : Colors.transparent,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                      side: BorderSide(
+                        color: selected
+                            ? theme.colorScheme.primary.withValues(alpha: 0.28)
+                            : colors.border,
+                      ),
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: InkWell(
+                      key: ValueKey<Object>((
+                        'app-select-option',
+                        option.value,
+                      )),
+                      onTap: () => Navigator.of(context).pop(option.value),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(minHeight: 54),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: AppTokens.space14,
+                            vertical: AppTokens.space10,
+                          ),
+                          child: Row(
+                            children: [
+                              if (option.icon != null) ...[
+                                Container(
+                                  width: 34,
+                                  height: 34,
+                                  alignment: Alignment.center,
+                                  decoration: BoxDecoration(
+                                    color: selected
+                                        ? theme.colorScheme.primary.withValues(
+                                            alpha: 0.10,
+                                          )
+                                        : colors.surfaceMuted,
+                                    borderRadius: BorderRadius.circular(
+                                      AppTokens.radiusSm,
+                                    ),
+                                  ),
+                                  child: Icon(
+                                    option.icon,
+                                    size: 18,
+                                    color: selected
+                                        ? theme.colorScheme.primary
+                                        : colors.textSecondary,
+                                  ),
+                                ),
+                                const SizedBox(width: AppTokens.space12),
+                              ],
+                              Expanded(
+                                child: Text(
+                                  option.label,
+                                  style: TextStyle(
+                                    color: selected
+                                        ? theme.colorScheme.primary
+                                        : colors.textPrimary,
+                                    fontSize: 15,
+                                    fontWeight: selected
+                                        ? FontWeight.w700
+                                        : FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: AppTokens.space12),
+                              AnimatedContainer(
+                                duration: AppTokens.durationFast,
+                                width: 24,
+                                height: 24,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  color: selected
+                                      ? theme.colorScheme.primary
+                                      : Colors.transparent,
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: selected
+                                        ? theme.colorScheme.primary
+                                        : colors.borderStrong,
+                                  ),
+                                ),
+                                child: selected
+                                    ? Icon(
+                                        Icons.check_rounded,
+                                        size: 16,
+                                        color: theme.colorScheme.onPrimary,
+                                      )
+                                    : null,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }

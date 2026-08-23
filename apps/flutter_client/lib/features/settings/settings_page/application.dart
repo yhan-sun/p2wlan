@@ -21,6 +21,7 @@ class _ApplicationSection extends StatelessWidget {
             expanded: MediaQuery.sizeOf(context).width < 520,
             width: 248,
             key: const ValueKey('settings-close-behavior-select'),
+            menuTitle: strings.closeBehavior,
             value: state._closeBehavior,
             options: [
               AppSelectOption(

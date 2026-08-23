@@ -216,7 +216,14 @@ void _registerPhase7Tests() {
       await tester.pump();
       expect(find.text('Unsaved changes'), findsOneWidget);
 
-      // Tap Home in bottom nav.
+      // A compact category is a real secondary route, so parent navigation is
+      // intentionally covered. Back preserves the draft and reveals the
+      // Settings root before a primary destination can be selected.
+      expect(find.byType(NavigationBar), findsNothing);
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+
+      // Tap Home in the now-visible bottom navigation.
       final homeBottom = find.descendant(
         of: find.byType(NavigationBar),
         matching: find.text('Home'),
@@ -252,6 +259,12 @@ void _registerPhase7Tests() {
         );
         await tester.pump();
         expect(find.text('Unsaved changes'), findsOneWidget);
+
+        // The category route covers parent chrome. Return to the Settings root
+        // first; the dirty draft and shell-level leave guard remain active.
+        expect(find.byIcon(Icons.more_horiz_rounded), findsNothing);
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
 
         // Open the mobile overflow menu and tap Troubleshooting.
         await tester.tap(find.byIcon(Icons.more_horiz_rounded));

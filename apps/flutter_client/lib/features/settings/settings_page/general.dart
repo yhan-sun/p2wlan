@@ -28,6 +28,7 @@ class _GeneralSection extends StatelessWidget {
           trailing: AppSelect<String>(
             expanded: MediaQuery.sizeOf(context).width < 520,
             key: const ValueKey('settings-language-select'),
+            menuTitle: strings.language,
             value: AppLanguage.fromCode(languageCode).code,
             options: [
               for (final language in AppLanguage.values)
@@ -45,6 +46,7 @@ class _GeneralSection extends StatelessWidget {
           trailing: AppSelect<String>(
             expanded: MediaQuery.sizeOf(context).width < 520,
             key: const ValueKey('settings-theme-select'),
+            menuTitle: strings.themeMode,
             value: AppThemeMode.fromCode(themeCode).code,
             options: [
               AppSelectOption(

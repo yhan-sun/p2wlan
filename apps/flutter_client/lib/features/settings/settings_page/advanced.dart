@@ -65,6 +65,7 @@ class _AdvancedNetworkSection extends StatelessWidget {
           trailing: AppSelect<String>(
             expanded: MediaQuery.sizeOf(context).width < 520,
             key: const ValueKey('settings-socket-pool-select'),
+            menuTitle: strings.socketPool,
             value: state._socketPool,
             options: const [
               AppSelectOption(value: 'off', label: 'off'),

@@ -159,51 +159,88 @@ void _registerSettingsPhase6Tests() {
     }
   });
 
-  testWidgets('mobile: returning from detail keeps Settings selected', (
+  testWidgets('android: Settings detail is full-screen and back unwinds', (
     tester,
   ) async {
     final stores = await _pumpSettingsShell(
       tester,
-      const Size(390, 844),
+      const Size(360, 800),
       capabilities: PlatformCapabilities.fromPlatform('android'),
+      dark: true,
     );
     addTearDown(stores.dispose);
 
-    // Exactly three bottom destinations, Settings selected.
-    expect(
-      find.descendant(
-        of: find.byType(NavigationBar),
-        matching: find.byType(NavigationDestination),
-      ),
-      findsNWidgets(3),
-    );
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      // The settings root is a primary destination with the normal shell.
+      expect(find.byType(NavigationBar), findsOneWidget);
+      expect(find.text('General'), findsOneWidget);
 
-    // Open Settings from the bottom bar, then open a category detail.
-    await tester.tap(
-      find.descendant(
-        of: find.byType(NavigationBar),
-        matching: find.text('Settings'),
-      ),
-    );
-    await tester.pumpAndSettle();
-    expect(find.text('General'), findsOneWidget);
-    await tester.tap(find.text('Account & Network'));
-    await tester.pumpAndSettle();
-    expect(find.text('Control server'), findsOneWidget);
+      await tester.tap(find.text('General'));
+      await tester.pumpAndSettle();
 
-    // Back returns to the settings root with Settings still the active tab.
-    await tester.tap(find.byIcon(Icons.arrow_back_rounded));
-    await tester.pumpAndSettle();
-    expect(find.text('General'), findsOneWidget);
-    expect(find.text('Control server'), findsNothing);
-    expect(
-      find.descendant(
-        of: find.byType(NavigationBar),
-        matching: find.byType(NavigationDestination),
-      ),
-      findsNWidgets(3),
-    );
-    expect(tester.takeException(), isNull);
+      // A real route covers both pieces of parent chrome from the screenshot:
+      // the shell app bar/overflow and the persistent bottom navigation.
+      expect(
+        find.byKey(const Key('settings-mobile-category-page')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const Key('settings-mobile-category-app-bar')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const Key('settings-mobile-category-back')),
+        findsOneWidget,
+      );
+      expect(find.byType(NavigationBar), findsNothing);
+      expect(find.byIcon(Icons.more_horiz_rounded), findsNothing);
+      expect(find.text('Device name'), findsOneWidget);
+
+      // Select controls use the mobile product sheet, not a stock popup.
+      final languageSelect = find.byKey(
+        const ValueKey('settings-language-select'),
+      );
+      expect(MediaQuery.sizeOf(tester.element(languageSelect)).width, 360);
+      expect(defaultTargetPlatform, TargetPlatform.android);
+      await _openAppSelect(tester, const ValueKey('settings-language-select'));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('app-select-mobile-sheet')),
+          matching: find.text('Language'),
+        ),
+        findsOneWidget,
+      );
+
+      // Back closes exactly one layer at a time: selector, category, Settings.
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsNothing);
+      expect(
+        find.byKey(const Key('settings-mobile-category-page')),
+        findsOneWidget,
+      );
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const Key('settings-mobile-category-page')),
+        findsNothing,
+      );
+      expect(find.byType(SettingsPage), findsOneWidget);
+      expect(find.byType(NavigationBar), findsOneWidget);
+      expect(find.text('General'), findsOneWidget);
+
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.byType(DashboardPage), findsOneWidget);
+      expect(find.byType(P2WlanShell), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 
   testWidgets('dirty detection: device name change shows Save, resets after', (
@@ -641,15 +678,20 @@ Future<_Stores> _pumpSettingsShell(
   Size size, {
   PlatformCapabilities? capabilities,
   double textScale = 1.0,
+  bool dark = false,
 }) async {
   // Reset the element tree so a previous pump's shell state (section /
   // selected category) does not leak into this new shell instance.
   await tester.pumpWidget(const SizedBox.shrink());
+  tester.view.physicalSize = size;
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
   await tester.binding.setSurfaceSize(size);
   addTearDown(() => tester.binding.setSurfaceSize(null));
 
   final caps = capabilities ?? PlatformCapabilities.fromPlatform('macos');
-  final isMobilePlatform = !caps.canControlLocalDaemon;
+  final isMobilePlatform = !caps.canUseSystemTray;
   if (isMobilePlatform) {
     // Infer android vs iOS from the size — android tests use 360 width,
     // iOS tests use 390 width. Both produce identical capabilities, so
@@ -671,12 +713,17 @@ Future<_Stores> _pumpSettingsShell(
     capabilities: caps,
   );
   if (textScale != 1.0) {
-    shell = MediaQuery(
-      data: MediaQueryData(textScaler: TextScaler.linear(textScale)),
-      child: shell,
+    final unscaledShell = shell;
+    shell = Builder(
+      builder: (context) => MediaQuery(
+        data: MediaQuery.of(
+          context,
+        ).copyWith(textScaler: TextScaler.linear(textScale)),
+        child: unscaledShell,
+      ),
     );
   }
-  await tester.pumpWidget(_DesignSystemHost(dark: false, child: shell));
+  await tester.pumpWidget(_DesignSystemHost(dark: dark, child: shell));
   await tester.pumpAndSettle();
   // Navigate to Settings (sidebar on expanded, rail on medium, bottom bar
   // on compact mobile).

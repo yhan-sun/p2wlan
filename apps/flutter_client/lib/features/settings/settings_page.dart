@@ -24,12 +24,13 @@ part 'settings_page/advanced.dart';
 part 'settings_page/developer.dart';
 part 'settings_page/actions.dart';
 
-/// Lets the app shell unwind Settings' in-place root/detail navigation before
-/// handling a system back gesture as product-level navigation.
+/// Lets the app shell unwind Settings' medium-width in-place root/detail
+/// navigation before handling a system back gesture as product-level
+/// navigation.
 ///
-/// Settings intentionally does not push a second Navigator route because its
-/// unsaved drafts belong to the same page state. The controller provides the
-/// equivalent back-stack contract without exposing that private state.
+/// Compact mobile details use a real Navigator route and therefore unwind
+/// natively before this controller is consulted. Unsaved drafts remain owned
+/// by the still-mounted Settings page state behind that route.
 class SettingsPageController {
   bool Function()? _backHandler;
 
@@ -110,7 +111,12 @@ class _SettingsPageState extends State<SettingsPage> {
   var _uploadingLogs = false;
   String? _logUploadError;
 
-  /// Currently open category in the medium/compact root-detail layout.
+  /// Rebuilds a full-screen mobile category route when draft-only state
+  /// changes. Settings/status stores and text controllers have their own
+  /// listenables; toggles and async busy/error state flow through this one.
+  final _detailViewNotifier = ValueNotifier<int>(0);
+
+  /// Currently open category in the medium-width root-detail layout.
   /// Null = the settings root. In the desktop rail layout it always maps to a
   /// concrete category (defaulting to the first visible one). Not persisted.
   SettingsCategory? _selectedCategory;
@@ -120,7 +126,11 @@ class _SettingsPageState extends State<SettingsPage> {
   /// a pushed detail page.
   var _lastLayoutWidth = double.infinity;
 
-  void _updateState(VoidCallback fn) => setState(fn);
+  void _updateState(VoidCallback fn) {
+    if (!mounted) return;
+    setState(fn);
+    _detailViewNotifier.value += 1;
+  }
 
   @override
   void initState() {
@@ -195,7 +205,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void _onDraftChanged() {
     if (!mounted) return;
     _notifyDirty();
-    setState(() {});
+    _updateState(() {});
   }
 
   bool _lastNotifiedDirty = false;
@@ -249,6 +259,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _udpBindController.dispose();
     _udpAdvertiseController.dispose();
     _relayServersController.dispose();
+    _detailViewNotifier.dispose();
     super.dispose();
   }
 
@@ -258,8 +269,21 @@ class _SettingsPageState extends State<SettingsPage> {
         _selectedCategory == null) {
       return false;
     }
-    setState(() => _selectedCategory = null);
+    _updateState(() => _selectedCategory = null);
     return true;
+  }
+
+  Future<void> _openMobileCategory(SettingsCategory category) async {
+    await Navigator.of(context, rootNavigator: true).push<void>(
+      MaterialPageRoute<void>(
+        settings: RouteSettings(name: '/settings/${category.name}'),
+        builder: (_) =>
+            _MobileSettingsCategoryPage(category: category, state: this),
+      ),
+    );
+    // The route edits the same controllers/state as this page. Refresh the
+    // root summaries after returning without manufacturing an in-page detail.
+    if (mounted) _updateState(() {});
   }
 
   /// Describes credential state for display without ever revealing the token.
@@ -379,8 +403,14 @@ class _SettingsPageState extends State<SettingsPage> {
                       layout: layout,
                       categories: categories,
                       selected: selected,
-                      onSelect: (category) =>
-                          _updateState(() => _selectedCategory = category),
+                      onSelect: (category) {
+                        if (layout == _SettingsLayout.rootDetail &&
+                            !_capabilities.canUseSystemTray) {
+                          _openMobileCategory(category);
+                        } else {
+                          _updateState(() => _selectedCategory = category);
+                        }
+                      },
                       onBack: () =>
                           _updateState(() => _selectedCategory = null),
                       strings: strings,

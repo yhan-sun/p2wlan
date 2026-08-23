@@ -2,7 +2,7 @@ part of '../settings_page.dart';
 
 /// The settings "home": a grouped list of categories with a short summary per
 /// row. Used for medium and compact layouts (and the standalone page below the
-/// desktop breakpoint). Tapping a category opens its detail in-place.
+/// desktop breakpoint). Tapping a category opens an adaptive detail surface.
 class _SettingsRoot extends StatelessWidget {
   const _SettingsRoot({
     required this.categories,
@@ -183,6 +183,7 @@ class _CategoryDetailView extends StatelessWidget {
     required this.strings,
     required this.credentialState,
     this.onBack,
+    this.showHeader = true,
   });
 
   final SettingsCategory category;
@@ -190,6 +191,7 @@ class _CategoryDetailView extends StatelessWidget {
   final AppStrings strings;
   final String credentialState;
   final VoidCallback? onBack;
+  final bool showHeader;
 
   @override
   Widget build(BuildContext context) {
@@ -202,11 +204,12 @@ class _CategoryDetailView extends StatelessWidget {
           child: ListView(
             padding: const EdgeInsets.fromLTRB(2, 2, 2, 16),
             children: [
-              _DetailHeader(
-                title: category.label(strings),
-                onBack: onBack,
-                subtitle: _categorySubtitle(category, strings),
-              ),
+              if (showHeader)
+                _DetailHeader(
+                  title: category.label(strings),
+                  onBack: onBack,
+                  subtitle: _categorySubtitle(category, strings),
+                ),
               if (state._formErrorCategory == category &&
                   state._formError != null) ...[
                 _SettingsErrorNotice(message: state._formError!),
@@ -250,6 +253,85 @@ class _CategoryDetailView extends StatelessWidget {
   }
 }
 
+/// A real secondary route for compact mobile settings. It covers the shell's
+/// root app bar and bottom navigation, gives Android predictive/system back a
+/// native route to pop, and still edits the parent Settings page's controllers
+/// so drafts survive returning to the category root.
+class _MobileSettingsCategoryPage extends StatelessWidget {
+  const _MobileSettingsCategoryPage({
+    required this.category,
+    required this.state,
+  });
+
+  final SettingsCategory category;
+  final _SettingsPageState state;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: Listenable.merge([
+        state._detailViewNotifier,
+        state.widget.settingsStore,
+        state.widget.statusStore,
+      ]),
+      builder: (context, _) {
+        final strings = AppStrings.fromCode(
+          state.widget.settingsStore.settings.languageCode,
+        );
+        final colors = P2WlanColors.of(context);
+        return AppStringsScope(
+          strings: strings,
+          child: Scaffold(
+            key: const Key('settings-mobile-category-page'),
+            backgroundColor: colors.surfaceMuted,
+            appBar: AppBar(
+              key: const Key('settings-mobile-category-app-bar'),
+              leading: const BackButton(
+                key: Key('settings-mobile-category-back'),
+              ),
+              title: Text(category.label(strings)),
+              centerTitle: false,
+              elevation: 0,
+              scrolledUnderElevation: 0,
+              surfaceTintColor: Colors.transparent,
+              backgroundColor: colors.surface,
+              bottom: PreferredSize(
+                preferredSize: const Size.fromHeight(1),
+                child: Divider(height: 1, color: colors.divider),
+              ),
+            ),
+            body: SafeArea(
+              top: false,
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    maxWidth: settingsPageMaxWidth,
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                      AppTokens.space16,
+                      AppTokens.space12,
+                      AppTokens.space16,
+                      AppTokens.space16,
+                    ),
+                    child: _CategoryDetailView(
+                      category: category,
+                      state: state,
+                      strings: strings,
+                      credentialState: state._describeCredential(strings),
+                      showHeader: false,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 Widget _categoryContent(
   SettingsCategory category,
   _SettingsPageState state,
@@ -279,9 +361,9 @@ Widget _categoryContent(
 }
 
 /// The responsive shell: desktop uses category rail + inline detail; medium and
-/// compact use a root list that opens a full category detail in-place (back
-/// returns to the root). No Navigator push, no second app shell — drafts live
-/// in the page state and survive category switches and detail back-navigation.
+/// compact use a root list. Mobile opens a real full-screen route; medium
+/// desktop opens the detail in-place. Drafts stay in the page state and survive
+/// either presentation.
 class _SettingsShell extends StatelessWidget {
   const _SettingsShell({
     required this.layout,

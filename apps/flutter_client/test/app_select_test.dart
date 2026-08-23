@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
@@ -47,5 +48,74 @@ void main() {
     expect(value, 'dark');
     expect(find.byKey(const ValueKey('theme-select')), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('AppSelect uses a full-width bottom sheet on Android phones', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    var value = 'system';
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.lightTheme,
+          darkTheme: AppTheme.darkTheme,
+          themeMode: ThemeMode.dark,
+          home: Scaffold(
+            body: StatefulBuilder(
+              builder: (context, setState) => Center(
+                child: AppSelect<String>(
+                  key: const ValueKey('mobile-theme-select'),
+                  menuTitle: 'Theme mode',
+                  expanded: true,
+                  value: value,
+                  options: const [
+                    AppSelectOption(value: 'system', label: 'Follow system'),
+                    AppSelectOption(value: 'light', label: 'Light'),
+                    AppSelectOption(value: 'dark', label: 'Dark'),
+                  ],
+                  onChanged: (next) => setState(() => value = next),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      final trigger = find.descendant(
+        of: find.byKey(const ValueKey('mobile-theme-select')),
+        matching: find.byType(OutlinedButton),
+      );
+      await tester.tap(trigger);
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsOneWidget);
+      expect(find.text('Theme mode'), findsOneWidget);
+      expect(find.byType(PopupMenuItem<String>), findsNothing);
+
+      // Android back dismisses only the transient selector first.
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsNothing);
+      expect(find.byKey(const ValueKey('mobile-theme-select')), findsOneWidget);
+
+      await tester.tap(trigger);
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey<Object>(('app-select-option', 'dark'))),
+      );
+      await tester.pumpAndSettle();
+
+      expect(value, 'dark');
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsNothing);
+      expect(tester.takeException(), isNull);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 }
