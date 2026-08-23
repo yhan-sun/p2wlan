@@ -423,11 +423,12 @@ extension DaemonControllerPids on DaemonController {
           .transform(systemEncoding.decoder)
           .join();
       final exitCodeFuture = started.exitCode;
-      final values = await Future.wait<Object>([
+      final valuesFuture = Future.wait<Object>([
         stdoutFuture,
         stderrFuture,
         exitCodeFuture,
-      ]).timeout(timeout);
+      ]);
+      final values = await valuesFuture.timeout(timeout);
       return ProcessResult(
         started.pid,
         values[2] as int,
@@ -437,8 +438,14 @@ extension DaemonControllerPids on DaemonController {
     } on TimeoutException {
       process?.kill();
       if (process != null) {
-        unawaited(process.stdout.drain<void>());
-        unawaited(process.stderr.drain<void>());
+        // stdout/stderr already have active listeners above. Do not attach a
+        // second listener here; just give the killed child a short window to
+        // close those streams and complete the existing exit-code future.
+        try {
+          await process.exitCode.timeout(const Duration(seconds: 1));
+        } on Object {
+          // The timeout result below is the useful startup diagnostic.
+        }
       }
       return ProcessResult(
         process?.pid ?? -1,
