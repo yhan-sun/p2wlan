@@ -110,7 +110,8 @@ fn control_endpoint_does_not_publish_speculative_candidate() {
 fn stable_control_endpoint_refresh_promotes_private_to_public() {
     assert!(should_update_stable_control_endpoint(
         Some("192.168.0.239:52633"),
-        "8.8.8.8:41000"
+        "8.8.8.8:41000",
+        MappingBehavior::EndpointIndependent,
     ));
 }
 
@@ -118,7 +119,17 @@ fn stable_control_endpoint_refresh_promotes_private_to_public() {
 fn stable_control_endpoint_refresh_ignores_same_public_ip_port_churn() {
     assert!(!should_update_stable_control_endpoint(
         Some("8.8.8.8:41000"),
-        "8.8.8.8:41037"
+        "8.8.8.8:41037",
+        MappingBehavior::EndpointIndependent,
+    ));
+}
+
+#[test]
+fn symmetric_control_endpoint_refresh_publishes_same_ip_port_churn() {
+    assert!(should_update_stable_control_endpoint(
+        Some("8.8.8.8:41000"),
+        "8.8.8.8:41037",
+        MappingBehavior::AddressOrPortDependent,
     ));
 }
 

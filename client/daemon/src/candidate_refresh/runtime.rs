@@ -500,7 +500,11 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         }
 
         let should_update_endpoint = should_advance_generation
-            || should_update_stable_control_endpoint(published_endpoint.as_deref(), &endpoint);
+            || should_update_stable_control_endpoint(
+                published_endpoint.as_deref(),
+                &endpoint,
+                report.nat_profile.mapping_behavior,
+            );
         if should_update_endpoint {
             let nat_type = report
                 .nat_profile

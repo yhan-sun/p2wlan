@@ -504,6 +504,15 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Whether a peer connection currently exists, using the async read lock.
+    ///
+    /// Control-event handling is already asynchronous and must not interpret
+    /// transient writer contention as a missing peer.  The synchronous mirror
+    /// above is intentionally retained only for non-await UDP adoption paths.
+    pub(crate) async fn peer_exists(&self, node_id: &str) -> bool {
+        self.connections.read().await.contains_key(node_id)
+    }
+
     /// Advance local network generation and invalidate confirmed direct paths.
     ///
     /// Existing remote candidates are kept so they can be reprobed, but prior

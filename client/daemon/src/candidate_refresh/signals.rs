@@ -98,6 +98,7 @@ fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
 pub(super) fn should_update_stable_control_endpoint(
     published_endpoint: Option<&str>,
     next_endpoint: &str,
+    mapping_behavior: MappingBehavior,
 ) -> bool {
     let next_endpoint = next_endpoint.trim();
     if next_endpoint.is_empty() {
@@ -117,7 +118,15 @@ pub(super) fn should_update_stable_control_endpoint(
     let next_addr = next_endpoint.parse::<SocketAddr>().ok();
     match (published_addr, next_addr) {
         (Some(published_addr), Some(next_addr)) if is_public_udp_candidate(next_addr) => {
-            !is_public_udp_candidate(published_addr) || published_addr.ip() != next_addr.ip()
+            !is_public_udp_candidate(published_addr)
+                || published_addr.ip() != next_addr.ip()
+                // An address/port-dependent NAT allocates a different public
+                // port for different destinations.  The port is therefore
+                // part of the peer-facing mapping even when the public IP is
+                // unchanged; suppressing this update leaves late joiners
+                // with an observer-specific or already-expired endpoint.
+                || (mapping_behavior == MappingBehavior::AddressOrPortDependent
+                    && published_addr.port() != next_addr.port())
         }
         (Some(published_addr), Some(next_addr)) => {
             !is_public_udp_candidate(published_addr) && published_addr != next_addr

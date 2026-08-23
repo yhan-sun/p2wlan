@@ -324,6 +324,41 @@ enum HardHardOfferHandling {
 }
 
 impl Daemon {
+    /// Repair the local peer-manager roster when a signal races a lifecycle
+    /// event.  The control client keeps an authoritative snapshot separately
+    /// from the event consumer; a PeerLeft/PeerJoined boundary can therefore
+    /// leave the consumer temporarily without a connection even though the
+    /// current roster still says the peer is online.  A deferred offer is
+    /// already authenticated by the control channel, so re-installing that
+    /// current online record is safe and lets the newest candidate set make
+    /// progress without waiting for another roster event.
+    async fn restore_peer_offer_identity_from_control_roster(&self, peer_id: &str) -> bool {
+        let Some(peer_info) = self
+            .control
+            .peers()
+            .await
+            .get(peer_id)
+            .filter(|peer| peer.online)
+            .cloned()
+        else {
+            return false;
+        };
+
+        self.peers.add_peer(&peer_info).await;
+        let restored = self.peers.peer_exists(peer_id).await;
+        if restored {
+            self.timeline.emit(
+                "peer_offer_identity_restored",
+                None,
+                Some("control_roster_repair"),
+                Some(format!(
+                    "peer={peer_id} restored from current online control roster"
+                )),
+            );
+        }
+        restored
+    }
+
     async fn wait_for_peer_offer_identity(
         &self,
         peer_id: &str,
@@ -332,6 +367,12 @@ impl Daemon {
         let deadline = Instant::now() + UNKNOWN_PEER_OFFER_WAIT;
         loop {
             if self.peers.get_connection(peer_id).await.is_some() {
+                return true;
+            }
+            if self
+                .restore_peer_offer_identity_from_control_roster(peer_id)
+                .await
+            {
                 return true;
             }
             if *cancellation.borrow() {
@@ -2164,7 +2205,7 @@ impl Daemon {
                     // state.  Enqueue the complete newest offer under the
                     // existing per-peer owner and replay it once registration
                     // becomes visible.
-                    if !self.peers.peer_exists_sync(&from_node_id) {
+                    if !self.peers.peer_exists(&from_node_id).await {
                         // Wake the peer poll immediately: the regular cadence
                         // can be seconds away and a cold-start handshake must
                         // not wait it out.
@@ -2561,7 +2602,7 @@ impl Daemon {
                     // its sender: wake the peer poll so the pending initiator
                     // transaction can be consumed without waiting out the
                     // regular cadence.
-                    if !self.peers.peer_exists_sync(&from_node_id) {
+                    if !self.peers.peer_exists(&from_node_id).await {
                         self.control.refresh_peers_now();
                     }
                     self.peers
@@ -2679,7 +2720,7 @@ impl Daemon {
                     // A peer-reflexive observation may arrive before the
                     // peer-list poll registers the sender; wake the poll so a
                     // cold-start handshake is not delayed by the cadence.
-                    if !self.peers.peer_exists_sync(&from_node_id) {
+                    if !self.peers.peer_exists(&from_node_id).await {
                         self.control.refresh_peers_now();
                     }
                     let work = PendingPeerReflexive {
