@@ -11,7 +11,13 @@ class DiagnosticsApi {
     Future<String?> Function()? authTokenReader,
   }) : _client = client ?? HttpClient(),
        _authTokenReader = authTokenReader ?? readDiagnosticsAuthToken {
-    _client.connectionTimeout = _requestTimeout;
+    _client
+      ..connectionTimeout = _requestTimeout
+      // Every accepted diagnostics URL is loopback-only. Dart's HttpClient
+      // otherwise inherits http_proxy/https_proxy from the launch shell,
+      // which can send 127.0.0.1 health checks to a proxy and make a healthy
+      // daemon look stuck until the startup timeout kills it.
+      ..findProxy = null;
   }
 
   static const _requestTimeout = Duration(milliseconds: 3500);
@@ -63,7 +69,7 @@ class DiagnosticsApi {
       request.headers.set(HttpHeaders.acceptHeader, 'text/plain');
       await _authorize(request);
       request.headers.contentLength = 0;
-      final response = await request.close().timeout(_requestTimeout);
+      final response = await _closeRequest(request, _requestTimeout);
       await response.drain<void>().timeout(_requestTimeout);
       return response.statusCode >= 200 && response.statusCode < 300;
     } catch (_) {
@@ -91,7 +97,7 @@ class DiagnosticsApi {
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     await _authorize(request);
     request.headers.contentLength = 0;
-    final response = await request.close().timeout(_speedTestTimeout);
+    final response = await _closeRequest(request, _speedTestTimeout);
     final body = await utf8.decodeStream(response).timeout(_speedTestTimeout);
     final decoded = _tryJsonObject(body);
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -187,7 +193,7 @@ class DiagnosticsApi {
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     await _authorize(request);
     request.headers.contentLength = 0;
-    final response = await request.close().timeout(_requestTimeout);
+    final response = await _closeRequest(request, _requestTimeout);
     final body = await utf8.decodeStream(response).timeout(_requestTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw DiagnosticsApiException(
@@ -212,7 +218,7 @@ class DiagnosticsApi {
     request.headers.set(HttpHeaders.acceptHeader, 'application/json');
     await _authorize(request);
     request.headers.contentLength = 0;
-    final response = await request.close().timeout(_requestTimeout);
+    final response = await _closeRequest(request, _requestTimeout);
     final body = await utf8.decodeStream(response).timeout(_requestTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw DiagnosticsApiException(
@@ -261,7 +267,7 @@ class DiagnosticsApi {
       final request = await _client.getUrl(uri).timeout(timeout);
       request.headers.set(HttpHeaders.acceptHeader, accept);
       if (authorize) await _authorize(request);
-      final response = await request.close().timeout(timeout);
+      final response = await _closeRequest(request, timeout);
       final body = await utf8.decodeStream(response).timeout(timeout);
       if (authorize &&
           response.statusCode == HttpStatus.unauthorized &&
@@ -306,6 +312,24 @@ class DiagnosticsApi {
       queryParameters: queryParameters,
       fragment: null,
     );
+  }
+
+  /// Unlike [Future.timeout], aborting the request also closes the underlying
+  /// socket. This prevents a non-responsive local proxy or endpoint from
+  /// leaving one established connection behind on every status poll.
+  Future<HttpClientResponse> _closeRequest(
+    HttpClientRequest request,
+    Duration timeout,
+  ) async {
+    final error = TimeoutException(
+      'Diagnostics request timed out after ${timeout.inMilliseconds} ms',
+    );
+    final timer = Timer(timeout, () => request.abort(error));
+    try {
+      return await request.close();
+    } finally {
+      timer.cancel();
+    }
   }
 
   void close() {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -117,6 +118,70 @@ void main() {
       expect(headers, ['Bearer diag-test-token', 'Bearer diag-test-token']);
     },
   );
+
+  test('loopback diagnostics bypass an inherited HTTP proxy', () async {
+    final diagnostics = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => diagnostics.close(force: true));
+    diagnostics.listen((request) async {
+      expect(request.uri.path, '/health');
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType.text
+        ..write('ok\n');
+      await request.response.close();
+    });
+
+    var proxyRequests = 0;
+    final proxy = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => proxy.close(force: true));
+    proxy.listen((request) async {
+      proxyRequests++;
+      request.response.statusCode = HttpStatus.badGateway;
+      await request.response.close();
+    });
+
+    final client = HttpClient()
+      ..findProxy = (_) => 'PROXY 127.0.0.1:${proxy.port}';
+    final api = DiagnosticsApi(
+      client: client,
+      authTokenReader: () async => null,
+    );
+    addTearDown(api.close);
+
+    expect(
+      await api.fetchHealth('http://127.0.0.1:${diagnostics.port}/status'),
+      isTrue,
+    );
+    expect(proxyRequests, 0);
+  });
+
+  test('a timed-out diagnostics request aborts its socket', () async {
+    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(server.close);
+    final accepted = Completer<Socket>();
+    server.listen((socket) {
+      if (!accepted.isCompleted) accepted.complete(socket);
+    });
+
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final health = api.fetchHealth('http://127.0.0.1:${server.port}/status');
+    final socket = await accepted.future.timeout(const Duration(seconds: 1));
+    addTearDown(socket.destroy);
+    final disconnected = Completer<void>();
+    socket.listen(
+      (_) {},
+      onError: (_) {
+        if (!disconnected.isCompleted) disconnected.complete();
+      },
+      onDone: () {
+        if (!disconnected.isCompleted) disconnected.complete();
+      },
+    );
+
+    expect(await health, isFalse);
+    await disconnected.future.timeout(const Duration(seconds: 1));
+  });
 
   test('retries a structured diagnostics snapshot timeout', () async {
     final fixture = await File(
