@@ -67,13 +67,8 @@ class _OfflineDiagnosticsApi implements DiagnosticsApi {
 
 /// A diagnostics API that reports the daemon as already running.
 class _RunningDiagnosticsApi implements DiagnosticsApi {
-  var healthFetchCount = 0;
-
   @override
-  Future<bool> fetchHealth(String diagnosticsUrl) async {
-    healthFetchCount += 1;
-    return true;
-  }
+  Future<bool> fetchHealth(String diagnosticsUrl) async => true;
 
   @override
   Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
@@ -196,11 +191,8 @@ class _ReadyDiagnosticsApi extends _OfflineDiagnosticsApi {
 class _FakeDaemonController extends DaemonController {
   _FakeDaemonController() : super(diagnosticsApi: DiagnosticsApi());
 
-  var startCount = 0;
-
   @override
   Future<DaemonCommandResult> start(AppSettings settings) async {
-    startCount += 1;
     return const DaemonCommandResult(ok: true, message: 'started');
   }
 
@@ -411,64 +403,6 @@ void main() {
     expect(find.text('首页'), findsWidgets);
     expect(find.text('把这台设备接入 P2WLAN'), findsNothing);
   });
-
-  testWidgets(
-    'P2WlanApp development opt-in starts an offline configured daemon once',
-    (tester) async {
-      final settings = await _makeSettings(tester, true);
-      final daemonController = _FakeDaemonController();
-      await tester.pumpWidget(
-        P2WlanApp(
-          initialRefresh: false,
-          autoStartPolling: false,
-          autoStartDaemon: true,
-          settingsStore: settings,
-          diagnosticsApi: _OfflineDiagnosticsApi(),
-          daemonController: daemonController,
-        ),
-      );
-
-      for (var i = 0; i < 30 && daemonController.startCount == 0; i++) {
-        await tester.runAsync(
-          () => Future<void>.delayed(const Duration(milliseconds: 30)),
-        );
-        await tester.pump();
-      }
-
-      expect(daemonController.startCount, 1);
-      expect(find.text('首页'), findsWidgets);
-    },
-  );
-
-  testWidgets(
-    'P2WlanApp development opt-in does not restart a reachable daemon',
-    (tester) async {
-      final settings = await _makeSettings(tester, true);
-      final diagnosticsApi = _RunningDiagnosticsApi();
-      final daemonController = _FakeDaemonController();
-      await tester.pumpWidget(
-        P2WlanApp(
-          initialRefresh: false,
-          autoStartPolling: false,
-          autoStartDaemon: true,
-          settingsStore: settings,
-          diagnosticsApi: diagnosticsApi,
-          daemonController: daemonController,
-        ),
-      );
-
-      for (var i = 0; i < 30 && diagnosticsApi.healthFetchCount == 0; i++) {
-        await tester.runAsync(
-          () => Future<void>.delayed(const Duration(milliseconds: 30)),
-        );
-        await tester.pump();
-      }
-
-      expect(diagnosticsApi.healthFetchCount, greaterThan(0));
-      expect(daemonController.startCount, 0);
-      expect(find.text('首页'), findsWidgets);
-    },
-  );
 
   testWidgets(
     'done completes onboarding once and persists across app restart',

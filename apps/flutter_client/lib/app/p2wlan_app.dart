@@ -24,7 +24,6 @@ class P2WlanApp extends StatefulWidget {
     super.key,
     this.initialRefresh = true,
     this.autoStartPolling = true,
-    this.autoStartDaemon = false,
     this.settingsStore,
     this.diagnosticsApi,
     this.daemonController,
@@ -34,10 +33,6 @@ class P2WlanApp extends StatefulWidget {
 
   final bool initialRefresh;
   final bool autoStartPolling;
-
-  /// Development-only opt-in supplied by the process environment. Production
-  /// launches keep this false and let the user start the privileged daemon.
-  final bool autoStartDaemon;
   final SettingsStore? settingsStore;
   final DiagnosticsApi? diagnosticsApi;
   final DaemonController? daemonController;
@@ -117,20 +112,6 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     } else if (widget.initialRefresh && canPollLocalDaemon) {
       unawaited(_statusStore.refreshUntilPeerCatalogSettled(silent: true));
     }
-    if (widget.autoStartDaemon && canPollLocalDaemon) {
-      unawaited(_autoStartConfiguredDaemon());
-    }
-  }
-
-  Future<void> _autoStartConfiguredDaemon() async {
-    // Do not bypass authentication or first-run permission onboarding. The
-    // one-click development launcher is for an already configured test app.
-    if (!_authenticated || !_settingsStore.settings.onboardingCompleted) {
-      return;
-    }
-    await _statusStore.refresh(silent: true);
-    if (!mounted || _statusStore.daemonReachable) return;
-    await _statusStore.startDaemon();
   }
 
   Future<void> _logout() async {

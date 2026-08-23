@@ -4,7 +4,6 @@ set -euo pipefail
 FLUTTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT_DIR="$(cd "$FLUTTER_DIR/../.." && pwd)"
 DAEMON_BIN="$ROOT_DIR/target/debug/p2wlan-daemon"
-AUTO_START=1
 SKIP_DAEMON_BUILD=0
 DRY_RUN=0
 FLUTTER_ARGS=()
@@ -14,29 +13,23 @@ usage() {
 Usage:
   apps/flutter_client/scripts/run_test_app_macos.sh [options] [-- flutter-run-args]
 
-Build the matching Rust daemon and launch the macOS Flutter test app. For an
-already configured client, the app automatically starts the daemon when local
-diagnostics are offline.
+Build the matching Rust daemon and launch the normal macOS Flutter app. Start
+and stop the daemon from the Home page or system tray, just like a packaged
+app.
 
 Options:
-  --no-auto-start       Launch the Flutter UI without starting the daemon.
   --skip-daemon-build   Reuse target/debug/p2wlan-daemon after identity checks.
   --dry-run             Build and validate, but only print the launch command.
   -h, --help            Show this help.
 
 Examples:
   ./apps/flutter_client/scripts/run_test_app_macos.sh
-  ./apps/flutter_client/scripts/run_test_app_macos.sh --no-auto-start
   ./apps/flutter_client/scripts/run_test_app_macos.sh -- --verbose
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-auto-start)
-      AUTO_START=0
-      shift
-      ;;
     --skip-daemon-build)
       SKIP_DAEMON_BUILD=1
       shift
@@ -94,16 +87,11 @@ if ! grep -Fq "\"git_commit\": \"$CURRENT_COMMIT\"" <<< "$BUILD_INFO"; then
 fi
 
 echo "[run-test-app] Daemon identity matches commit ${CURRENT_COMMIT:0:12}."
-if [[ "$AUTO_START" -eq 1 ]]; then
-  echo "[run-test-app] Automatic daemon start enabled. macOS may request administrator authorization."
-else
-  echo "[run-test-app] Automatic daemon start disabled; launching UI shell only."
-fi
+echo "[run-test-app] Launching the normal app. Start P2WLAN from Home when ready."
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   printf '[run-test-app] cd %q\n' "$FLUTTER_DIR"
-  printf '[run-test-app] P2WLAN_DAEMON_BIN=%q P2WLAN_AUTO_START_DAEMON=%q flutter run -d macos' \
-    "$DAEMON_BIN" "$AUTO_START"
+  printf '[run-test-app] P2WLAN_DAEMON_BIN=%q flutter run -d macos' "$DAEMON_BIN"
   if [[ "${#FLUTTER_ARGS[@]}" -gt 0 ]]; then
     printf ' %q' "${FLUTTER_ARGS[@]}"
   fi
@@ -113,5 +101,4 @@ fi
 
 cd "$FLUTTER_DIR"
 export P2WLAN_DAEMON_BIN="$DAEMON_BIN"
-export P2WLAN_AUTO_START_DAEMON="$AUTO_START"
 exec flutter run -d macos "${FLUTTER_ARGS[@]}"
