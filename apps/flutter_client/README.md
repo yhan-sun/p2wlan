@@ -16,6 +16,22 @@ The split is:
 
 ## Run
 
+For a configured macOS development checkout, use the one-command launcher. It
+builds and verifies the matching Rust daemon, launches Flutter, and asks the
+app to start the daemon when local diagnostics are offline:
+
+```bash
+./apps/flutter_client/scripts/run_test_app_macos.sh
+```
+
+The first daemon launch can show the normal macOS administrator prompt. A
+fresh checkout still goes through login and onboarding; the launcher never
+bypasses either. Use `--no-auto-start` when only the UI shell is wanted, or
+`--dry-run` to build and print the resolved launch command without opening the
+app.
+
+Equivalent manual commands:
+
 ```bash
 # Build the daemon binary used by the Flutter desktop client.
 cargo build -p p2wlan-daemon
@@ -26,6 +42,8 @@ target/debug/p2wlan-tray
 
 # Run Flutter.
 cd apps/flutter_client
+P2WLAN_DAEMON_BIN=../../target/debug/p2wlan-daemon \
+P2WLAN_AUTO_START_DAEMON=1 \
 flutter run -d macos
 ```
 

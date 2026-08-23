@@ -2,6 +2,27 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/main.dart';
 
 void main() {
+  group('autoStartDaemonForEnvironment', () {
+    test('defaults to disabled', () {
+      expect(autoStartDaemonForEnvironment({}), isFalse);
+    });
+
+    test('enables only for explicit true-like values', () {
+      for (final value in ['1', 'true', 'yes', 'on', ' TRUE ']) {
+        expect(
+          autoStartDaemonForEnvironment({'P2WLAN_AUTO_START_DAEMON': value}),
+          isTrue,
+        );
+      }
+      for (final value in ['', '0', 'false', 'no', 'off', 'unexpected']) {
+        expect(
+          autoStartDaemonForEnvironment({'P2WLAN_AUTO_START_DAEMON': value}),
+          isFalse,
+        );
+      }
+    });
+  });
+
   group('enableFlutterTrayForEnvironment', () {
     test(
       'defaults to enabled because the Flutter tray is bundled in releases',

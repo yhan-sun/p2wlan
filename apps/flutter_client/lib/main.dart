@@ -10,12 +10,14 @@ import 'app/p2wlan_app.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final enableFlutterTray = _enableFlutterTray;
+  final autoStartDaemon = _autoStartDaemon;
   if (_supportsDesktopHost) {
     await windowManager.ensureInitialized();
     await _configureDesktopWindowChrome();
   }
   runApp(
     P2WlanApp(
+      autoStartDaemon: autoStartDaemon,
       enableDesktopTray: enableFlutterTray,
       enableDesktopTaskbarStatus: _supportsDesktopHost && !enableFlutterTray,
     ),
@@ -54,6 +56,19 @@ bool get _supportsDesktopHost {
 bool get _enableFlutterTray {
   if (!_supportsDesktopHost) return false;
   return enableFlutterTrayForEnvironment(Platform.environment);
+}
+
+bool get _autoStartDaemon {
+  if (!_supportsDesktopHost) return false;
+  return autoStartDaemonForEnvironment(Platform.environment);
+}
+
+@visibleForTesting
+bool autoStartDaemonForEnvironment(Map<String, String> environment) {
+  final value = environment['P2WLAN_AUTO_START_DAEMON']?.trim().toLowerCase();
+  // Daemon launch may request elevation and alter system routes. It is never
+  // implicit in release builds: development launchers must opt in explicitly.
+  return value == '1' || value == 'true' || value == 'yes' || value == 'on';
 }
 
 @visibleForTesting
