@@ -9,6 +9,7 @@ async fn run_control_loop(
     config_path: Option<PathBuf>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
     critical_auth_tx: watch::Sender<Option<CriticalControlAuth>>,
+    health: Option<Arc<crate::tasks::HealthState>>,
 ) {
     let base_url = normalize_http_base_url(&config.control.server_url);
 
@@ -47,6 +48,9 @@ async fn run_control_loop(
                 .await;
                 match registration {
                     Ok((node_id, virtual_ip, cidr, server_relay_servers, relay_catalog)) => {
+                        if let Some(health) = health.as_ref() {
+                            health.mark_control_success().await;
+                        }
                         timeline.emit(
                             "control_registered",
                             None,
@@ -245,8 +249,14 @@ async fn run_control_loop(
         .await;
         if let Err(err) = initial_peer_poll {
             warn!("Initial peer polling failed: {err}");
+            if let Some(health) = health.as_ref() {
+                health.set_control_connected(false);
+            }
             let _ = event_tx.send(ControlEvent::Disconnected);
         } else {
+            if let Some(health) = health.as_ref() {
+                health.mark_control_success().await;
+            }
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
         let initial_signal_poll = async {
@@ -265,8 +275,14 @@ async fn run_control_loop(
         .await;
         if let Err(err) = initial_signal_poll {
             warn!("Initial signal polling failed: {err}");
+            if let Some(health) = health.as_ref() {
+                health.set_control_connected(false);
+            }
             let _ = event_tx.send(ControlEvent::Disconnected);
         } else {
+            if let Some(health) = health.as_ref() {
+                health.mark_control_success().await;
+            }
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
 
@@ -333,6 +349,9 @@ async fn run_control_loop(
                             let err_str = e.to_string();
                             if is_permanent_auth_error(&err_str) {
                                 error!("Permanent auth failure during polling: {err_str}");
+                                if let Some(health) = health.as_ref() {
+                                    health.set_reauth_required(true);
+                                }
                                 let _ = event_tx.send(ControlEvent::ReauthRequired {
                                     message: err_str,
                                 });
@@ -354,6 +373,9 @@ async fn run_control_loop(
                             poll_failures = poll_failures.saturating_add(1);
                             let delay = backoff_delay(poll_failures.saturating_sub(1));
                             warn!("Polling failed (attempt {poll_failures}); retrying in {delay:?}: {err_str}");
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_connected(false);
+                            }
                             let _ = event_tx.send(ControlEvent::Disconnected);
                             // After several consecutive failures, force a full re-register
                             // so device session and peer map are refreshed after control restart.
@@ -374,6 +396,9 @@ async fn run_control_loop(
                                 });
                             }
                             poll_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_control_success().await;
+                            }
                             let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                     }
@@ -387,12 +412,18 @@ async fn run_control_loop(
                     match signal_result {
                         Ok(()) => {
                             signal_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_control_success().await;
+                            }
                             let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                         Err(e) => {
                             let err_str = e.to_string();
                             if is_permanent_auth_error(&err_str) {
                                 error!("Permanent auth failure after WebSocket signal wake: {err_str}");
+                                if let Some(health) = health.as_ref() {
+                                    health.set_reauth_required(true);
+                                }
                                 let _ = event_tx.send(ControlEvent::ReauthRequired {
                                     message: err_str,
                                 });
@@ -400,6 +431,9 @@ async fn run_control_loop(
                             }
                             signal_failures = signal_failures.saturating_add(1);
                             warn!("Signal fetch after WebSocket wake failed: {err_str}");
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_connected(false);
+                            }
                             let _ = event_tx.send(ControlEvent::Disconnected);
                         }
                     }
@@ -420,12 +454,18 @@ async fn run_control_loop(
                     match signal_result {
                         Ok(()) => {
                             signal_failures = 0;
+                            if let Some(health) = health.as_ref() {
+                                health.mark_control_success().await;
+                            }
                             let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
                         Err(e) => {
                             let err_str = e.to_string();
                             if is_permanent_auth_error(&err_str) {
                                 error!("Permanent auth failure during signal polling: {err_str}");
+                                if let Some(health) = health.as_ref() {
+                                    health.set_reauth_required(true);
+                                }
                                 let _ = event_tx.send(ControlEvent::ReauthRequired {
                                     message: err_str,
                                 });
@@ -449,6 +489,9 @@ async fn run_control_loop(
                             warn!(
                                 "Signal polling failed (attempt {signal_failures}); continuing: {err_str}"
                             );
+                            if let Some(health) = health.as_ref() {
+                                health.set_control_connected(false);
+                            }
                             let _ = event_tx.send(ControlEvent::Disconnected);
                             if signal_failures >= 3 {
                                 warn!("Signal polling failed {signal_failures} times; re-registering with control plane");
@@ -463,6 +506,9 @@ async fn run_control_loop(
                 }
                 else => {
                     // Command channel closed — exit.
+                    if let Some(health) = health.as_ref() {
+                        health.set_control_connected(false);
+                    }
                     let _ = event_tx.send(ControlEvent::Disconnected);
                     return;
                 }
@@ -477,6 +523,9 @@ async fn run_control_loop(
         {
             let mut s = state.write().await;
             s.registered = false;
+        }
+        if let Some(health) = health.as_ref() {
+            health.set_control_connected(false);
         }
         let _ = event_tx.send(ControlEvent::Disconnected);
         info!("Re-entering control registration cycle");

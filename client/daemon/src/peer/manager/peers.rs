@@ -464,18 +464,27 @@ impl PeerManager {
         sent_probes: Option<u32>,
         detail: impl Into<String>,
     ) {
-        let generation = self.current_network_generation().await;
+        // Diagnostics must never become a back-pressure point for the control
+        // event loop.  A direct probe, candidate handover or relay renewal may
+        // briefly own the connection map while it commits state; waiting here
+        // would stop the loop from consuming ControlHealthy and new signals.
+        // The typed timeline event below remains authoritative when the map is
+        // contended, and the per-peer ring is best-effort for this diagnostic
+        // path.
+        let generation = self.current_network_generation_sync();
         let stage = stage.into();
         let detail = detail.into();
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.record_direct_event(
-                generation,
-                stage.clone(),
-                endpoint,
-                candidate_count,
-                sent_probes,
-                detail.clone(),
-            );
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_direct_event(
+                    generation,
+                    stage.clone(),
+                    endpoint,
+                    candidate_count,
+                    sent_probes,
+                    detail.clone(),
+                );
+            }
         }
         self.emit_direct_traversal_debug(
             node_id,
@@ -505,16 +514,18 @@ impl PeerManager {
     ) {
         let stage = stage.into();
         let detail = detail.into();
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.record_direct_event_with_socket(
-                generation,
-                stage.clone(),
-                endpoint,
-                socket_index,
-                candidate_count,
-                sent_probes,
-                detail.clone(),
-            );
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_direct_event_with_socket(
+                    generation,
+                    stage.clone(),
+                    endpoint,
+                    socket_index,
+                    candidate_count,
+                    sent_probes,
+                    detail.clone(),
+                );
+            }
         }
         self.emit_direct_traversal_debug(
             node_id,
@@ -643,17 +654,19 @@ impl PeerManager {
     ) {
         let stage = stage.into();
         let detail = detail.into();
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.record_direct_validation_event_with_metadata(
-                generation,
-                metadata,
-                stage.clone(),
-                endpoint,
-                socket_index,
-                candidate_count,
-                sent_probes,
-                detail.clone(),
-            );
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_direct_validation_event_with_metadata(
+                    generation,
+                    metadata,
+                    stage.clone(),
+                    endpoint,
+                    socket_index,
+                    candidate_count,
+                    sent_probes,
+                    detail.clone(),
+                );
+            }
         }
 
         // The `/status` direct-event ring already has the full typed record,
@@ -703,20 +716,22 @@ impl PeerManager {
         unique_target_ports: u32,
         repeated_target_ports: u32,
     ) {
-        let generation = self.current_network_generation().await;
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.record_direct_event_with_probe_coverage(
-                generation,
-                stage,
-                endpoint,
-                candidate_count,
-                sent_probes,
-                detail,
-                socket0_count,
-                alt_socket_count,
-                unique_target_ports,
-                repeated_target_ports,
-            );
+        let generation = self.current_network_generation_sync();
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_direct_event_with_probe_coverage(
+                    generation,
+                    stage,
+                    endpoint,
+                    candidate_count,
+                    sent_probes,
+                    detail,
+                    socket0_count,
+                    alt_socket_count,
+                    unique_target_ports,
+                    repeated_target_ports,
+                );
+            }
         }
     }
 

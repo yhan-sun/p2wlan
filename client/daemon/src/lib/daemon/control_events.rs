@@ -2164,7 +2164,7 @@ impl Daemon {
                     // state.  Enqueue the complete newest offer under the
                     // existing per-peer owner and replay it once registration
                     // becomes visible.
-                    if self.peers.get_connection(&from_node_id).await.is_none() {
+                    if !self.peers.peer_exists_sync(&from_node_id) {
                         // Wake the peer poll immediately: the regular cadence
                         // can be seconds away and a cold-start handshake must
                         // not wait it out.
@@ -2232,6 +2232,68 @@ impl Daemon {
                         }
                         continue;
                     }
+                    // Candidate-only offers have no latency-critical
+                    // WireGuard response to stage.  They still carry remote
+                    // candidate state and may need to wait behind the shared
+                    // epoch/UDP validation locks, so run them through the
+                    // existing per-peer newest-wins responder lane instead of
+                    // blocking the serial control receiver.  A later offer
+                    // for the same peer is coalesced by the same owner.
+                    if handshake_init.is_empty() {
+                        let admitted = {
+                            let mut state = self.pending_handshakes.lock().await;
+                            state.enqueue_responder_work(PendingPeerOffer {
+                                from_node_id: from_node_id.clone(),
+                                candidates: candidates.clone(),
+                                candidate_sources: candidate_sources.clone(),
+                                candidate_generation,
+                                network_generation,
+                                candidates_expires_at_ms,
+                                sender_public_key: sender_public_key.clone(),
+                                handshake_init: Vec::new(),
+                                punch_at_ms,
+                                punch_at_server_ms,
+                                session_id: session_id.clone(),
+                                probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
+                                ingress_suppressed: false,
+                            })
+                        };
+                        if let Some((reservation, offer)) = admitted {
+                            self.timeline.emit(
+                                "peer_offer_candidate_work_admitted",
+                                None,
+                                None,
+                                Some(format!(
+                                    "peer={} owner={} network_generation={} candidate_generation={} candidates={}",
+                                    from_node_id,
+                                    reservation.owner,
+                                    network_generation,
+                                    candidate_generation,
+                                    candidates.len()
+                                )),
+                            );
+                            responder_work.push(Box::pin(async move {
+                                daemon
+                                    .run_deferred_peer_offer_worker(offer, reservation)
+                                    .await;
+                            }));
+                        } else {
+                            self.timeline.emit(
+                                "peer_offer_candidate_work_coalesced",
+                                None,
+                                Some("newest_wins_coalesced"),
+                                Some(format!(
+                                    "peer={} network_generation={} candidate_generation={} candidates={}",
+                                    from_node_id,
+                                    network_generation,
+                                    candidate_generation,
+                                    candidates.len()
+                                )),
+                            );
+                        }
+                        continue;
+                    }
+
                     self.reset_peer_for_remote_incarnation_if_needed(
                         &from_node_id,
                         candidate_generation,
@@ -2499,7 +2561,7 @@ impl Daemon {
                     // its sender: wake the peer poll so the pending initiator
                     // transaction can be consumed without waiting out the
                     // regular cadence.
-                    if self.peers.get_connection(&from_node_id).await.is_none() {
+                    if !self.peers.peer_exists_sync(&from_node_id) {
                         self.control.refresh_peers_now();
                     }
                     self.peers
@@ -2617,7 +2679,7 @@ impl Daemon {
                     // A peer-reflexive observation may arrive before the
                     // peer-list poll registers the sender; wake the poll so a
                     // cold-start handshake is not delayed by the cadence.
-                    if self.peers.get_connection(&from_node_id).await.is_none() {
+                    if !self.peers.peer_exists_sync(&from_node_id) {
                         self.control.refresh_peers_now();
                     }
                     let work = PendingPeerReflexive {

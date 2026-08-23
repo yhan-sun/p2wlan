@@ -140,18 +140,23 @@ impl Daemon {
             );
         }
         let timeline = ConnectionTimeline::new(&config.node.node_id, boot_epoch_ms);
-        let (control, control_rx) = ControlClient::new(
+        // Construct health before the control runtime so successful polls can
+        // refresh it directly.  The main control-event consumer is allowed to
+        // spend time on a peer/UDP handover and must not be the only writer of
+        // the control-plane heartbeat timestamp.
+        let health = tasks::HealthState::new();
+        let (control, control_rx) = ControlClient::new_with_health(
             &config,
             control_enabled,
             config_path,
             Some(relay_selection.clone()),
             timeline.clone(),
+            Some(health.clone()),
         );
         let (transport, outbound_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
 
-        let health = tasks::HealthState::new();
         let task_manager = tasks::TaskManager::new(health.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 

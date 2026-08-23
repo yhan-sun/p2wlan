@@ -16,6 +16,29 @@ impl ControlClient {
         relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
         timeline: Arc<ConnectionTimeline>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
+        Self::new_with_health(
+            config,
+            enabled,
+            config_path,
+            relay_selection,
+            timeline,
+            None,
+        )
+    }
+
+    /// Create a control client and attach the daemon health state directly to
+    /// the HTTP polling runtime.  The control event consumer also handles the
+    /// same health events, but it may be busy processing a peer handover; the
+    /// polling task must be able to refresh the health timestamp independently
+    /// so a slow data-plane transition cannot produce a false stale warning.
+    pub fn new_with_health(
+        config: &Config,
+        enabled: bool,
+        config_path: Option<PathBuf>,
+        relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+        timeline: Arc<ConnectionTimeline>,
+        health: Option<Arc<crate::tasks::HealthState>>,
+    ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (critical_offer_tx, critical_offer_rx) = mpsc::channel(CRITICAL_OFFER_QUEUE_CAPACITY);
@@ -91,6 +114,7 @@ impl ControlClient {
                     cfg_path,
                     relay_selection,
                     critical_auth_tx,
+                    health,
                 )
                 .await;
             });

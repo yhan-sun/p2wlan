@@ -349,4 +349,26 @@ mod diagnostics_tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn direct_event_recording_does_not_wait_for_connection_writer() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        let _connection_writer = manager.connections.write().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.record_direct_event(
+                "peer-under-lock",
+                "peer_offer_received",
+                None,
+                Some(96),
+                None,
+                "diagnostic lock contention regression",
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
 }

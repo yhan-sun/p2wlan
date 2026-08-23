@@ -14,6 +14,9 @@ match cmd {
                             match &poll_result {
                                 Ok(_) => {
                                     poll_failures = 0;
+                                    if let Some(health) = health.as_ref() {
+                                        health.mark_control_success().await;
+                                    }
                                     let _ = event_tx.send(ControlEvent::ControlHealthy);
                                 }
                                 Err(err) => {
@@ -63,6 +66,9 @@ match cmd {
                                     advertised_endpoint = endpoint;
                                     advertised_nat_type = nat_type;
                                     debug!("Updated endpoint for {self_node_id}: {advertised_endpoint} ({advertised_nat_type})");
+                                    if let Some(health) = health.as_ref() {
+                                        health.mark_control_success().await;
+                                    }
                                     let _ = event_tx.send(ControlEvent::ControlHealthy);
                                 }
                                 Err(err) => {
