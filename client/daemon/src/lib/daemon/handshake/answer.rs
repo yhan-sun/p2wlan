@@ -1,10 +1,29 @@
 impl Daemon {
+    #[cfg(test)]
     async fn handle_peer_answer(
         &self,
         from_node_id: &str,
         handshake_response: &[u8],
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
+    ) -> Result<()> {
+        self.handle_peer_answer_for_identity(
+            from_node_id,
+            handshake_response,
+            session_id,
+            probe_ephemeral_public_key,
+            None,
+        )
+        .await
+    }
+
+    async fn handle_peer_answer_for_identity(
+        &self,
+        from_node_id: &str,
+        handshake_response: &[u8],
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
+        sender_public_key: Option<&str>,
     ) -> Result<()> {
         let lock_wait_started = Instant::now();
         let ingress_generation = self.peers.current_network_generation_sync();
@@ -39,6 +58,18 @@ impl Daemon {
                 handshake_token_fingerprint(session_id.as_deref())
             )),
         );
+        if !self
+            .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
+            .await
+        {
+            self.timeline.emit(
+                "peer_answer_rejected",
+                None,
+                Some("stale_sender_identity"),
+                Some(format!("peer={from_node_id}")),
+            );
+            return Ok(());
+        }
         let response = MessageResponse::from_bytes(handshake_response)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard response: {e}")))?;
         // The pending initiator and its answer must cross the local network

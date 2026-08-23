@@ -610,16 +610,17 @@ struct FetchRelayTicketResponse {
 
 /// Outcome of one peer-offer send attempt through the control plane.
 ///
-/// The HTTP worker distinguishes "cancelled before anything reached the wire"
-/// from a real failure: a caller advertising a fresh-mapping prediction must
-/// never finalize a durable handoff for a socket whose prediction was never
-/// sent, and never treat a cancellation as a successful send.
+/// The HTTP worker distinguishes an ownership cancellation from a real
+/// failure. Cancellation drops queued or in-flight I/O (which may already
+/// have reached the server before the local future is dropped), and the
+/// caller must never finalize the retired socket's durable handoff or treat
+/// that publication as accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerOfferSendOutcome {
     /// The HTTP request completed and the control server accepted the signal.
     Sent,
-    /// The fresh-mapping ownership was revoked before the request reached the
-    /// wire: nothing was sent and nothing must be finalized.
+    /// The fresh-mapping ownership was revoked while queued or in flight: the
+    /// request was cancelled and nothing must be finalized.
     Cancelled,
     /// The request was attempted but failed (HTTP error, decode failure).
     Failed,
@@ -644,13 +645,13 @@ struct CandidateOfferCommand {
     response_tx: oneshot::Sender<PeerOfferSendOutcome>,
 }
 
-/// Why a peer-offer send did not place the signal on the wire.
+/// Why a peer-offer send did not obtain authoritative server acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerOfferSendFailure {
-    /// The fresh-mapping ownership was revoked before the HTTP request: the
-    /// prediction was never sent and no durable handoff may be finalized.
+    /// The fresh-mapping ownership was revoked while queued or in flight: no
+    /// durable handoff may be finalized.
     Cancelled,
-    /// The HTTP request was attempted but the control server did not accept it.
+    /// The HTTP attempt failed or its acceptance could not be confirmed.
     SendFailed,
     /// The command channel or response channel closed.
     ChannelClosed,
@@ -659,7 +660,7 @@ pub(crate) enum PeerOfferSendFailure {
 impl std::fmt::Display for PeerOfferSendFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cancelled => write!(f, "peer offer cancelled before send"),
+            Self::Cancelled => write!(f, "peer offer cancelled with its owner"),
             Self::SendFailed => write!(f, "peer offer send failed"),
             Self::ChannelClosed => write!(f, "peer offer command channel closed"),
         }

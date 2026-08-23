@@ -342,6 +342,120 @@ async fn generation_env() -> (Arc<PeerManager>, Arc<UdpTransport>, SimulatedNat)
     (peers, Arc::new(transport), nat)
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_attach_waits_for_first_reader_poll_before_immediate_stun() {
+    let (_peers, transport, nat) = generation_env().await;
+    let (socket_index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    let mut attach = Box::pin(transport.attach_dynamic_punch_socket(
+        "peer-b",
+        socket_index,
+        socket.clone(),
+        0,
+        1,
+        None,
+    ));
+
+    // Poll only the attach future, without yielding to any spawned task.  It
+    // must reach the post-insert reader-ready handshake and remain pending;
+    // merely spawning the reader is not sufficient to complete the attach.
+    let first_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(attach.as_mut(), context))
+    })
+    .await;
+    assert!(
+        matches!(first_poll, std::task::Poll::Pending),
+        "attach returned before the spawned reader received its first poll"
+    );
+    assert!(
+        transport
+            .socket_state
+            .try_lock()
+            .expect("attach must not retain the socket-state lock while awaiting reader readiness")
+            .dynamic
+            .contains_key(&socket_index),
+        "the first poll must reach the post-insert reader-ready handshake"
+    );
+
+    let guard = timeout(Duration::from_secs(1), attach)
+        .await
+        .expect("the spawned reader must publish readiness")
+        .expect("the dynamic socket must attach");
+    let observations = transport
+        .measure_fresh_mapping_batch(
+            &socket,
+            &nat.observers,
+            FRESH_MAPPING_STUN_TIMEOUT,
+            || true,
+        )
+        .await;
+    assert_eq!(
+        observations.len(),
+        3,
+        "every immediate sequential observer response must reach the ready dynamic reader"
+    );
+
+    transport
+        .detach_dynamic_socket_by_index(socket_index, "reader_ready_test_complete")
+        .await;
+    drop(guard);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_reader_ready_ignores_prequeued_unrelated_datagram() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sender
+        .send_to(b"queued", receiver.local_addr().unwrap())
+        .await
+        .unwrap();
+    receiver
+        .readable()
+        .await
+        .expect("the unrelated datagram must be queued before the reader poll");
+
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let mut ready_tx = Some(ready_tx);
+    let mut first_buf = [0u8; 32];
+    let (first_len, _) = UdpTransport::recv_from_with_reader_ready(
+        &receiver,
+        &mut first_buf,
+        &mut ready_tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(&first_buf[..first_len], b"queued");
+    assert!(
+        matches!(
+            ready_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "consuming an already-queued packet must not acknowledge readiness for the next packet"
+    );
+
+    let mut next_buf = [0u8; 32];
+    let mut next_receive = Box::pin(UdpTransport::recv_from_with_reader_ready(
+        &receiver,
+        &mut next_buf,
+        &mut ready_tx,
+    ));
+    let first_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(
+            next_receive.as_mut(),
+            context,
+        ))
+    })
+    .await;
+    assert!(matches!(first_poll, std::task::Poll::Pending));
+    assert_eq!(ready_rx.await, Ok(true));
+
+    sender
+        .send_to(b"next", receiver.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (next_len, _) = next_receive.await.unwrap();
+    assert_eq!(&next_buf[..next_len], b"next");
+}
+
 /// Full measure-then-punch round trip through the simulated NAT.
 async fn run_generation_roundtrip(
     step: i16,
@@ -2102,6 +2216,7 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
 
     // 7 Direct peers fill most of the cap; the 8th socket is peer-0's own
     // predecessor (its current working path).
+    let mut direct_socket_guards = Vec::new();
     for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7"] {
         peers
             .add_peer(&peer_with_public_key(
@@ -2112,10 +2227,14 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
-        transport
+        let guard = transport
             .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1, None)
             .await
             .unwrap();
+        // A provisional socket is intentionally owned by its guard. Keep the
+        // owner alive while asserting capacity; dropping it is a request to
+        // detach the socket, not a harmless temporary-value cleanup.
+        direct_socket_guards.push(guard);
         peers.record_direct_success_for_generation(peer_id, None, 0).await;
     }
     let (predecessor_index, predecessor_socket) = transport.bind_fresh_punch_socket().await.unwrap();
@@ -2164,6 +2283,7 @@ async fn dynamic_socket_cap_holds_under_concurrent_attach() {
     let transport = transport.with_inbound_channel(tx);
 
     // 8 non-Direct peers fill the cap.
+    let mut socket_guards = Vec::new();
     for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8"] {
         peers
             .add_peer(&peer_with_public_key(
@@ -2174,10 +2294,11 @@ async fn dynamic_socket_cap_holds_under_concurrent_attach() {
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
-        transport
+        let guard = transport
             .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1, None)
             .await
             .unwrap();
+        socket_guards.push(guard);
     }
     assert_eq!(transport.dynamic_socket_count().await, 8);
 
@@ -2199,29 +2320,32 @@ async fn dynamic_socket_cap_holds_under_concurrent_attach() {
             let result = transport
                 .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1, None)
                 .await;
-            (peer_id, index, result.is_ok())
+            (peer_id, index, result.ok())
         }));
     }
-    let accepted = timeout(Duration::from_secs(30), async {
+    let (accepted, mut accepted_guards) = timeout(Duration::from_secs(30), async {
         let mut accepted = 0usize;
+        let mut accepted_guards = Vec::new();
         for task in tasks {
-            let (peer_id, index, ok) = task.await.unwrap();
-            if ok {
+            let (peer_id, index, guard) = task.await.unwrap();
+            if let Some(guard) = guard {
                 accepted += 1;
                 transport
                     .remember_peer_socket(peer_id, index, SocketEvidence::Stamped(0))
                     .await;
+                accepted_guards.push(guard);
             }
         }
-        accepted
+        (accepted, accepted_guards)
     })
     .await
     .expect("concurrent attaches must finish without deadlock");
+    socket_guards.append(&mut accepted_guards);
     assert!(accepted >= 4, "eviction must admit some of the 12 attach attempts");
     let count = transport.dynamic_socket_count().await;
-    assert!(
-        count <= MAX_DYNAMIC_PUNCH_SOCKETS,
-        "the cap must hold under concurrent attach, got {count}"
+    assert_eq!(
+        count, MAX_DYNAMIC_PUNCH_SOCKETS,
+        "every accepted attach must retain a live slot while its owner is held"
     );
     // Affinity never points at an evicted socket: every dynamic pin resolves.
     let state = transport.socket_state.lock().await;

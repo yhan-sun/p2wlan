@@ -114,7 +114,7 @@ impl UdpTransport {
                 .send_to(&encoded, server)
                 .await
                 .map_err(|error| format!("send_to failed: {error}"))?;
-            let (data, source) = timeout(stun_timeout, response_rx)
+            let StunResponse { data, source } = timeout(stun_timeout, response_rx)
                 .await
                 .map_err(|_| format!("no response from {server} after {stun_timeout:?}"))?
                 .map_err(|_| "STUN response dispatcher closed".to_string())?;

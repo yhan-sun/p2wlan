@@ -2,7 +2,10 @@ type ProbeNonce = [u8; 8];
 type PendingProbes = Arc<Mutex<HashMap<ProbeNonce, PendingProbe>>>;
 type HardHardProbeBindings = Arc<Mutex<HashMap<ProbeNonce, String>>>;
 type StunTransactionId = [u8; 12];
-type StunResponse = (Vec<u8>, SocketAddr);
+struct StunResponse {
+    data: Vec<u8>,
+    source: SocketAddr,
+}
 type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 /// Bounded, per-peer newest-wins ingress for peer-reflexive observations.
 ///
@@ -113,6 +116,25 @@ pub(crate) struct HeartbeatSendGate {
 
 #[cfg(test)]
 impl HeartbeatSendGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Barrier::new(2),
+        }
+    }
+}
+
+/// Deterministic one-shot seam after UDP lifecycle cleanup but before the
+/// remote-incarnation reset is published. The transaction still owns the
+/// peer adoption lock while parked here.
+#[cfg(test)]
+pub(crate) struct RemoteIncarnationCleanupGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl RemoteIncarnationCleanupGate {
     pub(crate) fn new() -> Self {
         Self {
             reached: tokio::sync::Notify::new(),
@@ -838,6 +860,9 @@ pub(crate) enum DynamicSocketAttachError {
     /// The transport has no inbound channel, so the socket reader could not
     /// deliver anything; the attach is rolled back.
     NoInboundChannel,
+    /// The spawned reader exited or failed to poll its socket within the
+    /// bounded startup handshake; the provisional attach is rolled back.
+    ReaderStartupFailed,
 }
 
 /// Outcome of one fresh-mapping punch generation.

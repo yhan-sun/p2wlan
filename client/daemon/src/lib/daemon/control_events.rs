@@ -144,39 +144,135 @@ enum OfferIngressVerdict {
     RateLimited,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteIncarnationResetWork {
+    ClearAll,
+    PreserveInitiator,
+    PreserveResponder,
+}
+
 impl Daemon {
     /// A same-node remote restart is identified by the encoded candidate
     /// generation carried in its offer. Keep this narrow: endpoint metadata is
     /// also changed by ordinary NAT churn and is not safe as a lifecycle
     /// signal. The arbiter covers the short state boundary; UDP cleanup then
     /// invalidates late probes and dynamic socket adoption.
+    #[cfg(test)]
     async fn reset_peer_for_remote_incarnation_if_needed(
         &self,
         peer_id: &str,
         candidate_generation: u64,
+        pending_work: RemoteIncarnationResetWork,
     ) -> bool {
+        self.reset_peer_for_remote_incarnation_if_needed_for_identity(
+            peer_id,
+            candidate_generation,
+            None,
+            pending_work,
+        )
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Identity-aware production preflight. `None` means the signal belonged
+    /// to a retired public key and must be dropped wholesale; `Some(changed)`
+    /// preserves the original restart-result contract for legacy callers.
+    async fn reset_peer_for_remote_incarnation_if_needed_for_identity(
+        &self,
+        peer_id: &str,
+        candidate_generation: u64,
+        sender_public_key: Option<&str>,
+        pending_work: RemoteIncarnationResetWork,
+    ) -> Option<bool> {
         let handshake_guard = self.handshake_arbiter.acquire(peer_id).await;
-        let changed = self
+        let claim = self
             .peers
-            .reset_peer_session_if_remote_incarnation_changed(
+            .claim_remote_candidate_incarnation_for_identity(
                 peer_id,
                 candidate_generation,
-                "remote_incarnation_changed",
+                sender_public_key,
             )
             .await;
-        if !changed {
-            drop(handshake_guard);
-            return false;
-        }
+        let (old_incarnation, claimed_incarnation) = match claim {
+            crate::peer::RemoteCandidateIncarnationClaim::IdentityMismatch => {
+                drop(handshake_guard);
+                self.peers
+                    .record_direct_event(
+                        peer_id,
+                        "remote_signal_stale_identity",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "ignored signal before incarnation/handshake/candidate mutation candidate_generation={candidate_generation}"
+                        ),
+                    )
+                    .await;
+                self.timeline.emit(
+                    "remote_signal_rejected",
+                    None,
+                    Some("stale_sender_identity"),
+                    Some(format!(
+                        "peer={peer_id} candidate_generation={candidate_generation}"
+                    )),
+                );
+                return None;
+            }
+            crate::peer::RemoteCandidateIncarnationClaim::NoReset => {
+                drop(handshake_guard);
+                return Some(false);
+            }
+            crate::peer::RemoteCandidateIncarnationClaim::Reset {
+                old_incarnation,
+                new_incarnation,
+            } => (old_incarnation, new_incarnation),
+        };
+
+        // Stop old key material and UDP adoption before resetting/publishing
+        // the claimed lifecycle. An old Probe handler either finishes before
+        // cleanup and is erased by the final reset, or resumes afterwards with
+        // a retired PeerSessionGeneration and fails closed.
         self.transport.remove_session(peer_id).await;
-        self.pending_handshakes.lock().await.clear_peer(peer_id);
-        drop(handshake_guard);
         self.punch_attempts.cancel(peer_id);
-        if let Some(udp) = self.udp_transport.read().await.clone() {
-            udp.cleanup_peer_lifecycle(peer_id, "remote_incarnation_changed", false)
-                .await;
+        let udp_slot = self.udp_transport.read().await;
+        let changed = if let Some(udp) = udp_slot.clone() {
+            // Hold the UDP adoption fence from cleanup through lifecycle
+            // publication. A Probe packet verified under the old
+            // PeerSessionGeneration can no longer adopt in the former gap.
+            udp.cleanup_peer_lifecycle_and_finish_remote_incarnation_reset(
+                peer_id,
+                "remote_incarnation_changed",
+                old_incarnation,
+                claimed_incarnation,
+            )
+            .await
+        } else {
+            // The transport slot's read guard prevents a replacement UDP
+            // publication until the reset has been committed.
+            self.peers
+                .finish_claimed_remote_incarnation_reset(
+                    peer_id,
+                    old_incarnation,
+                    claimed_incarnation,
+                    "remote_incarnation_changed",
+                )
+                .await
+        };
+        if changed {
+            let mut pending = self.pending_handshakes.lock().await;
+            match pending_work {
+                RemoteIncarnationResetWork::ClearAll => pending.clear_peer(peer_id),
+                RemoteIncarnationResetWork::PreserveInitiator => {
+                    pending.clear_peer_except_pending_initiator(peer_id)
+                }
+                RemoteIncarnationResetWork::PreserveResponder => {
+                    pending.clear_peer_except_responder_owner(peer_id)
+                }
+            }
         }
-        true
+        drop(udp_slot);
+        drop(handshake_guard);
+        Some(changed)
     }
 
     /// Decide whether an offer may touch candidate-plane state.
@@ -319,6 +415,10 @@ enum FreshPunchDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HardHardOfferHandling {
     NotHardHard,
+    /// The authenticated fresh window remains usable, but the local
+    /// Hard↔Hard optimization did not acquire a worker.  Continue through the
+    /// ordinary fresh-punch path instead of swallowing the offer.
+    Fallback,
     Rejected,
     Started,
 }
@@ -345,7 +445,7 @@ impl Daemon {
         };
 
         self.peers.add_peer(&peer_info).await;
-        let restored = self.peers.peer_exists(peer_id).await;
+        let restored = self.peers.peer_exists_sync(peer_id);
         if restored {
             self.timeline.emit(
                 "peer_offer_identity_restored",
@@ -418,7 +518,10 @@ impl Daemon {
                 .clear_hard_hard_sessions(Some(&offer.from_node_id))
                 .await;
         }
-        if hard_hard_handling != HardHardOfferHandling::NotHardHard {
+        if matches!(
+            hard_hard_handling,
+            HardHardOfferHandling::Rejected | HardHardOfferHandling::Started
+        ) {
             return;
         }
         match fresh_punch {
@@ -535,10 +638,10 @@ impl Daemon {
             return HardHardOfferHandling::Rejected;
         };
         let Some(udp) = self.udp_transport.read().await.clone() else {
-            return HardHardOfferHandling::Rejected;
+            return HardHardOfferHandling::Fallback;
         };
         let Some(signal) = self.hole_punch_signal_context().await else {
-            return HardHardOfferHandling::Rejected;
+            return HardHardOfferHandling::Fallback;
         };
         match coordination.role {
             HardHardRole::Initiator => {
@@ -549,7 +652,7 @@ impl Daemon {
                 self.peers
                     .clear_hard_hard_sessions(Some(peer_id))
                     .await;
-                spawn_hard_hard_responder(
+                match spawn_hard_hard_responder(
                     udp,
                     self.peers.clone(),
                     self.punch_attempts.clone(),
@@ -559,8 +662,12 @@ impl Daemon {
                     punch_at_ms,
                     frozen_targets,
                 )
-                .await;
-                HardHardOfferHandling::Started
+                .await
+                {
+                    HardHardRemoteStart::Started => HardHardOfferHandling::Started,
+                    HardHardRemoteStart::NotStarted => HardHardOfferHandling::Fallback,
+                    HardHardRemoteStart::Rejected => HardHardOfferHandling::Rejected,
+                }
             }
             HardHardRole::Responder => {
                 let current_remote_candidate_epoch = self
@@ -595,7 +702,7 @@ impl Daemon {
                     }
                     crate::peer::HardHardResponseAdmission::Ready => {}
                 }
-                spawn_hard_hard_initiator_response(
+                match spawn_hard_hard_initiator_response(
                     udp,
                     self.peers.clone(),
                     self.punch_attempts.clone(),
@@ -604,8 +711,12 @@ impl Daemon {
                     frozen_targets,
                     punch_at_ms,
                 )
-                .await;
-                HardHardOfferHandling::Started
+                .await
+                {
+                    HardHardRemoteStart::Started => HardHardOfferHandling::Started,
+                    HardHardRemoteStart::NotStarted => HardHardOfferHandling::Fallback,
+                    HardHardRemoteStart::Rejected => HardHardOfferHandling::Rejected,
+                }
             }
         }
     }
@@ -1188,11 +1299,30 @@ impl Daemon {
                 offer = newest;
                 continue;
             }
-            self.reset_peer_for_remote_incarnation_if_needed(
-                &offer.from_node_id,
-                offer.candidate_generation,
-            )
-            .await;
+            if self
+                .reset_peer_for_remote_incarnation_if_needed_for_identity(
+                    &offer.from_node_id,
+                    offer.candidate_generation,
+                    offer.sender_public_key.as_deref(),
+                    RemoteIncarnationResetWork::PreserveResponder,
+                )
+                .await
+                .is_none()
+            {
+                // The queued signal belongs to a retired public-key identity.
+                // Finish this exact owner turn normally so a newer queued offer
+                // can run and the per-peer responder lane cannot stay wedged.
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .await
+                    .finish_responder_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
             // The peer is now registered. Answer the encrypted initiation
             // before candidate/fresh-prediction work, for the same reason as
             // the normal known-peer path: a delayed candidate plane must not
@@ -1212,14 +1342,7 @@ impl Daemon {
             // state: duplicates and rate-limited retransmissions never apply
             // candidates, never run a fresh transaction and never trigger a
             // punch — the handshake part below is still answered.
-            let (_fresh_verdict, candidate_apply_result, fresh_punch) = if offer.ingress_suppressed
-            {
-                (
-                    FreshSignalVerdict::None,
-                    CandidateSetApplyResult::IgnoredStale,
-                    FreshPunchDecision::None,
-                )
-            } else if self
+            let (_fresh_verdict, candidate_apply_result, fresh_punch) = if self
                 .offer_ingress_verdict(
                     &offer.from_node_id,
                     &offer.candidates,
@@ -1337,10 +1460,12 @@ impl Daemon {
         peer_id: &str,
         sender_public_key: Option<&str>,
     ) -> bool {
-        let Some(sender_public_key) = sender_public_key.map(str::trim).filter(|key| !key.is_empty())
-        else {
+        let Some(sender_public_key) = sender_public_key.map(str::trim) else {
             return true;
         };
+        if sender_public_key.is_empty() {
+            return false;
+        }
         let Some(connection) = self.peers.get_connection(peer_id).await else {
             return false;
         };
@@ -1474,12 +1599,13 @@ impl Daemon {
         let (candidate_apply_result, fresh_punch) = match fresh_verdict {
             FreshSignalVerdict::None => (
                 self.peers
-                    .add_candidates_with_metadata(
+                    .add_candidates_with_metadata_for_identity(
                         from_node_id,
                         candidates,
                         candidate_sources,
                         candidate_generation,
                         candidates_expires_at_ms,
+                        sender_public_key,
                     )
                     .await,
                 FreshPunchDecision::None,
@@ -1487,13 +1613,14 @@ impl Daemon {
             FreshSignalVerdict::Accepted(id) => {
                 let apply_result = self
                     .peers
-                    .apply_remote_fresh_candidates(
+                    .apply_remote_fresh_candidates_for_identity(
                         from_node_id,
                         id,
                         candidates,
                         candidate_sources,
                         candidate_generation,
                         candidates_expires_at_ms,
+                        sender_public_key,
                     )
                     .await;
                 if apply_result != CandidateSetApplyResult::Applied {
@@ -1516,7 +1643,11 @@ impl Daemon {
                     (apply_result, FreshPunchDecision::None)
                 } else if self
                     .peers
-                    .commit_remote_fresh_prediction(from_node_id, id)
+                    .commit_remote_fresh_prediction_for_identity(
+                        from_node_id,
+                        id,
+                        sender_public_key,
+                    )
                     .await
                 {
                     // The identity is committed with an immutable snapshot:
@@ -1948,6 +2079,14 @@ impl Daemon {
                 }
 
                 ControlEvent::PeerUpdated(peer_info) => {
+                    // Public-key/offline publication and old-session removal
+                    // are one handshake lifecycle boundary. Offer/answer
+                    // workers re-check the server-bound sender key while they
+                    // own this same arbiter, so they can observe wholly before
+                    // or wholly after the update, never between `add_peer` and
+                    // the retired session cleanup.
+                    let peer_update_handshake_guard =
+                        self.handshake_arbiter.acquire(&peer_info.node_id).await;
                     let previous = self.peers.get_connection(&peer_info.node_id).await;
                     let update = self.peers.add_peer(&peer_info).await;
                     if !peer_info.online {
@@ -1955,19 +2094,12 @@ impl Daemon {
                             &mut deferred_initiators,
                             &peer_info.node_id,
                         );
-                        {
-                            // Linearize lifecycle cleanup with the short
-                            // offer/answer mutation phase.  The handler drops
-                            // this arbiter before STUN/HTTP, so offline state
-                            // never waits for a slow control-plane request.
-                            let _handshake_guard =
-                                self.handshake_arbiter.acquire(&peer_info.node_id).await;
-                            self.transport.remove_session(&peer_info.node_id).await;
-                            self.pending_handshakes
-                                .lock()
-                                .await
-                                .clear_peer(&peer_info.node_id);
-                        }
+                        self.transport.remove_session(&peer_info.node_id).await;
+                        self.pending_handshakes
+                            .lock()
+                            .await
+                            .clear_peer(&peer_info.node_id);
+                        drop(peer_update_handshake_guard);
                         self.punch_attempts.cancel(&peer_info.node_id);
                         self.peers
                             .clear_fresh_mapping(&peer_info.node_id, "peer_offline")
@@ -2004,18 +2136,12 @@ impl Daemon {
                             &mut deferred_initiators,
                             &peer_info.node_id,
                         );
-                        {
-                            // See the offline path above: a stale worker can
-                            // neither stage after this identity cleanup nor
-                            // commit once its owner is cancelled.
-                            let _handshake_guard =
-                                self.handshake_arbiter.acquire(&peer_info.node_id).await;
-                            self.transport.remove_session(&peer_info.node_id).await;
-                            self.pending_handshakes
-                                .lock()
-                                .await
-                                .clear_peer(&peer_info.node_id);
-                        }
+                        self.transport.remove_session(&peer_info.node_id).await;
+                        self.pending_handshakes
+                            .lock()
+                            .await
+                            .clear_peer(&peer_info.node_id);
+                        drop(peer_update_handshake_guard);
                         info!(
                             "Peer {} public key changed; discarded the old WireGuard session",
                             peer_info.node_id
@@ -2037,15 +2163,18 @@ impl Daemon {
                             )
                             .await;
                         }
-                    } else if update.endpoint_changed {
-                        // Endpoint metadata changes are normal NAT/candidate
-                        // churn.  They must not tear down a confirmed relay or
-                        // WireGuard session. A same-node restart is reset only
-                        // when a later peer offer carries a different encoded
-                        // candidate-generation incarnation.
-                        self.punch_attempts.cancel(&peer_info.node_id);
-                        if let Some(udp) = self.udp_transport.read().await.clone() {
-                            udp.clear_pending_probes_for_peer(&peer_info.node_id).await;
+                    } else {
+                        drop(peer_update_handshake_guard);
+                        if update.endpoint_changed {
+                            // Endpoint metadata changes are normal NAT/candidate
+                            // churn. They must not tear down a confirmed relay or
+                            // WireGuard session. A same-node restart is reset only
+                            // when a later peer offer carries a different encoded
+                            // candidate-generation incarnation.
+                            self.punch_attempts.cancel(&peer_info.node_id);
+                            if let Some(udp) = self.udp_transport.read().await.clone() {
+                                udp.clear_pending_probes_for_peer(&peer_info.node_id).await;
+                            }
                         }
                     }
                     let was_offline = previous.as_ref().is_some_and(|peer| !peer.online);
@@ -2139,7 +2268,8 @@ impl Daemon {
                         self.pending_handshakes.lock().await.clear_peer(&node_id);
                     }
                     self.punch_attempts.cancel(&node_id);
-                    if let Some(udp) = self.udp_transport.read().await.clone() {
+                    let udp_slot = self.udp_transport.read().await;
+                    if let Some(udp) = udp_slot.clone() {
                         // One atomic lifecycle cleanup under the peer's
                         // adoption lock: the connection removal, the pending
                         // probe drop with the cleanup-epoch bump, the dynamic
@@ -2151,6 +2281,11 @@ impl Daemon {
                         // later rejoins under the same node ID.
                         udp.cleanup_peer_lifecycle(&node_id, "peer_left", true)
                             .await;
+                    } else {
+                        // The control consumer can run before the UDP task
+                        // publishes its transport. Structural membership
+                        // removal must not depend on that optional handle.
+                        self.peers.remove_peer(&node_id).await;
                     }
                 }
 
@@ -2205,7 +2340,7 @@ impl Daemon {
                     // state.  Enqueue the complete newest offer under the
                     // existing per-peer owner and replay it once registration
                     // becomes visible.
-                    if !self.peers.peer_exists(&from_node_id).await {
+                    if !self.peers.peer_exists_sync(&from_node_id) {
                         // Wake the peer poll immediately: the regular cadence
                         // can be seconds away and a cold-start handshake must
                         // not wait it out.
@@ -2235,7 +2370,6 @@ impl Daemon {
                                 punch_at_server_ms,
                                 session_id: session_id.clone(),
                                 probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                ingress_suppressed: false,
                             })
                         };
                         if let Some((reservation, offer)) = admitted {
@@ -2296,7 +2430,6 @@ impl Daemon {
                                 punch_at_server_ms,
                                 session_id: session_id.clone(),
                                 probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                ingress_suppressed: false,
                             })
                         };
                         if let Some((reservation, offer)) = admitted {
@@ -2335,11 +2468,21 @@ impl Daemon {
                         continue;
                     }
 
-                    self.reset_peer_for_remote_incarnation_if_needed(
-                        &from_node_id,
-                        candidate_generation,
-                    )
-                    .await;
+                    if self
+                        .reset_peer_for_remote_incarnation_if_needed_for_identity(
+                            &from_node_id,
+                            candidate_generation,
+                            sender_public_key.as_deref(),
+                            RemoteIncarnationResetWork::ClearAll,
+                        )
+                        .await
+                        .is_none()
+                    {
+                        debug!(
+                            "Ignored peer offer from {from_node_id}: signal sender public key is stale"
+                        );
+                        continue;
+                    }
                     // Admit the latency-critical responder before touching
                     // candidate/fresh-prediction state.  A candidate refresh
                     // may wait on STUN/HTTP or the general slow-work budget;
@@ -2361,7 +2504,6 @@ impl Daemon {
                                 punch_at_server_ms,
                                 session_id: session_id.clone(),
                                 probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                ingress_suppressed: false,
                             })
                         };
                         if let Some((reservation, offer)) = admitted {
@@ -2521,7 +2663,10 @@ impl Daemon {
                             .clear_hard_hard_sessions(Some(&from_node_id))
                             .await;
                     }
-                    if hard_hard_handling != HardHardOfferHandling::NotHardHard {
+                    if matches!(
+                        hard_hard_handling,
+                        HardHardOfferHandling::Rejected | HardHardOfferHandling::Started
+                    ) {
                         continue;
                     }
                     match fresh_punch {
@@ -2602,7 +2747,7 @@ impl Daemon {
                     // its sender: wake the peer poll so the pending initiator
                     // transaction can be consumed without waiting out the
                     // regular cadence.
-                    if !self.peers.peer_exists(&from_node_id).await {
+                    if !self.peers.peer_exists_sync(&from_node_id) {
                         self.control.refresh_peers_now();
                     }
                     self.peers
@@ -2618,6 +2763,29 @@ impl Daemon {
                             ),
                         )
                         .await;
+                    // The answer can be the first signal observed after the
+                    // remote daemon restarted. Fence the retired transport but
+                    // preserve the exact local initiator that this answer is
+                    // about to complete.
+                    if self
+                        .reset_peer_for_remote_incarnation_if_needed_for_identity(
+                            &from_node_id,
+                            candidate_generation,
+                            sender_public_key.as_deref(),
+                            if handshake_response.is_empty() {
+                                RemoteIncarnationResetWork::ClearAll
+                            } else {
+                                RemoteIncarnationResetWork::PreserveInitiator
+                            },
+                        )
+                        .await
+                        .is_none()
+                    {
+                        debug!(
+                            "Ignored peer answer from {from_node_id}: signal sender public key is stale"
+                        );
+                        continue;
+                    }
                     // Consume the WireGuard answer before candidate refresh or
                     // fresh-mapping work. Those paths may perform HTTP/STUN
                     // I/O and must remain a background upgrade; delaying the
@@ -2639,11 +2807,12 @@ impl Daemon {
                             )
                             .await;
                         if let Err(err) = self
-                            .handle_peer_answer(
+                            .handle_peer_answer_for_identity(
                                 &from_node_id,
                                 &handshake_response,
                                 session_id.clone(),
                                 probe_ephemeral_public_key.clone(),
+                                sender_public_key.as_deref(),
                             )
                             .await
                         {
@@ -2720,7 +2889,7 @@ impl Daemon {
                     // A peer-reflexive observation may arrive before the
                     // peer-list poll registers the sender; wake the poll so a
                     // cold-start handshake is not delayed by the cadence.
-                    if !self.peers.peer_exists(&from_node_id).await {
+                    if !self.peers.peer_exists_sync(&from_node_id) {
                         self.control.refresh_peers_now();
                     }
                     let work = PendingPeerReflexive {

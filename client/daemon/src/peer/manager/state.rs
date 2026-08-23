@@ -58,10 +58,180 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) cancellation: Arc<crate::PunchSessionCancellation>,
 }
 
+/// Hard ceiling for remote identity tombstones retained after `PeerLeft`.
+///
+/// The ledger is only a cross-connection replay fence; a live connection keeps
+/// its own generation and incarnation high-waters. Recent departures are
+/// touched before their connection is removed, so ordinary leave/rejoin races
+/// retain both fences while unbounded node-ID churn cannot grow process memory
+/// forever.
+const MAX_REMOTE_IDENTITY_TOMBSTONES: usize = 4_096;
+
+#[derive(Debug, Clone)]
+struct RemoteIdentityTombstone {
+    public_key: String,
+    candidate_incarnation_high_water: Option<u64>,
+    /// Highest encoded candidate revision that must be rejected for this exact
+    /// public-key identity. Usually this is the last accepted generation. While
+    /// a newer incarnation is claimed but not yet applied, it is that incoming
+    /// generation's strict predecessor, so the trigger itself remains
+    /// admissible while lower same-boot counters are fenced across PeerLeft.
+    /// Legacy clock generations are deliberately never persisted.
+    candidate_generation_replay_floor: u64,
+}
+
+#[derive(Debug, Default)]
+struct RemoteIdentityLedger {
+    entries: HashMap<String, RemoteIdentityTombstone>,
+    /// Oldest-to-newest insertion/touch order. Each node ID occurs exactly once.
+    order: VecDeque<String>,
+}
+
+impl RemoteIdentityLedger {
+    fn get(&self, node_id: &str) -> Option<&RemoteIdentityTombstone> {
+        self.entries.get(node_id)
+    }
+
+    /// Insert or refresh one identity at the newest end of the bounded ledger.
+    fn upsert_and_touch(
+        &mut self,
+        node_id: &str,
+        public_key: &str,
+        candidate_incarnation_high_water: Option<u64>,
+        candidate_generation_replay_floor: u64,
+    ) {
+        let candidate_generation_replay_floor =
+            if crate::control::candidate_generation_incarnation(candidate_generation_replay_floor)
+                .is_some()
+            {
+                candidate_generation_replay_floor
+            } else {
+                0
+            };
+        if self.entries.contains_key(node_id) {
+            self.order.retain(|known| known != node_id);
+        }
+        let (candidate_incarnation_high_water, candidate_generation_replay_floor) = self
+            .entries
+            .get(node_id)
+            .filter(|identity| identity.public_key == public_key)
+            .map_or(
+                (
+                    candidate_incarnation_high_water,
+                    candidate_generation_replay_floor,
+                ),
+                |identity| {
+                    (
+                        match (
+                            identity.candidate_incarnation_high_water,
+                            candidate_incarnation_high_water,
+                        ) {
+                            (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+                            (existing, incoming) => existing.or(incoming),
+                        },
+                        identity
+                            .candidate_generation_replay_floor
+                            .max(candidate_generation_replay_floor),
+                    )
+                },
+            );
+        self.entries.insert(
+            node_id.to_string(),
+            RemoteIdentityTombstone {
+                public_key: public_key.to_string(),
+                candidate_incarnation_high_water,
+                candidate_generation_replay_floor,
+            },
+        );
+        self.order.push_back(node_id.to_string());
+        while self.entries.len() > MAX_REMOTE_IDENTITY_TOMBSTONES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    /// Raise the incarnation high-water without turning high-volume candidate
+    /// refreshes into O(n) recency-list updates.
+    fn record_candidate_incarnation(&mut self, node_id: &str, public_key: &str, incarnation: u64) {
+        if let Some(identity) = self.entries.get_mut(node_id) {
+            if identity.public_key == public_key {
+                identity.candidate_incarnation_high_water = Some(
+                    identity
+                        .candidate_incarnation_high_water
+                        .map_or(incarnation, |accepted| accepted.max(incarnation)),
+                );
+                return;
+            }
+            identity.public_key = public_key.to_string();
+            identity.candidate_incarnation_high_water = Some(incarnation);
+            identity.candidate_generation_replay_floor = 0;
+            return;
+        }
+        self.upsert_and_touch(node_id, public_key, Some(incarnation), 0);
+    }
+
+    /// Raise the candidate-generation replay floor without changing tombstone
+    /// recency. The value is either a completely accepted generation or the
+    /// strict predecessor published during ingress preflight. This complements
+    /// the independently claimed incarnation high-water: a PeerLeft/readd with
+    /// the same key must reject both an older boot and an older/equal counter
+    /// in the same boot.
+    fn record_candidate_generation_replay_floor(
+        &mut self,
+        node_id: &str,
+        public_key: &str,
+        generation: u64,
+    ) {
+        // Legacy generations are wall-clock based and may legitimately move
+        // backwards after PeerLeft. They have no daemon-incarnation namespace,
+        // so persisting them would strand a same-key legacy rejoin.
+        if crate::control::candidate_generation_incarnation(generation).is_none() {
+            return;
+        }
+        if let Some(identity) = self.entries.get_mut(node_id) {
+            if identity.public_key == public_key {
+                identity.candidate_generation_replay_floor =
+                    identity.candidate_generation_replay_floor.max(generation);
+                return;
+            }
+            identity.public_key = public_key.to_string();
+            identity.candidate_incarnation_high_water =
+                crate::control::candidate_generation_incarnation(generation);
+            identity.candidate_generation_replay_floor = generation;
+            return;
+        }
+        self.upsert_and_touch(
+            node_id,
+            public_key,
+            crate::control::candidate_generation_incarnation(generation),
+            generation,
+        );
+    }
+}
+
+#[cfg(test)]
+type AuthenticatedProbeVerifyGateSlot =
+    Arc<std::sync::Mutex<Option<(String, Arc<AuthenticatedProbeVerifyGate>)>>>;
+
 /// Manages all peer connections.
 pub struct PeerManager {
     /// Active peer connections, indexed by node ID.
     connections: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    /// No-await mirror of connection-map membership and peer lifecycle.
+    ///
+    /// The serial control-signal consumer must be able to decide whether an
+    /// offer raced PeerJoined without waiting behind an unrelated, long-lived
+    /// `connections` writer. The same mirror also gives UDP adoption paths a
+    /// precise lifecycle fence instead of treating `try_read` contention as a
+    /// missing peer. Structural add/remove, identity, online, and remote
+    /// incarnation transitions update this state while they own the network
+    /// epoch and connection writer; ordinary metadata/endpoint refreshes do
+    /// not rotate the session generation.
+    peer_membership: Arc<std::sync::Mutex<PeerMembershipState>>,
+    #[cfg(test)]
+    authenticated_probe_verify_gate: AuthenticatedProbeVerifyGateSlot,
     /// Last complete diagnostics snapshot.  Diagnostics must never turn a
     /// contended connection writer into a false empty roster; the snapshot is
     /// only a fallback while the live lock is unavailable.
@@ -143,14 +313,17 @@ pub struct PeerManager {
     /// commit can roll exactly its own candidates back.
     pending_fresh_applies:
         Arc<std::sync::Mutex<HashMap<(String, crate::FreshPredictionId), PendingFreshApply>>>,
-    /// The last public key each node ID joined with, surviving `remove_peer`.
+    /// Bounded identity tombstones surviving `remove_peer`.
     ///
     /// The remote fresh-prediction space is bound to the peer's identity: a
     /// PeerLeft followed by a rejoin with a NEW public key must not inherit
     /// the old incarnation's high-water (its predictions would be judged
     /// stale forever).  The identity map outlives the connection so
-    /// `add_peer` can compare the rejoining key even when `is_new`.
-    remote_fresh_identity_keys: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// `add_peer` can compare the rejoining key even when `is_new`. The same
+    /// entry retains the encoded candidate-incarnation high-water, preventing
+    /// a delayed old signal from becoming fresh merely because PeerLeft
+    /// removed the live connection.
+    remote_identity_ledger: Arc<std::sync::Mutex<RemoteIdentityLedger>>,
     /// Synchronous mirror of which peers are currently Direct.
     ///
     /// Kept in lockstep with every `ConnectionState` transition (the single
@@ -170,6 +343,10 @@ pub struct PeerManager {
     /// budgets (probe credit, fresh generations, HTTP publishes) and the
     /// feedback-driven stage machine.
     recovery_epochs: Arc<RwLock<HashMap<String, RecoveryEpochState>>>,
+    /// Process-monotonic identity for concrete recovery-epoch allocations.
+    /// Numeric per-peer epochs restart after teardown, so delayed reservations
+    /// use this non-reused allocation ID to fail closed across epoch ABA.
+    recovery_epoch_allocation_id: std::sync::atomic::AtomicU64,
     /// Outbound-UDP liveness verdict cache, keyed by `(peer_id, generation)`.
     /// TTL-bounded (`config.network.udp_liveness_ttl_ms`) and invalidated on
     /// generation change (a new egress IP makes the old verdict meaningless —
@@ -226,10 +403,6 @@ pub struct PeerManager {
     /// Hook cancelling the transport-owned relay-backoff heartbeat when a
     /// peer becomes Direct, leaves, or loses its relay safety net.
     relay_backoff_heartbeat_cancel_hook: PunchCancelHookSlot,
-    /// Hook requesting an immediate, bounded candidate re-publication and
-    /// synchronized direct retry after a direct probe has failed.  The hook
-    /// is installed by the daemon's UDP runtime and must be nonblocking.
-    direct_recovery_kick_hook: DirectRecoveryKickHookSlot,
     /// Optional per-process connection timeline.  The daemon installs it after
     /// construction; path-confirmation events (`first_direct_probe_sent`,
     /// `relay_peer_confirmed`, `direct_promoted`) emit through it, no-oping

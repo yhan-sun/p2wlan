@@ -71,12 +71,11 @@ impl PeerManager {
         // RelayBackoff here would short-circuit that progression and cap the
         // scan at 96 ports forever.  Only true hard failures (send errors,
         // handshake timeouts) call `mark_recovery_relay_backoff` explicitly.
-        let (probed_sources, request_recovery_kick) = {
+        let probed_sources = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
-            let request_recovery_kick = conn.online && conn.state != ConnectionState::Closed;
             let code = code.into();
             conn.direct_health
                 .record_failure(code.clone(), reason.clone());
@@ -115,15 +114,9 @@ impl PeerManager {
                     conn.direct_health.last_error.as_deref().unwrap_or("direct path failed")
                 );
             }
-            (probed_sources, request_recovery_kick)
+            probed_sources
         };
         self.record_traversal_failures(probed_sources).await;
-        if request_recovery_kick {
-            // The callback is deliberately invoked only after the connection
-            // lock is released.  It must be nonblocking and may spawn the
-            // candidate publication / punch retry asynchronously.
-            self.request_direct_recovery_kick(node_id);
-        }
         true
     }
 

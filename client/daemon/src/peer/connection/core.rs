@@ -156,6 +156,14 @@ pub struct PeerConnection {
     /// Newer candidate sets replace older ones; generation 0 remains valid for
     /// legacy peers that have not yet been upgraded.
     last_candidate_generation: u64,
+    /// Highest encoded remote daemon incarnation observed for this identity.
+    ///
+    /// This must not be derived from `last_candidate_generation`: a remote
+    /// restart clears candidate/path state before the replacement signal is
+    /// applied, and a second restart can arrive through the deferred responder
+    /// lane during that gap. Keeping the incarnation high-water independent
+    /// prevents an older deferred signal from rotating the lifecycle backwards.
+    remote_candidate_incarnation_high_water: Option<u64>,
     /// Local monotonic epoch for the accepted remote candidate set. This is
     /// intentionally separate from the wire generation because legacy peers
     /// may repeatedly publish generation `0`.
@@ -355,6 +363,7 @@ impl PeerConnection {
             candidates: Vec::new(),
             signaled_candidates: HashSet::new(),
             last_candidate_generation: 0,
+            remote_candidate_incarnation_high_water: None,
             remote_candidate_epoch: 0,
             local_interface_networks: Vec::new(),
             last_candidates_expires_at_ms: None,
@@ -398,6 +407,7 @@ impl PeerConnection {
         self.candidates.clear();
         self.signaled_candidates.clear();
         self.last_candidate_generation = 0;
+        self.remote_candidate_incarnation_high_water = None;
         self.remote_candidate_epoch = 0;
         self.last_candidates_expires_at_ms = None;
         self.candidate_sources.clear();
@@ -431,14 +441,18 @@ impl PeerConnection {
     /// Reset all transport/path state for a new remote daemon session while
     /// retaining the peer's long-lived identity and Probe MAC key.
     ///
-    /// A control-plane endpoint change is stronger than a candidate refresh:
+    /// A remote daemon incarnation change is stronger than a candidate refresh:
     /// the old WireGuard session may still contain a high counter and the old
     /// relay confirmation may still be accepted by local path selection, even
-    /// though the remote daemon that owned them has gone away.  The caller
-    /// must first stop the transport/UDP workers, then use this reset before
-    /// starting the replacement handshake.
+    /// though the remote daemon that owned them has gone away. The caller must
+    /// first stop the transport/UDP workers, then use this reset before starting
+    /// the replacement handshake.
     pub(crate) fn reset_for_peer_session(&mut self) {
+        let incarnation_high_water = self.remote_candidate_incarnation_high_water;
+        let candidate_generation_replay_floor = self.last_candidate_generation;
         self.reset_for_identity_change();
+        self.remote_candidate_incarnation_high_water = incarnation_high_water;
+        self.last_candidate_generation = candidate_generation_replay_floor;
     }
 
     /// Whether the connection is active (direct or relay).

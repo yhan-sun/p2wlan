@@ -347,6 +347,7 @@ impl PeerManager {
     /// and when two applies DO run concurrently the loser's rollback removes
     /// only the candidates this apply installed that the winner's committed
     /// snapshot does not contain (see [`Self::rollback_remote_fresh_apply`]).
+    #[cfg(test)]
     pub(crate) async fn apply_remote_fresh_candidates(
         &self,
         peer_id: &str,
@@ -355,6 +356,29 @@ impl PeerManager {
         candidate_sources: &HashMap<String, String>,
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
+    ) -> CandidateSetApplyResult {
+        self.apply_remote_fresh_candidates_for_identity(
+            peer_id,
+            id,
+            candidates,
+            candidate_sources,
+            candidate_generation,
+            candidates_expires_at_ms,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn apply_remote_fresh_candidates_for_identity(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+        sender_public_key: Option<&str>,
     ) -> CandidateSetApplyResult {
         let (previous_generation, previous_expiry) = {
             let conns = self.connections.read().await;
@@ -369,12 +393,13 @@ impl PeerManager {
                 .unwrap_or((0, None))
         };
         let result = self
-            .add_candidates_with_metadata(
+            .add_candidates_with_metadata_for_identity(
                 peer_id,
                 candidates,
                 candidate_sources,
                 candidate_generation,
                 candidates_expires_at_ms,
+                sender_public_key,
             )
             .await;
         if result == CandidateSetApplyResult::Applied {
@@ -423,11 +448,45 @@ impl PeerManager {
     /// Only the current high-water's snapshot is retained: every older
     /// snapshot for the peer is pruned here, so the snapshot map cannot grow
     /// without bound across identities.
+    #[cfg(test)]
     pub(crate) async fn commit_remote_fresh_prediction(
         &self,
         peer_id: &str,
         id: crate::FreshPredictionId,
     ) -> bool {
+        self.commit_remote_fresh_prediction_for_identity(peer_id, id, None)
+            .await
+    }
+
+    /// Commit a fresh prediction only while the signal still belongs to the
+    /// peer identity that applied its candidates.
+    ///
+    /// The identity check and fresh-state commit share the peer epoch with
+    /// `add_peer`. If a public-key change wins first, any delayed pending apply
+    /// is discarded; if this commit wins first, the subsequent identity reset
+    /// clears the old high-water and snapshot.
+    pub(crate) async fn commit_remote_fresh_prediction_for_identity(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+        sender_public_key: Option<&str>,
+    ) -> bool {
+        let sender_public_key = sender_public_key.map(str::trim);
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let connections = self.connections.read().await;
+        if sender_public_key.is_some_and(|public_key| {
+            public_key.is_empty()
+                || connections
+                    .get(peer_id)
+                    .is_none_or(|conn| conn.public_key.trim() != public_key)
+        }) {
+            self.pending_fresh_applies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&(peer_id.to_string(), id));
+            return false;
+        }
         let mut high_water = self
             .remote_fresh_generations
             .lock()

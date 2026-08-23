@@ -5,6 +5,10 @@ use p2pnet_nat::mapping::{
 };
 
 const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
+/// A spawned dynamic reader should reach its first socket receive poll
+/// immediately.  Bound the handshake so a broken runtime/task cannot leave a
+/// fresh-mapping generation waiting forever before its first STUN request.
+const DYNAMIC_READER_READY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Adaptive-prediction learner state for one network generation, scoped by
 /// destination so a stride learned toward STUN observers is not blindly applied
@@ -152,12 +156,18 @@ impl UdpTransport {
         let direct_peers = self.peers.direct_peer_ids().await;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (reader_ready_tx, reader_ready_rx) = oneshot::channel();
         let reader_handle = {
             let transport = self.clone();
             let socket = socket.clone();
             tokio::spawn(async move {
                 transport
-                    .run_dynamic_inbound_socket(socket_index, socket, shutdown_rx)
+                    .run_dynamic_inbound_socket(
+                        socket_index,
+                        socket,
+                        shutdown_rx,
+                        reader_ready_tx,
+                    )
                     .await
             })
         };
@@ -287,6 +297,23 @@ impl UdpTransport {
         for entry in evicted {
             self.detach_dynamic_entry(entry, "dynamic_socket_cap_reached")
                 .await;
+        }
+        // Do not let the caller issue the first STUN request until the spawned
+        // reader has actually polled `recv_from` once.  Spawning alone is not a
+        // scheduling barrier: on a busy runtime the request and response can
+        // otherwise complete while the reader has never registered socket
+        // readiness, making the sole STUN waiter time out.  The sender fires
+        // from the same poll that registers readiness (see
+        // `recv_from_with_reader_ready`).
+        let reader_ready = matches!(
+            timeout(DYNAMIC_READER_READY_TIMEOUT, reader_ready_rx).await,
+            Ok(Ok(true))
+        );
+        if !reader_ready {
+            self.detach_dynamic_socket_by_index(socket_index, "dynamic_reader_start_failed")
+                .await;
+            drop(provisional_guard);
+            return Err(DynamicSocketAttachError::ReaderStartupFailed);
         }
         self.dynamic_socket_diagnostics.lock().await.insert(
             socket_index,
@@ -701,16 +728,18 @@ impl UdpTransport {
             }
             let responded_at_ms = monotonic_millis();
             let parsed = match result {
-                Ok(Ok((data, source))) if source == *observer => match StunMessage::decode(&data) {
-                    Ok(response)
-                        if response.transaction_id == transaction_id
-                            && response.msg_type == p2pnet_nat::BINDING_RESPONSE =>
-                    {
-                        response.get_reflexive_address()
+                Ok(Ok(StunResponse { data, source })) if source == *observer => {
+                    match StunMessage::decode(&data) {
+                        Ok(response)
+                            if response.transaction_id == transaction_id
+                                && response.msg_type == p2pnet_nat::BINDING_RESPONSE =>
+                        {
+                            response.get_reflexive_address()
+                        }
+                        Ok(_) => None,
+                        Err(_) => None,
                     }
-                    Ok(_) => None,
-                    Err(_) => None,
-                },
+                }
                 _ => None,
             };
             if let Some(observed) = parsed {
@@ -961,7 +990,10 @@ impl UdpTransport {
                     DynamicSocketAttachError::CapacityRejected => {
                         FreshMappingRejection::CapacityRejected
                     }
-                    DynamicSocketAttachError::NoInboundChannel => FreshMappingRejection::BindFailed,
+                    DynamicSocketAttachError::NoInboundChannel
+                    | DynamicSocketAttachError::ReaderStartupFailed => {
+                        FreshMappingRejection::BindFailed
+                    }
                 });
             }
         };

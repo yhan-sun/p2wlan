@@ -21,6 +21,9 @@ impl PeerManager {
     ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
+            #[cfg(test)]
+            authenticated_probe_verify_gate: Arc::new(std::sync::Mutex::new(None)),
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
@@ -39,10 +42,11 @@ impl PeerManager {
             remote_fresh_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_snapshots: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_fresh_applies: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            remote_fresh_identity_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            remote_identity_ledger: Arc::new(std::sync::Mutex::new(RemoteIdentityLedger::default())),
             direct_peers: Arc::new(std::sync::Mutex::new(HashSet::new())),
             relay_first_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             recovery_epochs: Arc::new(RwLock::new(HashMap::new())),
+            recovery_epoch_allocation_id: std::sync::atomic::AtomicU64::new(0),
             outbound_liveness_cache: Arc::new(RwLock::new(HashMap::new())),
             c0_pair_ledgers: Arc::new(RwLock::new(HashMap::new())),
             direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -55,7 +59,6 @@ impl PeerManager {
             relay_not_found_grace: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             relay_backoff_heartbeat_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
-            direct_recovery_kick_hook: Arc::new(std::sync::Mutex::new(None)),
             timeline: std::sync::Mutex::new(None),
             outbound_loss_slot: Arc::new(std::sync::Mutex::new(None)),
             outbound_loss_default: Arc::new(tokio::sync::Mutex::new(OutboundLossCounters::default())),
@@ -492,26 +495,101 @@ impl PeerManager {
         }
     }
 
-    /// Whether a peer connection currently exists, readable without awaiting.
+    /// Whether a peer connection currently exists, readable without awaiting
+    /// or contending on the async connection map.
     ///
-    /// Used under the UDP adoption lock to refuse ACK/punch adoption for a
-    /// peer whose connection was removed concurrently (PeerLeft): a late
-    /// packet must never recreate affinity or candidate state for a peer that
-    /// no longer exists.
+    /// `add_peer` and `remove_peer` maintain this membership mirror at their
+    /// lifecycle linearization points. In particular, an unrelated writer on
+    /// `connections` cannot turn an existing peer into a false negative.
     pub(crate) fn peer_exists_sync(&self, node_id: &str) -> bool {
-        self.connections
-            .try_read()
-            .map(|connections| connections.contains_key(node_id))
-            .unwrap_or(false)
+        self.peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(node_id)
     }
 
-    /// Whether a peer connection currently exists, using the async read lock.
-    ///
-    /// Control-event handling is already asynchronous and must not interpret
-    /// transient writer contention as a missing peer.  The synchronous mirror
-    /// above is intentionally retained only for non-await UDP adoption paths.
-    pub(crate) async fn peer_exists(&self, node_id: &str) -> bool {
-        self.connections.read().await.contains_key(node_id)
+    /// Whether `expected` still names the online peer lifecycle that
+    /// authenticated delayed work.
+    pub(crate) fn peer_session_is_current_sync(
+        &self,
+        node_id: &str,
+        expected: PeerSessionGeneration,
+    ) -> bool {
+        self.peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_generation_is_current(node_id, expected)
+    }
+
+    /// Snapshot the current online lifecycle for delayed authenticated work.
+    pub(crate) fn peer_session_generation_sync(
+        &self,
+        node_id: &str,
+    ) -> Option<PeerSessionGeneration> {
+        self.peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_generation(node_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_authenticated_probe_verify_gate_for_test(
+        &self,
+        node_id: &str,
+        gate: Arc<AuthenticatedProbeVerifyGate>,
+    ) {
+        *self
+            .authenticated_probe_verify_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((node_id.to_string(), gate));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_after_authenticated_probe_verify_for_test(
+        &self,
+        node_id: &str,
+    ) -> Option<Arc<AuthenticatedProbeVerifyGate>> {
+        let gate = {
+            let mut installed = self
+                .authenticated_probe_verify_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if installed
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == node_id)
+            {
+                installed.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.wait().await;
+            Some(gate)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_map_for_test(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, PeerConnection>>> {
+        self.connections.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peer_session_snapshot_for_test(
+        &self,
+        node_id: &str,
+    ) -> Option<(PeerSessionGeneration, bool)> {
+        self.peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .peers
+            .get(node_id)
+            .map(|entry| (entry.session_generation, entry.online))
     }
 
     /// Advance local network generation and invalidate confirmed direct paths.

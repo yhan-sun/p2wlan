@@ -920,6 +920,213 @@ async fn candidate_offer_workers_are_fair_and_fifo() {
     server.task.abort();
 }
 
+/// Cancelling an in-flight candidate publication (for example when its UDP
+/// lease is superseded during a rebind) must cancel only that immutable HTTP
+/// request. The per-peer FIFO worker stays alive so the replacement
+/// transport's first candidate offer is not dropped behind a stale sender.
+#[tokio::test]
+async fn cancelled_candidate_offer_keeps_same_peer_worker_available() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal" && body.contains("51100") {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
+    server.wait_registered().await;
+
+    let cancelled = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_offer_with_sources_and_punch_at(
+                    "peer-rebind",
+                    &["203.0.113.92:51100".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server
+                .signal_posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("peer-rebind") && body.contains("51100"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the old UDP owner's candidate request must be in flight before cancellation");
+
+    cancelled.abort();
+    let _ = cancelled.await;
+    tokio::task::yield_now().await;
+
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_offer_with_sources_and_punch_at(
+            "peer-rebind",
+            &["203.0.113.92:51101".to_string()],
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the replacement UDP owner's first offer must not wait on the cancelled request")
+    .expect("the same-peer worker must accept the replacement candidate offer");
+
+    let posts = server.signal_posts.lock().unwrap().clone();
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51100"))
+            .count(),
+        1,
+        "the cancelled request may reach the wire once but must not retry"
+    );
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51101"))
+            .count(),
+        1,
+        "the first replacement offer must reach the wire exactly once"
+    );
+
+    drop(client);
+    server.task.abort();
+}
+
+/// Revoking a fresh prediction's exact ownership handle must cancel an
+/// already-started HTTP request without requiring the caller task itself to be
+/// aborted.  The per-peer lane then remains available to the replacement UDP
+/// owner.
+#[tokio::test]
+async fn in_flight_fresh_ownership_cancellation_keeps_same_peer_worker_available() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal" && body.contains("51200") {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
+    server.wait_registered().await;
+
+    let ownership = Arc::new(crate::PunchSessionCancellation::default());
+    let cancelled = tokio::spawn({
+        let client = client.clone();
+        let ownership = ownership.clone();
+        async move {
+            client
+                .send_fresh_peer_offer_with_sources_and_punch_at(
+                    "peer-rebind",
+                    &["203.0.113.92:51200".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    ownership,
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server
+                .signal_posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("peer-rebind") && body.contains("51200"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retired fresh owner's HTTP request must be in flight before cancellation");
+
+    ownership.cancel_for_hard_hard_cleanup();
+    assert_eq!(
+        timeout(Duration::from_secs(2), cancelled)
+            .await
+            .expect("fresh ownership cancellation must stop the in-flight request")
+            .expect("fresh send task must not panic"),
+        Err(PeerOfferSendFailure::Cancelled),
+    );
+
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_offer_with_sources_and_punch_at(
+            "peer-rebind",
+            &["203.0.113.92:51201".to_string()],
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the replacement offer must not wait on the cancelled fresh request")
+    .expect("the same-peer worker must accept the replacement offer");
+
+    let posts = server.signal_posts.lock().unwrap().clone();
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51200"))
+            .count(),
+        1,
+        "the cancelled fresh request may reach the server once but must not retry"
+    );
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51201"))
+            .count(),
+        1,
+        "the replacement offer must reach the wire exactly once"
+    );
+
+    drop(client);
+    server.task.abort();
+}
+
 #[tokio::test]
 async fn fresh_candidate_offer_uses_fresh_signal_queue_and_keeps_session_envelope() {
     let server = MockControlServer::spawn(|_, _| MockAction::Ok).await;

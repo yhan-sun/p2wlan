@@ -1374,8 +1374,21 @@ impl WireGuardTransport {
         peer_id: &str,
         token: &str,
     ) -> ResponderSessionConfirmation {
-        let emit_lock = self.outbound_emit_lock(peer_id).await;
-        let _emit_guard = emit_lock.lock().await;
+        let emit_guard = self.acquire_outbound_emit_guard(peer_id).await;
+        self.confirm_responder_session_with_emit_guard(peer_id, token, &emit_guard)
+            .await
+    }
+
+    /// Confirm a responder session while the caller already owns the peer's
+    /// counter-ordering guard. Cross-layer UDP adoption uses this form so its
+    /// lock order stays `emit -> adoption -> epoch -> sessions`; acquiring emit
+    /// after the global epoch gate would invert the outbound data path.
+    pub(crate) async fn confirm_responder_session_with_emit_guard(
+        &self,
+        peer_id: &str,
+        token: &str,
+        _emit_guard: &OwnedMutexGuard<()>,
+    ) -> ResponderSessionConfirmation {
         let now = Instant::now();
         let (result, flush_pending) = {
             let mut sessions = self.sessions.lock().await;
@@ -1423,7 +1436,6 @@ impl WireGuardTransport {
                 (ResponderSessionConfirmation::Missing, false)
             }
         };
-        drop(_emit_guard);
         if flush_pending {
             // Probe-v2 still has to commit the matching key before the caller
             // can ACK or learn Direct. Do not make that cross-layer commit

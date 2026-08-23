@@ -433,15 +433,32 @@ async fn spawn_hole_punch_task(
                         ),
                     )
                     .await;
-                spawn_hard_hard_initiator(
-                    udp,
-                    peers,
-                    punch_deduplicator,
-                    peer_id,
+                let hard_hard_start = spawn_hard_hard_initiator(
+                    udp.clone(),
+                    peers.clone(),
+                    punch_deduplicator.clone(),
+                    peer_id.clone(),
                     signal,
                 )
                 .await;
-                return;
+                if hard_hard_start.is_handled() {
+                    return;
+                }
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "hard_hard_fallback_to_ordinary",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "Hard↔Hard did not acquire a traversal owner; continuing with ordinary synchronized punching reason={}",
+                            hard_hard_start
+                                .fallback_reason()
+                                .unwrap_or("unknown_not_started")
+                        ),
+                    )
+                    .await;
             }
         }
     }
@@ -1913,11 +1930,12 @@ async fn spawn_hole_punch_task(
 /// today's strategy.
 ///
 /// Ownership checks run before building the payload, again before the
-/// command is queued, and inside the HTTP worker just before the request;
-/// once the command is irrevocably on the wire the receiver's per-peer
-/// fresh-generation high-water rejects any superseded label, so a stale
-/// prediction can never overwrite a newer one.  A cancellation observed at
-/// any of these fences is reported distinctly from a send failure.
+/// command is queued, and inside the HTTP worker before and during the request.
+/// A newer delivered signal supersedes an older one through the receiver's
+/// per-peer fresh-generation high-water. If an in-flight cancellation has
+/// ambiguous delivery and no successor reached the server, the retired local
+/// socket is still never finalized. Cancellation is reported distinctly from
+/// a send failure.
 ///
 /// Returns `true` only when the prediction was really accepted by the control
 /// server while the session's ownership was still valid: the caller then
@@ -1985,9 +2003,11 @@ async fn advertise_fresh_mapping_prediction(
             .await;
         return false;
     }
-    // The command worker re-checks the ownership inside the queue AND again
-    // just before the HTTP request: a cancellation at either point surfaces
-    // as `Cancelled`, which must never be mistaken for a successful send.
+    // The command worker re-checks ownership inside the queue, immediately
+    // before HTTP, and while the request is in flight. `Cancelled` therefore
+    // means delivery is not authoritative: the server may already have
+    // accepted a request whose local response future was dropped, so the
+    // caller must roll back instead of finalizing the socket.
     match signal
         .control
         .send_fresh_peer_offer_with_sources_and_punch_at(
@@ -2009,11 +2029,11 @@ async fn advertise_fresh_mapping_prediction(
                     None,
                     Some(candidates.len()),
                     None,
-                    "fresh-mapping prediction ownership was revoked before the HTTP request; the prediction was not sent",
+                    "fresh-mapping prediction ownership was revoked while queued or in flight; delivery is ambiguous and the socket must not be finalized",
                 )
                 .await;
             debug!(
-                "Fresh-mapping prediction to peer {peer_id} was cancelled before the HTTP request; not finalizing the socket"
+                "Fresh-mapping prediction to peer {peer_id} was cancelled while queued or in flight; delivery is ambiguous and the socket will not be finalized"
             );
             return false;
         }

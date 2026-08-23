@@ -50,11 +50,16 @@ pub(crate) fn prepare_signal_payload(
     probe_ephemeral_public_key: Option<&str>,
     signing_identity: Option<&SignalSigningIdentity>,
 ) -> Result<serde_json::Value> {
-    // Keep the revision and expiry derived from one instant: a candidate set
-    // must have a coherent lifetime even if the wall clock is adjusted while
-    // this request is being assembled.  A refused generation (incarnation or
-    // per-boot counter exhausted) fails the whole signal instead of sending a
-    // wrapped value receivers would judge stale.
+    // `candidate_generation` is the signal/candidate freshness revision, not
+    // a declaration that this process rebound its UDP transport. A fresh
+    // offer/answer (including a routine WireGuard rekey) deliberately gets a
+    // new revision even when `candidates` is identical; receivers compare the
+    // candidate set and encrypted-confirmed endpoint before declaring a remote
+    // transport handover. Keep the revision and expiry derived from one
+    // instant so the set has a coherent lifetime even if the wall clock moves.
+    // A refused generation (incarnation or per-boot counter exhausted) fails
+    // the whole signal instead of sending a wrapped value receivers judge
+    // stale.
     let candidate_generation = next_candidate_generation().map_err(|error| {
         warn!("{error}; dropping this candidate signal");
         DaemonError::ControlPlane(error.to_string())
@@ -526,6 +531,30 @@ pub(crate) fn candidate_generation_incarnation(generation: u64) -> Option<u64> {
     let incarnation =
         (generation & (CANDIDATE_GENERATION_INCARNATION_FLAG - 1)) >> CANDIDATE_GENERATION_COUNTER_BITS;
     (incarnation != 0).then_some(incarnation)
+}
+
+/// Return the strict ordering floor immediately before one valid
+/// incarnation-encoded generation.
+///
+/// Production counters start at one. Persisting this predecessor while a
+/// newer remote incarnation is being reset lets the triggering generation
+/// itself apply exactly once, while lower counters from that incarnation are
+/// already fenced across a concurrent PeerLeft/rejoin. Counter zero is not a
+/// valid wire generation and therefore has no predecessor floor.
+pub(crate) fn candidate_generation_predecessor_floor(generation: u64) -> Option<u64> {
+    candidate_generation_incarnation(generation)?;
+    let counter = generation & CANDIDATE_GENERATION_COUNTER_MASK;
+    (counter > 0).then_some(generation - 1)
+}
+
+/// Whether a value occupies the incarnation-encoded wire namespace but does
+/// not contain both a non-zero incarnation and a non-zero counter. Such a
+/// value cannot be a legacy wall-clock generation because every legacy value
+/// is below the marker bit, so receivers must fail closed instead of silently
+/// treating it as legacy.
+pub(crate) fn candidate_generation_is_malformed_encoded(generation: u64) -> bool {
+    generation & CANDIDATE_GENERATION_INCARNATION_FLAG != 0
+        && candidate_generation_predecessor_floor(generation).is_none()
 }
 
 /// Why no candidate generation could be produced for this signal.

@@ -45,11 +45,6 @@ struct PendingPeerOffer {
     punch_at_server_ms: Option<u64>,
     session_id: Option<String>,
     probe_ephemeral_public_key: Option<String>,
-    /// Set when the offer-ingress verdict suppressed the candidate plane
-    /// (duplicate or rate-limited): the worker still answers the handshake
-    /// (crossing rekeys must never be dropped) but skips the fresh-prediction
-    /// transaction and the punch trigger.
-    ingress_suppressed: bool,
 }
 
 /// A peer-reflexive control-plane observation awaiting its bounded worker.
@@ -84,7 +79,20 @@ struct ResponderWorkReservation {
 struct ResponderWorkOwner {
     owner: u64,
     cancellation: tokio::sync::watch::Sender<bool>,
+    /// Sender identity of the offer currently owned by the worker. Keeping it
+    /// beside the queued slot prevents a late retransmit from the active
+    /// (retired) identity from overwriting a queued offer from a replacement
+    /// identity before either can be checked against the peer roster.
+    active_sender_public_key: Option<String>,
     queued: Option<PendingPeerOffer>,
+}
+
+fn same_responder_sender_identity(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.trim() == right.trim(),
+        _ => false,
+    }
 }
 
 /// Owner token for the one peer-reflexive worker admitted for a peer.
@@ -440,6 +448,33 @@ impl PendingHandshakeState {
         }
     }
 
+    /// Clear work owned by a retired remote incarnation while retaining the
+    /// exact local initiator transaction that an arriving PeerAnswer completes.
+    fn clear_peer_except_pending_initiator(&mut self, peer_id: &str) {
+        self.cancel_reservation(peer_id);
+        self.responder_cache
+            .retain(|(cached_peer, _), _| cached_peer != peer_id);
+        if let Some(worker) = self.responder_workers.remove(peer_id) {
+            worker.cancellation.send_replace(true);
+        }
+        if let Some(worker) = self.peer_reflexive_workers.remove(peer_id) {
+            worker.cancellation.send_replace(true);
+        }
+    }
+
+    /// Clear retired initiator/reflexive work while retaining the responder
+    /// owner that is currently applying the restart offer.
+    fn clear_peer_except_responder_owner(&mut self, peer_id: &str) {
+        self.remove(peer_id);
+        self.cancel_reservation(peer_id);
+        self.attempts.remove(peer_id);
+        self.responder_cache
+            .retain(|(cached_peer, _), _| cached_peer != peer_id);
+        if let Some(worker) = self.peer_reflexive_workers.remove(peer_id) {
+            worker.cancellation.send_replace(true);
+        }
+    }
+
     fn is_current(&self, peer_id: &str, pending_id: u64) -> bool {
         self.pending_ids.get(peer_id).copied() == Some(pending_id)
     }
@@ -536,6 +571,23 @@ impl PendingHandshakeState {
             self.responder_workers.remove(&offer.from_node_id);
         }
         if let Some(worker) = self.responder_workers.get_mut(&offer.from_node_id) {
+            let incoming_matches_active = same_responder_sender_identity(
+                worker.active_sender_public_key.as_deref(),
+                offer.sender_public_key.as_deref(),
+            );
+            let queued_has_different_identity = worker.queued.as_ref().is_some_and(|queued| {
+                !same_responder_sender_identity(
+                    queued.sender_public_key.as_deref(),
+                    offer.sender_public_key.as_deref(),
+                )
+            });
+            if incoming_matches_active && queued_has_different_identity {
+                // The active identity already has one turn. Do not let its
+                // later retransmit erase the sole queued turn for a different
+                // (typically replacement) identity. Same-queued-identity and
+                // third-identity arrivals remain newest-wins below.
+                return None;
+            }
             worker.queued = Some(offer);
             return None;
         }
@@ -549,6 +601,7 @@ impl PendingHandshakeState {
             ResponderWorkOwner {
                 owner,
                 cancellation: cancellation_tx,
+                active_sender_public_key: offer.sender_public_key.clone(),
                 queued: None,
             },
         );
@@ -576,7 +629,9 @@ impl PendingHandshakeState {
         if worker.owner != owner || *worker.cancellation.borrow() {
             return None;
         }
-        worker.queued.take()
+        let next = worker.queued.take()?;
+        worker.active_sender_public_key = next.sender_public_key.clone();
+        Some(next)
     }
 
     /// Return the newest queued offer, if any, while retaining the same
@@ -589,6 +644,7 @@ impl PendingHandshakeState {
             return None;
         }
         if let Some(next) = worker.queued.take() {
+            worker.active_sender_public_key = next.sender_public_key.clone();
             return Some(next);
         }
         self.responder_workers.remove(peer_id);

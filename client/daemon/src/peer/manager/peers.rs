@@ -44,11 +44,13 @@ fn push_unique_probe_key(
     key: ProbeMacKey,
     role: ProbeKeyRole,
     session_id: Option<String>,
+    session_generation: PeerSessionGeneration,
 ) {
     if !candidates.iter().any(|candidate| candidate.key == key) {
         candidates.push(ProbeKeyCandidate {
             key,
             role,
+            session_generation,
             session_id,
         });
     }
@@ -58,6 +60,7 @@ fn push_probe_binding_compatibility_keys(
     candidates: &mut Vec<ProbeKeyCandidate>,
     base_key: ProbeMacKey,
     binding: &ProbeSessionBinding,
+    session_generation: PeerSessionGeneration,
 ) {
     if let Some(session_id) = binding.session_id.as_deref() {
         push_unique_probe_key(
@@ -65,48 +68,179 @@ fn push_probe_binding_compatibility_keys(
             derive_session_probe_mac_key(&base_key, session_id),
             ProbeKeyRole::Compatibility,
             binding.session_id.clone(),
+            session_generation,
         );
     }
 }
 
 impl PeerManager {
-    /// Reset a same-node peer only when its encoded candidate generation proves
-    /// that the remote daemon incarnation changed. This keeps normal endpoint
-    /// refreshes on the existing path while making an Air restart fail closed
-    /// against old WireGuard state and acknowledgements.
-    pub(crate) async fn reset_peer_session_if_remote_incarnation_changed(
+    /// Mirror a connection's accepted remote daemon incarnation into the
+    /// bounded identity ledger. Callers already own `network_epoch_gate` and
+    /// the connection writer, so `add_peer`/`remove_peer` use the same
+    /// `epoch -> connections -> identity-ledger` order.
+    fn record_remote_candidate_incarnation_high_water(
+        &self,
+        node_id: &str,
+        public_key: &str,
+        incarnation: u64,
+    ) {
+        self.remote_identity_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_candidate_incarnation(node_id, public_key, incarnation);
+    }
+
+    /// Raise the encoded candidate replay floor in the bounded identity
+    /// ledger. Candidate apply records the accepted generation itself; ingress
+    /// preflight records its strict predecessor so a same-key PeerLeft/rejoin
+    /// before apply cannot admit a lower counter. Legacy generations are
+    /// ignored by the ledger implementation.
+    fn record_remote_candidate_generation_replay_floor(
+        &self,
+        node_id: &str,
+        public_key: &str,
+        generation: u64,
+    ) {
+        self.remote_identity_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_candidate_generation_replay_floor(node_id, public_key, generation);
+    }
+
+    /// Publish the strict replay floor for one valid encoded generation, then
+    /// claim a strictly newer remote daemon incarnation when necessary.
+    ///
+    /// The replay floor is published for first-incarnation and same-incarnation
+    /// signals too: candidate apply happens after this helper returns, so a
+    /// PeerLeft/rejoin in that gap must not admit a lower counter. A new
+    /// incarnation claim remains the high-water linearization point before
+    /// slow WireGuard/UDP cleanup.
+    pub(crate) async fn claim_remote_candidate_incarnation_for_identity(
         &self,
         node_id: &str,
         candidate_generation: u64,
-        reason: &str,
-    ) -> bool {
+        sender_public_key: Option<&str>,
+    ) -> RemoteCandidateIncarnationClaim {
+        // Only an absent fingerprint is legacy-compatible. An explicitly
+        // present but empty fingerprint is malformed identity evidence and
+        // must fail closed like every other non-matching `Some` value.
+        let sender_public_key = sender_public_key.map(str::trim);
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let mut connections = self.connections.write().await;
+        let Some(conn) = connections.get_mut(node_id) else {
+            return if sender_public_key.is_some() {
+                RemoteCandidateIncarnationClaim::IdentityMismatch
+            } else {
+                RemoteCandidateIncarnationClaim::NoReset
+            };
+        };
+        if sender_public_key.is_some_and(|public_key| {
+            public_key.is_empty() || conn.public_key.trim() != public_key
+        }) {
+            return RemoteCandidateIncarnationClaim::IdentityMismatch;
+        }
         let Some(new_incarnation) =
             crate::control::candidate_generation_incarnation(candidate_generation)
         else {
-            return false;
+            return RemoteCandidateIncarnationClaim::NoReset;
         };
-        let (had_relay_confirmation, old_incarnation, new_incarnation) = {
+        let Some(claim_floor) = crate::control::candidate_generation_predecessor_floor(
+            candidate_generation,
+        ) else {
+            return RemoteCandidateIncarnationClaim::NoReset;
+        };
+        conn.last_candidate_generation = conn.last_candidate_generation.max(claim_floor);
+        self.record_remote_candidate_generation_replay_floor(
+            node_id,
+            &conn.public_key,
+            claim_floor,
+        );
+        let Some(old_incarnation) = conn.remote_candidate_incarnation_high_water else {
+            conn.remote_candidate_incarnation_high_water = Some(new_incarnation);
+            self.record_remote_candidate_incarnation_high_water(
+                node_id,
+                &conn.public_key,
+                new_incarnation,
+            );
+            return RemoteCandidateIncarnationClaim::NoReset;
+        };
+        if new_incarnation <= old_incarnation {
+            return RemoteCandidateIncarnationClaim::NoReset;
+        }
+        conn.remote_candidate_incarnation_high_water = Some(new_incarnation);
+        // The predecessor was published above before this claim. Mirror the
+        // new incarnation itself before slow transport cleanup as the second
+        // half of the replay fence.
+        self.record_remote_candidate_incarnation_high_water(
+            node_id,
+            &conn.public_key,
+            new_incarnation,
+        );
+        RemoteCandidateIncarnationClaim::Reset {
+            old_incarnation,
+            new_incarnation,
+        }
+    }
+
+    /// Compatibility wrapper for internal tests that exercise only incarnation
+    /// ordering and do not model the server-bound sender identity.
+    #[cfg(test)]
+    pub(crate) async fn claim_remote_candidate_incarnation_if_newer(
+        &self,
+        node_id: &str,
+        candidate_generation: u64,
+    ) -> Option<(u64, u64)> {
+        match self
+            .claim_remote_candidate_incarnation_for_identity(node_id, candidate_generation, None)
+            .await
+        {
+            RemoteCandidateIncarnationClaim::Reset {
+                old_incarnation,
+                new_incarnation,
+            } => Some((old_incarnation, new_incarnation)),
+            RemoteCandidateIncarnationClaim::IdentityMismatch
+            | RemoteCandidateIncarnationClaim::NoReset => None,
+        }
+    }
+
+    /// Finish a previously claimed remote restart after old WireGuard and UDP
+    /// work has been stopped. The high-water equality check prevents an older
+    /// cleanup owner from resetting state claimed by a later incarnation.
+    pub(crate) async fn finish_claimed_remote_incarnation_reset(
+        &self,
+        node_id: &str,
+        old_incarnation: u64,
+        claimed_incarnation: u64,
+        reason: &str,
+    ) -> bool {
+        let had_relay_confirmation = {
             let epoch_gate = self.network_epoch_gate();
             let _epoch_guard = epoch_gate.lock().await;
             let mut connections = self.connections.write().await;
             let Some(conn) = connections.get_mut(node_id) else {
                 return false;
             };
-            let Some(old_incarnation) =
-                crate::control::candidate_generation_incarnation(conn.last_candidate_generation)
-            else {
-                return false;
-            };
-            if old_incarnation == new_incarnation {
+            if conn.remote_candidate_incarnation_high_water != Some(claimed_incarnation) {
                 return false;
             }
             let had_relay_confirmation = conn.relay_confirmed_at.is_some();
             conn.reset_for_peer_session();
+            let published = self
+                .peer_membership
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .publish(node_id, conn.online, true);
+            if !published {
+                warn!(
+                    "Peer lifecycle generation exhausted while resetting remote incarnation for {node_id}; authentication disabled"
+                );
+            }
             if had_relay_confirmation {
                 conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                 self.bump_relay_confirm_seq(node_id);
             }
-            (had_relay_confirmation, old_incarnation, new_incarnation)
+            had_relay_confirmation
         };
         self.clear_hard_hard_sessions(Some(node_id)).await;
         self.emit_timeline(
@@ -114,10 +248,34 @@ impl PeerManager {
             None,
             Some(reason),
             Some(format!(
-                "peer={node_id} reason={reason} old_incarnation={old_incarnation} new_incarnation={new_incarnation} relay_confirmation_cleared={had_relay_confirmation}"
+                "peer={node_id} reason={reason} old_incarnation={old_incarnation} new_incarnation={claimed_incarnation} relay_confirmation_cleared={had_relay_confirmation}"
             )),
         );
         true
+    }
+
+    /// Convenience wrapper for tests and callers that do not need to compose
+    /// transport cleanup between the claim and connection reset.
+    #[cfg(test)]
+    pub(crate) async fn reset_peer_session_if_remote_incarnation_changed(
+        &self,
+        node_id: &str,
+        candidate_generation: u64,
+        reason: &str,
+    ) -> bool {
+        let Some((old_incarnation, claimed_incarnation)) = self
+            .claim_remote_candidate_incarnation_if_newer(node_id, candidate_generation)
+            .await
+        else {
+            return false;
+        };
+        self.finish_claimed_remote_incarnation_reset(
+            node_id,
+            old_incarnation,
+            claimed_incarnation,
+            reason,
+        )
+        .await
     }
 
     /// Add or update a peer from control plane info.
@@ -155,6 +313,7 @@ impl PeerManager {
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
         let old_signaled_endpoint = conn.signaled_endpoint;
+        let old_online = conn.online;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
 
@@ -185,20 +344,58 @@ impl PeerManager {
         // (public key): a rejoin with a NEW key — including a PeerLeft
         // followed by `add_peer` with `is_new == true` — must not inherit the
         // old incarnation's high-water, or the new incarnation's predictions
-        // would be judged stale against it forever.  The key map survives
+        // would be judged stale against it forever. The identity ledger survives
         // `remove_peer`, so the comparison works even when the connection was
         // recreated.
-        let identity_changed = {
-            let mut keys = self
-                .remote_fresh_identity_keys
+        let (
+            identity_changed,
+            retained_candidate_incarnation,
+            retained_candidate_generation,
+        ) = {
+            let mut identities = self
+                .remote_identity_ledger
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let changed = keys
-                .get(&info.node_id)
-                .is_none_or(|key| key != &info.public_key);
-            keys.insert(info.node_id.clone(), info.public_key.clone());
-            changed
+            let prior = identities.get(&info.node_id).cloned();
+            // A missing ledger entry for an existing connection means only
+            // that the bounded tombstone was evicted. The live connection is
+            // still authoritative for both identity and incarnation.
+            let changed = prior
+                .as_ref()
+                .is_some_and(|identity| identity.public_key != info.public_key)
+                || (prior.is_none() && (is_new || public_key_changed));
+            let retained = if changed {
+                None
+            } else {
+                match (
+                    conn.remote_candidate_incarnation_high_water,
+                    prior
+                        .as_ref()
+                        .and_then(|identity| identity.candidate_incarnation_high_water),
+                ) {
+                    (Some(connection), Some(tombstone)) => Some(connection.max(tombstone)),
+                    (connection, tombstone) => connection.or(tombstone),
+                }
+            };
+            let retained_generation = if changed {
+                0
+            } else {
+                conn.last_candidate_generation.max(
+                    prior
+                        .as_ref()
+                        .map_or(0, |identity| identity.candidate_generation_replay_floor),
+                )
+            };
+            identities.upsert_and_touch(
+                &info.node_id,
+                &info.public_key,
+                retained,
+                retained_generation,
+            );
+            (changed, retained, retained_generation)
         };
+        conn.remote_candidate_incarnation_high_water = retained_candidate_incarnation;
+        conn.last_candidate_generation = retained_candidate_generation;
         if identity_changed {
             clear_hard_hard_after_lock = true;
             // Fresh-generation cleanup takes its own mutexes and emits a
@@ -315,6 +512,22 @@ impl PeerManager {
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
+        // Publish only after the connection is fully initialized. The
+        // process-local generation rotates at every structural/identity/online
+        // lifecycle boundary, but ordinary metadata and endpoint churn retain
+        // the same authenticated session identity.
+        let rotate_peer_session = is_new || public_key_changed || old_online != info.online;
+        let published = self
+            .peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish(&info.node_id, info.online, rotate_peer_session);
+        if !published {
+            warn!(
+                "Peer lifecycle generation exhausted while publishing {}; authentication disabled",
+                info.node_id
+            );
+        }
         drop(conns);
         drop(ip_map);
         drop(epoch_guard);
@@ -356,6 +569,23 @@ impl PeerManager {
             let epoch_gate = self.network_epoch_gate();
             let _epoch_guard = epoch_gate.lock().await;
             let mut conns = self.connections.write().await;
+            if let Some(conn) = conns.get(node_id) {
+                self.remote_identity_ledger
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .upsert_and_touch(
+                        node_id,
+                        &conn.public_key,
+                        conn.remote_candidate_incarnation_high_water,
+                        conn.last_candidate_generation,
+                    );
+            }
+            // This is the lifecycle linearization point. No later no-await
+            // authentication/adoption check may observe the removed peer.
+            self.peer_membership
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id);
             let removed_virtual_ip = conns.remove(node_id).map(|conn| conn.virtual_ip);
             // PeerLeft is a terminal boundary for the current peer session.
             // Cancel the forced-relay token while the same epoch gate covers
@@ -1040,6 +1270,17 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return Vec::new();
         };
+        if !conn.online {
+            return Vec::new();
+        }
+        let Some(session_generation) = self
+            .peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_generation(node_id)
+        else {
+            return Vec::new();
+        };
         prune_probe_session_bindings(conn, Instant::now());
         let Some(base_key) = conn.probe_mac_key else {
             return Vec::new();
@@ -1054,6 +1295,7 @@ impl PeerManager {
             probe_mac_key_for_binding(base_key, &active),
             ProbeKeyRole::Active,
             active.session_id.clone(),
+            session_generation,
         );
         for pending in pending.values() {
             let role = if pending.promote_on_match {
@@ -1072,6 +1314,7 @@ impl PeerManager {
                 probe_mac_key_for_binding(base_key, &pending.binding),
                 role,
                 pending.binding.session_id.clone(),
+                session_generation,
             );
         }
         if let Some(previous) = previous.as_ref() {
@@ -1080,14 +1323,21 @@ impl PeerManager {
                 probe_mac_key_for_binding(base_key, &previous.binding),
                 ProbeKeyRole::Previous,
                 previous.binding.session_id.clone(),
+                session_generation,
             );
         }
-        push_probe_binding_compatibility_keys(&mut candidates, base_key, &active);
+        push_probe_binding_compatibility_keys(
+            &mut candidates,
+            base_key,
+            &active,
+            session_generation,
+        );
         for pending in pending.values() {
             push_probe_binding_compatibility_keys(
                 &mut candidates,
                 base_key,
                 &pending.binding,
+                session_generation,
             );
         }
         if let Some(previous) = previous.as_ref() {
@@ -1095,6 +1345,7 @@ impl PeerManager {
                 &mut candidates,
                 base_key,
                 &previous.binding,
+                session_generation,
             );
         }
         push_unique_probe_key(
@@ -1102,6 +1353,7 @@ impl PeerManager {
             base_key,
             ProbeKeyRole::Compatibility,
             None,
+            session_generation,
         );
         candidates
     }

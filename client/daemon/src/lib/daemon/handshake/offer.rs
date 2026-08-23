@@ -100,6 +100,7 @@ impl Daemon {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -124,6 +125,7 @@ impl Daemon {
             );
             return Ok(());
         }
+        let sender_public_key = offer.sender_public_key.clone();
         self.handle_peer_offer_with_cancellation(
             &offer.from_node_id,
             &offer.candidates,
@@ -132,6 +134,7 @@ impl Daemon {
             offer.punch_at_server_ms,
             offer.session_id,
             offer.probe_ephemeral_public_key,
+            sender_public_key.as_deref(),
             Some(cancellation),
             Some(owner),
             Some(offer.network_generation),
@@ -149,6 +152,7 @@ impl Daemon {
         punch_at_server_ms: Option<u64>,
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
+        sender_public_key: Option<&str>,
         mut cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
         responder_work_owner: Option<u64>,
         expected_network_generation: Option<u64>,
@@ -181,6 +185,18 @@ impl Daemon {
         else {
             return Ok(());
         };
+        if !self
+            .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
+            .await
+        {
+            self.timeline.emit(
+                "peer_offer_rejected",
+                None,
+                Some("stale_sender_identity"),
+                Some(format!("peer={from_node_id}")),
+            );
+            return Ok(());
+        }
         if cancellation
             .as_deref()
             .is_some_and(|cancellation| *cancellation.borrow())
