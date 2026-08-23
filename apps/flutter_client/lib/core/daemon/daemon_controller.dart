@@ -9,6 +9,7 @@ import '../api/diagnostics_api.dart';
 import '../build_info.dart';
 import '../capabilities/permission_preflight.dart';
 import '../models/diagnostics_models.dart';
+import '../security/redactor.dart';
 
 part 'daemon_controller/process_control.dart';
 part 'daemon_controller/elevation.dart';
@@ -115,7 +116,9 @@ class DaemonController {
       return _startupFailure(
         startupTrace,
         stage: 2,
-        code: DaemonStartupFailureCode.daemonBinaryLoadFailed,
+        code:
+            windowsProbe.failureCode ??
+            DaemonStartupFailureCode.daemonBinaryLoadFailed,
         message:
             '[DAEMON_BINARY_LOAD_FAILED] Windows 守护进程无法加载，发布包可能缺少运行库或文件不完整：${windowsProbe.error}',
       );

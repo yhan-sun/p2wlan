@@ -70,49 +70,7 @@ extension DaemonControllerProcessControl on DaemonController {
   /// misleading generic permission error.
   Future<DaemonBinaryProbe> _probeWindowsDaemonBinary(File binary) async {
     if (!Platform.isWindows) return const DaemonBinaryProbe();
-    Process? process;
-    try {
-      process = await Process.start(binary.path, const [
-        '--build-info',
-      ], mode: ProcessStartMode.detachedWithStdio);
-      final output = await Future.wait<Object>([
-        process.stdout.transform(systemEncoding.decoder).join(),
-        process.stderr.transform(systemEncoding.decoder).join(),
-        process.exitCode,
-      ]).timeout(const Duration(seconds: 6));
-      final exitCode = output[2] as int;
-      final stderr = (output[1] as String).trim();
-      final stdout = (output[0] as String).trim();
-      if (exitCode == 0) {
-        try {
-          final decoded = jsonDecode(stdout);
-          if (decoded is Map<String, dynamic>) {
-            final identity = DaemonBuildInfo.fromJson(decoded);
-            if (identity.isComplete) {
-              return DaemonBinaryProbe(identity: identity);
-            }
-          }
-        } catch (_) {}
-        return const DaemonBinaryProbe(
-          error: 'daemon --build-info did not return a complete JSON identity',
-        );
-      }
-      final detail = stderr.isNotEmpty ? stderr : stdout;
-      return DaemonBinaryProbe(
-        error: detail.isEmpty
-            ? 'daemon identity probe exited with code $exitCode'
-            : detail,
-      );
-    } on TimeoutException {
-      try {
-        process?.kill();
-      } catch (_) {}
-      return const DaemonBinaryProbe(
-        error: 'daemon identity probe timed out after 6 seconds',
-      );
-    } on Object catch (error) {
-      return DaemonBinaryProbe(error: error.toString());
-    }
+    return probeDaemonBinary(binary);
   }
 
   List<String> get _binaryNames {
@@ -173,9 +131,101 @@ extension DaemonControllerProcessControl on DaemonController {
   }
 }
 
+const _daemonBinaryProbeTimeout = Duration(seconds: 6);
+
+/// Execute a daemon identity probe as a normal, short-lived child process.
+///
+/// This is intentionally separate from the detached process used for the
+/// actual daemon launch. A detached process has no awaitable exit code in
+/// dart:io, while this probe must consume stdout, stderr, and exitCode before
+/// deciding whether the binary is executable.
+Future<DaemonBinaryProbe> probeDaemonBinary(
+  File binary, {
+  List<String> arguments = const ['--build-info'],
+  Duration timeout = _daemonBinaryProbeTimeout,
+}) async {
+  Process? process;
+  try {
+    process = await Process.start(
+      binary.path,
+      arguments,
+      workingDirectory: binary.parent.path,
+      mode: ProcessStartMode.normal,
+    );
+
+    final stdoutFuture = process.stdout
+        .transform(systemEncoding.decoder)
+        .join();
+    final stderrFuture = process.stderr
+        .transform(systemEncoding.decoder)
+        .join();
+    final exitCodeFuture = process.exitCode;
+
+    final values = await Future.wait<Object>([
+      stdoutFuture,
+      stderrFuture,
+      exitCodeFuture,
+    ]).timeout(timeout);
+    final stdout = values[0] as String;
+    final stderr = values[1] as String;
+    final exitCode = values[2] as int;
+
+    if (exitCode == 0) {
+      try {
+        final decoded = jsonDecode(stdout.trim());
+        if (decoded is Map<String, dynamic>) {
+          final identity = DaemonBuildInfo.fromJson(decoded);
+          if (identity.isComplete) {
+            return DaemonBinaryProbe(identity: identity);
+          }
+        }
+      } catch (_) {}
+      return _daemonBinaryProbeFailure(
+        'daemon --build-info did not return a complete JSON identity; '
+        'stdout=${_sanitizeProbeOutput(stdout)}; '
+        'stderr=${_sanitizeProbeOutput(stderr)}',
+      );
+    }
+
+    return _daemonBinaryProbeFailure(
+      'daemon identity probe exited with code $exitCode; '
+      'stdout=${_sanitizeProbeOutput(stdout)}; '
+      'stderr=${_sanitizeProbeOutput(stderr)}',
+    );
+  } on TimeoutException {
+    try {
+      process?.kill();
+    } catch (_) {}
+    return _daemonBinaryProbeFailure(
+      'daemon identity probe timed out after '
+      '${timeout.inMilliseconds} milliseconds',
+    );
+  } on Object catch (error) {
+    return _daemonBinaryProbeFailure(_sanitizeProbeOutput(error.toString()));
+  }
+}
+
+String _sanitizeProbeOutput(String value) {
+  final compact = redactSensitive(
+    value,
+  ).replaceAll(RegExp(r'[\r\n]+'), ' ').trim();
+  if (compact.isEmpty) return '<empty>';
+  const maxLength = 2048;
+  if (compact.length <= maxLength) return compact;
+  return '${compact.substring(0, maxLength)}…';
+}
+
+DaemonBinaryProbe _daemonBinaryProbeFailure(String error) {
+  return DaemonBinaryProbe(
+    error: error,
+    failureCode: DaemonStartupFailureCode.daemonBinaryLoadFailed,
+  );
+}
+
 class DaemonBinaryProbe {
-  const DaemonBinaryProbe({this.identity, this.error});
+  const DaemonBinaryProbe({this.identity, this.error, this.failureCode});
 
   final DaemonBuildInfo? identity;
   final String? error;
+  final DaemonStartupFailureCode? failureCode;
 }
