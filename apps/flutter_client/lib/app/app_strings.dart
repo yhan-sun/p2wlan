@@ -436,6 +436,24 @@ class AppStrings {
   String get pathDecision => isZh ? '路径判定' : 'Path decision';
   String get deviceActions => isZh ? '设备操作' : 'Device actions';
   String get viewDetails => isZh ? '查看详情' : 'View details';
+  String get deviceDetails => isZh ? '设备详情' : 'Device details';
+  String get connectionInProgressTitle =>
+      isZh ? '正在建立可用连接' : 'Establishing a connection';
+  String get connectionInProgressBody => isZh
+      ? '设备在线，但直连或中继路径尚未确认。P2WLAN 会继续在后台探测。'
+      : 'The device is online, but a direct or relay path is not confirmed yet. P2WLAN will keep probing in the background.';
+  String get deviceUnavailableTitle =>
+      isZh ? '设备暂时不可达' : 'Device is currently unreachable';
+  String get deviceUnavailableBody => isZh
+      ? '设备可能未运行、网络受限，或刚刚断开连接。'
+      : 'The device may be stopped, network-restricted, or recently disconnected.';
+  String get connectionNeedsAttentionTitle =>
+      isZh ? '连接需要关注' : 'Connection needs attention';
+  String get connectionNeedsAttentionBody => isZh
+      ? '当前路径出现异常，P2WLAN 会继续尝试恢复连接。'
+      : 'The current path reported a problem. P2WLAN will keep trying to recover.';
+  String get technicalDetails => isZh ? '技术详情' : 'Technical details';
+  String get hideTechnicalDetails => isZh ? '收起技术详情' : 'Hide technical details';
   String get removeDevice => isZh ? '移除设备' : 'Remove device';
   String get copyVirtualIp => isZh ? '复制虚拟 IP' : 'Copy virtual IP';
   String get copyPingCommand => isZh ? '复制 ping 命令' : 'Copy ping command';

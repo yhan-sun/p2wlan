@@ -199,7 +199,12 @@ class _P2WlanShellState extends State<P2WlanShell> {
         showHeader: false,
         capabilities: widget.capabilities,
         onOpenDevices: () => _select(P2WlanSection.devices),
-        onOpenPeer: (peer) => showPeerDetailsSurface(context, peer),
+        onOpenPeer: (peer) => showPeerDetailsSurface(
+          context,
+          peer,
+          statusStore: widget.statusStore,
+          capabilities: widget.capabilities,
+        ),
         onOpenTroubleshooting: () => _select(P2WlanSection.troubleshooting),
       ),
       P2WlanSection.devices => NodesPage(

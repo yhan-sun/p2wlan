@@ -11,6 +11,7 @@ import '../../app/p2wlan_colors.dart';
 import '../../core/api/control_api.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/security/redactor.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
@@ -229,7 +230,7 @@ class _NodesPageState extends State<NodesPage> {
                               peers: visiblePeers,
                               peerTransferRates: peerTransferRates,
                               compact: layout == _NodesLayout.compact,
-                              onTap: (peer) => _openPeer(peer, layout),
+                              onTap: _openPeer,
                             );
                           },
                         ),
@@ -241,8 +242,9 @@ class _NodesPageState extends State<NodesPage> {
     );
   }
 
-  void _openPeer(PeerSnapshot peer, _NodesLayout layout) {
-    _showPeerDetails(peer, mobile: layout == _NodesLayout.compact);
+  void _openPeer(PeerSnapshot peer) {
+    final capabilities = widget.capabilities ?? PlatformCapabilities.current();
+    _showPeerDetails(peer, mobile: !capabilities.canUseSystemTray);
   }
 
   Future<void> _copy(String value, String key) async {
@@ -407,10 +409,12 @@ class _NodesPageState extends State<NodesPage> {
     if (mobile) {
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
-          fullscreenDialog: true,
           builder: (_) => _MobilePeerDetails(
             peer: peer,
             strings: stringsOf(context),
+            statusStore: widget.statusStore,
+            copiedKey: _copiedKey,
+            busyPeerId: _busyPeerId,
             onCopy: _copy,
             onEdit: _editPeer,
             onDelete: _deletePeer,
@@ -425,6 +429,7 @@ class _NodesPageState extends State<NodesPage> {
       builder: (dialogContext) => _PeerDetailsDialog(
         peer: peer,
         strings: stringsOf(context),
+        statusStore: widget.statusStore,
         copiedKey: _copiedKey,
         busyPeerId: _busyPeerId,
         onCopy: _copy,
@@ -603,20 +608,30 @@ AppStrings stringsOf(BuildContext context) => AppStringsScope.of(context);
 /// the Devices section just to inspect one peer.
 Future<void> showPeerDetailsSurface(
   BuildContext context,
-  PeerSnapshot peer,
-) async {
+  PeerSnapshot peer, {
+  StatusStore? statusStore,
+  PlatformCapabilities? capabilities,
+}) async {
   final strings = stringsOf(context);
-  if (MediaQuery.sizeOf(context).width < AppBreakpoints.compactMaxWidth) {
+  final resolvedCapabilities = capabilities ?? PlatformCapabilities.current();
+  if (!resolvedCapabilities.canUseSystemTray) {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
-        fullscreenDialog: true,
-        builder: (_) => _MobilePeerDetails(peer: peer, strings: strings),
+        builder: (_) => _MobilePeerDetails(
+          peer: peer,
+          strings: strings,
+          statusStore: statusStore,
+        ),
       ),
     );
     return;
   }
   await showDialog<void>(
     context: context,
-    builder: (_) => _PeerDetailsDialog(peer: peer, strings: strings),
+    builder: (_) => _PeerDetailsDialog(
+      peer: peer,
+      strings: strings,
+      statusStore: statusStore,
+    ),
   );
 }

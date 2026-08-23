@@ -533,7 +533,7 @@ void _registerDashboardTests() {
     expect(find.byType(Dialog), findsOneWidget);
     expect(find.byType(NodesPage), findsNothing);
     expect(find.text('24 ms'), findsWidgets);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
     await tester.tap(find.byKey(const Key('home-view-all-devices')));

@@ -269,7 +269,7 @@ void _registerNodesTests() {
     expect(find.text('10 ms'), findsNothing);
 
     // Raw lastError is not dumped into the list; a warning indicator is
-    // shown instead. The full error lives in the detail surfaces.
+    // shown instead. Technical detail remains available on demand.
     expect(
       find.text('no direct probe ACK after 320 background UDP retry probes'),
       findsNothing,
@@ -280,6 +280,13 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsOneWidget);
     expect(find.text('Offline'), findsWidgets);
+    expect(find.text('Device is currently unreachable'), findsOneWidget);
+    expect(
+      find.text('no direct probe ACK after 320 background UDP retry probes'),
+      findsNothing,
+    );
+    await tester.tap(find.byKey(const Key('nodes-issue-details-toggle')));
+    await tester.pumpAndSettle();
     expect(
       find.text('no direct probe ACK after 320 background UDP retry probes'),
       findsOneWidget,
@@ -419,9 +426,12 @@ void _registerNodesTests() {
     // Actions live inside the explicitly opened detail surface.
     await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
     await tester.pumpAndSettle();
-    await tester.tap(
-      find.byKey(const Key('node-detail-speedtest-peer-relay-002')),
+    final speedTestAction = find.byKey(
+      const Key('node-detail-speedtest-peer-relay-002'),
     );
+    await tester.ensureVisible(speedTestAction);
+    await tester.pumpAndSettle();
+    await tester.tap(speedTestAction);
     await tester.pumpAndSettle();
 
     expect(find.byKey(const Key('node-speedtest-dialog')), findsOneWidget);
@@ -476,9 +486,12 @@ void _registerNodesTests() {
 
     await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
     await tester.pumpAndSettle();
-    await tester.tap(
-      find.byKey(const Key('node-detail-speedtest-peer-relay-002')),
+    final speedTestAction = find.byKey(
+      const Key('node-detail-speedtest-peer-relay-002'),
     );
+    await tester.ensureVisible(speedTestAction);
+    await tester.pumpAndSettle();
+    await tester.tap(speedTestAction);
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('node-speedtest-start')));
     await tester.pump();
@@ -703,7 +716,7 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsOneWidget);
     expect(find.text('relay-nas'), findsWidgets);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
     // Refresh does not leave an implicit detail selection behind.
@@ -779,7 +792,7 @@ void _registerNodesTests() {
     expect(detailText('Version'), findsOneWidget);
     expect(detailText('1.0.0'), findsOneWidget);
     expect(detailText('State'), findsOneWidget);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
@@ -803,8 +816,10 @@ void _registerNodesTests() {
     await tester.pumpWidget(
       _TestApp(
         child: NodesPage(
+          key: const ValueKey('nodes-responsive-mobile'),
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('android'),
         ),
       ),
     );
@@ -817,7 +832,8 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
     expect(find.text('10.20.0.11'), findsWidgets);
     expect(tester.takeException(), isNull);
-    await tester.tap(find.byType(CloseButton));
+    expect(find.byKey(const Key('nodes-mobile-detail-back')), findsOneWidget);
+    await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('nodes-mobile-detail')), findsNothing);
     tester.view.resetPhysicalSize();
@@ -840,7 +856,7 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsOneWidget);
     expect(find.text('Connection type'), findsOneWidget);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
@@ -862,7 +878,7 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsOneWidget);
     expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
     tester.view.resetPhysicalSize();
@@ -961,7 +977,7 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsOneWidget);
     expect(find.text('relay-nas'), findsWidgets);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
     // Filter to Direct via the menu: the Relay row disappears cleanly.
@@ -1070,7 +1086,7 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(cancelApi.deleteCalls, 0);
     expect(find.byType(Dialog), findsOneWidget);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
@@ -1112,7 +1128,7 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
     expect(failApi.deleteCalls, 1);
     expect(find.byType(Dialog), findsOneWidget);
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
     tester.view.resetPhysicalSize();
     tester.view.resetDevicePixelRatio();
@@ -1135,6 +1151,7 @@ void _registerNodesTests() {
           settingsStore: mobileStores.settingsStore,
           statusStore: mobileStores.statusStore,
           controlApi: mobileApi,
+          capabilities: PlatformCapabilities.fromPlatform('android'),
         ),
       ),
     );
@@ -1272,7 +1289,7 @@ void _registerNodesTests() {
       find.descendant(of: find.byType(Dialog), matching: find.text('直连')),
       findsNothing,
     );
-    await tester.tap(find.byTooltip('Cancel'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
     // Chinese scope: explicit zh strings must reach the dialog.
@@ -1304,7 +1321,7 @@ void _registerNodesTests() {
       find.descendant(of: find.byType(Dialog), matching: find.text('Direct')),
       findsNothing,
     );
-    await tester.tap(find.byTooltip('取消'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
     // Verified relay peer keeps its localized path label in the dialog too.
@@ -1317,7 +1334,7 @@ void _registerNodesTests() {
       find.descendant(of: find.byType(Dialog), matching: find.text('中继')),
       findsWidgets,
     );
-    await tester.tap(find.byTooltip('取消'));
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
     // Compact mobile detail route preserves the explicit locale strings.
@@ -1330,6 +1347,7 @@ void _registerNodesTests() {
           key: const ValueKey('nodes-badge-zh-mobile'),
           settingsStore: zhStores.settingsStore,
           statusStore: zhStores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('android'),
         ),
       ),
     );

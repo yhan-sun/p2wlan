@@ -7,7 +7,11 @@ part of '../p15_widget_test.dart';
 /// shell chrome at each responsive boundary. All widths use the same compact
 /// list-first interaction: tap a device to open its details.
 void _registerNodesShellTests() {
-  Future<void> pumpShell(WidgetTester tester, Size size) async {
+  Future<void> pumpShell(
+    WidgetTester tester,
+    Size size, {
+    PlatformCapabilities? capabilities,
+  }) async {
     await tester.binding.setSurfaceSize(size);
     addTearDown(() => tester.binding.setSurfaceSize(null));
     final stores = await _smokeStores(tester);
@@ -18,7 +22,8 @@ void _registerNodesShellTests() {
         child: P2WlanShell(
           settingsStore: stores.settingsStore,
           statusStore: stores.statusStore,
-          capabilities: PlatformCapabilities.fromPlatform('macos'),
+          capabilities:
+              capabilities ?? PlatformCapabilities.fromPlatform('macos'),
         ),
       ),
     );
@@ -124,23 +129,27 @@ void _registerNodesShellTests() {
     await pumpShell(tester, const Size(700, 1000));
     await goToDevices(tester);
 
-    // Medium shell: labeled rail, no sidebar, no inspector. The page behaves
-    // compact, so selecting a peer opens the full-screen detail.
+    // A narrow desktop still uses a contained dialog. Window width must not
+    // turn a desktop app into a sparse full-window mobile route.
     expect(find.byType(AppNavRail), findsOneWidget);
     expect(find.byType(DesktopSidebar), findsNothing);
     expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
 
     await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
-    expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
-    expect(find.byType(Dialog), findsNothing);
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsNothing);
+    expect(find.byType(Dialog), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
   testWidgets('full shell at 390x844 opens full-screen device detail', (
     tester,
   ) async {
-    await pumpShell(tester, const Size(390, 844));
+    await pumpShell(
+      tester,
+      const Size(390, 844),
+      capabilities: PlatformCapabilities.fromPlatform('android'),
+    );
     await goToDevices(tester);
 
     // Compact phone shell: bottom navigation, no rail, no sidebar, no pane.
@@ -153,6 +162,14 @@ void _registerNodesShellTests() {
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
     expect(find.byType(Dialog), findsNothing);
+
+    // Android's hardware/system back unwinds the secondary page and keeps the
+    // app shell alive instead of exiting the application.
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsNothing);
+    expect(find.byType(NavigationBar), findsOneWidget);
+    expect(find.byType(P2WlanShell), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 }
