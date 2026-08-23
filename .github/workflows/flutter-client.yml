@@ -274,7 +274,8 @@ jobs:
 
       - name: Bundle Windows daemon
         shell: pwsh
-        run: Copy-Item "target\release\p2wlan-daemon.exe" "apps\flutter_client\build\windows\x64\runner\Release\p2wlan-daemon.exe" -Force
+        working-directory: apps/flutter_client
+        run: Copy-Item "..\..\target\release\p2wlan-daemon.exe" "build\windows\x64\runner\Release\p2wlan-daemon.exe" -Force
 
       - name: Bundle Wintun runtime
         shell: pwsh
