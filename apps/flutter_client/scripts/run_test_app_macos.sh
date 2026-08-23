@@ -101,4 +101,7 @@ fi
 
 cd "$FLUTTER_DIR"
 export P2WLAN_DAEMON_BIN="$DAEMON_BIN"
-exec flutter run -d macos "${FLUTTER_ARGS[@]}"
+if [[ "${#FLUTTER_ARGS[@]}" -gt 0 ]]; then
+  exec flutter run -d macos "${FLUTTER_ARGS[@]}"
+fi
+exec flutter run -d macos
