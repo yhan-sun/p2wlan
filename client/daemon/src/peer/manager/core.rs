@@ -42,7 +42,10 @@ impl PeerManager {
             remote_fresh_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_snapshots: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_fresh_applies: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            remote_fresh_identity_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            remote_fresh_transaction_gate: Arc::new(tokio::sync::Mutex::new(())),
+            remote_identity_ledger: Arc::new(
+                std::sync::Mutex::new(RemoteIdentityLedger::default()),
+            ),
             direct_peers: Arc::new(std::sync::Mutex::new(HashSet::new())),
             relay_first_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             recovery_epochs: Arc::new(RwLock::new(HashMap::new())),
@@ -56,13 +59,15 @@ impl PeerManager {
             relay_probe_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             path_commit_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             quarantined_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            quarantine_deadline_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_not_found_grace: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             relay_backoff_heartbeat_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
-            direct_recovery_kick_hook: Arc::new(std::sync::Mutex::new(None)),
             timeline: std::sync::Mutex::new(None),
             outbound_loss_slot: Arc::new(std::sync::Mutex::new(None)),
-            outbound_loss_default: Arc::new(tokio::sync::Mutex::new(OutboundLossCounters::default())),
+            outbound_loss_default: Arc::new(tokio::sync::Mutex::new(
+                OutboundLossCounters::default(),
+            )),
             config,
         }
     }
@@ -276,8 +281,8 @@ impl PeerManager {
             }
         };
         let network_generation = self.current_network_generation_sync();
-        let capabilities = NatCapabilities::from_profile(&profile)
-            .with_profile_generation(profile_generation);
+        let capabilities =
+            NatCapabilities::from_profile(&profile).with_profile_generation(profile_generation);
         debug!(
             event = "nat_profile_updated",
             network_generation,
@@ -329,11 +334,9 @@ impl PeerManager {
         profile_generation: u64,
     ) -> bool {
         let mut connections = self.connections.write().await;
-        connections
-            .get_mut(node_id)
-            .is_some_and(|connection| {
-                connection.bind_remote_nat_profile_to_candidate_epoch(profile_generation)
-            })
+        connections.get_mut(node_id).is_some_and(|connection| {
+            connection.bind_remote_nat_profile_to_candidate_epoch(profile_generation)
+        })
     }
 
     /// Bound probe rounds from the observed local NAT behavior.  Endpoint-
@@ -368,7 +371,9 @@ impl PeerManager {
         self.traversal_history
             .try_read()
             .map(|history| history.diagnostics())
-            .unwrap_or_else(|_| TraversalHistoryDiagnostics { sources: Vec::new() })
+            .unwrap_or_else(|_| TraversalHistoryDiagnostics {
+                sources: Vec::new(),
+            })
     }
 
     async fn record_traversal_success(&self, source: CandidatePairSource) {
@@ -429,7 +434,8 @@ impl PeerManager {
     /// this never lags a completed advance; the generation only moves forward,
     /// so a check against this value can never pass with a stale generation.
     pub(crate) fn current_network_generation_sync(&self) -> u64 {
-        self.network_generation_sync.load(std::sync::atomic::Ordering::Acquire)
+        self.network_generation_sync
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The shared network-epoch gate that serializes generation advances
@@ -485,10 +491,7 @@ impl PeerManager {
     /// candidate-set handover. The caller already holds `network_epoch_gate`,
     /// so this helper deliberately does not acquire it again; that keeps the
     /// candidate publication and validation cancellation one transaction.
-    pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(
-        &self,
-        peer_id: &str,
-    ) {
+    pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(&self, peer_id: &str) {
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry
                 .cancel_peer_with_reason(peer_id, "remote_candidate_generation_changed")
@@ -580,9 +583,7 @@ impl PeerManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn connection_map_for_test(
-        &self,
-    ) -> Arc<RwLock<HashMap<String, PeerConnection>>> {
+    pub(crate) fn connection_map_for_test(&self) -> Arc<RwLock<HashMap<String, PeerConnection>>> {
         self.connections.clone()
     }
 
@@ -650,7 +651,8 @@ impl PeerManager {
         for peer_id in relay_confirmation_cancellations {
             self.bump_relay_confirm_seq(&peer_id);
         }
-        self.clear_all_fresh_mappings("network_generation_changed").await;
+        self.clear_all_fresh_mappings("network_generation_changed")
+            .await;
         self.clear_hard_hard_sessions(None).await;
 
         info!(
@@ -725,7 +727,8 @@ impl PeerManager {
         }
         let peer_count = conns.len();
         drop(conns);
-        self.clear_all_fresh_mappings("candidate_refresh_generation_changed").await;
+        self.clear_all_fresh_mappings("candidate_refresh_generation_changed")
+            .await;
         self.clear_hard_hard_sessions(None).await;
 
         info!(

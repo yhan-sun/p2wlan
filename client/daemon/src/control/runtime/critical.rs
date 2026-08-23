@@ -281,25 +281,26 @@ async fn run_candidate_offer_worker(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let result = match http.current() {
             Err(error) => CandidateOfferAttempt::Completed(Err(error)),
-            Ok(_) if remaining.is_zero() => CandidateOfferAttempt::Completed(Err(
-                DaemonError::ControlPlane(
-                "candidate offer deadline exceeded before delivery".into(),
-            ))),
+            Ok(_) if remaining.is_zero() => {
+                CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                    "candidate offer deadline exceeded; delivery status is unknown".into(),
+                )))
+            }
             Ok(current_http) => loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                        "candidate offer deadline exceeded before delivery".into(),
+                        "candidate offer deadline exceeded; delivery status is unknown".into(),
                     )));
                 }
                 let result = tokio::select! {
                     biased;
                     // Fresh ownership can be revoked while the HTTP request is
-                    // already in flight.  Dropping that request is the only
-                    // way to keep a retired dynamic socket's prediction from
-                    // surviving its exact punch/session owner.  This cancels
-                    // only the current immutable command; the per-peer FIFO
-                    // worker remains available for the replacement owner.
+                    // already in flight. Drop the local request future and
+                    // report ambiguous delivery so the caller rolls back the
+                    // retired socket; the server may already have accepted it.
+                    // This cancels only the current immutable command, leaving
+                    // the per-peer FIFO worker available for its replacement.
                     _ = async {
                         if let Some(ownership) = fresh_ownership.as_ref() {
                             ownership.cancelled().await;
@@ -320,7 +321,7 @@ async fn run_candidate_offer_worker(
                     )) => CandidateOfferAttempt::Completed(match result {
                         Ok(result) => result,
                         Err(_) => Err(DaemonError::ControlPlane(
-                            "candidate offer deadline exceeded during request".into(),
+                            "candidate offer deadline exceeded during request; delivery status is unknown".into(),
                         )),
                     }),
                     changed = auth_rx.changed() => {

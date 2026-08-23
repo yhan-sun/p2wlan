@@ -350,11 +350,11 @@ impl ControlClient {
     /// Send a peer offer with candidate sources and an optional synchronized punch window.
     ///
     /// `fresh_ownership` optionally carries the punch-session cancellation for
-    /// a fresh-mapping prediction advertisement: the HTTP worker refuses to
-    /// send once the session was superseded, so a stale prediction can never
-    /// reach the wire after its owner was cancelled.  The outcome reports
-    /// whether the signal was really sent (`Sent`), was revoked before the
-    /// request (`Cancelled`) or failed (`Failed`).
+    /// a fresh-mapping prediction advertisement. The HTTP worker drops queued
+    /// or in-flight work once the session is superseded; an in-flight request
+    /// may already have reached the server, so `Cancelled` means delivery is
+    /// ambiguous and the retired socket must not be finalized. `Sent` means
+    /// the server accepted the request; `Failed` means the attempt failed.
     pub(crate) async fn send_peer_offer_with_sources_and_punch_at(
         &self,
         to_node_id: &str,

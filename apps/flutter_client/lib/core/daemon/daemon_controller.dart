@@ -211,6 +211,11 @@ class DaemonController {
       if (Platform.isWindows) await protectRuntimeDirectory(logDir);
       await startupTrace?.stageOk(5, 'runtime_acl');
     } catch (error) {
+      await _recordWindowsStartupError(
+        startupTrace,
+        '05 runtime_acl ERROR',
+        error,
+      );
       return _startupFailure(
         startupTrace,
         stage: 5,
@@ -221,33 +226,62 @@ class DaemonController {
 
     await startupTrace?.stageStart(6, 'launch_token');
     if (!useManualMode && (requiresElevation || Platform.isWindows)) {
-      try {
-        tokenFile = await createEphemeralLaunchTokenFile(logDir, authToken);
+      if (Platform.isWindows) {
+        // Stage 05 is the sole owner of the runtime-directory DACL. Rewriting
+        // it here can fail independently and used to be misreported as a
+        // token-access failure before UAC was even requested.
+        await startupTrace?.detail('06a stale_cleanup START');
+        try {
+          await cleanupStaleLaunchTokenFiles(logDir);
+          await startupTrace?.detail('06a stale_cleanup OK');
+        } catch (error) {
+          return _launchTokenStartupFailure(
+            startupTrace,
+            substage: 'stale_cleanup',
+            error: error,
+          );
+        }
+
+        await startupTrace?.detail('06b token_write START');
+        late final File writtenToken;
+        try {
+          writtenToken = await writeEphemeralLaunchTokenFile(logDir, authToken);
+          tokenFile = writtenToken;
+          await startupTrace?.detail('06b token_write OK');
+        } catch (error) {
+          return _launchTokenStartupFailure(
+            startupTrace,
+            substage: 'token_write',
+            error: error,
+          );
+        }
+
+        await startupTrace?.detail('06c token_acl START');
+        try {
+          await protectEphemeralLaunchTokenFile(writtenToken);
+          await startupTrace?.detail('06c token_acl OK');
+        } catch (error) {
+          try {
+            await deleteEphemeralLaunchTokenFile(writtenToken);
+          } catch (_) {}
+          return _launchTokenStartupFailure(
+            startupTrace,
+            substage: 'token_acl',
+            error: error,
+          );
+        }
         await startupTrace?.stageOk(6, 'launch_token');
-      } catch (error) {
-        return _startupFailure(
-          startupTrace,
-          stage: 6,
-          code: Platform.isWindows
-              ? DaemonStartupFailureCode.tokenAccessFailed
-              : _failureCodeForError(error),
-          message: _startFailureMessage(error),
-        );
-      }
-    } else if (Platform.isWindows) {
-      try {
-        // Manual/offline mode has no launch token, but an elevated daemon
-        // still needs the same user/admin ACL on the runtime directory for
-        // its log, PID marker, and diagnostics session file.
-        await protectRuntimeDirectory(logDir);
-        await startupTrace?.stageOk(6, 'launch_token');
-      } catch (error) {
-        return _startupFailure(
-          startupTrace,
-          stage: 6,
-          code: _failureCodeForError(error),
-          message: _startFailureMessage(error),
-        );
+      } else {
+        try {
+          tokenFile = await createEphemeralLaunchTokenFile(logDir, authToken);
+          await startupTrace?.stageOk(6, 'launch_token');
+        } catch (error) {
+          return _launchTokenStartupFailure(
+            startupTrace,
+            substage: 'token_prepare',
+            error: error,
+          );
+        }
       }
     } else {
       await startupTrace?.stageSkipped(6, 'launch_token');
@@ -307,10 +341,9 @@ class DaemonController {
       await logDir.create(recursive: true);
       if (Platform.isWindows) {
         // The daemon may run under the alternate administrator selected in
-        // the UAC prompt. Grant only the interactive SID and local
-        // Administrators (never Everyone) access to both runtime roots.
+        // the UAC prompt. The log directory DACL was completed once in stage
+        // 05; only the config root needs protection here.
         await protectRuntimeDirectory(configPath.parent);
-        await protectRuntimeDirectory(logDir);
         if (await configPath.exists()) {
           await _restrictLaunchPath(configPath.path);
         }
@@ -335,6 +368,11 @@ class DaemonController {
       try {
         await deleteEphemeralLaunchTokenFile(tokenFile);
       } catch (_) {}
+      await _recordWindowsStartupError(
+        startupTrace,
+        '07 log_prepare ERROR',
+        error,
+      );
       return _startupFailure(
         startupTrace,
         stage: 7,
@@ -595,6 +633,37 @@ class DaemonController {
       manualCommand: manualCommand,
       failureCode: code,
     );
+  }
+
+  Future<DaemonCommandResult> _launchTokenStartupFailure(
+    WindowsStartupTrace? trace, {
+    required String substage,
+    required Object error,
+  }) async {
+    final code = Platform.isWindows
+        ? windowsLaunchTokenFailureCodeForError(error)
+        : _failureCodeForError(error);
+    await _recordWindowsStartupError(trace, '06 $substage ERROR', error);
+    final message = Platform.isWindows
+        ? switch (code) {
+            DaemonStartupFailureCode.aclFailure =>
+              '[ACL_FAILURE] 无法为启动凭据设置安全 Windows ACL。',
+            _ => '[TOKEN_ACCESS_FAILED] 无法准备安全的一次性 Windows 启动凭据。',
+          }
+        : _startFailureMessage(error);
+    return _startupFailure(trace, stage: 6, code: code, message: message);
+  }
+
+  Future<void> _recordWindowsStartupError(
+    WindowsStartupTrace? trace,
+    String prefix,
+    Object error,
+  ) async {
+    if (!Platform.isWindows) return;
+    final detail = error is WindowsAclProtectionException
+        ? error.diagnostic
+        : 'error=${_sanitizeProbeOutput(error.toString())}';
+    await trace?.detail('$prefix $detail');
   }
 
   DaemonStartupFailureCode _failureCodeForError(Object error) {

@@ -99,7 +99,12 @@ async fn punch_candidate_snapshot(
     canonical.sort_unstable();
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for endpoint in &canonical {
-        for byte in endpoint.as_bytes().iter().copied().chain(std::iter::once(0)) {
+        for byte in endpoint
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(0))
+        {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -201,6 +206,9 @@ async fn spawn_peer_reflexive_micro_window(
     if peers.is_direct(&peer_id).await {
         return;
     }
+    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+        return;
+    };
 
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
         peers
@@ -218,9 +226,11 @@ async fn spawn_peer_reflexive_micro_window(
         return;
     };
     let generation = peers.current_network_generation().await;
-    let session = match punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+    let Some(claim) = punch_deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            &peers,
             &peer_id,
+            peer_session_generation,
             generation,
             epoch,
             PUNCH_PRIORITY_SYNCHRONIZED,
@@ -228,7 +238,10 @@ async fn spawn_peer_reflexive_micro_window(
             Some(punch_at_ms),
         )
         .await
-    {
+    else {
+        return;
+    };
+    let session = match claim {
         RendezvousPunchClaim::Claimed(session) => session,
         RendezvousPunchClaim::Deferred(deferred) => {
             peers
@@ -252,10 +265,14 @@ async fn spawn_peer_reflexive_micro_window(
                 .await;
             return;
         }
+        RendezvousPunchClaim::RejectedStalePeerSession => return,
     };
     let delay = relay_assisted_punch_delay(Some(punch_at_ms));
     let session_id = session.session_id();
     tokio::spawn(async move {
+        if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+            return;
+        }
         peers
             .record_direct_event_for_generation_with_socket(
                 &peer_id,
@@ -294,7 +311,10 @@ async fn spawn_peer_reflexive_micro_window(
                 }
             }
         }
-        if session.is_cancelled() || peers.is_direct(&peer_id).await {
+        if peers.is_direct(&peer_id).await
+            || session.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+        {
             return;
         }
 
@@ -407,16 +427,18 @@ async fn spawn_peer_reflexive_micro_window(
                     ).await;
                 }
                 None => {
-                    peers.record_direct_event_for_generation_with_socket(
-                        &peer_id,
-                        generation,
-                        "peer_reflexive_micro_window_cancelled",
-                        targets.first().copied(),
-                        None,
-                        Some(targets.len()),
-                        None,
-                        format!("origin={origin} session_id={session_id} send did not start"),
-                    ).await;
+                    peers
+                        .record_direct_event_for_generation_with_socket(
+                            &peer_id,
+                            generation,
+                            "peer_reflexive_micro_window_cancelled",
+                            targets.first().copied(),
+                            None,
+                            Some(targets.len()),
+                            None,
+                            format!("origin={origin} session_id={session_id} send did not start"),
+                        )
+                        .await;
                 }
             },
         }
@@ -475,11 +497,7 @@ async fn record_hole_punch_send_error_for_lifecycle(
         .await;
     if failed {
         peers
-            .mark_recovery_relay_backoff_for_peer_session(
-                peer_id,
-                peer_session_generation,
-                detail,
-            )
+            .mark_recovery_relay_backoff_for_peer_session(peer_id, peer_session_generation, detail)
             .await;
     }
     failed
@@ -635,16 +653,21 @@ async fn spawn_hole_punch_task_with_lifecycle(
         return;
     }
     let network_generation = peers.current_network_generation().await;
-    let claimed = punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+    let Some(claimed) = punch_deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            &peers,
             &peer_id,
+            peer_session_generation,
             network_generation,
             epoch,
             claim_priority,
             fresh_prediction,
             punch_at_ms,
         )
-        .await;
+        .await
+    else {
+        return;
+    };
     let session = match claimed {
         RendezvousPunchClaim::Claimed(session) => session,
         RendezvousPunchClaim::Deferred(deferred) => {
@@ -703,6 +726,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
             );
             return;
         }
+        RendezvousPunchClaim::RejectedStalePeerSession => return,
     };
     let punch_delay = relay_assisted_punch_delay(punch_at_ms);
     if !punch_delay.is_zero() {
@@ -715,7 +739,10 @@ async fn spawn_hole_punch_task_with_lifecycle(
     let invocation_cancellation = session.cancellation_handle();
     tokio::spawn(async move {
         let worker = async move {
-        peers
+            if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+                return;
+            }
+            peers
             .record_direct_event(
                 &peer_id,
                 "punch_scheduled",
@@ -736,22 +763,22 @@ async fn spawn_hole_punch_task_with_lifecycle(
             )
             .await;
 
-        // Fresh mapping is an optimization for later Direct retries.  It must
-        // not sit in front of the first relay-assisted/ordinary punch: field
-        // evidence showed this measurement can take about a second.  Build a
-        // self-contained future now and start it only after all early
-        // cancellation/candidate gates below have passed; the first punch and
-        // this optimization then run concurrently.
-        let fresh_mapping_future = {
-            let signal = signal.clone();
-            let udp = udp.clone();
-            let peers = peers.clone();
-            let peer_id = peer_id.clone();
-            let cancellation = session.cancellation_handle();
-            async move {
-                let fresh_generation = if let Some(signal) = signal.as_ref() {
-            if signal.boot_epoch_ms == 0 {
-                peers
+            // Fresh mapping is an optimization for later Direct retries.  It must
+            // not sit in front of the first relay-assisted/ordinary punch: field
+            // evidence showed this measurement can take about a second.  Build a
+            // self-contained future now and start it only after all early
+            // cancellation/candidate gates below have passed; the first punch and
+            // this optimization then run concurrently.
+            let fresh_mapping_future = {
+                let signal = signal.clone();
+                let udp = udp.clone();
+                let peers = peers.clone();
+                let peer_id = peer_id.clone();
+                let cancellation = session.cancellation_handle();
+                async move {
+                    let fresh_generation = if let Some(signal) = signal.as_ref() {
+                        if signal.boot_epoch_ms == 0 {
+                            peers
                     .record_direct_event(
                         &peer_id,
                         "fresh_mapping_skipped",
@@ -761,42 +788,60 @@ async fn spawn_hole_punch_task_with_lifecycle(
                         "fresh-mapping prediction disabled this boot (no trustworthy persistent incarnation); continuing with ordinary punching",
                     )
                     .await;
-                FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
-            } else if !peers.try_begin_fresh_generation(&peer_id).await {
-                peers
-                    .record_direct_event(
-                        &peer_id,
-                        "fresh_mapping_epoch_quota_exhausted",
-                        None,
-                        None,
-                        None,
-                        format!(
-                            "fresh-mapping generation skipped: the recovery epoch {epoch} already used its fresh-generation quota"
-                        ),
-                    )
-                    .await;
-                FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded)
-            } else {
-                let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
-                let mut generation = udp
-                    .run_fresh_mapping_generation(
-                        &peer_id,
-                        &signal.stun_servers,
-                        signal.stun_timeout,
-                        &targets,
-                        probe_interval,
-                        attempts.min(2),
-                        Some(&cancellation),
-                    )
-                    .await;
-                match &mut generation {
-                    FreshMappingOutcome::Accepted(result, handoff) => {
-                        // The session may have been superseded while the
-                        // generation measured: a stale prediction must not be
-                        // advertised (its HTTP-send-time generation would look
-                        // newer to the peer and cancel the fresher session).
-                        if cancellation.is_cancelled() {
-                            peers
+                            FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
+                        } else {
+                            let Some(reservation) = peers
+                                .try_begin_fresh_generation_for_epoch(&peer_id, epoch)
+                                .await
+                            else {
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "fresh_mapping_epoch_quota_exhausted",
+                                        None,
+                                        None,
+                                        None,
+                                        format!(
+                                            "fresh-mapping generation skipped: the recovery epoch {epoch} already used its fresh-generation quota"
+                                        ),
+                                    )
+                                    .await;
+                                return;
+                            };
+                            if cancellation.is_cancelled()
+                                || !peers
+                                    .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                            {
+                                reservation.refund().await;
+                                return;
+                            }
+                            let recovery_identity = reservation.identity();
+                            reservation.commit();
+                            let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
+                            let mut generation = udp
+                                .run_fresh_mapping_generation(
+                                    &peer_id,
+                                    &signal.stun_servers,
+                                    signal.stun_timeout,
+                                    &targets,
+                                    probe_interval,
+                                    attempts.min(2),
+                                    Some(&cancellation),
+                                )
+                                .await;
+                            match &mut generation {
+                                FreshMappingOutcome::Accepted(result, handoff) => {
+                                    // The session may have been superseded while the
+                                    // generation measured: a stale prediction must not be
+                                    // advertised (its HTTP-send-time generation would look
+                                    // newer to the peer and cancel the fresher session).
+                                    if cancellation.is_cancelled()
+                                        || !peers.peer_session_is_current_sync(
+                                            &peer_id,
+                                            peer_session_generation,
+                                        )
+                                    {
+                                        peers
                                 .record_direct_event(
                                     &peer_id,
                                     "fresh_mapping_skipped",
@@ -806,15 +851,15 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     "fresh-mapping generation completed but its punch session was superseded; not advertising the prediction",
                                 )
                                 .await;
-                            // The guard stays alive until this task ends; its
-                            // watcher then rolls the peer back to its
-                            // previous path (nothing was advertised).
-                        } else if peers.is_direct(&peer_id).await {
-                            // Direct was confirmed while the generation
-                            // measured: the prediction must not be advertised
-                            // (a post-convergence HTTP signal) and the socket
-                            // rolls back when the guard drops.
-                            peers
+                                        // The guard stays alive until this task ends; its
+                                        // watcher then rolls the peer back to its
+                                        // previous path (nothing was advertised).
+                                    } else if peers.is_direct(&peer_id).await {
+                                        // Direct was confirmed while the generation
+                                        // measured: the prediction must not be advertised
+                                        // (a post-convergence HTTP signal) and the socket
+                                        // rolls back when the guard drops.
+                                        peers
                                 .record_direct_event(
                                     &peer_id,
                                     "fresh_mapping_skipped",
@@ -824,15 +869,27 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     "fresh-mapping prediction was not advertised because Direct was confirmed while measuring",
                                 )
                                 .await;
-                        } else {
-                            // The durable handoff happens ONLY after the
-                            // prediction is really advertised: a send failure
-                            // or a cancellation during the advertise keeps the
-                            // socket rollable, so the guard is dropped without
-                            // finalizing instead of leaving an un-advertised
-                            // socket as the peer's long-term path.
-                            let advertised = if !peers.try_consume_recovery_http_quota(&peer_id).await {
-                                peers
+                                    } else {
+                                        // The durable handoff happens ONLY after the
+                                        // prediction is really advertised: a send failure
+                                        // or a cancellation during the advertise keeps the
+                                        // socket rollable, so the guard is dropped without
+                                        // finalizing instead of leaving an un-advertised
+                                        // socket as the peer's long-term path.
+                                        let advertised = if cancellation.is_cancelled()
+                                            || !peers.peer_session_is_current_sync(
+                                                &peer_id,
+                                                peer_session_generation,
+                                            ) {
+                                            false
+                                        } else if !peers
+                                            .try_consume_recovery_http_quota_for_identity(
+                                                &peer_id,
+                                                recovery_identity,
+                                            )
+                                            .await
+                                        {
+                                            peers
                                     .record_direct_event(
                                         &peer_id,
                                         "fresh_mapping_epoch_http_quota_exhausted",
@@ -844,20 +901,27 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                         ),
                                     )
                                     .await;
-                                false
-                            } else {
-                                advertise_fresh_mapping_prediction(
-                                    signal,
-                                    &peers,
-                                    &peer_id,
-                                    &*result,
-                                    &cancellation,
-                                )
-                                .await
-                            };
-                            if advertised {
-                                if !handoff.finalize().await {
-                                    peers
+                                            false
+                                        } else if cancellation.is_cancelled()
+                                            || !peers.peer_session_is_current_sync(
+                                                &peer_id,
+                                                peer_session_generation,
+                                            )
+                                        {
+                                            false
+                                        } else {
+                                            advertise_fresh_mapping_prediction(
+                                                signal,
+                                                &peers,
+                                                &peer_id,
+                                                &*result,
+                                                &cancellation,
+                                            )
+                                            .await
+                                        };
+                                        if advertised {
+                                            if !handoff.finalize().await {
+                                                peers
                                         .record_direct_event(
                                             &peer_id,
                                             "fresh_mapping_skipped",
@@ -867,9 +931,9 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                             "fresh-mapping prediction was advertised but the socket was rolled back before the durable handoff; continuing with ordinary punching",
                                         )
                                         .await;
-                                }
-                            } else {
-                                peers
+                                            }
+                                        } else {
+                                            peers
                                     .record_direct_event(
                                         &peer_id,
                                         "fresh_mapping_skipped",
@@ -879,33 +943,38 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                         "fresh-mapping prediction was not advertised; the generation's socket rolls back to the previous path",
                                     )
                                     .await;
+                                        }
+                                    }
+                                }
+                                FreshMappingOutcome::Rejected(reason) => {
+                                    peers
+                                        .record_direct_event(
+                                            &peer_id,
+                                            "fresh_mapping_skipped",
+                                            None,
+                                            None,
+                                            None,
+                                            format!(
+                                                "fresh-mapping generation skipped: {}",
+                                                reason.label()
+                                            ),
+                                        )
+                                        .await;
+                                }
                             }
+                            generation
                         }
-                    }
-                    FreshMappingOutcome::Rejected(reason) => {
-                        peers
-                            .record_direct_event(
-                                &peer_id,
-                                "fresh_mapping_skipped",
-                                None,
-                                None,
-                                None,
-                                format!("fresh-mapping generation skipped: {}", reason.label()),
-                            )
-                            .await;
-                    }
+                    } else {
+                        FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
+                    };
+                    drop(fresh_generation);
                 }
-                generation
-            }
-        } else {
-            FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
-        };
-                drop(fresh_generation);
-            }
-        };
+            };
 
-        if session.is_cancelled() {
-            peers
+            if session.is_cancelled()
+                || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
+                peers
                 .record_direct_event(
                     &peer_id,
                     "punch_session_cancelled",
@@ -924,14 +993,14 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     ),
                 )
                 .await;
-            return;
-        }
+                return;
+            }
 
-        // Direct may have been confirmed while the fresh-mapping generation
-        // measured or while the rendezvous window was pending: a stale task
-        // must not start its candidate sweep on a confirmed path.
-        if peers.is_direct(&peer_id).await {
-            peers
+            // Direct may have been confirmed while the fresh-mapping generation
+            // measured or while the rendezvous window was pending: a stale task
+            // must not start its candidate sweep on a confirmed path.
+            if peers.is_direct(&peer_id).await {
+                peers
                 .record_direct_event(
                     &peer_id,
                     "punch_skipped_already_direct",
@@ -941,207 +1010,208 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     "skipped UDP punch because Direct was confirmed while the punch session was pending",
                 )
                 .await;
-            debug!("Skipping UDP punch for {peer_id}; Direct path was confirmed while waiting");
-            return;
-        }
-
-        // The dedup/recovery owner was claimed for `network_generation` before
-        // this task was spawned. Never retag the delayed worker with whatever
-        // network generation happens to be current after the rendezvous wait.
-        let generation = network_generation;
-        // A fresh-mapping prediction session punches toward the immutable
-        // candidate snapshot frozen when the fresh signal arrived; ordinary
-        // sessions read the shared candidate set at session time.  A later
-        // ordinary refresh may update the shared set, but it must never change
-        // the target of a running fresh session.
-        //
-        // The frozen prediction window NEVER replaces the ordinary candidate
-        // set: it is UNIONED with it.  Field evidence (v0.1.115 Mini log): a
-        // destination-dependent CGNAT peer (Air) advertised a 96-port
-        // prediction window that its actual peer-facing mapping (port 6609)
-        // was NOT inside, while the ordinary candidate set carried the peer's
-        // STUN-observed endpoint (6467).  Because the frozen window replaced
-        // the ordinary set, all four 512-probe sessions (2048 datagrams)
-        // scanned the wrong window and the only working signal was the
-        // peer-reflexive observation.  Merging keeps the trusted ordinary
-        // candidates FIRST (they carry real authenticated evidence) and
-        // appends the prediction window after them.
-        //
-        // The newest-wins pending target (stashed by a trigger that was
-        // suppressed while another session ran) wins over a freshly computed
-        // target: new candidates update the plan's target without ever
-        // resetting its budgets or starting a parallel session.
-        let pending_target = peers.take_recovery_target(&peer_id).await;
-        let merge_frozen = |ordinary: Option<DirectProbeTargetSet>,
-                            frozen: Option<Vec<SocketAddr>>,
-                            preferred_fast_candidates: Option<Vec<SocketAddr>>,
-                            recovery_epoch: u64|
-         -> Option<DirectProbeTargetSet> {
-            let frozen = frozen.unwrap_or_default();
-            let preferred_fast_candidates =
-                preferred_fast_candidates.unwrap_or_else(|| frozen.clone());
-            match ordinary {
-                Some(mut ordinary) => {
-                    merge_unique_socket_addresses(&mut ordinary.candidates, &frozen);
-                    merge_unique_socket_addresses(
-                        &mut ordinary.preferred_fast_candidates,
-                        &preferred_fast_candidates,
-                    );
-                    Some(ordinary)
-                }
-                None if !frozen.is_empty() => Some(DirectProbeTargetSet {
-                    peer_id: peer_id.clone(),
-                    preferred_fast_candidates,
-                    candidates: frozen,
-                    remote_scatter_pool: false,
-                    stable_remote_scatter: false,
-                    birthday_plan: None,
-                    recovery_epoch,
-                }),
-                None => None,
+                debug!("Skipping UDP punch for {peer_id}; Direct path was confirmed while waiting");
+                return;
             }
-        };
-        // Snapshot before the match consumes the option: the owned punch
-        // block below still needs to know whether this session is a frozen
-        // prediction window (it decides the attempt policy and the bounded
-        // fast prefix). A pending fresh prediction can replace the original
-        // trigger target, so retain that snapshot too.
-        let mut is_frozen_prediction_window = frozen_targets.is_some();
-        let mut fast_prediction_candidates = frozen_targets.clone().unwrap_or_default();
-        let target = match pending_target {
-            Some(pending) => {
-                if let Some(punch_at) = pending.punch_at_ms {
-                    debug!(
+
+            // The dedup/recovery owner was claimed for `network_generation` before
+            // this task was spawned. Never retag the delayed worker with whatever
+            // network generation happens to be current after the rendezvous wait.
+            let generation = network_generation;
+            // A fresh-mapping prediction session punches toward the immutable
+            // candidate snapshot frozen when the fresh signal arrived; ordinary
+            // sessions read the shared candidate set at session time.  A later
+            // ordinary refresh may update the shared set, but it must never change
+            // the target of a running fresh session.
+            //
+            // The frozen prediction window NEVER replaces the ordinary candidate
+            // set: it is UNIONED with it.  Field evidence (v0.1.115 Mini log): a
+            // destination-dependent CGNAT peer (Air) advertised a 96-port
+            // prediction window that its actual peer-facing mapping (port 6609)
+            // was NOT inside, while the ordinary candidate set carried the peer's
+            // STUN-observed endpoint (6467).  Because the frozen window replaced
+            // the ordinary set, all four 512-probe sessions (2048 datagrams)
+            // scanned the wrong window and the only working signal was the
+            // peer-reflexive observation.  Merging keeps the trusted ordinary
+            // candidates FIRST (they carry real authenticated evidence) and
+            // appends the prediction window after them.
+            //
+            // The newest-wins pending target (stashed by a trigger that was
+            // suppressed while another session ran) wins over a freshly computed
+            // target: new candidates update the plan's target without ever
+            // resetting its budgets or starting a parallel session.
+            let pending_target = peers.take_recovery_target(&peer_id).await;
+            let merge_frozen = |ordinary: Option<DirectProbeTargetSet>,
+                                frozen: Option<Vec<SocketAddr>>,
+                                preferred_fast_candidates: Option<Vec<SocketAddr>>,
+                                recovery_epoch: u64|
+             -> Option<DirectProbeTargetSet> {
+                let frozen = frozen.unwrap_or_default();
+                let preferred_fast_candidates =
+                    preferred_fast_candidates.unwrap_or_else(|| frozen.clone());
+                match ordinary {
+                    Some(mut ordinary) => {
+                        merge_unique_socket_addresses(&mut ordinary.candidates, &frozen);
+                        merge_unique_socket_addresses(
+                            &mut ordinary.preferred_fast_candidates,
+                            &preferred_fast_candidates,
+                        );
+                        Some(ordinary)
+                    }
+                    None if !frozen.is_empty() => Some(DirectProbeTargetSet {
+                        peer_id: peer_id.clone(),
+                        preferred_fast_candidates,
+                        candidates: frozen,
+                        remote_scatter_pool: false,
+                        stable_remote_scatter: false,
+                        birthday_plan: None,
+                        recovery_epoch,
+                    }),
+                    None => None,
+                }
+            };
+            // Snapshot before the match consumes the option: the owned punch
+            // block below still needs to know whether this session is a frozen
+            // prediction window (it decides the attempt policy and the bounded
+            // fast prefix). A pending fresh prediction can replace the original
+            // trigger target, so retain that snapshot too.
+            let mut is_frozen_prediction_window = frozen_targets.is_some();
+            let mut fast_prediction_candidates = frozen_targets.clone().unwrap_or_default();
+            let target = match pending_target {
+                Some(pending) => {
+                    if let Some(punch_at) = pending.punch_at_ms {
+                        debug!(
                         "Punch session for {peer_id} picked up a newest-wins pending target (fresh_prediction={:?} punch_at_ms={punch_at} candidates={})",
                         pending.fresh_prediction,
                         pending.candidates.len()
                     );
+                    }
+                    let has_frozen = pending.frozen_targets.is_some();
+                    let pending_preferred_fast_candidates = if has_frozen {
+                        pending.frozen_targets.clone().unwrap_or_default()
+                    } else {
+                        pending.preferred_fast_candidates.clone()
+                    };
+                    if has_frozen {
+                        fast_prediction_candidates = pending_preferred_fast_candidates.clone();
+                        is_frozen_prediction_window = true;
+                    } else {
+                        // A newer ordinary refresh supersedes the original
+                        // prediction target. Never let the old frozen window leak
+                        // into the fast prefix of the replacement session, but do
+                        // retain the refresh's authenticated/learned sources.
+                        fast_prediction_candidates = pending_preferred_fast_candidates.clone();
+                        is_frozen_prediction_window = false;
+                    }
+                    let frozen = if has_frozen {
+                        pending.frozen_targets
+                    } else {
+                        Some(pending.candidates)
+                    };
+                    let ordinary = if has_frozen {
+                        peers.direct_probe_target_set_for(&peer_id).await
+                    } else {
+                        None
+                    };
+                    merge_frozen(
+                        ordinary,
+                        frozen,
+                        Some(pending_preferred_fast_candidates),
+                        epoch,
+                    )
                 }
-                let has_frozen = pending.frozen_targets.is_some();
-                let pending_preferred_fast_candidates = if has_frozen {
-                    pending.frozen_targets.clone().unwrap_or_default()
-                } else {
-                    pending.preferred_fast_candidates.clone()
-                };
-                if has_frozen {
-                    fast_prediction_candidates = pending_preferred_fast_candidates.clone();
-                    is_frozen_prediction_window = true;
-                } else {
-                    // A newer ordinary refresh supersedes the original
-                    // prediction target. Never let the old frozen window leak
-                    // into the fast prefix of the replacement session, but do
-                    // retain the refresh's authenticated/learned sources.
-                    fast_prediction_candidates = pending_preferred_fast_candidates.clone();
-                    is_frozen_prediction_window = false;
+                None => match frozen_targets {
+                    Some(frozen) => {
+                        let ordinary = peers.direct_probe_target_set_for(&peer_id).await;
+                        merge_frozen(ordinary, Some(frozen), None, epoch)
+                    }
+                    None => peers.direct_probe_target_set_for(&peer_id).await,
+                },
+            };
+            let Some(mut target) = target else {
+                if peers.is_direct(&peer_id).await {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_skipped_already_direct",
+                            None,
+                            None,
+                            None,
+                            "skipped UDP punch because Direct path is already confirmed",
+                        )
+                        .await;
+                    debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
+                    return;
                 }
-                let frozen = if has_frozen {
-                    pending.frozen_targets
-                } else {
-                    Some(pending.candidates)
-                };
-                let ordinary = if has_frozen {
-                    peers.direct_probe_target_set_for(&peer_id).await
-                } else {
-                    None
-                };
-                merge_frozen(
-                    ordinary,
-                    frozen,
-                    Some(pending_preferred_fast_candidates),
-                    epoch,
-                )
-            }
-            None => match frozen_targets {
-                Some(frozen) => {
-                    let ordinary = peers.direct_probe_target_set_for(&peer_id).await;
-                    merge_frozen(ordinary, Some(frozen), None, epoch)
-                }
-                None => peers.direct_probe_target_set_for(&peer_id).await,
-            },
-        };
-        let Some(mut target) = target else {
-            if peers.is_direct(&peer_id).await {
+                // No candidate set yet: the peer just joined and its candidates
+                // are still travelling through the control plane.  This is NOT a
+                // failed probe batch — nothing was even attempted — so the path
+                // must not degrade and force a relay selection while the
+                // candidate exchange is still in flight.
+                debug!("No UDP candidates for {peer_id}; skipping hole punch");
                 peers
                     .record_direct_event(
                         &peer_id,
-                        "punch_skipped_already_direct",
+                        "punch_skipped_no_candidates",
                         None,
                         None,
                         None,
-                        "skipped UDP punch because Direct path is already confirmed",
+                        "skipped UDP punch because the peer candidate set is still being exchanged",
                     )
                     .await;
-                debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
                 return;
-            }
-            // No candidate set yet: the peer just joined and its candidates
-            // are still travelling through the control plane.  This is NOT a
-            // failed probe batch — nothing was even attempted — so the path
-            // must not degrade and force a relay selection while the
-            // candidate exchange is still in flight.
-            debug!("No UDP candidates for {peer_id}; skipping hole punch");
-            peers
-                .record_direct_event(
-                    &peer_id,
-                    "punch_skipped_no_candidates",
-                    None,
-                    None,
-                    None,
-                    "skipped UDP punch because the peer candidate set is still being exchanged",
-                )
+            };
+            // The target may have crossed another await boundary since it was
+            // selected. Re-check the remote epoch immediately before deriving the
+            // actual send vectors so a retired frozen prediction cannot be merged
+            // back into the running session.
+            target.candidates = peers
+                .current_remote_endpoints_for(&peer_id, target.candidates)
                 .await;
-            return;
-        };
-        // The target may have crossed another await boundary since it was
-        // selected. Re-check the remote epoch immediately before deriving the
-        // actual send vectors so a retired frozen prediction cannot be merged
-        // back into the running session.
-        target.candidates = peers
-            .current_remote_endpoints_for(&peer_id, target.candidates)
-            .await;
-        target.preferred_fast_candidates = peers
-            .current_remote_endpoints_for(&peer_id, target.preferred_fast_candidates)
-            .await;
-        fast_prediction_candidates = peers
-            .current_remote_endpoints_for(&peer_id, fast_prediction_candidates)
-            .await;
-        let mut candidates = target.candidates;
-        if fast_prediction_candidates.is_empty() {
-            fast_prediction_candidates = target.preferred_fast_candidates;
-        }
-        let remote_scatter_pool = target.remote_scatter_pool;
-        let stable_remote_scatter = target.stable_remote_scatter;
-        let birthday_plan = target.birthday_plan;
-        if candidates.is_empty() {
-            if peers.is_direct(&peer_id).await {
+            target.preferred_fast_candidates = peers
+                .current_remote_endpoints_for(&peer_id, target.preferred_fast_candidates)
+                .await;
+            fast_prediction_candidates = peers
+                .current_remote_endpoints_for(&peer_id, fast_prediction_candidates)
+                .await;
+            let mut candidates = target.candidates;
+            if fast_prediction_candidates.is_empty() {
+                fast_prediction_candidates = target.preferred_fast_candidates;
+            }
+            let remote_scatter_pool = target.remote_scatter_pool;
+            let stable_remote_scatter = target.stable_remote_scatter;
+            let birthday_plan = target.birthday_plan;
+            if candidates.is_empty() {
+                if peers.is_direct(&peer_id).await {
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_skipped_already_direct",
+                            None,
+                            None,
+                            None,
+                            "skipped UDP punch because Direct path is already confirmed",
+                        )
+                        .await;
+                    debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
+                    return;
+                }
+                debug!("No UDP candidates for {peer_id}; skipping hole punch");
                 peers
                     .record_direct_event(
                         &peer_id,
-                        "punch_skipped_already_direct",
+                        "punch_skipped_no_candidates",
                         None,
                         None,
                         None,
-                        "skipped UDP punch because Direct path is already confirmed",
+                        "skipped UDP punch because the candidate set is empty",
                     )
                     .await;
-                debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
                 return;
             }
-            debug!("No UDP candidates for {peer_id}; skipping hole punch");
+            let mut dispatch_snapshot =
+                punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
             peers
-                .record_direct_event(
-                    &peer_id,
-                    "punch_skipped_no_candidates",
-                    None,
-                    None,
-                    None,
-                    "skipped UDP punch because the candidate set is empty",
-                )
-                .await;
-            return;
-        }
-        let mut dispatch_snapshot = punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
-        peers
             .record_direct_event(
                 &peer_id,
                 "punch_started",
@@ -1161,22 +1231,22 @@ async fn spawn_hole_punch_task_with_lifecycle(
                 ),
             )
             .await;
-        // A multi-socket peer may probe ANY of our advertised socket-pool
-        // mappings: temporarily activate the pool so every socket sends
-        // peer-directed probes and every advertised mapping stays alive for
-        // the peer's first punch (see `peer_needs_local_socket_pool`).
-        if peers.peer_needs_local_socket_pool(&peer_id).await {
-            udp.set_socket_pool_active(true);
-        }
+            // A multi-socket peer may probe ANY of our advertised socket-pool
+            // mappings: temporarily activate the pool so every socket sends
+            // peer-directed probes and every advertised mapping stays alive for
+            // the peer's first punch (see `peer_needs_local_socket_pool`).
+            if peers.peer_needs_local_socket_pool(&peer_id).await {
+                udp.set_socket_pool_active(true);
+            }
 
-        // The bounded cold-start prefix is latency-sensitive even before NAT
-        // classification has established that the peer needs a socket pool.
-        // Use every socket that is already bound so one stale/private
-        // candidate on socket 0 cannot delay the first public mapping.  The
-        // FastPrefixPool policy is scoped to this one prefix; it does not
-        // change the later stable/scatter policy or the transport-wide gate.
-        if udp.socket_count() > 1 {
-            peers
+            // The bounded cold-start prefix is latency-sensitive even before NAT
+            // classification has established that the peer needs a socket pool.
+            // Use every socket that is already bound so one stale/private
+            // candidate on socket 0 cannot delay the first public mapping.  The
+            // FastPrefixPool policy is scoped to this one prefix; it does not
+            // change the later stable/scatter policy or the transport-wide gate.
+            if udp.socket_count() > 1 {
+                peers
                 .record_direct_event(
                     &peer_id,
                     "direct_fast_probe_socket_pool_selected",
@@ -1189,36 +1259,37 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     ),
                 )
                 .await;
-        }
+            }
 
-        // A relay-coordinated punch timestamp is deliberately conservative:
-        // both peers need time to receive the signal before the wide window.
-        // Do not make ordinary Direct paths wait for that rendezvous. Probe a
-        // small, already-ranked candidate prefix immediately, then keep the
-        // synchronized full window below as the dependent-NAT fallback. This
-        // stage is control traffic only; business packets remain relay-first
-        // until the encrypted Direct validation ACK commits the path.
-        let has_fresh_prediction_window = !fast_prediction_candidates.is_empty();
-        let fast_probe_is_allowed = direct_fast_probe_is_allowed(
-            remote_scatter_pool,
-            stable_remote_scatter,
-            has_fresh_prediction_window,
-        );
-        if punch_at_ms.is_some()
-            && !session.is_cancelled()
-            && !peers.is_direct(&peer_id).await
-            && fast_probe_is_allowed
-        {
-            let fast_candidates = if fast_prediction_candidates.is_empty() {
-                direct_fast_probe_candidates(&candidates)
-            } else {
-                direct_fast_probe_candidates_with_predicted_window(
-                    &candidates,
-                    &fast_prediction_candidates,
-                )
-            };
-            if !fast_candidates.is_empty() {
-                peers
+            // A relay-coordinated punch timestamp is deliberately conservative:
+            // both peers need time to receive the signal before the wide window.
+            // Do not make ordinary Direct paths wait for that rendezvous. Probe a
+            // small, already-ranked candidate prefix immediately, then keep the
+            // synchronized full window below as the dependent-NAT fallback. This
+            // stage is control traffic only; business packets remain relay-first
+            // until the encrypted Direct validation ACK commits the path.
+            let has_fresh_prediction_window = !fast_prediction_candidates.is_empty();
+            let fast_probe_is_allowed = direct_fast_probe_is_allowed(
+                remote_scatter_pool,
+                stable_remote_scatter,
+                has_fresh_prediction_window,
+            );
+            if punch_at_ms.is_some()
+                && !session.is_cancelled()
+                && !peers.is_direct(&peer_id).await
+                && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+                && fast_probe_is_allowed
+            {
+                let fast_candidates = if fast_prediction_candidates.is_empty() {
+                    direct_fast_probe_candidates(&candidates)
+                } else {
+                    direct_fast_probe_candidates_with_predicted_window(
+                        &candidates,
+                        &fast_prediction_candidates,
+                    )
+                };
+                if !fast_candidates.is_empty() {
+                    peers
                     .record_direct_event(
                         &peer_id,
                         "direct_fast_probe_started",
@@ -1233,37 +1304,42 @@ async fn spawn_hole_punch_task_with_lifecycle(
                         ),
                     )
                     .await;
-                match udp
-                            .punch_candidates_fast_prefix_until_not_direct_report(
-                        &peer_id,
-                        fast_candidates.clone(),
-                        Duration::ZERO,
-                        DIRECT_FAST_PROBE_ATTEMPTS,
-                    )
-                    .await
-                {
-                    Ok(report) => {
-                        peers
-                            .record_direct_event(
-                                &peer_id,
-                                "direct_fast_probe_sent",
-                                fast_candidates.first().copied(),
-                                Some(fast_candidates.len()),
-                                Some(report.packets_sent),
-                                format!(
+                    if session.is_cancelled()
+                        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+                    {
+                        return;
+                    }
+                    match udp
+                        .punch_candidates_fast_prefix_until_not_direct_report(
+                            &peer_id,
+                            fast_candidates.clone(),
+                            Duration::ZERO,
+                            DIRECT_FAST_PROBE_ATTEMPTS,
+                        )
+                        .await
+                    {
+                        Ok(report) => {
+                            peers
+                                .record_direct_event(
+                                    &peer_id,
+                                    "direct_fast_probe_sent",
+                                    fast_candidates.first().copied(),
+                                    Some(fast_candidates.len()),
+                                    Some(report.packets_sent),
+                                    format!(
                                     "session_id={} packets_sent={} actual_first_send_at_ms={:?}",
                                     session.session_id(),
                                     report.packets_sent,
                                     report.first_send_at_ms,
                                 ),
-                            )
-                            .await;
-                    }
-                    Err(error) => {
-                        // The synchronized stage below is still authoritative;
-                        // a failed fast hint must not degrade the relay path or
-                        // consume the session's terminal failure state.
-                        peers
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            // The synchronized stage below is still authoritative;
+                            // a failed fast hint must not degrade the relay path or
+                            // consume the session's terminal failure state.
+                            peers
                             .record_direct_event(
                                 &peer_id,
                                 "direct_fast_probe_failed",
@@ -1276,61 +1352,61 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                 ),
                             )
                             .await;
+                        }
+                    }
+
+                    if peers.is_direct(&peer_id).await {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "direct_fast_probe_confirmed",
+                                None,
+                                Some(fast_candidates.len()),
+                                None,
+                                format!(
+                                    "session_id={} Direct committed before synchronized rendezvous",
+                                    session.session_id(),
+                                ),
+                            )
+                            .await;
+                        return;
+                    }
+
+                    // Give an ACK already in flight a short chance to commit, but
+                    // never hold the relay-backed session behind a long validation
+                    // wait. The per-probe Direct gate also stops the scheduled
+                    // window immediately if the ACK lands after this check.
+                    let commit_seq = peers.direct_commit_seq_sync(&peer_id);
+                    if peers
+                        .wait_for_direct_commit_or_timeout(
+                            &peer_id,
+                            commit_seq,
+                            DIRECT_FAST_PROBE_ACK_WINDOW,
+                        )
+                        .await
+                    {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "direct_fast_probe_confirmed",
+                                None,
+                                Some(fast_candidates.len()),
+                                None,
+                                format!(
+                                    "session_id={} Direct committed during fast ACK window",
+                                    session.session_id(),
+                                ),
+                            )
+                            .await;
+                        return;
                     }
                 }
-
-                if peers.is_direct(&peer_id).await {
-                    peers
-                        .record_direct_event(
-                            &peer_id,
-                            "direct_fast_probe_confirmed",
-                            None,
-                            Some(fast_candidates.len()),
-                            None,
-                            format!(
-                                "session_id={} Direct committed before synchronized rendezvous",
-                                session.session_id(),
-                            ),
-                        )
-                        .await;
-                    return;
-                }
-
-                // Give an ACK already in flight a short chance to commit, but
-                // never hold the relay-backed session behind a long validation
-                // wait. The per-probe Direct gate also stops the scheduled
-                // window immediately if the ACK lands after this check.
-                let commit_seq = peers.direct_commit_seq_sync(&peer_id);
-                if peers
-                    .wait_for_direct_commit_or_timeout(
-                        &peer_id,
-                        commit_seq,
-                        DIRECT_FAST_PROBE_ACK_WINDOW,
-                    )
-                    .await
-                {
-                    peers
-                        .record_direct_event(
-                            &peer_id,
-                            "direct_fast_probe_confirmed",
-                            None,
-                            Some(fast_candidates.len()),
-                            None,
-                            format!(
-                                "session_id={} Direct committed during fast ACK window",
-                                session.session_id(),
-                            ),
-                        )
-                        .await;
-                    return;
-                }
-            }
-        } else if punch_at_ms.is_some()
-            && !session.is_cancelled()
-            && !peers.is_direct(&peer_id).await
-            && !fast_probe_is_allowed
-        {
-            peers
+            } else if punch_at_ms.is_some()
+                && !session.is_cancelled()
+                && !peers.is_direct(&peer_id).await
+                && !fast_probe_is_allowed
+            {
+                peers
                 .record_direct_event(
                     &peer_id,
                     "direct_fast_probe_skipped",
@@ -1347,109 +1423,111 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     ),
                 )
                 .await;
-        }
+            }
 
-        // Candidate resolution and the small fast prefix above are allowed to
-        // run immediately.  The rendezvous timestamp only gates the broad,
-        // synchronized sweep below; otherwise a healthy candidate would sit
-        // behind the full relay-assisted delay before receiving its first
-        // Direct probe.
-        if !punch_delay.is_zero() {
-            tokio::select! {
-                _ = sleep(punch_delay) => {}
-                _ = session.cancelled() => {
-                    peers
-                        .record_direct_event(
-                            &peer_id,
-                            "punch_session_cancelled",
-                            None,
-                            None,
-                            None,
-                            format!(
-                                "cancelled scheduled UDP punch while waiting for rendezvous session_id={} network_generation={} recovery_epoch={} reason={}",
-                                session.session_id(),
-                                network_generation,
-                                epoch,
-                                session
-                                    .cancellation_reason()
-                                    .map(PunchCancellationReason::label)
-                                    .unwrap_or("unknown"),
-                            ),
-                        )
-                        .await;
-                    return;
+            // Candidate resolution and the small fast prefix above are allowed to
+            // run immediately.  The rendezvous timestamp only gates the broad,
+            // synchronized sweep below; otherwise a healthy candidate would sit
+            // behind the full relay-assisted delay before receiving its first
+            // Direct probe.
+            if !punch_delay.is_zero() {
+                tokio::select! {
+                    _ = sleep(punch_delay) => {}
+                    _ = session.cancelled() => {
+                        peers
+                            .record_direct_event(
+                                &peer_id,
+                                "punch_session_cancelled",
+                                None,
+                                None,
+                                None,
+                                format!(
+                                    "cancelled scheduled UDP punch while waiting for rendezvous session_id={} network_generation={} recovery_epoch={} reason={}",
+                                    session.session_id(),
+                                    network_generation,
+                                    epoch,
+                                    session
+                                        .cancellation_reason()
+                                        .map(PunchCancellationReason::label)
+                                        .unwrap_or("unknown"),
+                                ),
+                            )
+                            .await;
+                        return;
+                    }
                 }
             }
-        }
 
-        // A control-plane candidate refresh can arrive while the owned
-        // rendezvous session is waiting for its scheduled broad window.  The
-        // recovery scheduler intentionally folds that refresh into a
-        // newest-wins pending target instead of starting a second per-peer
-        // worker.  Consume that target at the last safe boundary before the
-        // broad sweep: first give its strongest candidates the same bounded
-        // fast-prefix opportunity, then append the complete snapshot to this
-        // session's existing FIFO.  This keeps the original punch_at_ms and
-        // epoch budgets intact while preventing a fresh peer-reflexive/public
-        // endpoint from waiting for the next one-second retry tick.
-        if !session.is_cancelled()
-            && !peers.is_direct(&peer_id).await
-            && peers.current_network_generation().await == generation
-            && peers.peer_online(&peer_id).await
-        {
-            if let Some(pending) = peers.take_recovery_target(&peer_id).await {
-                let frozen_targets = match pending.frozen_targets {
-                    Some(frozen) => Some(
-                        peers
-                            .current_remote_endpoints_for(&peer_id, frozen)
-                            .await,
-                    ),
-                    None => None,
-                };
-                let mut preferred = match frozen_targets.as_ref() {
-                    Some(frozen) => frozen.clone(),
-                    None => {
-                        peers
-                            .current_remote_endpoints_for(
-                                &peer_id,
-                                pending.preferred_fast_candidates,
-                            )
-                            .await
+            // A control-plane candidate refresh can arrive while the owned
+            // rendezvous session is waiting for its scheduled broad window.  The
+            // recovery scheduler intentionally folds that refresh into a
+            // newest-wins pending target instead of starting a second per-peer
+            // worker.  Consume that target at the last safe boundary before the
+            // broad sweep: first give its strongest candidates the same bounded
+            // fast-prefix opportunity, then append the complete snapshot to this
+            // session's existing FIFO.  This keeps the original punch_at_ms and
+            // epoch budgets intact while preventing a fresh peer-reflexive/public
+            // endpoint from waiting for the next one-second retry tick.
+            if !session.is_cancelled()
+                && !peers.is_direct(&peer_id).await
+                && peers.current_network_generation().await == generation
+                && peers.peer_online(&peer_id).await
+                && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
+                if let Some(pending) = peers.take_recovery_target(&peer_id).await {
+                    let frozen_targets = match pending.frozen_targets {
+                        Some(frozen) => {
+                            Some(peers.current_remote_endpoints_for(&peer_id, frozen).await)
+                        }
+                        None => None,
+                    };
+                    let mut preferred = match frozen_targets.as_ref() {
+                        Some(frozen) => frozen.clone(),
+                        None => {
+                            peers
+                                .current_remote_endpoints_for(
+                                    &peer_id,
+                                    pending.preferred_fast_candidates,
+                                )
+                                .await
+                        }
+                    };
+                    let mut pending_candidates = peers
+                        .current_remote_endpoints_for(&peer_id, pending.candidates)
+                        .await;
+                    if !preferred.is_empty() {
+                        // A fresh prediction carries only its immutable window.
+                        // Keep the current ordinary candidates in the same
+                        // refresh, because an authenticated/STUN endpoint is a
+                        // stronger fallback than a prediction that may already be
+                        // one NAT allocation behind.
+                        if let Some(current) = peers.direct_probe_target_set_for(&peer_id).await {
+                            merge_unique_socket_addresses(
+                                &mut pending_candidates,
+                                &current.candidates,
+                            );
+                            merge_unique_socket_addresses(
+                                &mut preferred,
+                                &current.preferred_fast_candidates,
+                            );
+                        }
                     }
-                };
-                let mut pending_candidates = peers
-                    .current_remote_endpoints_for(&peer_id, pending.candidates)
-                    .await;
-                if !preferred.is_empty() {
-                    // A fresh prediction carries only its immutable window.
-                    // Keep the current ordinary candidates in the same
-                    // refresh, because an authenticated/STUN endpoint is a
-                    // stronger fallback than a prediction that may already be
-                    // one NAT allocation behind.
-                    if let Some(current) = peers.direct_probe_target_set_for(&peer_id).await {
-                        merge_unique_socket_addresses(&mut pending_candidates, &current.candidates);
-                        merge_unique_socket_addresses(
-                            &mut preferred,
-                            &current.preferred_fast_candidates,
-                        );
-                    }
-                }
-                let fast_candidates = if preferred.is_empty() {
-                    direct_fast_probe_candidates(&pending_candidates)
-                } else {
-                    direct_fast_probe_candidates_with_predicted_window(
-                        &pending_candidates,
-                        &preferred,
-                    )
-                };
-                let fast_probe_is_allowed = direct_fast_probe_is_allowed(
-                    remote_scatter_pool,
-                    stable_remote_scatter,
-                    !preferred.is_empty(),
-                );
-                let mut direct_committed = peers.is_direct(&peer_id).await;
-                if fast_probe_is_allowed && !fast_candidates.is_empty() && !direct_committed {
-                    peers
+                    let fast_candidates = if preferred.is_empty() {
+                        direct_fast_probe_candidates(&pending_candidates)
+                    } else {
+                        direct_fast_probe_candidates_with_predicted_window(
+                            &pending_candidates,
+                            &preferred,
+                        )
+                    };
+                    let fast_probe_is_allowed = direct_fast_probe_is_allowed(
+                        remote_scatter_pool,
+                        stable_remote_scatter,
+                        !preferred.is_empty(),
+                    );
+                    let mut direct_committed = peers.is_direct(&peer_id).await;
+                    if fast_probe_is_allowed && !fast_candidates.is_empty() && !direct_committed {
+                        peers
                         .record_direct_event(
                             &peer_id,
                             "deferred_candidate_fast_probe_started",
@@ -1465,18 +1543,24 @@ async fn spawn_hole_punch_task_with_lifecycle(
                             ),
                         )
                         .await;
-                    let commit_seq = peers.direct_commit_seq_sync(&peer_id);
-                    match udp
-                        .punch_candidates_fast_prefix_until_not_direct_report(
-                            &peer_id,
-                            fast_candidates.clone(),
-                            Duration::ZERO,
-                            DIRECT_FAST_PROBE_ATTEMPTS,
-                        )
-                        .await
-                    {
-                        Ok(report) => {
-                            peers
+                        if session.is_cancelled()
+                            || !peers
+                                .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                        {
+                            return;
+                        }
+                        let commit_seq = peers.direct_commit_seq_sync(&peer_id);
+                        match udp
+                            .punch_candidates_fast_prefix_until_not_direct_report(
+                                &peer_id,
+                                fast_candidates.clone(),
+                                Duration::ZERO,
+                                DIRECT_FAST_PROBE_ATTEMPTS,
+                            )
+                            .await
+                        {
+                            Ok(report) => {
+                                peers
                                 .record_direct_event(
                                     &peer_id,
                                     "deferred_candidate_fast_probe_sent",
@@ -1491,9 +1575,9 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     ),
                                 )
                                 .await;
-                        }
-                        Err(error) => {
-                            peers
+                            }
+                            Err(error) => {
+                                peers
                                 .record_direct_event(
                                     &peer_id,
                                     "deferred_candidate_fast_probe_failed",
@@ -1506,21 +1590,21 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     ),
                                 )
                                 .await;
+                            }
+                        }
+                        direct_committed = peers.is_direct(&peer_id).await;
+                        if !direct_committed {
+                            direct_committed = peers
+                                .wait_for_direct_commit_or_timeout(
+                                    &peer_id,
+                                    commit_seq,
+                                    DIRECT_FAST_PROBE_ACK_WINDOW,
+                                )
+                                .await;
                         }
                     }
-                    direct_committed = peers.is_direct(&peer_id).await;
-                    if !direct_committed {
-                        direct_committed = peers
-                            .wait_for_direct_commit_or_timeout(
-                                &peer_id,
-                                commit_seq,
-                                DIRECT_FAST_PROBE_ACK_WINDOW,
-                            )
-                            .await;
-                    }
-                }
-                if direct_committed {
-                    peers
+                    if direct_committed {
+                        peers
                         .record_direct_event(
                             &peer_id,
                             "deferred_candidate_fast_probe_confirmed",
@@ -1533,13 +1617,13 @@ async fn spawn_hole_punch_task_with_lifecycle(
                             ),
                         )
                         .await;
-                    return;
-                }
+                        return;
+                    }
 
-                let added = merge_unique_socket_addresses(&mut candidates, &pending_candidates);
-                dispatch_snapshot =
-                    punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
-                peers
+                    let added = merge_unique_socket_addresses(&mut candidates, &pending_candidates);
+                    dispatch_snapshot =
+                        punch_candidate_snapshot(&peers, &peer_id, candidates.clone()).await;
+                    peers
                     .record_direct_event(
                         &peer_id,
                         "deferred_candidate_target_consumed",
@@ -1554,68 +1638,80 @@ async fn spawn_hole_punch_task_with_lifecycle(
                         ),
                     )
                     .await;
+                }
             }
-        }
 
-        if let Some(plan) = birthday_plan.as_ref() {
-            peers
-                .record_birthday_probe_plan_started(&peer_id, plan)
+            if let Some(plan) = birthday_plan.as_ref() {
+                peers
+                    .record_birthday_probe_plan_started(&peer_id, plan)
+                    .await;
+            }
+
+            for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
+                if session.is_cancelled()
+                    || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+                {
+                    return;
+                }
+                udp.spawn_nat_binding_maintainer(
+                    &peer_id,
+                    endpoint,
+                    HARD_NAT_MAINTAINER_CONNECTING_INTERVAL,
+                    HARD_NAT_MAINTAINER_CONNECTING_DURATION,
+                )
                 .await;
-        }
+            }
+            // The relay-backed heartbeat keeps the direct punch windows warm at a
+            // low sustained rate for as long as the relay carries the data plane,
+            // independent of the recovery epoch's one-time credit/plan quotas.
+            if session.is_cancelled()
+                || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
+                return;
+            }
+            udp.spawn_relay_backoff_heartbeat(&peer_id, RELAY_BACKOFF_HEARTBEAT_INTERVAL)
+                .await;
 
-        for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
-            udp.spawn_nat_binding_maintainer(
-                &peer_id,
-                endpoint,
-                HARD_NAT_MAINTAINER_CONNECTING_INTERVAL,
-                HARD_NAT_MAINTAINER_CONNECTING_DURATION,
-            )
-            .await;
-        }
-        // The relay-backed heartbeat keeps the direct punch windows warm at a
-        // low sustained rate for as long as the relay carries the data plane,
-        // independent of the recovery epoch's one-time credit/plan quotas.
-        udp.spawn_relay_backoff_heartbeat(&peer_id, RELAY_BACKOFF_HEARTBEAT_INTERVAL)
-            .await;
+            let success_count_before = peers
+                .direct_probe_success_count_for_generation(&peer_id, generation)
+                .await;
+            let commit_seq_before = peers.direct_commit_seq_sync(&peer_id);
+            // Keep the before/after diagnostic delta on the exact signaling
+            // session that was active when this owned punch began.  A rekey can
+            // legitimately arrive while a still-valid first punch window is
+            // preserved; consulting the current session at the end would then
+            // make an old-session ACK appear to vanish (or a new-session ACK
+            // appear to belong to this task).
+            let probe_rx_session_id = peers.probe_session_id_for_peer(&peer_id).await;
 
-        let success_count_before = peers
-            .direct_probe_success_count_for_generation(&peer_id, generation)
-            .await;
-        let commit_seq_before = peers.direct_commit_seq_sync(&peer_id);
-        // Keep the before/after diagnostic delta on the exact signaling
-        // session that was active when this owned punch began.  A rekey can
-        // legitimately arrive while a still-valid first punch window is
-        // preserved; consulting the current session at the end would then
-        // make an old-session ACK appear to vanish (or a new-session ACK
-        // appear to belong to this task).
-        let probe_rx_session_id = peers.probe_session_id_for_peer(&peer_id).await;
-
-        let rx_before = udp
-            .probe_rx_snapshot_for_peer_session(
-                &peer_id,
-                generation,
-                probe_rx_session_id.as_deref(),
-            )
-            .await;
-        let mut last_punch_report: Option<PunchSendReport> = None;
-        let deadline = punch_session_deadline(
-            &candidates,
-            probe_interval,
-            attempts,
-            remote_scatter_pool,
-            if stable_remote_scatter {
-                1
-            } else {
-                udp.socket_count()
-            },
-        );
-        // The first ordinary/relay-assisted sweep and the optional
-        // fresh-mapping optimization now start together.  The fresh-mapping
-        // task can improve later windows, but it is never allowed to delay
-        // the first Direct packet or relay-first business continuity.
-        let fresh_mapping_task = tokio::spawn(fresh_mapping_future);
-        let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
-            if session.is_cancelled() {
+            let rx_before = udp
+                .probe_rx_snapshot_for_peer_session(
+                    &peer_id,
+                    generation,
+                    probe_rx_session_id.as_deref(),
+                )
+                .await;
+            let mut last_punch_report: Option<PunchSendReport> = None;
+            let deadline = punch_session_deadline(
+                &candidates,
+                probe_interval,
+                attempts,
+                remote_scatter_pool,
+                if stable_remote_scatter {
+                    1
+                } else {
+                    udp.socket_count()
+                },
+            );
+            // The first ordinary/relay-assisted sweep and the optional
+            // fresh-mapping optimization now start together.  The fresh-mapping
+            // task can improve later windows, but it is never allowed to delay
+            // the first Direct packet or relay-first business continuity.
+            let fresh_mapping_task = tokio::spawn(fresh_mapping_future);
+            let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
+            if session.is_cancelled()
+                || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
                 return;
             }
             // This synchronous dispatch boundary is immediately before the
@@ -1646,6 +1742,11 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     ),
                 )
                 .await;
+            if session.is_cancelled()
+                || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
+                return;
+            }
             // A prediction window / wide scatter sweep is one CONTROLLED
             // window coverage: every candidate is sent once from every active
             // socket, then the window either matched (ACK / Direct) or the
@@ -1932,8 +2033,8 @@ async fn spawn_hole_punch_task_with_lifecycle(
         })
         .await;
 
-        if let Err(error) = fresh_mapping_task.await {
-            peers
+            if let Err(error) = fresh_mapping_task.await {
+                peers
                 .record_direct_event(
                     &peer_id,
                     "fresh_mapping_worker_failed",
@@ -1943,12 +2044,12 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     format!("fresh-mapping worker failed without changing the first punch outcome: {error}"),
                 )
                 .await;
-        }
+            }
 
-        match outcome {
-            PunchSessionOutcome::Completed => {}
-            PunchSessionOutcome::Cancelled => {
-                peers
+            match outcome {
+                PunchSessionOutcome::Completed => {}
+                PunchSessionOutcome::Cancelled => {
+                    peers
                     .record_direct_event(
                         &peer_id,
                         "punch_session_cancelled",
@@ -1967,17 +2068,17 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     ),
                 )
                     .await;
-            }
-            PunchSessionOutcome::DeadlineExceeded => {
-                let rx_delta = udp
-                    .probe_rx_snapshot_for_peer_session(
-                        &peer_id,
-                        generation,
-                        probe_rx_session_id.as_deref(),
-                    )
-                    .await
-                    .delta_since(rx_before);
-                let timeout_detail = format!(
+                }
+                PunchSessionOutcome::DeadlineExceeded => {
+                    let rx_delta = udp
+                        .probe_rx_snapshot_for_peer_session(
+                            &peer_id,
+                            generation,
+                            probe_rx_session_id.as_deref(),
+                        )
+                        .await
+                        .delta_since(rx_before);
+                    let timeout_detail = format!(
                     "synchronized UDP punch session stopped after {}ms deadline; probe_session_id={} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} authenticated_probe_ack_observed_delta={} authenticated_probe_ack_unmatched_delta={} legacy_probe_ack_observed_delta={} legacy_probe_ack_unmatched_delta={} matched_probe_ack_rx_delta={}",
                     deadline.as_millis(),
                     probe_rx_session_id.as_deref().unwrap_or("legacy"),
@@ -1989,25 +2090,25 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     rx_delta.legacy_probe_acks_unmatched,
                     rx_delta.probe_acks_received
                 );
-                peers
-                    .record_direct_event(
-                        &peer_id,
-                        "punch_session_deadline",
-                        candidates.first().copied(),
-                        Some(candidates.len()),
-                        None,
-                        timeout_detail.clone(),
-                    )
-                    .await;
-                if let (true, Some(plan)) = (stable_remote_scatter, birthday_plan.as_ref()) {
-                    let covered_all = last_punch_report.as_ref().is_some_and(|report| {
-                        report.unique_target_endpoints as usize >= candidates.len()
-                    });
-                    if covered_all {
-                        let cursor_advanced = peers
-                            .commit_birthday_probe_cursor(&peer_id, plan, true)
-                            .await;
-                        peers
+                    peers
+                        .record_direct_event(
+                            &peer_id,
+                            "punch_session_deadline",
+                            candidates.first().copied(),
+                            Some(candidates.len()),
+                            None,
+                            timeout_detail.clone(),
+                        )
+                        .await;
+                    if let (true, Some(plan)) = (stable_remote_scatter, birthday_plan.as_ref()) {
+                        let covered_all = last_punch_report.as_ref().is_some_and(|report| {
+                            report.unique_target_endpoints as usize >= candidates.len()
+                        });
+                        if covered_all {
+                            let cursor_advanced = peers
+                                .commit_birthday_probe_cursor(&peer_id, plan, true)
+                                .await;
+                            peers
                             .record_direct_event(
                                 &peer_id,
                                 "birthday_probe_plan_completed",
@@ -2021,8 +2122,8 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                 ),
                             )
                             .await;
-                    } else {
-                        peers
+                        } else {
+                            peers
                             .record_direct_event(
                                 &peer_id,
                                 "birthday_probe_window_incomplete",
@@ -2032,18 +2133,18 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                 "stable-side birthday session hit its deadline before a complete send report; cursor and peer backoff were left unchanged",
                             )
                             .await;
+                        }
+                    } else if peers.has_relay_safety_net(&peer_id).await {
+                        peers
+                            .record_direct_probe_batch_failure_for_generation(
+                                &peer_id,
+                                generation,
+                                timeout_detail,
+                            )
+                            .await;
                     }
-                } else if peers.has_relay_safety_net(&peer_id).await {
-                    peers
-                        .record_direct_probe_batch_failure_for_generation(
-                            &peer_id,
-                            generation,
-                            timeout_detail,
-                        )
-                        .await;
                 }
             }
-        }
         };
 
         if let Some(shutdown_rx) = invocation_shutdown_rx {
@@ -2074,11 +2175,12 @@ async fn spawn_hole_punch_task_with_lifecycle(
 /// today's strategy.
 ///
 /// Ownership checks run before building the payload, again before the
-/// command is queued, and inside the HTTP worker just before the request;
-/// once the command is irrevocably on the wire the receiver's per-peer
-/// fresh-generation high-water rejects any superseded label, so a stale
-/// prediction can never overwrite a newer one.  A cancellation observed at
-/// any of these fences is reported distinctly from a send failure.
+/// command is queued, and inside the HTTP worker before and during the request.
+/// A newer delivered signal supersedes an older one through the receiver's
+/// per-peer fresh-generation high-water. If an in-flight cancellation has
+/// ambiguous delivery and no successor reached the server, the retired local
+/// socket is still never finalized. Cancellation is reported distinctly from
+/// a send failure.
 ///
 /// Returns `true` only when the prediction was really accepted by the control
 /// server while the session's ownership was still valid: the caller then
@@ -2146,9 +2248,11 @@ async fn advertise_fresh_mapping_prediction(
             .await;
         return false;
     }
-    // The command worker re-checks the ownership inside the queue AND again
-    // just before the HTTP request: a cancellation at either point surfaces
-    // as `Cancelled`, which must never be mistaken for a successful send.
+    // The command worker re-checks ownership inside the queue, immediately
+    // before HTTP, and while the request is in flight. `Cancelled` therefore
+    // means delivery is not authoritative: the server may already have
+    // accepted a request whose local response future was dropped, so the
+    // caller must roll back instead of finalizing the socket.
     match signal
         .control
         .send_fresh_peer_offer_with_sources_and_punch_at(
@@ -2170,18 +2274,16 @@ async fn advertise_fresh_mapping_prediction(
                     None,
                     Some(candidates.len()),
                     None,
-                    "fresh-mapping prediction ownership was revoked before the HTTP request; the prediction was not sent",
+                    "fresh-mapping prediction ownership was revoked while queued or in flight; delivery is ambiguous and the socket must not be finalized",
                 )
                 .await;
             debug!(
-                "Fresh-mapping prediction to peer {peer_id} was cancelled before the HTTP request; not finalizing the socket"
+                "Fresh-mapping prediction to peer {peer_id} was cancelled while queued or in flight; delivery is ambiguous and the socket will not be finalized"
             );
             return false;
         }
         Err(PeerOfferSendFailure::SendFailed | PeerOfferSendFailure::ChannelClosed) => {
-            warn!(
-                "Failed to advertise fresh-mapping prediction window to peer {peer_id}"
-            );
+            warn!("Failed to advertise fresh-mapping prediction window to peer {peer_id}");
             return false;
         }
     }
@@ -2295,7 +2397,9 @@ fn build_fresh_mapping_signal_payload(
     let fresh_label = fresh_prediction_source_label(fresh_id);
     for port in &result.predicted_ports {
         let endpoint = SocketAddr::new(
-            result.public_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            result
+                .public_ip
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             *port,
         )
         .to_string();

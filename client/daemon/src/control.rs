@@ -36,7 +36,6 @@ use tracing::{debug, error, info, warn};
 mod http;
 mod websocket;
 
-pub(crate) use http::candidate_generation_incarnation;
 /// Single control-plane HTTP client builder shared by the ordinary loop and the
 /// critical lane (see [`control::proxy`](crate::control::proxy)).
 pub use http::control_http_client;
@@ -51,6 +50,10 @@ pub use http::proxy_consults_environment;
 pub use http::proxy_http_behavior_label;
 #[cfg(test)]
 use http::register_device_payload;
+pub(crate) use http::{
+    candidate_generation_incarnation, candidate_generation_is_malformed_encoded,
+    candidate_generation_predecessor_floor,
+};
 use http::{
     create_tunnel, fetch_relay_ticket_http, normalize_http_base_url, obtain_device_credential,
     poll_peers, poll_signals, prepare_signal_payload, register_device,

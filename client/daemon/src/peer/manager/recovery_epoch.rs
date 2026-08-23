@@ -435,7 +435,8 @@ impl PeerManager {
         let now = Instant::now();
 
         if self.is_direct(peer_id).await || self.get_connection(peer_id).await.is_none() {
-            self.recovery_epoch_end(peer_id, "peer_direct_or_gone").await;
+            self.recovery_epoch_end(peer_id, "peer_direct_or_gone")
+                .await;
             return RecoveryAdmission::Superseded;
         }
 
@@ -507,14 +508,8 @@ impl PeerManager {
         // A frozen epoch stays frozen until its controlled backoff elapses.
         // The freeze survives pending targets and offers: only the backoff
         // expiry or an epoch rotation re-opens recovery.
-        if entry.budget_exhausted
-            && entry
-                .budget_backoff_until
-                .is_some_and(|until| now < until)
-        {
-            return RecoveryAdmission::BudgetExhausted {
-                epoch: entry.epoch,
-            };
+        if entry.budget_exhausted && entry.budget_backoff_until.is_some_and(|until| now < until) {
+            return RecoveryAdmission::BudgetExhausted { epoch: entry.epoch };
         }
         if entry.budget_exhausted {
             // The controlled backoff elapsed: unfreeze and record that the
@@ -531,20 +526,13 @@ impl PeerManager {
                 entry.epoch,
             );
         }
-        RecoveryAdmission::Accepted {
-            epoch: entry.epoch,
-        }
+        RecoveryAdmission::Accepted { epoch: entry.epoch }
     }
 
     /// End (and drop) the recovery epoch for a peer: Direct confirmation,
     /// PeerLeft, offline, public-key change or generation advance.
     pub(crate) async fn recovery_epoch_end(&self, peer_id: &str, reason: &str) {
-        let removed = self
-            .recovery_epochs
-            .write()
-            .await
-            .remove(peer_id)
-            .is_some();
+        let removed = self.recovery_epochs.write().await.remove(peer_id).is_some();
         if removed {
             info!(
                 event = "recovery_epoch_ended",
@@ -643,11 +631,7 @@ impl PeerManager {
     /// manufacturing a delayed-work owner. Production delayed paths must carry
     /// and pass their admission-time lifecycle explicitly.
     #[cfg(test)]
-    pub(crate) async fn advance_recovery_stage_after_no_ack(
-        &self,
-        peer_id: &str,
-        detail: &str,
-    ) {
+    pub(crate) async fn advance_recovery_stage_after_no_ack(&self, peer_id: &str, detail: &str) {
         let Some(peer_session_generation) = self.peer_session_generation_sync(peer_id) else {
             return;
         };
@@ -725,11 +709,7 @@ impl PeerManager {
     /// Any matched ACK resets the stage: a live path must never be expanded
     /// by a later no-ACK batch.  A matched ACK also unfreezes a budget-
     /// exhausted epoch: a live path is the strongest re-open signal.
-    pub(crate) async fn record_recovery_ack_feedback(
-        &self,
-        peer_id: &str,
-        endpoint: SocketAddr,
-    ) {
+    pub(crate) async fn record_recovery_ack_feedback(&self, peer_id: &str, endpoint: SocketAddr) {
         {
             let mut epochs = self.recovery_epochs.write().await;
             let Some(state) = epochs.get_mut(peer_id) else {
@@ -783,6 +763,7 @@ impl PeerManager {
 
     /// Consume the epoch's fresh-mapping generation quota (one generation,
     /// one dedicated dynamic socket per epoch).
+    #[cfg(test)]
     pub(crate) async fn try_begin_fresh_generation(&self, peer_id: &str) -> bool {
         let mut epochs = self.recovery_epochs.write().await;
         let Some(state) = epochs.get_mut(peer_id) else {
@@ -806,9 +787,7 @@ impl PeerManager {
         expected_epoch: u64,
     ) -> Option<FreshGenerationReservation> {
         let mut epochs = self.recovery_epochs.write().await;
-        let Some(state) = epochs.get_mut(peer_id) else {
-            return None;
-        };
+        let state = epochs.get_mut(peer_id)?;
         if state.epoch != expected_epoch || state.epoch_fresh_generation_quota_remaining == 0 {
             return None;
         }
@@ -834,9 +813,7 @@ impl PeerManager {
         expected: RecoveryEpochIdentity,
     ) -> Option<FreshGenerationReservation> {
         let mut epochs = self.recovery_epochs.write().await;
-        let Some(state) = epochs.get_mut(peer_id) else {
-            return None;
-        };
+        let state = epochs.get_mut(peer_id)?;
         if state.epoch != expected.epoch
             || state.network_generation != expected.network_generation
             || state.allocation_id != expected.allocation_id
@@ -853,14 +830,24 @@ impl PeerManager {
         })
     }
 
-    /// Consume the epoch's HTTP publish quota (fresh-prediction
-    /// advertisements).
-    pub(crate) async fn try_consume_recovery_http_quota(&self, peer_id: &str) -> bool {
+    /// Consume HTTP publish quota only from the exact recovery allocation
+    /// which admitted the delayed worker. Numeric epochs restart after peer
+    /// cleanup, so comparing only `epoch` would let an old task consume quota
+    /// from a same-ID replacement whose first epoch is also `1`.
+    pub(crate) async fn try_consume_recovery_http_quota_for_identity(
+        &self,
+        peer_id: &str,
+        expected: RecoveryEpochIdentity,
+    ) -> bool {
         let mut epochs = self.recovery_epochs.write().await;
         let Some(state) = epochs.get_mut(peer_id) else {
-            return true;
+            return false;
         };
-        if state.epoch_http_quota_remaining == 0 {
+        if state.epoch != expected.epoch
+            || state.network_generation != expected.network_generation
+            || state.allocation_id != expected.allocation_id
+            || state.epoch_http_quota_remaining == 0
+        {
             return false;
         }
         state.epoch_http_quota_remaining -= 1;
@@ -943,10 +930,7 @@ impl PeerManager {
         state.budget_exhausted = true;
         state.last_budget_exhausted_at = Some(Instant::now());
         state.zero_send_streak = state.zero_send_streak.saturating_add(1);
-        let exponent = state
-            .zero_send_streak
-            .saturating_sub(1)
-            .min(10); // 60s << 10 = ~17h, capped below at 15min
+        let exponent = state.zero_send_streak.saturating_sub(1).min(10); // 60s << 10 = ~17h, capped below at 15min
         let backoff = RECOVERY_BUDGET_BACKOFF_BASE
             .checked_mul(1_u32 << exponent)
             .unwrap_or(RECOVERY_BUDGET_BACKOFF_MAX)
@@ -1013,9 +997,7 @@ impl PeerManager {
             .get(peer_id)
             .is_some_and(|state| {
                 state.budget_exhausted
-                    && state
-                        .budget_backoff_until
-                        .is_some_and(|until| now < until)
+                    && state.budget_backoff_until.is_some_and(|until| now < until)
             })
     }
 
@@ -1123,11 +1105,7 @@ impl PeerManager {
     /// this peer's epoch.  Returns `true` only the first time per epoch (or
     /// after an evidence re-open cleared the marker), so a frozen epoch
     /// cannot emit `recovery_plan_build_quota_exhausted` once per second.
-    pub(crate) async fn recovery_quota_event_report_due(
-        &self,
-        peer_id: &str,
-        stage: &str,
-    ) -> bool {
+    pub(crate) async fn recovery_quota_event_report_due(&self, peer_id: &str, stage: &str) -> bool {
         let mut epochs = self.recovery_epochs.write().await;
         let Some(state) = epochs.get_mut(peer_id) else {
             return false;
@@ -1165,15 +1143,8 @@ impl PeerManager {
             ),
         )
         .await;
-        self.mark_recovery_budget_exhausted(
-            peer_id,
-            candidate_count,
-            visited,
-            0,
-            skipped,
-            reason,
-        )
-        .await;
+        self.mark_recovery_budget_exhausted(peer_id, candidate_count, visited, 0, skipped, reason)
+            .await;
     }
 
     /// Report the remaining epoch budgets (epoch, probe credit, plan
@@ -1184,18 +1155,14 @@ impl PeerManager {
         &self,
         peer_id: &str,
     ) -> Option<(u64, u32, u32, u32)> {
-        self.recovery_epochs
-            .read()
-            .await
-            .get(peer_id)
-            .map(|state| {
-                (
-                    state.epoch,
-                    state.epoch_probe_credit_remaining,
-                    state.epoch_fresh_generation_quota_remaining,
-                    state.epoch_http_quota_remaining,
-                )
-            })
+        self.recovery_epochs.read().await.get(peer_id).map(|state| {
+            (
+                state.epoch,
+                state.epoch_probe_credit_remaining,
+                state.epoch_fresh_generation_quota_remaining,
+                state.epoch_http_quota_remaining,
+            )
+        })
     }
 
     /// Full budget snapshot for tests and diagnostics.
@@ -1279,7 +1246,10 @@ impl PeerManager {
 
     /// Take the newest pending target for the running session's next stage
     /// boundary, if any.
-    pub(crate) async fn take_recovery_target(&self, peer_id: &str) -> Option<PendingRecoveryTarget> {
+    pub(crate) async fn take_recovery_target(
+        &self,
+        peer_id: &str,
+    ) -> Option<PendingRecoveryTarget> {
         let target = self
             .recovery_epochs
             .write()
@@ -1305,11 +1275,7 @@ impl PeerManager {
         if let Some(frozen_targets) = target.frozen_targets.as_mut() {
             frozen_targets.retain(|endpoint| conn.is_current_remote_endpoint(*endpoint));
         }
-        if target.candidates.is_empty()
-            && target
-                .frozen_targets
-                .as_ref()
-                .is_none_or(Vec::is_empty)
+        if target.candidates.is_empty() && target.frozen_targets.as_ref().is_none_or(Vec::is_empty)
         {
             return None;
         }

@@ -119,9 +119,7 @@ fn deferred_initiator_queue_removes_offline_or_replaced_peer() {
 
 #[tokio::test]
 async fn candidate_snapshot_reader_observes_only_committed_tuple() {
-    let daemon = Daemon::new(
-        Config::generate_default("http://127.0.0.1:1", "net1").unwrap(),
-    );
+    let daemon = Daemon::new(Config::generate_default("http://127.0.0.1:1", "net1").unwrap());
     let candidates = vec!["192.168.1.20:40000".to_string()];
     let sources = HashMap::from([("192.168.1.20:40000".to_string(), "host".to_string())]);
     daemon
@@ -136,20 +134,21 @@ async fn candidate_snapshot_reader_observes_only_committed_tuple() {
     assert_eq!(read_candidates, candidates);
     assert_eq!(read_sources, sources);
     let snapshot = daemon.cached_candidate_snapshot().await.unwrap();
-    assert_eq!(snapshot.network_identity, vec!["host:192.168.1.20".to_string()]);
-    assert_eq!(snapshot.hash, candidate_set_hash(&read_candidates, &read_sources));
+    assert_eq!(
+        snapshot.network_identity,
+        vec!["host:192.168.1.20".to_string()]
+    );
+    assert_eq!(
+        snapshot.hash,
+        candidate_set_hash(&read_candidates, &read_sources)
+    );
 }
 
 #[tokio::test]
 async fn peer_reflexive_candidate_refreshes_the_committed_snapshot() {
-    let daemon = Daemon::new(
-        Config::generate_default("http://127.0.0.1:1", "net1").unwrap(),
-    );
+    let daemon = Daemon::new(Config::generate_default("http://127.0.0.1:1", "net1").unwrap());
     let initial = vec!["198.51.100.10:40000".to_string()];
-    let initial_sources = HashMap::from([(
-        initial[0].clone(),
-        "stun_observed".to_string(),
-    )]);
+    let initial_sources = HashMap::from([(initial[0].clone(), "stun_observed".to_string())]);
     daemon
         .publish_candidate_snapshot(
             initial.clone(),
@@ -158,7 +157,11 @@ async fn peer_reflexive_candidate_refreshes_the_committed_snapshot() {
         )
         .await;
 
-    assert!(daemon.add_local_peer_reflexive_candidate("198.51.100.11:40001").await);
+    assert!(
+        daemon
+            .add_local_peer_reflexive_candidate("198.51.100.11:40001")
+            .await
+    );
 
     let snapshot = daemon
         .cached_candidate_snapshot()
@@ -174,9 +177,18 @@ async fn peer_reflexive_candidate_refreshes_the_committed_snapshot() {
             .map(String::as_str),
         Some("peer_reflexive")
     );
-    assert_eq!(snapshot.network_identity, vec!["public:198.51.100.10".to_string()]);
-    assert!(snapshot.version > 1, "the update must advance snapshot version");
-    assert_ne!(snapshot.hash, candidate_set_hash(&initial, &initial_sources));
+    assert_eq!(
+        snapshot.network_identity,
+        vec!["public:198.51.100.10".to_string()]
+    );
+    assert!(
+        snapshot.version > 1,
+        "the update must advance snapshot version"
+    );
+    assert_ne!(
+        snapshot.hash,
+        candidate_set_hash(&initial, &initial_sources)
+    );
 }
 
 #[tokio::test]
@@ -236,6 +248,9 @@ async fn same_epoch_candidate_refresh_preserves_scheduled_rendezvous_permit() {
     {
         RendezvousPunchClaim::Claimed(permit) => permit,
         RendezvousPunchClaim::Deferred(_) => panic!("first rendezvous must claim"),
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            panic!("fixture lifecycle must not be retired")
+        }
     };
 
     // A same-generation ordinary offer/candidate refresh is useful input, but
@@ -281,6 +296,9 @@ async fn fresh_prediction_inside_rendezvous_lead_preserves_first_window() {
     {
         RendezvousPunchClaim::Claimed(permit) => permit,
         RendezvousPunchClaim::Deferred(_) => panic!("first rendezvous must claim"),
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            panic!("fixture lifecycle must not be retired")
+        }
     };
     let fresh_id = FreshPredictionId {
         boot_epoch: 1_742_987_654_321,
@@ -328,6 +346,9 @@ async fn generation_change_can_replace_protected_rendezvous_with_reason() {
     {
         RendezvousPunchClaim::Claimed(permit) => permit,
         RendezvousPunchClaim::Deferred(_) => panic!("first rendezvous must claim"),
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            panic!("fixture lifecycle must not be retired")
+        }
     };
 
     let replacement = deduplicator
@@ -341,7 +362,10 @@ async fn generation_change_can_replace_protected_rendezvous_with_reason() {
         )
         .await;
     assert!(matches!(replacement, RendezvousPunchClaim::Claimed(_)));
-    assert!(first.is_cancelled(), "new network generation must replace old plan");
+    assert!(
+        first.is_cancelled(),
+        "new network generation must replace old plan"
+    );
     assert_eq!(
         first.cancellation_reason(),
         Some(PunchCancellationReason::NetworkGenerationChanged)
@@ -435,6 +459,172 @@ async fn punch_attempt_deduplicator_cancel_releases_session_for_rejoin() {
         .claim("peer-a")
         .await
         .expect("rejoin punch must not be suppressed by the stale session");
+}
+
+#[tokio::test]
+async fn retired_peer_session_rejects_cancel_before_claim_and_cannot_cancel_rejoin() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "punch-lifecycle-tombstone").unwrap(),
+    ));
+    let peer_id = "peer-lifecycle-tombstone";
+    let peer = deferred_initiator_test_peer(peer_id, "198.51.100.20:42000");
+    peers.add_peer(&peer).await;
+    let old_peer_session = peers
+        .peer_session_generation_sync(peer_id)
+        .expect("old online lifecycle must exist");
+    let old_epoch = match peers.recovery_epoch_admit(peer_id).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("old lifecycle recovery must be admitted: {admission:?}"),
+    };
+    let deduplicator = PunchAttemptDeduplicator::default();
+
+    // Reproduce the real cleanup ordering: retire/cancel is published before
+    // structural removal rotates the PeerSessionGeneration.  A task which
+    // captured the old generation before cleanup must already be unable to
+    // claim, even though PeerManager still reports that generation as current.
+    deduplicator.retire_peer_session(peer_id, old_peer_session);
+    assert!(peers.peer_session_is_current_sync(peer_id, old_peer_session));
+    assert!(
+        deduplicator
+            .claim_for_epoch_with_rendezvous_for_peer_session(
+                &peers,
+                peer_id,
+                old_peer_session,
+                peers.current_network_generation_sync(),
+                old_epoch,
+                PUNCH_PRIORITY_FRESH_PREDICTION,
+                None,
+                None,
+            )
+            .await
+            .is_none(),
+        "the lifecycle tombstone must reject cancel-before-claim"
+    );
+    assert_eq!(deduplicator.active_session_count(), 0);
+
+    peers.remove_peer(peer_id).await;
+    let mut replacement = peer;
+    replacement.last_seen = replacement.last_seen.saturating_add(1);
+    peers.add_peer(&replacement).await;
+    let replacement_peer_session = peers
+        .peer_session_generation_sync(peer_id)
+        .expect("replacement online lifecycle must exist");
+    assert!(replacement_peer_session > old_peer_session);
+    let replacement_epoch = match peers.recovery_epoch_admit(peer_id).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("replacement recovery must be admitted: {admission:?}"),
+    };
+    let replacement_owner = match deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            &peers,
+            peer_id,
+            replacement_peer_session,
+            peers.current_network_generation_sync(),
+            replacement_epoch,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            None,
+        )
+        .await
+        .expect("replacement lifecycle must pass the exact generation fence")
+    {
+        RendezvousPunchClaim::Claimed(session) => session,
+        RendezvousPunchClaim::Deferred(_) => panic!("replacement lifecycle must claim"),
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            panic!("replacement lifecycle must be newer than the tombstone")
+        }
+    };
+
+    let stale_preemption = deduplicator.claim_with_rendezvous(
+        peer_id,
+        old_peer_session,
+        peers.current_network_generation_sync(),
+        old_epoch,
+        PUNCH_PRIORITY_FRESH_PREDICTION,
+        None,
+        None,
+    );
+    assert!(matches!(
+        stale_preemption,
+        RendezvousPunchClaim::RejectedStalePeerSession
+    ));
+    assert!(
+        !replacement_owner.is_cancelled(),
+        "an old high-priority claim must never cancel the replacement owner"
+    );
+    assert_eq!(deduplicator.active_session_count(), 1);
+}
+
+#[tokio::test]
+async fn background_quota_cancel_before_consume_cannot_charge_same_id_rejoin() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "background-quota-lifecycle").unwrap(),
+    ));
+    let peer_id = "peer-background-quota-lifecycle";
+    let peer = deferred_initiator_test_peer(peer_id, "198.51.100.21:42001");
+    peers.add_peer(&peer).await;
+    let old_peer_session = peers
+        .peer_session_generation_sync(peer_id)
+        .expect("old online lifecycle must exist");
+    let old_epoch = match peers.recovery_epoch_admit(peer_id).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("old lifecycle recovery must be admitted: {admission:?}"),
+    };
+    let old_reservation = peers
+        .try_begin_fresh_generation_for_epoch(peer_id, old_epoch)
+        .await
+        .expect("old lifecycle must expose its fresh quota identity");
+    let old_recovery_identity = old_reservation.identity();
+    old_reservation.refund().await;
+
+    let deduplicator = PunchAttemptDeduplicator::default();
+    deduplicator.retire_peer_session(peer_id, old_peer_session);
+    peers.remove_peer(peer_id).await;
+    let mut replacement = peer;
+    replacement.last_seen = replacement.last_seen.saturating_add(1);
+    peers.add_peer(&replacement).await;
+    let replacement_peer_session = peers
+        .peer_session_generation_sync(peer_id)
+        .expect("replacement online lifecycle must exist");
+    assert!(replacement_peer_session > old_peer_session);
+    let replacement_epoch = match peers.recovery_epoch_admit(peer_id).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("replacement recovery must be admitted: {admission:?}"),
+    };
+    assert_eq!(
+        replacement_epoch, old_epoch,
+        "the numeric epoch is intentionally reusable across lifecycle cleanup"
+    );
+
+    // This is the exact race the background task must close: its old numeric
+    // epoch can reserve the replacement's quota after rejoin. The post-await
+    // lifecycle fence detects that mismatch and the opaque token refunds only
+    // the concrete replacement allocation it briefly reserved.
+    let stale_task_reservation = peers
+        .try_begin_fresh_generation_for_epoch(peer_id, old_epoch)
+        .await
+        .expect("same numeric epoch demonstrates why lifecycle fencing is required");
+    assert!(!peers.peer_session_is_current_sync(peer_id, old_peer_session));
+    stale_task_reservation.refund().await;
+
+    let replacement_reservation = peers
+        .try_begin_fresh_generation_for_epoch(peer_id, replacement_epoch)
+        .await
+        .expect("stale task refund must restore the replacement fresh quota");
+    let replacement_recovery_identity = replacement_reservation.identity();
+    replacement_reservation.commit();
+    assert!(
+        !peers
+            .try_consume_recovery_http_quota_for_identity(peer_id, old_recovery_identity)
+            .await,
+        "an old allocation identity must not charge replacement HTTP quota"
+    );
+    assert!(
+        peers
+            .try_consume_recovery_http_quota_for_identity(peer_id, replacement_recovery_identity)
+            .await,
+        "replacement allocation must retain its HTTP quota"
+    );
 }
 
 #[test]
@@ -566,7 +756,11 @@ fn relay_assisted_punch_starts_slightly_before_advertised_time() {
 #[test]
 fn direct_fast_probe_window_preserves_candidate_order_and_is_bounded() {
     let candidates = (0..32)
-        .map(|port| format!("198.51.100.10:{port}").parse::<SocketAddr>().unwrap())
+        .map(|port| {
+            format!("198.51.100.10:{port}")
+                .parse::<SocketAddr>()
+                .unwrap()
+        })
         .chain(std::iter::once("198.51.100.10:7".parse().unwrap()))
         .collect::<Vec<_>>();
 
@@ -623,7 +817,11 @@ fn direct_fast_probe_prefers_fresh_prediction_window_without_expanding_budget() 
 #[test]
 fn direct_fast_probe_predicted_window_reaches_late_candidate_with_bound() {
     let candidates = (40000..40032)
-        .map(|port| format!("198.51.100.10:{port}").parse::<SocketAddr>().unwrap())
+        .map(|port| {
+            format!("198.51.100.10:{port}")
+                .parse::<SocketAddr>()
+                .unwrap()
+        })
         .collect::<Vec<_>>();
     let preferred = candidates[8..].to_vec();
 
@@ -777,7 +975,10 @@ async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_sessio
         .iter()
         .find(|event| event.stage == "direct_validation_started")
         .and_then(|event| event.validation_session_id);
-    assert!(validation_session_id.is_some(), "validation start must expose its owner session");
+    assert!(
+        validation_session_id.is_some(),
+        "validation start must expose its owner session"
+    );
     assert!(diagnostics[0].direct_events.iter().any(|event| {
         event.stage == "direct_validation_request_sent"
             && event.network_generation == 0
@@ -942,7 +1143,12 @@ async fn encrypted_validation_cancellation_keeps_lease_generation_and_owner_in_d
     .await
     .expect("validation worker must publish its owner before waiting for WireGuard");
 
-    assert_eq!(peers.advance_network_generation("test validation cancellation").await, 1);
+    assert_eq!(
+        peers
+            .advance_network_generation("test validation cancellation")
+            .await,
+        1
+    );
     timeout(Duration::from_secs(1), worker)
         .await
         .expect("generation advance must wake the validation worker")
@@ -1262,9 +1468,12 @@ async fn scheduled_hole_punch_skips_direct_peer_even_with_live_candidates() {
     // Nothing may have been emitted toward the peer endpoint.
     let mut buf = [0u8; 512];
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), remote_socket.recv_from(&mut buf))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            remote_socket.recv_from(&mut buf)
+        )
+        .await
+        .is_err(),
         "a Direct peer must not receive synchronized punch probes"
     );
 }
@@ -1322,10 +1531,9 @@ async fn superseded_udp_lease_cancels_old_detached_punch_without_touching_replac
     .await;
     assert_eq!(deduplicator.active_session_count(), 1);
 
-    let replacement_udp =
-        UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
-            .await
-            .unwrap();
+    let replacement_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
     let replacement_addr = replacement_udp.local_addr().unwrap();
     assert_ne!(replacement_addr, old_addr);
     let replacement_lease = publication.publish(replacement_udp.clone()).await;
@@ -1343,9 +1551,12 @@ async fn superseded_udp_lease_cancels_old_detached_punch_without_touching_replac
 
     let mut datagram = [0u8; 2048];
     assert!(
-        timeout(Duration::from_millis(350), remote_socket.recv_from(&mut datagram))
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(350),
+            remote_socket.recv_from(&mut datagram)
+        )
+        .await
+        .is_err(),
         "the detached worker must not send from the withdrawn UDP socket"
     );
     let conn = peers.get_connection("node-b").await.unwrap();
@@ -1381,10 +1592,13 @@ async fn superseded_udp_lease_cancels_old_detached_punch_without_touching_replac
         Some(replacement_lease.shutdown_receiver()),
     )
     .await;
-    let (_, source) = timeout(Duration::from_secs(2), remote_socket.recv_from(&mut datagram))
-        .await
-        .expect("replacement worker must remain send-capable")
-        .expect("replacement UDP probe receive must succeed");
+    let (_, source) = timeout(
+        Duration::from_secs(2),
+        remote_socket.recv_from(&mut datagram),
+    )
+    .await
+    .expect("replacement worker must remain send-capable")
+    .expect("replacement UDP probe receive must succeed");
     assert_eq!(
         source, replacement_addr,
         "only the replacement transport may send after supersession"
@@ -1494,7 +1708,6 @@ async fn scheduled_hole_punch_skips_without_degrading_already_direct_peer() {
         None,
         None,
     )
-
     .await;
 
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1567,7 +1780,6 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
         None,
         None,
     )
-
     .await;
 
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -1609,9 +1821,7 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
         .iter()
         .find(|event| event.stage == "punch_ack_timeout")
         .expect("scheduled hole punch should record ACK timeout");
-    assert!(timeout
-        .detail
-        .contains("known_peer_ip_rx_delta="));
+    assert!(timeout.detail.contains("known_peer_ip_rx_delta="));
     assert!(timeout
         .detail
         .contains("authenticated_probe_ack_observed_delta="));
@@ -1704,7 +1914,9 @@ async fn suppressed_same_epoch_offer_stashes_latest_targets_without_reclocking_f
         .iter()
         .find(|event| event.stage == "punch_window_preserved")
         .expect("the preserved rendezvous must be visible in diagnostics");
-    assert!(preserved.detail.contains("reason=same_epoch_active_session"));
+    assert!(preserved
+        .detail
+        .contains("reason=same_epoch_active_session"));
     assert!(preserved
         .detail
         .contains(&format!("active_punch_at_ms=Some({first_punch_at})")));
@@ -1761,10 +1973,12 @@ async fn start_hole_punch_skipped_for_healthy_confirmed_direct() {
         .unwrap();
     *daemon.udp_transport.write().await = Some(udp);
 
-    assert!(daemon
-        .peers
-        .should_defer_relay_assisted_punch("node-b")
-        .await);
+    assert!(
+        daemon
+            .peers
+            .should_defer_relay_assisted_punch("node-b")
+            .await
+    );
     daemon.start_hole_punch_at("node-b", None, None, None).await;
     daemon.start_hole_punch_at("node-b", None, None, None).await;
 
@@ -1858,7 +2072,9 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
     })
     .await
     .expect("first fresh signal candidates must be applied");
-    assert!(peer_conn.candidate_sources.contains_key("203.0.113.10:45393"));
+    assert!(peer_conn
+        .candidate_sources
+        .contains_key("203.0.113.10:45393"));
 
     // A stale (older generation) fresh signal arrives late: its candidates
     // must NOT replace the current set.
@@ -2043,15 +2259,11 @@ async fn fresh_prediction_not_applied_keeps_identity_and_retry_commits() {
     send_offer(&control, Some(1));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if peers
-                .get_connection("node-b")
-                .await
-                .is_some_and(|conn| {
-                    conn.direct_events
-                        .iter()
-                        .any(|event| event.stage == "fresh_prediction_not_applied")
-                })
-            {
+            if peers.get_connection("node-b").await.is_some_and(|conn| {
+                conn.direct_events
+                    .iter()
+                    .any(|event| event.stage == "fresh_prediction_not_applied")
+            }) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -2092,13 +2304,7 @@ async fn fresh_prediction_not_applied_keeps_identity_and_retry_commits() {
     .expect("the retried fresh candidates must be applied");
     assert_eq!(
         peers
-            .prepare_remote_fresh_prediction(
-                "node-b",
-                id,
-                &fresh_candidates,
-                &fresh_sources,
-                None,
-            )
+            .prepare_remote_fresh_prediction("node-b", id, &fresh_candidates, &fresh_sources, None,)
             .await,
         crate::peer::RemoteFreshAdmission::AlreadyRecorded,
         "the retry must commit the identity"
@@ -2112,15 +2318,11 @@ async fn fresh_prediction_not_applied_keeps_identity_and_retry_commits() {
     send_offer(&control, None);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if peers
-                .get_connection("node-b")
-                .await
-                .is_some_and(|conn| {
-                    conn.direct_events
-                        .iter()
-                        .any(|event| event.stage == "fresh_prediction_retry")
-                })
-            {
+            if peers.get_connection("node-b").await.is_some_and(|conn| {
+                conn.direct_events
+                    .iter()
+                    .any(|event| event.stage == "fresh_prediction_retry")
+            }) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -2254,7 +2456,12 @@ async fn frozen_fresh_target_snapshot_survives_later_ordinary_refresh() {
             .await,
         CandidateSetApplyResult::Applied
     );
-    assert!(daemon.peers.commit_remote_fresh_prediction("node-b", id).await);
+    assert!(
+        daemon
+            .peers
+            .commit_remote_fresh_prediction("node-b", id)
+            .await
+    );
     let frozen = daemon
         .freeze_fresh_punch_targets("node-b", id)
         .await
@@ -2279,7 +2486,13 @@ async fn frozen_fresh_target_snapshot_survives_later_ordinary_refresh() {
 
     // The shared set moved on...
     let after = daemon.peers.direct_probe_targets_for("node-b").await;
-    assert_eq!(after, vec!["198.51.100.9:44444".parse::<SocketAddr>().unwrap()]);
+    assert_eq!(
+        after,
+        vec!["198.51.100.9:44444".parse::<SocketAddr>().unwrap()]
+    );
     // ...but the frozen snapshot still targets exactly the fresh window.
-    assert_eq!(frozen, vec!["203.0.113.10:45393".parse::<SocketAddr>().unwrap()]);
+    assert_eq!(
+        frozen,
+        vec!["203.0.113.10:45393".parse::<SocketAddr>().unwrap()]
+    );
 }

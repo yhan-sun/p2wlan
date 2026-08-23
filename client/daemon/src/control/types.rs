@@ -739,13 +739,13 @@ struct CandidateOfferCommand {
     response_tx: oneshot::Sender<PeerOfferSendOutcome>,
 }
 
-/// Why a peer-offer send did not place the signal on the wire.
+/// Why a peer-offer send did not obtain authoritative server acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerOfferSendFailure {
     /// The fresh-mapping ownership was revoked while queued or in flight: no
     /// durable handoff may be finalized.
     Cancelled,
-    /// The HTTP request was attempted but the control server did not accept it.
+    /// The HTTP attempt failed or its acceptance could not be confirmed.
     SendFailed,
     /// The command channel or response channel closed.
     ChannelClosed,

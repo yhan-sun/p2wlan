@@ -141,7 +141,7 @@ impl PeerManager {
         // RelayBackoff here would short-circuit that progression and cap the
         // scan at 96 ports forever.  Only true hard failures (send errors,
         // handshake timeouts) call `mark_recovery_relay_backoff` explicitly.
-        let (probed_sources, request_recovery_kick) = {
+        let probed_sources = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return DirectFailureCommitOutcome::Rejected;
@@ -159,9 +159,7 @@ impl PeerManager {
                     conn.endpoint,
                     Some(conn.candidate_pairs.len()),
                     None,
-                    format!(
-                        "{reason}; ignored because encrypted Direct is already confirmed"
-                    ),
+                    format!("{reason}; ignored because encrypted Direct is already confirmed"),
                 );
                 debug!(
                     event = "direct_probe_batch_timeout_ignored",
@@ -172,7 +170,6 @@ impl PeerManager {
                 );
                 return DirectFailureCommitOutcome::IgnoredConfirmedDirect;
             }
-            let request_recovery_kick = true;
             conn.direct_health
                 .record_failure(code.clone(), reason.clone());
             conn.record_direct_event(
@@ -210,22 +207,10 @@ impl PeerManager {
                     conn.direct_health.last_error.as_deref().unwrap_or("direct path failed")
                 );
             }
-            (probed_sources, request_recovery_kick)
+            probed_sources
         };
         drop(epoch_guard);
         self.record_traversal_failures(probed_sources).await;
-        if request_recovery_kick {
-            // The callback is deliberately invoked only after the connection
-            // lock is released.  It must be nonblocking and may spawn the
-            // candidate publication / punch retry asynchronously.
-            let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
-            if generation == self.current_network_generation_sync()
-                && self.peer_session_is_current_sync(node_id, peer_session_generation)
-            {
-                self.request_direct_recovery_kick(node_id);
-            }
-        }
         DirectFailureCommitOutcome::Applied
     }
 
@@ -320,9 +305,7 @@ impl PeerManager {
                     conn.endpoint,
                     Some(endpoints.len()),
                     None,
-                    format!(
-                        "{reason}; ignored because encrypted Direct is already confirmed"
-                    ),
+                    format!("{reason}; ignored because encrypted Direct is already confirmed"),
                 );
                 return true;
             }

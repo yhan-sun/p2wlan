@@ -329,11 +329,14 @@ jobs:
         working-directory: apps/flutter_client
         run: .\scripts\bundle_msvc_runtime.ps1 -DestinationDirectory "build\windows\x64\runner\Release"
 
-      - name: Run Windows daemon binary probe integration
+      - name: Run Windows startup integration tests
         working-directory: apps/flutter_client
         env:
           P2WLAN_DAEMON_BIN: ${{ github.workspace }}/apps/flutter_client/build/windows/x64/runner/Release/p2wlan-daemon.exe
-        run: flutter test test/windows_binary_probe_integration_test.dart
+        run: >
+          flutter test
+          test/windows_binary_probe_integration_test.dart
+          test/windows_tray_event_contract_test.dart
 
       - name: Pack Windows bundle
         shell: pwsh

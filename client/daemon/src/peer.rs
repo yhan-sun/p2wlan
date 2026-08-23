@@ -170,7 +170,7 @@ pub(crate) enum ProbeKeyRole {
 /// offline and come back, or restart while reusing otherwise identical
 /// candidates.  Authenticated UDP work snapshots this value together with the
 /// key that verified the packet and must re-check it before adopting evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PeerSessionGeneration(u64);
 
 impl PeerSessionGeneration {
@@ -292,6 +292,22 @@ pub enum CandidateSetApplyResult {
     IgnoredStale,
     IgnoredExpired,
     PeerMissing,
+}
+
+/// Admission result for the identity-bound remote-incarnation preflight.
+///
+/// A signal whose server-bound sender key no longer matches the peer's current
+/// public key is terminally rejected before it can reset transport state.  A
+/// legacy signal without sender identity remains compatible and simply has no
+/// restart work when its generation is unencoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteCandidateIncarnationClaim {
+    IdentityMismatch,
+    NoReset,
+    Reset {
+        old_incarnation: u64,
+        new_incarnation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

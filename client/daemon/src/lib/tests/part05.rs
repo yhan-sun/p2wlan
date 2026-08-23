@@ -1243,7 +1243,7 @@ async fn stale_sender_identity_fresh_signal_never_enters_new_high_water() {
                 .unwrap()
                 .direct_events
                 .iter()
-                .any(|event| event.stage == "fresh_prediction_stale_identity")
+                .any(|event| event.stage == "remote_signal_stale_identity")
             {
                 break;
             }

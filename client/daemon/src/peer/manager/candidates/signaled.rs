@@ -35,6 +35,32 @@ impl PeerManager {
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
     ) -> CandidateSetApplyResult {
+        self.add_candidates_with_metadata_for_identity(
+            node_id,
+            candidates,
+            candidate_sources,
+            candidate_generation,
+            candidates_expires_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Identity-bound candidate apply used by control-plane signals.
+    ///
+    /// The sender fingerprint is checked inside the same epoch/connection
+    /// transaction that mutates candidate state. A public-key update therefore
+    /// linearizes wholly before or wholly after this apply; a queued signal from
+    /// the retired identity can never populate the replacement connection.
+    pub(crate) async fn add_candidates_with_metadata_for_identity(
+        &self,
+        node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+        sender_public_key: Option<&str>,
+    ) -> CandidateSetApplyResult {
         let epoch_gate = self.network_epoch_gate();
         let _epoch_guard = epoch_gate.lock().await;
         let generation = self.current_network_generation_sync();
@@ -42,6 +68,19 @@ impl PeerManager {
         let Some(conn) = connections.get_mut(node_id) else {
             return CandidateSetApplyResult::PeerMissing;
         };
+        if sender_public_key.map(str::trim).is_some_and(|public_key| {
+            public_key.is_empty() || conn.public_key.trim() != public_key
+        }) {
+            conn.record_direct_event(
+                generation,
+                "candidates_stale_identity",
+                None,
+                Some(candidates.len()),
+                None,
+                "ignored candidate signal bound to a retired sender public key",
+            );
+            return CandidateSetApplyResult::IgnoredStale;
+        }
         let valid_candidates = candidates
             .iter()
             .filter(|candidate| candidate.parse::<SocketAddr>().is_ok())
@@ -77,6 +116,37 @@ impl PeerManager {
             );
             return CandidateSetApplyResult::IgnoredExpired;
         }
+        let candidate_incarnation =
+            crate::control::candidate_generation_incarnation(candidate_generation);
+        if crate::control::candidate_generation_is_malformed_encoded(candidate_generation) {
+            conn.record_direct_event(
+                generation,
+                "candidates_invalid_generation",
+                None,
+                Some(valid_candidates.len()),
+                None,
+                format!(
+                    "ignored malformed incarnation-encoded candidate generation {candidate_generation}"
+                ),
+            );
+            return CandidateSetApplyResult::IgnoredStale;
+        }
+        if candidate_incarnation.is_some_and(|incoming| {
+            conn.remote_candidate_incarnation_high_water
+                .is_some_and(|accepted| incoming < accepted)
+        }) {
+            conn.record_direct_event(
+                generation,
+                "candidates_stale_incarnation",
+                None,
+                Some(valid_candidates.len()),
+                None,
+                format!(
+                    "ignored candidate generation {candidate_generation} from a retired remote incarnation"
+                ),
+            );
+            return CandidateSetApplyResult::IgnoredStale;
+        }
         if candidate_generation != 0 && candidate_generation <= conn.last_candidate_generation {
             conn.record_direct_event(
                 generation,
@@ -90,6 +160,22 @@ impl PeerManager {
         }
         if candidate_generation != 0 {
             conn.last_candidate_generation = candidate_generation;
+            self.record_remote_candidate_generation_replay_floor(
+                node_id,
+                &conn.public_key,
+                candidate_generation,
+            );
+        }
+        if let Some(incarnation) = candidate_incarnation {
+            conn.remote_candidate_incarnation_high_water = Some(
+                conn.remote_candidate_incarnation_high_water
+                    .map_or(incarnation, |accepted| accepted.max(incarnation)),
+            );
+            self.record_remote_candidate_incarnation_high_water(
+                node_id,
+                &conn.public_key,
+                incarnation,
+            );
         }
         conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
 

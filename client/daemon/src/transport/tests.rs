@@ -2824,6 +2824,9 @@ mod tests {
                 udp.local_addr().ok(),
                 Some(0),
                 None,
+                peers
+                    .peer_session_generation_sync("peer-a")
+                    .expect("peer lifecycle must be online"),
                 token,
             )
             .await;
@@ -2860,6 +2863,137 @@ mod tests {
             Some(token.request_id),
             "request_id must remain structured rather than only appearing in detail text"
         );
+    }
+
+    /// Model the exact boundary after the inbound worker's transport-session
+    /// check: it has captured the old `PeerSessionGeneration`, but the Request
+    /// handler is parked before its UDP adoption transaction. A same-ID
+    /// remove/re-add must make that captured generation fail closed without
+    /// feeding the replacement peer's validation scheduler or registry owner.
+    #[tokio::test]
+    async fn validation_request_after_outer_check_cannot_cross_same_id_readd() {
+        let (_remote_session, local_session) = establish_sessions();
+        let (transport, _encrypted_rx) = WireGuardTransport::new();
+        transport.add_session("peer-a", local_session).await;
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let old_info = PeerInfo {
+            node_id: "peer-a".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            endpoint: "198.51.100.70:51820".to_string(),
+            online: true,
+            ..PeerInfo::default()
+        };
+        peers.add_peer(&old_info).await;
+        let old_peer_session_generation = peers
+            .peer_session_generation_sync("peer-a")
+            .expect("old peer lifecycle must be online");
+
+        let trigger_count = Arc::new(AtomicUsize::new(0));
+        let trigger_count_clone = trigger_count.clone();
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_validation_trigger(Arc::new(move |_| {
+                trigger_count_clone.fetch_add(1, Ordering::SeqCst);
+            }));
+        let stale_source: std::net::SocketAddr = "198.51.100.71:51820".parse().unwrap();
+        let replacement_target: std::net::SocketAddr = "198.51.100.72:51820".parse().unwrap();
+        let token = crate::transport::DirectValidationToken {
+            kind: crate::transport::DirectValidationKind::Request,
+            generation: 9,
+            request_id: 0x4103,
+            sequence: 0,
+            owner_token: 10,
+        };
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            token.request_id,
+            0,
+            &crate::transport::build_direct_validation_payload(
+                crate::transport::DirectValidationKind::Request,
+                token.generation,
+                token.request_id,
+                token.sequence,
+                token.owner_token,
+            ),
+        );
+
+        // Hold the same fence that the handler acquires immediately after the
+        // outer check, so the captured old lifecycle is guaranteed to wait
+        // until the replacement lifecycle and its owner are published.
+        let adoption_guard = udp.lock_peer_adoption_for_direct_validation("peer-a").await;
+        let handler = tokio::spawn({
+            let transport = transport.clone();
+            let peers = peers.clone();
+            let udp = udp.clone();
+            async move {
+                transport
+                    .handle_direct_validation_packet(
+                        &peers,
+                        Some(&udp),
+                        "peer-a",
+                        &packet,
+                        Some(stale_source),
+                        udp.local_addr().ok(),
+                        Some(0),
+                        None,
+                        old_peer_session_generation,
+                        token,
+                    )
+                    .await;
+            }
+        });
+
+        peers.remove_peer("peer-a").await;
+        let replacement_info = PeerInfo {
+            endpoint: "198.51.100.73:51820".to_string(),
+            ..old_info
+        };
+        peers.add_peer(&replacement_info).await;
+        let replacement_peer_session_generation = peers
+            .peer_session_generation_sync("peer-a")
+            .expect("replacement peer lifecycle must be online");
+        assert_ne!(
+            old_peer_session_generation,
+            replacement_peer_session_generation
+        );
+
+        let local_generation = peers.current_network_generation().await;
+        let replacement_owner = match udp
+            .begin_or_merge_direct_validation("peer-a", replacement_target, local_generation)
+            .await
+        {
+            crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+            _ => panic!("replacement lifecycle must acquire a fresh owner"),
+        };
+
+        drop(adoption_guard);
+        timeout(Duration::from_secs(1), handler)
+            .await
+            .expect("stale Request handler must finish after adoption is released")
+            .unwrap();
+
+        assert_eq!(
+            trigger_count.load(Ordering::SeqCst),
+            0,
+            "the old source must not reach the replacement validation ingress"
+        );
+        let target = udp
+            .direct_validation_target("peer-a")
+            .await
+            .expect("replacement owner must remain installed");
+        assert_eq!(target.owner_token, replacement_owner);
+        assert_eq!(target.endpoint, replacement_target);
+        let connection = peers.get_connection("peer-a").await.unwrap();
+        assert_ne!(connection.endpoint, Some(stale_source));
+        assert!(!connection
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "direct_validation_request_received"));
+        assert!(udp.affinity_pin_for_test("peer-a").await.is_none());
     }
 
     #[tokio::test]
@@ -2935,6 +3069,9 @@ mod tests {
                 Some(receiving_endpoint),
                 Some(0),
                 None,
+                peers
+                    .peer_session_generation_sync("peer-a")
+                    .expect("peer lifecycle must be online"),
                 token,
             )
             .await;
@@ -3019,6 +3156,9 @@ mod tests {
                 Some(dynamic_endpoint),
                 Some(socket_index),
                 Some(dynamic_socket.clone()),
+                peers
+                    .peer_session_generation_sync("peer-a")
+                    .expect("peer lifecycle must be online"),
                 token,
             )
             .await;

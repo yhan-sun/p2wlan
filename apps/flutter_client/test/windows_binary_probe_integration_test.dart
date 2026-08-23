@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -142,6 +143,55 @@ void main() {
     await Future<void>.delayed(const Duration(seconds: 1));
     expect(marker.existsSync(), isFalse);
   }, skip: !Platform.isWindows);
+
+  test(
+    'Windows ACL token preparation keeps only the required runtime access',
+    () async {
+      final root = await _createTempRoot();
+      addTearDown(() => _deleteTempRoot(root));
+      final api = DiagnosticsApi(authTokenReader: () async => null);
+      addTearDown(api.close);
+      final controller = DaemonController(diagnosticsApi: api);
+      final runtime = Directory('${root.path}${Platform.pathSeparator}runtime');
+      await runtime.create(recursive: true);
+      final stale = File(
+        '${runtime.path}${Platform.pathSeparator}'
+        'p2wlan-launch-abcdef0123456789.token',
+      );
+      await stale.writeAsString('expired');
+      await stale.setLastModified(
+        DateTime.now().subtract(const Duration(minutes: 11)),
+      );
+
+      // This is the production stage-05/06 sequence: protect the directory
+      // once, then clean stale files, write the new token, and protect only
+      // that token file.
+      await controller.protectRuntimeDirectory(runtime);
+      final currentSid = await _windowsCurrentUserSid(controller);
+      _expectRestrictedWindowsAcl(
+        await _readWindowsAcl(controller, runtime.path, directory: true),
+        currentSid,
+      );
+
+      await controller.cleanupStaleLaunchTokenFiles(runtime);
+      expect(await stale.exists(), isFalse);
+
+      final token = await controller.writeEphemeralLaunchTokenFile(
+        runtime,
+        'integration-launch-token',
+      );
+      await controller.protectEphemeralLaunchTokenFile(token);
+      expect(await token.readAsString(), 'integration-launch-token');
+      _expectRestrictedWindowsAcl(
+        await _readWindowsAcl(controller, token.path, directory: false),
+        currentSid,
+      );
+
+      await controller.deleteEphemeralLaunchTokenFile(token);
+      expect(await token.exists(), isFalse);
+    },
+    skip: !Platform.isWindows,
+  );
 }
 
 Future<Directory> _createTempRoot() {
@@ -253,4 +303,71 @@ String? _resolveWindowsDaemonBinary() {
     if (File(candidate).existsSync()) return File(candidate).absolute.path;
   }
   return null;
+}
+
+Future<String> _windowsCurrentUserSid(DaemonController controller) async {
+  final result = await controller.runWindowsPowerShellForTesting(
+    '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+  );
+  expect(result.exitCode, 0, reason: result.stderr.toString());
+  final sid = result.stdout.toString().trim();
+  expect(
+    RegExp(r'^S-\d-\d+(?:-\d+)+$').hasMatch(sid),
+    isTrue,
+    reason: result.stdout.toString(),
+  );
+  return sid;
+}
+
+Future<_WindowsAclSnapshot> _readWindowsAcl(
+  DaemonController controller,
+  String path, {
+  required bool directory,
+}) async {
+  final quotedPath = path.replaceAll("'", "''");
+  final result = await controller.runWindowsPowerShellForTesting(
+    '\$path = \'$quotedPath\'; '
+    'if (\'$directory\' -eq \'true\') { '
+    '\$acl = [System.IO.Directory]::GetAccessControl(\$path) '
+    '} else { '
+    '\$acl = [System.IO.File]::GetAccessControl(\$path) }; '
+    '\$sids = @(\$acl.Access | ForEach-Object { '
+    'try { \$_.IdentityReference.Translate('
+    '[System.Security.Principal.SecurityIdentifier]).Value } '
+    'catch { \$_.IdentityReference.Value } } | Sort-Object -Unique); '
+    '[pscustomobject]@{ '
+    'protected = [bool]\$acl.AreAccessRulesProtected; '
+    'sids = @(\$sids) '
+    '} | ConvertTo-Json -Compress',
+  );
+  expect(result.exitCode, 0, reason: result.stderr.toString());
+  final decoded = jsonDecode(result.stdout.toString().trim());
+  expect(
+    decoded,
+    isA<Map<String, dynamic>>(),
+    reason: result.stdout.toString(),
+  );
+  final json = decoded! as Map<String, dynamic>;
+  final rawSids = json['sids'];
+  final values = rawSids is List<Object?> ? rawSids : <Object?>[rawSids];
+  return _WindowsAclSnapshot(
+    isProtected: json['protected'] == true,
+    sids: values.whereType<String>().toSet(),
+  );
+}
+
+void _expectRestrictedWindowsAcl(_WindowsAclSnapshot acl, String currentSid) {
+  expect(acl.isProtected, isTrue);
+  expect(acl.sids, contains(currentSid));
+  expect(acl.sids, contains('S-1-5-32-544'));
+  expect(acl.sids, contains('S-1-5-18'));
+  expect(acl.sids, isNot(contains('S-1-1-0')));
+  expect(acl.sids, isNot(contains('S-1-5-32-545')));
+}
+
+class _WindowsAclSnapshot {
+  const _WindowsAclSnapshot({required this.isProtected, required this.sids});
+
+  final bool isProtected;
+  final Set<String> sids;
 }

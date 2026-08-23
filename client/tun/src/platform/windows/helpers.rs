@@ -115,17 +115,9 @@ fn set_interface_address(name: &str, addr: Ipv4Addr, netmask: Ipv4Addr) -> Resul
 fn set_interface_mtu(name: &str, mtu: u32) -> Result<()> {
     info!("[tun] configuring MTU: interface={name} mtu={mtu}");
 
+    let args = crate::windows_command::netsh_set_mtu_args(name, mtu);
     let output = hidden_command("netsh")
-        .args([
-            "interface",
-            "ipv4",
-            "set",
-            "subinterface",
-            name,
-            "mtu",
-            &mtu.to_string(),
-            "store=persistent",
-        ])
+        .args(args)
         .output()
         .map_err(|e| Error::Platform(format!("failed to run netsh: {e}")))?;
 

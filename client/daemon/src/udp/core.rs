@@ -22,6 +22,10 @@ pub(crate) enum DirectValidationSendError {
     NoSocket,
 }
 
+#[cfg(test)]
+type RemoteIncarnationCleanupGateSlot =
+    Arc<std::sync::Mutex<Option<(String, Arc<RemoteIncarnationCleanupGate>)>>>;
+
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
@@ -109,6 +113,10 @@ pub struct UdpTransport {
     /// the worker re-validates its ownership before the actual send.
     #[cfg(test)]
     heartbeat_send_gate: Arc<std::sync::Mutex<Option<Arc<HeartbeatSendGate>>>>,
+    /// One-shot lifecycle linearization seam used only by the remote-restart
+    /// race regression.
+    #[cfg(test)]
+    remote_incarnation_cleanup_gate: RemoteIncarnationCleanupGateSlot,
     authenticated_punch_replay: AuthPunchReplayState,
     authenticated_punch_rate: AuthPunchRateState,
     outbound_probe_budget: OutboundProbeBudgetState,
@@ -200,6 +208,8 @@ impl UdpTransport {
             )),
             #[cfg(test)]
             heartbeat_send_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
             authenticated_punch_rate: Arc::new(Mutex::new(HashMap::new())),
             outbound_probe_budget: Arc::new(Mutex::new(HashMap::new())),
@@ -937,6 +947,83 @@ impl UdpTransport {
     ) {
         let adoption = self.adoption_lock_for(peer_id).await;
         let _adoption_guard = adoption.lock().await;
+        self.cleanup_peer_lifecycle_under_adoption(peer_id, reason, remove_connection)
+            .await;
+    }
+
+    /// Atomically erase the old UDP lifecycle and publish a claimed remote
+    /// incarnation while owning the same adoption fence used by authenticated
+    /// Probe handlers.
+    ///
+    /// WireGuard session removal happens before this call (`emit`), then this
+    /// method owns `adoption` while cleanup and `finish` acquire `epoch`,
+    /// preserving the canonical cross-layer order `emit -> adoption -> epoch`.
+    pub(crate) async fn cleanup_peer_lifecycle_and_finish_remote_incarnation_reset(
+        &self,
+        peer_id: &str,
+        reason: &str,
+        old_incarnation: u64,
+        claimed_incarnation: u64,
+    ) -> bool {
+        let adoption = self.adoption_lock_for(peer_id).await;
+        let _adoption_guard = adoption.lock().await;
+        self.cleanup_peer_lifecycle_under_adoption(peer_id, reason, false)
+            .await;
+        #[cfg(test)]
+        self.pause_after_remote_incarnation_cleanup_for_test(peer_id)
+            .await;
+        self.peers
+            .finish_claimed_remote_incarnation_reset(
+                peer_id,
+                old_incarnation,
+                claimed_incarnation,
+                reason,
+            )
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_remote_incarnation_cleanup_gate_for_test(
+        &self,
+        peer_id: &str,
+        gate: Arc<RemoteIncarnationCleanupGate>,
+    ) {
+        *self
+            .remote_incarnation_cleanup_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((peer_id.to_string(), gate));
+    }
+
+    #[cfg(test)]
+    async fn pause_after_remote_incarnation_cleanup_for_test(&self, peer_id: &str) {
+        let gate = {
+            let mut installed = self
+                .remote_incarnation_cleanup_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if installed
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == peer_id)
+            {
+                installed.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.wait().await;
+        }
+    }
+
+    /// Cleanup body for callers that already own this peer's adoption lock.
+    async fn cleanup_peer_lifecycle_under_adoption(
+        &self,
+        peer_id: &str,
+        reason: &str,
+        remove_connection: bool,
+    ) {
         // Revoke the validation owner before removing peer/socket state.  A
         // worker that was waiting for a handshake or ACK immediately observes
         // cancellation, and its owner-conditional cleanup cannot erase a

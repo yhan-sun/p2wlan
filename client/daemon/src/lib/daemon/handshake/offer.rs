@@ -101,6 +101,7 @@ impl Daemon {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -132,6 +133,7 @@ impl Daemon {
             );
             return Ok(());
         }
+        let sender_public_key = offer.sender_public_key.clone();
         self.handle_peer_offer_with_cancellation(
             &offer.from_node_id,
             &offer.candidates,
@@ -140,6 +142,7 @@ impl Daemon {
             offer.punch_at_server_ms,
             offer.session_id,
             offer.probe_ephemeral_public_key,
+            sender_public_key.as_deref(),
             Some(cancellation),
             Some(owner),
             Some(offer.network_generation),
@@ -158,6 +161,7 @@ impl Daemon {
         punch_at_server_ms: Option<u64>,
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
+        sender_public_key: Option<&str>,
         mut cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
         responder_work_owner: Option<u64>,
         expected_network_generation: Option<u64>,
@@ -190,6 +194,54 @@ impl Daemon {
                 .peers
                 .peer_session_is_current_sync(from_node_id, expected)
         }) {
+            self.timeline.emit(
+                "peer_offer_rejected",
+                None,
+                Some("stale_peer_session"),
+                Some(format!("peer={from_node_id}")),
+            );
+            return Ok(());
+        }
+        if let Some(owner) = responder_work_owner {
+            let current = self
+                .pending_handshakes
+                .lock()
+                .await
+                .responder_work_is_current(from_node_id, owner);
+            if !current {
+                return Ok(());
+            }
+        }
+        // Identity lookup may wait behind control/connection state. Never hold
+        // the per-peer arbiter across it: this responder future is cooperatively
+        // polled by the serial control loop, whose lifecycle branch may itself
+        // be waiting to acquire the same arbiter.
+        if !self
+            .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
+            .await
+        {
+            self.timeline.emit(
+                "peer_offer_rejected",
+                None,
+                Some("stale_sender_identity"),
+                Some(format!("peer={from_node_id}")),
+            );
+            return Ok(());
+        }
+        if cancellation
+            .as_deref()
+            .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Ok(());
+        }
+        if expected_network_generation
+            .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+            || expected_peer_session_generation.is_some_and(|expected| {
+                !self
+                    .peers
+                    .peer_session_is_current_sync(from_node_id, expected)
+            })
+        {
             return Ok(());
         }
         if let Some(owner) = responder_work_owner {
@@ -211,6 +263,16 @@ impl Daemon {
         if cancellation
             .as_deref()
             .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Ok(());
+        }
+        if expected_network_generation
+            .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+            || expected_peer_session_generation.is_some_and(|expected| {
+                !self
+                    .peers
+                    .peer_session_is_current_sync(from_node_id, expected)
+            })
         {
             return Ok(());
         }

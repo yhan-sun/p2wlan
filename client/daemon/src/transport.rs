@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
-use crate::peer::PeerManager;
+use crate::peer::{PeerManager, PeerSessionGeneration};
 use crate::relay::RelayTransport;
 
 /// Stable, non-reversible diagnostic fingerprint for an opaque encrypted
@@ -2910,6 +2910,14 @@ impl WireGuardTransport {
                                 // ICMP echo reply or user traffic.
                                 if owns_direct_packet {
                                     let token_kind = token.kind;
+                                    // Snapshot the peer lifecycle before the
+                                    // transport-session check awaits.  A
+                                    // same-ID remove/re-add after this point
+                                    // must not let the old authenticated
+                                    // request enqueue work for the replacement
+                                    // peer incarnation.
+                                    let peer_session_generation =
+                                        peers.peer_session_generation_sync(&inbound.peer_id);
                                     let session_guard = if token_kind == DirectValidationKind::Ack {
                                         self.acquire_current_session_evidence_guard(
                                             &inbound.peer_id,
@@ -2930,7 +2938,7 @@ impl WireGuardTransport {
                                         )
                                         .await
                                     };
-                                    if session_current {
+                                    if session_current && peer_session_generation.is_some() {
                                         self.handle_direct_validation_packet(
                                             peers,
                                             udp.as_ref(),
@@ -2940,6 +2948,8 @@ impl WireGuardTransport {
                                             local_endpoint,
                                             socket_index,
                                             direct_socket,
+                                            peer_session_generation
+                                                .expect("peer lifecycle checked immediately above"),
                                             token,
                                         )
                                         .await;
@@ -3330,6 +3340,7 @@ impl WireGuardTransport {
         local_endpoint: Option<SocketAddr>,
         socket_index: Option<usize>,
         direct_socket: Option<Arc<tokio::net::UdpSocket>>,
+        peer_session_generation: PeerSessionGeneration,
         token: crate::transport::DirectValidationToken,
     ) {
         match token.kind {
@@ -3385,7 +3396,8 @@ impl WireGuardTransport {
                         .await;
                     return;
                 };
-                // No generation gate here: network generations are PER-SIDE
+                // No REMOTE network-generation comparison here: network
+                // generations are PER-SIDE
                 // counters (each daemon advances its own on candidate
                 // refreshes), so the initiator's generation can never be
                 // compared with the responder's.  The request is already
@@ -3396,19 +3408,42 @@ impl WireGuardTransport {
                 // trigger a benign idempotent ACK.
 
                 // The request is authenticated (decrypted under the peer's
-                // WireGuard session) and arrived over the direct path.  Make
-                // its local promotion one transaction with PeerLeft/key
-                // cleanup: adoption -> network epoch -> explicit local
-                // generation promotion -> generation-bound socket affinity.
+                // WireGuard session) and arrived over the direct path. Make
+                // its validation ingress one transaction with PeerLeft/key
+                // cleanup: adoption -> network epoch -> lifecycle re-check ->
+                // generation snapshot -> scheduler enqueue.
                 // The token generation is remote-local and therefore cannot
                 // be compared with `local_generation`; it is echoed only for
                 // the initiator's owned ACK expectation.
+                // Revalidate the local peer lifecycle at the same
+                // adoption -> network-epoch boundary used by lifecycle
+                // cleanup.  The outer transport-session check deliberately
+                // released its emit guard so this request can later acquire
+                // that guard to encrypt its ACK without self-deadlocking.
+                let adoption_guard = udp.lock_peer_adoption_for_direct_validation(peer_id).await;
+                let epoch_gate = peers.network_epoch_gate();
+                let epoch_guard = epoch_gate.lock().await;
+                if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+                    drop(epoch_guard);
+                    drop(adoption_guard);
+                    peers.emit_timeline(
+                        "stale_session_evidence",
+                        Some("direct"),
+                        Some("peer_lifecycle_replaced_or_removed"),
+                        Some(format!(
+                            "peer={peer_id} direct_validation={:?} request_id={}",
+                            token.kind, token.request_id,
+                        )),
+                    );
+                    return;
+                }
+
                 // An authenticated request is evidence for the local
                 // validation worker, not proof of the local path. Enqueue it
                 // newest-wins and let the worker send our own request. This
                 // keeps an inbound request from cancelling the local
                 // request/ACK transaction in the R7/R8 cross-over race.
-                let local_generation = peers.current_network_generation().await;
+                let local_generation = peers.current_network_generation_sync();
 
                 peers
                     .record_direct_validation_event_with_metadata(
@@ -3433,6 +3468,16 @@ impl WireGuardTransport {
                         ),
                     )
                     .await;
+                udp.enqueue_direct_validation_observation(crate::udp::PeerReflexiveObservation {
+                    peer_id: peer_id.to_string(),
+                    observed_endpoint: source,
+                });
+                // ACK encryption takes the per-peer WireGuard emit guard.
+                // Release the UDP lifecycle transaction first to preserve the
+                // canonical emit -> adoption -> epoch order used by teardown
+                // and ACK evidence commits.
+                drop(epoch_guard);
+                drop(adoption_guard);
                 info!(
                     event = "direct_validation_request_received",
                     peer_id = %peer_id,
@@ -3441,10 +3486,6 @@ impl WireGuardTransport {
                     "received authenticated encrypted validation request request_id={}",
                     token.request_id
                 );
-                udp.enqueue_direct_validation_observation(crate::udp::PeerReflexiveObservation {
-                    peer_id: peer_id.to_string(),
-                    observed_endpoint: source,
-                });
                 // Answer idempotently — also when already Direct — so the
                 // initiator always gets the confirmation it needs.  The ACK
                 // uses the request's own IP header with source/destination
