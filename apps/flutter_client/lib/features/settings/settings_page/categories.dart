@@ -21,6 +21,16 @@ enum SettingsCategory {
       SettingsCategory.developer => strings.settingsSectionDeveloperDiagnostics,
     };
   }
+
+  IconData get icon {
+    return switch (this) {
+      SettingsCategory.general => Icons.tune_rounded,
+      SettingsCategory.accountNetwork => Icons.admin_panel_settings_outlined,
+      SettingsCategory.application => Icons.desktop_windows_outlined,
+      SettingsCategory.advancedNetwork => Icons.router_outlined,
+      SettingsCategory.developer => Icons.code_rounded,
+    };
+  }
 }
 
 /// Categories to show for a given capability set. Categories without a real

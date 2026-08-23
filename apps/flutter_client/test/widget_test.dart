@@ -62,12 +62,20 @@ void main() {
     await tester.tap(find.text('常规'));
     await tester.pump(const Duration(milliseconds: 250));
     await tester.tap(find.text('简体中文').last);
-    await tester.pump(const Duration(milliseconds: 250));
-    await tester.tap(find.text('English').last);
-    await tester.runAsync(() async {
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-    });
-    await tester.pump();
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.byKey(const ValueKey<Object>(('app-select-option', 'en'))),
+    );
+    for (
+      var attempt = 0;
+      attempt < 20 && find.text('Settings').evaluate().isEmpty;
+      attempt += 1
+    ) {
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      await tester.pump();
+    }
 
     expect(find.text('Settings'), findsWidgets);
     // Back to the settings root, then open Developer & Diagnostics.
@@ -264,6 +272,61 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets('system back unwinds Settings detail then returns Home', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await _pumpTestApp(tester);
+    await tester.tap(find.text('设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('常规'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SettingsPage), findsOneWidget);
+    expect(find.byIcon(Icons.arrow_back_rounded), findsOneWidget);
+
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+
+    expect(find.byType(SettingsPage), findsOneWidget);
+    expect(find.byIcon(Icons.arrow_back_rounded), findsNothing);
+    expect(find.text('常规'), findsOneWidget);
+
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DashboardPage), findsOneWidget);
+    expect(find.byType(SettingsPage), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('system back returns contextual Troubleshooting to its origin', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await _pumpTestApp(tester);
+    await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('故障排查'));
+    await tester.pumpAndSettle();
+    expect(find.byType(DiagnosticsPage), findsOneWidget);
+
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DashboardPage), findsOneWidget);
+    expect(find.byType(DiagnosticsPage), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('troubleshooting stays open across viewport changes', (
     tester,

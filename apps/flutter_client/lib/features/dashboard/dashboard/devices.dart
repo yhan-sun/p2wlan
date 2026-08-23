@@ -86,7 +86,11 @@ class _OnlineDevicesSection extends StatelessWidget {
           )
         else
           for (var index = 0; index < peers.length; index++) ...[
-            if (index > 0) const SizedBox(height: AppTokens.space4),
+            if (index > 0)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: AppTokens.space4),
+                child: Divider(height: 1),
+              ),
             _DeviceRow(
               peer: peers[index],
               speedBytesPerSecond: peerTransferRates[peers[index].nodeId],
@@ -130,16 +134,42 @@ class _DeviceRow extends StatelessWidget {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                Semantics(
-                  label: statusLabel,
-                  child: Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: statusColor,
-                      shape: BoxShape.circle,
+                Stack(
+                  clipBehavior: Clip.none,
+                  children: [
+                    Container(
+                      width: 32,
+                      height: 32,
+                      decoration: BoxDecoration(
+                        color: P2WlanColors.of(context).selectedSurface,
+                        borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+                      ),
+                      child: Icon(
+                        Icons.devices_rounded,
+                        size: 17,
+                        color: theme.colorScheme.primary,
+                      ),
                     ),
-                  ),
+                    Positioned(
+                      right: -1,
+                      bottom: -1,
+                      child: Semantics(
+                        label: statusLabel,
+                        child: Container(
+                          width: 9,
+                          height: 9,
+                          decoration: BoxDecoration(
+                            color: statusColor,
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: P2WlanColors.of(context).surface,
+                              width: 1.5,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(width: AppTokens.space10),
                 Expanded(

@@ -62,24 +62,20 @@ class _AdvancedNetworkSection extends StatelessWidget {
         _PreferenceRow(
           label: strings.socketPool,
           subtitle: strings.socketPoolHelper,
-          trailing: DropdownButton<String>(
-            isExpanded: MediaQuery.sizeOf(context).width < 520,
-            key: ValueKey('socket-pool-${state._socketPool}'),
+          trailing: AppSelect<String>(
+            expanded: MediaQuery.sizeOf(context).width < 520,
+            key: const ValueKey('settings-socket-pool-select'),
             value: state._socketPool,
-            underline: const SizedBox.shrink(),
-            items: const [
-              DropdownMenuItem(value: 'off', child: Text('off')),
-              DropdownMenuItem(value: '2', child: Text('2 sockets')),
-              DropdownMenuItem(value: '3', child: Text('3 sockets')),
-              DropdownMenuItem(value: '4', child: Text('4 sockets')),
+            options: const [
+              AppSelectOption(value: 'off', label: 'off'),
+              AppSelectOption(value: '2', label: '2 sockets'),
+              AppSelectOption(value: '3', label: '3 sockets'),
+              AppSelectOption(value: '4', label: '4 sockets'),
             ],
             onChanged: saving || daemonBusy
                 ? null
-                : (value) {
-                    if (value != null) {
-                      state._updateState(() => state._socketPool = value);
-                    }
-                  },
+                : (value) =>
+                      state._updateState(() => state._socketPool = value),
           ),
         ),
         const SizedBox(height: AppTokens.space6),

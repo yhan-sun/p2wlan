@@ -264,7 +264,7 @@ void _registerSettingsPhase6Tests() {
     await tester.tap(find.text('General'));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byKey(const ValueKey('theme-system')));
+    await _openAppSelect(tester, const ValueKey('settings-theme-select'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Dark').last);
     await tester.pump();

@@ -17,28 +17,25 @@ class _ApplicationSection extends StatelessWidget {
         _PreferenceRow(
           label: strings.closeBehavior,
           subtitle: strings.closeBehaviorHelper,
-          trailing: DropdownButton<String>(
-            isExpanded: MediaQuery.sizeOf(context).width < 520,
-            key: ValueKey('close-behavior-${state._closeBehavior}'),
+          trailing: AppSelect<String>(
+            expanded: MediaQuery.sizeOf(context).width < 520,
+            width: 248,
+            key: const ValueKey('settings-close-behavior-select'),
             value: state._closeBehavior,
-            underline: const SizedBox.shrink(),
-            items: [
-              DropdownMenuItem(
+            options: [
+              AppSelectOption(
                 value: 'keep-running',
-                child: Text(strings.closeBehaviorKeepRunning),
+                label: strings.closeBehaviorKeepRunning,
               ),
-              DropdownMenuItem(
+              AppSelectOption(
                 value: 'stop-and-quit',
-                child: Text(strings.closeBehaviorStopAndQuit),
+                label: strings.closeBehaviorStopAndQuit,
               ),
             ],
             onChanged: saving
                 ? null
-                : (value) {
-                    if (value != null) {
-                      state._updateState(() => state._closeBehavior = value);
-                    }
-                  },
+                : (value) =>
+                      state._updateState(() => state._closeBehavior = value),
           ),
         ),
       ],

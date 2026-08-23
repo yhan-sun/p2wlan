@@ -54,14 +54,20 @@ class PageScaffold extends StatelessWidget {
                     children: [
                       if (showHeader) ...[
                         Align(
-                          alignment: Alignment.center,
+                          alignment: isNarrow
+                              ? Alignment.center
+                              : Alignment.centerLeft,
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.center,
+                            crossAxisAlignment: isNarrow
+                                ? CrossAxisAlignment.center
+                                : CrossAxisAlignment.start,
                             children: [
                               Text(
                                 title,
-                                textAlign: TextAlign.center,
+                                textAlign: isNarrow
+                                    ? TextAlign.center
+                                    : TextAlign.left,
                                 style: TextStyle(
                                   fontSize: isNarrow ? 20 : 22,
                                   fontWeight: FontWeight.w600,
@@ -75,7 +81,9 @@ class PageScaffold extends StatelessWidget {
                                 const SizedBox(height: 3),
                                 Text(
                                   trimmedSubtitle,
-                                  textAlign: TextAlign.center,
+                                  textAlign: isNarrow
+                                      ? TextAlign.center
+                                      : TextAlign.left,
                                   style: TextStyle(
                                     fontSize: 13,
                                     fontWeight: FontWeight.w400,

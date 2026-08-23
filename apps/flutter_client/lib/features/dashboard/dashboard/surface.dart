@@ -1,5 +1,35 @@
 part of '../dashboard_page.dart';
 
+/// Supporting Home sections use the same restrained surface treatment as the
+/// rest of the product. On wide layouts they form the dashboard's two-column
+/// information grid; on narrow layouts they stack with unchanged reading
+/// order.
+class _DashboardSectionSurface extends StatelessWidget {
+  const _DashboardSectionSurface({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
+    return Container(
+      decoration: BoxDecoration(
+        color: colors.surface,
+        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+        border: Border.all(color: colors.border),
+        boxShadow: theme.brightness == Brightness.dark
+            ? const []
+            : AppTokens.shadowBorder,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(AppTokens.space16),
+        child: child,
+      ),
+    );
+  }
+}
+
 /// Manual daemon recovery command behind progressive disclosure: only a quiet
 /// "manual start needed" header by default; the terminal block appears on
 /// demand, never on a healthy page.

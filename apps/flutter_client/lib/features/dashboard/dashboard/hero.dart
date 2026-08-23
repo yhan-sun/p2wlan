@@ -104,6 +104,20 @@ class _NetworkHero extends StatelessWidget {
 
     final header = Row(
       children: [
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            color: P2WlanColors.of(context).selectedSurface,
+            borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+          ),
+          child: Icon(
+            Icons.hub_rounded,
+            size: 19,
+            color: theme.colorScheme.primary,
+          ),
+        ),
+        const SizedBox(width: AppTokens.space12),
         Expanded(
           child: Text(
             strings.homeNetworkTitle,
@@ -271,7 +285,8 @@ class _NetworkHero extends StatelessWidget {
   }
 }
 
-/// The one prominent surface on Home: light border, no shadow, radius 12.
+/// The primary Home surface: quiet elevation, product color, and generous
+/// spacing without the heavy default Material Card treatment.
 class _HeroSurface extends StatelessWidget {
   const _HeroSurface({required this.child});
 
@@ -280,14 +295,18 @@ class _HeroSurface extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return DecoratedBox(
+    final colors = P2WlanColors.of(context);
+    return Container(
       decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
+        color: colors.surface,
         borderRadius: BorderRadius.circular(AppTokens.radiusLg),
-        border: Border.all(color: theme.colorScheme.outline, width: 1),
+        border: Border.all(color: colors.border, width: 1),
+        boxShadow: theme.brightness == Brightness.dark
+            ? const []
+            : AppTokens.shadowBorder,
       ),
       child: Padding(
-        padding: const EdgeInsets.all(AppTokens.space16),
+        padding: const EdgeInsets.all(AppTokens.space20),
         child: child,
       ),
     );
@@ -421,7 +440,7 @@ class _StaleNote extends StatelessWidget {
   }
 }
 
-/// Online / Direct / Relay — one quiet row, no metric cards or separators.
+/// Online / Direct / Relay in one compact statistics surface.
 class _HomeMetrics extends StatelessWidget {
   const _HomeMetrics({required this.counts});
 
@@ -430,27 +449,50 @@ class _HomeMetrics extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    return Row(
-      children: [
-        _MetricCell(
-          key: const Key('dashboard-count-online'),
-          value: counts.online,
-          label: strings.onlineDevices,
-        ),
-        const SizedBox(width: AppTokens.space12),
-        _MetricCell(
-          key: const Key('dashboard-count-direct'),
-          value: counts.direct,
-          label: strings.direct,
-        ),
-        const SizedBox(width: AppTokens.space12),
-        _MetricCell(
-          key: const Key('dashboard-count-relay'),
-          value: counts.relay,
-          label: strings.relay,
-        ),
-      ],
+    final colors = P2WlanColors.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppTokens.space8,
+        vertical: AppTokens.space12,
+      ),
+      decoration: BoxDecoration(
+        color: colors.surfaceMuted,
+        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      child: Row(
+        children: [
+          _MetricCell(
+            key: const Key('dashboard-count-online'),
+            value: counts.online,
+            label: strings.onlineDevices,
+          ),
+          _MetricDivider(color: colors.border),
+          _MetricCell(
+            key: const Key('dashboard-count-direct'),
+            value: counts.direct,
+            label: strings.direct,
+          ),
+          _MetricDivider(color: colors.border),
+          _MetricCell(
+            key: const Key('dashboard-count-relay'),
+            value: counts.relay,
+            label: strings.relay,
+          ),
+        ],
+      ),
     );
+  }
+}
+
+class _MetricDivider extends StatelessWidget {
+  const _MetricDivider({required this.color});
+
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(width: 1, height: 34, color: color);
   }
 }
 

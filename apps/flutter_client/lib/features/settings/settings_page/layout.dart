@@ -20,15 +20,46 @@ class _SettingsRoot extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: AppTokens.space6),
       children: [
-        for (var index = 0; index < categories.length; index++) ...[
-          if (index != 0) const SizedBox(height: AppTokens.space4),
-          _PreferenceRow(
-            label: categories[index].label(strings),
-            value: summaries[categories[index]],
-            onTap: () => onSelect(categories[index]),
+        _SettingsSurface(
+          padding: const EdgeInsets.symmetric(
+            horizontal: AppTokens.space6,
+            vertical: AppTokens.space4,
           ),
-        ],
+          child: Column(
+            children: [
+              for (var index = 0; index < categories.length; index++)
+                _PreferenceRow(
+                  label: categories[index].label(strings),
+                  value: summaries[categories[index]],
+                  leading: _SettingsCategoryIcon(categories[index]),
+                  showDivider: index != categories.length - 1,
+                  onTap: () => onSelect(categories[index]),
+                ),
+            ],
+          ),
+        ),
       ],
+    );
+  }
+}
+
+class _SettingsCategoryIcon extends StatelessWidget {
+  const _SettingsCategoryIcon(this.category);
+
+  final SettingsCategory category;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
+    return Container(
+      width: 34,
+      height: 34,
+      decoration: BoxDecoration(
+        color: colors.selectedSurface,
+        borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+      ),
+      child: Icon(category.icon, size: 18, color: theme.colorScheme.primary),
     );
   }
 }
@@ -81,6 +112,7 @@ class _CategoryRailItem extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(
         vertical: 1,
@@ -102,9 +134,7 @@ class _CategoryRailItem extends StatelessWidget {
                 vertical: AppTokens.space10,
               ),
               decoration: BoxDecoration(
-                color: selected
-                    ? theme.colorScheme.secondaryContainer
-                    : Colors.transparent,
+                color: selected ? colors.selectedSurface : Colors.transparent,
                 borderRadius: BorderRadius.circular(AppTokens.radiusMd),
               ),
               child: Row(
@@ -120,7 +150,7 @@ class _CategoryRailItem extends StatelessWidget {
                             ? FontWeight.w600
                             : FontWeight.w500,
                         color: selected
-                            ? theme.colorScheme.onSecondaryContainer
+                            ? theme.colorScheme.primary
                             : theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
@@ -165,36 +195,47 @@ class _CategoryDetailView extends StatelessWidget {
   Widget build(BuildContext context) {
     final dirty = state._categoryDirty(category);
     final content = _categoryContent(category, state, strings, credentialState);
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(2, 2, 2, 16),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _DetailHeader(
-          title: category.label(strings),
-          onBack: onBack,
-          subtitle: _categorySubtitle(category, strings),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(2, 2, 2, 16),
+            children: [
+              _DetailHeader(
+                title: category.label(strings),
+                onBack: onBack,
+                subtitle: _categorySubtitle(category, strings),
+              ),
+              if (state._formErrorCategory == category &&
+                  state._formError != null) ...[
+                _SettingsErrorNotice(message: state._formError!),
+                const SizedBox(height: AppTokens.space12),
+              ],
+              if (state._restartRequired) ...[
+                _PendingRestartNotice(
+                  busy: state._saving || state.widget.statusStore.daemonBusy,
+                  canRestart: state._capabilities.canControlLocalDaemon,
+                  onRestart: state._restartDaemonToApply,
+                ),
+                const SizedBox(height: AppTokens.space12),
+              ],
+              _SettingsSurface(
+                padding: const EdgeInsets.all(AppTokens.space10),
+                child: content,
+              ),
+            ],
+          ),
         ),
-        if (state._formErrorCategory == category &&
-            state._formError != null) ...[
-          _SettingsErrorNotice(message: state._formError!),
-          const SizedBox(height: AppTokens.space12),
-        ],
-        if (state._restartRequired) ...[
-          _PendingRestartNotice(
-            busy: state._saving || state.widget.statusStore.daemonBusy,
-            canRestart: state._capabilities.canControlLocalDaemon,
-            onRestart: state._restartDaemonToApply,
+        if (dirty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(2, AppTokens.space10, 2, 2),
+            child: _SaveBar(
+              busy: state._saving,
+              restartRequired: state._restartRequired,
+              onSave: () => state._saveCategory(category),
+            ),
           ),
-          const SizedBox(height: AppTokens.space12),
-        ],
-        content,
-        if (dirty) ...[
-          const SizedBox(height: AppTokens.space16),
-          _SaveBar(
-            busy: state._saving,
-            restartRequired: state._restartRequired,
-            onSave: () => state._saveCategory(category),
-          ),
-        ],
       ],
     );
   }

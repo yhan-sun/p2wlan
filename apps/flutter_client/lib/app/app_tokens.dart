@@ -1,63 +1,61 @@
 import 'package:flutter/material.dart';
 
 /// Design tokens for P2WLAN Flutter Client UI/UX.
-/// Native engineering aesthetic: calm, reliable, precise, full P2WLAN network client.
+/// Calm connectivity aesthetic: modern, reliable, precise, and platform-neutral.
 abstract final class AppTokens {
   // --- Color Palette ---
-  // Cool light neutral background & surfaces
-  static const colorBg = Color(0xFFF2F4F3);
-  static const colorSurface = Color(0xFFFEFEFC);
-  static const colorSurfaceSubtle = Color(0xFFF7F8F6);
-  static const colorBorder = Color(0xFFDDE4E1);
-  static const colorBorderSubtle = Color(0xFFE9EEEB);
+  // Reference-aligned light neutral background & surfaces.
+  static const colorBg = Color(0xFFF6F7F8);
+  static const colorSurface = Color(0xFFFFFFFF);
+  static const colorSurfaceSubtle = Color(0xFFF8FAFC);
+  static const colorBorder = Color(0xFFE6E9EB);
+  static const colorBorderSubtle = Color(0xFFF0F2F4);
 
   // Dark theme neutral background & surfaces
-  static const colorDarkBg = Color(0xFF101716);
-  static const colorDarkSurface = Color(0xFF182220);
-  static const colorDarkSurfaceSubtle = Color(0xFF1F2B29);
-  static const colorDarkBorder = Color(0xFF2E3D3A);
-  static const colorDarkBorderSubtle = Color(0xFF263330);
+  static const colorDarkBg = Color(0xFF0B1220);
+  static const colorDarkSurface = Color(0xFF111827);
+  static const colorDarkSurfaceSubtle = Color(0xFF172033);
+  static const colorDarkBorder = Color(0xFF2A3547);
+  static const colorDarkBorderSubtle = Color(0xFF202A3A);
 
   // Text hierarchy
-  static const colorTextPrimary = Color(0xFF151A1D);
-  static const colorTextSecondary = Color(0xFF48535A);
-  static const colorTextMuted = Color(0xFF68757B);
+  static const colorTextPrimary = Color(0xFF171A1F);
+  static const colorTextSecondary = Color(0xFF667078);
+  static const colorTextMuted = Color(0xFF8A949E);
 
   // Dark text hierarchy
-  static const colorDarkTextPrimary = Color(0xFFEDF2F0);
-  static const colorDarkTextSecondary = Color(0xFFA1AFAC);
-  static const colorDarkTextMuted = Color(0xFF758582);
+  static const colorDarkTextPrimary = Color(0xFFF7F9FC);
+  static const colorDarkTextSecondary = Color(0xFFB5C0D0);
+  static const colorDarkTextMuted = Color(0xFF7F8BA0);
 
-  // Brand / Low-frequency accent (Slate blue / Slate blue-teal)
-  static const colorAccent = Color(0xFF173E3C);
-  static const colorAccentMuted = Color(0xFF2A5653);
+  // Brand blue from the approved visual reference.
+  static const colorAccent = Color(0xFF2563EB);
+  static const colorAccentMuted = Color(0xFF1D4ED8);
 
-  // Dark Brand accent. Same hue family as the light accent (teal ≈ 176°):
-  // dark mode only raises lightness/saturation for contrast, never shifts to
-  // a different brand (previously a sky blue).
-  static const colorDarkAccent = Color(0xFF35B5AD);
-  static const colorDarkAccentMuted = Color(0xFF1E3E3B);
+  // Dark mode raises blue lightness for contrast while preserving brand hue.
+  static const colorDarkAccent = Color(0xFF60A5FA);
+  static const colorDarkAccentMuted = Color(0xFF1E3A8A);
 
   // Status Tones (Semantic, strictly scoped)
   // Good / Online / Direct
-  static const colorGoodBg = Color(0xFFF2FAF5);
-  static const colorGoodBorder = Color(0xFFB9DFC9);
-  static const colorGoodText = Color(0xFF276044);
+  static const colorGoodBg = Color(0xFFF0FDF4);
+  static const colorGoodBorder = Color(0xFFBBF7D0);
+  static const colorGoodText = Color(0xFF15803D);
 
   // Warning / Degraded / Probing
-  static const colorWarnBg = Color(0xFFFCF7EA);
-  static const colorWarnBorder = Color(0xFFE6CD8F);
-  static const colorWarnText = Color(0xFF755622);
+  static const colorWarnBg = Color(0xFFFFFBEB);
+  static const colorWarnBorder = Color(0xFFFDE68A);
+  static const colorWarnText = Color(0xFFB45309);
 
   // Bad / Unhealthy / Actual failures
-  static const colorBadBg = Color(0xFFFCF3F1);
-  static const colorBadBorder = Color(0xFFE7B8AE);
-  static const colorBadText = Color(0xFF8B372D);
+  static const colorBadBg = Color(0xFFFEF2F2);
+  static const colorBadBorder = Color(0xFFFECACA);
+  static const colorBadText = Color(0xFFDC2626);
 
   // Neutral / Offline / Skipped / Idle
-  static const colorNeutralBg = Color(0xFFF1F4F3);
-  static const colorNeutralBorder = Color(0xFFD3DCDA);
-  static const colorNeutralText = Color(0xFF4C585D);
+  static const colorNeutralBg = Color(0xFFF3F4F6);
+  static const colorNeutralBorder = Color(0xFFD1D5DB);
+  static const colorNeutralText = Color(0xFF667078);
 
   // Dark status tones keep semantic color visible on dark surfaces without
   // falling back to pale light-theme labels.
@@ -87,19 +85,19 @@ abstract final class AppTokens {
   static const colorConsoleText = Color(0xFFE5ECE8);
 
   static const shadowBorder = [
-    BoxShadow(color: Color(0x12000000), blurRadius: 0, spreadRadius: 1),
+    BoxShadow(color: Color(0x0D0F172A), blurRadius: 0, spreadRadius: 1),
     BoxShadow(
-      color: Color(0x08000000),
-      offset: Offset(0, 1),
-      blurRadius: 2,
-      spreadRadius: -1,
+      color: Color(0x0F0F172A),
+      offset: Offset(0, 6),
+      blurRadius: 20,
+      spreadRadius: -8,
     ),
   ];
 
   // --- Radius & Spacing ---
-  static const radiusSm = 6.0;
-  static const radiusMd = 8.0;
-  static const radiusLg = 12.0;
+  static const radiusSm = 8.0;
+  static const radiusMd = 10.0;
+  static const radiusLg = 14.0;
 
   // --- Spacing scale (visual rhythm) ---
   // page/section/card rhythm uses these; per-row or painter-specific offsets

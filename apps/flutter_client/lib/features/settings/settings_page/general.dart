@@ -25,52 +25,45 @@ class _GeneralSection extends StatelessWidget {
         _PreferenceRow(
           label: strings.language,
           subtitle: strings.languageHelper,
-          trailing: DropdownButton<String>(
-            isExpanded: MediaQuery.sizeOf(context).width < 520,
-            key: ValueKey('language-$languageCode'),
+          trailing: AppSelect<String>(
+            expanded: MediaQuery.sizeOf(context).width < 520,
+            key: const ValueKey('settings-language-select'),
             value: AppLanguage.fromCode(languageCode).code,
-            underline: const SizedBox.shrink(),
-            items: [
+            options: [
               for (final language in AppLanguage.values)
-                DropdownMenuItem(
+                AppSelectOption(
                   value: language.code,
-                  child: Text(strings.languageLabel(language.code)),
+                  label: strings.languageLabel(language.code),
                 ),
             ],
-            onChanged: saving
-                ? null
-                : (value) {
-                    if (value != null) state._saveLanguage(value);
-                  },
+            onChanged: saving ? null : (value) => state._saveLanguage(value),
           ),
         ),
         _PreferenceRow(
           label: strings.themeMode,
           subtitle: strings.themeModeHelper,
-          trailing: DropdownButton<String>(
-            isExpanded: MediaQuery.sizeOf(context).width < 520,
-            key: ValueKey('theme-$themeCode'),
+          trailing: AppSelect<String>(
+            expanded: MediaQuery.sizeOf(context).width < 520,
+            key: const ValueKey('settings-theme-select'),
             value: AppThemeMode.fromCode(themeCode).code,
-            underline: const SizedBox.shrink(),
-            items: [
-              DropdownMenuItem(
+            options: [
+              AppSelectOption(
                 value: AppThemeMode.system.code,
-                child: Text(strings.themeSystem),
+                label: strings.themeSystem,
+                icon: Icons.brightness_auto_outlined,
               ),
-              DropdownMenuItem(
+              AppSelectOption(
                 value: AppThemeMode.light.code,
-                child: Text(strings.themeLight),
+                label: strings.themeLight,
+                icon: Icons.light_mode_outlined,
               ),
-              DropdownMenuItem(
+              AppSelectOption(
                 value: AppThemeMode.dark.code,
-                child: Text(strings.themeDark),
+                label: strings.themeDark,
+                icon: Icons.dark_mode_outlined,
               ),
             ],
-            onChanged: saving
-                ? null
-                : (value) {
-                    if (value != null) state._saveThemeMode(value);
-                  },
+            onChanged: saving ? null : (value) => state._saveThemeMode(value),
           ),
         ),
       ],

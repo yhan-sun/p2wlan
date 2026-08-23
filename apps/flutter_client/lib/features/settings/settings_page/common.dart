@@ -10,6 +10,8 @@ class _PreferenceRow extends StatelessWidget {
     this.value,
     this.onTap,
     this.trailing,
+    this.leading,
+    this.showDivider = true,
   });
 
   final String label;
@@ -22,34 +24,47 @@ class _PreferenceRow extends StatelessWidget {
   /// Optional explicit control (switch, dropdown, …); when present it wins
   /// over [value].
   final Widget? trailing;
+  final Widget? leading;
+  final bool showDivider;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final hasTrailing = trailing != null;
-    final leading = Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
+    final labelContent = Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        Text(
-          label,
-          style: TextStyle(
-            fontSize: 14,
-            fontWeight: FontWeight.w500,
-            color: theme.colorScheme.onSurface,
+        if (leading != null) ...[
+          leading!,
+          const SizedBox(width: AppTokens.space12),
+        ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+              if (subtitle != null && subtitle!.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  subtitle!,
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.3,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ],
           ),
         ),
-        if (subtitle != null && subtitle!.isNotEmpty) ...[
-          const SizedBox(height: 2),
-          Text(
-            subtitle!,
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.3,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ],
       ],
     );
 
@@ -107,7 +122,7 @@ class _PreferenceRow extends StatelessWidget {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    leading,
+                    labelContent,
                     const SizedBox(height: AppTokens.space4),
                     Align(
                       alignment: Alignment.centerRight,
@@ -127,7 +142,7 @@ class _PreferenceRow extends StatelessWidget {
               if (hasTrailing) {
                 return Row(
                   children: [
-                    Expanded(child: leading),
+                    Expanded(child: labelContent),
                     const SizedBox(width: AppTokens.space12),
                     Align(
                       alignment: Alignment.centerRight,
@@ -138,7 +153,7 @@ class _PreferenceRow extends StatelessWidget {
               }
               return Row(
                 children: [
-                  Expanded(child: leading),
+                  Expanded(child: labelContent),
                   const SizedBox(width: AppTokens.space12),
                   Flexible(
                     child: Align(
@@ -156,8 +171,43 @@ class _PreferenceRow extends StatelessWidget {
     return Column(
       children: [
         content,
-        Divider(height: 1, color: theme.colorScheme.outlineVariant),
+        if (showDivider)
+          Divider(height: 1, color: theme.colorScheme.outlineVariant),
       ],
+    );
+  }
+}
+
+class _SettingsSurface extends StatelessWidget {
+  const _SettingsSurface({
+    required this.child,
+    this.padding = const EdgeInsets.all(AppTokens.space6),
+  });
+
+  final Widget child;
+  final EdgeInsetsGeometry padding;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
+    final radius = BorderRadius.circular(AppTokens.radiusLg);
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: radius,
+        boxShadow: theme.brightness == Brightness.dark
+            ? const []
+            : AppTokens.shadowBorder,
+      ),
+      child: Material(
+        color: colors.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: radius,
+          side: BorderSide(color: colors.border),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Padding(padding: padding, child: child),
+      ),
     );
   }
 }
@@ -429,7 +479,7 @@ class _PendingRestartNotice extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
-    final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
     final message = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -437,7 +487,7 @@ class _PendingRestartNotice extends StatelessWidget {
         Text(
           strings.restartRequired,
           style: TextStyle(
-            color: theme.colorScheme.onSecondaryContainer,
+            color: colors.warningText,
             fontSize: 13,
             fontWeight: FontWeight.w700,
           ),
@@ -448,7 +498,7 @@ class _PendingRestartNotice extends StatelessWidget {
               ? strings.restartRequiredDetail
               : strings.restartWillApplyLater,
           style: TextStyle(
-            color: theme.colorScheme.onSecondaryContainer,
+            color: colors.warningText,
             fontSize: 12,
             height: 1.35,
           ),
@@ -457,8 +507,8 @@ class _PendingRestartNotice extends StatelessWidget {
     );
     return Container(
       decoration: BoxDecoration(
-        color: theme.colorScheme.secondaryContainer,
-        border: Border.all(color: theme.colorScheme.outlineVariant),
+        color: colors.warningSurface,
+        border: Border.all(color: colors.warningBorder),
         borderRadius: BorderRadius.circular(AppTokens.radiusMd),
       ),
       padding: const EdgeInsets.all(AppTokens.space12),

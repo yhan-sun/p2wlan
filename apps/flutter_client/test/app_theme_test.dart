@@ -56,9 +56,14 @@ void main() {
     test('light and dark primary belong to the same hue family', () {
       final lightHue = _hue(AppTokens.colorAccent);
       final darkHue = _hue(AppTokens.colorDarkAccent);
-      // Same teal hue family; dark only lightens for contrast, never shifts to
-      // a different brand (this was previously a sky blue).
+      // Same blue hue family; dark only lightens for contrast.
       expect(_hueDistance(lightHue, darkHue), lessThan(20));
+    });
+
+    test('light primary matches the approved UI reference', () {
+      expect(AppTokens.colorAccent, const Color(0xFF2563EB));
+      expect(AppTokens.colorBg, const Color(0xFFF6F7F8));
+      expect(AppTokens.colorSurface, const Color(0xFFFFFFFF));
     });
 
     test('light primary is a darker shade than dark primary (same hue)', () {

@@ -54,10 +54,12 @@ class _P2WlanShellState extends State<P2WlanShell> {
   /// category. Set by the SettingsPage via [onDirtyChanged]; when true,
   /// navigating away from Settings prompts a discard confirmation.
   var _settingsDirty = false;
+  late final SettingsPageController _settingsController;
 
   @override
   void initState() {
     super.initState();
+    _settingsController = SettingsPageController();
     widget.settingsStore.addListener(_handleSettingsChanged);
   }
 
@@ -97,18 +99,24 @@ class _P2WlanShellState extends State<P2WlanShell> {
         final useBottomNav =
             breakpoint == AppBreakpoint.compact && !_isDesktopShell;
 
-        return Scaffold(
-          appBar: _buildTopBar(strings, useBottomNav, useDesktopSidebar),
-          body: useBottomNav
-              ? _buildBody()
-              : Row(
-                  children: [
-                    _buildNavigation(strings, useDesktopSidebar),
-                    const VerticalDivider(width: 1),
-                    Expanded(child: _buildBody()),
-                  ],
-                ),
-          bottomNavigationBar: useBottomNav ? _buildBottomNav(strings) : null,
+        return PopScope<Object?>(
+          canPop: _section == P2WlanSection.home,
+          onPopInvokedWithResult: (didPop, result) {
+            if (!didPop) _handleSystemBack();
+          },
+          child: Scaffold(
+            appBar: _buildTopBar(strings, useBottomNav, useDesktopSidebar),
+            body: useBottomNav
+                ? _buildBody(showPageHeader: false)
+                : Row(
+                    children: [
+                      _buildNavigation(strings, useDesktopSidebar),
+                      const VerticalDivider(width: 1),
+                      Expanded(child: _buildBody(showPageHeader: true)),
+                    ],
+                  ),
+            bottomNavigationBar: useBottomNav ? _buildBottomNav(strings) : null,
+          ),
         );
       },
     );
@@ -183,7 +191,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
     );
   }
 
-  Widget _buildBody() {
+  Widget _buildBody({required bool showPageHeader}) {
     final page = switch (_section) {
       P2WlanSection.home => DashboardPage(
         settingsStore: widget.settingsStore,
@@ -197,24 +205,25 @@ class _P2WlanShellState extends State<P2WlanShell> {
       P2WlanSection.devices => NodesPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
-        showHeader: false,
+        showHeader: showPageHeader,
         capabilities: widget.capabilities,
       ),
       P2WlanSection.troubleshooting => DiagnosticsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
         capabilities: widget.capabilities,
-        showHeader: false,
+        showHeader: showPageHeader,
         onOpenDevices: () => _select(P2WlanSection.devices),
         onOpenSettings: () => _select(P2WlanSection.settings),
       ),
       P2WlanSection.settings => SettingsPage(
         settingsStore: widget.settingsStore,
         statusStore: widget.statusStore,
+        controller: _settingsController,
         capabilities: widget.capabilities,
         onLogout: widget.onLogout,
         onDirtyChanged: (dirty) => _settingsDirty = dirty,
-        showHeader: false,
+        showHeader: showPageHeader,
       ),
     };
     return AnimatedSwitcher(
@@ -250,6 +259,24 @@ class _P2WlanShellState extends State<P2WlanShell> {
         _lastPrimarySection = section;
       }
     });
+  }
+
+  void _handleSystemBack() {
+    // Settings categories are in-place details, so they unwind before the
+    // shell moves between primary sections.
+    if (_section == P2WlanSection.settings &&
+        _settingsController.maybeGoBack()) {
+      return;
+    }
+
+    // Contextual troubleshooting returns to the primary section that opened
+    // it. Primary destinations return Home; only a second back on Home leaves
+    // the app, matching Android's expected task behavior.
+    if (_section == P2WlanSection.troubleshooting) {
+      _select(_lastPrimarySection);
+    } else if (_section != P2WlanSection.home) {
+      _select(P2WlanSection.home);
+    }
   }
 
   void _showDiscardGuard(P2WlanSection targetSection) {

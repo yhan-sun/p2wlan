@@ -69,9 +69,11 @@ class DashboardPage extends StatelessWidget {
         );
         final daemonAvailable =
             statusStore.daemonReachable || statusStore.statusReachable;
+        final awaitingInitialProbe = statusStore.lastFetchedAt == null;
         final loading =
             snapshot == null &&
             !daemonAvailable &&
+            awaitingInitialProbe &&
             (statusStore.refreshing || statusStore.daemonBusy);
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);
@@ -130,19 +132,44 @@ class DashboardPage extends StatelessWidget {
               ),
             ],
             if (capabilities.canActAsLocalVpnNode && snapshot != null) ...[
-              const SizedBox(height: AppTokens.space20),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  _OnlineDevicesSection(
-                    peers: overviewPeers,
-                    peerTransferRates: peerTransferRates,
-                    onOpenDevices: onOpenDevices,
-                    onOpenPeer: onOpenPeer,
-                  ),
-                  const SizedBox(height: AppTokens.space20),
-                  _NetworkComponentsSection(snapshot: snapshot, counts: counts),
-                ],
+              const SizedBox(height: AppTokens.space16),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final devices = _DashboardSectionSurface(
+                    child: _OnlineDevicesSection(
+                      peers: overviewPeers,
+                      peerTransferRates: peerTransferRates,
+                      onOpenDevices: onOpenDevices,
+                      onOpenPeer: onOpenPeer,
+                    ),
+                  );
+                  final components = _DashboardSectionSurface(
+                    child: _NetworkComponentsSection(
+                      snapshot: snapshot,
+                      counts: counts,
+                    ),
+                  );
+
+                  if (constraints.maxWidth < 820) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        devices,
+                        const SizedBox(height: AppTokens.space16),
+                        components,
+                      ],
+                    );
+                  }
+
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(flex: 5, child: devices),
+                      const SizedBox(width: AppTokens.space16),
+                      SizedBox(width: 340, child: components),
+                    ],
+                  );
+                },
               ),
             ],
             if (capabilities.canActAsLocalVpnNode && manualCommand != null) ...[

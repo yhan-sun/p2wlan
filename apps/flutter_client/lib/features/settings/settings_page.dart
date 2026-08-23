@@ -12,6 +12,7 @@ import '../../core/diagnostics/session_log_bundle.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
+import '../../shared/widgets/app_select.dart';
 
 part 'settings_page/categories.dart';
 part 'settings_page/common.dart';
@@ -23,6 +24,24 @@ part 'settings_page/advanced.dart';
 part 'settings_page/developer.dart';
 part 'settings_page/actions.dart';
 
+/// Lets the app shell unwind Settings' in-place root/detail navigation before
+/// handling a system back gesture as product-level navigation.
+///
+/// Settings intentionally does not push a second Navigator route because its
+/// unsaved drafts belong to the same page state. The controller provides the
+/// equivalent back-stack contract without exposing that private state.
+class SettingsPageController {
+  bool Function()? _backHandler;
+
+  bool maybeGoBack() => _backHandler?.call() ?? false;
+
+  void _attach(bool Function() handler) => _backHandler = handler;
+
+  void _detach(bool Function() handler) {
+    if (_backHandler == handler) _backHandler = null;
+  }
+}
+
 class SettingsPage extends StatefulWidget {
   const SettingsPage({
     super.key,
@@ -32,6 +51,7 @@ class SettingsPage extends StatefulWidget {
     this.controlApi,
     this.onLogout,
     this.onDirtyChanged,
+    this.controller,
     this.showHeader = true,
   });
 
@@ -52,6 +72,8 @@ class SettingsPage extends StatefulWidget {
   /// (any category has unsaved drafts). The shell uses this to guard against
   /// silently losing settings when the user navigates away.
   final ValueChanged<bool>? onDirtyChanged;
+
+  final SettingsPageController? controller;
 
   final bool showHeader;
 
@@ -93,6 +115,11 @@ class _SettingsPageState extends State<SettingsPage> {
   /// concrete category (defaulting to the first visible one). Not persisted.
   SettingsCategory? _selectedCategory;
 
+  /// Width of the last rendered Settings body. It is read only for a system
+  /// back request so desktop's persistent category rail is never mistaken for
+  /// a pushed detail page.
+  var _lastLayoutWidth = double.infinity;
+
   void _updateState(VoidCallback fn) => setState(fn);
 
   @override
@@ -131,6 +158,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _manualMode = settings.manualMode;
     _socketPool = normalizeSocketPool(settings.socketPool);
     _closeBehavior = normalizeCloseBehavior(settings.closeBehavior);
+    widget.controller?._attach(_handleBackRequest);
     // Live dirty detection: any controller edit triggers a rebuild so the
     // category save bar appears/disappears without needing an explicit submit.
     for (final controller in [
@@ -153,6 +181,15 @@ class _SettingsPageState extends State<SettingsPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _notifyDirty();
     });
+  }
+
+  @override
+  void didUpdateWidget(covariant SettingsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller?._detach(_handleBackRequest);
+      widget.controller?._attach(_handleBackRequest);
+    }
   }
 
   void _onDraftChanged() {
@@ -182,6 +219,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    widget.controller?._detach(_handleBackRequest);
     if (_ownsControlApi) _controlApi.close();
     for (final controller in [
       _diagnosticsUrlController,
@@ -212,6 +250,16 @@ class _SettingsPageState extends State<SettingsPage> {
     _udpAdvertiseController.dispose();
     _relayServersController.dispose();
     super.dispose();
+  }
+
+  bool _handleBackRequest() {
+    if (!mounted ||
+        _lastLayoutWidth >= _settingsSidebarBreakpoint ||
+        _selectedCategory == null) {
+      return false;
+    }
+    setState(() => _selectedCategory = null);
+    return true;
   }
 
   /// Describes credential state for display without ever revealing the token.
@@ -273,6 +321,8 @@ class _SettingsPageState extends State<SettingsPage> {
     final selected = _normalizeSelection(categories);
     return LayoutBuilder(
       builder: (context, constraints) {
+        _lastLayoutWidth = constraints.maxWidth;
+        final isNarrow = constraints.maxWidth < 520;
         final layout = constraints.maxWidth >= _settingsSidebarBreakpoint
             ? _SettingsLayout.expanded
             : _SettingsLayout.rootDetail;
@@ -291,9 +341,14 @@ class _SettingsPageState extends State<SettingsPage> {
                 children: [
                   if (widget.showHeader) ...[
                     Align(
-                      alignment: Alignment.center,
+                      alignment: isNarrow
+                          ? Alignment.center
+                          : Alignment.centerLeft,
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: isNarrow
+                            ? CrossAxisAlignment.center
+                            : CrossAxisAlignment.start,
                         children: [
                           Text(
                             strings.settings,
@@ -306,6 +361,9 @@ class _SettingsPageState extends State<SettingsPage> {
                           const SizedBox(height: 3),
                           Text(
                             strings.settingsSubtitle,
+                            textAlign: isNarrow
+                                ? TextAlign.center
+                                : TextAlign.left,
                             style: TextStyle(
                               fontSize: 13,
                               color: theme.colorScheme.onSurfaceVariant,

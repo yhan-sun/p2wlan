@@ -17,12 +17,16 @@ abstract final class AppTheme {
         outlineVariant: AppTokens.colorBorderSubtle,
         primary: AppTokens.colorAccent,
         onPrimary: AppTokens.colorSurface,
+        secondary: AppTokens.colorAccent,
+        onSecondary: AppTokens.colorSurface,
+        secondaryContainer: Color(0xFFEAF1FF),
+        onSecondaryContainer: AppTokens.colorAccentMuted,
         error: AppTokens.colorBadText,
         surfaceContainerHighest: AppTokens.colorNeutralBg,
       ),
       extensions: const [P2WlanColors.light],
       hoverColor: P2WlanColors.light.hoverSurface,
-      focusColor: Color(0x1A173E3C),
+      focusColor: Color(0x1A2563EB),
       appBarTheme: const AppBarTheme(
         backgroundColor: AppTokens.colorSurface,
         foregroundColor: AppTokens.colorTextPrimary,
@@ -168,7 +172,7 @@ abstract final class AppTheme {
       navigationBarTheme: NavigationBarThemeData(
         backgroundColor: AppTokens.colorSurface,
         elevation: 0,
-        indicatorColor: AppTokens.colorSurfaceSubtle,
+        indicatorColor: P2WlanColors.light.selectedSurface,
         height: 64,
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.selected)) {
@@ -216,12 +220,16 @@ abstract final class AppTheme {
         outlineVariant: AppTokens.colorDarkBorderSubtle,
         primary: AppTokens.colorDarkAccent,
         onPrimary: AppTokens.colorDarkBg,
+        secondary: AppTokens.colorDarkAccent,
+        onSecondary: AppTokens.colorDarkBg,
+        secondaryContainer: Color(0xFF1E3A8A),
+        onSecondaryContainer: Color(0xFFDBEAFE),
         error: AppTokens.colorDarkBadText,
         surfaceContainerHighest: AppTokens.colorDarkSurfaceSubtle,
       ),
       extensions: const [P2WlanColors.dark],
       hoverColor: P2WlanColors.dark.hoverSurface,
-      focusColor: Color(0x4035B5AD),
+      focusColor: Color(0x4060A5FA),
       appBarTheme: const AppBarTheme(
         backgroundColor: AppTokens.colorDarkSurface,
         foregroundColor: AppTokens.colorDarkTextPrimary,
@@ -367,7 +375,7 @@ abstract final class AppTheme {
       navigationBarTheme: NavigationBarThemeData(
         backgroundColor: AppTokens.colorDarkSurface,
         elevation: 0,
-        indicatorColor: AppTokens.colorDarkSurfaceSubtle,
+        indicatorColor: P2WlanColors.dark.selectedSurface,
         height: 64,
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
           if (states.contains(WidgetState.selected)) {

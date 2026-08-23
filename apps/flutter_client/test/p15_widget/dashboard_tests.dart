@@ -36,6 +36,52 @@ void _registerDashboardTests() {
     expect(find.text('Network components'), findsNothing);
   });
 
+  testWidgets(
+    'Home leaves initial loading once and stays stopped during later polls',
+    (tester) async {
+      final api = _ControllableOfflineDiagnosticsApi();
+      final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+      addTearDown(stores.dispose);
+
+      final initialHealth = api.pauseNextHealth();
+      final initialRefresh = stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+
+      // Before the first probe completes, the endpoint state is genuinely
+      // unknown and the one-time loading copy is appropriate.
+      expect(find.text('Fetching network status…'), findsOneWidget);
+      expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
+
+      initialHealth.complete(false);
+      await initialRefresh;
+      await tester.pump();
+      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
+
+      // A periodic poll must not send the confirmed stopped UI back to the
+      // loading state while its health request is in flight.
+      final nextHealth = api.pauseNextHealth();
+      final periodicRefresh = stores.statusStore.refresh();
+      await tester.pump();
+      expect(find.text('Fetching network status…'), findsNothing);
+      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(find.byKey(const Key('dashboard-start-button')), findsOneWidget);
+
+      nextHealth.complete(false);
+      await periodicRefresh;
+      await tester.pump();
+      expect(find.text('P2WLAN is not running'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('Home shows healthy network from a real fixture snapshot', (
     tester,
   ) async {
@@ -950,4 +996,23 @@ DiagnosticsSnapshot _snapshotWithPeers(
   (raw['stats'] as Map<String, dynamic>)['total_peers'] = peers.length;
   raw['virtual_ip'] = '10.20.0.5';
   return DiagnosticsSnapshot.fromJson(raw);
+}
+
+class _ControllableOfflineDiagnosticsApi extends _FakeDiagnosticsApi {
+  _ControllableOfflineDiagnosticsApi() : super(health: false);
+
+  Completer<bool>? _nextHealth;
+
+  Completer<bool> pauseNextHealth() {
+    assert(_nextHealth == null, 'A health probe is already paused.');
+    return _nextHealth = Completer<bool>();
+  }
+
+  @override
+  Future<bool> fetchHealth(String diagnosticsUrl) {
+    final pending = _nextHealth;
+    if (pending == null) return Future<bool>.value(false);
+    _nextHealth = null;
+    return pending.future;
+  }
 }

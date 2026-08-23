@@ -281,7 +281,7 @@ void _registerPhase7Tests() {
       // Switch language — immediate save, no dirty bar, no guard on leave.
       await tester.tap(find.text('General'));
       await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('language-en')));
+      await _openAppSelect(tester, const ValueKey('settings-language-select'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('简体中文').last);
       await tester.pump();
@@ -289,7 +289,10 @@ void _registerPhase7Tests() {
         tester,
         () => stores.settingsStore.settings.languageCode == 'zh-Hans',
       );
-      await _waitForSaveComplete(tester, const ValueKey('theme-system'));
+      await _waitForSaveComplete(
+        tester,
+        const ValueKey('settings-theme-select'),
+      );
 
       // Navigate to Home — no guard (language is immediate, not dirty).
       // UI is now in Chinese after language switch, so Home is '首页'.

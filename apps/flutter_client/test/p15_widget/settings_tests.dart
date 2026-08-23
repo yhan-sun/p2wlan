@@ -72,14 +72,26 @@ Future<void> _waitFor(WidgetTester tester, bool Function() condition) async {
 /// set synchronously, before the async disk write finishes).
 Future<void> _waitForSaveComplete(WidgetTester tester, Key key) async {
   for (var attempt = 0; attempt < 30; attempt += 1) {
-    final dropdown = tester.widget<DropdownButton<String>>(find.byKey(key));
-    if (dropdown.onChanged != null) return;
+    final trigger = find.descendant(
+      of: find.byKey(key),
+      matching: find.byType(OutlinedButton),
+    );
+    if (trigger.evaluate().isNotEmpty &&
+        tester.widget<OutlinedButton>(trigger).onPressed != null) {
+      return;
+    }
     await tester.runAsync(
       () => Future<void>.delayed(const Duration(milliseconds: 100)),
     );
     await tester.pump();
   }
   fail('Immediate-save dropdown never re-enabled for $key');
+}
+
+Future<void> _openAppSelect(WidgetTester tester, Key key) async {
+  await tester.tap(
+    find.descendant(of: find.byKey(key), matching: find.byType(OutlinedButton)),
+  );
 }
 
 void _registerSettingsTests() {
@@ -396,7 +408,7 @@ void _registerSettingsTests() {
     // Immediate settings never trigger the dirty save bar.
     expect(find.text('Unsaved changes'), findsNothing);
 
-    await tester.tap(find.byKey(const ValueKey('theme-system')));
+    await _openAppSelect(tester, const ValueKey('settings-theme-select'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('Dark').last);
     await tester.pump();
@@ -406,10 +418,13 @@ void _registerSettingsTests() {
     );
     // The store value is set synchronously before persistence finishes; wait
     // until the save completes (the dropdown re-enables) before the next edit.
-    await _waitForSaveComplete(tester, const ValueKey('language-en'));
+    await _waitForSaveComplete(
+      tester,
+      const ValueKey('settings-language-select'),
+    );
     expect(stores.settingsStore.settings.themeMode, 'dark');
 
-    await tester.tap(find.byKey(const ValueKey('language-en')));
+    await _openAppSelect(tester, const ValueKey('settings-language-select'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('简体中文').last);
     await tester.pump();
@@ -417,7 +432,7 @@ void _registerSettingsTests() {
       tester,
       () => stores.settingsStore.settings.languageCode == 'zh-Hans',
     );
-    await _waitForSaveComplete(tester, const ValueKey('theme-dark'));
+    await _waitForSaveComplete(tester, const ValueKey('settings-theme-select'));
     expect(stores.settingsStore.settings.languageCode, 'zh-Hans');
     expect(find.text('设置'), findsWidgets);
     // No connection settings save was triggered by the immediate edits.
@@ -529,7 +544,10 @@ void _registerSettingsTests() {
     // Second save with no daemon-launch change (close behavior only). The
     // pending restart must NOT be cleared by this unrelated save.
     await _openCategory(tester, 'App');
-    await tester.tap(find.byKey(const ValueKey('close-behavior-keep-running')));
+    await _openAppSelect(
+      tester,
+      const ValueKey('settings-close-behavior-select'),
+    );
     await tester.pumpAndSettle();
     await tester.tap(find.text('Stop P2WLAN').last);
     await tester.pump();
