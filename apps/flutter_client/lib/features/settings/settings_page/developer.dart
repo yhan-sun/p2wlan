@@ -27,7 +27,10 @@ class _DeveloperSection extends StatelessWidget {
           helper: strings.diagnosticsUrlHelper,
           errorText: state._diagnosticsError,
           keyboardType: TextInputType.url,
-          onSubmitted: (_) => state._saveCategory(SettingsCategory.developer),
+          textInputAction: TextInputAction.done,
+          onSubmitted: saving
+              ? null
+              : (_) => state._saveCategory(SettingsCategory.developer),
         ),
         const SizedBox(height: AppTokens.space10),
         Wrap(

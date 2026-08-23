@@ -1017,8 +1017,11 @@ class _MobilePeerDetails extends StatelessWidget {
       key: const Key('nodes-mobile-detail'),
       backgroundColor: colors.surfaceMuted,
       appBar: AppBar(
-        leading: const BackButton(key: Key('nodes-mobile-detail-back')),
+        leading: const AppBackButton(key: Key('nodes-mobile-detail-back')),
         title: Text(strings.deviceDetails),
+        backgroundColor: colors.surface,
+        elevation: 0,
+        scrolledUnderElevation: 0,
         surfaceTintColor: Colors.transparent,
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1),

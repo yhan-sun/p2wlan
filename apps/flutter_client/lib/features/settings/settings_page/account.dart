@@ -39,6 +39,7 @@ class _AccountSection extends StatelessWidget {
             label: strings.authToken,
             helper: strings.credentialChangeHelper,
             obscureText: true,
+            textInputAction: TextInputAction.next,
           ),
           const SizedBox(height: AppTokens.space6),
         ],
@@ -47,18 +48,24 @@ class _AccountSection extends StatelessWidget {
           label: strings.controlServer,
           helper: strings.controlServerHelper,
           keyboardType: TextInputType.url,
+          textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: AppTokens.space6),
         _SettingsField(
           controller: state._networkIdController,
           label: strings.networkId,
           helper: strings.networkIdHelper,
+          textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: AppTokens.space6),
         _SettingsField(
           controller: state._virtualIpController,
           label: strings.requestedVirtualIp,
           helper: strings.requestedVirtualIpHelperSettings,
+          textInputAction: TextInputAction.done,
+          onSubmitted: saving
+              ? null
+              : (_) => state._saveCategory(SettingsCategory.accountNetwork),
         ),
         if (state.widget.onLogout != null) ...[
           const SizedBox(height: AppTokens.space16),

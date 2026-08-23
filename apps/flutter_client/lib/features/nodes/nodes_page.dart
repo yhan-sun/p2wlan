@@ -16,6 +16,7 @@ import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/layout/app_breakpoints.dart';
+import '../../shared/widgets/app_back_button.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
@@ -407,8 +408,9 @@ class _NodesPageState extends State<NodesPage> {
     required bool mobile,
   }) async {
     if (mobile) {
-      await Navigator.of(context).push(
+      await Navigator.of(context, rootNavigator: true).push(
         MaterialPageRoute<void>(
+          settings: RouteSettings(name: '/devices/${peer.nodeId}'),
           builder: (_) => _MobilePeerDetails(
             peer: peer,
             strings: stringsOf(context),
@@ -615,8 +617,9 @@ Future<void> showPeerDetailsSurface(
   final strings = stringsOf(context);
   final resolvedCapabilities = capabilities ?? PlatformCapabilities.current();
   if (!resolvedCapabilities.canUseSystemTray) {
-    await Navigator.of(context).push(
+    await Navigator.of(context, rootNavigator: true).push(
       MaterialPageRoute<void>(
+        settings: RouteSettings(name: '/devices/${peer.nodeId}'),
         builder: (_) => _MobilePeerDetails(
           peer: peer,
           strings: strings,

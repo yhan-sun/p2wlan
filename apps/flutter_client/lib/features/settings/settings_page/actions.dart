@@ -56,6 +56,7 @@ extension _SettingsPageActions on _SettingsPageState {
   /// controllers, so a General save can never be blocked by a pending
   /// Diagnostics URL edit or clobber another category's in-progress changes.
   Future<void> _saveCategory(SettingsCategory category) async {
+    if (_saving) return;
     final strings = AppStrings.fromCode(
       widget.settingsStore.settings.languageCode,
     );

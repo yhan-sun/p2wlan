@@ -85,7 +85,7 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
     this.repairResult,
   }) : routes = routes ?? _fakeRoutes;
 
-  final bool health;
+  bool health;
   DiagnosticsSnapshot? snapshot;
   final Object? statusError;
   final SpeedTestResult? speedTestResult;

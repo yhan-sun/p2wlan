@@ -6,17 +6,30 @@ part of '../settings_page.dart';
 class _SettingsRoot extends StatelessWidget {
   const _SettingsRoot({
     required this.categories,
-    required this.summaries,
+    required this.summaryFor,
+    required this.statusListenable,
     required this.onSelect,
   });
 
   final List<SettingsCategory> categories;
-  final Map<SettingsCategory, String> summaries;
+  final String Function(SettingsCategory category) summaryFor;
+  final Listenable statusListenable;
   final ValueChanged<SettingsCategory> onSelect;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
+    Widget rowFor(int index) {
+      final category = categories[index];
+      return _PreferenceRow(
+        label: category.label(strings),
+        value: summaryFor(category),
+        leading: _SettingsCategoryIcon(category),
+        showDivider: index != categories.length - 1,
+        onTap: () => onSelect(category),
+      );
+    }
+
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: AppTokens.space6),
       children: [
@@ -28,13 +41,13 @@ class _SettingsRoot extends StatelessWidget {
           child: Column(
             children: [
               for (var index = 0; index < categories.length; index++)
-                _PreferenceRow(
-                  label: categories[index].label(strings),
-                  value: summaries[categories[index]],
-                  leading: _SettingsCategoryIcon(categories[index]),
-                  showDivider: index != categories.length - 1,
-                  onTap: () => onSelect(categories[index]),
-                ),
+                if (categories[index] == SettingsCategory.developer)
+                  AnimatedBuilder(
+                    animation: statusListenable,
+                    builder: (context, _) => rowFor(index),
+                  )
+                else
+                  rowFor(index),
             ],
           ),
         ),
@@ -195,6 +208,18 @@ class _CategoryDetailView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final statusSensitive =
+        category == SettingsCategory.advancedNetwork ||
+        category == SettingsCategory.developer ||
+        state._restartRequired;
+    if (!statusSensitive) return _buildDetail(context);
+    return AnimatedBuilder(
+      animation: state._statusViewNotifier,
+      builder: (context, _) => _buildDetail(context),
+    );
+  }
+
+  Widget _buildDetail(BuildContext context) {
     final dirty = state._categoryDirty(category);
     final content = _categoryContent(category, state, strings, credentialState);
     return Column(
@@ -202,6 +227,7 @@ class _CategoryDetailView extends StatelessWidget {
       children: [
         Expanded(
           child: ListView(
+            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
             padding: const EdgeInsets.fromLTRB(2, 2, 2, 16),
             children: [
               if (showHeader)
@@ -272,7 +298,6 @@ class _MobileSettingsCategoryPage extends StatelessWidget {
       animation: Listenable.merge([
         state._detailViewNotifier,
         state.widget.settingsStore,
-        state.widget.statusStore,
       ]),
       builder: (context, _) {
         final strings = AppStrings.fromCode(
@@ -286,7 +311,7 @@ class _MobileSettingsCategoryPage extends StatelessWidget {
             backgroundColor: colors.surfaceMuted,
             appBar: AppBar(
               key: const Key('settings-mobile-category-app-bar'),
-              leading: const BackButton(
+              leading: const AppBackButton(
                 key: Key('settings-mobile-category-back'),
               ),
               title: Text(category.label(strings)),
@@ -417,10 +442,8 @@ class _SettingsShell extends StatelessWidget {
     if (current == null) {
       return _SettingsRoot(
         categories: categories,
-        summaries: {
-          for (final category in categories)
-            category: state._categorySummary(category, strings),
-        },
+        summaryFor: (category) => state._categorySummary(category, strings),
+        statusListenable: state._statusViewNotifier,
         onSelect: onSelect,
       );
     }

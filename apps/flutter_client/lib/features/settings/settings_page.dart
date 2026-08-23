@@ -12,6 +12,7 @@ import '../../core/diagnostics/session_log_bundle.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
+import '../../shared/widgets/app_back_button.dart';
 import '../../shared/widgets/app_select.dart';
 
 part 'settings_page/categories.dart';
@@ -23,6 +24,13 @@ part 'settings_page/application.dart';
 part 'settings_page/advanced.dart';
 part 'settings_page/developer.dart';
 part 'settings_page/actions.dart';
+
+typedef _SettingsStatusProjection = ({
+  bool daemonBusy,
+  bool daemonReachable,
+  bool refreshActivityVisible,
+  String daemonBuildSignature,
+});
 
 /// Lets the app shell unwind Settings' medium-width in-place root/detail
 /// navigation before handling a system back gesture as product-level
@@ -115,6 +123,7 @@ class _SettingsPageState extends State<SettingsPage> {
   /// changes. Settings/status stores and text controllers have their own
   /// listenables; toggles and async busy/error state flow through this one.
   final _detailViewNotifier = ValueNotifier<int>(0);
+  late final ValueNotifier<_SettingsStatusProjection> _statusViewNotifier;
 
   /// Currently open category in the medium-width root-detail layout.
   /// Null = the settings root. In the desktop rail layout it always maps to a
@@ -138,6 +147,8 @@ class _SettingsPageState extends State<SettingsPage> {
     _capabilities = widget.capabilities ?? PlatformCapabilities.current();
     _ownsControlApi = widget.controlApi == null;
     _controlApi = widget.controlApi ?? ControlApi();
+    _statusViewNotifier = ValueNotifier(_statusProjection(widget.statusStore));
+    widget.statusStore.addListener(_onStatusChanged);
     final settings = widget.settingsStore.settings;
     _diagnosticsUrlController = TextEditingController(
       text: settings.diagnosticsUrl,
@@ -200,6 +211,35 @@ class _SettingsPageState extends State<SettingsPage> {
       oldWidget.controller?._detach(_handleBackRequest);
       widget.controller?._attach(_handleBackRequest);
     }
+    if (oldWidget.statusStore != widget.statusStore) {
+      oldWidget.statusStore.removeListener(_onStatusChanged);
+      widget.statusStore.addListener(_onStatusChanged);
+      _statusViewNotifier.value = _statusProjection(widget.statusStore);
+    }
+  }
+
+  void _onStatusChanged() {
+    _statusViewNotifier.value = _statusProjection(widget.statusStore);
+  }
+
+  _SettingsStatusProjection _statusProjection(StatusStore store) {
+    final build = store.daemonController.lastDaemonBuildInfo;
+    return (
+      daemonBusy: store.daemonBusy,
+      daemonReachable: store.daemonReachable,
+      refreshActivityVisible: store.refreshActivityVisible,
+      daemonBuildSignature: build == null
+          ? ''
+          : [
+              build.appVersion,
+              build.daemonVersion,
+              build.gitCommit,
+              build.buildId,
+              build.dirtyLabel,
+              build.diffHash,
+              build.profile,
+            ].join('|'),
+    );
   }
 
   void _onDraftChanged() {
@@ -230,6 +270,7 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void dispose() {
     widget.controller?._detach(_handleBackRequest);
+    widget.statusStore.removeListener(_onStatusChanged);
     if (_ownsControlApi) _controlApi.close();
     for (final controller in [
       _diagnosticsUrlController,
@@ -260,6 +301,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _udpAdvertiseController.dispose();
     _relayServersController.dispose();
     _detailViewNotifier.dispose();
+    _statusViewNotifier.dispose();
     super.dispose();
   }
 
@@ -325,7 +367,11 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: Listenable.merge([widget.settingsStore, widget.statusStore]),
+      // Settings changes affect locale/theme/persisted values across the whole
+      // page. Fast status polling is listened to only by the few rows/details
+      // that actually display daemon state (see layout.dart), so typing in a
+      // normal settings form is not rebuilt several times per second.
+      animation: widget.settingsStore,
       builder: (context, _) {
         final strings = AppStrings.fromCode(
           widget.settingsStore.settings.languageCode,

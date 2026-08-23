@@ -91,7 +91,14 @@ void main() {
         of: find.byKey(const ValueKey('mobile-theme-select')),
         matching: find.byType(OutlinedButton),
       );
-      await tester.tap(trigger);
+      final semantics = tester.widget<Semantics>(
+        find.ancestor(of: trigger, matching: find.byType(Semantics)).first,
+      );
+      expect(semantics.properties.label, 'Theme mode');
+      expect(semantics.properties.value, 'Follow system');
+      expect(semantics.properties.button, isTrue);
+      expect(semantics.properties.onTap, isNotNull);
+      semantics.properties.onTap!();
       await tester.pumpAndSettle();
 
       expect(find.byKey(const Key('app-select-mobile-sheet')), findsOneWidget);
@@ -113,6 +120,20 @@ void main() {
 
       expect(value, 'dark');
       expect(find.byKey(const Key('app-select-mobile-sheet')), findsNothing);
+
+      // A phone remains touch-first after rotating to landscape.
+      tester.view.physicalSize = const Size(844, 390);
+      await tester.pump();
+      await tester.tap(
+        find.descendant(
+          of: find.byKey(const ValueKey('mobile-theme-select')),
+          matching: find.byType(OutlinedButton),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('app-select-mobile-sheet')), findsOneWidget);
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
     } finally {
       debugDefaultTargetPlatformOverride = null;

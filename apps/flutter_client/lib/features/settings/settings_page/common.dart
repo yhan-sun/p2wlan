@@ -310,6 +310,7 @@ class _SettingsField extends StatelessWidget {
     this.obscureText = false,
     this.errorText,
     this.onSubmitted,
+    this.textInputAction,
   });
 
   final TextEditingController controller;
@@ -320,6 +321,7 @@ class _SettingsField extends StatelessWidget {
   final bool obscureText;
   final String? errorText;
   final ValueChanged<String>? onSubmitted;
+  final TextInputAction? textInputAction;
 
   @override
   Widget build(BuildContext context) {
@@ -330,8 +332,14 @@ class _SettingsField extends StatelessWidget {
         child: TextField(
           controller: controller,
           keyboardType: keyboardType,
+          textInputAction: textInputAction,
           obscureText: obscureText,
+          autocorrect: false,
+          enableSuggestions: false,
+          smartDashesType: SmartDashesType.disabled,
+          smartQuotesType: SmartQuotesType.disabled,
           onSubmitted: onSubmitted,
+          onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
           decoration: InputDecoration(
             labelText: label,
             hintText: hintText,

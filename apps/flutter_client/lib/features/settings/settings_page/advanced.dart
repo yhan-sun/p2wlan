@@ -31,6 +31,7 @@ class _AdvancedNetworkSection extends StatelessWidget {
           controller: state._tunInterfaceController,
           label: strings.interfaceName,
           helper: strings.interfaceNameHelper,
+          textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: AppTokens.space6),
         _SettingsField(
@@ -38,12 +39,14 @@ class _AdvancedNetworkSection extends StatelessWidget {
           label: strings.mtu,
           helper: strings.mtuHelper,
           keyboardType: TextInputType.number,
+          textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: AppTokens.space6),
         _SettingsField(
           controller: state._overlayCidrController,
           label: strings.overlayCidr,
           helper: strings.overlayCidrHelper,
+          textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: AppTokens.space6),
         _SubsectionLabel(strings.udpSubsection),
@@ -51,12 +54,14 @@ class _AdvancedNetworkSection extends StatelessWidget {
           controller: state._udpBindController,
           label: strings.udpBind,
           helper: strings.udpBindHelper,
+          textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: AppTokens.space6),
         _SettingsField(
           controller: state._udpAdvertiseController,
           label: strings.udpAdvertise,
           helper: strings.udpAdvertiseHelper,
+          textInputAction: TextInputAction.next,
         ),
         const SizedBox(height: AppTokens.space6),
         _PreferenceRow(
@@ -85,6 +90,10 @@ class _AdvancedNetworkSection extends StatelessWidget {
           controller: state._relayServersController,
           label: strings.relayCandidates,
           helper: strings.relayCandidatesHelper,
+          textInputAction: TextInputAction.done,
+          onSubmitted: saving
+              ? null
+              : (_) => state._saveCategory(SettingsCategory.advancedNetwork),
         ),
       ],
     );

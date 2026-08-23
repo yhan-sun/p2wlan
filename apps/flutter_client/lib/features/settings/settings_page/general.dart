@@ -20,6 +20,10 @@ class _GeneralSection extends StatelessWidget {
           controller: state._deviceNameController,
           label: strings.deviceName,
           helper: strings.deviceNameHelper,
+          textInputAction: TextInputAction.done,
+          onSubmitted: saving
+              ? null
+              : (_) => state._saveCategory(SettingsCategory.general),
         ),
         const SizedBox(height: AppTokens.space6),
         _PreferenceRow(

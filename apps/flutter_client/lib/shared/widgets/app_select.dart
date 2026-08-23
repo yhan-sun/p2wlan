@@ -1,8 +1,10 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
+import '../layout/app_breakpoints.dart';
 
 /// A typed option rendered by [AppSelect].
 @immutable
@@ -53,16 +55,15 @@ class AppSelect<T> extends StatelessWidget {
     final selected = options.firstWhere((option) => option.value == value);
     final enabled = onChanged != null;
 
-    final select = Builder(
+    return Builder(
       builder: (anchorContext) {
-        return OutlinedButton(
-          onPressed: enabled
-              ? () => _openMenu(
-                  context: context,
-                  anchorContext: anchorContext,
-                  colors: colors,
-                )
-              : null,
+        Future<void> openMenu() => _openMenu(
+          context: context,
+          anchorContext: anchorContext,
+          colors: colors,
+        );
+        Widget result = OutlinedButton(
+          onPressed: enabled ? openMenu : null,
           style: ButtonStyle(
             minimumSize: const WidgetStatePropertyAll(
               Size(0, AppTokens.minTouchTarget),
@@ -127,15 +128,28 @@ class AppSelect<T> extends StatelessWidget {
             ],
           ),
         );
+        result = SizedBox(
+          width: expanded ? double.infinity : width,
+          child: result,
+        );
+        if (tooltip != null && tooltip!.isNotEmpty) {
+          result = Tooltip(message: tooltip!, child: result);
+        }
+        if (menuTitle != null && menuTitle!.trim().isNotEmpty) {
+          result = Semantics(
+            container: true,
+            button: true,
+            enabled: enabled,
+            label: menuTitle,
+            value: selected.label,
+            onTap: enabled ? openMenu : null,
+            excludeSemantics: true,
+            child: result,
+          );
+        }
+        return result;
       },
     );
-
-    final sized = SizedBox(
-      width: expanded ? double.infinity : width,
-      child: select,
-    );
-    if (tooltip == null || tooltip!.isEmpty) return sized;
-    return Tooltip(message: tooltip!, child: sized);
   }
 
   Future<void> _openMenu({
@@ -154,13 +168,19 @@ class AppSelect<T> extends StatelessWidget {
   }
 
   bool _usesMobileSheet(BuildContext context) {
-    if (kIsWeb || MediaQuery.sizeOf(context).width >= 720) return false;
-    return switch (defaultTargetPlatform) {
+    if (kIsWeb) return false;
+    final isMobilePlatform = switch (defaultTargetPlatform) {
       TargetPlatform.android ||
       TargetPlatform.iOS ||
       TargetPlatform.fuchsia => true,
       _ => false,
     };
+    if (!isMobilePlatform) return false;
+    // Stay touch-first when a phone rotates: width alone would turn an
+    // 844x390 handset into a desktop popover. Shortest-side is stable across
+    // orientation and still lets larger tablets use the anchored menu.
+    return MediaQuery.sizeOf(context).shortestSide <
+        AppBreakpoints.compactMaxWidth;
   }
 
   Future<T?> _openMobileSheet(BuildContext context) {
@@ -393,7 +413,10 @@ class _AppSelectSheet<T> extends StatelessWidget {
                         'app-select-option',
                         option.value,
                       )),
-                      onTap: () => Navigator.of(context).pop(option.value),
+                      onTap: () {
+                        HapticFeedback.selectionClick();
+                        Navigator.of(context).pop(option.value);
+                      },
                       child: ConstrainedBox(
                         constraints: const BoxConstraints(minHeight: 54),
                         child: Padding(

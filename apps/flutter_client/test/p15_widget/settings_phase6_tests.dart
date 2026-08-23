@@ -43,7 +43,8 @@ void _registerSettingsPhase6Tests() {
   testWidgets('mobile root: no technical text fields, categories only', (
     tester,
   ) async {
-    final stores = await storesWith(tester, _FakeDiagnosticsApi(health: false));
+    final api = _FakeDiagnosticsApi(health: false);
+    final stores = await storesWith(tester, api);
     await pump(tester, stores, size: const Size(390, 844));
 
     // The root is a findable category list, never a stack of input fields.
@@ -62,6 +63,15 @@ void _registerSettingsPhase6Tests() {
     ]) {
       expect(find.text(technical), findsNothing);
     }
+
+    // The one live summary on the root still updates, without making the
+    // entire Settings page subscribe to every polling notification.
+    expect(find.text('Not running'), findsOneWidget);
+    api.health = true;
+    api.snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    await stores.statusStore.refresh(silent: true);
+    await tester.pump();
+    expect(find.text('Running'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -193,9 +203,16 @@ void _registerSettingsPhase6Tests() {
         find.byKey(const Key('settings-mobile-category-back')),
         findsOneWidget,
       );
+      expect(find.byTooltip('Back'), findsOneWidget);
       expect(find.byType(NavigationBar), findsNothing);
       expect(find.byIcon(Icons.more_horiz_rounded), findsNothing);
       expect(find.text('Device name'), findsOneWidget);
+      final deviceNameField = tester.widget<TextField>(
+        _settingsTextField('Device name'),
+      );
+      expect(deviceNameField.autocorrect, isFalse);
+      expect(deviceNameField.enableSuggestions, isFalse);
+      expect(deviceNameField.textInputAction, TextInputAction.done);
 
       // Select controls use the mobile product sheet, not a stock popup.
       final languageSelect = find.byKey(
@@ -203,6 +220,14 @@ void _registerSettingsPhase6Tests() {
       );
       expect(MediaQuery.sizeOf(tester.element(languageSelect)).width, 360);
       expect(defaultTargetPlatform, TargetPlatform.android);
+
+      // Silent one-second status refreshes must not recreate a normal form.
+      // This keeps cursor/selection/IME interaction stable while polling.
+      final selectBeforeRefresh = tester.widget(languageSelect);
+      await stores.statusStore.refresh(silent: true);
+      await tester.pump();
+      expect(tester.widget(languageSelect), same(selectBeforeRefresh));
+
       await _openAppSelect(tester, const ValueKey('settings-language-select'));
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('app-select-mobile-sheet')), findsOneWidget);
