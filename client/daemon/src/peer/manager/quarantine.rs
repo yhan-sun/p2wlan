@@ -331,6 +331,35 @@ impl PeerManager {
             hook(peer_id);
         }
     }
+
+    /// Register the nonblocking hook used to recover a direct path after a
+    /// failed probe.  The daemon owns the actual candidate publication and
+    /// UDP punch task; the peer manager only reports the recovery edge.
+    pub(crate) fn set_direct_recovery_kick_hook(
+        &self,
+        hook: Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        *self
+            .direct_recovery_kick_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Request one direct recovery kick, if the daemon installed a hook.
+    ///
+    /// Direct failures can arrive from several overlapping probe and relay
+    /// workers.  Keep the edge synchronous and let the daemon's hook spawn
+    /// async work; the hook itself applies the transport/control rate limit.
+    pub(crate) fn request_direct_recovery_kick(&self, peer_id: &str) {
+        if let Some(hook) = self
+            .direct_recovery_kick_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook(peer_id);
+        }
+    }
 }
 
 /// Internal helper type alias to keep the struct field declaration compact.
@@ -338,3 +367,6 @@ pub(crate) type PunchCancelHook =
     Arc<dyn Fn(&str) + Send + Sync>;
 pub(crate) type PunchCancelHookSlot =
     Arc<std::sync::Mutex<Option<PunchCancelHook>>>;
+pub(crate) type DirectRecoveryKickHook = Arc<dyn Fn(&str) + Send + Sync>;
+pub(crate) type DirectRecoveryKickHookSlot =
+    Arc<std::sync::Mutex<Option<DirectRecoveryKickHook>>>;

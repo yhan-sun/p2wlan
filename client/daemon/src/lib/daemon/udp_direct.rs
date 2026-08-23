@@ -42,6 +42,154 @@ struct UdpDirectTaskContext {
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
+/// Minimum spacing between automatic candidate re-publications for one peer.
+///
+/// The first failed punch must be repaired immediately, but a symmetric NAT
+/// can produce several timeout signals while the relay and control lanes are
+/// still converging.  A small per-peer cooldown prevents those signals from
+/// turning into a candidate-offer storm while still being much faster than a
+/// process restart or the ordinary background retry cadence.
+const DIRECT_RECOVERY_KICK_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Install the automatic recovery edge for the current UDP socket instance.
+///
+/// A candidate-only `peer_offer` is already understood by the control plane
+/// and by older peers: it refreshes the peer's candidate set without creating
+/// a second WireGuard handshake.  The matching synchronized punch is started
+/// locally as well, so either side can create a new destination-specific NAT
+/// mapping.  The peer-reflexive signal path then feeds the observed mapping
+/// back into the normal direct validation flow.
+#[allow(clippy::too_many_arguments)]
+fn install_direct_recovery_kick_hook(
+    peers: &Arc<PeerManager>,
+    control: &ControlClient,
+    udp: &UdpTransport,
+    local_candidates: &Arc<RwLock<Vec<String>>>,
+    local_candidate_sources: &Arc<RwLock<HashMap<String, String>>>,
+    candidate_snapshot: &Arc<RwLock<Option<CandidateSnapshotLease>>>,
+    runtime_stun_servers: &Arc<RwLock<Vec<SocketAddr>>>,
+    stun_timeout: Duration,
+    punch_deduplicator: &PunchAttemptDeduplicator,
+    probe_interval: Duration,
+    attempts: u32,
+    boot_epoch_ms: u64,
+) {
+    let last_kicks = Arc::new(std::sync::Mutex::new(HashMap::<String, Instant>::new()));
+    let peers_for_hook = peers.clone();
+    let control_for_hook = control.clone();
+    let udp_for_hook = udp.clone();
+    let local_candidates_for_hook = local_candidates.clone();
+    let local_sources_for_hook = local_candidate_sources.clone();
+    let candidate_snapshot_for_hook = candidate_snapshot.clone();
+    let runtime_stun_servers_for_hook = runtime_stun_servers.clone();
+    let punch_deduplicator_for_hook = punch_deduplicator.clone();
+
+    peers.set_direct_recovery_kick_hook(Arc::new(move |peer_id| {
+        let should_kick = {
+            let mut last_kicks = last_kicks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            if last_kicks
+                .get(peer_id)
+                .is_some_and(|previous| now.duration_since(*previous) < DIRECT_RECOVERY_KICK_MIN_INTERVAL)
+            {
+                false
+            } else {
+                last_kicks.insert(peer_id.to_string(), now);
+                true
+            }
+        };
+        if !should_kick {
+            return;
+        }
+
+        let peer_id = peer_id.to_string();
+        let peers = peers_for_hook.clone();
+        let control = control_for_hook.clone();
+        let udp = udp_for_hook.clone();
+        let local_candidates = local_candidates_for_hook.clone();
+        let local_sources = local_sources_for_hook.clone();
+        let candidate_snapshot = candidate_snapshot_for_hook.clone();
+        let runtime_stun_servers = runtime_stun_servers_for_hook.clone();
+        let punch_deduplicator = punch_deduplicator_for_hook.clone();
+
+        tokio::spawn(async move {
+            if peers.is_direct(&peer_id).await {
+                return;
+            }
+
+            let snapshot = candidate_snapshot.read().await.clone();
+            let (candidates, candidate_sources) = match snapshot {
+                Some(snapshot) if !snapshot.candidates.is_empty() => {
+                    (snapshot.candidates, snapshot.candidate_sources)
+                }
+                _ => (
+                    local_candidates.read().await.clone(),
+                    local_sources.read().await.clone(),
+                ),
+            };
+            if candidates.is_empty() {
+                debug!(
+                    event = "direct_recovery_kick_skipped",
+                    peer_id = %peer_id,
+                    reason = "local_candidates_not_ready",
+                    "Skipping automatic direct recovery kick because local UDP candidates are not ready"
+                );
+                return;
+            }
+
+            let punch_at_ms = Some(relay_assisted_punch_at_ms());
+            match control
+                .send_peer_offer_with_sources_and_punch_at(
+                    &peer_id,
+                    &candidates,
+                    &candidate_sources,
+                    &[],
+                    punch_at_ms,
+                    None,
+                )
+                .await
+            {
+                Ok(()) => info!(
+                    event = "direct_recovery_candidate_kick_sent",
+                    peer_id = %peer_id,
+                    candidate_count = candidates.len(),
+                    punch_at_ms = ?punch_at_ms,
+                    "Published current UDP candidates to trigger automatic direct recovery"
+                ),
+                Err(error) => warn!(
+                    event = "direct_recovery_candidate_kick_failed",
+                    peer_id = %peer_id,
+                    error = %error,
+                    "Failed to publish the automatic direct recovery candidate kick"
+                ),
+            }
+
+            let signal = Some(HolePunchSignalContext {
+                control: control.clone(),
+                candidate_snapshot,
+                stun_servers: runtime_stun_servers.read().await.clone(),
+                stun_timeout,
+                boot_epoch_ms,
+            });
+            spawn_hole_punch_task(
+                udp,
+                peers,
+                punch_deduplicator,
+                peer_id,
+                probe_interval,
+                attempts.clamp(1, 3),
+                punch_at_ms,
+                signal,
+                None,
+                None,
+            )
+            .await;
+        });
+    }));
+}
+
 async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
     let excluded_interfaces = ctx.excluded_interfaces.clone();
     run_udp_direct_task_with_binder(ctx, move |udp_bind, peers| {
@@ -228,7 +376,7 @@ async fn run_udp_direct_instance(
         stun_servers,
         stun_server_specs: _,
         udp_observer_specs: _,
-        runtime_stun_servers: _,
+        runtime_stun_servers,
         stun_timeout,
         udp_advertise,
         upnp_enabled,
@@ -276,6 +424,23 @@ async fn run_udp_direct_instance(
         trigger_ingress.submit(observation);
     });
     let udp = udp.with_validation_trigger(trigger);
+    // A direct failure must be able to refresh the peer's view of this
+    // socket without waiting for a process restart.  The hook is installed
+    // per UDP incarnation so a rebind always uses the live socket.
+    install_direct_recovery_kick_hook(
+        &peers,
+        &control,
+        &udp,
+        &local_candidates,
+        &udp_local_candidate_sources,
+        &candidate_snapshot,
+        &runtime_stun_servers,
+        stun_timeout,
+        &punch_deduplicator,
+        udp_punch_interval,
+        udp_punch_attempts,
+        boot_epoch_ms,
+    );
     // Peer lifecycle transitions revoke heartbeat leases synchronously. The
     // transport owns the lease registry, so the callback only sends the
     // cancellation signal and never performs async work under peer locks.

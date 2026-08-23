@@ -55,6 +55,7 @@ impl PeerManager {
             relay_not_found_grace: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             punch_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             relay_backoff_heartbeat_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
+            direct_recovery_kick_hook: Arc::new(std::sync::Mutex::new(None)),
             timeline: std::sync::Mutex::new(None),
             outbound_loss_slot: Arc::new(std::sync::Mutex::new(None)),
             outbound_loss_default: Arc::new(tokio::sync::Mutex::new(OutboundLossCounters::default())),

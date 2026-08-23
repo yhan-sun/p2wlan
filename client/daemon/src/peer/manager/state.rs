@@ -226,6 +226,10 @@ pub struct PeerManager {
     /// Hook cancelling the transport-owned relay-backoff heartbeat when a
     /// peer becomes Direct, leaves, or loses its relay safety net.
     relay_backoff_heartbeat_cancel_hook: PunchCancelHookSlot,
+    /// Hook requesting an immediate, bounded candidate re-publication and
+    /// synchronized direct retry after a direct probe has failed.  The hook
+    /// is installed by the daemon's UDP runtime and must be nonblocking.
+    direct_recovery_kick_hook: DirectRecoveryKickHookSlot,
     /// Optional per-process connection timeline.  The daemon installs it after
     /// construction; path-confirmation events (`first_direct_probe_sent`,
     /// `relay_peer_confirmed`, `direct_promoted`) emit through it, no-oping
