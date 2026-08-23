@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
 
 import '../build_info.dart';
 import '../diagnostics/session_log_bundle.dart';
@@ -204,25 +206,21 @@ class ControlApi {
     }
     final normalizedControlServer = _normalizeAuthControlServer(controlServer);
     final logFiles = files
-        .map(
-          (file) => {
-            'name': file.name,
-            // Redact again at the network boundary so callers cannot
-            // accidentally bypass the local bundle's redaction step.
-            'content': redactSensitive(file.content),
-          },
-        )
+        .map((file) => {'name': file.name, 'content': file.content})
         .toList(growable: false);
     if (logFiles.isEmpty) {
       throw const ControlApiException('没有找到本次启动的日志');
     }
 
-    final payload = <String, dynamic>{
-      'schema_version': 1,
-      'uploaded_at': DateTime.now().toUtc().toIso8601String(),
-      'device_name': deviceName.trim(),
-      'platform': Platform.operatingSystem,
-      'client_build': {
+    // Redaction, JSON expansion, UTF-8 encoding and gzip are deliberately
+    // performed off the Flutter UI isolate. `async` alone does not move CPU
+    // work off the main isolate and was causing Android to freeze on large
+    // daemon logs.
+    final compressed = await _prepareSupportLogPayload(
+      uploadedAt: DateTime.now().toUtc().toIso8601String(),
+      deviceName: deviceName.trim(),
+      platform: Platform.operatingSystem,
+      clientBuild: {
         'app_version': clientBuild.appVersion,
         'git_commit': clientBuild.gitCommit,
         'build_id': clientBuild.buildId,
@@ -230,19 +228,19 @@ class ControlApi {
         'diff_hash': clientBuild.diffHash,
         'profile': clientBuild.profile,
       },
-      if (daemonBuild != null)
-        'daemon_build': {
-          'app_version': daemonBuild.appVersion,
-          'daemon_version': daemonBuild.daemonVersion,
-          'git_commit': daemonBuild.gitCommit,
-          'build_id': daemonBuild.buildId,
-          'dirty': daemonBuild.dirtyLabel,
-          'diff_hash': daemonBuild.diffHash,
-          'profile': daemonBuild.profile,
-        },
-      'files': logFiles,
-    };
-    final compressed = GZipCodec().encode(utf8.encode(jsonEncode(payload)));
+      daemonBuild: daemonBuild == null
+          ? null
+          : {
+              'app_version': daemonBuild.appVersion,
+              'daemon_version': daemonBuild.daemonVersion,
+              'git_commit': daemonBuild.gitCommit,
+              'build_id': daemonBuild.buildId,
+              'dirty': daemonBuild.dirtyLabel,
+              'diff_hash': daemonBuild.diffHash,
+              'profile': daemonBuild.profile,
+            },
+      files: logFiles,
+    );
     if (compressed.length > _maxSupportLogCompressedBytes) {
       throw const ControlApiException('日志压缩后仍然过大，请缩短本次启动时间后再试');
     }
@@ -370,6 +368,43 @@ class ControlApi {
   void close() {
     _client.close(force: true);
   }
+}
+
+Future<Uint8List> _prepareSupportLogPayload({
+  required String uploadedAt,
+  required String deviceName,
+  required String platform,
+  required Map<String, String> clientBuild,
+  required Map<String, String>? daemonBuild,
+  required List<Map<String, String>> files,
+}) async {
+  final transferable = await Isolate.run(() {
+    final logFiles = files
+        .map(
+          (file) => <String, String>{
+            'name': file['name'] ?? '',
+            // This is the only redaction pass. It runs in the worker isolate,
+            // so even a busy log cannot monopolize Flutter's UI isolate.
+            'content': redactSensitive(file['content'] ?? ''),
+          },
+        )
+        .toList(growable: false);
+    final payload = <String, dynamic>{
+      'schema_version': 1,
+      'uploaded_at': uploadedAt,
+      'device_name': deviceName,
+      'platform': platform,
+      'client_build': clientBuild,
+      ...?daemonBuild == null
+          ? null
+          : <String, dynamic>{'daemon_build': daemonBuild},
+      'files': logFiles,
+    };
+    final jsonBytes = utf8.encode(jsonEncode(payload));
+    final compressed = GZipCodec().encode(jsonBytes);
+    return TransferableTypedData.fromList([Uint8List.fromList(compressed)]);
+  });
+  return transferable.materialize().asUint8List();
 }
 
 String _normalizeAuthControlServer(String value) {

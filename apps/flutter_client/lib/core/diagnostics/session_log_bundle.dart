@@ -1,10 +1,15 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import '../daemon/diagnostics_auth.dart';
 import '../security/redactor.dart';
 
-const maxCurrentSessionLogBytesPerFile = 8 * 1024 * 1024;
+// Mobile log uploads must not make the Flutter UI hold several copies of a
+// multi-megabyte, high-volume daemon log while it is being redacted and
+// compressed. The tail is still large enough to include the recent failure
+// timeline, while keeping Android memory pressure predictable.
+const maxCurrentSessionLogBytesPerFile = 1 * 1024 * 1024;
 
 class SessionLogFile {
   const SessionLogFile({required this.name, required this.content});
@@ -26,10 +31,23 @@ class CurrentSessionLogBundle {
   }) async {
     final directory = await resolveP2WlanLogDir();
     final separator = Platform.pathSeparator;
-    return collect(
-      daemonLogPath: '${directory.path}${separator}p2wlan-daemon.log',
-      clientLogPath: '${directory.path}${separator}p2wlan-client.log',
-      maxBytesPerFile: maxBytesPerFile,
+    // File reads and redaction are CPU/memory work from the UI's point of
+    // view. Keep the platform channel lookup above on the main isolate, then
+    // do the actual collection in a worker isolate.
+    final serializedFiles = await Isolate.run(
+      () => _collectCurrentStartupFiles(
+        daemonLogPath: '${directory.path}${separator}p2wlan-daemon.log',
+        clientLogPath: '${directory.path}${separator}p2wlan-client.log',
+        maxBytesPerFile: maxBytesPerFile,
+      ),
+    );
+    return CurrentSessionLogBundle(
+      files: List.unmodifiable(
+        serializedFiles.map(
+          (file) =>
+              SessionLogFile(name: file['name']!, content: file['content']!),
+        ),
+      ),
     );
   }
 
@@ -39,6 +57,7 @@ class CurrentSessionLogBundle {
     required String daemonLogPath,
     required String clientLogPath,
     int maxBytesPerFile = maxCurrentSessionLogBytesPerFile,
+    bool redactFiles = true,
   }) async {
     final candidates = <({String name, String path})>[
       (name: 'p2wlan-daemon.log', path: daemonLogPath),
@@ -51,9 +70,8 @@ class CurrentSessionLogBundle {
       if (normalizedPath.isEmpty || !seenPaths.add(normalizedPath)) continue;
       final file = File(normalizedPath);
       if (!await file.exists()) continue;
-      final content = redactSensitive(
-        await _readCurrentFile(file, maxBytesPerFile),
-      );
+      final rawContent = await _readCurrentFile(file, maxBytesPerFile);
+      final content = redactFiles ? redactSensitive(rawContent) : rawContent;
       if (content.trim().isEmpty) continue;
       files.add(SessionLogFile(name: candidate.name, content: content));
     }
@@ -64,6 +82,26 @@ class CurrentSessionLogBundle {
     }
     return CurrentSessionLogBundle(files: List.unmodifiable(files));
   }
+}
+
+Future<List<Map<String, String>>> _collectCurrentStartupFiles({
+  required String daemonLogPath,
+  required String clientLogPath,
+  required int maxBytesPerFile,
+}) async {
+  final bundle = await CurrentSessionLogBundle.collect(
+    daemonLogPath: daemonLogPath,
+    clientLogPath: clientLogPath,
+    maxBytesPerFile: maxBytesPerFile,
+    // The upload encoder is the final redaction boundary. Keeping the file
+    // raw here avoids doing the same expensive pass twice in worker isolates.
+    redactFiles: false,
+  );
+  return bundle.files
+      .map(
+        (file) => <String, String>{'name': file.name, 'content': file.content},
+      )
+      .toList(growable: false);
 }
 
 Future<String> _readCurrentFile(File file, int maxBytes) async {
