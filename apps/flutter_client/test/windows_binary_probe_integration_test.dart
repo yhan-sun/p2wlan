@@ -169,7 +169,7 @@ void main() {
       await controller.protectRuntimeDirectory(runtime);
       final currentSid = await _windowsCurrentUserSid(controller);
       _expectRestrictedWindowsAcl(
-        await _readWindowsAcl(controller, runtime.path),
+        await _readWindowsAcl(controller, runtime.path, directory: true),
         currentSid,
       );
 
@@ -183,7 +183,7 @@ void main() {
       await controller.protectEphemeralLaunchTokenFile(token);
       expect(await token.readAsString(), 'integration-launch-token');
       _expectRestrictedWindowsAcl(
-        await _readWindowsAcl(controller, token.path),
+        await _readWindowsAcl(controller, token.path, directory: false),
         currentSid,
       );
 
@@ -321,11 +321,16 @@ Future<String> _windowsCurrentUserSid(DaemonController controller) async {
 
 Future<_WindowsAclSnapshot> _readWindowsAcl(
   DaemonController controller,
-  String path,
-) async {
+  String path, {
+  required bool directory,
+}) async {
   final quotedPath = path.replaceAll("'", "''");
   final result = await controller.runWindowsPowerShellForTesting(
-    '\$acl = Get-Acl -LiteralPath \'$quotedPath\'; '
+    '\$path = \'$quotedPath\'; '
+    'if (\'$directory\' -eq \'true\') { '
+    '\$acl = [System.IO.Directory]::GetAccessControl(\$path) '
+    '} else { '
+    '\$acl = [System.IO.File]::GetAccessControl(\$path) }; '
     '\$sids = @(\$acl.Access | ForEach-Object { '
     'try { \$_.IdentityReference.Translate('
     '[System.Security.Principal.SecurityIdentifier]).Value } '

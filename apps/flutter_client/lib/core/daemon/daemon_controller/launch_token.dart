@@ -136,7 +136,14 @@ extension DaemonControllerLaunchToken on DaemonController {
       // immediately after startup and is never a credential store.
       final quotedPath = _powershellSingleQuoted(path);
       final result = await _runWindowsPowerShell(
-        '\$acl = Get-Acl -LiteralPath $quotedPath; '
+        // Do not depend on Get-Acl/Set-Acl from Microsoft.PowerShell.Security:
+        // some non-interactive Windows children cannot load that module even
+        // though the underlying .NET access-control APIs are available.
+        '\$path = $quotedPath; '
+        'if (\'$directory\' -eq \'True\') { '
+        '\$acl = [System.IO.Directory]::GetAccessControl(\$path) '
+        '} else { '
+        '\$acl = [System.IO.File]::GetAccessControl(\$path) }; '
         // Remove inherited and pre-existing explicit ACEs first.  `/grant:r`
         // alone only replaces grants for the two named SIDs and can leave a
         // stale explicit Everyone/Users entry behind on a directory created
@@ -157,7 +164,10 @@ extension DaemonControllerLaunchToken on DaemonController {
         '\$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(\$currentSid, \$rights, \$inheritance, \$propagation, \$allow)); '
         '\$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(\$adminSid, \$rights, \$inheritance, \$propagation, \$allow)); '
         '\$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(\$systemSid, \$rights, \$inheritance, \$propagation, \$allow)); '
-        'Set-Acl -LiteralPath $quotedPath -AclObject \$acl',
+        'if (\'$directory\' -eq \'True\') { '
+        '[System.IO.Directory]::SetAccessControl(\$path, \$acl) '
+        '} else { '
+        '[System.IO.File]::SetAccessControl(\$path, \$acl) }',
       );
       if (result.exitCode != 0) {
         throw WindowsAclProtectionException(
