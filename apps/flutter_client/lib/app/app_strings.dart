@@ -581,6 +581,20 @@ class AppStrings {
       isZh ? 'daemon 构建身份' : 'Daemon build identity';
   String get clientLogFileLabel => isZh ? 'Client 启动日志' : 'Client startup log';
   String get daemonLogFileLabel => isZh ? 'daemon 日志' : 'Daemon log';
+  String get uploadCurrentSessionLogs =>
+      isZh ? '上传本次启动日志' : 'Upload current startup logs';
+  String get uploadingLogs => isZh ? '上传中...' : 'Uploading...';
+  String get uploadLogsTitle => isZh ? '上传本次启动日志？' : 'Upload startup logs?';
+  String get uploadLogsBody => isZh
+      ? '只会上传本次启动产生的 daemon 日志和当前启动 trace。日志会先脱敏，但可能包含设备名称、网络地址和连接诊断信息。'
+      : 'Only the daemon log and startup trace from this launch will be uploaded. Logs are redacted first, but may contain the device name, network addresses, and connection diagnostics.';
+  String get uploadLogsConfirm => isZh ? '确认上传' : 'Upload';
+  String logsUploaded(String uploadId) =>
+      isZh ? '日志已上传，编号：$uploadId' : 'Logs uploaded. ID: $uploadId';
+  String get logsUploadFailed =>
+      isZh ? '日志上传失败，请稍后重试。' : 'Log upload failed. Try again later.';
+  String get logsUploadRequiresLogin =>
+      isZh ? '请先登录后再上传日志。' : 'Sign in before uploading logs.';
   String get buildCommitLabel => isZh ? 'Git commit' : 'Git commit';
   String get buildIdLabel => isZh ? 'Build ID' : 'Build ID';
   String get buildDirtyLabel => isZh ? 'Dirty' : 'Dirty';

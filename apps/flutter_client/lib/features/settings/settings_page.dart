@@ -4,8 +4,11 @@ import '../../app/app_constants.dart';
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
+import '../../core/api/control_api.dart';
 import '../../core/api/diagnostics_api.dart';
+import '../../core/build_info.dart';
 import '../../core/capabilities/platform_capabilities.dart';
+import '../../core/diagnostics/session_log_bundle.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -26,6 +29,7 @@ class SettingsPage extends StatefulWidget {
     required this.settingsStore,
     required this.statusStore,
     this.capabilities,
+    this.controlApi,
     this.onLogout,
     this.onDirtyChanged,
     this.showHeader = true,
@@ -37,6 +41,10 @@ class SettingsPage extends StatefulWidget {
   /// Platform capability override (used by tests to simulate mobile). Defaults
   /// to the current runtime platform.
   final PlatformCapabilities? capabilities;
+
+  /// Optional auth client override used by tests and embedded shells. When
+  /// omitted, the page owns a short-lived client for support-log uploads.
+  final ControlApi? controlApi;
 
   final VoidCallback? onLogout;
 
@@ -53,6 +61,8 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   late final PlatformCapabilities _capabilities;
+  late final ControlApi _controlApi;
+  late final bool _ownsControlApi;
   late final TextEditingController _diagnosticsUrlController;
   late final TextEditingController _controlServerController;
   late final TextEditingController _authTokenController;
@@ -75,6 +85,8 @@ class _SettingsPageState extends State<SettingsPage> {
   var _restartRequired = false;
   var _closeBehavior = defaultCloseBehavior;
   var _showTokenField = false;
+  var _uploadingLogs = false;
+  String? _logUploadError;
 
   /// Currently open category in the medium/compact root-detail layout.
   /// Null = the settings root. In the desktop rail layout it always maps to a
@@ -87,6 +99,8 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _capabilities = widget.capabilities ?? PlatformCapabilities.current();
+    _ownsControlApi = widget.controlApi == null;
+    _controlApi = widget.controlApi ?? ControlApi();
     final settings = widget.settingsStore.settings;
     _diagnosticsUrlController = TextEditingController(
       text: settings.diagnosticsUrl,
@@ -168,6 +182,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   @override
   void dispose() {
+    if (_ownsControlApi) _controlApi.close();
     for (final controller in [
       _diagnosticsUrlController,
       _controlServerController,

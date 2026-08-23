@@ -16,6 +16,7 @@ type Server struct {
 	auth                     *auth.Service
 	hub                      *signaling.Hub
 	db                       *database.DB
+	supportLogDir            string
 	relayServers             []string
 	relayCatalog             *RelayCatalog
 	relayTicketSigner        *auth.RelayTicketSigner
@@ -56,6 +57,7 @@ func NewServer(authService *auth.Service, hub *signaling.Hub, db *database.DB) *
 		auth:                     authService,
 		hub:                      hub,
 		db:                       db,
+		supportLogDir:            supportLogDirFromEnv(),
 		relayServers:             parseRelayServers(),
 		relayCatalog:             catalog,
 		relayTicketSigner:        signer,

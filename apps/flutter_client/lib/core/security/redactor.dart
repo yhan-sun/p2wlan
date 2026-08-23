@@ -49,6 +49,12 @@ String redactSensitive(String input) {
     'api_key',
     'apikey',
     'secret',
+    'password',
+    'private_key',
+    'device_credential',
+    'access_token',
+    'refresh_token',
+    'jwt',
   ];
   result = _mapMatches(
     result,
@@ -73,6 +79,12 @@ String redactSensitive(String input) {
     'api_key',
     'apikey',
     'secret',
+    'password',
+    'private_key',
+    'device_credential',
+    'access_token',
+    'refresh_token',
+    'jwt',
   ];
   result = _mapMatches(
     result,
