@@ -11,8 +11,16 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
+import '../platform/android_platform.dart';
+
 /// Platform-normalized directory the daemon writes its log and token files to.
 Directory defaultP2WlanLogDir() {
+  if (Platform.isAndroid) {
+    final cachedPath = cachedApplicationSupportDirectoryPath;
+    if (cachedPath != null && cachedPath.isNotEmpty) {
+      return Directory(cachedPath);
+    }
+  }
   if (Platform.isMacOS) {
     final home = Platform.environment['HOME'];
     if (home != null && home.isNotEmpty) {
@@ -32,6 +40,21 @@ Directory defaultP2WlanLogDir() {
   return Directory(
     '${Directory.systemTemp.path}${Platform.pathSeparator}p2wlan',
   );
+}
+
+/// Resolve the directory that the running daemon actually uses for its log
+/// and diagnostics token files. Android's private files directory cannot be
+/// inferred reliably from Dart's process environment, so ask the native
+/// application for it instead of applying a desktop HOME-based convention.
+Future<Directory> resolveP2WlanLogDir() async {
+  if (Platform.isAndroid) {
+    final directory = await resolveApplicationSupportDirectory();
+    if (directory == null) {
+      throw StateError('Android application support directory is unavailable.');
+    }
+    return directory;
+  }
+  return defaultP2WlanLogDir();
 }
 
 /// Path of the per-process diagnostics auth token file.

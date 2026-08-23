@@ -394,6 +394,12 @@ extension DaemonControllerDiagnosticsPaths on DaemonController {
   }
 
   Directory _defaultLogDir() {
+    if (Platform.isAndroid) {
+      final cachedPath = cachedApplicationSupportDirectoryPath;
+      if (cachedPath != null && cachedPath.isNotEmpty) {
+        return Directory(cachedPath);
+      }
+    }
     if (Platform.isMacOS) {
       final home = Platform.environment['HOME'];
       if (home != null && home.isNotEmpty) {

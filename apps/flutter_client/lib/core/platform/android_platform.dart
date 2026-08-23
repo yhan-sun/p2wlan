@@ -8,6 +8,14 @@ import 'package:flutter/services.dart';
 /// the native VPN service's existing `filesDir/p2wlan` configuration area.
 const _androidPlatformChannel = MethodChannel('p2wlan/platform');
 
+String? _cachedApplicationSupportDirectoryPath;
+
+/// The native VPN service and Flutter use the same private directory on
+/// Android.  Keep the resolved value available to synchronous display-only
+/// getters after the asynchronous bridge has been initialized by SettingsStore.
+String? get cachedApplicationSupportDirectoryPath =>
+    _cachedApplicationSupportDirectoryPath;
+
 Future<Directory?> resolveApplicationSupportDirectory() async {
   if (!Platform.isAndroid) return null;
 
@@ -18,6 +26,7 @@ Future<Directory?> resolveApplicationSupportDirectory() async {
   if (trimmed.isEmpty) {
     throw StateError('Android application support directory is unavailable.');
   }
+  _cachedApplicationSupportDirectoryPath = trimmed;
   return Directory(trimmed);
 }
 

@@ -28,8 +28,9 @@ android {
     }
 
     // Release builds must use the same private key for the lifetime of the
-    // app. CI writes this file from GitHub Actions secrets; local developers
-    // can omit it and still use the debug-key fallback for `flutter run`.
+    // app. CI writes this file from GitHub Actions secrets. A debug-signed
+    // release APK must never be produced accidentally: it cannot update the
+    // installed app and is not suitable for distribution.
     val releaseSigningPropertiesFile = rootProject.file("key.properties")
     val releaseSigningProperties = Properties()
     if (releaseSigningPropertiesFile.isFile) {
@@ -38,6 +39,20 @@ android {
         }
     }
     val hasReleaseSigning = releaseSigningPropertiesFile.isFile
+    val allowDebugReleaseSigning =
+        System.getenv("P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING") == "1"
+    val releaseBuildRequested = gradle.startParameter.taskNames.any {
+        it.contains("Release", ignoreCase = true)
+    }
+
+    if (releaseBuildRequested && !hasReleaseSigning && !allowDebugReleaseSigning) {
+        throw GradleException(
+            "Missing apps/flutter_client/android/key.properties. " +
+                "A release APK must be signed with the stable P2WLAN key; " +
+                "use a configured CI release or set " +
+                "P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING=1 only for local testing.",
+        )
+    }
 
     signingConfigs {
         create("release") {
@@ -57,9 +72,8 @@ android {
             signingConfig = if (hasReleaseSigning) {
                 signingConfigs.getByName("release")
             } else {
-                // Keep local release builds usable until the developer has
-                // configured a private release key. The release workflow
-                // fails closed when this file is absent.
+                // This branch is opt-in for local testing only; the guard
+                // above prevents it from being used accidentally.
                 signingConfigs.getByName("debug")
             }
         }

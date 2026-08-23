@@ -24,7 +24,7 @@ typedef _PermissionSnapshot = PermissionPreflight;
 Future<_PermissionSnapshot> _checkPermissions() => runPermissionPreflight();
 
 Future<void> _openLogsDefault() async {
-  final dir = defaultP2WlanLogDir();
+  final dir = await resolveP2WlanLogDir();
   await dir.create(recursive: true);
   if (Platform.isMacOS) {
     await Process.start('open', [dir.path]);
@@ -37,10 +37,11 @@ Future<void> _openLogsDefault() async {
 
 Future<DiagnosticsLogPreview> _loadLogPreview() async {
   const previewLines = 120;
-  final path =
-      '${defaultP2WlanLogDir().path}${Platform.pathSeparator}p2wlan-daemon.log';
-  final file = File(path);
+  var path = '';
   try {
+    final dir = await resolveP2WlanLogDir();
+    path = '${dir.path}${Platform.pathSeparator}p2wlan-daemon.log';
+    final file = File(path);
     if (!await file.exists()) {
       return DiagnosticsLogPreview(path: path, content: '', shownLineCount: 0);
     }

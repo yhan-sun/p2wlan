@@ -10,6 +10,7 @@ import '../api/diagnostics_api.dart';
 import '../build_info.dart';
 import '../capabilities/permission_preflight.dart';
 import '../models/diagnostics_models.dart';
+import '../platform/android_platform.dart';
 import '../security/redactor.dart';
 
 part 'daemon_controller/process_control.dart';

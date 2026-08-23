@@ -281,10 +281,7 @@ extension _SettingsPageActions on _SettingsPageState {
       _logUploadError = null;
     });
     try {
-      final bundle = await CurrentSessionLogBundle.collect(
-        daemonLogPath: widget.statusStore.daemonController.daemonLogPath,
-        clientLogPath: widget.statusStore.daemonController.clientLogPath,
-      );
+      final bundle = await CurrentSessionLogBundle.collectCurrentStartup();
       final result = await _controlApi.uploadSupportLogs(
         controlServer: settings.controlServer,
         authToken: authToken,

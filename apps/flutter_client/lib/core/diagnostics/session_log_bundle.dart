@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import '../daemon/diagnostics_auth.dart';
 import '../security/redactor.dart';
 
 const maxCurrentSessionLogBytesPerFile = 8 * 1024 * 1024;
@@ -16,6 +17,21 @@ class CurrentSessionLogBundle {
   const CurrentSessionLogBundle({required this.files});
 
   final List<SessionLogFile> files;
+
+  /// Collect the files from the platform-specific directory used by the
+  /// running daemon. Android resolves this through the native Context because
+  /// its private files directory is not exposed as a stable HOME path.
+  static Future<CurrentSessionLogBundle> collectCurrentStartup({
+    int maxBytesPerFile = maxCurrentSessionLogBytesPerFile,
+  }) async {
+    final directory = await resolveP2WlanLogDir();
+    final separator = Platform.pathSeparator;
+    return collect(
+      daemonLogPath: '${directory.path}${separator}p2wlan-daemon.log',
+      clientLogPath: '${directory.path}${separator}p2wlan-client.log',
+      maxBytesPerFile: maxBytesPerFile,
+    );
+  }
 
   /// Read only the two files that represent the current daemon startup.
   /// Rotated `.1` files are deliberately never consulted.
