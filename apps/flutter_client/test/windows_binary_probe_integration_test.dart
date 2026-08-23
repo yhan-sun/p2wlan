@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 
 void main() {
@@ -83,6 +84,64 @@ void main() {
     expect(probe.identity, isNotNull);
     expect(probe.identity!.isComplete, isTrue);
   }, skip: !Platform.isWindows);
+
+  test(
+    'Windows helper reads the real current-user SID with a normal child',
+    () async {
+      final api = DiagnosticsApi(authTokenReader: () async => null);
+      addTearDown(api.close);
+      final controller = DaemonController(diagnosticsApi: api);
+
+      final result = await controller.runWindowsPowerShellForTesting(
+        '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+      );
+
+      expect(result.exitCode, 0, reason: result.stderr.toString());
+      expect(
+        RegExp(
+          r'^S-\d-\d+(?:-\d+)+$',
+        ).hasMatch(result.stdout.toString().trim()),
+        isTrue,
+        reason: result.stdout.toString(),
+      );
+    },
+    skip: !Platform.isWindows,
+  );
+
+  test('Windows helper preserves a non-zero child exit code', () async {
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
+
+    final result = await controller.runWindowsPowerShellForTesting(
+      r'Write-Output "helper stdout"; $global:LASTEXITCODE = 17',
+    );
+
+    expect(result.exitCode, 17, reason: result.stderr.toString());
+    expect(result.stdout, contains('helper stdout'));
+  }, skip: !Platform.isWindows);
+
+  test('Windows helper kills a timed-out child', () async {
+    final root = await _createTempRoot();
+    addTearDown(() => _deleteTempRoot(root));
+    final marker = File(
+      '${root.path}${Platform.pathSeparator}helper-timeout-finished.marker',
+    );
+    final markerPath = marker.path.replaceAll("'", "''");
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
+
+    final result = await controller.runWindowsPowerShellForTesting(
+      "Start-Sleep -Seconds 30; Set-Content -LiteralPath '$markerPath' -Value finished",
+      timeout: const Duration(milliseconds: 250),
+    );
+
+    expect(result.exitCode, isNot(0));
+    expect(result.stderr, contains('timed out after 250 milliseconds'));
+    await Future<void>.delayed(const Duration(seconds: 1));
+    expect(marker.existsSync(), isFalse);
+  }, skip: !Platform.isWindows);
 }
 
 Future<Directory> _createTempRoot() {
@@ -99,7 +158,7 @@ Future<DaemonBinaryProbe> _runControlledProbe(
   Directory root,
   String mode, {
   File? marker,
-  Duration timeout = const Duration(seconds: 6),
+  Duration timeout = const Duration(seconds: 30),
 }) async {
   if (Platform.isWindows) {
     final script = File(

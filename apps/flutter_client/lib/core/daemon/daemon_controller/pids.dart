@@ -370,21 +370,26 @@ extension DaemonControllerPids on DaemonController {
         _equalsIgnoreCase(result.stdout.toString().trim(), 'true');
   }
 
-  /// Run a Windows helper without creating a transient console window.
+  @visibleForTesting
+  Future<ProcessResult> runWindowsPowerShellForTesting(
+    String script, {
+    Duration timeout = const Duration(seconds: 10),
+  }) => _runWindowsPowerShell(script, timeout: timeout);
+
+  /// Run a Windows helper as a normal short-lived child process.
   ///
-  /// Flutter's Windows runner is a GUI process. Launching console programs
-  /// such as PowerShell or net.exe with the default process mode can make a
-  /// black terminal flash during every daemon start/stop probe. A detached
-  /// process with piped stdio uses the Windows detached-process creation mode,
-  /// so the helper is invisible from the moment it is created (unlike
-  /// `-WindowStyle Hidden`, which can still flash before PowerShell applies
-  /// the style).
-  Future<ProcessResult> _runWindowsPowerShell(String script) async {
+  /// Flutter's Windows runner is a GUI process. The hidden window style keeps
+  /// PowerShell invisible, while normal process mode gives us a reliable
+  /// process exit code. Detached process modes cannot expose [exitCode], so
+  /// they must not be used for helpers whose result controls startup.
+  Future<ProcessResult> _runWindowsPowerShell(
+    String script, {
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
     final windir = Platform.environment['WINDIR']?.trim();
     final executable = windir == null || windir.isEmpty
         ? 'powershell.exe'
         : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-    const marker = '__P2WLAN_HELPER_EXIT__';
     final wrappedScript =
         '\$ErrorActionPreference = \'Stop\'; '
         'try { & { $script }; '
@@ -394,44 +399,62 @@ extension DaemonControllerPids on DaemonController {
         '[Console]::Error.WriteLine(\$_.Exception.Message); '
         '\$exitCode = 1 '
         '} '
-        'Write-Output (\'$marker\' + \$exitCode)';
-    final process = await Process.start(executable, [
-      '-NoLogo',
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      wrappedScript,
-    ], mode: ProcessStartMode.detachedWithStdio);
+        'exit \$exitCode';
 
+    Process? process;
     try {
-      final captured = await Future.wait<String>([
-        process.stdout.transform(systemEncoding.decoder).join(),
-        process.stderr.transform(systemEncoding.decoder).join(),
-      ]).timeout(const Duration(seconds: 10));
-      final stdout = captured[0];
-      final stderr = captured[1];
-      final lines = stdout.split('\n');
-      final markerIndex = lines.lastIndexWhere(
-        (line) => line.trimLeft().startsWith(marker),
-      );
-      if (markerIndex < 0) {
-        return ProcessResult(process.pid, 1, stdout, stderr);
-      }
-      final markerLine = lines.removeAt(markerIndex).trim();
-      final exitCode = int.tryParse(markerLine.substring(marker.length)) ?? 1;
-      return ProcessResult(process.pid, exitCode, lines.join('\n'), stderr);
-    } on TimeoutException {
-      process.kill();
-      unawaited(process.stdout.drain<void>());
-      unawaited(process.stderr.drain<void>());
+      final started = await Process.start(executable, [
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-WindowStyle',
+        'Hidden',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        wrappedScript,
+      ], mode: ProcessStartMode.normal);
+      process = started;
+
+      final stdoutFuture = started.stdout
+          .transform(systemEncoding.decoder)
+          .join();
+      final stderrFuture = started.stderr
+          .transform(systemEncoding.decoder)
+          .join();
+      final exitCodeFuture = started.exitCode;
+      final valuesFuture = Future.wait<Object>([
+        stdoutFuture,
+        stderrFuture,
+        exitCodeFuture,
+      ]);
+      final values = await valuesFuture.timeout(timeout);
       return ProcessResult(
-        process.pid,
+        started.pid,
+        values[2] as int,
+        values[0] as String,
+        values[1] as String,
+      );
+    } on TimeoutException {
+      process?.kill();
+      if (process != null) {
+        // stdout/stderr already have active listeners above. Do not attach a
+        // second listener here; just give the killed child a short window to
+        // close those streams and complete the existing exit-code future.
+        try {
+          await process.exitCode.timeout(const Duration(seconds: 1));
+        } on Object {
+          // The timeout result below is the useful startup diagnostic.
+        }
+      }
+      return ProcessResult(
+        process?.pid ?? -1,
         1,
         '',
-        'Windows helper timed out after 10 seconds',
+        'Windows helper timed out after ${timeout.inMilliseconds} milliseconds',
       );
+    } catch (error) {
+      return ProcessResult(process?.pid ?? -1, 1, '', error.toString());
     }
   }
 

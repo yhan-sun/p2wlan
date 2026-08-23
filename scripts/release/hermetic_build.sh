@@ -35,6 +35,13 @@ FLUTTER_MANAGED=(
   "apps/flutter_client/pubspec.lock"
   "apps/flutter_client/analysis_options.yaml"
   "apps/flutter_client/.metadata"
+  "apps/flutter_client/linux/flutter/generated_plugin_registrant.cc"
+  "apps/flutter_client/linux/flutter/generated_plugin_registrant.h"
+  "apps/flutter_client/linux/flutter/generated_plugins.cmake"
+  "apps/flutter_client/macos/Flutter/GeneratedPluginRegistrant.swift"
+  "apps/flutter_client/windows/flutter/generated_plugin_registrant.cc"
+  "apps/flutter_client/windows/flutter/generated_plugin_registrant.h"
+  "apps/flutter_client/windows/flutter/generated_plugins.cmake"
 )
 
 do_restore() {
