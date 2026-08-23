@@ -917,3 +917,196 @@ async fn unavailable_pending_probe_transaction_is_not_acked_or_learned() {
 
     worker.abort();
 }
+
+/// A Probe-v2 MAC proves the key that verified the datagram, not that the
+/// same node ID still denotes that identity after an await. Park a packet
+/// immediately after old-key verification, replace the peer completely, then
+/// reuse the same generation+nonce under the new key.
+#[tokio::test]
+async fn verified_old_probe_cannot_cross_remove_and_same_id_readd() {
+    let local_identity = NodeIdentity::generate();
+    let old_remote_identity = NodeIdentity::generate();
+    let new_remote_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(old_remote_identity.public_key()),
+            None,
+        ))
+        .await;
+    let old_key = peers.probe_key_for_peer("peer-b").await.unwrap();
+
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a");
+    let local_addr = transport.local_addr().unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let gate = Arc::new(crate::peer::AuthenticatedProbeVerifyGate::new());
+    peers.install_authenticated_probe_verify_gate_for_test("peer-b", gate.clone());
+    let old_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let old_source = old_sender.local_addr().unwrap();
+    let generation = peers.current_network_generation().await;
+    let (old_punch, nonce) =
+        build_authenticated_punch_packet("peer-b", "peer-a", generation, &old_key);
+    old_sender.send_to(&old_punch, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), gate.reached.notified())
+        .await
+        .expect("old packet must reach the post-MAC lifecycle barrier");
+
+    // Exact ABA window: A verified under the old key, PeerLeft deletes A,
+    // then B is fully published under the same node ID before A resumes.
+    transport
+        .cleanup_peer_lifecycle("peer-b", "peer_left", true)
+        .await;
+    peers
+        .add_peer(&peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(new_remote_identity.public_key()),
+            None,
+        ))
+        .await;
+    let new_key = peers.probe_key_for_peer("peer-b").await.unwrap();
+    assert_ne!(old_key, new_key);
+    gate.release.wait().await;
+
+    // A fresh B packet is processed by the same sequential socket reader. Its
+    // ACK proves A's resumed handler already finished, so the state assertions
+    // below do not depend on a sleep or scheduler timing.
+    let new_sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let new_source = new_sender.local_addr().unwrap();
+    let (fresh_punch, fresh_nonce) =
+        build_authenticated_punch_packet("peer-b", "peer-a", generation, &new_key);
+    new_sender.send_to(&fresh_punch, local_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+    let (n, _) = timeout(Duration::from_secs(1), new_sender.recv_from(&mut buf))
+        .await
+        .expect("fresh replacement-session packet must receive an ACK")
+        .unwrap();
+    let ack = decode_authenticated_punch_packet(&buf[..n], &new_key).unwrap();
+    assert_eq!(ack.kind, PunchPacketKind::Ack);
+    assert_eq!(ack.nonce, fresh_nonce);
+
+    let mut old_ack = [0u8; 512];
+    assert!(
+        timeout(
+            Duration::from_millis(100),
+            old_sender.recv_from(&mut old_ack)
+        )
+        .await
+        .is_err(),
+        "the stale old-key packet must not be ACKed"
+    );
+
+    let conn = peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(conn.endpoint, Some(new_source));
+    assert_eq!(conn.direct_health.success_count, 1);
+    assert!(!conn
+        .candidates
+        .iter()
+        .any(|candidate| candidate == &old_source.to_string()));
+    assert!(conn
+        .candidate_pairs
+        .iter()
+        .all(|pair| pair.remote_endpoint != old_source));
+    assert!(transport.affinity_pin_for_test("peer-b").await.is_some());
+    assert!(
+        !transport
+            .authenticated_punch_rate
+            .lock()
+            .await
+            .contains_key(&("peer-b".to_string(), old_source)),
+        "stale lifecycle evidence must not consume replacement rate state"
+    );
+    assert!(
+        !transport
+            .authenticated_punch_replay
+            .lock()
+            .await
+            .contains_key(&(
+                "peer-b".to_string(),
+                generation,
+                nonce,
+                punch_kind_code(PunchPacketKind::Punch),
+            )),
+        "stale lifecycle evidence must not leave a replay admission"
+    );
+    let diagnostics = transport.socket_pool_diagnostics().await;
+    assert_eq!(diagnostics[0].authenticated_probe_punches_received, 1);
+    assert_eq!(diagnostics[0].probe_acks_sent, 1);
+
+    worker.abort();
+}
+
+/// The cross-layer pending-key promotion must never wait for WireGuard's emit
+/// turn while holding the global network epoch. The outbound data path owns
+/// the opposite canonical order (emit -> epoch), so an epoch -> emit wait is
+/// a process-wide ABBA deadlock under load.
+#[tokio::test]
+async fn pending_probe_waits_for_emit_before_acquiring_network_epoch() {
+    let token = "pending-emit-order";
+    let (peers, wireguard, udp, _old_probe_key, pending_probe_key) =
+        pending_probe_inbound_fixture(token).await;
+    let local_addr = udp.local_addr().unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let worker = tokio::spawn(udp.clone().run_inbound(tx));
+
+    let gate = Arc::new(crate::peer::AuthenticatedProbeVerifyGate::new());
+    peers.install_authenticated_probe_verify_gate_for_test("peer-b", gate.clone());
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let generation = peers.current_network_generation().await;
+    let (punch, nonce) =
+        build_authenticated_punch_packet("peer-b", "peer-a", generation, &pending_probe_key);
+    sender.send_to(&punch, local_addr).await.unwrap();
+
+    timeout(Duration::from_secs(1), gate.reached.notified())
+        .await
+        .expect("pending-key packet must pause after MAC verification");
+    let emit_guard = wireguard.acquire_outbound_emit_guard("peer-b").await;
+    gate.release.wait().await;
+    timeout(
+        Duration::from_secs(1),
+        gate.pending_emit_wait_started.notified(),
+    )
+    .await
+    .expect("inbound handler must reach the contended emit acquisition");
+
+    // The handler is now known to be waiting for emit. If it had acquired the
+    // epoch first, this bounded acquisition would time out deterministically.
+    let epoch_guard = timeout(Duration::from_millis(250), udp.network_epoch_gate.lock())
+        .await
+        .expect("network epoch must remain available while pending promotion waits for emit");
+    drop(epoch_guard);
+
+    let mut buf = [0u8; 512];
+    assert!(
+        timeout(Duration::from_millis(100), sender.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "pending packet cannot complete until its emit turn is released"
+    );
+    drop(emit_guard);
+
+    let (n, _) = timeout(Duration::from_secs(1), sender.recv_from(&mut buf))
+        .await
+        .expect("pending packet must finish after emit is released")
+        .unwrap();
+    let ack = decode_authenticated_punch_packet(&buf[..n], &pending_probe_key).unwrap();
+    assert_eq!(ack.kind, PunchPacketKind::Ack);
+    assert_eq!(ack.nonce, nonce);
+    assert_eq!(
+        peers.probe_key_for_peer("peer-b").await,
+        Some(pending_probe_key)
+    );
+
+    worker.abort();
+}

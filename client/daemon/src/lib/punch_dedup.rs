@@ -159,7 +159,7 @@ impl PunchSessionCancellation {
         self.notify.notify_waiters();
     }
 
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         loop {
             let notified = self.notify.notified();
             if self

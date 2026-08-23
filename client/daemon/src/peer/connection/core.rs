@@ -476,10 +476,18 @@ impl PeerConnection {
                 self.node_id, self.state, new_state
             );
         }
-        if (new_state == ConnectionState::Direct || new_state == ConnectionState::Relay)
-            && self.connected_at.is_none()
-        {
-            self.connected_at = Some(Instant::now());
+        let was_active = self.is_active();
+        let becomes_active = matches!(new_state, ConnectionState::Direct | ConnectionState::Relay);
+        if becomes_active {
+            // Direct <-> Relay is one continuously usable connection, but the
+            // first active state after any inactive interval begins a new
+            // session clock. This prevents diagnostics from charging outage
+            // time (or a previous connection's lifetime) to a reconnect.
+            if !was_active || self.connected_at.is_none() {
+                self.connected_at = Some(Instant::now());
+            }
+        } else {
+            self.connected_at = None;
         }
         self.state = new_state;
         self.sync_direct_cache();

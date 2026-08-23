@@ -195,6 +195,96 @@ pub(crate) enum RecoveryAdmission {
     BudgetExhausted { epoch: u64 },
 }
 
+/// Unforgeable identity of one concrete recovery-epoch allocation.
+///
+/// The numeric epoch intentionally restarts at one after the per-peer state
+/// is removed. Pair it with a process-monotonic allocation ID (and network
+/// generation) so a delayed Hard↔Hard retry/refund cannot act on a later
+/// epoch which happens to reuse the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryEpochIdentity {
+    epoch: u64,
+    network_generation: u64,
+    allocation_id: u64,
+}
+
+/// One reserved fresh-mapping generation from an exact recovery epoch.
+///
+/// This token is deliberately neither `Copy` nor `Clone`: the only two valid
+/// terminal actions are committing it after acquiring a punch owner, or
+/// consuming it in the exact-identity refund path.
+#[derive(Debug)]
+pub(crate) struct FreshGenerationReservation {
+    recovery_epochs: Arc<RwLock<HashMap<String, RecoveryEpochState>>>,
+    peer_id: String,
+    identity: RecoveryEpochIdentity,
+    resolved: bool,
+}
+
+impl FreshGenerationReservation {
+    pub(crate) fn identity(&self) -> RecoveryEpochIdentity {
+        self.identity
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.resolved = true;
+    }
+
+    pub(crate) async fn refund(mut self) {
+        let mut epochs = self.recovery_epochs.write().await;
+        Self::refund_if_current(&mut epochs, &self.peer_id, self.identity);
+        self.resolved = true;
+    }
+
+    fn refund_if_current(
+        epochs: &mut HashMap<String, RecoveryEpochState>,
+        peer_id: &str,
+        expected: RecoveryEpochIdentity,
+    ) {
+        let Some(state) = epochs.get_mut(peer_id) else {
+            return;
+        };
+        if state.epoch == expected.epoch
+            && state.network_generation == expected.network_generation
+            && state.allocation_id == expected.allocation_id
+        {
+            state.epoch_fresh_generation_quota_remaining = state
+                .epoch_fresh_generation_quota_remaining
+                .saturating_add(1)
+                .min(RECOVERY_EPOCH_FRESH_GENERATIONS);
+        }
+    }
+}
+
+impl Drop for FreshGenerationReservation {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        if let Ok(mut epochs) = self.recovery_epochs.try_write() {
+            Self::refund_if_current(&mut epochs, &self.peer_id, self.identity);
+            self.resolved = true;
+            return;
+        }
+
+        // A surrounding lease `select!` may drop the owner while an explicit
+        // async refund is waiting for the epoch lock. Keep the exact opaque
+        // identity in this detached cleanup; it cannot replenish a recreated
+        // epoch, and it never cancels or mutates a newer punch owner.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let recovery_epochs = self.recovery_epochs.clone();
+        let peer_id = self.peer_id.clone();
+        let identity = self.identity;
+        drop(runtime.spawn(async move {
+            let mut epochs = recovery_epochs.write().await;
+            Self::refund_if_current(&mut epochs, &peer_id, identity);
+        }));
+        self.resolved = true;
+    }
+}
+
 /// Newest-wins pending target: a newer trigger replaces the pending target
 /// but can never spawn a parallel session or reset the epoch's budgets.
 #[derive(Debug, Clone)]
@@ -218,6 +308,9 @@ pub(crate) struct PendingRecoveryTarget {
 pub(crate) struct RecoveryEpochState {
     pub epoch: u64,
     pub network_generation: u64,
+    /// Process-monotonic identity of this exact state allocation. Unlike the
+    /// per-peer `epoch`, this value never restarts after state removal.
+    pub allocation_id: u64,
     pub stage: RecoveryStage,
     pub stage_started_at: Instant,
     pub epoch_started_at: Instant,
@@ -282,10 +375,11 @@ pub(crate) struct RecoveryBudgetEvent {
 }
 
 impl RecoveryEpochState {
-    fn new(epoch: u64, network_generation: u64, now: Instant) -> Self {
+    fn new(epoch: u64, network_generation: u64, allocation_id: u64, now: Instant) -> Self {
         Self {
             epoch,
             network_generation,
+            allocation_id,
             stage: RecoveryStage::Initial,
             stage_started_at: now,
             epoch_started_at: now,
@@ -312,6 +406,17 @@ impl RecoveryEpochState {
 }
 
 impl PeerManager {
+    fn next_recovery_epoch_allocation_id(&self) -> Option<u64> {
+        self.recovery_epoch_allocation_id
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| current.checked_add(1),
+            )
+            .ok()
+            .and_then(|previous| previous.checked_add(1))
+    }
+
     /// The authoritative admission gate for every punch trigger.
     ///
     /// A trigger is admitted only while the peer is in recovery, inside the
@@ -343,9 +448,24 @@ impl PeerManager {
         self.apply_cached_liveness_block(peer_id).await;
 
         let mut epochs = self.recovery_epochs.write().await;
-        let entry = epochs.entry(peer_id.to_string()).or_insert_with(|| {
-            RecoveryEpochState::new(1, generation, now)
-        });
+        if !epochs.contains_key(peer_id) {
+            let Some(allocation_id) = self.next_recovery_epoch_allocation_id() else {
+                warn!(
+                    event = "recovery_epoch_allocation_exhausted",
+                    peer_id = %peer_id,
+                    "recovery_epoch_allocation_exhausted peer_id={}",
+                    peer_id,
+                );
+                return RecoveryAdmission::BudgetExhausted { epoch: u64::MAX };
+            };
+            epochs.insert(
+                peer_id.to_string(),
+                RecoveryEpochState::new(1, generation, allocation_id, now),
+            );
+        }
+        let entry = epochs
+            .get_mut(peer_id)
+            .expect("recovery epoch was inserted above");
         let mut new_epoch = None;
         let rotation_reason = if entry.network_generation != generation {
             "network_generation_changed"
@@ -358,6 +478,17 @@ impl PeerManager {
             new_epoch = Some(entry.epoch.wrapping_add(1));
         }
         if let Some(epoch) = new_epoch {
+            let Some(allocation_id) = self.next_recovery_epoch_allocation_id() else {
+                warn!(
+                    event = "recovery_epoch_allocation_exhausted",
+                    peer_id = %peer_id,
+                    epoch = entry.epoch,
+                    "recovery_epoch_allocation_exhausted peer_id={} epoch={}",
+                    peer_id,
+                    entry.epoch,
+                );
+                return RecoveryAdmission::BudgetExhausted { epoch: entry.epoch };
+            };
             info!(
                 event = "recovery_epoch_rotated",
                 peer_id = %peer_id,
@@ -371,7 +502,7 @@ impl PeerManager {
                 generation,
                 rotation_reason,
             );
-            *entry = RecoveryEpochState::new(epoch, generation, now);
+            *entry = RecoveryEpochState::new(epoch, generation, allocation_id, now);
         }
         // A frozen epoch stays frozen until its controlled backoff elapses.
         // The freeze survives pending targets and offers: only the backoff
@@ -448,15 +579,39 @@ impl PeerManager {
 
     /// Feedback-driven advancement: a probe batch completed with zero matched
     /// ACKs, so the next stage may widen the scan.
-    pub(crate) async fn advance_recovery_stage_after_no_ack(
+    pub(crate) async fn advance_recovery_stage_after_no_ack_for_peer_session(
         &self,
         peer_id: &str,
+        network_generation: u64,
+        expected: PeerSessionGeneration,
         detail: &str,
-    ) {
+    ) -> bool {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if self.current_network_generation_sync() != network_generation
+            || !self.peer_session_is_current_sync(peer_id, expected)
+        {
+            return false;
+        }
+        {
+            let connections = self.connections.read().await;
+            let Some(conn) = connections.get(peer_id) else {
+                return false;
+            };
+            if !conn.online
+                || conn.state == ConnectionState::Closed
+                || conn.state == ConnectionState::Direct
+            {
+                return false;
+            }
+        }
         let mut epochs = self.recovery_epochs.write().await;
         let Some(state) = epochs.get_mut(peer_id) else {
-            return;
+            return false;
         };
+        if state.network_generation != network_generation {
+            return false;
+        }
         let next = match state.stage {
             RecoveryStage::Initial => RecoveryStage::Predicted,
             RecoveryStage::Predicted => RecoveryStage::ScatterSmall,
@@ -465,7 +620,7 @@ impl PeerManager {
             RecoveryStage::RelayBackoff => RecoveryStage::RelayBackoff,
         };
         if next == state.stage {
-            return;
+            return true;
         }
         state.stage = next;
         state.stage_started_at = Instant::now();
@@ -481,6 +636,29 @@ impl PeerManager {
             next.label(),
             detail
         );
+        true
+    }
+
+    /// Test convenience for exercising the recovery stage machine without
+    /// manufacturing a delayed-work owner. Production delayed paths must carry
+    /// and pass their admission-time lifecycle explicitly.
+    #[cfg(test)]
+    pub(crate) async fn advance_recovery_stage_after_no_ack(
+        &self,
+        peer_id: &str,
+        detail: &str,
+    ) {
+        let Some(peer_session_generation) = self.peer_session_generation_sync(peer_id) else {
+            return;
+        };
+        let network_generation = self.current_network_generation_sync();
+        self.advance_recovery_stage_after_no_ack_for_peer_session(
+            peer_id,
+            network_generation,
+            peer_session_generation,
+            detail,
+        )
+        .await;
     }
 
     /// Mark the recovery as relay-backed: a hard failure (send error,
@@ -506,6 +684,42 @@ impl PeerManager {
             state.epoch,
             reason
         );
+    }
+
+    /// Lifecycle-bound variant for delayed timeout owners. The epoch gate
+    /// keeps the exact peer-generation check atomic with the recovery-ledger
+    /// mutation, so an old timeout cannot put a same-node replacement into
+    /// RelayBackoff after rejoin.
+    pub(crate) async fn mark_recovery_relay_backoff_for_peer_session(
+        &self,
+        peer_id: &str,
+        expected: PeerSessionGeneration,
+        reason: &str,
+    ) -> bool {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if !self.peer_session_is_current_sync(peer_id, expected) {
+            return false;
+        }
+        let mut epochs = self.recovery_epochs.write().await;
+        let Some(state) = epochs.get_mut(peer_id) else {
+            return false;
+        };
+        if state.stage != RecoveryStage::RelayBackoff {
+            state.stage = RecoveryStage::RelayBackoff;
+            state.stage_started_at = Instant::now();
+            info!(
+                event = "recovery_stage_relay_backoff",
+                peer_id = %peer_id,
+                epoch = state.epoch,
+                reason = %reason,
+                "recovery_stage_relay_backoff peer_id={} epoch={} reason={}",
+                peer_id,
+                state.epoch,
+                reason
+            );
+        }
+        true
     }
 
     /// Any matched ACK resets the stage: a live path must never be expanded
@@ -579,6 +793,64 @@ impl PeerManager {
         }
         state.epoch_fresh_generation_quota_remaining -= 1;
         true
+    }
+
+    /// Reserve one fresh generation only for the exact recovery epoch that
+    /// selected a Hard↔Hard plan.  A protected punch-owner claim can be
+    /// deferred after this reservation; callers then use the matching refund
+    /// below so a plan which never acquired an owner cannot burn the epoch's
+    /// sole fresh-generation credit.
+    pub(crate) async fn try_begin_fresh_generation_for_epoch(
+        &self,
+        peer_id: &str,
+        expected_epoch: u64,
+    ) -> Option<FreshGenerationReservation> {
+        let mut epochs = self.recovery_epochs.write().await;
+        let Some(state) = epochs.get_mut(peer_id) else {
+            return None;
+        };
+        if state.epoch != expected_epoch || state.epoch_fresh_generation_quota_remaining == 0 {
+            return None;
+        }
+        state.epoch_fresh_generation_quota_remaining -= 1;
+        Some(FreshGenerationReservation {
+            recovery_epochs: self.recovery_epochs.clone(),
+            peer_id: peer_id.to_string(),
+            identity: RecoveryEpochIdentity {
+                epoch: state.epoch,
+                network_generation: state.network_generation,
+                allocation_id: state.allocation_id,
+            },
+            resolved: false,
+        })
+    }
+
+    /// Reserve a retry from the same concrete epoch allocation as an earlier
+    /// refunded reservation.  This is stronger than comparing the numeric
+    /// epoch, which can be reused after Direct ends the old state.
+    pub(crate) async fn try_begin_fresh_generation_for_identity(
+        &self,
+        peer_id: &str,
+        expected: RecoveryEpochIdentity,
+    ) -> Option<FreshGenerationReservation> {
+        let mut epochs = self.recovery_epochs.write().await;
+        let Some(state) = epochs.get_mut(peer_id) else {
+            return None;
+        };
+        if state.epoch != expected.epoch
+            || state.network_generation != expected.network_generation
+            || state.allocation_id != expected.allocation_id
+            || state.epoch_fresh_generation_quota_remaining == 0
+        {
+            return None;
+        }
+        state.epoch_fresh_generation_quota_remaining -= 1;
+        Some(FreshGenerationReservation {
+            recovery_epochs: self.recovery_epochs.clone(),
+            peer_id: peer_id.to_string(),
+            identity: expected,
+            resolved: false,
+        })
     }
 
     /// Consume the epoch's HTTP publish quota (fresh-prediction
@@ -950,6 +1222,20 @@ impl PeerManager {
                     .map(|event| event.next_retry_at_ms_since_epoch),
             }
         })
+    }
+
+    /// Hold the epoch writer across a test-controlled cancellation point so a
+    /// reservation's `Drop` path must use its asynchronous exact-refund
+    /// fallback instead of the uncontended `try_write` fast path.
+    #[cfg(test)]
+    pub(crate) async fn hold_recovery_epoch_write_for_test(
+        &self,
+        reached: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        let _epochs = self.recovery_epochs.write().await;
+        reached.notify_one();
+        release.notified().await;
     }
 
     /// Last budget-exhausted event summary for tests.

@@ -1,3 +1,25 @@
+#[tokio::test]
+async fn signal_delivery_receipt_is_first_terminal_outcome_wins() {
+    let receipt = SignalDeliveryReceipt::pending();
+    let waiter = receipt.clone();
+
+    receipt.complete(SignalApplyOutcome::Applied);
+    receipt.complete(SignalApplyOutcome::Retry);
+
+    assert_eq!(receipt.current(), SignalApplyOutcome::Applied);
+    assert_eq!(waiter.wait().await, SignalApplyOutcome::Applied);
+}
+
+#[tokio::test]
+async fn abandoned_signal_delivery_becomes_retry() {
+    let receipt = SignalDeliveryReceipt::pending();
+    let waiter = receipt.waiter();
+
+    drop(receipt);
+
+    assert_eq!(waiter.wait().await, SignalApplyOutcome::Retry);
+}
+
 #[test]
 fn test_control_message_serialization() {
     let msg = ControlMessage::Register {

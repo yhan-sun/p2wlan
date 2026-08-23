@@ -384,10 +384,180 @@ async fn remote_candidate_refresh_invalidates_old_direct_pair_and_ack() {
         Some(NetworkPath::Direct),
         "diagnostics must not expose the retired Direct path"
     );
-    assert!(!diagnostics
+    assert!(diagnostics
         .selected_pair
         .as_ref()
-        .is_some_and(|pair| pair.remote_endpoint == old_endpoint.to_string()));
+        .is_none_or(|pair| pair.remote_endpoint != old_endpoint.to_string()));
+}
+
+#[tokio::test]
+async fn identical_versioned_candidate_refresh_advances_only_freshness_revision() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "203.0.113.10:41030".parse().unwrap();
+    let initial_sources =
+        HashMap::from([(endpoint.to_string(), "predicted".to_string())]);
+    let refreshed_sources =
+        HashMap::from([(endpoint.to_string(), "stun_observed".to_string())]);
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[endpoint.to_string()],
+                &initial_sources,
+                30,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(5)),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    let before = manager.get_connection("peer1").await.unwrap();
+    let remote_epoch = before.remote_candidate_epoch();
+    let direct_commit_seq = before.direct_commit_seq;
+    let invalidation_count = before
+        .direct_events
+        .iter()
+        .filter(|event| event.stage == "remote_candidates_invalidated")
+        .count();
+    assert_eq!(before.state, ConnectionState::Direct);
+
+    // Production emits a new candidate generation for every signal, including
+    // a routine WireGuard rekey. Reusing the same candidate set is freshness,
+    // not evidence that the remote UDP transport changed. Source metadata can
+    // be refined independently without turning the refresh into a handover.
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[endpoint.to_string()],
+                &refreshed_sources,
+                31,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    let after = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(after.last_candidate_generation, 31);
+    assert_eq!(after.remote_candidate_epoch(), remote_epoch);
+    assert_eq!(after.direct_commit_seq, direct_commit_seq);
+    assert_eq!(after.state, ConnectionState::Direct);
+    assert_eq!(after.endpoint, Some(endpoint));
+    assert!(after.candidate_pairs.iter().any(|pair| {
+        pair.remote_endpoint == endpoint
+            && pair.source == CandidatePairSource::StunObserved
+            && pair.state == CandidatePairState::Selected
+    }));
+    assert_eq!(manager.direct_endpoint_for_send("peer1").await, Some(endpoint));
+    assert!(after
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "candidate_revision_refreshed"));
+    assert_eq!(
+        after
+        .direct_events
+        .iter()
+        .filter(|event| event.stage == "remote_candidates_invalidated")
+        .count(),
+        invalidation_count,
+        "an identical candidate revision must not invalidate the transport epoch",
+    );
+}
+
+#[tokio::test]
+async fn rekey_candidate_change_retains_encrypted_confirmed_endpoint() {
+    let manager = PeerManager::new(test_config());
+    let selected: SocketAddr = "203.0.113.10:41100".parse().unwrap();
+    let retired_alternate: SocketAddr = "203.0.113.10:41101".parse().unwrap();
+    let new_alternate: SocketAddr = "203.0.113.10:41102".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", selected)).await;
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[selected.to_string(), retired_alternate.to_string()],
+                &HashMap::new(),
+                40,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            selected,
+            Some(Duration::from_millis(4)),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(selected)).await;
+
+    let before = manager.get_connection("peer1").await.unwrap();
+    let remote_epoch = before.remote_candidate_epoch();
+    let direct_commit_seq = before.direct_commit_seq;
+    assert_eq!(before.state, ConnectionState::Direct);
+
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[selected.to_string(), new_alternate.to_string()],
+                &HashMap::new(),
+                41,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    let after = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(after.last_candidate_generation, 41);
+    assert_eq!(after.remote_candidate_epoch(), remote_epoch);
+    assert_eq!(after.direct_commit_seq, direct_commit_seq);
+    assert_eq!(after.state, ConnectionState::Direct);
+    assert_eq!(after.endpoint, Some(selected));
+    assert!(after.candidates.contains(&selected.to_string()));
+    assert!(after.candidates.contains(&new_alternate.to_string()));
+    assert!(!after.candidates.contains(&retired_alternate.to_string()));
+    assert!(!after
+        .candidate_pairs
+        .iter()
+        .any(|pair| pair.remote_endpoint == retired_alternate
+            && pair.remote_candidate_epoch == remote_epoch));
+    assert!(after
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "remote_candidate_revision_direct_retained"));
+
+    // A delayed confirmation for the withdrawn alternate cannot replace the
+    // make-before-break endpoint merely because the transport epoch stayed up.
+    assert!(!manager
+        .record_direct_success_for_generation(
+            "peer1",
+            Some(retired_alternate),
+            manager.current_network_generation().await,
+        )
+        .await);
+    assert!(!manager
+        .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
+            "peer1",
+            retired_alternate,
+            Some(Duration::from_millis(3)),
+            manager.current_network_generation().await,
+            None,
+        )
+        .await);
+    assert_eq!(manager.direct_endpoint_for_send("peer1").await, Some(selected));
 }
 
 #[tokio::test]
@@ -483,6 +653,7 @@ async fn remote_candidate_refresh_does_not_resurrect_retired_endpoint_from_raw_u
 async fn stale_direct_validation_result_cannot_promote_reused_endpoint_after_remote_handover() {
     let manager = PeerManager::new(test_config());
     let reused_endpoint: SocketAddr = "203.0.113.10:41020".parse().unwrap();
+    let replacement_endpoint: SocketAddr = "203.0.113.10:42020".parse().unwrap();
     manager
         .add_peer(&test_peer("peer1", reused_endpoint))
         .await;
@@ -500,15 +671,24 @@ async fn stale_direct_validation_result_cannot_promote_reused_endpoint_after_rem
         .await
         .unwrap();
 
-    // The endpoint string is intentionally reused by the new remote candidate
-    // set. Endpoint equality alone must not make an in-flight old validation
-    // look like proof for the new remote socket.
+    // A real handover removes the endpoint before a later revision reuses its
+    // literal address. Equality alone must not make the old in-flight
+    // validation look like proof for the replacement transport epoch.
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[replacement_endpoint.to_string()],
+            &HashMap::new(),
+            11,
+            Some(u64::MAX),
+        )
+        .await;
     manager
         .add_candidates_with_metadata(
             "peer1",
             &[reused_endpoint.to_string()],
             &HashMap::new(),
-            11,
+            12,
             Some(u64::MAX),
         )
         .await;
@@ -542,6 +722,7 @@ async fn stale_direct_validation_result_cannot_promote_reused_endpoint_after_rem
 async fn stale_probe_result_cannot_promote_reused_endpoint_after_remote_handover() {
     let manager = PeerManager::new(test_config());
     let reused_endpoint: SocketAddr = "203.0.113.10:41021".parse().unwrap();
+    let replacement_endpoint: SocketAddr = "203.0.113.10:42021".parse().unwrap();
     manager
         .add_peer(&test_peer("peer1", reused_endpoint))
         .await;
@@ -561,9 +742,18 @@ async fn stale_probe_result_cannot_promote_reused_endpoint_after_remote_handover
     manager
         .add_candidates_with_metadata(
             "peer1",
-            &[reused_endpoint.to_string()],
+            &[replacement_endpoint.to_string()],
             &HashMap::new(),
             21,
+            Some(u64::MAX),
+        )
+        .await;
+    manager
+        .add_candidates_with_metadata(
+            "peer1",
+            &[reused_endpoint.to_string()],
+            &HashMap::new(),
+            22,
             Some(u64::MAX),
         )
         .await;
@@ -606,6 +796,10 @@ async fn versioned_candidates_reject_stale_and_expired_sets() {
         .await,
         CandidateSetApplyResult::Applied
     );
+    let accepted_epoch = manager
+        .current_remote_candidate_epoch("peer1")
+        .await
+        .unwrap();
     assert_eq!(
         manager
         .add_candidates_with_metadata(
@@ -633,6 +827,7 @@ async fn versioned_candidates_reject_stale_and_expired_sets() {
 
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(conn.last_candidate_generation, 10);
+    assert_eq!(conn.remote_candidate_epoch(), accepted_epoch);
     assert!(conn.candidates.contains(&initial.to_string()));
     assert!(!conn.candidates.contains(&stale.to_string()));
     assert!(!conn.candidates.contains(&expired.to_string()));

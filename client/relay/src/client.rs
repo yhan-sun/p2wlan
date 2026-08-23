@@ -23,9 +23,11 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -84,8 +86,14 @@ fn resolve_close_reason(reason: &Arc<std::sync::Mutex<RelayCloseReason>>) -> Rel
 pub enum RelayMessage {
     /// Data from a peer.
     Data { from_node: String, data: Vec<u8> },
-    /// Pong response with timestamp.
-    Pong { timestamp: u64 },
+    /// Pong response echoing the ping token. `round_trip_time` is present only
+    /// when the token belongs to an outstanding ping on this connection.  The
+    /// sample is measured with the local monotonic clock at the writer/read
+    /// boundaries; the protocol timestamp is never interpreted as wall time.
+    Pong {
+        timestamp: u64,
+        round_trip_time: Option<Duration>,
+    },
     /// Relay protocol or operational error.
     Error { code: u16, message: String },
     /// The relay connection ended, classified by the client's read/write
@@ -93,6 +101,73 @@ pub enum RelayMessage {
     /// resets, idle timeouts and local write failures instead of collapsing
     /// every disconnect into one "connection closed".
     Closed { reason: RelayCloseReason },
+}
+
+/// Process-local source of opaque ping tokens.  Relay protocol v1 calls this
+/// field a timestamp, but the server only echoes it; uniqueness within the
+/// client process is the property needed to bind a pong to its send boundary.
+static NEXT_PING_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct PingExpectations {
+    max_age: Duration,
+    pending: HashMap<u64, Instant>,
+}
+
+impl PingExpectations {
+    fn new(max_age: Duration) -> Self {
+        Self {
+            max_age,
+            pending: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, token: u64, sent_at: Instant) {
+        self.pending
+            .retain(|_, started| sent_at.saturating_duration_since(*started) <= self.max_age);
+        self.pending.insert(token, sent_at);
+    }
+
+    fn cancel(&mut self, token: u64) {
+        self.pending.remove(&token);
+    }
+
+    fn consume(&mut self, token: u64, received_at: Instant) -> Option<Duration> {
+        let sent_at = self.pending.remove(&token)?;
+        let elapsed = received_at.saturating_duration_since(sent_at);
+        (elapsed <= self.max_age).then_some(elapsed)
+    }
+}
+
+type SharedPingExpectations = Arc<std::sync::Mutex<PingExpectations>>;
+
+fn new_ping_expectations(max_age: Duration) -> SharedPingExpectations {
+    Arc::new(std::sync::Mutex::new(PingExpectations::new(max_age)))
+}
+
+/// Register the local monotonic expectation immediately before the writer
+/// enters `write_all`.  The echoed wire value is an opaque correlation token.
+fn begin_ping(expectations: &SharedPingExpectations) -> (u64, Frame) {
+    let token = NEXT_PING_TOKEN.fetch_add(1, Ordering::Relaxed);
+    expectations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .register(token, Instant::now());
+    (token, Frame::ping_with_timestamp(token))
+}
+
+fn cancel_ping(expectations: &SharedPingExpectations, token: u64) {
+    expectations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel(token);
+}
+
+fn consume_ping_rtt(expectations: &SharedPingExpectations, token: u64) -> Option<Duration> {
+    expectations
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .consume(token, Instant::now())
 }
 
 /// Why a relay connection ended.  The read task attributes transport-level
@@ -121,7 +196,8 @@ pub enum RelayCloseReason {
 }
 
 /// Commands sent from the client handle to the background write task.
-#[derive(Debug)]
+type WriteBoundaryHook = Box<dyn FnOnce(Instant) -> bool + Send + 'static>;
+
 enum ClientCommand {
     /// Send a raw frame (currently unused by public API but available for extensions).
     #[allow(dead_code)]
@@ -130,6 +206,10 @@ enum ClientCommand {
     SendData {
         dst: String,
         data: Vec<u8>,
+        /// Optional synchronous commit hook invoked by the writer after it
+        /// dequeues and encodes this frame, immediately before `write_all`.
+        /// Returning false rejects the frame without touching the socket.
+        write_boundary: Option<WriteBoundaryHook>,
         /// Completion is sent only after the writer has completed
         /// `write_all`. A successful `try_send` alone is only local queue
         /// acceptance and must not be reported as transport success.

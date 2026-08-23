@@ -79,7 +79,11 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
   var probing = 0;
   var offline = 0;
   for (final peer in peers) {
-    if (peer.online) online += 1;
+    if (!peer.online || peer.path == 'offline') {
+      offline += 1;
+      continue;
+    }
+    online += 1;
     switch (peer.path) {
       case 'direct':
         direct += 1;
@@ -88,7 +92,8 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
       case 'probing' || 'direct_trial':
         probing += 1;
       default:
-        offline += 1;
+        // The peer is present but has no verified usable path yet.
+        probing += 1;
     }
   }
   return _PeerCounts(
@@ -192,6 +197,9 @@ String? _dashboardIssueMessage({
   final health = snapshot?.health;
   if (health?.reauthRequired == true) return strings.issueReauthRequired;
   if (health != null && !health.controlConnected) {
+    if (health.controlApiReachable && !health.deviceLeaseHealthy) {
+      return strings.issueDeviceLeaseLost;
+    }
     return strings.issueControlDisconnected;
   }
   final reason = health?.reason?.trim();

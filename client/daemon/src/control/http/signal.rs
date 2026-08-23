@@ -50,11 +50,16 @@ pub(crate) fn prepare_signal_payload(
     probe_ephemeral_public_key: Option<&str>,
     signing_identity: Option<&SignalSigningIdentity>,
 ) -> Result<serde_json::Value> {
-    // Keep the revision and expiry derived from one instant: a candidate set
-    // must have a coherent lifetime even if the wall clock is adjusted while
-    // this request is being assembled.  A refused generation (incarnation or
-    // per-boot counter exhausted) fails the whole signal instead of sending a
-    // wrapped value receivers would judge stale.
+    // `candidate_generation` is the signal/candidate freshness revision, not
+    // a declaration that this process rebound its UDP transport. A fresh
+    // offer/answer (including a routine WireGuard rekey) deliberately gets a
+    // new revision even when `candidates` is identical; receivers compare the
+    // candidate set and encrypted-confirmed endpoint before declaring a remote
+    // transport handover. Keep the revision and expiry derived from one
+    // instant so the set has a coherent lifetime even if the wall clock moves.
+    // A refused generation (incarnation or per-boot counter exhausted) fails
+    // the whole signal instead of sending a wrapped value receivers judge
+    // stale.
     let candidate_generation = next_candidate_generation().map_err(|error| {
         warn!("{error}; dropping this candidate signal");
         DaemonError::ControlPlane(error.to_string())
@@ -167,7 +172,7 @@ pub(super) async fn poll_signals(
     self_node_id: &str,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
     wait_ms: u64,
-    recent_signal_ids: &Arc<tokio::sync::Mutex<VecDeque<String>>>,
+    delivery_tracker: &Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
 ) -> Result<()> {
     // ACK mode (`ack=1`): the server hands out delivery LEASES instead of
     // deleting rows at GET time, so a connection that breaks mid-body or a
@@ -206,32 +211,41 @@ pub(super) async fn poll_signals(
             );
         }
     }
+    let ack_mode = body.delivery.is_some();
     if let Some(delivery) = body.delivery.as_ref() {
         debug!(
-            "Control server granted an ACK-mode delivery lease (batch_token={} lease_expires_at_ms={:?}); acknowledging per-row tokens after enqueue",
+            "Control server granted an ACK-mode delivery lease (batch_token={} lease_expires_at_ms={:?}); acknowledging each row only after state-machine application",
             delivery.batch_token, delivery.lease_expires_at_ms
         );
     }
 
-    // Every signal that was delivered to us in ACK mode is acknowledged only
-    // after it was validated and either enqueued or classified as a terminal
-    // malformed/unsupported row.  A target mismatch or a failed local enqueue
-    // is deliberately left leased so the control plane redelivers it instead
-    // of turning a routing/channel failure into silent loss.
-    let mut acks: Vec<SignalAckRequest> = Vec::new();
-    let mut seen_any_delivery = false;
-    let mut dedup = recent_signal_ids.lock().await;
+    // ACK-mode rows are handed to detached, per-sender ordered application
+    // lanes below. Keeping those lanes outside the HTTP/control heartbeat loop
+    // prevents a slow responder handshake from starving the device lease
+    // heartbeat, while one blocked peer cannot stall an independent sender.
+    let mut leased_deliveries: HashMap<String, Vec<LeasedSignalDelivery>> = HashMap::new();
+    let mut blocked_senders = HashSet::new();
     for signal in body.signals {
+        let sender_key = signal.from_node_id.clone();
+        if blocked_senders.contains(&sender_key) {
+            continue;
+        }
         let delivery_ack = match (signal.id.as_deref(), signal.delivery_token.as_deref()) {
-            (Some(signal_id), Some(delivery_token)) => {
-                seen_any_delivery = true;
-                Some(SignalAckRequest {
-                    id: signal_id.to_string(),
-                    delivery_token: delivery_token.to_string(),
-                })
-            }
+            (Some(signal_id), Some(delivery_token)) => Some(SignalAckRequest {
+                id: signal_id.to_string(),
+                delivery_token: delivery_token.to_string(),
+            }),
             _ => None,
         };
+
+        if ack_mode && delivery_ack.is_none() {
+            warn!(
+                "Rejecting ACK-mode signal batch at id={:?}: missing id or delivery_token; leaving this row and every later row from the same sender unacknowledged",
+                signal.id
+            );
+            blocked_senders.insert(sender_key);
+            continue;
+        }
 
         debug!(
             "Control signal delivery received id={:?} from={} to={:?} type={} signal_seq={:?}",
@@ -254,6 +268,7 @@ pub(super) async fn poll_signals(
             // Do not ACK a row that the server claims belongs to another
             // device.  Its lease will expire and preserve evidence of the
             // routing defect for the control-plane operator.
+            blocked_senders.insert(sender_key);
             continue;
         }
         if signal.protocol_version != SIGNAL_REST_PROTOCOL_VERSION {
@@ -261,26 +276,19 @@ pub(super) async fn poll_signals(
                 "Skipping unsupported signal protocol_version={} from {} type={}",
                 signal.protocol_version, signal.from_node_id, signal.signal_type
             );
-            if let Some(ack) = delivery_ack {
-                acks.push(ack);
+            if let (Some(signal_id), Some(ack)) = (signal.id.clone(), delivery_ack) {
+                leased_deliveries
+                    .entry(sender_key)
+                    .or_default()
+                    .push(LeasedSignalDelivery {
+                        signal_id,
+                        signal_seq: signal.signal_seq,
+                        from_node_id: signal.from_node_id,
+                        ack,
+                        prepared: PreparedSignalDelivery::TerminalRejected,
+                    });
             }
             continue;
-        }
-        if let Some(signal_id) = signal.id.as_deref() {
-            // A redelivered batch (lost ACK, expired lease) must not apply
-            // the same signal twice: the bounded id cache dedups by signal
-            // id; candidate generation and the fresh high-water dedup the
-            // rest.
-            if dedup.iter().any(|seen| seen == signal_id) {
-                debug!(
-                    "Skipping duplicate signal {signal_id} from {} (redelivered batch); already processed",
-                    signal.from_node_id
-                );
-                if let Some(ack) = delivery_ack {
-                    acks.push(ack);
-                }
-                continue;
-            }
         }
         let punch_at_ms =
             normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
@@ -295,42 +303,38 @@ pub(super) async fn poll_signals(
         // signals of the same poll together with the bad one (their leases
         // would expire and redeliver, so nothing is lost).
         let handshake = if signal.handshake.trim().is_empty() {
-            Vec::new()
+            Some(Vec::new())
         } else if signal.handshake.trim().len() % 2 != 0 {
             warn!(
                 "Skipping signal from {} type={}: handshake hex has an odd length",
                 signal.from_node_id, signal.signal_type
             );
-            if let Some(ack) = delivery_ack {
-                acks.push(ack);
-            }
-            continue;
+            None
         } else {
             match hex::decode(signal.handshake.trim()) {
-                Ok(decoded) => decoded,
+                Ok(decoded) => Some(decoded),
                 Err(error) => {
                     warn!(
                         "Skipping signal from {} type={}: handshake hex decode failed: {error}",
                         signal.from_node_id, signal.signal_type
                     );
-                    if let Some(ack) = delivery_ack {
-                        acks.push(ack);
-                    }
-                    continue;
+                    None
                 }
             }
         };
 
         let signal_id = signal.id.clone();
         let from_node_id = signal.from_node_id.clone();
-        let enqueued = match signal.signal_type.as_str() {
+        let signal_seq = signal.signal_seq;
+        let signal_type = signal.signal_type.clone();
+        let prepared = match (signal.signal_type.as_str(), handshake) {
             // `peer_offer_fresh` is the independent queue key for fresh-mapping
             // prediction advertisements: it is delivered in send order and an
             // ordinary `peer_offer` can never overwrite it server-side.  The
             // event handler re-verifies the fresh label and the per-peer
             // high-water before applying anything.
-            "peer_offer" | "peer_offer_fresh" => {
-                event_tx.send(ControlEvent::PeerOffer {
+            ("peer_offer" | "peer_offer_fresh", Some(handshake)) => {
+                PreparedSignalDelivery::Apply(ControlEvent::PeerOffer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     session_id: signal.session_id,
@@ -342,10 +346,10 @@ pub(super) async fn poll_signals(
                     punch_at_ms,
                     punch_at_server_ms,
                     sender_public_key: signal.sender_public_key,
-                }).is_ok()
+                })
             }
-            "peer_answer" => {
-                event_tx.send(ControlEvent::PeerAnswer {
+            ("peer_answer", Some(handshake)) => {
+                PreparedSignalDelivery::Apply(ControlEvent::PeerAnswer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     session_id: signal.session_id,
@@ -357,75 +361,311 @@ pub(super) async fn poll_signals(
                     punch_at_ms,
                     punch_at_server_ms,
                     sender_public_key: signal.sender_public_key,
-                }).is_ok()
+                })
             }
-            "peer_reflexive" => {
+            ("peer_reflexive", Some(_)) => {
                 if let Some(observed_endpoint) = peer_reflexive_endpoint_from_signal(&signal) {
-                    event_tx.send(ControlEvent::PeerReflexive {
+                    PreparedSignalDelivery::Apply(ControlEvent::PeerReflexive {
                         from_node_id: signal.from_node_id,
                         observed_endpoint,
                         punch_at_ms,
-                    }).is_ok()
+                    })
                 } else {
                     warn!(
                         "Ignoring peer_reflexive signal from {}; missing observed endpoint",
                         signal.from_node_id
                     );
-                    true
+                    PreparedSignalDelivery::TerminalRejected
                 }
             }
-            other => {
+            (_, None) => PreparedSignalDelivery::TerminalRejected,
+            (other, Some(_)) => {
                 warn!("Ignoring unsupported signal type from control plane: {other}");
-                true
+                PreparedSignalDelivery::TerminalRejected
             }
         };
-        if enqueued {
-            if let Some(signal_id) = signal_id.as_deref() {
-                dedup.push_back(signal_id.to_string());
-                while dedup.len() > MAX_RECENT_SIGNAL_IDS {
-                    dedup.pop_front();
-                }
-            }
+
+        if let (Some(signal_id), Some(ack)) = (signal_id, delivery_ack) {
             debug!(
-                "Control signal delivery enqueued id={:?} from={} to={} type={} signal_seq={:?}",
+                "Control signal delivery staged id={} from={} to={} type={} signal_seq={:?}",
                 signal_id,
                 from_node_id,
                 self_node_id,
-                signal.signal_type,
-                signal.signal_seq,
+                signal_type,
+                signal_seq,
             );
-            if let Some(ack) = delivery_ack {
-                acks.push(ack);
+            leased_deliveries
+                .entry(sender_key)
+                .or_default()
+                .push(LeasedSignalDelivery {
+                    signal_id,
+                    signal_seq,
+                    from_node_id,
+                    ack,
+                    prepared,
+                });
+            continue;
+        }
+
+        // Legacy delete-on-GET servers provide no durable lease. Preserve
+        // compatibility by dispatching immediately; an ACK-mode response with
+        // incomplete per-row metadata was rejected above and must never fall
+        // through to this crash-unsafe compatibility path.
+        if !ack_mode {
+            if let PreparedSignalDelivery::Apply(event) = prepared {
+                event_tx.send(event).map_err(|_| {
+                    DaemonError::ControlPlane(
+                        "control signal event channel closed before dispatch".to_string(),
+                    )
+                })?;
             }
-        } else {
-            warn!(
-                "Control signal delivery could not enqueue id={:?} from={} reason_code=local_event_channel_closed",
-                signal_id, from_node_id
-            );
         }
     }
-    drop(dedup);
 
-    // Acknowledge the whole delivered batch only now that every signal was
-    // decoded and enqueued into the local event queue.  Best-effort: when the
-    // ACK fails, the lease expires and the batch is redelivered (deduped by
-    // signal id), so nothing is lost and nothing is applied twice.
-    if seen_any_delivery && !acks.is_empty() {
-        if let Err(err) = ack_signals(http, base_url, token, self_node_id, &acks).await {
-            warn!(
-                "Signal delivery ACK failed for {} signals (the lease will expire and redeliver): {err}",
-                acks.len()
-            );
-        }
+    for deliveries in leased_deliveries.into_values() {
+        spawn_signal_application_lane(
+            http.clone(),
+            base_url.to_string(),
+            token.to_string(),
+            self_node_id.to_string(),
+            event_tx.clone(),
+            delivery_tracker.clone(),
+            deliveries,
+        );
     }
 
     Ok(())
 }
 
-/// How many recent signal IDs the receive-side dedup cache retains.  Bounded
-/// well above any lease window's batch volume (a 500-row batch redelivered a
-/// few times must still dedup), and sized so the memory cost stays trivial.
+/// How many recent signal IDs the receive-side dedup cache retains.  The
+/// per-sender applied sequence high-water below remains authoritative after an
+/// ID ages out, so this deque only needs to absorb legacy rows without a
+/// sequence and ordinary lost-ACK redelivery.
 const MAX_RECENT_SIGNAL_IDS: usize = 2_048;
+
+#[derive(Debug, Default)]
+pub(super) struct SignalDeliveryTracker {
+    applied_ids: VecDeque<String>,
+    applied_seq_by_sender: HashMap<String, u64>,
+    in_flight: HashMap<String, SignalDeliveryWaiter>,
+}
+
+impl SignalDeliveryTracker {
+    fn already_applied(&self, signal_id: &str, from_node_id: &str, signal_seq: Option<u64>) -> bool {
+        self.applied_ids.iter().any(|seen| seen == signal_id)
+            || signal_seq.is_some_and(|seq| {
+                self.applied_seq_by_sender
+                    .get(from_node_id)
+                    .is_some_and(|high_water| seq <= *high_water)
+            })
+    }
+
+    fn mark_applied(&mut self, signal_id: String, from_node_id: &str, signal_seq: Option<u64>) {
+        if !self.applied_ids.iter().any(|seen| seen == &signal_id) {
+            self.applied_ids.push_back(signal_id);
+            while self.applied_ids.len() > MAX_RECENT_SIGNAL_IDS {
+                self.applied_ids.pop_front();
+            }
+        }
+        if let Some(seq) = signal_seq {
+            self.applied_seq_by_sender
+                .entry(from_node_id.to_string())
+                .and_modify(|high_water| *high_water = (*high_water).max(seq))
+                .or_insert(seq);
+        }
+    }
+
+    fn begin_application(
+        &mut self,
+        signal_id: &str,
+        from_node_id: &str,
+        signal_seq: Option<u64>,
+    ) -> TrackedSignalApplication {
+        if self.already_applied(signal_id, from_node_id, signal_seq) {
+            return TrackedSignalApplication::AlreadyApplied;
+        }
+        if let Some(waiter) = self.in_flight.get(signal_id) {
+            return TrackedSignalApplication::Join(waiter.clone());
+        }
+        let receipt = SignalDeliveryReceipt::pending();
+        let waiter = receipt.waiter();
+        self.in_flight
+            .insert(signal_id.to_string(), waiter.clone());
+        TrackedSignalApplication::Start { receipt, waiter }
+    }
+
+    fn finish_application(
+        &mut self,
+        signal_id: String,
+        from_node_id: &str,
+        signal_seq: Option<u64>,
+        waiter: Option<&SignalDeliveryWaiter>,
+        outcome: SignalApplyOutcome,
+    ) {
+        if let Some(waiter) = waiter {
+            let remove = self
+                .in_flight
+                .get(&signal_id)
+                .is_some_and(|current| current.same_delivery(waiter));
+            if remove {
+                self.in_flight.remove(&signal_id);
+            }
+        }
+        if matches!(
+            outcome,
+            SignalApplyOutcome::Applied | SignalApplyOutcome::TerminalRejected
+        ) {
+            self.mark_applied(signal_id, from_node_id, signal_seq);
+        }
+    }
+}
+
+enum TrackedSignalApplication {
+    AlreadyApplied,
+    Join(SignalDeliveryWaiter),
+    Start {
+        receipt: SignalDeliveryReceipt,
+        waiter: SignalDeliveryWaiter,
+    },
+}
+
+#[derive(Debug)]
+enum PreparedSignalDelivery {
+    Apply(ControlEvent),
+    TerminalRejected,
+}
+
+#[derive(Debug)]
+struct LeasedSignalDelivery {
+    signal_id: String,
+    signal_seq: Option<u64>,
+    from_node_id: String,
+    ack: SignalAckRequest,
+    prepared: PreparedSignalDelivery,
+}
+
+/// Apply one leased server batch in response order without blocking the
+/// heartbeat/roster polling loop.  ACKs are deliberately emitted one row at a
+/// time: if an ACK is ambiguous, later rows stay unacknowledged and the
+/// server's per-pair head-of-line lease will replay from the first uncertain
+/// commit instead of allowing a newer handshake to overtake it.
+fn spawn_signal_application_lane(
+    http: reqwest::Client,
+    base_url: String,
+    token: String,
+    self_node_id: String,
+    event_tx: mpsc::UnboundedSender<ControlEvent>,
+    delivery_tracker: Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
+    deliveries: Vec<LeasedSignalDelivery>,
+) {
+    tokio::spawn(async move {
+        for delivery in deliveries {
+            let mut application_waiter = None;
+            let mut already_applied = false;
+            let outcome = match delivery.prepared {
+                PreparedSignalDelivery::TerminalRejected => {
+                    already_applied = delivery_tracker.lock().await.already_applied(
+                        &delivery.signal_id,
+                        &delivery.from_node_id,
+                        delivery.signal_seq,
+                    );
+                    if already_applied {
+                        SignalApplyOutcome::Applied
+                    } else {
+                        SignalApplyOutcome::TerminalRejected
+                    }
+                }
+                PreparedSignalDelivery::Apply(event) => {
+                    let tracked = delivery_tracker.lock().await.begin_application(
+                        &delivery.signal_id,
+                        &delivery.from_node_id,
+                        delivery.signal_seq,
+                    );
+                    match tracked {
+                        TrackedSignalApplication::AlreadyApplied => {
+                            already_applied = true;
+                            SignalApplyOutcome::Applied
+                        }
+                        TrackedSignalApplication::Join(waiter) => {
+                            debug!(
+                                "Joining in-flight redelivery {} from {} at seq {:?}",
+                                delivery.signal_id, delivery.from_node_id, delivery.signal_seq
+                            );
+                            application_waiter = Some(waiter.clone());
+                            waiter.wait().await
+                        }
+                        TrackedSignalApplication::Start { receipt, waiter } => {
+                            application_waiter = Some(waiter.clone());
+                            let delivered = ControlEvent::DeliveredSignal {
+                                signal_id: delivery.signal_id.clone(),
+                                signal_seq: delivery.signal_seq,
+                                event: Box::new(event),
+                                receipt,
+                            };
+                            if event_tx.send(delivered).is_err() {
+                                warn!(
+                                    "Control signal {} could not enter the daemon state machine; leaving its server lease unacknowledged",
+                                    delivery.signal_id
+                                );
+                                delivery_tracker.lock().await.finish_application(
+                                    delivery.signal_id.clone(),
+                                    &delivery.from_node_id,
+                                    delivery.signal_seq,
+                                    application_waiter.as_ref(),
+                                    SignalApplyOutcome::Retry,
+                                );
+                                break;
+                            }
+                            waiter.wait().await
+                        }
+                    }
+                }
+            };
+
+            if already_applied {
+                debug!(
+                    "Skipping redelivered signal {} from {} at seq {:?}; state-machine application already committed",
+                    delivery.signal_id, delivery.from_node_id, delivery.signal_seq
+                );
+            } else {
+                delivery_tracker.lock().await.finish_application(
+                    delivery.signal_id.clone(),
+                    &delivery.from_node_id,
+                    delivery.signal_seq,
+                    application_waiter.as_ref(),
+                    outcome,
+                );
+            }
+
+            if !matches!(
+                outcome,
+                SignalApplyOutcome::Applied | SignalApplyOutcome::TerminalRejected
+            ) {
+                warn!(
+                    "Control signal {} application ended as {:?}; leaving it and all later rows unacknowledged for ordered redelivery",
+                    delivery.signal_id, outcome
+                );
+                break;
+            }
+
+            if let Err(error) = ack_signals(
+                &http,
+                &base_url,
+                &token,
+                &self_node_id,
+                std::slice::from_ref(&delivery.ack),
+            )
+            .await
+            {
+                warn!(
+                    "Signal {} applied but ACK failed; later rows remain unprocessed until ordered redelivery: {error}",
+                    delivery.signal_id
+                );
+                break;
+            }
+        }
+    });
+}
 
 /// One per-row delivery acknowledgement.
 #[derive(Debug, Clone, serde::Serialize)]

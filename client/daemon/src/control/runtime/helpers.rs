@@ -58,6 +58,18 @@ mod signal_schedule_tests {
     fn signal_reconcile_cadence_is_below_one_second() {
         assert!(SIGNAL_FALLBACK_TICK < Duration::from_secs(1));
     }
+
+    #[tokio::test]
+    async fn relay_connect_setup_time_is_not_published_as_relay_rtt() {
+        let diagnostics = Arc::new(RwLock::new(RelaySelectionDiagnostics {
+            selected_connect_latency_ms: Some(87),
+            ..RelaySelectionDiagnostics::default()
+        }));
+        assert_eq!(current_relay_rtt_ms(Some(&diagnostics)).await, None);
+
+        diagnostics.write().await.selected_last_pong_rtt_ms = Some(23);
+        assert_eq!(current_relay_rtt_ms(Some(&diagnostics)).await, Some(23));
+    }
 }
 
 fn is_permanent_auth_error(err: &str) -> bool {
@@ -81,5 +93,4 @@ async fn current_relay_rtt_ms(
     diagnostics
         .selected_rtt_ewma_ms
         .or(diagnostics.selected_last_pong_rtt_ms)
-        .or(diagnostics.selected_connect_latency_ms)
 }

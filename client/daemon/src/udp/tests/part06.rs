@@ -804,8 +804,15 @@ async fn relay_backoff_heartbeat_hard_nat_slice_serves_all_eleven_peers_without_
         "the endpoint-group scheduler must rotate all three local sockets"
     );
 
-    let mut received = 0u32;
+    // Give the first loopback datagram enough scheduling headroom under the
+    // full parallel daemon suite. Once delivery starts, use the short drain
+    // timeout to preserve the exact packet-count assertion.
+    let mut received = 1u32;
     let mut buf = [0u8; 256];
+    timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
+        .await
+        .expect("first relay-backoff heartbeat must reach the loopback receiver")
+        .expect("loopback heartbeat receive must succeed");
     while let Ok(Ok(_)) = timeout(Duration::from_millis(20), receiver.recv_from(&mut buf)).await {
         received = received.saturating_add(1);
     }

@@ -343,7 +343,9 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
         "node-a",
         &event_tx,
         0,
-        &Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+        &Arc::new(tokio::sync::Mutex::new(
+            SignalDeliveryTracker::default(),
+        )),
     )
     .await;
     assert!(
@@ -371,12 +373,11 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
     server.abort();
 }
 
-/// ACK-mode delivery: the server hands out delivery leases with per-row
-/// tokens, the client decodes and enqueues every healthy signal, and only
-/// THEN acknowledges the batch.  A redelivered batch (simulated by a second
-/// poll with the same signals) is deduped by signal id but still ACKed.
+/// ACK-mode delivery: merely entering the daemon event channel is not enough
+/// to delete a durable server row. The application receipt must complete first;
+/// a redelivered, already-applied row is then deduped and ACKed idempotently.
 #[tokio::test]
-async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
+async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -445,10 +446,12 @@ async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
     };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let dedup: Arc<tokio::sync::Mutex<VecDeque<String>>> =
-        Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+    let dedup = Arc::new(tokio::sync::Mutex::new(
+        SignalDeliveryTracker::default(),
+    ));
 
-    // First poll: the signal is decoded, enqueued, and ACKed.
+    // First poll: the signal is decoded and dispatched, but remains durable
+    // until the daemon state machine completes the receipt.
     let result = poll_signals(
         &test_no_proxy_client(),
         &format!("http://{address}"),
@@ -460,22 +463,61 @@ async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
     )
     .await;
     assert!(result.is_ok(), "first poll must succeed: {result:?}");
-    match timeout(Duration::from_secs(5), event_rx.recv()).await {
-        Ok(Some(ControlEvent::PeerOffer { from_node_id, .. })) => {
-            assert_eq!(from_node_id, "peer-b");
-        }
+    let receipt = match timeout(Duration::from_secs(5), event_rx.recv()).await {
+        Ok(Some(ControlEvent::DeliveredSignal {
+            event, receipt, ..
+        })) => match *event {
+            ControlEvent::PeerOffer { from_node_id, .. } => {
+                assert_eq!(from_node_id, "peer-b");
+                receipt
+            }
+            other => panic!("expected an enveloped peer offer, got {other:?}"),
+        },
         other => panic!("expected the delivered peer offer, got {other:?}"),
-    }
-    // The ACK is sent after the enqueue (the mock server must have seen it).
+    };
+    assert_eq!(
+        ack_posts.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "enqueue alone must never ACK/delete a durable signal"
+    );
+
+    // Simulate a lease expiry while the first state-machine owner is still
+    // applying. The duplicate joins that exact application receipt; it must
+    // not enqueue a second handshake worker.
+    let result = poll_signals(
+        &test_no_proxy_client(),
+        &format!("http://{address}"),
+        "test-token",
+        "node-a",
+        &event_tx,
+        0,
+        &dedup,
+    )
+    .await;
+    assert!(result.is_ok(), "in-flight redelivery poll must succeed: {result:?}");
+    tokio::task::yield_now().await;
+    assert!(
+        event_rx.try_recv().is_err(),
+        "an in-flight redelivery must join, not duplicate, the state-machine application"
+    );
+    assert_eq!(
+        ack_posts.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "neither delivery may ACK before the shared application commits"
+    );
+
+    receipt.complete(SignalApplyOutcome::Applied);
+    // Both delivery tokens are ACKed only after the shared application receipt
+    // completes (a real server accepts only the newest re-lease token).
     timeout(Duration::from_secs(5), async {
-        while ack_posts.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        while ack_posts.load(std::sync::atomic::Ordering::Relaxed) < 2 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the delivered batch must be ACKed after enqueueing");
+    .expect("the delivered row must be ACKed after state-machine application");
 
-    // Second poll: the SAME batch is redelivered (the ACK was "lost" and the
+    // Third poll: the SAME batch is redelivered (the ACK was "lost" and the
     // lease expired).  The signal id dedup skips the duplicate event but the
     // ACK is still sent, so the server stops redelivering.
     let result = poll_signals(
@@ -488,13 +530,13 @@ async fn poll_signals_ack_mode_enqueues_then_acks_and_dedupes_redelivery() {
         &dedup,
     )
     .await;
-    assert!(result.is_ok(), "second poll must succeed: {result:?}");
+    assert!(result.is_ok(), "third poll must succeed: {result:?}");
     assert!(
         event_rx.try_recv().is_err(),
         "a redelivered signal must not be enqueued twice"
     );
     timeout(Duration::from_secs(5), async {
-        while ack_posts.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+        while ack_posts.load(std::sync::atomic::Ordering::Relaxed) < 3 {
             tokio::task::yield_now().await;
         }
     })
@@ -920,6 +962,213 @@ async fn candidate_offer_workers_are_fair_and_fifo() {
     server.task.abort();
 }
 
+/// Cancelling an in-flight candidate publication (for example when its UDP
+/// lease is superseded during a rebind) must cancel only that immutable HTTP
+/// request. The per-peer FIFO worker stays alive so the replacement
+/// transport's first candidate offer is not dropped behind a stale sender.
+#[tokio::test]
+async fn cancelled_candidate_offer_keeps_same_peer_worker_available() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal" && body.contains("51100") {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
+    server.wait_registered().await;
+
+    let cancelled = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_peer_offer_with_sources_and_punch_at(
+                    "peer-rebind",
+                    &["203.0.113.92:51100".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server
+                .signal_posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("peer-rebind") && body.contains("51100"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the old UDP owner's candidate request must be in flight before cancellation");
+
+    cancelled.abort();
+    let _ = cancelled.await;
+    tokio::task::yield_now().await;
+
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_offer_with_sources_and_punch_at(
+            "peer-rebind",
+            &["203.0.113.92:51101".to_string()],
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the replacement UDP owner's first offer must not wait on the cancelled request")
+    .expect("the same-peer worker must accept the replacement candidate offer");
+
+    let posts = server.signal_posts.lock().unwrap().clone();
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51100"))
+            .count(),
+        1,
+        "the cancelled request may reach the wire once but must not retry"
+    );
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51101"))
+            .count(),
+        1,
+        "the first replacement offer must reach the wire exactly once"
+    );
+
+    drop(client);
+    server.task.abort();
+}
+
+/// Revoking a fresh prediction's exact ownership handle must cancel an
+/// already-started HTTP request without requiring the caller task itself to be
+/// aborted.  The per-peer lane then remains available to the replacement UDP
+/// owner.
+#[tokio::test]
+async fn in_flight_fresh_ownership_cancellation_keeps_same_peer_worker_available() {
+    let server = MockControlServer::spawn(|kind, body| {
+        if kind == "signal" && body.contains("51200") {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
+    server.wait_registered().await;
+
+    let ownership = Arc::new(crate::PunchSessionCancellation::default());
+    let cancelled = tokio::spawn({
+        let client = client.clone();
+        let ownership = ownership.clone();
+        async move {
+            client
+                .send_fresh_peer_offer_with_sources_and_punch_at(
+                    "peer-rebind",
+                    &["203.0.113.92:51200".to_string()],
+                    &HashMap::new(),
+                    &[],
+                    None,
+                    ownership,
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if server
+                .signal_posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("peer-rebind") && body.contains("51200"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retired fresh owner's HTTP request must be in flight before cancellation");
+
+    ownership.cancel_for_hard_hard_cleanup();
+    assert_eq!(
+        timeout(Duration::from_secs(2), cancelled)
+            .await
+            .expect("fresh ownership cancellation must stop the in-flight request")
+            .expect("fresh send task must not panic"),
+        Err(PeerOfferSendFailure::Cancelled),
+    );
+
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_offer_with_sources_and_punch_at(
+            "peer-rebind",
+            &["203.0.113.92:51201".to_string()],
+            &HashMap::new(),
+            &[],
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the replacement offer must not wait on the cancelled fresh request")
+    .expect("the same-peer worker must accept the replacement offer");
+
+    let posts = server.signal_posts.lock().unwrap().clone();
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51200"))
+            .count(),
+        1,
+        "the cancelled fresh request may reach the server once but must not retry"
+    );
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| body.contains("peer-rebind") && body.contains("51201"))
+            .count(),
+        1,
+        "the replacement offer must reach the wire exactly once"
+    );
+
+    drop(client);
+    server.task.abort();
+}
+
 #[tokio::test]
 async fn fresh_candidate_offer_uses_fresh_signal_queue_and_keeps_session_envelope() {
     let server = MockControlServer::spawn(|_, _| MockAction::Ok).await;
@@ -1203,8 +1452,17 @@ async fn critical_endpoint_publish_bypasses_stalled_ordinary_lane() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let health = crate::tasks::HealthState::new();
+    let (client, _rx) = ControlClient::new_with_health(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+        Some(health.clone()),
+    );
     server.wait_registered().await;
+    health.set_device_lease_healthy(false);
 
     let stalled = tokio::spawn({
         let client = client.clone();
@@ -1236,8 +1494,55 @@ async fn critical_endpoint_publish_bypasses_stalled_ordinary_lane() {
         endpoints.iter().any(|body| body.contains("203.0.113.99:54000")),
         "the endpoint publish must reach the server: {endpoints:?}"
     );
+    let health_snapshot = health.snapshot(&[]).await;
+    assert!(health_snapshot.control_api_reachable);
+    assert!(health_snapshot.device_lease_healthy);
+    assert!(health_snapshot.control_connected);
 
     drop(client);
     stalled.abort();
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn failed_critical_endpoint_publish_invalidates_only_device_lease() {
+    let server = MockControlServer::spawn(|kind, _| {
+        if kind == "endpoint" {
+            MockAction::Fail500
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let health = crate::tasks::HealthState::new();
+    let (client, _rx) = ControlClient::new_with_health(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+        Some(health.clone()),
+    );
+    server.wait_registered().await;
+
+    let error = client
+        .update_endpoint_for_handshake("203.0.113.99:54001", "FullCone")
+        .await
+        .expect_err("HTTP 500 must fail the critical endpoint publish");
+    assert!(error.to_string().contains("500"));
+
+    let health_snapshot = health.snapshot(&[]).await;
+    assert!(
+        health_snapshot.control_api_reachable,
+        "a failed endpoint lease must not erase separately observed API reachability"
+    );
+    assert!(!health_snapshot.device_lease_healthy);
+    assert!(!health_snapshot.control_connected);
+
+    drop(client);
     server.task.abort();
 }

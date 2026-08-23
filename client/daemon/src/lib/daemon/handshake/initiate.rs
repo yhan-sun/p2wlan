@@ -48,18 +48,27 @@ impl Daemon {
         // staging its Probe binding for the same peer.
         let _handshake_guard = self.handshake_arbiter.acquire(peer_id).await;
         let network_generation = self.peers.current_network_generation_sync();
+        let peer_session_generation = self.peers.peer_session_generation_sync(peer_id)?;
         let stale_session_id = self
             .pending_handshakes
             .lock()
             .await
-            .remove_stale_pending_for_generation(peer_id, network_generation);
+            .remove_stale_pending_for_generation(
+                peer_id,
+                network_generation,
+                peer_session_generation,
+            );
         if let Some(session_id) = stale_session_id {
             self.peers
                 .discard_pending_probe_session_binding(peer_id, &session_id)
                 .await;
         }
         let mut state = self.pending_handshakes.lock().await;
-        let reservation = state.reserve_start_with_owner_at_generation(peer_id, network_generation)?;
+        let reservation = state.reserve_start_with_owner_at_generation(
+            peer_id,
+            network_generation,
+            peer_session_generation,
+        )?;
         if state.attempts.get(peer_id).copied().unwrap_or(0) >= MAX_HANDSHAKE_ATTEMPTS {
             state.attempts.remove(peer_id);
         }
@@ -96,7 +105,12 @@ impl Daemon {
         // allowed to turn an old initiation into a session for a newer network
         // incarnation, nor may an old task silently retag itself as new.
         let handshake_generation = reservation.network_generation;
-        if self.peers.current_network_generation_sync() != handshake_generation {
+        if self.peers.current_network_generation_sync() != handshake_generation
+            || !self.peers.peer_session_is_current_sync(
+                &peer_info.node_id,
+                reservation.peer_session_generation,
+            )
+        {
             self.pending_handshakes
                 .lock()
                 .await
@@ -126,9 +140,26 @@ impl Daemon {
                 lock_wait_started.elapsed().as_millis()
             )),
         );
+        if !self.peers.peer_session_is_current_sync(
+            &peer_info.node_id,
+            reservation.peer_session_generation,
+        ) {
+            drop(handshake_guard);
+            self.pending_handshakes
+                .lock()
+                .await
+                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+            return Ok(None);
+        }
+        // This worker is cooperatively polled by the serial control loop. The
+        // arbiter is an admission boundary only: keeping it across the actor
+        // status await would self-deadlock if PeerLeft/offline entered the
+        // serial branch, waited for this guard, and thereby stopped polling the
+        // worker which owns it. The reservation/lifecycle stamp is revalidated
+        // at the later publish transaction.
+        drop(handshake_guard);
         let status = self.transport.session_status(&peer_info.node_id).await;
         if status.has_active || status.has_pending_responder {
-            drop(handshake_guard);
             self.pending_handshakes
                 .lock()
                 .await
@@ -139,7 +170,6 @@ impl Daemon {
         let identity = match self.local_identity() {
             Ok(identity) => identity,
             Err(error) => {
-                drop(handshake_guard);
                 self.pending_handshakes
                     .lock()
                     .await
@@ -150,7 +180,6 @@ impl Daemon {
         let peer_public = match decode_x25519_key(&peer_info.public_key, "peer public key") {
             Ok(peer_public) => peer_public,
             Err(error) => {
-                drop(handshake_guard);
                 self.pending_handshakes
                     .lock()
                     .await
@@ -159,7 +188,6 @@ impl Daemon {
             }
         };
         if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
-            drop(handshake_guard);
             self.pending_handshakes
                 .lock()
                 .await
@@ -171,7 +199,6 @@ impl Daemon {
         let initiation = match initiator.create_initiation() {
             Ok(initiation) => initiation,
             Err(error) => {
-                drop(handshake_guard);
                 self.pending_handshakes
                     .lock()
                     .await
@@ -183,9 +210,8 @@ impl Daemon {
         };
         let initiation_bytes = initiation.to_bytes();
 
-        // Candidate gathering may wait on a live STUN fan-out.  Keep the
-        // owner reservation, but never keep the per-peer arbiter across it.
-        drop(handshake_guard);
+        // Candidate gathering may wait on a live STUN fan-out. Keep the owner
+        // reservation; the arbiter was already released before actor I/O.
         let (candidates, candidate_sources) = {
             let snapshot = self.cached_local_candidate_set().await;
             let mut relay_available = self.relay_available_tx.subscribe();
@@ -278,6 +304,10 @@ impl Daemon {
                 lock_wait_started.elapsed().as_millis()
             )),
         );
+        // As above, never let a cooperatively-polled worker own the arbiter
+        // while awaiting the emit/session actors. Exact reservation, network
+        // generation and peer lifecycle checks below form the commit fence.
+        drop(handshake_guard);
         // The outbound worker establishes the canonical lifecycle order
         // `emit -> generation -> session/connection`. Acquire emit before the
         // generation gate so a rekey or generation advance cannot deadlock
@@ -288,7 +318,12 @@ impl Daemon {
             .await;
         let epoch_gate = self.peers.network_epoch_gate();
         let epoch_guard = epoch_gate.lock().await;
-        if self.peers.current_network_generation_sync() != handshake_generation {
+        if self.peers.current_network_generation_sync() != handshake_generation
+            || !self.peers.peer_session_is_current_sync(
+                &peer_info.node_id,
+                reservation.peer_session_generation,
+            )
+        {
             self.pending_handshakes
                 .lock()
                 .await
@@ -297,7 +332,6 @@ impl Daemon {
         }
         let status = self.transport.session_status(&peer_info.node_id).await;
         if status.has_active || status.has_pending_responder {
-            drop(handshake_guard);
             self.pending_handshakes
                 .lock()
                 .await
@@ -318,6 +352,7 @@ impl Daemon {
                     Some(session_id.clone()),
                     Some(probe_ephemeral),
                     handshake_generation,
+                    reservation.peer_session_generation,
                 )
                 .map(|pending_id| {
                     let attempts = state.attempts.entry(peer_id.clone()).or_insert(0);
@@ -325,7 +360,6 @@ impl Daemon {
                     (*attempts, pending_id)
                 })
         }) else {
-            drop(handshake_guard);
             return Ok(None);
         };
         if self
@@ -354,7 +388,6 @@ impl Daemon {
                     .discard_pending_probe_session_binding(&peer_id, &session_id)
                     .await;
             }
-            drop(handshake_guard);
             return Err(DaemonError::Peer(format!(
                 "failed to stage Probe v2 handshake binding for {peer_id}"
             )));
@@ -372,10 +405,10 @@ impl Daemon {
         drop(epoch_guard);
         drop(emit_guard);
 
-        // The pending-id now owns cleanup of the committed initiator.  Release
-        // the arbiter before the HTTP request; an answer arriving while this
-        // POST is queued must be able to consume the pending transaction.
-        drop(handshake_guard);
+        // The pending-id now owns cleanup of the committed initiator. The
+        // admission-only arbiter was released before any actor await above, so
+        // an answer arriving while this POST is queued can consume the pending
+        // transaction without self-locking the serial control loop.
         let punch_at_ms = relay_assisted_punch_at_ms();
         let Some(offer_result) = await_initiator_offer_or_cancellation(
             self.control.send_peer_offer_with_sources_punch_and_session(
@@ -452,22 +485,20 @@ impl Daemon {
         let peers = self.peers.clone();
         let timeout_session_id = session_id;
         let generation = handshake_generation;
+        let timeout_peer_session_generation = reservation.peer_session_generation;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS)).await;
-            if !transport.has_session(&timeout_peer).await {
-                warn!("Handshake timeout for peer {timeout_peer}");
-                peers
-                    .record_direct_failure_for_generation(
-                        &timeout_peer,
-                        generation,
-                        REASON_HANDSHAKE_TIMEOUT,
-                        "handshake timed out",
-                    )
-                    .await;
-            }
+            // The pending transaction is the timeout's first authority.  A
+            // matching answer, retry, leave/rejoin, or crossing responder may
+            // have replaced this owner while the timer slept; in that case the
+            // old timer must not publish a failure into the replacement
+            // lifecycle (same-node ABA).
             let removed = {
                 let mut state = pending.lock().await;
-                if state.is_current(&timeout_peer, pending_id) {
+                if state.is_current(&timeout_peer, pending_id)
+                    && state.peer_session_generation(&timeout_peer)
+                        == Some(timeout_peer_session_generation)
+                {
                     state.remove(&timeout_peer);
                     if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
                         state.attempts.remove(&timeout_peer);
@@ -477,11 +508,43 @@ impl Daemon {
                     false
                 }
             };
-            if removed {
-                peers
-                    .discard_pending_probe_session_binding(&timeout_peer, &timeout_session_id)
-                    .await;
+            if !removed {
+                return;
             }
+
+            if peers.peer_session_is_current_sync(
+                &timeout_peer,
+                timeout_peer_session_generation,
+            ) && !transport.has_session(&timeout_peer).await
+                && peers.peer_session_is_current_sync(
+                    &timeout_peer,
+                    timeout_peer_session_generation,
+                )
+            {
+                warn!("Handshake timeout for peer {timeout_peer}");
+                let failed = peers
+                    .record_direct_failure_for_generation_and_peer_session_with_local_endpoint(
+                        &timeout_peer,
+                        generation,
+                        timeout_peer_session_generation,
+                        REASON_HANDSHAKE_TIMEOUT,
+                        "handshake timed out",
+                        None,
+                    )
+                    .await;
+                if failed {
+                    peers
+                        .mark_recovery_relay_backoff_for_peer_session(
+                            &timeout_peer,
+                            timeout_peer_session_generation,
+                            "handshake timed out",
+                        )
+                        .await;
+                }
+            }
+            peers
+                .discard_pending_probe_session_binding(&timeout_peer, &timeout_session_id)
+                .await;
         });
 
         offer_result?;

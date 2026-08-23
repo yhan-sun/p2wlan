@@ -71,6 +71,7 @@ fn status_fixture_deserializes_into_daemon_snapshot() {
             snapshot.relay_connected,
             &snapshot.peers,
             vip,
+            snapshot.ready_phase == "connected_manual",
         );
         assert!(known.contains(&phase), "derived unknown phase {phase}");
     }
@@ -83,11 +84,7 @@ fn events_fixture_deserializes_into_status_events() {
         serde_json::from_str(&raw).expect("events.json must deserialize into EventsResponse");
     assert_eq!(response.contract_version, 1);
     let expected: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let actual = serde_json::to_value(EventsResponse::new(
-        response.revision,
-        response.events.clone(),
-    ))
-    .unwrap();
+    let actual = serde_json::to_value(response.clone()).unwrap();
     assert_eq!(
         actual, expected,
         "events serializer must match the shared fixture"

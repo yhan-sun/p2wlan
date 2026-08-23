@@ -133,6 +133,14 @@ impl PeerManager {
         if generation != self.current_network_generation_sync() {
             return false;
         }
+        // Bind the commit to the exact currently-online peer lifecycle while
+        // the network-epoch gate is held. PeerLeft/offline/rejoin and public
+        // key/incarnation replacement rotate this generation under the same
+        // gate, so no late ACK can turn a terminal Closed connection back into
+        // Direct (including a same-node ABA rejoin).
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+            return false;
+        };
         // An exact, decrypted validation ACK is authoritative evidence for
         // this request/generation/endpoint.  Its RTT is recorded for path
         // quality and the make-before-break selector can switch immediately.
@@ -144,6 +152,12 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
+            if !self.peer_session_is_current_sync(node_id, peer_session_generation)
+                || !conn.online
+                || conn.state == ConnectionState::Closed
+            {
+                return false;
+            }
             if expected_remote_candidate_epoch
                 .is_some_and(|expected| conn.remote_candidate_epoch() != expected)
             {
@@ -513,6 +527,12 @@ impl PeerManager {
                 return false;
             }
             let ack_confirmed = latency.is_some();
+            let selected_endpoint = conn
+                .selected_direct_endpoint_for_consent(generation)
+                .or(conn.endpoint);
+            let alternate_direct_candidate = ack_confirmed
+                && conn.state == ConnectionState::Direct
+                && selected_endpoint.is_some_and(|selected| selected != endpoint);
             let slow_probe_retained = ack_confirmed
                 && latency.is_some_and(|latency| {
                     duration_millis(latency) >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS
@@ -538,11 +558,6 @@ impl PeerManager {
                     // the very endpoint we just quarantined and would cause
                     // delayed ACKs from other sockets to keep re-validating
                     // the same queue-prone mapping.
-                    let selected_endpoint = conn
-                        .selected_direct_endpoint_for_consent(generation)
-                        .or(conn.endpoint);
-                    let alternate_direct_candidate = conn.state == ConnectionState::Direct
-                        && selected_endpoint.is_some_and(|selected| selected != endpoint);
                     if !alternate_direct_candidate {
                         conn.endpoint = Some(endpoint);
                     }
@@ -564,7 +579,12 @@ impl PeerManager {
             };
             match latency {
                 Some(latency) => {
-                    if !slow_probe_retained {
+                    // Candidate-pair RTT belongs to every matched ACK, but the
+                    // peer-level Direct RTT represents the ACTIVE business
+                    // path only. A delayed/alternate endpoint ACK must not make
+                    // the UI and path ranking report its latency for the still-
+                    // selected endpoint.
+                    if !slow_probe_retained && !alternate_direct_candidate {
                         conn.direct_health.record_success_with_latency(latency);
                     }
                     if let Some((source, true)) = pair_success {

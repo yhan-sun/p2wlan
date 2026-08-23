@@ -97,11 +97,17 @@ class EventsResponse {
     required this.contractVersion,
     required this.revision,
     required this.events,
+    this.oldestSeq = 0,
+    this.resetRequired = false,
+    this.processId,
   });
 
   final int contractVersion;
   final int revision;
   final List<DiagnosticEvent> events;
+  final int oldestSeq;
+  final bool resetRequired;
+  final int? processId;
 
   factory EventsResponse.fromJson(JsonMap json) {
     final version = _contractVersion(json);
@@ -113,6 +119,9 @@ class EventsResponse {
     return EventsResponse(
       contractVersion: version,
       revision: _requiredInt(json['revision'], 'EventsResponse.revision'),
+      oldestSeq: _int(json['oldest_seq']),
+      resetRequired: _bool(json['reset_required']),
+      processId: _intOrNull(json['process_id']),
       events: [
         for (final item in rawEvents)
           DiagnosticEvent.fromJson(_requiredMap(item, 'EventsResponse.events')),

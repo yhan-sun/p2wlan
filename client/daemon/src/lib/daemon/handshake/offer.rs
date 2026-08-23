@@ -100,6 +100,7 @@ impl Daemon {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -110,7 +111,14 @@ impl Daemon {
         owner: u64,
         cancellation: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        if self.peers.current_network_generation_sync() != offer.network_generation {
+        let Some(peer_session_generation) = offer.peer_session_generation else {
+            return Ok(());
+        };
+        if self.peers.current_network_generation_sync() != offer.network_generation
+            || !self
+                .peers
+                .peer_session_is_current_sync(&offer.from_node_id, peer_session_generation)
+        {
             self.timeline.emit(
                 "peer_offer_rejected",
                 None,
@@ -135,6 +143,7 @@ impl Daemon {
             Some(cancellation),
             Some(owner),
             Some(offer.network_generation),
+            Some(peer_session_generation),
         )
         .await
     }
@@ -152,6 +161,7 @@ impl Daemon {
         mut cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
         responder_work_owner: Option<u64>,
         expected_network_generation: Option<u64>,
+        expected_peer_session_generation: Option<PeerSessionGeneration>,
     ) -> Result<()> {
         if cancellation
             .as_deref()
@@ -175,16 +185,11 @@ impl Daemon {
             );
             return Ok(());
         }
-        let Some(handshake_guard) = self
-            .acquire_responder_handshake_guard(from_node_id, cancellation.as_deref_mut())
-            .await?
-        else {
-            return Ok(());
-        };
-        if cancellation
-            .as_deref()
-            .is_some_and(|cancellation| *cancellation.borrow())
-        {
+        if expected_peer_session_generation.is_some_and(|expected| {
+            !self
+                .peers
+                .peer_session_is_current_sync(from_node_id, expected)
+        }) {
             return Ok(());
         }
         if let Some(owner) = responder_work_owner {
@@ -197,6 +202,25 @@ impl Daemon {
                 return Ok(());
             }
         }
+        let Some(handshake_guard) = self
+            .acquire_responder_handshake_guard(from_node_id, cancellation.as_deref_mut())
+            .await?
+        else {
+            return Ok(());
+        };
+        if cancellation
+            .as_deref()
+            .is_some_and(|cancellation| *cancellation.borrow())
+        {
+            return Ok(());
+        }
+        // `responder_work` is cooperatively polled by the serial control task.
+        // Holding this arbiter across any subsequent async lock/HTTP/session
+        // await can self-deadlock when a lifecycle branch waits on the arbiter
+        // and thereby stops polling the responder future. The arbiter is only
+        // an admission barrier here; exact worker/lifecycle fences protect the
+        // delayed staging and commit below.
+        drop(handshake_guard);
         let initiation = MessageInitiation::from_bytes(handshake_init)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard initiation: {e}")))?;
         // The static WireGuard public keys provide a deterministic role: the
@@ -387,6 +411,16 @@ impl Daemon {
         // A valid offer from the designated initiator supersedes any stale
         // local initiator reservation left by an older retry path. Remove its
         // Probe binding as one transaction before staging the responder key.
+        if expected_network_generation
+            .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+            || expected_peer_session_generation.is_some_and(|expected| {
+                !self
+                    .peers
+                    .peer_session_is_current_sync(from_node_id, expected)
+            })
+        {
+            return Ok(());
+        }
         let superseded_initiator_token = {
             let mut state = self.pending_handshakes.lock().await;
             let token = state.session_id(from_node_id).map(str::to_string);
@@ -408,6 +442,11 @@ impl Daemon {
         // the source of a responder-answer deadlock.
         if expected_network_generation
             .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+            || expected_peer_session_generation.is_some_and(|expected| {
+                !self
+                    .peers
+                    .peer_session_is_current_sync(from_node_id, expected)
+            })
         {
             self.timeline.emit(
                 "peer_offer_rejected",
@@ -511,6 +550,11 @@ impl Daemon {
         );
         if expected_network_generation
             .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+            || expected_peer_session_generation.is_some_and(|expected| {
+                !self
+                    .peers
+                    .peer_session_is_current_sync(from_node_id, expected)
+            })
         {
             self.timeline.emit(
                 "peer_answer_stage_invalidated",
@@ -551,7 +595,6 @@ impl Daemon {
         // relay transport is already available, an empty snapshot is valid and
         // lets the encrypted session/relay probe complete before Direct
         // candidates arrive. Candidate refresh remains a background upgrade.
-        drop(handshake_guard);
         let (candidates, candidate_sources) = {
             let snapshot = self.cached_local_candidate_set().await;
             let mut relay_available = self.relay_available_tx.subscribe();
@@ -654,7 +697,17 @@ impl Daemon {
         // Re-enter the state boundary after the slow POST.  Lifecycle cleanup
         // can cancel this exact responder owner while the request is in
         // flight; a stale task must not refresh grace or commit a replacement.
-        let Some(_handshake_guard) = self
+        if let Some(owner) = responder_work_owner {
+            let current = self
+                .pending_handshakes
+                .lock()
+                .await
+                .responder_work_is_current(from_node_id, owner);
+            if !current {
+                return Ok(());
+            }
+        }
+        let Some(handshake_guard) = self
             .acquire_responder_handshake_guard(from_node_id, cancellation.as_deref_mut())
             .await?
         else {
@@ -666,16 +719,7 @@ impl Daemon {
         {
             return Ok(());
         }
-        if let Some(owner) = responder_work_owner {
-            let current = self
-                .pending_handshakes
-                .lock()
-                .await
-                .responder_work_is_current(from_node_id, owner);
-            if !current {
-                return Ok(());
-            }
-        }
+        drop(handshake_guard);
         // Refresh both pending slots after the HTTP attempt. This separates
         // potentially slow control-plane delivery from the wide direct
         // adoption window; an ambiguous error intentionally leaves both
@@ -737,6 +781,11 @@ impl Daemon {
         let epoch_guard = epoch_gate.lock().await;
         if expected_network_generation
             .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
+            || expected_peer_session_generation.is_some_and(|expected| {
+                !self
+                    .peers
+                    .peer_session_is_current_sync(from_node_id, expected)
+            })
         {
             drop(epoch_guard);
             drop(emit_guard);
@@ -809,9 +858,23 @@ impl Daemon {
             .await
             .map(|connection| connection.state);
         if should_mark_connecting_after_session_install(had_active, current_state) {
-            self.peers
-                .update_state(from_node_id, ConnectionState::Connecting)
-                .await;
+            if let Some(expected) = expected_peer_session_generation {
+                if !self
+                    .peers
+                    .update_state_if_peer_session_current(
+                        from_node_id,
+                        expected,
+                        ConnectionState::Connecting,
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+            } else {
+                self.peers
+                    .update_state(from_node_id, ConnectionState::Connecting)
+                    .await;
+            }
         }
         info!(
             "Committed WireGuard responder answer for {from_node_id} ({} bytes, {} candidates, rekey={had_active}, commit={commit:?})",

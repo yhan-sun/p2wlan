@@ -62,6 +62,20 @@ pub(crate) struct HardHardSessionRecord {
 pub struct PeerManager {
     /// Active peer connections, indexed by node ID.
     connections: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    /// No-await mirror of connection-map membership and peer lifecycle.
+    ///
+    /// The serial control-signal consumer must be able to decide whether an
+    /// offer raced PeerJoined without waiting behind an unrelated, long-lived
+    /// `connections` writer.  The same mirror also gives UDP adoption paths a
+    /// precise lifecycle fence instead of treating `try_read` contention as a
+    /// missing peer. Structural add/remove, identity, online, and remote
+    /// incarnation transitions update this state while they own the network
+    /// epoch and connection writer; ordinary metadata/endpoint refreshes do
+    /// not rotate the session generation.
+    peer_membership: Arc<std::sync::Mutex<PeerMembershipState>>,
+    #[cfg(test)]
+    authenticated_probe_verify_gate:
+        Arc<std::sync::Mutex<Option<(String, Arc<AuthenticatedProbeVerifyGate>)>>>,
     /// Last complete diagnostics snapshot.  Diagnostics must never turn a
     /// contended connection writer into a false empty roster; the snapshot is
     /// only a fallback while the live lock is unavailable.
@@ -170,6 +184,10 @@ pub struct PeerManager {
     /// budgets (probe credit, fresh generations, HTTP publishes) and the
     /// feedback-driven stage machine.
     recovery_epochs: Arc<RwLock<HashMap<String, RecoveryEpochState>>>,
+    /// Process-monotonic identity for concrete recovery-epoch allocations.
+    /// Numeric per-peer epochs restart after teardown, so delayed reservations
+    /// use this non-reused allocation ID to fail closed across epoch ABA.
+    recovery_epoch_allocation_id: std::sync::atomic::AtomicU64,
     /// Outbound-UDP liveness verdict cache, keyed by `(peer_id, generation)`.
     /// TTL-bounded (`config.network.udp_liveness_ttl_ms`) and invalidated on
     /// generation change (a new egress IP makes the old verdict meaningless —
@@ -295,6 +313,9 @@ pub struct PeerUpdate {
     pub virtual_ip_changed: bool,
     pub endpoint_changed: bool,
     pub public_key_changed: bool,
+    /// The control-plane heartbeat advanced only user-visible liveness time;
+    /// no identity, reachability, NAT, path or relay metadata changed.
+    pub last_seen_only: bool,
 }
 
 fn derive_probe_mac_key(config: &Config, peer_public_key: &str) -> Option<ProbeMacKey> {

@@ -28,6 +28,7 @@ async fn run_critical_control_loop(
     mut auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+    health: Option<Arc<crate::tasks::HealthState>>,
 ) {
     let answer_permits = Arc::new(Semaphore::new(CRITICAL_ANSWER_MAX_INFLIGHT));
     let offer_permits = Arc::new(Semaphore::new(CRITICAL_OFFER_MAX_INFLIGHT));
@@ -73,6 +74,7 @@ async fn run_critical_control_loop(
                             event_tx.clone(),
                             ctrl_permits.clone(),
                             relay_selection.clone(),
+                            health.clone(),
                         ));
                     }
                     CriticalControlCommand::Shutdown => {
@@ -120,13 +122,12 @@ async fn run_critical_control_loop(
                 let worker_tx = if let Some(sender) = candidate_workers.get(&peer_id) {
                     sender.clone()
                 } else {
-                    let (sender, receiver) = mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
-                    candidate_tasks.spawn(run_candidate_offer_worker(
-                        receiver,
+                    let sender = spawn_candidate_offer_worker(
+                        &mut candidate_tasks,
                         candidate_http.clone(),
                         auth_rx.clone(),
                         event_tx.clone(),
-                    ));
+                    );
                     candidate_workers.insert(peer_id.clone(), sender.clone());
                     sender
                 };
@@ -141,9 +142,34 @@ async fn run_critical_control_loop(
                     Err(mpsc::error::TrySendError::Closed(command)) => {
                         candidate_workers.remove(&peer_id);
                         warn!(
-                            "Candidate offer worker closed for {peer_id}; reason_code=candidate_offer_worker_closed"
+                            "Candidate offer worker closed for {peer_id}; recreating lane reason_code=candidate_offer_worker_closed"
                         );
-                        let _ = command.response_tx.send(PeerOfferSendOutcome::Failed);
+                        // A completed/panicked worker can leave its sender in
+                        // the routing map until this command observes the
+                        // closed receiver. Recreate the per-peer lane and
+                        // retry the SAME immutable command once; dropping the
+                        // first post-rebind candidate offer would otherwise
+                        // leave the remote peer on the retired UDP endpoint.
+                        let replacement = spawn_candidate_offer_worker(
+                            &mut candidate_tasks,
+                            candidate_http.clone(),
+                            auth_rx.clone(),
+                            event_tx.clone(),
+                        );
+                        candidate_workers.insert(peer_id.clone(), replacement.clone());
+                        if let Err(error) = replacement.try_send(command) {
+                            let command = match error {
+                                mpsc::error::TrySendError::Full(command) => command,
+                                mpsc::error::TrySendError::Closed(command) => {
+                                    candidate_workers.remove(&peer_id);
+                                    command
+                                }
+                            };
+                            warn!(
+                                "Replacement candidate offer worker unavailable for {peer_id}; reason_code=candidate_offer_worker_recreate_failed"
+                            );
+                            let _ = command.response_tx.send(PeerOfferSendOutcome::Failed);
+                        }
                     }
                 }
             }
@@ -154,6 +180,22 @@ async fn run_critical_control_loop(
     candidate_tasks.abort_all();
 }
 
+fn spawn_candidate_offer_worker(
+    candidate_tasks: &mut JoinSet<()>,
+    candidate_http: RouteAwareControlHttpClient,
+    auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
+    event_tx: mpsc::UnboundedSender<ControlEvent>,
+) -> mpsc::Sender<CandidateOfferCommand> {
+    let (sender, receiver) = mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
+    candidate_tasks.spawn(run_candidate_offer_worker(
+        receiver,
+        candidate_http,
+        auth_rx,
+        event_tx,
+    ));
+    sender
+}
+
 /// One per-peer candidate worker.  Requests for different peers run in
 /// parallel, while this receiver preserves the strict order for one peer.
 async fn run_candidate_offer_worker(
@@ -162,6 +204,12 @@ async fn run_candidate_offer_worker(
     mut auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
 ) {
+    enum CandidateOfferAttempt {
+        Completed(Result<()>),
+        OwnershipCancelled,
+        ResponseClosed,
+    }
+
     while let Some(command) = rx.recv().await {
         let CandidateOfferCommand {
             to_node_id,
@@ -232,44 +280,61 @@ async fn run_candidate_offer_worker(
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let result = match http.current() {
-            Err(error) => Err(error),
-            Ok(_) if remaining.is_zero() => Err(DaemonError::ControlPlane(
+            Err(error) => CandidateOfferAttempt::Completed(Err(error)),
+            Ok(_) if remaining.is_zero() => CandidateOfferAttempt::Completed(Err(
+                DaemonError::ControlPlane(
                 "candidate offer deadline exceeded before delivery".into(),
-            )),
+            ))),
             Ok(current_http) => loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    break Err(DaemonError::ControlPlane(
+                    break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
                         "candidate offer deadline exceeded before delivery".into(),
-                    ));
+                    )));
                 }
                 let result = tokio::select! {
+                    biased;
+                    // Fresh ownership can be revoked while the HTTP request is
+                    // already in flight.  Dropping that request is the only
+                    // way to keep a retired dynamic socket's prediction from
+                    // surviving its exact punch/session owner.  This cancels
+                    // only the current immutable command; the per-peer FIFO
+                    // worker remains available for the replacement owner.
+                    _ = async {
+                        if let Some(ownership) = fresh_ownership.as_ref() {
+                            ownership.cancelled().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => CandidateOfferAttempt::OwnershipCancelled,
+                    // Cancelling one owner must abort only this immutable
+                    // request. Returning from the whole per-peer worker leaves
+                    // a closed sender cached in `candidate_workers`, so the
+                    // next (often post-rebind) candidate publication is lost.
+                    _ = response_tx.closed() => CandidateOfferAttempt::ResponseClosed,
                     result = timeout(remaining, send_prepared_signal(
                         &current_http,
                         &auth.base_url,
                         &auth.token,
                         &payload,
-                    )) => {
-                        match result {
-                            Ok(result) => result,
-                            Err(_) => Err(DaemonError::ControlPlane(
-                                "candidate offer deadline exceeded during request".into(),
-                            )),
-                        }
-                    }
-                    _ = response_tx.closed() => return,
+                    )) => CandidateOfferAttempt::Completed(match result {
+                        Ok(result) => result,
+                        Err(_) => Err(DaemonError::ControlPlane(
+                            "candidate offer deadline exceeded during request".into(),
+                        )),
+                    }),
                     changed = auth_rx.changed() => {
                         if changed.is_err() {
-                            break Err(DaemonError::ControlPlane(
+                            break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
                                 "candidate offer control identity watch closed".into(),
-                            ));
+                            )));
                         }
                         if auth_rx.borrow().as_ref().is_some_and(|current| {
                             !auth.same_identity_as(current)
                         }) {
-                            break Err(DaemonError::ControlPlane(
+                            break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
                                 "candidate offer control identity changed during request".into(),
-                            ));
+                            )));
                         }
                         // A duplicate publication of the same identity (for
                         // example, after credential issuance) did not change
@@ -280,6 +345,30 @@ async fn run_candidate_offer_worker(
                 };
                 break result;
             },
+        };
+        let result = match result {
+            CandidateOfferAttempt::Completed(_)
+                if fresh_ownership
+                    .as_ref()
+                    .is_some_and(|ownership| ownership.is_cancelled()) =>
+            {
+                // Close the completion race in which HTTP readiness and
+                // ownership revocation become observable in the same poll.
+                let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
+            CandidateOfferAttempt::Completed(result) => result,
+            CandidateOfferAttempt::OwnershipCancelled => {
+                let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
+            CandidateOfferAttempt::ResponseClosed => {
+                // The response receiver is the request owner's cancellation
+                // token. The in-flight HTTP future was dropped by the select,
+                // so no detached I/O or retry survives; keep the lane for the
+                // next command from this peer.
+                continue;
+            }
         };
         let outcome = match result {
             Ok(()) => {
@@ -425,6 +514,7 @@ async fn run_critical_endpoint_command(
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     permits: Arc<Semaphore>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+    health: Option<Arc<crate::tasks::HealthState>>,
 ) {
     let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
         return;
@@ -469,6 +559,9 @@ async fn run_critical_endpoint_command(
     };
     match &result {
         Ok(()) => {
+            if let Some(health) = health.as_ref() {
+                health.mark_device_lease_success().await;
+            }
             debug!(
                 "Updated endpoint for {} through handshake control lane: {} ({})",
                 auth.self_node_id, endpoint, nat_type
@@ -476,6 +569,13 @@ async fn run_critical_endpoint_command(
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
         Err(error) => {
+            if let Some(health) = health.as_ref() {
+                // Endpoint PATCH is the online lease operation. Preserve API
+                // reachability independently: a later successful GET may
+                // still prove the control API reachable, but it cannot repair
+                // this failed device lease.
+                health.set_device_lease_healthy(false);
+            }
             let _ = event_tx.send(ControlEvent::ServerError {
                 code: 2000,
                 message: error.to_string(),

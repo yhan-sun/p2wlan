@@ -93,23 +93,32 @@ impl PeerManager {
         }
         conn.last_candidates_expires_at_ms = candidates_expires_at_ms;
 
-        // A versioned signal is an explicit remote incarnation of the
-        // candidate set, even when an endpoint string happens to be reused.
-        // Legacy unversioned signals are common during periodic refreshes, so
-        // an identical endpoint set must not reset the birthday cursor or
-        // invalidate a healthy pair merely because the control heartbeat was
-        // repeated.
+        // `candidate_generation` is a freshness revision, not proof that the
+        // peer rebound its UDP transport.  Production assigns a new revision
+        // to every offer/answer (including routine WireGuard rekeys), so only
+        // an actual endpoint-set change may advance the remote transport epoch.
         let incoming_signaled = valid_candidates.iter().cloned().collect::<HashSet<_>>();
-        let remote_candidate_set_changed = candidate_generation != 0
-            || conn.signaled_candidates != incoming_signaled;
-        if remote_candidate_set_changed {
-            // Candidate publication is a remote transport handover. Advance
-            // the local epoch before touching the new set so old pair proofs
-            // and in-flight punch tasks cannot be mistaken for the new remote
-            // socket.
-            conn.mark_remote_candidate_generation_changed(
+        let remote_candidate_set_changed = conn.signaled_candidates != incoming_signaled;
+        // Make-before-break for an encrypted-confirmed Direct path: a revised
+        // set that still advertises the selected endpoint is continuity of the
+        // same live remote transport.  Alternate candidates may be added or
+        // withdrawn without tearing down that proven path.  If the selected
+        // endpoint disappears (or there is no Direct proof), the change is a
+        // real handover and retains the strict epoch/cancellation fence.
+        let retained_direct_endpoint = remote_candidate_set_changed
+            .then(|| {
+                (conn.state == ConnectionState::Direct)
+                    .then(|| conn.selected_direct_endpoint_for_consent(generation))
+                    .flatten()
+                    .filter(|endpoint| incoming_signaled.contains(&endpoint.to_string()))
+            })
+            .flatten();
+        let remote_transport_handover =
+            remote_candidate_set_changed && retained_direct_endpoint.is_none();
+        if remote_transport_handover {
+            conn.mark_remote_transport_handover(
                 generation,
-                "accepted newer remote candidate set",
+                "accepted remote candidate set that replaced the active transport context",
             );
             conn.direct_commit_seq = conn.direct_commit_seq.wrapping_add(1);
             self.bump_direct_commit_seq(node_id);
@@ -169,6 +178,30 @@ impl PeerManager {
             }
         }
 
+        if let Some(endpoint) = retained_direct_endpoint {
+            let retired_pairs = conn.retire_withdrawn_signaled_candidate_pairs(
+                &incoming_signaled,
+                "candidate revision withdrew an alternate endpoint while retaining the encrypted-confirmed Direct transport",
+            );
+            conn.mark_remote_candidate_revision_with_direct_continuity(
+                generation,
+                endpoint,
+                candidate_generation,
+                retired_pairs,
+            );
+        } else if !remote_candidate_set_changed && candidate_generation != 0 {
+            conn.record_direct_event(
+                generation,
+                "candidate_revision_refreshed",
+                conn.endpoint,
+                Some(valid_candidates.len()),
+                None,
+                format!(
+                    "accepted freshness revision {candidate_generation} for an unchanged remote candidate set; transport epoch retained"
+                ),
+            );
+        }
+
         if !valid_candidates.is_empty() {
             conn.record_direct_event(
                 generation,
@@ -190,7 +223,7 @@ impl PeerManager {
                 .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
         }
         drop(connections);
-        if remote_candidate_set_changed {
+        if remote_transport_handover {
             self.cancel_direct_validation_for_remote_candidate_change(node_id)
                 .await;
         }

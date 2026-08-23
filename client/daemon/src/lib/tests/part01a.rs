@@ -1269,6 +1269,192 @@ async fn scheduled_hole_punch_skips_direct_peer_even_with_live_candidates() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_udp_lease_cancels_old_detached_punch_without_touching_replacement() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "udp-punch-lifecycle").unwrap(),
+    ));
+    let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = remote_socket.local_addr().unwrap();
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers
+        .add_candidates("node-b", &[endpoint.to_string()])
+        .await;
+
+    let publication = UdpTransportPublication::new(Arc::new(RwLock::new(None)));
+    let old_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let old_addr = old_udp.local_addr().unwrap();
+    let old_lease = publication.publish(old_udp.clone()).await;
+    let deduplicator = PunchAttemptDeduplicator::default();
+
+    // The call has returned only after its detached worker claimed the permit
+    // and captured `old_udp`. On current-thread Tokio the worker cannot run
+    // before this task next yields, so replacing the publication below is a
+    // deterministic cancellation-before-first-poll fence.
+    spawn_hole_punch_task_with_lifecycle(
+        old_udp,
+        peers.clone(),
+        deduplicator.clone(),
+        "node-b".to_string(),
+        Duration::from_millis(5),
+        1,
+        Some(unix_time_millis() + 150),
+        None,
+        None,
+        None,
+        Some(old_lease.shutdown_receiver()),
+    )
+    .await;
+    assert_eq!(deduplicator.active_session_count(), 1);
+
+    let replacement_udp =
+        UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+    let replacement_addr = replacement_udp.local_addr().unwrap();
+    assert_ne!(replacement_addr, old_addr);
+    let replacement_lease = publication.publish(replacement_udp.clone()).await;
+    let replacement_generation = peers
+        .advance_network_generation("replace UDP transport in lifecycle regression")
+        .await;
+
+    timeout(Duration::from_secs(1), async {
+        while deduplicator.active_session_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old lease cancellation must drop its exact punch permit");
+
+    let mut datagram = [0u8; 2048];
+    assert!(
+        timeout(Duration::from_millis(350), remote_socket.recv_from(&mut datagram))
+            .await
+            .is_err(),
+        "the detached worker must not send from the withdrawn UDP socket"
+    );
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert!(
+        !conn.direct_events.iter().any(|event| {
+            event.network_generation == replacement_generation
+                && matches!(
+                    event.stage.as_str(),
+                    "punch_scheduled"
+                        | "punch_started"
+                        | "direct_fast_probe_started"
+                        | "punch_first_send_dispatch"
+                        | "punch_first_packet_sent"
+                )
+        }),
+        "a cancelled old worker must not write recovery progress into the replacement generation"
+    );
+
+    // A separate receiver scopes the replacement invocation. Cancelling the
+    // old session must not use the peer-wide deduplicator API or suppress this
+    // new transport's worker.
+    spawn_hole_punch_task_with_lifecycle(
+        replacement_udp,
+        peers,
+        deduplicator,
+        "node-b".to_string(),
+        Duration::ZERO,
+        1,
+        None,
+        None,
+        None,
+        None,
+        Some(replacement_lease.shutdown_receiver()),
+    )
+    .await;
+    let (_, source) = timeout(Duration::from_secs(2), remote_socket.recv_from(&mut datagram))
+        .await
+        .expect("replacement worker must remain send-capable")
+        .expect("replacement UDP probe receive must succeed");
+    assert_eq!(
+        source, replacement_addr,
+        "only the replacement transport may send after supersession"
+    );
+}
+
+#[tokio::test]
+async fn late_hole_punch_send_error_cannot_degrade_same_node_rejoin() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "hole-punch-send-error-lifecycle").unwrap(),
+    ));
+    let peer = control::PeerInfo {
+        node_id: "node-b".to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: "old-peer-key".to_string(),
+        endpoint: "198.51.100.20:42000".to_string(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 1,
+        relay_rtt_ms: None,
+    };
+    peers.add_peer(&peer).await;
+    let stale_lifecycle = peers
+        .peer_session_generation_sync("node-b")
+        .expect("first online lifecycle must exist");
+
+    peers.remove_peer("node-b").await;
+    let mut replacement = peer;
+    replacement.public_key = "replacement-peer-key".to_string();
+    replacement.last_seen = 2;
+    peers.add_peer(&replacement).await;
+    let replacement_lifecycle = peers
+        .peer_session_generation_sync("node-b")
+        .expect("replacement online lifecycle must exist");
+    assert_ne!(stale_lifecycle, replacement_lifecycle);
+
+    peers
+        .update_state("node-b", ConnectionState::HolePunching)
+        .await;
+    assert!(matches!(
+        peers.recovery_epoch_admit("node-b").await,
+        RecoveryAdmission::Accepted { .. }
+    ));
+    let network_generation = peers.current_network_generation_sync();
+
+    assert!(
+        !record_hole_punch_send_error_for_lifecycle(
+            &peers,
+            "node-b",
+            network_generation,
+            stale_lifecycle,
+            "late old-worker send error",
+        )
+        .await,
+        "an old punch worker must not commit into a same-node replacement"
+    );
+
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::HolePunching);
+    assert_eq!(conn.direct_health.failure_count, 0);
+    assert!(conn.direct_health.last_error.is_none());
+    assert_eq!(
+        peers.recovery_stage_for("node-b").await,
+        RecoveryStage::Initial,
+        "the old worker must not move the replacement recovery epoch to relay backoff"
+    );
+}
+
 #[tokio::test]
 async fn scheduled_hole_punch_skips_without_degrading_already_direct_peer() {
     let peers = Arc::new(PeerManager::new(

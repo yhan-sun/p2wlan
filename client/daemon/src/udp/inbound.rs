@@ -2,6 +2,7 @@ impl UdpTransport {
     /// Commit a modern responder handshake transaction from an authenticated
     /// pending Probe-v2 packet. WireGuard is promoted first; Probe is only
     /// promoted for the same exact token after that succeeds.
+    #[cfg(test)]
     async fn confirm_pending_probe_adoption(&self, peer_id: &str, token: &str) -> bool {
         let Some(wireguard) = self.wireguard_transport.as_ref() else {
             return false;
@@ -11,6 +12,39 @@ impl UdpTransport {
             .confirm_probe_and_transport_transaction(peer_id, token, || async {
                 matches!(
                     wireguard.confirm_responder_session(peer_id, token).await,
+                    ResponderSessionConfirmation::Promoted
+                        | ResponderSessionConfirmation::AlreadyActive
+                )
+            })
+            .await
+        {
+            return false;
+        }
+        wireguard
+            .acknowledge_promoted_responder_token(peer_id, token)
+            .await;
+        true
+    }
+
+    /// Commit the same cross-layer transaction when the inbound handler
+    /// acquired WireGuard's emit guard before UDP adoption and the global
+    /// network-epoch gate.
+    async fn confirm_pending_probe_adoption_with_emit_guard(
+        &self,
+        peer_id: &str,
+        token: &str,
+        emit_guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> bool {
+        let Some(wireguard) = self.wireguard_transport.as_ref() else {
+            return false;
+        };
+        if !self
+            .peers
+            .confirm_probe_and_transport_transaction(peer_id, token, || async {
+                matches!(
+                    wireguard
+                        .confirm_responder_session_with_emit_guard(peer_id, token, emit_guard)
+                        .await,
                     ResponderSessionConfirmation::Promoted
                         | ResponderSessionConfirmation::AlreadyActive
                 )
@@ -324,7 +358,36 @@ impl UdpTransport {
                     _ => None,
                 };
                 let matched_probe_session_id = key_candidate.session_id.clone();
+                let peer_session_generation = key_candidate.session_generation;
                 let key = key_candidate.key;
+                #[cfg(test)]
+                let authenticated_probe_verify_gate = self
+                    .peers
+                    .pause_after_authenticated_probe_verify_for_test(&identity.source_node_id)
+                    .await;
+                // A pending Probe key may promote the matching WireGuard
+                // responder session. Reserve its counter-ordering turn before
+                // either branch acquires adoption -> epoch, preserving the
+                // canonical cross-layer order `emit -> adoption -> epoch`.
+                // The lifecycle stamp below is still authoritative if the
+                // peer changes while this per-peer lock is contended.
+                let pending_emit_guard = match (
+                    pending_token.as_ref(),
+                    self.wireguard_transport.as_ref(),
+                ) {
+                    (Some(_), Some(wireguard)) => {
+                        #[cfg(test)]
+                        if let Some(gate) = authenticated_probe_verify_gate.as_ref() {
+                            gate.pending_emit_wait_started.notify_one();
+                        }
+                        Some(
+                            wireguard
+                                .acquire_outbound_emit_guard(&identity.source_node_id)
+                                .await,
+                        )
+                    }
+                    _ => None,
+                };
                 // Probe v2 carries the *sender's* local generation.  Timeout
                 // diagnostics are scoped to this daemon's punch generation,
                 // so never use the remote counter as the local map key.
@@ -333,6 +396,28 @@ impl UdpTransport {
                 let received_local_generation = self.peers.current_network_generation().await;
                 match packet.kind {
                     PunchPacketKind::Punch => {
+                        // Bind every effect of the authenticated packet to the
+                        // exact peer lifecycle that owned the MAC key.  The
+                        // lifecycle writers use the shared epoch gate while
+                        // publishing a new session generation; holding
+                        // adoption -> epoch here therefore makes the check,
+                        // replay/rate admission, ACK and all evidence adoption
+                        // one transaction.  A verified packet from an old
+                        // same-ID incarnation is rejected before it can even
+                        // consume the replacement session's replay budget.
+                        let adoption = self.adoption_lock_for(&identity.source_node_id).await;
+                        let adoption_guard = adoption.lock().await;
+                        let epoch_guard = self.network_epoch_gate.lock().await;
+                        if !self.peers.peer_session_is_current_sync(
+                            &identity.source_node_id,
+                            peer_session_generation,
+                        ) {
+                            trace!(
+                                "Ignored authenticated UDP punch from {}; peer lifecycle changed after MAC verification",
+                                identity.source_node_id
+                            );
+                            continue;
+                        }
                         self.update_peer_probe_rx_diagnostics(
                             &identity.source_node_id,
                             received_local_generation,
@@ -363,12 +448,18 @@ impl UdpTransport {
                         {
                             AuthenticatedPunchAdmission::Accepted => {
                                 if let Some(token) = pending_token.as_deref() {
-                                    if self
-                                        .confirm_pending_probe_adoption(
-                                            &identity.source_node_id,
-                                            token,
-                                        )
-                                        .await
+                                    let promoted = match pending_emit_guard.as_ref() {
+                                        Some(emit_guard) => {
+                                            self.confirm_pending_probe_adoption_with_emit_guard(
+                                                &identity.source_node_id,
+                                                token,
+                                                emit_guard,
+                                            )
+                                            .await
+                                        }
+                                        None => false,
+                                    };
+                                    if promoted
                                     {
                                         debug!(
                                             "Promoted matching WireGuard and Probe v2 bindings for peer {} after accepted authenticated punch",
@@ -489,22 +580,6 @@ impl UdpTransport {
                             );
                             continue;
                         }
-                        // The adoption section (socket pin, direct success
-                        // accounting, peer-reflexive notification) runs under
-                        // the peer's adoption lock, re-verifying the peer
-                        // still exists: a PeerLeft cleanup that raced this
-                        // punch must not leave affinity or candidate state
-                        // for a peer that no longer exists (a same-ID rejoin
-                        // would otherwise inherit it).
-                        let adoption = self.adoption_lock_for(&identity.source_node_id).await;
-                        let _adoption_guard = adoption.lock().await;
-                        if !self.peers.peer_exists_sync(&identity.source_node_id) {
-                            trace!(
-                                "Ignored authenticated UDP punch from {}; peer was removed before adoption",
-                                identity.source_node_id
-                            );
-                            continue;
-                        }
                         self.peers
                             .record_predicted_window_hit_if_predicted(&identity.source_node_id, source)
                             .await;
@@ -524,13 +599,22 @@ impl UdpTransport {
                                 )
                                 .await;
                         }
-                        self.remember_peer_socket(
-                            &identity.source_node_id,
-                            socket_index,
-                            SocketEvidence::Fresh,
-                        )
-                        .await;
+                        let _ = self
+                            .remember_peer_socket_for_generation_in_epoch(
+                                &epoch_guard,
+                                &identity.source_node_id,
+                                socket_index,
+                                generation,
+                                SocketEvidence::Fresh,
+                            )
+                            .await;
                         self.notify_peer_reflexive_observation(&identity.source_node_id, source).await;
+
+                        // Triggered probes register pending state under the
+                        // epoch gate themselves. Release this transaction
+                        // first to preserve the single acquisition order.
+                        drop(epoch_guard);
+                        drop(adoption_guard);
 
                         if ack_sent {
                             debug!(
@@ -571,6 +655,17 @@ impl UdpTransport {
                             .adoption_lock_for(&identity.source_node_id)
                             .await;
                         let _adoption_guard = adoption.lock().await;
+                        let epoch_guard = self.network_epoch_gate.lock().await;
+                        if !self.peers.peer_session_is_current_sync(
+                            &identity.source_node_id,
+                            peer_session_generation,
+                        ) {
+                            trace!(
+                                "Ignored authenticated UDP ACK from {}; peer lifecycle changed after MAC verification",
+                                identity.source_node_id
+                            );
+                            continue;
+                        }
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
                             let remote_candidate_epoch = self
@@ -719,12 +814,18 @@ impl UdpTransport {
                                 continue;
                             }
                             if let Some(token) = pending_token.as_deref() {
-                                if self
-                                    .confirm_pending_probe_adoption(
-                                        &identity.source_node_id,
-                                        token,
-                                    )
-                                    .await
+                                let promoted = match pending_emit_guard.as_ref() {
+                                    Some(emit_guard) => {
+                                        self.confirm_pending_probe_adoption_with_emit_guard(
+                                            &identity.source_node_id,
+                                            token,
+                                            emit_guard,
+                                        )
+                                        .await
+                                    }
+                                    None => false,
+                                };
+                                if promoted
                                 {
                                     debug!(
                                         "Promoted matching WireGuard and Probe v2 bindings for peer {} after matched authenticated ACK",
@@ -784,12 +885,15 @@ impl UdpTransport {
                                 },
                             )
                             .await;
-                            self.remember_peer_socket(
-                                &identity.source_node_id,
-                                socket_index,
-                                SocketEvidence::Stamped(socket_epoch),
-                            )
-                            .await;
+                            let _ = self
+                                .remember_peer_socket_for_generation_in_epoch(
+                                    &epoch_guard,
+                                    &identity.source_node_id,
+                                    socket_index,
+                                    generation,
+                                    SocketEvidence::Stamped(socket_epoch),
+                                )
+                                .await;
                             self.peers
                                 .learn_authenticated_endpoint(&identity.source_node_id, source)
                                 .await;

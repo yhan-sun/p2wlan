@@ -31,27 +31,61 @@ mod tests {
                 {
                     "online": true,
                     "active_path": "relay",
-                    "state": "relay",
+                    "state": "direct",
                     "relay_confirmed_endpoint": "relay.example:18081",
                     "relay_confirmed_generation": 0,
                     "relay": {"latency_ms": 43}
                 },
                 {
-                    "online": true,
+                    "online": false,
                     "active_path": "direct",
-                    "state": "hole_punching",
+                    "state": "direct",
                     "direct": {"latency_ms": 1}
                 },
                 {
                     "online": true,
                     "active_path": "relay",
                     "state": "relay",
-                    "relay": {"latency_ms": 2}
+                    "relay_confirmed_endpoint": "relay.example:18081",
+                    "relay_confirmed_generation": 0,
+                    "remote_relay_latency_ms": 2,
+                    "relay": {}
+                },
+                {
+                    "online": true,
+                    "active_path": "direct",
+                    "state": "hole_punching",
+                    "direct": {"latency_ms": 3}
                 }
             ]
         });
 
         assert_eq!(average_verified_latency_ms(&status), Some(34));
+        assert_eq!(verified_online_connection_count(&status), Some(3));
+    }
+
+    #[test]
+    fn device_menu_contains_online_roster_only() {
+        let status = serde_json::json!({
+            "peers": [
+                {
+                    "node_id": "online",
+                    "device_name": "Online",
+                    "virtual_ip": "10.20.0.2",
+                    "online": true
+                },
+                {
+                    "node_id": "offline",
+                    "device_name": "Offline",
+                    "virtual_ip": "10.20.0.3",
+                    "online": false
+                }
+            ]
+        });
+
+        let menu = tray_device_menu(&status);
+        assert_eq!(menu.total, 1);
+        assert_eq!(menu.devices[0].name, "Online");
     }
 
     #[test]

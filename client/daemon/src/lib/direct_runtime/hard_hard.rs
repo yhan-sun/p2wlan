@@ -14,6 +14,92 @@ const HARD_HARD_DIRECT_CONFIRMATION_GRACE: Duration = Duration::from_secs(1);
 const HARD_HARD_SWEEP_INTERVAL: Duration = Duration::from_millis(20);
 const HARD_HARD_SWEEP_ATTEMPTS: u32 = 2;
 const HARD_HARD_MAX_PREDICTION_TARGETS: usize = 96;
+const HARD_HARD_PROTECTED_CLAIM_RETRY_SLACK: Duration = Duration::from_millis(10);
+
+/// Until an initiator record is installed in the manager ledger, no other
+/// owner will cancel its shared handle when the short-lived punch permit is
+/// dropped.  Make every pre-ledger return (including cancellation/panic
+/// unwinding) cancel the exact handle so the UDP-lease watcher cannot outlive
+/// a failed measurement until the whole transport is replaced.
+struct PendingHardHardSessionCancellation {
+    cancellation: Option<Arc<crate::PunchSessionCancellation>>,
+}
+
+impl PendingHardHardSessionCancellation {
+    fn new(cancellation: Arc<crate::PunchSessionCancellation>) -> Self {
+        Self {
+            cancellation: Some(cancellation),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cancellation = None;
+    }
+}
+
+impl Drop for PendingHardHardSessionCancellation {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel_for_hard_hard_cleanup();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardHardInitiatorStart {
+    /// A new Hard↔Hard measurement worker owns the punch session.
+    Started,
+    /// The peer already has a live Hard↔Hard ledger session.
+    ExistingSession,
+    /// Another punch permit already owns this peer's recovery window.
+    ExistingPunchOwner,
+    /// The UDP publication lease which requested this attempt was already
+    /// withdrawn.  This invocation is handled by stopping; it must not fall
+    /// through and attach an ordinary worker to the same retired socket.
+    InvocationCancelled,
+    /// Hard↔Hard did not acquire an owner; the caller must continue through
+    /// the ordinary synchronized-punch path.
+    NotStarted(HardHardInitiatorNotStarted),
+}
+
+impl HardHardInitiatorStart {
+    pub(crate) fn is_handled(self) -> bool {
+        !matches!(self, Self::NotStarted(_))
+    }
+
+    pub(crate) fn fallback_reason(self) -> Option<&'static str> {
+        match self {
+            Self::NotStarted(reason) => Some(reason.label()),
+            Self::Started
+            | Self::ExistingSession
+            | Self::ExistingPunchOwner
+            | Self::InvocationCancelled => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardHardInitiatorNotStarted {
+    PlanChanged,
+    BootEpochUnavailable,
+    InsufficientStunObservers,
+    RecoverySuperseded,
+    RecoveryBudgetExhausted,
+    FreshGenerationQuotaExhausted,
+}
+
+impl HardHardInitiatorNotStarted {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PlanChanged => "plan_changed_before_start",
+            Self::BootEpochUnavailable => "boot_epoch_unavailable",
+            Self::InsufficientStunObservers => "insufficient_stun_observers",
+            Self::RecoverySuperseded => "recovery_superseded",
+            Self::RecoveryBudgetExhausted => "recovery_budget_exhausted",
+            Self::FreshGenerationQuotaExhausted => "fresh_generation_quota_exhausted",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HardHardRole {
@@ -227,6 +313,207 @@ fn hard_hard_punch_window_is_usable(now_ms: u64, punch_at_ms: u64) -> bool {
         && punch_at_ms <= now_ms.saturating_add(HARD_HARD_SESSION_TTL.as_millis() as u64)
 }
 
+/// A fresh Hard↔Hard response normally preempts an ordinary punch, but the
+/// deduplicator deliberately protects an ordinary rendezvous which already
+/// reached its lead/first-send edge.  Wait only until that short protection is
+/// guaranteed to have elapsed, then retry exactly once while the much longer
+/// canonical Hard↔Hard window is still useful.
+fn hard_hard_protected_claim_retry_delay(
+    deferred: DeferredPunchClaim,
+    now_ms: u64,
+) -> Option<Duration> {
+    let guard_ms = RELAY_ASSISTED_PUNCH_LEAD.as_millis().min(u64::MAX as u128) as u64;
+    let slack_ms = HARD_HARD_PROTECTED_CLAIM_RETRY_SLACK
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let max_delay_ms = guard_ms.saturating_mul(2).saturating_add(slack_ms);
+    let delay_ms = match deferred.reason {
+        PunchClaimDeferredReason::FirstSendProtected => guard_ms.saturating_add(slack_ms),
+        PunchClaimDeferredReason::RendezvousLeadProtected => deferred
+            .active_punch_at_ms
+            .map(|active_punch_at_ms| {
+                active_punch_at_ms
+                    .saturating_add(guard_ms)
+                    .saturating_sub(now_ms)
+                    .saturating_add(slack_ms)
+            })
+            .unwrap_or_else(|| guard_ms.saturating_add(slack_ms)),
+        PunchClaimDeferredReason::SameEpochActive
+        | PunchClaimDeferredReason::LowerPriorityActive
+        | PunchClaimDeferredReason::SameOrOlderFreshPrediction => return None,
+    };
+    Some(Duration::from_millis(delay_ms.clamp(1, max_delay_ms)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn claim_hard_hard_responder_session(
+    peers: &PeerManager,
+    punch_deduplicator: &PunchAttemptDeduplicator,
+    peer_id: &str,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+    plan: crate::peer::HardHardPlanSnapshot,
+    epoch: u64,
+    punch_at_ms: u64,
+) -> Option<PunchSessionPermit> {
+    let Some(reservation) = peers
+        .try_begin_fresh_generation_for_epoch(peer_id, epoch)
+        .await
+    else {
+        peers
+            .record_direct_event(
+                peer_id,
+                "hard_hard_fresh_generation_quota_exhausted",
+                None,
+                None,
+                None,
+                "Hard↔Hard responder fresh-generation quota exhausted before punch claim; Relay remains usable",
+            )
+            .await;
+        return None;
+    };
+    if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+        reservation.refund().await;
+        return None;
+    }
+    let claim = punch_deduplicator
+        .claim_for_epoch_with_rendezvous(
+            peer_id,
+            plan.local_network_generation,
+            epoch,
+            PUNCH_PRIORITY_FRESH_PREDICTION,
+            None,
+            Some(punch_at_ms),
+        )
+        .await;
+    let deferred = match claim {
+        RendezvousPunchClaim::Claimed(session) => {
+            reservation.commit();
+            return Some(session);
+        }
+        RendezvousPunchClaim::Deferred(deferred) => deferred,
+    };
+    let epoch_identity = reservation.identity();
+    reservation.refund().await;
+    let Some(retry_delay) =
+        hard_hard_protected_claim_retry_delay(deferred, unix_time_millis())
+    else {
+        peers
+            .record_direct_event(
+                peer_id,
+                "hard_hard_responder_claim_deferred",
+                None,
+                None,
+                None,
+                format!(
+                    "Hard↔Hard responder folded behind session_id={} without retry reason={}",
+                    deferred.active_session_id,
+                    deferred.reason.label(),
+                ),
+            )
+            .await;
+        return None;
+    };
+
+    peers
+        .record_direct_event(
+            peer_id,
+            "hard_hard_responder_claim_deferred",
+            None,
+            None,
+            None,
+            format!(
+                "Hard↔Hard responder waiting once for protected ordinary session_id={} reason={} retry_delay_ms={}",
+                deferred.active_session_id,
+                deferred.reason.label(),
+                retry_delay.as_millis(),
+            ),
+        )
+        .await;
+    sleep(retry_delay).await;
+
+    let retry_fence_is_current = hard_hard_punch_window_is_usable(
+        hard_hard_now_ms(),
+        punch_at_ms,
+    ) && !peers.is_direct(peer_id).await
+        && peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+        && peers
+            .hard_hard_plan_for_peer(peer_id)
+            .await
+            .is_some_and(|current| hard_hard_plan_matches(current, plan))
+        && matches!(
+            peers.recovery_epoch_admit(peer_id).await,
+            RecoveryAdmission::Accepted { epoch: current } if current == epoch
+        );
+    if !retry_fence_is_current {
+        peers
+            .record_direct_event(
+                peer_id,
+                "hard_hard_responder_claim_retry_fenced",
+                None,
+                None,
+                None,
+                "Hard↔Hard responder protected-claim retry crossed its punch/session/recovery fence",
+            )
+            .await;
+        return None;
+    }
+
+    let Some(retry_reservation) = peers
+        .try_begin_fresh_generation_for_identity(peer_id, epoch_identity)
+        .await
+    else {
+        peers
+            .record_direct_event(
+                peer_id,
+                "hard_hard_responder_claim_retry_fenced",
+                None,
+                None,
+                None,
+                "Hard↔Hard responder protected-claim retry lost its exact recovery reservation",
+            )
+            .await;
+        return None;
+    };
+    if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+        retry_reservation.refund().await;
+        return None;
+    }
+    match punch_deduplicator
+        .claim_for_epoch_with_rendezvous(
+            peer_id,
+            plan.local_network_generation,
+            epoch,
+            PUNCH_PRIORITY_FRESH_PREDICTION,
+            None,
+            Some(punch_at_ms),
+        )
+        .await
+    {
+        RendezvousPunchClaim::Claimed(session) => {
+            retry_reservation.commit();
+            Some(session)
+        }
+        RendezvousPunchClaim::Deferred(retry) => {
+            retry_reservation.refund().await;
+            peers
+                .record_direct_event(
+                    peer_id,
+                    "hard_hard_responder_claim_retry_exhausted",
+                    None,
+                    None,
+                    None,
+                    format!(
+                        "Hard↔Hard responder bounded claim retry remained deferred behind session_id={} reason={}",
+                        retry.active_session_id,
+                        retry.reason.label(),
+                    ),
+                )
+                .await;
+            None
+        }
+    }
+}
+
 fn hard_hard_socket_identity(
     peer_id: &str,
     session_token: &str,
@@ -350,14 +637,18 @@ pub(crate) async fn spawn_hard_hard_initiator(
     punch_deduplicator: PunchAttemptDeduplicator,
     peer_id: String,
     signal: HolePunchSignalContext,
-) {
+    invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) -> HardHardInitiatorStart {
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        return HardHardInitiatorStart::InvocationCancelled;
+    }
     if peers.hard_hard_session_is_active(&peer_id).await {
-        return;
+        return HardHardInitiatorStart::ExistingSession;
     }
     let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await else {
-        return;
+        return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::PlanChanged);
     };
-    if signal.boot_epoch_ms == 0 || signal.stun_servers.len() < 3 {
+    if signal.boot_epoch_ms == 0 {
         peers
             .record_direct_event(
                 &peer_id,
@@ -365,15 +656,48 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 None,
                 None,
                 None,
-                "Hard↔Hard requires a trustworthy boot incarnation and at least three STUN observers; Relay remains available",
+                "Hard↔Hard requires a trustworthy boot incarnation; continuing with ordinary punching",
             )
             .await;
-        return;
+        return HardHardInitiatorStart::NotStarted(
+            HardHardInitiatorNotStarted::BootEpochUnavailable,
+        );
     }
-    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
-        return;
+    if signal.stun_servers.len() < 3 {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "hard_hard_skipped",
+                None,
+                None,
+                None,
+                "Hard↔Hard requires at least three STUN observers; continuing with ordinary punching",
+            )
+            .await;
+        return HardHardInitiatorStart::NotStarted(
+            HardHardInitiatorNotStarted::InsufficientStunObservers,
+        );
+    }
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        return HardHardInitiatorStart::InvocationCancelled;
+    }
+    let epoch = match peers.recovery_epoch_admit(&peer_id).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        RecoveryAdmission::Superseded => {
+            return HardHardInitiatorStart::NotStarted(
+                HardHardInitiatorNotStarted::RecoverySuperseded,
+            );
+        }
+        RecoveryAdmission::BudgetExhausted { .. } => {
+            return HardHardInitiatorStart::NotStarted(
+                HardHardInitiatorNotStarted::RecoveryBudgetExhausted,
+            );
+        }
     };
-    if !peers.try_begin_fresh_generation(&peer_id).await {
+    let Some(fresh_generation_reservation) = peers
+        .try_begin_fresh_generation_for_epoch(&peer_id, epoch)
+        .await
+    else {
         peers
             .record_direct_event(
                 &peer_id,
@@ -384,7 +708,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 "Hard↔Hard fresh-generation quota exhausted for this recovery epoch; Relay remains usable",
             )
             .await;
-        return;
+        return HardHardInitiatorStart::NotStarted(
+            HardHardInitiatorNotStarted::FreshGenerationQuotaExhausted,
+        );
+    };
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        fresh_generation_reservation.refund().await;
+        return HardHardInitiatorStart::InvocationCancelled;
     }
     let punch_at_ms = hard_hard_now_ms().saturating_add(HARD_HARD_PUNCH_LEAD.as_millis() as u64);
     let session = match punch_deduplicator
@@ -398,8 +728,12 @@ pub(crate) async fn spawn_hard_hard_initiator(
         )
         .await
     {
-        RendezvousPunchClaim::Claimed(session) => session,
+        RendezvousPunchClaim::Claimed(session) => {
+            fresh_generation_reservation.commit();
+            session
+        }
         RendezvousPunchClaim::Deferred(deferred) => {
+            fresh_generation_reservation.refund().await;
             peers
                 .record_direct_event(
                     &peer_id,
@@ -415,13 +749,21 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     ),
                 )
                 .await;
-            return;
+            return HardHardInitiatorStart::ExistingPunchOwner;
         }
     };
     let token = hard_hard_session_token(session.session_id());
     let coordination = hard_hard_coordination_from_plan(token, HardHardRole::Initiator, plan);
     let cancellation = session.cancellation_handle();
+    bind_hard_hard_session_to_punch_invocation(invocation_shutdown_rx, cancellation.clone());
     tokio::spawn(async move {
+        // Keep the dedup permit until the measured session is installed in the
+        // authoritative manager ledger. Without this capture `session` was
+        // dropped as soon as the worker was spawned, allowing an ordinary
+        // trigger to run in parallel while Hard↔Hard was still measuring.
+        let session_owner = session;
+        let mut pending_session_cancellation =
+            PendingHardHardSessionCancellation::new(cancellation.clone());
         let outcome = udp
             .run_hard_hard_fresh_mapping_generation(
                 &peer_id,
@@ -431,6 +773,9 @@ pub(crate) async fn spawn_hard_hard_initiator(
             )
             .await;
         let FreshMappingOutcome::Accepted(result, handoff) = outcome else {
+            if cancellation.is_cancelled() {
+                return;
+            }
             peers
                 .record_direct_event(
                     &peer_id,
@@ -513,6 +858,14 @@ pub(crate) async fn spawn_hard_hard_initiator(
             peers.hard_hard_remove_session(&peer_id, &session_id).await;
             return;
         }
+        pending_session_cancellation.disarm();
+        // The manager ledger is now the authoritative active-session gate.
+        // Release the measurement permit before publishing: the peer cannot
+        // send its reciprocal response until that publish succeeds, and the
+        // initiator-response worker must be able to claim the punch owner as
+        // soon as such a response arrives.  Holding this permit through the
+        // publish would fold and silently lose an extremely fast response.
+        drop(session_owner);
         let advertised = if peers.try_consume_recovery_http_quota(&peer_id).await {
             matches!(
                 signal
@@ -598,6 +951,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
         // reciprocal prediction arrives.  Relay continues to carry data while
         // this short response fence is pending.
     });
+    HardHardInitiatorStart::Started
 }
 
 /// Start the responder half after a fresh prediction was admitted by the
@@ -660,32 +1014,21 @@ pub(crate) async fn spawn_hard_hard_responder(
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
         return;
     };
-    if !peers.try_begin_fresh_generation(&peer_id).await {
-        peers
-            .record_direct_event(
-                &peer_id,
-                "hard_hard_fresh_generation_quota_exhausted",
-                None,
-                None,
-                None,
-                "Hard↔Hard responder fresh-generation quota exhausted for this recovery epoch; Relay remains usable",
-            )
-            .await;
+    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
         return;
-    }
-    let session = match punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
-            &peer_id,
-            plan.local_network_generation,
-            epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
-            None,
-            Some(punch_at_ms),
-        )
-        .await
-    {
-        RendezvousPunchClaim::Claimed(session) => session,
-        RendezvousPunchClaim::Deferred(_) => return,
+    };
+    let Some(session) = claim_hard_hard_responder_session(
+        &peers,
+        &punch_deduplicator,
+        &peer_id,
+        peer_session_generation,
+        plan,
+        epoch,
+        punch_at_ms,
+    )
+    .await
+    else {
+        return;
     };
     let cancellation = session.cancellation_handle();
     let session_id = coordination.encode();
@@ -715,6 +1058,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             return;
         };
         if cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             || peers.is_direct(&peer_id).await
             || current_plan.local_network_generation != plan.local_network_generation
             || current_plan.local_profile_generation != plan.local_profile_generation

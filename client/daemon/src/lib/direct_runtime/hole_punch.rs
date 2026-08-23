@@ -13,6 +13,55 @@ struct HolePunchSignalContext {
     boot_epoch_ms: u64,
 }
 
+/// Whether the UDP transport incarnation that admitted a punch has already
+/// been withdrawn.  A closed sender is cancellation too: no detached worker
+/// may keep an unpublished socket alive merely because its final `true` value
+/// could not be observed.
+fn punch_invocation_is_cancelled(shutdown_rx: Option<&tokio::sync::watch::Receiver<bool>>) -> bool {
+    shutdown_rx
+        .is_some_and(|shutdown_rx| *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err())
+}
+
+async fn wait_and_cancel_punch_invocation(
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    cancellation: Arc<crate::PunchSessionCancellation>,
+) {
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            break;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            break;
+        }
+    }
+    // This handle belongs to exactly one claimed punch/session.  Cancelling it
+    // cannot revoke a replacement transport's newer per-peer owner.
+    cancellation.cancel_for_hard_hard_cleanup();
+}
+
+/// Hard↔Hard releases its short-lived dedup permit after installing the
+/// durable session ledger, so its transport-incarnation fence must outlive the
+/// initiating worker.  Bind the old lease to that session's own cancellation
+/// handle instead of calling the peer-wide deduplicator cancellation API.
+fn bind_hard_hard_session_to_punch_invocation(
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    cancellation: Arc<crate::PunchSessionCancellation>,
+) {
+    if let Some(shutdown_rx) = shutdown_rx {
+        tokio::spawn(async move {
+            let cancellation_on_shutdown = cancellation.clone();
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {}
+                _ = wait_and_cancel_punch_invocation(
+                    shutdown_rx,
+                    cancellation_on_shutdown,
+                ) => {}
+            }
+        });
+    }
+}
+
 /// Immutable telemetry captured when a trigger is admitted or folded into an
 /// existing rendezvous. The endpoints themselves remain in the peer's normal
 /// candidate diagnostics; this record only carries a stable hash and source
@@ -387,6 +436,84 @@ async fn spawn_hole_punch_task(
     fresh_prediction: Option<FreshPredictionId>,
     frozen_targets: Option<Vec<SocketAddr>>,
 ) {
+    spawn_hole_punch_task_with_lifecycle(
+        udp,
+        peers,
+        punch_deduplicator,
+        peer_id,
+        probe_interval,
+        attempts,
+        punch_at_ms,
+        signal,
+        fresh_prediction,
+        frozen_targets,
+        None,
+    )
+    .await;
+}
+
+/// Publish one hard punch-send failure only for the lifecycle that admitted
+/// the punch worker.  Keeping this in a small helper makes the delayed-worker
+/// fence directly testable without relying on an operating-system-specific UDP
+/// send failure.
+async fn record_hole_punch_send_error_for_lifecycle(
+    peers: &PeerManager,
+    peer_id: &str,
+    network_generation: u64,
+    peer_session_generation: PeerSessionGeneration,
+    detail: &str,
+) -> bool {
+    let failed = peers
+        .record_direct_failure_for_generation_and_peer_session_with_local_endpoint(
+            peer_id,
+            network_generation,
+            peer_session_generation,
+            REASON_DIRECT_PROBE_FAILED,
+            detail,
+            None,
+        )
+        .await;
+    if failed {
+        peers
+            .mark_recovery_relay_backoff_for_peer_session(
+                peer_id,
+                peer_session_generation,
+                detail,
+            )
+            .await;
+    }
+    failed
+}
+
+/// Spawn a hole-punch worker owned by one UDP publication lease.
+///
+/// The optional receiver is deliberately per invocation.  It cancels only the
+/// permit/session created by this call and therefore cannot tear down a newer
+/// worker which happens to target the same peer through a replacement socket.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_hole_punch_task_with_lifecycle(
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
+    peer_id: String,
+    probe_interval: Duration,
+    attempts: u32,
+    punch_at_ms: Option<u64>,
+    signal: Option<HolePunchSignalContext>,
+    fresh_prediction: Option<FreshPredictionId>,
+    frozen_targets: Option<Vec<SocketAddr>>,
+    invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        return;
+    }
+    // Bind every delayed result from this invocation to the exact online
+    // lifecycle that admitted it.  Peer IDs are reusable after PeerLeft, so a
+    // worker which merely re-reads `online=true` at completion can otherwise
+    // publish an old send error into a same-node replacement (ABA).
+    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+        return;
+    };
     // A peer that is already Direct must not schedule a synchronized punch
     // session at all: the fresh-mapping measurement, the candidate sweep and
     // the prediction advertisement are all post-convergence scans on a
@@ -404,6 +531,9 @@ async fn spawn_hole_punch_task(
             )
             .await;
         debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
+        return;
+    }
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         return;
     }
     // Hard↔Hard is a planner-gated replacement for the ordinary first punch
@@ -433,15 +563,33 @@ async fn spawn_hole_punch_task(
                         ),
                     )
                     .await;
-                spawn_hard_hard_initiator(
-                    udp,
-                    peers,
-                    punch_deduplicator,
-                    peer_id,
+                let hard_hard_start = spawn_hard_hard_initiator(
+                    udp.clone(),
+                    peers.clone(),
+                    punch_deduplicator.clone(),
+                    peer_id.clone(),
                     signal,
+                    invocation_shutdown_rx.clone(),
                 )
                 .await;
-                return;
+                if hard_hard_start.is_handled() {
+                    return;
+                }
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "hard_hard_fallback_to_ordinary",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "Hard↔Hard did not acquire a traversal owner; continuing with ordinary synchronized punching reason={}",
+                            hard_hard_start
+                                .fallback_reason()
+                                .unwrap_or("unknown_not_started")
+                        ),
+                    )
+                    .await;
             }
         }
     }
@@ -483,6 +631,9 @@ async fn spawn_hole_punch_task(
         .current_remote_endpoints_for(&peer_id, trigger_candidates)
         .await;
     let trigger_snapshot = punch_candidate_snapshot(&peers, &peer_id, trigger_candidates).await;
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        return;
+    }
     let network_generation = peers.current_network_generation().await;
     let claimed = punch_deduplicator
         .claim_for_epoch_with_rendezvous(
@@ -561,7 +712,9 @@ async fn spawn_hole_punch_task(
         );
     }
 
+    let invocation_cancellation = session.cancellation_handle();
     tokio::spawn(async move {
+        let worker = async move {
         peers
             .record_direct_event(
                 &peer_id,
@@ -792,7 +945,10 @@ async fn spawn_hole_punch_task(
             return;
         }
 
-        let generation = peers.current_network_generation().await;
+        // The dedup/recovery owner was claimed for `network_generation` before
+        // this task was spawned. Never retag the delayed worker with whatever
+        // network generation happens to be current after the rendezvous wait.
+        let generation = network_generation;
         // A fresh-mapping prediction session punches toward the immutable
         // candidate snapshot frozen when the fresh signal arrived; ordinary
         // sessions read the shared candidate set at session time.  A later
@@ -1755,30 +1911,21 @@ async fn spawn_hole_punch_task(
                     }
                 }
                 Err(err) => {
-                    peers
-                        .record_direct_event(
-                            &peer_id,
-                            "punch_send_error",
-                            candidates.first().copied(),
-                            Some(candidates.len()),
-                            None,
-                            format!("hole punch failed: {err}"),
-                        )
-                        .await;
-                    peers
-                        .record_direct_failure_for_generation(
-                            &peer_id,
-                            generation,
-                            REASON_DIRECT_PROBE_FAILED,
-                            format!("hole punch failed: {err}"),
-                        )
-                        .await;
+                    let detail = format!("hole punch failed: {err}");
                     // A real send error is a hard failure: the recovery stage
                     // moves into relay-backoff where the exponential retry
-                    // backoff paces further work.
-                    peers
-                        .mark_recovery_relay_backoff(&peer_id, &format!("hole punch failed: {err}"))
-                        .await;
+                    // backoff paces further work. The direct-failure commit
+                    // itself records the structured traversal event atomically
+                    // with the state mutation, so do not emit a second,
+                    // unfenced event into a possible same-node replacement.
+                    record_hole_punch_send_error_for_lifecycle(
+                        &peers,
+                        &peer_id,
+                        generation,
+                        peer_session_generation,
+                        &detail,
+                    )
+                    .await;
                     warn!("Failed to punch peer {peer_id}: {err}");
                 }
             }
@@ -1896,6 +2043,20 @@ async fn spawn_hole_punch_task(
                         .await;
                 }
             }
+        }
+        };
+
+        if let Some(shutdown_rx) = invocation_shutdown_rx {
+            tokio::select! {
+                biased;
+                _ = wait_and_cancel_punch_invocation(
+                    shutdown_rx,
+                    invocation_cancellation,
+                ) => {}
+                _ = worker => {}
+            }
+        } else {
+            worker.await;
         }
     });
 }

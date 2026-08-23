@@ -12,7 +12,7 @@ use p2pnet_nat::{
 };
 use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, Notify, Semaphore};
 
 const HARD_HARD_A: &str = "peer-a";
 const HARD_HARD_B: &str = "peer-b";
@@ -74,6 +74,18 @@ fn hard_hard_now_for_test() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+fn hard_hard_replacement_candidate(candidate: &str) -> String {
+    let endpoint = candidate
+        .parse::<SocketAddr>()
+        .expect("Hard↔Hard signal candidates must be socket addresses");
+    let replacement_port = if endpoint.port() <= u16::MAX - 20_000 {
+        endpoint.port() + 20_000
+    } else {
+        endpoint.port() - 20_000
+    };
+    SocketAddr::new(endpoint.ip(), replacement_port).to_string()
 }
 
 fn hard_hard_profile(public_endpoint: SocketAddr, port_delta: i32) -> NatProfile {
@@ -423,12 +435,14 @@ impl NatPacketLink {
 struct TwoPeerHarness {
     peers_a: Arc<PeerManager>,
     peers_b: Arc<PeerManager>,
+    punch_attempts_b: PunchAttemptDeduplicator,
     udp_a: UdpTransport,
     udp_b: UdpTransport,
     control_a: ControlClient,
     control_b: ControlClient,
     signals_a: Arc<StdMutex<Vec<TestControlSignal>>>,
     signals_b: Arc<StdMutex<Vec<TestControlSignal>>>,
+    signal_hook_a_to_b: Arc<StdMutex<Option<TestSignalHook>>>,
     shutdown_a: watch::Sender<bool>,
     shutdown_b: watch::Sender<bool>,
     control_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -441,6 +455,8 @@ struct TwoPeerHarness {
     stun_tasks: Vec<tokio::task::JoinHandle<()>>,
     temp_dirs: Vec<PathBuf>,
 }
+
+type TestSignalHook = Arc<dyn Fn(&TestControlSignal) + Send + Sync>;
 
 impl TwoPeerHarness {
     async fn shutdown(mut self) {
@@ -564,6 +580,7 @@ fn install_signal_forwarder(
     from_node_id: &str,
     from_public_key: String,
     log: Arc<StdMutex<Vec<TestControlSignal>>>,
+    signal_hook: Arc<StdMutex<Option<TestSignalHook>>>,
     advance_clock_on_response: bool,
 ) {
     let event_tx = to.control.event_sender();
@@ -583,6 +600,13 @@ fn install_signal_forwarder(
                 if let Some(punch_at_ms) = signal.punch_at_ms {
                     set_hard_hard_test_now_ms(Some(punch_at_ms));
                 }
+            }
+            if let Some(hook) = signal_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                hook(&signal);
             }
             log.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -635,6 +659,7 @@ async fn build_two_peer_harness(
 
     let peers_a = daemon_a.peers.clone();
     let peers_b = daemon_b.peers.clone();
+    let punch_attempts_b = daemon_b.punch_attempts.clone();
     let a_profile = hard_hard_profile(ports.a_public, 4);
     let b_profile = hard_hard_profile(ports.b_public, 3);
     peers_a.update_nat_profile(a_profile.clone()).await;
@@ -705,8 +730,14 @@ async fn build_two_peer_harness(
         .await;
     *daemon_a.runtime_stun_servers.write().await = ports.a_observers.to_vec();
     *daemon_b.runtime_stun_servers.write().await = ports.b_observers.to_vec();
-    *daemon_a.runtime_stun_timeout.write().await = Duration::from_millis(100);
-    *daemon_b.runtime_stun_timeout.write().await = Duration::from_millis(100);
+    // Keep the loopback harness deterministic under the full daemon test
+    // suite.  Hard↔Hard performs a three-observer measurement on both peers;
+    // Do not let the harness's caller-configured timeout tighten the
+    // production fresh-mapping limits (350 ms per sample / 1.2 s per batch).
+    // HARD_HARD_E2E_SERIAL keeps the expensive two-peer harnesses from
+    // competing with each other; the production bounds remain under test.
+    *daemon_a.runtime_stun_timeout.write().await = Duration::from_millis(500);
+    *daemon_b.runtime_stun_timeout.write().await = Duration::from_millis(500);
 
     let mut a_handshake = HandshakeInitiator::new(a_identity.clone(), b_identity.public_key(), None);
     let initiation = a_handshake.create_initiation().unwrap();
@@ -726,12 +757,15 @@ async fn build_two_peer_harness(
 
     let signals_a = Arc::new(StdMutex::new(Vec::new()));
     let signals_b = Arc::new(StdMutex::new(Vec::new()));
+    let signal_hook_a_to_b = Arc::new(StdMutex::new(None));
+    let signal_hook_b_to_a = Arc::new(StdMutex::new(None));
     install_signal_forwarder(
         &mut daemon_a,
         &daemon_b,
         HARD_HARD_A,
         a_public_key,
         signals_b.clone(),
+        signal_hook_a_to_b.clone(),
         advance_clock_on_response,
     );
     install_signal_forwarder(
@@ -740,6 +774,7 @@ async fn build_two_peer_harness(
         HARD_HARD_B,
         b_public_key,
         signals_a.clone(),
+        signal_hook_b_to_a,
         advance_clock_on_response,
     );
 
@@ -813,12 +848,14 @@ async fn build_two_peer_harness(
     TwoPeerHarness {
         peers_a,
         peers_b,
+        punch_attempts_b,
         udp_a,
         udp_b,
         control_a,
         control_b,
         signals_a,
         signals_b,
+        signal_hook_a_to_b,
         shutdown_a,
         shutdown_b,
         control_tasks: vec![control_task_a, control_task_b],
@@ -1069,6 +1106,504 @@ async fn assert_relay_remains_available(harness: &TwoPeerHarness) {
     );
 }
 
+async fn build_hard_hard_ordinary_fallback_fixture() -> (
+    Arc<PeerManager>,
+    UdpTransport,
+    ControlClient,
+) {
+    let mut config = Config::generate_default("http://hard-hard-fallback.test", "phase-2-2-fallback")
+        .unwrap();
+    config.node.node_id = HARD_HARD_A.to_string();
+    config.network.manual = true;
+    config.network.udp_bind = "127.0.0.1:0".to_string();
+    config.network.fresh_mapping_punch_enabled = true;
+    config.network.fresh_mapping_harness_loopback = true;
+    config.network.birthday_probing_enabled = false;
+    config.relay.servers = vec!["relay.invalid:443".to_string()];
+    let daemon = Daemon::new(config);
+    let peers = daemon.peers.clone();
+
+    let local_public: SocketAddr = "198.51.100.10:41000".parse().unwrap();
+    let remote_public: SocketAddr = "198.51.100.20:42000".parse().unwrap();
+    let local_profile = hard_hard_profile(local_public, 4);
+    let remote_profile = hard_hard_profile(remote_public, 3);
+    peers.update_nat_profile(local_profile).await;
+    let remote = peer_info(
+        HARD_HARD_B,
+        "10.20.0.2",
+        "hard-hard-fallback-peer-key".to_string(),
+        remote_public,
+        remote_profile.control_label_with_generation(1),
+    );
+    peers.add_peer(&remote).await;
+    peers
+        .add_candidates_with_sources(
+            HARD_HARD_B,
+            &[remote_public.to_string()],
+            &HashMap::from([(remote_public.to_string(), "predicted".to_string())]),
+        )
+        .await;
+    // Bind the parsed remote profile to the candidate epoch installed above.
+    peers.add_peer(&remote).await;
+    assert!(
+        peers.hard_hard_plan_for_peer(HARD_HARD_B).await.is_some(),
+        "fixture must select the Hard↔Hard planner branch"
+    );
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    (peers, udp, daemon.control.clone())
+}
+
+fn hard_hard_fallback_signal(
+    control: ControlClient,
+    boot_epoch_ms: u64,
+    stun_servers: Vec<SocketAddr>,
+) -> HolePunchSignalContext {
+    HolePunchSignalContext {
+        control,
+        candidate_snapshot: Arc::new(RwLock::new(None)),
+        stun_servers,
+        stun_timeout: Duration::from_millis(25),
+        boot_epoch_ms,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_preflight_failure_falls_through_to_ordinary_punch() {
+    let (peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let signal = hard_hard_fallback_signal(control, 0, Vec::new());
+
+    spawn_hole_punch_task(
+        udp,
+        peers.clone(),
+        PunchAttemptDeduplicator::default(),
+        HARD_HARD_B.to_string(),
+        Duration::from_millis(1),
+        1,
+        None,
+        Some(signal),
+        None,
+        None,
+    )
+    .await;
+
+    let fallback = wait_for_stage(
+        &peers,
+        HARD_HARD_B,
+        "hard_hard_fallback_to_ordinary",
+    )
+    .await;
+    assert!(fallback.detail.contains("reason=boot_epoch_unavailable"));
+    wait_for_stage(&peers, HARD_HARD_B, "punch_started").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_insufficient_stun_falls_through_to_ordinary_punch() {
+    let (peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let blackholes = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let signal = hard_hard_fallback_signal(
+        control,
+        1,
+        blackholes
+            .iter()
+            .map(|socket| socket.local_addr().unwrap())
+            .collect(),
+    );
+
+    spawn_hole_punch_task(
+        udp,
+        peers.clone(),
+        PunchAttemptDeduplicator::default(),
+        HARD_HARD_B.to_string(),
+        Duration::from_millis(1),
+        1,
+        None,
+        Some(signal),
+        None,
+        None,
+    )
+    .await;
+
+    let fallback = wait_for_stage(
+        &peers,
+        HARD_HARD_B,
+        "hard_hard_fallback_to_ordinary",
+    )
+    .await;
+    assert!(
+        fallback
+            .detail
+            .contains("reason=insufficient_stun_observers")
+    );
+    wait_for_stage(&peers, HARD_HARD_B, "punch_started").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_async_failure_uses_next_trigger_for_ordinary_punch() {
+    let (peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    // Bound three sockets that intentionally never answer STUN.  This admits
+    // Hard↔Hard, then deterministically fails its asynchronous measurement.
+    let blackholes = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let stun_servers = blackholes
+        .iter()
+        .map(|socket| socket.local_addr().unwrap())
+        .collect::<Vec<_>>();
+    let signal = hard_hard_fallback_signal(control, 1, stun_servers);
+    let deduplicator = PunchAttemptDeduplicator::default();
+
+    spawn_hole_punch_task(
+        udp.clone(),
+        peers.clone(),
+        deduplicator.clone(),
+        HARD_HARD_B.to_string(),
+        Duration::from_millis(1),
+        1,
+        None,
+        Some(signal.clone()),
+        None,
+        None,
+    )
+    .await;
+    wait_for_stage(&peers, HARD_HARD_B, "hard_hard_measurement_failed").await;
+    assert!(
+        !peers
+            .get_connection(HARD_HARD_B)
+            .await
+            .unwrap()
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "punch_started"),
+        "the trigger owned by the asynchronous Hard↔Hard attempt must not also start ordinary punching"
+    );
+
+    // A recovery epoch permits exactly one fresh generation.  Once the failed
+    // worker releases its punch permit, the next trigger observes that spent
+    // quota, returns NotStarted, and must continue through ordinary punching.
+    spawn_hole_punch_task(
+        udp,
+        peers.clone(),
+        deduplicator,
+        HARD_HARD_B.to_string(),
+        Duration::from_millis(1),
+        1,
+        None,
+        Some(signal),
+        None,
+        None,
+    )
+    .await;
+    let fallback = wait_for_stage(
+        &peers,
+        HARD_HARD_B,
+        "hard_hard_fallback_to_ordinary",
+    )
+    .await;
+    assert!(
+        fallback
+            .detail
+            .contains("reason=fresh_generation_quota_exhausted")
+    );
+    wait_for_stage(&peers, HARD_HARD_B, "punch_started").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_initiator_is_cancelled_with_its_udp_invocation_only() {
+    let (peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let blackholes = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let signal = hard_hard_fallback_signal(
+        control,
+        1,
+        blackholes
+            .iter()
+            .map(|socket| socket.local_addr().unwrap())
+            .collect(),
+    );
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    spawn_hole_punch_task_with_lifecycle(
+        udp,
+        peers.clone(),
+        deduplicator.clone(),
+        HARD_HARD_B.to_string(),
+        Duration::from_millis(1),
+        1,
+        None,
+        Some(signal),
+        None,
+        None,
+        Some(shutdown_rx),
+    )
+    .await;
+    assert_eq!(
+        deduplicator.active_session_count(),
+        1,
+        "the initiator measurement must own its punch permit before detaching"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    let replacement_generation = peers
+        .advance_network_generation("supersede Hard-Hard UDP invocation")
+        .await;
+    timeout(Duration::from_secs(1), async {
+        while deduplicator.active_session_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the old invocation must cancel and release its exact Hard-Hard permit");
+    sleep(Duration::from_millis(150)).await;
+
+    let conn = peers.get_connection(HARD_HARD_B).await.unwrap();
+    assert!(
+        !conn.direct_events.iter().any(|event| {
+            event.network_generation == replacement_generation
+                && matches!(
+                    event.stage.as_str(),
+                    "hard_hard_measurement_failed"
+                        | "hard_hard_measurement_fenced"
+                        | "hard_hard_prediction_signaled"
+                        | "hard_hard_advertisement_failed"
+                        | "punch_started"
+                )
+        }),
+        "a cancelled old Hard-Hard invocation must not publish or write recovery progress into the replacement generation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_failed_preledger_measurement_releases_udp_lifecycle_watcher() {
+    let (peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let blackholes = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let signal = hard_hard_fallback_signal(
+        control,
+        1,
+        blackholes
+            .iter()
+            .map(|socket| socket.local_addr().unwrap())
+            .collect(),
+    );
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    spawn_hole_punch_task_with_lifecycle(
+        udp,
+        peers.clone(),
+        deduplicator.clone(),
+        HARD_HARD_B.to_string(),
+        Duration::from_millis(1),
+        1,
+        None,
+        Some(signal),
+        None,
+        None,
+        Some(shutdown_rx),
+    )
+    .await;
+    wait_for_stage(&peers, HARD_HARD_B, "hard_hard_measurement_failed").await;
+
+    timeout(Duration::from_secs(1), async {
+        while shutdown_tx.receiver_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a pre-ledger failure must cancel its handle and let the lease watcher exit");
+    assert_eq!(
+        deduplicator.active_session_count(),
+        0,
+        "the failed measurement must also release its short-lived punch owner"
+    );
+    assert!(
+        !*shutdown_tx.borrow(),
+        "the watcher must exit because its exact session was cancelled, not because the UDP lease ended"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_initiator_deferred_claim_refunds_exact_fresh_quota() {
+    let (peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let blackholes = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let signal = hard_hard_fallback_signal(
+        control,
+        1,
+        blackholes
+            .iter()
+            .map(|socket| socket.local_addr().unwrap())
+            .collect(),
+    );
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let epoch = match peers.recovery_epoch_admit(HARD_HARD_B).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("fixture recovery must be admitted: {admission:?}"),
+    };
+    let existing = match deduplicator
+        .claim_for_epoch_with_rendezvous(
+            HARD_HARD_B,
+            peers.current_network_generation_sync(),
+            epoch,
+            PUNCH_PRIORITY_FRESH_PREDICTION,
+            None,
+            None,
+        )
+        .await
+    {
+        RendezvousPunchClaim::Claimed(session) => session,
+        RendezvousPunchClaim::Deferred(_) => panic!("fixture fresh owner must claim"),
+    };
+
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp,
+            peers.clone(),
+            deduplicator,
+            HARD_HARD_B.to_string(),
+            signal,
+            None,
+        )
+        .await,
+        HardHardInitiatorStart::ExistingPunchOwner,
+    );
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(HARD_HARD_B)
+            .await
+            .expect("the recovery epoch must remain active")
+            .fresh_generations_remaining,
+        1,
+        "an initiator which never acquired the punch owner must refund its exact reservation"
+    );
+    assert!(!existing.is_cancelled());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_fresh_reservation_cannot_refund_recreated_numeric_epoch() {
+    let (peers, _udp, _control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let old_epoch = match peers.recovery_epoch_admit(HARD_HARD_B).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("old recovery epoch must be admitted: {admission:?}"),
+    };
+    let old_reservation = peers
+        .try_begin_fresh_generation_for_epoch(HARD_HARD_B, old_epoch)
+        .await
+        .expect("old epoch must reserve its fresh quota");
+
+    peers
+        .recovery_epoch_end(HARD_HARD_B, "test_recreate_numeric_epoch")
+        .await;
+    let new_epoch = match peers.recovery_epoch_admit(HARD_HARD_B).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("replacement recovery epoch must be admitted: {admission:?}"),
+    };
+    assert_eq!(
+        new_epoch, old_epoch,
+        "the regression fixture must reproduce numeric recovery-epoch ABA"
+    );
+    let new_reservation = peers
+        .try_begin_fresh_generation_for_epoch(HARD_HARD_B, new_epoch)
+        .await
+        .expect("replacement epoch must independently reserve its quota");
+
+    old_reservation.refund().await;
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(HARD_HARD_B)
+            .await
+            .expect("replacement epoch must remain active")
+            .fresh_generations_remaining,
+        0,
+        "an old allocation token must not replenish the replacement epoch"
+    );
+    new_reservation.refund().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_fresh_reservation_refunds_after_epoch_lock_contention() {
+    let (peers, _udp, _control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let epoch = match peers.recovery_epoch_admit(HARD_HARD_B).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("recovery epoch must be admitted: {admission:?}"),
+    };
+    let reservation = peers
+        .try_begin_fresh_generation_for_epoch(HARD_HARD_B, epoch)
+        .await
+        .expect("fixture must reserve the sole fresh quota");
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let holder = tokio::spawn({
+        let peers = peers.clone();
+        let reached = reached.clone();
+        let release = release.clone();
+        async move {
+            peers
+                .hold_recovery_epoch_write_for_test(reached, release)
+                .await;
+        }
+    });
+    reached.notified().await;
+
+    // Models an outer UDP-lease select dropping the Hard↔Hard future while
+    // its explicit refund is blocked behind the epoch writer.
+    drop(reservation);
+    release.notify_one();
+    holder.await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers
+                .recovery_epoch_work_budget_report(HARD_HARD_B)
+                .await
+                .is_some_and(|budget| budget.fresh_generations_remaining == 1)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelling the reservation owner must asynchronously refund the exact epoch");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_lifecycle_watcher_exits_when_session_finishes_first() {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let cancellation = Arc::new(crate::PunchSessionCancellation::default());
+    bind_hard_hard_session_to_punch_invocation(Some(shutdown_rx), cancellation.clone());
+    assert!(
+        Arc::strong_count(&cancellation) >= 2,
+        "the lifecycle watcher must own the exact session cancellation handle"
+    );
+
+    cancellation.cancel_for_hard_hard_cleanup();
+    timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&cancellation) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a completed/removed session must not retain a watcher until the UDP lease ends");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn hard_hard_two_peer_success_is_full_e2e_and_exact_socket() {
     let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
@@ -1241,6 +1776,87 @@ async fn hard_hard_two_peer_success_is_full_e2e_and_exact_socket() {
         }));
     }
 
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_two_peer_first_send_protection_refunds_then_retries_response() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let now = hard_hard_now_for_test();
+    set_hard_hard_test_now_ms(Some(now));
+    let _clock = HardHardClockReset;
+    let harness = build_two_peer_harness(true, false, false).await;
+
+    let epoch = match harness.peers_b.recovery_epoch_admit(HARD_HARD_A).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        admission => panic!("B must admit the protected ordinary fixture: {admission:?}"),
+    };
+    let ordinary_punch_at =
+        unix_time_millis().saturating_add(RELAY_ASSISTED_PUNCH_LEAD.as_millis() as u64);
+    let ordinary = match harness
+        .punch_attempts_b
+        .claim_for_epoch_with_rendezvous(
+            HARD_HARD_A,
+            harness.peers_b.current_network_generation_sync(),
+            epoch,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            Some(ordinary_punch_at),
+        )
+        .await
+    {
+        RendezvousPunchClaim::Claimed(session) => session,
+        RendezvousPunchClaim::Deferred(_) => panic!("ordinary fixture must own B's punch window"),
+    };
+    let ordinary_cancellation = ordinary.cancellation_handle();
+    let ordinary_owner = Arc::new(StdMutex::new(Some(ordinary)));
+    *harness.signal_hook_a_to_b.lock().unwrap() = Some(Arc::new({
+        let ordinary_owner = ordinary_owner.clone();
+        move |signal: &TestControlSignal| {
+            if signal
+                .session_id
+                .as_deref()
+                .is_some_and(|session| session.starts_with("hh1:i:"))
+            {
+                ordinary_owner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .expect("ordinary owner must remain live through the protected claim")
+                    .mark_first_send_started();
+            }
+        }
+    }));
+
+    trigger_initial_offer(&harness).await;
+    let deferred = wait_for_stage(
+        &harness.peers_b,
+        HARD_HARD_A,
+        "hard_hard_responder_claim_deferred",
+    )
+    .await;
+    assert!(
+        deferred.detail.contains("reason=active_first_send_protected"),
+        "the responder must encounter the real first-send protection branch: {}",
+        deferred.detail
+    );
+    assert_eq!(
+        harness
+            .peers_b
+            .recovery_epoch_work_budget_report(HARD_HARD_A)
+            .await
+            .expect("the same recovery epoch must remain active while retrying")
+            .fresh_generations_remaining,
+        1,
+        "a Deferred claim must refund B's sole fresh-generation reservation before waiting"
+    );
+
+    wait_for_hard_hard_response_signal(&harness).await;
+    assert!(
+        ordinary_cancellation.is_cancelled(),
+        "after the bounded protection expires, the fresh response must preempt the ordinary owner"
+    );
+    wait_for_both_direct(&harness).await;
     harness.shutdown().await;
 }
 
@@ -1638,12 +2254,18 @@ async fn hard_hard_two_peer_remote_candidate_epoch_fences_old_session() {
         .first()
         .cloned()
         .expect("response must carry a candidate");
-    let candidate_sources = HashMap::from([(candidate.clone(), "predicted".to_string())]);
+    // A newer freshness revision alone no longer advances the remote
+    // transport epoch. Use a genuinely different endpoint so this remains a
+    // transport-handover fencing test rather than a version-counter test.
+    let replacement_candidate = hard_hard_replacement_candidate(&candidate);
+    assert!(!response.candidates.contains(&replacement_candidate));
+    let candidate_sources =
+        HashMap::from([(replacement_candidate.clone(), "predicted".to_string())]);
     let apply_result = harness
         .peers_a
         .add_candidates_with_metadata(
             HARD_HARD_B,
-            &[candidate],
+            &[replacement_candidate],
             &candidate_sources,
             response.candidate_generation.saturating_add(1),
             response.candidates_expires_at_ms,
@@ -1762,13 +2384,17 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
         .first()
         .cloned()
         .expect("response must carry a candidate");
-    let sources = HashMap::from([(candidate.clone(), "predicted".to_string())]);
+    // Model a real replacement transport before replaying the stale response;
+    // an identical set with a higher revision is only a freshness refresh.
+    let replacement_candidate = hard_hard_replacement_candidate(&candidate);
+    assert!(!response.candidates.contains(&replacement_candidate));
+    let sources = HashMap::from([(replacement_candidate.clone(), "predicted".to_string())]);
     assert!(matches!(
         harness
             .peers_a
             .add_candidates_with_metadata(
                 HARD_HARD_B,
-                &[candidate],
+                &[replacement_candidate],
                 &sources,
                 response.candidate_generation.saturating_add(1),
                 response.candidates_expires_at_ms,

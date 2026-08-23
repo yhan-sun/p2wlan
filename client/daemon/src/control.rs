@@ -12,7 +12,7 @@
 //! The control plane uses a simple JSON-over-WebSocket protocol for signaling,
 //! with protobuf available for higher performance in production.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -55,7 +55,8 @@ use http::{
     create_tunnel, fetch_relay_ticket_http, normalize_http_base_url, obtain_device_credential,
     poll_peers, poll_signals, prepare_signal_payload, register_device,
     route_aware_control_http_clients, send_prepared_signal, send_signal, update_endpoint,
-    RouteAwareControlHttpClient, SignalSigningIdentity, SIGNAL_REST_PROTOCOL_VERSION,
+    RouteAwareControlHttpClient, SignalDeliveryTracker, SignalSigningIdentity,
+    SIGNAL_REST_PROTOCOL_VERSION,
 };
 use websocket::spawn_signal_websocket;
 /// Stable WebSocket proxy policy label (`direct_only`).  Signaling never rides

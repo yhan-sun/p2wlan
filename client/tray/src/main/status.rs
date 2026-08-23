@@ -32,19 +32,12 @@ fn query_daemon_state() -> DaemonState {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("—")
         .to_string();
-    let online = status.as_ref().and_then(|value| {
-        let stats = value.get("stats")?;
-        Some(
-            stats
-                .get("direct_connections")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default()
-                + stats
-                    .get("relay_connections")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default(),
-        )
-    });
+    // Aggregate counters are derived from raw connection state and can lag
+    // the per-peer diagnostics during a transition. Count only peers whose
+    // roster lifecycle is online and whose active path is currently verified.
+    let online = status
+        .as_ref()
+        .and_then(verified_online_connection_count);
     let peer_count = status
         .as_ref()
         .and_then(|value| value.get("stats"))
@@ -98,15 +91,40 @@ fn average_verified_latency_ms(status: &serde_json::Value) -> Option<u64> {
     Some(((sum + count / 2) / count) as u64)
 }
 
+fn verified_online_connection_count(status: &serde_json::Value) -> Option<u64> {
+    let peers = status.get("peers").and_then(serde_json::Value::as_array)?;
+    Some(
+        peers
+            .iter()
+            .filter(|peer| verified_active_path_key(peer).is_some())
+            .count() as u64,
+    )
+}
+
 fn verified_peer_latency_ms(peer: &serde_json::Value) -> Option<u64> {
-    if peer.get("online").and_then(serde_json::Value::as_bool) == Some(false) {
+    let path_key = verified_active_path_key(peer)?;
+
+    peer.get(path_key)
+        .and_then(|path| path.get("rtt_ewma_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            peer.get(path_key)
+                .and_then(|path| path.get("latency_ms"))
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
+fn verified_active_path_key(peer: &serde_json::Value) -> Option<&'static str> {
+    if peer.get("online").and_then(serde_json::Value::as_bool) != Some(true) {
         return None;
     }
-
     let active_path = peer.get("active_path").and_then(serde_json::Value::as_str);
     let state = peer.get("state").and_then(serde_json::Value::as_str);
-    let path_key = match (active_path, state) {
-        (Some("direct"), Some("direct")) => "direct",
+    match (active_path, state) {
+        // Active-path publication is authoritative, but Direct additionally
+        // requires its committed raw state: an optimistic/transitional
+        // active_path must not claim a verified Direct connection.
+        (Some("direct"), Some("direct")) => Some("direct"),
         (Some("relay"), _) => {
             let confirmed = peer
                 .get("relay_confirmed_endpoint")
@@ -119,25 +137,10 @@ fn verified_peer_latency_ms(peer: &serde_json::Value) -> Option<u64> {
             if !confirmed {
                 return None;
             }
-            "relay"
+            Some("relay")
         }
-        _ => return None,
-    };
-
-    peer.get(path_key)
-        .and_then(|path| path.get("rtt_ewma_ms"))
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            peer.get(path_key)
-                .and_then(|path| path.get("latency_ms"))
-                .and_then(serde_json::Value::as_u64)
-        })
-        .or_else(|| {
-            (path_key == "relay")
-                .then(|| peer.get("remote_relay_latency_ms"))
-                .flatten()
-                .and_then(serde_json::Value::as_u64)
-        })
+        _ => None,
+    }
 }
 
 fn fetch_status_with_auth(
@@ -177,6 +180,9 @@ fn tray_device_menu(status: &serde_json::Value) -> TrayDeviceMenu {
     let mut devices = peers
         .iter()
         .filter_map(|peer| {
+            if peer.get("online").and_then(serde_json::Value::as_bool) != Some(true) {
+                return None;
+            }
             let virtual_ip = peer.get("virtual_ip").and_then(serde_json::Value::as_str)?;
             virtual_ip.parse::<IpAddr>().ok()?;
             let node_id = peer

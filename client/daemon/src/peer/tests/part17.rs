@@ -47,7 +47,7 @@ fn remote_profile_is_invalidated_by_candidate_epoch_and_rebound_only_by_hh1_cont
     assert!(connection.update_remote_nat_profile(profile, None));
     assert!(connection.remote_nat_profile_matches_candidate_epoch());
 
-    connection.mark_remote_candidate_generation_changed(1, "test remote handover");
+    connection.mark_remote_transport_handover(1, "test remote handover");
     assert!(!connection.remote_nat_profile_matches_candidate_epoch());
     assert!(!connection.bind_remote_nat_profile_to_candidate_epoch(8));
     assert!(connection.bind_remote_nat_profile_to_candidate_epoch(7));

@@ -84,6 +84,80 @@ async fn relay_backed_scatter_peer_targets_due_at_flat_interval() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn direct_probe_targets_due_completes_with_writer_queued_behind_snapshot_reader() {
+    // Regression: `direct_probe_targets_due` held one `connections` read
+    // guard and called `has_relay_safety_net().await`, which tried to acquire
+    // the same writer-preferring RwLock for reading again.  The queue below is
+    // deliberately ordered as outer reader -> writer: the old nested reader
+    // then queued behind the writer and deadlocked with it permanently.
+    let manager = Arc::new(PeerManager::new(test_config()));
+    let endpoint: SocketAddr = "8.8.8.8:41836".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager.set_relay("peer1", "127.0.0.1:9000").await;
+
+    // Stop the planner immediately before its retry-eligibility connection
+    // snapshot.  On the single-thread runtime, one yield lets it run through
+    // the uncontended prechecks and queue on this recovery-epoch writer.
+    let recovery_gate = manager.recovery_epochs.write().await;
+    let planner_manager = Arc::clone(&manager);
+    let mut planner = tokio::spawn(async move {
+        planner_manager
+            .direct_probe_targets_due(Duration::ZERO)
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    // Hold the connection map while the planner is released from the epoch
+    // gate.  The epoch sentinel can acquire only after admission has released
+    // its writer; by then the planner has queued its connection-map reader.
+    let connection_gate = manager.connections.write().await;
+    let (epoch_passed_tx, epoch_passed_rx) = tokio::sync::oneshot::channel();
+    let epoch_sentinel_manager = Arc::clone(&manager);
+    let epoch_sentinel = tokio::spawn(async move {
+        let _guard = epoch_sentinel_manager.recovery_epochs.write().await;
+        let _ = epoch_passed_tx.send(());
+    });
+    drop(recovery_gate);
+    epoch_passed_rx
+        .await
+        .expect("recovery admission should release the epoch lock");
+    epoch_sentinel.await.unwrap();
+
+    // Queue a writer behind the planner's reader before allowing that reader
+    // to acquire the map.  Sending `writer_queued` and polling `write().await`
+    // happen in the same task poll, so receipt proves the waiter was enqueued.
+    let (writer_queued_tx, writer_queued_rx) = tokio::sync::oneshot::channel();
+    let writer_manager = Arc::clone(&manager);
+    let mut writer = tokio::spawn(async move {
+        let _ = writer_queued_tx.send(());
+        let connections = writer_manager.connections.write().await;
+        assert!(connections.contains_key("peer1"));
+    });
+    writer_queued_rx
+        .await
+        .expect("connection writer should reach the lock wait");
+    drop(connection_gate);
+
+    let targets = match tokio::time::timeout(Duration::from_secs(1), &mut planner).await {
+        Ok(result) => result.expect("probe planner task should not panic"),
+        Err(_) => {
+            planner.abort();
+            writer.abort();
+            panic!("direct_probe_targets_due deadlocked behind the queued connection writer");
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(1), &mut writer)
+        .await
+        .expect("queued connection writer should complete")
+        .expect("connection writer task should not panic");
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].peer_id, "peer1");
+    assert!(targets[0].candidates.contains(&endpoint));
+}
+
 #[tokio::test]
 async fn preferred_fast_candidates_merge_advertised_neighborhood_without_predicted_window() {
     // Regression (dual-CGNAT black hole, 2026-08-16): with no fresh

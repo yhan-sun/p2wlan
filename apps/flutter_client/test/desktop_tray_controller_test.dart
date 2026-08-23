@@ -49,8 +49,43 @@ void main() {
 
     expect(labels, contains('停止 P2WLAN'));
     expect(labels, isNot(contains('启动 P2WLAN')));
-    expect(labels.any((label) => label.contains('延迟: 34 ms')), isTrue);
-    expect(labels.any((label) => label.contains('速度: —')), isTrue);
+    expect(labels.any((label) => label.contains('本端平均 RTT: 34 ms')), isTrue);
+    expect(labels.any((label) => label.contains('传输速度: —')), isTrue);
+  });
+
+  test('desktop tray online-device submenu excludes offline peers', () async {
+    final raw =
+        jsonDecode(
+              await File('test/fixtures/status_connected.json').readAsString(),
+            )
+            as Map<String, dynamic>;
+    final peers = raw['peers'] as List<dynamic>;
+    final offline =
+        Map<String, dynamic>.from(peers.first as Map<String, dynamic>)
+          ..['node_id'] = 'offline-peer'
+          ..['device_name'] = 'offline-device'
+          ..['virtual_ip'] = '10.20.0.99'
+          ..['online'] = false;
+    peers.add(offline);
+    final stores = await _makeStores(
+      api: _FakeDiagnosticsApi(snapshot: DiagnosticsSnapshot.fromJson(raw)),
+    );
+    addTearDown(stores.dispose);
+    await stores.statusStore.refresh();
+
+    final menu = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    ).buildMenuForTesting();
+    final devices = menu.items!.firstWhere((item) => item.label == '设备');
+    final labels = devices.submenu!.items!
+        .map((item) => item.label)
+        .whereType<String>()
+        .toList();
+
+    expect(labels.any((label) => label.contains('direct-laptop')), isTrue);
+    expect(labels.any((label) => label.contains('relay-nas')), isTrue);
+    expect(labels.any((label) => label.contains('offline-device')), isFalse);
   });
 
   test(
@@ -408,6 +443,7 @@ class _FakeDiagnosticsApi implements DiagnosticsApi {
   Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
+    int? processId,
     Duration timeout = const Duration(seconds: 30),
   }) async => throw UnimplementedError();
 

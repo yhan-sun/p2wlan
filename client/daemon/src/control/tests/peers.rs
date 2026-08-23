@@ -131,6 +131,12 @@ fn peer_endpoint_change_is_reported_as_metadata_update() {
     assert!(peer_metadata_changed(&known, &updated));
 
     updated.endpoint = known.endpoint.clone();
+    assert!(
+        peer_metadata_changed(&known, &updated),
+        "last_seen-only heartbeat changes must reach PeerManager diagnostics"
+    );
+
+    updated.last_seen = known.last_seen;
     assert!(!peer_metadata_changed(&known, &updated));
 
     updated.app_version = "0.1.68".to_string();

@@ -89,6 +89,7 @@ impl ControlClient {
             let critical_event_tx = event_tx.clone();
             let critical_relay_selection = relay_selection.clone();
             let critical_http = http.clone();
+            let critical_health = health.clone();
             tokio::spawn(async move {
                 run_critical_control_loop(
                     critical_http,
@@ -100,6 +101,7 @@ impl ControlClient {
                     critical_auth_rx,
                     critical_event_tx,
                     critical_relay_selection,
+                    critical_health,
                 )
                 .await;
             });
@@ -422,9 +424,10 @@ impl ControlClient {
     /// refresh can never overwrite the predicted window on the server, and the
     /// server's per-pair ordering delivers it in send order.
     ///
-    /// Returns `Err(PeerOfferSendFailure::Cancelled)` when the ownership was
-    /// revoked before the HTTP request: the caller must NOT treat the
-    /// prediction as advertised and must NOT finalize the generation's socket.
+    /// Returns `Err(PeerOfferSendFailure::Cancelled)` when ownership is
+    /// revoked while queued or while the HTTP request is in flight: the caller
+    /// must NOT treat the prediction as advertised and must NOT finalize the
+    /// generation's socket.
     pub(crate) async fn send_fresh_peer_offer_with_sources_and_punch_at(
         &self,
         to_node_id: &str,

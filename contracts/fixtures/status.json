@@ -1,6 +1,6 @@
 {
   "contractVersion": 1,
-  "version": "0.1.134",
+  "version": "0.1.137",
   "process_id": 44413,
   "node_id": "node-a",
   "virtual_ip": "10.20.0.7",
@@ -8,6 +8,11 @@
   "network_generation": 0,
   "uptime_ms": 2,
   "revision": 1,
+  "captured_revision": 1,
+  "captured_at_ms": 2,
+  "peer_snapshot_stale": false,
+  "peer_snapshot_age_ms": 0,
+  "peer_snapshot_shape": "v1:0000000000000000000000000000000000000000000000000000000000000000",
   "ready_phase": "connected_manual",
   "protocol": {
     "data_plane": "wireguard_like_noise",
@@ -114,6 +119,9 @@
     "critical_tasks": [],
     "control_connected": false,
     "last_control_success_secs_ago": null,
+    "control_api_reachable": false,
+    "device_lease_healthy": false,
+    "last_device_lease_success_secs_ago": null,
     "reauth_required": false
   }
 }

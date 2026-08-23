@@ -36,9 +36,8 @@ class PeerSnapshot {
   final bool online;
   final int lastSeen;
 
-  /// RTT to the selected relay reported by the remote peer. Some daemon
-  /// versions expose this value while the local relay path health is still
-  /// missing a sample.
+  /// RTT from the remote peer to that peer's selected relay. This is topology
+  /// diagnostics only and must never be rendered as this client's peer RTT.
   final int? remoteRelayLatencyMs;
   final String state;
   final String? activePath;
@@ -71,7 +70,9 @@ class PeerSnapshot {
       virtualIp: _string(json['virtual_ip']),
       endpoint: _nullableString(json['endpoint']),
       natType: _string(json['nat_type'], 'unknown'),
-      online: _bool(json['online'], true),
+      // Lifecycle evidence is fail-closed. A missing field from a partial or
+      // mixed-version snapshot must not make a stale peer appear connected.
+      online: _bool(json['online'], false),
       lastSeen: _int(json['last_seen']),
       remoteRelayLatencyMs: _intOrNull(json['remote_relay_latency_ms']),
       state: _string(json['state'], 'unknown'),
@@ -132,7 +133,10 @@ class PeerSnapshot {
         state == 'connecting') {
       return 'probing';
     }
-    return 'offline';
+    // Roster presence and path usability are separate facts. An online peer
+    // with no verified path is still online; it is probing until encrypted
+    // Direct/Relay evidence arrives.
+    return 'probing';
   }
 
   String get connectionType {
@@ -142,7 +146,7 @@ class PeerSnapshot {
     }
     if (path == 'relay') return 'relay';
     if (path == 'direct_trial' || path == 'probing') return 'probing';
-    return 'offline';
+    return 'probing';
   }
 
   int? get latencyMs {
@@ -154,9 +158,10 @@ class PeerSnapshot {
       return isDirectVerified ? direct.displayLatencyMs : null;
     }
     if (path == 'relay') {
-      return isRelayVerified
-          ? relay.displayLatencyMs ?? remoteRelayLatencyMs
-          : null;
+      // `remoteRelayLatencyMs` is the remote daemon's RTT to its own relay,
+      // not this daemon's end-to-end RTT to the peer.  Only the locally timed
+      // and verified relay path sample is a displayable peer latency.
+      return isRelayVerified ? relay.displayLatencyMs : null;
     }
     return null;
   }

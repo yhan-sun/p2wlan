@@ -44,11 +44,13 @@ fn push_unique_probe_key(
     key: ProbeMacKey,
     role: ProbeKeyRole,
     session_id: Option<String>,
+    session_generation: PeerSessionGeneration,
 ) {
     if !candidates.iter().any(|candidate| candidate.key == key) {
         candidates.push(ProbeKeyCandidate {
             key,
             role,
+            session_generation,
             session_id,
         });
     }
@@ -58,6 +60,7 @@ fn push_probe_binding_compatibility_keys(
     candidates: &mut Vec<ProbeKeyCandidate>,
     base_key: ProbeMacKey,
     binding: &ProbeSessionBinding,
+    session_generation: PeerSessionGeneration,
 ) {
     if let Some(session_id) = binding.session_id.as_deref() {
         push_unique_probe_key(
@@ -65,13 +68,40 @@ fn push_probe_binding_compatibility_keys(
             derive_session_probe_mac_key(&base_key, session_id),
             ProbeKeyRole::Compatibility,
             binding.session_id.clone(),
+            session_generation,
         );
     }
 }
 
 impl PeerManager {
+    /// Whether an encoded candidate generation proves a strictly newer remote
+    /// daemon incarnation than the one already accepted for this peer.
+    ///
+    /// A merely different incarnation is not enough: a delayed signal from an
+    /// older boot must remain stale instead of resetting the current session
+    /// and lowering its candidate high-water mark.
+    pub(crate) async fn remote_candidate_incarnation_is_newer(
+        &self,
+        node_id: &str,
+        candidate_generation: u64,
+    ) -> bool {
+        let Some(new_incarnation) =
+            crate::control::candidate_generation_incarnation(candidate_generation)
+        else {
+            return false;
+        };
+        self.connections
+            .read()
+            .await
+            .get(node_id)
+            .and_then(|conn| {
+                crate::control::candidate_generation_incarnation(conn.last_candidate_generation)
+            })
+            .is_some_and(|old_incarnation| new_incarnation > old_incarnation)
+    }
+
     /// Reset a same-node peer only when its encoded candidate generation proves
-    /// that the remote daemon incarnation changed. This keeps normal endpoint
+    /// that the remote daemon incarnation advanced. This keeps normal endpoint
     /// refreshes on the existing path while making an Air restart fail closed
     /// against old WireGuard state and acknowledgements.
     pub(crate) async fn reset_peer_session_if_remote_incarnation_changed(
@@ -97,11 +127,25 @@ impl PeerManager {
             else {
                 return false;
             };
-            if old_incarnation == new_incarnation {
+            // Incarnations are monotonic. An equal value is an ordinary
+            // candidate refresh and an older value is a delayed/replayed
+            // signal from a previous daemon instance. Neither is allowed to
+            // tear down the current peer lifecycle.
+            if new_incarnation <= old_incarnation {
                 return false;
             }
             let had_relay_confirmation = conn.relay_confirmed_at.is_some();
             conn.reset_for_peer_session();
+            let published = self
+                .peer_membership
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .publish(node_id, conn.online, true);
+            if !published {
+                warn!(
+                    "Peer lifecycle generation exhausted while resetting remote incarnation for {node_id}; authentication disabled"
+                );
+            }
             if had_relay_confirmation {
                 conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                 self.bump_relay_confirm_seq(node_id);
@@ -155,6 +199,12 @@ impl PeerManager {
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
         let old_signaled_endpoint = conn.signaled_endpoint;
+        let old_online = conn.online;
+        let old_device_name = conn.device_name.clone();
+        let old_app_version = conn.app_version.clone();
+        let old_nat_type = conn.nat_type.clone();
+        let old_last_seen = conn.last_seen;
+        let old_remote_relay_rtt_ms = conn.remote_relay_rtt_ms;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
 
@@ -237,6 +287,16 @@ impl PeerManager {
             }
         };
         let endpoint_changed = !is_new && old_signaled_endpoint != signaled_endpoint;
+        let last_seen_only = !is_new
+            && old_last_seen != info.last_seen
+            && !virtual_ip_changed
+            && !public_key_changed
+            && !endpoint_changed
+            && old_device_name == info.device_name
+            && old_app_version == info.app_version
+            && old_nat_type == info.nat_type
+            && old_online == info.online
+            && old_remote_relay_rtt_ms == info.relay_rtt_ms;
         // PeerUpdated may carry a new host/private endpoint while an
         // encrypted-confirmed public pair is live. Keep the confirmed pair as
         // the active endpoint; the new value remains in signaled_endpoint and
@@ -315,6 +375,21 @@ impl PeerManager {
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
+        // Publish membership only after the connection is fully initialized.
+        // Readers of the no-await mirror may then safely dispatch candidate
+        // work without mistaking an in-progress PeerJoined for a ready peer.
+        let rotate_peer_session = is_new || public_key_changed || old_online != info.online;
+        let published = self
+            .peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish(&info.node_id, info.online, rotate_peer_session);
+        if !published {
+            warn!(
+                "Peer lifecycle generation exhausted while publishing {}; authentication disabled",
+                info.node_id
+            );
+        }
         drop(conns);
         drop(ip_map);
         drop(epoch_guard);
@@ -341,6 +416,7 @@ impl PeerManager {
             virtual_ip_changed,
             endpoint_changed,
             public_key_changed,
+            last_seen_only,
         }
     }
 
@@ -356,6 +432,14 @@ impl PeerManager {
             let epoch_gate = self.network_epoch_gate();
             let _epoch_guard = epoch_gate.lock().await;
             let mut conns = self.connections.write().await;
+            // This is the lifecycle linearization point: once the mirror is
+            // cleared, no new UDP adoption or control candidate work may treat
+            // the old connection as present, even though physical map cleanup
+            // follows immediately under the same writer.
+            self.peer_membership
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id);
             let removed_virtual_ip = conns.remove(node_id).map(|conn| conn.virtual_ip);
             // PeerLeft is a terminal boundary for the current peer session.
             // Cancel the forced-relay token while the same epoch gate covers
@@ -421,6 +505,38 @@ impl PeerManager {
         if updated && !matches!(state, ConnectionState::Relay | ConnectionState::FallbackToRelay) {
             self.cancel_relay_backoff_heartbeat(node_id);
         }
+    }
+
+    /// Transition connection state only for the exact online peer lifecycle
+    /// that admitted delayed handshake work. The epoch gate makes the
+    /// generation check and connection mutation one commit, so a same-node
+    /// leave/rejoin cannot receive the old task's state transition.
+    pub(crate) async fn update_state_if_peer_session_current(
+        &self,
+        node_id: &str,
+        expected: PeerSessionGeneration,
+        state: ConnectionState,
+    ) -> bool {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if !self.peer_session_is_current_sync(node_id, expected) {
+            return false;
+        }
+        let updated = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            if !conn.online || conn.state == ConnectionState::Closed {
+                return false;
+            }
+            conn.transition(state);
+            true
+        };
+        if updated && !matches!(state, ConnectionState::Relay | ConnectionState::FallbackToRelay) {
+            self.cancel_relay_backoff_heartbeat(node_id);
+        }
+        updated
     }
 
     /// Atomically re-check the state observed before an asynchronous punch
@@ -1040,6 +1156,17 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return Vec::new();
         };
+        if !conn.online {
+            return Vec::new();
+        }
+        let Some(session_generation) = self
+            .peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_generation(node_id)
+        else {
+            return Vec::new();
+        };
         prune_probe_session_bindings(conn, Instant::now());
         let Some(base_key) = conn.probe_mac_key else {
             return Vec::new();
@@ -1054,6 +1181,7 @@ impl PeerManager {
             probe_mac_key_for_binding(base_key, &active),
             ProbeKeyRole::Active,
             active.session_id.clone(),
+            session_generation,
         );
         for pending in pending.values() {
             let role = if pending.promote_on_match {
@@ -1072,6 +1200,7 @@ impl PeerManager {
                 probe_mac_key_for_binding(base_key, &pending.binding),
                 role,
                 pending.binding.session_id.clone(),
+                session_generation,
             );
         }
         if let Some(previous) = previous.as_ref() {
@@ -1080,14 +1209,21 @@ impl PeerManager {
                 probe_mac_key_for_binding(base_key, &previous.binding),
                 ProbeKeyRole::Previous,
                 previous.binding.session_id.clone(),
+                session_generation,
             );
         }
-        push_probe_binding_compatibility_keys(&mut candidates, base_key, &active);
+        push_probe_binding_compatibility_keys(
+            &mut candidates,
+            base_key,
+            &active,
+            session_generation,
+        );
         for pending in pending.values() {
             push_probe_binding_compatibility_keys(
                 &mut candidates,
                 base_key,
                 &pending.binding,
+                session_generation,
             );
         }
         if let Some(previous) = previous.as_ref() {
@@ -1095,6 +1231,7 @@ impl PeerManager {
                 &mut candidates,
                 base_key,
                 &previous.binding,
+                session_generation,
             );
         }
         push_unique_probe_key(
@@ -1102,6 +1239,7 @@ impl PeerManager {
             base_key,
             ProbeKeyRole::Compatibility,
             None,
+            session_generation,
         );
         candidates
     }

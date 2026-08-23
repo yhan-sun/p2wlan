@@ -349,12 +349,250 @@ async fn initiator_rekey_keeps_peer_in_direct_state() {
 }
 
 #[tokio::test]
+async fn peer_answer_from_new_remote_incarnation_rebinds_pending_initiator() {
+    fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
+        0x4000_0000_0000_0000 | (incarnation << 21) | counter
+    }
+
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-answer-remote-restart";
+    let peer_identity = NodeIdentity::generate();
+    let endpoint = "203.0.113.20:42100";
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.21".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let old_candidate_generation = encoded_generation(100, 1);
+    let new_candidate_generation = encoded_generation(101, 1);
+    assert_eq!(
+        daemon
+            .peers
+            .add_candidates_with_metadata(
+                peer_id,
+                &[endpoint.to_string()],
+                &HashMap::new(),
+                old_candidate_generation,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    daemon
+        .peers
+        .update_state(peer_id, ConnectionState::Direct)
+        .await;
+    let old_peer_session_generation = daemon.peers.peer_session_generation_sync(peer_id).unwrap();
+
+    let (old_local_session, _) = part03_establish_sessions();
+    daemon
+        .transport
+        .add_session(peer_id, old_local_session)
+        .await;
+
+    let mut initiator = HandshakeInitiator::new(
+        daemon.local_identity().unwrap(),
+        peer_identity.public_key(),
+        None,
+    );
+    let initiation = initiator.create_initiation().unwrap();
+    let mut responder = HandshakeResponder::new(peer_identity, None);
+    let (response, _) = responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    daemon
+        .pending_handshakes
+        .lock()
+        .await
+        .insert_with_generation(
+            peer_id.to_string(),
+            initiator,
+            None,
+            None,
+            None,
+            daemon.peers.current_network_generation_sync(),
+            old_peer_session_generation,
+        );
+
+    assert!(
+        daemon
+            .reset_peer_for_remote_incarnation_if_needed(
+                peer_id,
+                new_candidate_generation,
+                RemoteIncarnationResetWork::PreserveInitiator,
+            )
+            .await
+    );
+    let new_peer_session_generation = daemon.peers.peer_session_generation_sync(peer_id).unwrap();
+    assert_ne!(new_peer_session_generation, old_peer_session_generation);
+    {
+        let pending = daemon.pending_handshakes.lock().await;
+        assert!(pending.pending.contains_key(peer_id));
+        assert_eq!(
+            pending.peer_session_generation(peer_id),
+            Some(new_peer_session_generation),
+            "the exact answer transaction must be rebound to the restart lifecycle"
+        );
+    }
+    assert!(!daemon.transport.has_session(peer_id).await);
+    assert_eq!(
+        daemon.peers.get_connection(peer_id).await.unwrap().state,
+        ConnectionState::Idle
+    );
+
+    assert!(daemon
+        .handle_peer_answer(peer_id, &response.to_bytes(), None, None)
+        .await
+        .unwrap());
+    assert!(daemon.transport.has_session(peer_id).await);
+    assert_eq!(
+        daemon
+            .peers
+            .add_candidates_with_metadata(
+                peer_id,
+                &[endpoint.to_string()],
+                &HashMap::new(),
+                new_candidate_generation,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    // A delayed signal from the retired boot is different but not newer. It
+    // must not tear down the newly installed answer session or rotate the
+    // lifecycle backwards.
+    assert!(
+        !daemon
+            .reset_peer_for_remote_incarnation_if_needed(
+                peer_id,
+                old_candidate_generation,
+                RemoteIncarnationResetWork::ClearAll,
+            )
+            .await
+    );
+    assert_eq!(
+        daemon.peers.peer_session_generation_sync(peer_id),
+        Some(new_peer_session_generation)
+    );
+    assert!(daemon.transport.has_session(peer_id).await);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn responder_remote_incarnation_reset_does_not_self_lock_lifecycle_arbiter() {
+    fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
+        0x4000_0000_0000_0000 | (incarnation << 21) | counter
+    }
+
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-responder-reset-no-self-lock";
+    let endpoint = "203.0.113.31:43100";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.31".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let old_candidate_generation = encoded_generation(200, 1);
+    let new_candidate_generation = encoded_generation(201, 1);
+    assert_eq!(
+        daemon
+            .peers
+            .add_candidates_with_metadata(
+                peer_id,
+                &[endpoint.to_string()],
+                &HashMap::new(),
+                old_candidate_generation,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    *daemon.udp_transport.write().await = Some(udp.clone());
+
+    // Force the reset to suspend only after it owns the lifecycle arbiter. In
+    // the old inline implementation the serial control-loop future itself held
+    // that arbiter here, so ceasing to poll it made a concurrent PeerLeft wait
+    // forever even after UDP cleanup became runnable.
+    let adoption_guard = udp
+        .lock_peer_adoption_for_direct_validation(peer_id)
+        .await;
+    let reset = daemon.reset_peer_for_remote_incarnation_if_needed(
+        peer_id,
+        new_candidate_generation,
+        RemoteIncarnationResetWork::PreserveResponder,
+    );
+    tokio::pin!(reset);
+    tokio::select! {
+        changed = &mut reset => {
+            panic!("reset unexpectedly bypassed the held UDP adoption lock: {changed}");
+        }
+        _ = sleep(Duration::from_millis(25)) => {}
+    }
+    drop(adoption_guard);
+
+    let lifecycle_guard = timeout(
+        Duration::from_millis(500),
+        daemon.handshake_arbiter.acquire(peer_id),
+    )
+    .await
+    .expect("responder reset retained an unpolled lifecycle-arbiter owner");
+    drop(lifecycle_guard);
+    assert!(
+        timeout(Duration::from_millis(500), &mut reset)
+            .await
+            .expect("independent responder reset task did not complete")
+    );
+}
+
+#[tokio::test]
 async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
     let daemon = Daemon::new(config);
     let peer_id = "peer-stale-answer";
 
     let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
     let mut initiator = HandshakeInitiator::new(
         daemon.local_identity().unwrap(),
         peer_identity.public_key(),
@@ -390,6 +628,21 @@ async fn wireguard_answer_from_previous_network_generation_cannot_install_sessio
     let daemon = Daemon::new(config);
     let peer_id = "peer-old-network-generation-answer";
     let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
     let mut initiator = HandshakeInitiator::new(
         daemon.local_identity().unwrap(),
         peer_identity.public_key(),
@@ -403,7 +656,15 @@ async fn wireguard_answer_from_previous_network_generation_cannot_install_sessio
 
     {
         let mut state = daemon.pending_handshakes.lock().await;
-        state.insert_with_generation(peer_id.to_string(), initiator, None, None, None, 0);
+        state.insert_with_generation(
+            peer_id.to_string(),
+            initiator,
+            None,
+            None,
+            None,
+            0,
+            PeerSessionGeneration::for_test(1),
+        );
     }
     assert_eq!(
         daemon
@@ -444,6 +705,7 @@ async fn responder_offer_from_previous_network_generation_cannot_stage_session()
         candidate_sources: HashMap::new(),
         candidate_generation: 0,
         network_generation: 0,
+        peer_session_generation: None,
         candidates_expires_at_ms: None,
         sender_public_key: None,
         handshake_init: Vec::new(),
@@ -452,6 +714,7 @@ async fn responder_offer_from_previous_network_generation_cannot_stage_session()
         session_id: None,
         probe_ephemeral_public_key: None,
         ingress_suppressed: false,
+        delivery_receipt: None,
     };
     let (reservation, offer) = daemon
         .pending_handshakes
@@ -501,6 +764,21 @@ async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() 
         .await;
 
     let new_remote_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(new_remote_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
     let mut new_initiator = HandshakeInitiator::new(
         daemon.local_identity().unwrap(),
         new_remote_identity.public_key(),
@@ -676,6 +954,45 @@ fn stale_handshake_start_owner_cannot_clear_replacement_reservation() {
 }
 
 #[test]
+fn handshake_reservation_commit_requires_exact_peer_lifecycle() {
+    let mut state = PendingHandshakeState::default();
+    let peer_id = "peer-reservation-lifecycle";
+    let admitted_lifecycle = PeerSessionGeneration::for_test(41);
+    let replacement_lifecycle = PeerSessionGeneration::for_test(42);
+    let reservation = state
+        .reserve_start_with_owner_at_generation(peer_id, 7, admitted_lifecycle)
+        .expect("first lifecycle must reserve the initiator slot");
+
+    let old_identity = NodeIdentity::generate();
+    let remote_identity = NodeIdentity::generate();
+    assert!(
+        state
+            .insert_reserved_if_current_with_generation(
+                peer_id.to_string(),
+                reservation.owner,
+                HandshakeInitiator::new(
+                    old_identity,
+                    remote_identity.public_key(),
+                    None,
+                ),
+                Some("stale-lifecycle-session".to_string()),
+                None,
+                7,
+                replacement_lifecycle,
+            )
+            .is_none(),
+        "the right owner token must still fail when its peer lifecycle is stale"
+    );
+    assert_eq!(state.starting_ids.get(peer_id), Some(&reservation.owner));
+    assert_eq!(
+        state.starting_peer_session_generations.get(peer_id),
+        Some(&admitted_lifecycle),
+        "a failed stale commit must not consume or rewrite the live reservation"
+    );
+    assert!(!state.pending.contains_key(peer_id));
+}
+
+#[test]
 fn new_generation_replaces_stale_pending_initiator_before_retry() {
     let mut state = PendingHandshakeState::default();
     let peer_id = "peer-stale-pending-generation";
@@ -693,18 +1010,19 @@ fn new_generation_replaces_stale_pending_initiator_before_retry() {
             Some("stale-session".to_string()),
             None,
             0,
+            reservation.peer_session_generation,
         )
         .expect("reservation must become pending");
     assert!(state.is_current(peer_id, pending_id));
 
     let stale_token = state
-        .remove_stale_pending_for_generation(peer_id, 1)
+        .remove_stale_pending_for_generation(peer_id, 1, reservation.peer_session_generation)
         .expect("generation advance must retire the old pending transaction");
     assert_eq!(stale_token, "stale-session");
     assert!(!state.pending.contains_key(peer_id));
 
     let replacement = state
-        .reserve_start_with_owner_at_generation(peer_id, 1)
+        .reserve_start_with_owner_at_generation(peer_id, 1, reservation.peer_session_generation)
         .expect("new generation must not wait for the stale answer timeout");
     assert!(state.starting.contains(peer_id));
     assert_eq!(
@@ -724,6 +1042,7 @@ fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
             candidate_sources: HashMap::from([(endpoint.to_string(), "stun".to_string())]),
             candidate_generation: 1,
             network_generation: 0,
+            peer_session_generation: None,
             candidates_expires_at_ms: None,
             sender_public_key: None,
             handshake_init: vec![1, 2, 3],
@@ -732,6 +1051,7 @@ fn deferred_unknown_peer_offer_is_newest_wins_and_owner_scoped() {
             session_id: None,
             probe_ephemeral_public_key: None,
             ingress_suppressed: false,
+            delivery_receipt: None,
         }
     }
 
@@ -776,6 +1096,7 @@ fn cancelled_responder_owner_cannot_consume_a_new_offer() {
             candidate_sources: HashMap::new(),
             candidate_generation: 1,
             network_generation: 0,
+            peer_session_generation: None,
             candidates_expires_at_ms: None,
             sender_public_key: None,
             handshake_init: vec![1, 2, 3],
@@ -784,6 +1105,7 @@ fn cancelled_responder_owner_cannot_consume_a_new_offer() {
             session_id: None,
             probe_ephemeral_public_key: None,
             ingress_suppressed: false,
+            delivery_receipt: None,
         }
     }
 
@@ -814,6 +1136,8 @@ fn peer_reflexive_work_is_newest_wins_and_owner_scoped() {
             from_node_id: peer_id.to_string(),
             observed_endpoint: endpoint.to_string(),
             punch_at_ms: None,
+            peer_session_generation: None,
+            delivery_receipt: None,
         }
     }
 
@@ -856,6 +1180,7 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
         candidate_sources: HashMap::from([(candidate.to_string(), "stun".to_string())]),
         candidate_generation: 1,
         network_generation: 0,
+        peer_session_generation: None,
         candidates_expires_at_ms: None,
         sender_public_key: Some(hex::encode(peer_identity.public_key())),
         handshake_init: Vec::new(),
@@ -864,6 +1189,7 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
         session_id: None,
         probe_ephemeral_public_key: None,
         ingress_suppressed: false,
+        delivery_receipt: None,
     };
     let (reservation, offer) = daemon
         .pending_handshakes
@@ -961,7 +1287,10 @@ async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_
 
     tokio::time::timeout(Duration::from_millis(250), async {
         loop {
-            if health.snapshot(&[]).await.control_connected {
+            // ControlHealthy proves API reachability only; it must not forge a
+            // successful device-lease refresh. This test is about receiver
+            // progress, so observe the exact bit the event is allowed to set.
+            if health.snapshot(&[]).await.control_api_reachable {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -973,6 +1302,194 @@ async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_
     drop(candidate_guard);
     let _ = shutdown.send(true);
     tokio::time::timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+/// Peer roster removal is structural control-plane state, not an optional UDP
+/// side effect. During startup the control consumer can run before the UDP
+/// transport is published; a leave in that window must still remove the peer
+/// and make a same-node rejoin allocate a fresh lifecycle generation.
+#[tokio::test]
+async fn peer_left_without_udp_transport_removes_membership_and_fences_same_id_rejoin() {
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    assert!(
+        daemon.udp_transport.read().await.is_none(),
+        "the regression requires the real pre-publication UDP state"
+    );
+
+    // Keep PeerJoined focused on lifecycle state: make the local daemon the
+    // deterministic responder so no initiator slow-work is spawned.
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "peer-left-before-udp";
+    let peer_info = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: "203.0.113.40:51820".to_string(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.40".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    };
+
+    let peers = daemon.peers.clone();
+    let control = daemon.control.clone();
+    let shutdown = daemon.shutdown_sender();
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    control
+        .event_sender()
+        .send(ControlEvent::PeerJoined(peer_info.clone()))
+        .unwrap();
+    let initial_generation = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some((generation, true)) = peers.peer_session_snapshot_for_test(peer_id) {
+                break generation;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PeerJoined must publish the initial online lifecycle");
+
+    control
+        .event_sender()
+        .send(ControlEvent::PeerLeft(peer_id.to_string()))
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        while peers.peer_exists_sync(peer_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PeerLeft must remove structural membership even without UDP");
+    assert!(peers.get_connection(peer_id).await.is_none());
+    assert!(peers.peer_session_snapshot_for_test(peer_id).is_none());
+
+    control
+        .event_sender()
+        .send(ControlEvent::PeerJoined(peer_info))
+        .unwrap();
+    let rejoined_generation = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some((generation, true)) = peers.peer_session_snapshot_for_test(peer_id) {
+                break generation;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-ID rejoin must publish a replacement lifecycle");
+    assert_ne!(
+        rejoined_generation, initial_generation,
+        "remove/readd must never reuse the departed peer lifecycle"
+    );
+
+    let _ = shutdown.send(true);
+    timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+#[tokio::test]
+async fn last_seen_only_peer_update_refreshes_diagnostics_without_handshake_reservation() {
+    let config = Config::generate_default("http://127.0.0.1:1", "last-seen-heartbeat").unwrap();
+    let daemon = Daemon::new(config);
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if local_public < identity.public_key() {
+            break identity;
+        }
+    };
+    let peer_id = "peer-last-seen-heartbeat";
+    let peer_info = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        device_name: "Heartbeat Peer".to_string(),
+        app_version: "1.2.3".to_string(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: "203.0.113.50:51820".to_string(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.50".to_string(),
+        online: true,
+        last_seen: 10,
+        relay_rtt_ms: Some(25),
+    };
+    daemon.peers.add_peer(&peer_info).await;
+    let lifecycle = daemon
+        .peers
+        .peer_session_generation_sync(peer_id)
+        .expect("initial peer lifecycle must exist");
+
+    let peers = daemon.peers.clone();
+    let pending = daemon.pending_handshakes.clone();
+    let control = daemon.control.clone();
+    let shutdown = daemon.shutdown_sender();
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    let mut heartbeat = peer_info;
+    heartbeat.last_seen = 11;
+    control
+        .event_sender()
+        .send(ControlEvent::PeerUpdated(heartbeat))
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|conn| conn.last_seen == 11)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("last_seen-only update must reach peer diagnostics");
+    // Give the old behavior enough time to reserve and detach its initiator
+    // worker. The fixed branch returns immediately after `add_peer`.
+    sleep(Duration::from_millis(25)).await;
+
+    let state = pending.lock().await;
+    assert!(!state.starting.contains(peer_id));
+    assert!(!state.pending.contains_key(peer_id));
+    assert!(!state.attempts.contains_key(peer_id));
+    drop(state);
+    assert_eq!(
+        peers.peer_session_generation_sync(peer_id),
+        Some(lifecycle),
+        "a liveness timestamp must not rotate the authenticated peer lifecycle"
+    );
+
+    let _ = shutdown.send(true);
+    timeout(Duration::from_secs(1), loop_task)
         .await
         .expect("control event loop did not stop")
         .expect("control event loop task panicked");
@@ -1161,6 +1678,104 @@ async fn control_event_loop_processes_peer_offer_while_peer_reflexive_work_waits
 }
 
 #[tokio::test]
+async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_blocked() {
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-connection-writer-blocked-offer";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    // Reproduce the field failure: candidate refresh/fresh-mapping work owns
+    // the global connection writer when a candidate-only offer reaches the
+    // serial signal consumer.  Membership is already registered, so ingress
+    // must enqueue the offer without awaiting this writer.  The worker may
+    // wait for the writer, but the receiver itself must consume ControlHealthy.
+    let connection_guard = daemon.peers.connection_map_for_test().write_owned().await;
+    let offered_candidate = "198.51.100.23:42345".to_string();
+    let control = daemon.control.clone();
+    let health = daemon.health.clone();
+    let peers = daemon.peers.clone();
+    let shutdown = daemon.shutdown_sender();
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec![offered_candidate.clone()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::from([(offered_candidate.clone(), "stun".to_string())]),
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+    control
+        .event_sender()
+        .send(ControlEvent::ControlHealthy)
+        .unwrap();
+
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            // ControlHealthy is API evidence, not a device-lease renewal.
+            if health.snapshot(&[]).await.control_api_reachable {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("ControlHealthy must pass a candidate offer blocked on the connection writer");
+
+    drop(connection_guard);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let installed = peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|connection| connection.candidates.contains(&offered_candidate));
+            if installed {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("queued candidate offer must be consumed after the writer is released");
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+#[tokio::test]
 async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
     use std::future::Future;
     use std::task::Poll;
@@ -1186,6 +1801,7 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
         last_seen: 0,
         relay_rtt_ms: None,
     };
+    daemon.peers.add_peer(&peer_info).await;
     let candidate_refresh_lock = daemon.candidate_refresh_lock.clone();
     let candidate_guard = candidate_refresh_lock.lock().await;
     let mut reservation = daemon
@@ -4059,6 +4675,9 @@ async fn test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack() 
 
     // The replacement overwrites the old expectation with the same token but
     // a new local connection incarnation.
+    peers
+        .mark_relay_transport_ready_with_transport("node-b", endpoint, generation, Some(1))
+        .await;
     peers.register_relay_probe_expectation_for_transport(
         "node-b",
         generation,
@@ -4067,6 +4686,9 @@ async fn test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack() 
         endpoint,
         1,
     );
+    peers
+        .mark_relay_transport_ready_with_transport("node-b", endpoint, generation, Some(2))
+        .await;
     peers.register_relay_probe_expectation_for_transport(
         "node-b",
         generation,

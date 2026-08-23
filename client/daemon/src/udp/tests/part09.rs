@@ -51,6 +51,8 @@ async fn run_one(
         .run_fresh_mapping_generation(
             "peer-b",
             &nat.observers,
+            // Stay above the production 350 ms per-sample cap without
+            // changing it; the test exercises the real measurement budget.
             Duration::from_millis(500),
             &[nat.peer_public],
             Duration::from_millis(10),

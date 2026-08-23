@@ -29,6 +29,23 @@ fn manual_register_payload_keeps_requested_virtual_ip() {
     assert_eq!(payload["virtual_ip"], "10.20.0.44");
 }
 
+#[test]
+fn ordinary_endpoint_update_uses_the_device_lease_health_lane() {
+    // `commands.rs` is include!-spliced inside the runtime select branch, so a
+    // source-level contract assertion is the narrowest regression test for
+    // this call-site wiring; HealthState's behavior is exercised separately.
+    let source = include_str!("runtime/commands.rs");
+    let update_endpoint = source
+        .split("ControlCommand::UpdateEndpoint")
+        .nth(1)
+        .and_then(|tail| tail.split("ControlCommand::SendPeerReflexive").next())
+        .expect("UpdateEndpoint command branch");
+
+    assert!(update_endpoint.contains("mark_device_lease_success().await"));
+    assert!(update_endpoint.contains("set_device_lease_healthy(false)"));
+    assert!(!update_endpoint.contains("mark_control_success().await"));
+}
+
 include!("tests/websocket.rs");
 include!("tests/peers.rs");
 include!("tests/messages.rs");

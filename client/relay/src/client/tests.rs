@@ -1,6 +1,7 @@
 use super::*;
 use crate::{RelayClientConfig, RelayServer, RelayServerConfig};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
 
 #[tokio::test]
 async fn test_connect_and_registration_confirmed() {
@@ -128,9 +129,74 @@ async fn test_ping_pong() {
         .unwrap()
         .unwrap();
 
-    assert!(matches!(msg, RelayMessage::Pong { .. }));
+    match msg {
+        RelayMessage::Pong {
+            round_trip_time: Some(round_trip_time),
+            ..
+        } => assert!(round_trip_time <= Duration::from_secs(2)),
+        other => panic!("expected a locally matched pong RTT, got {other:?}"),
+    }
 
     server.shutdown().await;
+}
+
+#[test]
+fn pong_rtt_uses_monotonic_expectation_not_echo_token_or_wall_clock() {
+    let received_at = Instant::now();
+    let sent_at = received_at.checked_sub(Duration::from_millis(37)).unwrap();
+    let mut expectations = PingExpectations::new(Duration::from_secs(1));
+
+    // A token that would look like a far-future wall timestamp must remain an
+    // opaque correlation value; only the saved Instant determines the RTT.
+    expectations.register(u64::MAX, sent_at);
+    assert_eq!(
+        expectations.consume(u64::MAX, received_at),
+        Some(Duration::from_millis(37))
+    );
+
+    // Unknown and replayed tokens cannot create another sample.
+    assert_eq!(expectations.consume(u64::MAX, received_at), None);
+    assert_eq!(expectations.consume(123_456, received_at), None);
+}
+
+#[tokio::test]
+async fn unknown_pong_token_is_delivered_without_an_rtt_sample() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let unknown_token = u64::MAX - 7;
+    let addr = raw_relay_peer(move |mut stream| async move {
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf).await;
+        stream
+            .write_all(&Frame::registered("unknown-pong-node").encode())
+            .await
+            .unwrap();
+        stream
+            .write_all(&Frame::pong(unknown_token).encode())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await;
+
+    let (_client, mut rx) = RelayClient::connect(&addr.to_string(), "unknown-pong-node")
+        .await
+        .unwrap();
+    match tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        RelayMessage::Pong {
+            timestamp,
+            round_trip_time,
+        } => {
+            assert_eq!(timestamp, unknown_token);
+            assert_eq!(round_trip_time, None);
+        }
+        other => panic!("expected unknown-token pong, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -237,6 +303,88 @@ async fn abort_interrupts_blocked_write_without_late_completion() {
         "{result:?}"
     );
     server.await.unwrap();
+}
+
+async fn assert_write_boundary_hook_runs_after_queue_wait(
+    client: RelayClient,
+    mut rx: mpsc::Receiver<RelayMessage>,
+) {
+    let client = Arc::new(client);
+    let (first_started_tx, first_started_rx) = oneshot::channel();
+    let first_client = client.clone();
+    let first = tokio::spawn(async move {
+        first_client
+            .send_data_with_write_boundary("peer", b"first", move |_| {
+                let _ = first_started_tx.send(());
+                // Hold the writer after dequeue so the second command spends
+                // observable time in the local command queue.
+                std::thread::sleep(Duration::from_millis(120));
+                false
+            })
+            .await
+    });
+    first_started_rx.await.unwrap();
+
+    let queued_at = Instant::now();
+    let (boundary_tx, boundary_rx) = oneshot::channel();
+    let second_client = client.clone();
+    let second = tokio::spawn(async move {
+        second_client
+            .send_data_with_write_boundary("peer", b"second", move |write_started_at| {
+                let _ = boundary_tx.send(write_started_at);
+                false
+            })
+            .await
+    });
+    let write_started_at = tokio::time::timeout(Duration::from_secs(1), boundary_rx)
+        .await
+        .expect("second command must reach the writer")
+        .unwrap();
+    assert!(
+        write_started_at.saturating_duration_since(queued_at) >= Duration::from_millis(70),
+        "write-boundary timestamp must be taken after local queue wait"
+    );
+    for result in [first.await.unwrap(), second.await.unwrap()] {
+        assert!(matches!(result, Err(RelayError::WriteBoundaryRejected)));
+    }
+
+    // Boundary rejection is pre-write, not a transport failure: the same
+    // writer must remain usable for a later ping.
+    client.ping().await.unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(RelayMessage::Pong { .. }) = rx.recv().await {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(pong.is_ok(), "writer must survive boundary rejection");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_writer_boundary_hook_excludes_local_queue_delay() {
+    let server = RelayServer::start_random().await.unwrap();
+    let (client, rx) = RelayClient::connect(&server.addr.to_string(), "legacy-boundary")
+        .await
+        .unwrap();
+    assert_write_boundary_hook_runs_after_queue_wait(client, rx).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_writer_boundary_hook_excludes_local_queue_delay() {
+    let server = RelayServer::start_random().await.unwrap();
+    let config = RelayClientConfig {
+        allow_insecure_plaintext: true,
+        ..Default::default()
+    };
+    let endpoint = format!("tcp://{}", server.addr);
+    let (client, rx) = RelayClient::connect_with_endpoint(&endpoint, "endpoint-boundary", config)
+        .await
+        .unwrap();
+    assert_write_boundary_hook_runs_after_queue_wait(client, rx).await;
+    server.shutdown().await;
 }
 
 #[tokio::test]

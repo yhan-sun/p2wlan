@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn relay_validation_echo_is_not_first_usable_business_evidence() {
-        let payload = build_relay_validation_payload(unix_time_millis().saturating_sub(42));
+        let payload = build_relay_validation_payload(42);
         let request = Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 1),
             Ipv4Addr::new(10, 20, 0, 2),
@@ -50,8 +50,8 @@ mod tests {
 
         assert!(!is_real_overlay_business_packet(&request));
         assert!(!is_real_overlay_business_packet(&reply));
-        assert!(relay_validation_rtt(&reply).is_some());
-        assert!(relay_validation_rtt(&request).is_none());
+        assert!(is_relay_validation_packet(&request));
+        assert!(is_relay_validation_packet(&reply));
     }
 
     #[test]
@@ -82,6 +82,21 @@ mod tests {
         );
         assert!(crate::relay_probe::parse_relay_probe_token(&relay_probe).is_some());
         assert!(!is_real_overlay_business_packet(&relay_probe));
+
+        let path_commit = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x4322,
+            1,
+            &crate::path_commit::build_path_commit_payload(
+                crate::path_commit::PathCommitKind::Request,
+                7,
+                0x4322,
+                10,
+            ),
+        );
+        assert!(crate::path_commit::parse_path_commit_token(&path_commit).is_some());
+        assert!(!is_real_overlay_business_packet(&path_commit));
     }
 
     #[test]
@@ -2012,7 +2027,12 @@ mod tests {
         );
         let relay_connection_id = relay.connection_id();
         peers
-            .mark_relay_transport_ready("peer-a", relay_endpoint, 0)
+            .mark_relay_transport_ready_with_transport(
+                "peer-a",
+                relay_endpoint,
+                0,
+                Some(relay_connection_id),
+            )
             .await;
         assert!(peers
             .confirm_relay_peer_with_transport(
@@ -2137,7 +2157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_validation_echo_reply_records_peer_rtt() {
+    async fn legacy_relay_validation_echo_is_untimed_observation_only() {
         let (mut remote_session, local_session) = establish_sessions();
         let (transport, _encrypted_rx) = WireGuardTransport::new();
         transport.add_session("peer-a", local_session).await;
@@ -2154,7 +2174,7 @@ mod tests {
             })
             .await;
 
-        let payload = build_relay_validation_payload(unix_time_millis().saturating_sub(42));
+        let payload = build_relay_validation_payload(42);
         let mut packet = Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 1),
             Ipv4Addr::new(10, 20, 0, 2),
@@ -2194,10 +2214,11 @@ mod tests {
         assert_eq!(inbound_rx.recv().await.unwrap().peer_id, "peer-a");
 
         let conn = peers.get_connection("peer-a").await.unwrap();
-        let latency = conn.relay_health.latency_ms.unwrap();
-        assert!(latency >= 42);
-        assert!(latency < 1_000);
-        assert_eq!(conn.relay_health.rtt_ewma_ms, Some(latency));
+        assert!(conn.relay_health.last_observation_at.is_some());
+        assert_eq!(conn.relay_health.observation_count, 1);
+        assert!(conn.relay_health.last_success_at.is_none());
+        assert!(conn.relay_health.latency_ms.is_none());
+        assert!(conn.relay_health.rtt_ewma_ms.is_none());
         // Relay validation is daemon-internal health evidence only.  It must
         // never become the production first-usable business milestone; that
         // milestone requires a normal decrypted overlay packet.

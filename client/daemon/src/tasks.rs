@@ -5,8 +5,7 @@
 //! drive a controlled shutdown.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +14,11 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 const CONTROL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(30);
+/// The control server expires a device after 90 seconds without a successful
+/// endpoint/lease refresh. Keep the local diagnostic fence aligned with that
+/// server-side contract instead of allowing unrelated successful GETs to keep
+/// the device lease looking healthy forever.
+const DEVICE_LEASE_STALE_AFTER: Duration = Duration::from_secs(90);
 
 /// Health status reported by diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +49,17 @@ pub struct HealthSnapshot {
     pub critical_tasks: Vec<TaskStatus>,
     pub control_connected: bool,
     pub last_control_success_secs_ago: Option<u64>,
+    /// Whether a non-heartbeat control API request most recently succeeded.
+    /// This is deliberately separate from the device's server-side online
+    /// lease: roster/signal GET success cannot refresh that lease.
+    #[serde(default)]
+    pub control_api_reachable: bool,
+    /// Whether the most recent device-authenticated lease refresh succeeded
+    /// and has not exceeded the server's lease TTL.
+    #[serde(default)]
+    pub device_lease_healthy: bool,
+    #[serde(default)]
+    pub last_device_lease_success_secs_ago: Option<u64>,
     pub reauth_required: bool,
 }
 
@@ -70,65 +85,152 @@ struct TrackedTask {
 /// Shared health state used by diagnostics and the main loop.
 #[derive(Debug)]
 pub struct HealthState {
-    status: Mutex<HealthStatus>,
-    reason: Mutex<Option<String>>,
-    control_connected: AtomicBool,
-    reauth_required: AtomicBool,
-    last_control_success: Mutex<Option<Instant>>,
+    presentation: Mutex<HealthPresentation>,
+    /// API reachability, device lease ownership, auth state, and their clocks
+    /// form one logical snapshot. Keeping them under one short std mutex avoids
+    /// impossible combinations when GET and PATCH completions race `/status`.
+    control: StdMutex<ControlHealthState>,
+}
+
+#[derive(Debug)]
+struct HealthPresentation {
+    status: HealthStatus,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ControlHealthState {
+    control_api_reachable: bool,
+    device_lease_healthy: bool,
+    reauth_required: bool,
+    last_control_success: Option<Instant>,
+    last_device_lease_success: Option<Instant>,
 }
 
 impl HealthState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            status: Mutex::new(HealthStatus::Healthy),
-            reason: Mutex::new(None),
-            control_connected: AtomicBool::new(false),
-            reauth_required: AtomicBool::new(false),
-            last_control_success: Mutex::new(None),
+            presentation: Mutex::new(HealthPresentation {
+                status: HealthStatus::Healthy,
+                reason: None,
+            }),
+            control: StdMutex::new(ControlHealthState::default()),
         })
     }
 
     pub async fn set_status(&self, status: HealthStatus, reason: Option<String>) {
-        *self.status.lock().await = status;
-        *self.reason.lock().await = reason;
+        *self.presentation.lock().await = HealthPresentation { status, reason };
     }
 
     pub fn set_control_connected(&self, connected: bool) {
-        self.control_connected.store(connected, Ordering::SeqCst);
+        // Compatibility entry point used by generic ControlEvent consumers.
+        // It only describes API reachability. Device lease ownership is changed
+        // exclusively by the registration/heartbeat lane below.
+        self.set_control_api_reachable(connected);
+    }
+
+    pub fn set_control_api_reachable(&self, reachable: bool) {
+        self.control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .control_api_reachable = reachable;
+    }
+
+    pub fn set_device_lease_healthy(&self, healthy: bool) {
+        self.control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .device_lease_healthy = healthy;
     }
 
     pub fn set_reauth_required(&self, required: bool) {
-        self.reauth_required.store(required, Ordering::SeqCst);
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.reauth_required = required;
         if required {
-            self.control_connected.store(false, Ordering::SeqCst);
+            control.control_api_reachable = false;
+            control.device_lease_healthy = false;
         }
     }
 
+    /// Record a successful control API operation. This intentionally does NOT
+    /// refresh the server-side device lease.
     pub async fn mark_control_success(&self) {
-        *self.last_control_success.lock().await = Some(Instant::now());
-        self.control_connected.store(true, Ordering::SeqCst);
-        self.reauth_required.store(false, Ordering::SeqCst);
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.last_control_success = Some(Instant::now());
+        control.control_api_reachable = true;
+        control.reauth_required = false;
+    }
+
+    /// Record a successful registration or endpoint PATCH: the only operations
+    /// that refresh the device's server-side online lease.
+    pub async fn mark_device_lease_success(&self) {
+        let now = Instant::now();
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        control.last_control_success = Some(now);
+        control.last_device_lease_success = Some(now);
+        control.control_api_reachable = true;
+        control.device_lease_healthy = true;
+        control.reauth_required = false;
     }
 
     pub async fn snapshot(&self, tasks: &[TaskStatus]) -> HealthSnapshot {
-        let mut status = *self.status.lock().await;
-        let mut reason = self.reason.lock().await.clone();
-        let last = self
-            .last_control_success
+        let presentation = self.presentation.lock().await;
+        let mut status = presentation.status;
+        let mut reason = presentation.reason.clone();
+        drop(presentation);
+        let control = self
+            .control
             .lock()
-            .await
-            .map(|t| t.elapsed().as_secs());
-        let raw_control_connected = self.control_connected.load(Ordering::SeqCst);
-        let control_stale = raw_control_connected
-            && last.is_some_and(|age| age > CONTROL_HEALTH_STALE_AFTER.as_secs());
-        let control_connected = raw_control_connected && !control_stale;
-        if control_stale && status == HealthStatus::Healthy {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let last = control
+            .last_control_success
+            .map(|instant| instant.elapsed().as_secs());
+        let last_device_lease = control
+            .last_device_lease_success
+            .map(|instant| instant.elapsed().as_secs());
+        let raw_api_reachable = control.control_api_reachable;
+        let raw_device_lease_healthy = control.device_lease_healthy;
+        let reauth_required = control.reauth_required;
+        drop(control);
+        let control_stale =
+            raw_api_reachable && last.is_some_and(|age| age > CONTROL_HEALTH_STALE_AFTER.as_secs());
+        let device_lease_stale = raw_device_lease_healthy
+            && last_device_lease.is_some_and(|age| age > DEVICE_LEASE_STALE_AFTER.as_secs());
+        let control_api_reachable = raw_api_reachable && !control_stale;
+        let device_lease_healthy = raw_device_lease_healthy && !device_lease_stale;
+        let control_connected = control_api_reachable && device_lease_healthy;
+        let previously_connected = last.is_some() || last_device_lease.is_some();
+        if previously_connected && !control_connected && status == HealthStatus::Healthy {
             status = HealthStatus::Degraded;
             if reason.is_none() {
-                let age = last.unwrap_or_default();
-                reason = Some(format!(
-                    "control plane last successful sync was {age}s ago; peer and candidate state may be stale"
-                ));
+                reason = Some(if !device_lease_healthy {
+                    if device_lease_stale {
+                        format!(
+                            "device lease last refreshed {}s ago and may have expired on the control server",
+                            last_device_lease.unwrap_or_default()
+                        )
+                    } else {
+                        "device lease refresh failed; successful control API reads do not keep this node online"
+                            .to_string()
+                    }
+                } else if control_stale {
+                    format!(
+                        "control plane last successful API request was {}s ago; peer and candidate state may be stale",
+                        last.unwrap_or_default()
+                    )
+                } else {
+                    "control API is unreachable while the last device lease may still be active"
+                        .to_string()
+                });
             }
         }
         HealthSnapshot {
@@ -137,7 +239,10 @@ impl HealthState {
             critical_tasks: tasks.to_vec(),
             control_connected,
             last_control_success_secs_ago: last,
-            reauth_required: self.reauth_required.load(Ordering::SeqCst),
+            control_api_reachable,
+            device_lease_healthy,
+            last_device_lease_success_secs_ago: last_device_lease,
+            reauth_required,
         }
     }
 }
@@ -397,10 +502,14 @@ mod tests {
     #[tokio::test]
     async fn stale_control_success_reports_disconnected() {
         let health = HealthState::new();
-        health.mark_control_success().await;
+        health.mark_device_lease_success().await;
         {
-            let mut last = health.last_control_success.lock().await;
-            *last = Some(Instant::now() - CONTROL_HEALTH_STALE_AFTER - Duration::from_secs(1));
+            let mut control = health
+                .control
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            control.last_control_success =
+                Some(Instant::now() - CONTROL_HEALTH_STALE_AFTER - Duration::from_secs(1));
         }
 
         let snap = health.snapshot(&[]).await;
@@ -414,12 +523,58 @@ mod tests {
     #[tokio::test]
     async fn explicit_control_disconnect_overrides_recent_success() {
         let health = HealthState::new();
-        health.mark_control_success().await;
+        health.mark_device_lease_success().await;
         health.set_control_connected(false);
 
         let snap = health.snapshot(&[]).await;
 
         assert!(!snap.control_connected);
+        assert!(!snap.control_api_reachable);
+        assert!(snap.device_lease_healthy);
+        assert_eq!(snap.status, HealthStatus::Degraded);
         assert_eq!(snap.last_control_success_secs_ago, Some(0));
+    }
+
+    #[tokio::test]
+    async fn successful_get_cannot_override_failed_device_lease_refresh() {
+        let health = HealthState::new();
+        health.mark_device_lease_success().await;
+        health.set_device_lease_healthy(false);
+
+        // A later roster/signal GET proves API reachability only.
+        health.mark_control_success().await;
+        let snap = health.snapshot(&[]).await;
+
+        assert!(snap.control_api_reachable);
+        assert!(!snap.device_lease_healthy);
+        assert!(!snap.control_connected);
+        assert_eq!(snap.status, HealthStatus::Degraded);
+        assert!(snap
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("device lease refresh failed"));
+    }
+
+    #[tokio::test]
+    async fn recent_get_cannot_hide_an_expired_device_lease() {
+        let health = HealthState::new();
+        health.mark_device_lease_success().await;
+        {
+            let mut control = health
+                .control
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            control.last_device_lease_success =
+                Some(Instant::now() - DEVICE_LEASE_STALE_AFTER - Duration::from_secs(1));
+        }
+        health.mark_control_success().await;
+
+        let snap = health.snapshot(&[]).await;
+
+        assert!(snap.control_api_reachable);
+        assert!(!snap.device_lease_healthy);
+        assert!(!snap.control_connected);
+        assert!(snap.reason.as_deref().unwrap().contains("may have expired"));
     }
 }

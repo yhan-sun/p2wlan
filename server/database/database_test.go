@@ -461,6 +461,50 @@ func TestCreateDeviceWithOptionsStoresRequestedIPAndVersion(t *testing.T) {
 	}
 }
 
+func TestDeviceReregistrationClearsPreviousRuntimeEndpointFacts(t *testing.T) {
+	db, err := New(filepath.Join(t.TempDir(), "p2wlan.db"))
+	if err != nil {
+		t.Fatalf("New database: %v", err)
+	}
+	defer db.Close()
+
+	user, err := db.CreateUser("reregister-runtime@p2wlan.local", "pwd")
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	device, err := db.CreateDeviceWithOptions(
+		user.ID, "default", "reregister-runtime-key", "old-process", "macos", "", "", "0.1.137",
+	)
+	if err != nil {
+		t.Fatalf("initial registration failed: %v", err)
+	}
+	oldRelayRTT := int64(87)
+	if err := db.UpdateDeviceEndpoint(device.ID, "198.51.100.8:51820", "symmetric", &oldRelayRTT); err != nil {
+		t.Fatalf("publish old runtime metadata: %v", err)
+	}
+
+	reregistered, err := db.CreateDeviceWithOptions(
+		user.ID, "default", "reregister-runtime-key", "new-process", "macos", "", "", "0.1.137",
+	)
+	if err != nil {
+		t.Fatalf("re-registration failed: %v", err)
+	}
+	if reregistered.ID != device.ID {
+		t.Fatalf("re-registration must retain device id: got %q want %q", reregistered.ID, device.ID)
+	}
+	if reregistered.Endpoint != "" || reregistered.NATType != "unknown" || reregistered.RelayRTTMS != nil {
+		t.Fatalf("re-registration leaked old runtime metadata: %+v", reregistered)
+	}
+
+	stored, err := db.GetDevice(device.ID)
+	if err != nil {
+		t.Fatalf("GetDevice after re-registration: %v", err)
+	}
+	if stored.Endpoint != "" || stored.NATType != "unknown" || stored.RelayRTTMS != nil {
+		t.Fatalf("database retained old runtime metadata: %+v", stored)
+	}
+}
+
 func TestUpdateDeviceVirtualIPValidatesNetworkPool(t *testing.T) {
 	db, err := New(filepath.Join(t.TempDir(), "p2wlan.db"))
 	if err != nil {

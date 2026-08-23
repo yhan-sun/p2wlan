@@ -26,7 +26,26 @@ fn test_peer_connection_transition() {
     conn.transition(ConnectionState::Direct);
     assert!(conn.is_active());
     assert!(!conn.is_relay());
-    assert!(conn.connected_at.is_some());
+    let first_connected_at = conn.connected_at.expect("Direct starts the active-session clock");
+
+    conn.transition(ConnectionState::Relay);
+    assert_eq!(
+        conn.connected_at,
+        Some(first_connected_at),
+        "Direct-to-Relay fallback remains one continuously usable session"
+    );
+
+    conn.transition(ConnectionState::FallbackToRelay);
+    assert!(
+        conn.connected_at.is_none(),
+        "every non-active state must clear the prior connection clock"
+    );
+    conn.transition(ConnectionState::Direct);
+    assert!(
+        conn.connected_at
+            .is_some_and(|reconnected_at| reconnected_at >= first_connected_at),
+        "the first active state after an outage must start a fresh clock"
+    );
 }
 
 #[test]
@@ -69,6 +88,49 @@ async fn test_peer_manager_add_remove() {
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(conn.virtual_ip, "10.20.0.2");
     assert_eq!(conn.device_name, "Office Mac");
+    assert!(manager.peer_exists_sync("peer1"));
+    let initial_session = manager
+        .peer_session_snapshot_for_test("peer1")
+        .expect("new online peer must publish an active lifecycle");
+    assert!(initial_session.1);
+
+    // An unrelated connection-map writer must not turn a registered peer into
+    // a false negative for control ingress or UDP lifecycle fencing.
+    let connection_writer = manager.connections.write().await;
+    assert!(manager.peer_exists_sync("peer1"));
+    drop(connection_writer);
+
+    let mut updated_peer_info = peer_info.clone();
+    updated_peer_info.device_name = "Office Mac Updated".to_string();
+    let update = manager.add_peer(&updated_peer_info).await;
+    assert!(!update.is_new);
+    assert!(manager.peer_exists_sync("peer1"));
+    assert_eq!(
+        manager.peer_session_snapshot_for_test("peer1"),
+        Some(initial_session),
+        "ordinary metadata refresh must retain the authenticated lifecycle"
+    );
+
+    let mut offline_peer_info = updated_peer_info.clone();
+    offline_peer_info.online = false;
+    manager.add_peer(&offline_peer_info).await;
+    let offline_session = manager
+        .peer_session_snapshot_for_test("peer1")
+        .expect("offline peers remain structurally present");
+    assert_ne!(offline_session.0, initial_session.0);
+    assert!(!offline_session.1);
+    assert!(manager.peer_exists_sync("peer1"));
+    assert!(manager
+        .probe_key_candidates_for_peer("peer1")
+        .await
+        .is_empty());
+
+    manager.add_peer(&updated_peer_info).await;
+    let reonline_session = manager
+        .peer_session_snapshot_for_test("peer1")
+        .expect("online transition must republish the peer");
+    assert_ne!(reonline_session.0, offline_session.0);
+    assert!(reonline_session.1);
 
     // Resolve virtual IP
     let node_id = manager.resolve_virtual_ip("10.20.0.2").await.unwrap();
@@ -76,6 +138,14 @@ async fn test_peer_manager_add_remove() {
 
     manager.remove_peer("peer1").await;
     assert!(manager.get_connection("peer1").await.is_none());
+    assert!(!manager.peer_exists_sync("peer1"));
+    assert!(manager.peer_session_snapshot_for_test("peer1").is_none());
+
+    manager.add_peer(&updated_peer_info).await;
+    let readded_session = manager
+        .peer_session_snapshot_for_test("peer1")
+        .expect("same-ID readd must publish a lifecycle");
+    assert_ne!(readded_session.0, reonline_session.0);
 }
 
 #[tokio::test]
@@ -115,6 +185,66 @@ async fn offline_control_peer_remains_visible_without_active_path() {
         .direct_probe_targets_due(Duration::ZERO)
         .await
         .is_empty());
+}
+
+#[tokio::test]
+async fn late_direct_results_cannot_revive_offline_or_rejoined_peer_lifecycle() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+    let mut peer = test_peer("peer-late-direct", endpoint);
+    manager.add_peer(&peer).await;
+    let generation = manager.current_network_generation_sync();
+    let old_peer_session_generation = manager
+        .peer_session_generation_sync(&peer.node_id)
+        .expect("online peer publishes a lifecycle");
+
+    peer.online = false;
+    manager.add_peer(&peer).await;
+    assert!(
+        !manager
+            .record_direct_success_for_generation(&peer.node_id, Some(endpoint), generation)
+            .await,
+        "late Direct success must not promote an offline Closed peer"
+    );
+    assert!(
+        !manager
+            .record_direct_failure_for_generation(
+                &peer.node_id,
+                generation,
+                REASON_DIRECT_PROBE_FAILED,
+                "late failure after offline",
+            )
+            .await,
+        "late Direct failure must not rewrite an offline Closed peer"
+    );
+    assert_eq!(
+        manager.get_connection(&peer.node_id).await.unwrap().state,
+        ConnectionState::Closed
+    );
+
+    peer.online = true;
+    manager.add_peer(&peer).await;
+    let replacement_generation = manager
+        .peer_session_generation_sync(&peer.node_id)
+        .expect("rejoined peer publishes a replacement lifecycle");
+    assert_ne!(replacement_generation, old_peer_session_generation);
+    assert!(
+        !manager
+            .record_direct_failure_for_generation_and_peer_session_with_local_endpoint(
+                &peer.node_id,
+                generation,
+                old_peer_session_generation,
+                REASON_DIRECT_PROBE_FAILED,
+                "old lifecycle timeout after same-node rejoin",
+                None,
+            )
+            .await,
+        "an old timeout owner must not commit against the replacement lifecycle"
+    );
+    assert_eq!(
+        manager.get_connection(&peer.node_id).await.unwrap().state,
+        ConnectionState::Idle
+    );
 }
 
 #[tokio::test]
@@ -201,12 +331,18 @@ async fn public_key_change_resets_confirmed_paths() {
     let endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();
     let mut peer = test_peer("peer1", endpoint);
     manager.add_peer(&peer).await;
+    let old_session = manager.peer_session_snapshot_for_test("peer1").unwrap();
     manager.record_direct_success("peer1", Some(endpoint)).await;
     manager.set_relay("peer1", "relay.test:443").await;
 
     peer.public_key = "new-key".to_string();
     let update = manager.add_peer(&peer).await;
     assert!(update.public_key_changed);
+    assert_ne!(
+        manager.peer_session_snapshot_for_test("peer1").unwrap().0,
+        old_session.0,
+        "public-key identity change must rotate authenticated lifecycle"
+    );
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(conn.state, ConnectionState::Idle);
     assert_eq!(conn.active_path(), None);
@@ -221,17 +357,30 @@ async fn endpoint_churn_does_not_reset_existing_path() {
     let old_endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();
     let peer = test_peer("peer-restart", old_endpoint);
     manager.add_peer(&peer).await;
-    manager.record_direct_success("peer-restart", Some(old_endpoint)).await;
+    let old_session = manager
+        .peer_session_snapshot_for_test("peer-restart")
+        .unwrap();
+    manager
+        .record_direct_success("peer-restart", Some(old_endpoint))
+        .await;
     manager.set_relay("peer-restart", "relay.test:443").await;
 
     let mut updated = peer.clone();
     updated.endpoint = "1.2.3.4:6000".to_string();
     let update = manager.add_peer(&updated).await;
     assert!(update.endpoint_changed);
+    assert_eq!(
+        manager.peer_session_snapshot_for_test("peer-restart"),
+        Some(old_session),
+        "source/endpoint-only refresh must not look like an identity handover"
+    );
 
     let connection = manager.get_connection("peer-restart").await.unwrap();
     assert_eq!(connection.public_key, peer.public_key);
-    assert_eq!(connection.signaled_endpoint, Some("1.2.3.4:6000".parse().unwrap()));
+    assert_eq!(
+        connection.signaled_endpoint,
+        Some("1.2.3.4:6000".parse().unwrap())
+    );
     assert_eq!(connection.endpoint, Some(old_endpoint));
     assert_eq!(connection.state, ConnectionState::Direct);
     assert!(connection.direct_health.last_success_at.is_some());
@@ -250,6 +399,7 @@ async fn remote_incarnation_change_resets_but_same_boot_candidate_refresh_does_n
     let old_generation = 0x4000_0000_0000_0000u64 | (1000u64 << 21) | 1;
     let same_boot_refresh = 0x4000_0000_0000_0000u64 | (1000u64 << 21) | 2;
     let new_boot_generation = 0x4000_0000_0000_0000u64 | (1001u64 << 21) | 1;
+    let replayed_old_boot_generation = 0x4000_0000_0000_0000u64 | (999u64 << 21) | 99;
     manager
         .add_candidates_with_metadata(
             "peer-incarnation",
@@ -259,14 +409,21 @@ async fn remote_incarnation_change_resets_but_same_boot_candidate_refresh_does_n
             None,
         )
         .await;
-    manager.record_direct_success("peer-incarnation", Some(endpoint)).await;
-    assert!(!manager
-        .reset_peer_session_if_remote_incarnation_changed(
-            "peer-incarnation",
-            same_boot_refresh,
-            "same_boot_candidate_refresh",
-        )
-        .await);
+    let old_session = manager
+        .peer_session_snapshot_for_test("peer-incarnation")
+        .unwrap();
+    manager
+        .record_direct_success("peer-incarnation", Some(endpoint))
+        .await;
+    assert!(
+        !manager
+            .reset_peer_session_if_remote_incarnation_changed(
+                "peer-incarnation",
+                same_boot_refresh,
+                "same_boot_candidate_refresh",
+            )
+            .await
+    );
     assert_eq!(
         manager
             .get_connection("peer-incarnation")
@@ -275,14 +432,44 @@ async fn remote_incarnation_change_resets_but_same_boot_candidate_refresh_does_n
             .state,
         ConnectionState::Direct
     );
+    assert_eq!(
+        manager.peer_session_snapshot_for_test("peer-incarnation"),
+        Some(old_session),
+        "same remote incarnation candidate refresh must retain lifecycle"
+    );
+    assert!(
+        !manager
+            .reset_peer_session_if_remote_incarnation_changed(
+                "peer-incarnation",
+                replayed_old_boot_generation,
+                "replayed_old_incarnation",
+            )
+            .await,
+        "an older remote incarnation is a replay, not a restart"
+    );
+    assert_eq!(
+        manager.peer_session_snapshot_for_test("peer-incarnation"),
+        Some(old_session),
+        "old-incarnation replay must not rotate the current lifecycle"
+    );
 
-    assert!(manager
-        .reset_peer_session_if_remote_incarnation_changed(
-            "peer-incarnation",
-            new_boot_generation,
-            "remote_incarnation_changed",
-        )
-        .await);
+    assert!(
+        manager
+            .reset_peer_session_if_remote_incarnation_changed(
+                "peer-incarnation",
+                new_boot_generation,
+                "remote_incarnation_changed",
+            )
+            .await
+    );
+    assert_ne!(
+        manager
+            .peer_session_snapshot_for_test("peer-incarnation")
+            .unwrap()
+            .0,
+        old_session.0,
+        "remote daemon incarnation reset must fence old authenticated work"
+    );
     let connection = manager.get_connection("peer-incarnation").await.unwrap();
     assert_eq!(connection.state, ConnectionState::Idle);
     assert!(connection.direct_health.last_success_at.is_none());

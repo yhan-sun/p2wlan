@@ -72,6 +72,11 @@ pub enum RelayError {
     #[error("relay writer stopped before write completion")]
     WriterStoppedBeforeWrite,
 
+    /// A caller-provided write-boundary guard rejected the frame before any
+    /// bytes were written. Unlike an I/O failure, the connection stays usable.
+    #[error("relay write-boundary guard rejected the frame")]
+    WriteBoundaryRejected,
+
     /// Unsupported protocol version.
     #[error("unsupported protocol version: {0}")]
     UnsupportedVersion(u8),
@@ -213,6 +218,7 @@ impl RelayError {
             RelayError::CommandQueueFull => "relay_command_queue_full",
             RelayError::WriterStoppedBeforeAccept => "relay_writer_stopped_before_accept",
             RelayError::WriterStoppedBeforeWrite => "relay_writer_stopped_before_write",
+            RelayError::WriteBoundaryRejected => "relay_write_boundary_rejected",
             RelayError::Closed(_) => "connection_closed",
             RelayError::Io(_) => "io_error",
             RelayError::UnexpectedMessageType(_) => "unexpected_message_type",

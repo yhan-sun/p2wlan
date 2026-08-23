@@ -457,12 +457,22 @@ async fn fresh_mapping_generation_predicts_step1_and_ack_returns_on_same_socket(
     .await
     .expect("matched ACK observed");
 
-    // The peer saw the punch from exactly the predicted top-1 port.
+    // The peer saw every punch from exactly the predicted top-1 port. ACK
+    // processing is deliberately asynchronous, so a loaded runtime may emit
+    // one or more bounded retry rounds before the Direct transition becomes
+    // visible to the sender; packet multiplicity is not the path invariant.
     let seen_sources = seen.lock().await.clone();
-    assert_eq!(seen_sources.len(), 1, "peer saw {seen_sources:?}");
-    let (source, _generation) = seen_sources[0];
-    assert_eq!(source.port(), base + 3);
-    assert_eq!(source.ip(), nat.nat_ip);
+    assert!(!seen_sources.is_empty(), "peer saw no predicted punch");
+    assert!(
+        seen_sources.len() <= 6,
+        "two attempts with two bounded retransmissions each must not exceed six punches; peer saw {seen_sources:?}"
+    );
+    assert!(
+        seen_sources
+            .iter()
+            .all(|(source, _generation)| source.port() == base + 3 && source.ip() == nat.nat_ip),
+        "every retry must use the predicted top-1 endpoint; peer saw {seen_sources:?}"
+    );
 
     // The NAT really assigned the predicted port for the dynamic socket.
     assert_eq!(nat.assigned_punch_port(result.socket_local_endpoint).await, base + 3);
@@ -1054,13 +1064,16 @@ async fn direct_promotion_cancels_in_flight_fresh_mapping() {
                 .await
         })
     };
-    // Let only the first STUN sample reach the observers, then confirm the
-    // peer Direct while the remaining samples are still in flight.
-    sleep(Duration::from_millis(80)).await;
-    assert!(
-        request_count.load(std::sync::atomic::Ordering::Relaxed) >= 1,
-        "the measurement must have started before Direct was confirmed"
-    );
+    // Wait on the observable barrier instead of assuming the spawned
+    // measurement is scheduled within 80 ms. Then confirm the peer Direct
+    // while the deliberately delayed STUN responses are still in flight.
+    timeout(Duration::from_secs(1), async {
+        while request_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the measurement must start before Direct is confirmed");
     peers
         .record_direct_success("peer-b", Some(nat.peer_public))
         .await;
