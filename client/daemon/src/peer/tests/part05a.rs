@@ -97,6 +97,44 @@ async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
 }
 
 #[tokio::test]
+async fn on_link_direct_bypasses_relay_first_gate() {
+    let config = test_config();
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "192.168.2.8:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.16".parse().unwrap(),
+            24,
+        )])
+        .await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(4)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert!(selected.direct_confirmed);
+    assert!(manager
+        .is_data_path_admitted_for_generation("peer1", generation, true)
+        .await);
+
+    let diagnostics = manager
+        .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
+        .await;
+    assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
+    assert_eq!(diagnostics[0].direct_type, DirectPathType::Lan);
+}
+
+#[tokio::test]
 async fn relay_ticket_renewal_does_not_rearm_completed_relay_first_gate() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.62:51831".parse().unwrap();

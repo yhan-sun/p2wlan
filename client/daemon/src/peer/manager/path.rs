@@ -99,8 +99,10 @@ impl PeerManager {
 
     /// Whether a queued business packet may consume a WireGuard counter in
     /// the current generation.  A Direct ACK is a valid background probe
-    /// result, but relay-first keeps it out of the data plane until the
-    /// per-peer relay transport has also received its matching encrypted ACK.
+    /// result, but relay-first keeps an off-link path out of the data plane
+    /// until the per-peer relay transport has also received its matching
+    /// encrypted ACK. A confirmed on-link pair is already a physical LAN
+    /// safety path and is admitted immediately.
     /// The predicate is intentionally evaluated from one connection snapshot
     /// so queue admission cannot observe Direct and relay confirmation from
     /// different generations.
@@ -139,6 +141,14 @@ impl PeerManager {
                 }
                 if !conn.online || conn.state == ConnectionState::Closed {
                     return false;
+                }
+                let on_link_direct = conn.state == ConnectionState::Direct
+                    && conn.direct_generation == generation
+                    && conn
+                        .endpoint
+                        .is_some_and(|endpoint| conn.is_on_link_host_candidate(endpoint));
+                if on_link_direct {
+                    return true;
                 }
                 let relay_confirmed = relay_available
                     && conn.relay_confirmed_at.is_some()

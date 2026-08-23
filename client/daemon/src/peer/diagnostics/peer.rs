@@ -164,6 +164,9 @@ impl PeerDiagnostics {
                 pair.state == CandidatePairState::Selected
                     && !conn.is_overlay_candidate_pair(pair)
             });
+        let on_link_direct_snapshot = confirmed_direct_snapshot
+            && snapshot_direct_pair
+                .is_some_and(|pair| conn.is_on_link_host_candidate(pair.remote_endpoint));
         // Relay health is only a local observation (for example, a writer
         // completion or a validation packet). It is deliberately not enough
         // to expose Relay as the active path. Status must be backed by the
@@ -180,12 +183,10 @@ impl PeerDiagnostics {
         // business gate is incomplete, Direct is not the active business
         // path.  Keeping this distinction in `/status` prevents a UI from
         // rendering a Direct probe as a usable connection or latency sample.
-        let relay_first_pending = conn.relay_first_confirmation_pending(local_generation, true);
-        let relay_first_business_pending = (conn.relay_ready_generation == Some(local_generation)
-            || conn.relay_first.gate_generation == Some(local_generation))
-            && relay_peer_confirmed
-            && conn.relay_first.business_gate_completed_generation != Some(local_generation)
-            && conn.relay_first.business_exchange_generation != Some(local_generation);
+        let relay_first_pending = !on_link_direct_snapshot
+            && conn.relay_first_confirmation_pending(local_generation, relay_available);
+        let relay_first_business_pending =
+            !on_link_direct_snapshot && conn.relay_first_business_pending(local_generation, relay_available);
         let confirmed_direct_active =
             confirmed_direct_snapshot && !relay_first_pending && !relay_first_business_pending;
         let mut active_path = match current_selection {
@@ -222,7 +223,8 @@ impl PeerDiagnostics {
         // explicit quality-driven fallback to an actually peer-confirmed
         // Relay. This preserves make-before-break while still allowing a
         // real Direct ACK to correct an older `Relay` selector decision.
-        let selector_is_confirmed_relay = current_selection
+        let selector_is_confirmed_relay = !on_link_direct_snapshot
+            && current_selection
             .is_some_and(|selection| selection.path == Some(NetworkPath::Relay) && relay_peer_confirmed);
         if confirmed_direct_active && !selector_is_confirmed_relay {
             active_path = Some(NetworkPath::Direct);

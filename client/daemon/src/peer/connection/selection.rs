@@ -421,6 +421,13 @@ impl PeerConnection {
             trial_direct,
         );
         let retain_private_direct = selected_pair.is_some_and(should_retain_private_direct_pair);
+        // An encrypted-confirmed pair whose endpoint is on one of our physical
+        // interface prefixes is already the strongest available path.  The
+        // relay-first business gate is a safety net for off-link traversal;
+        // applying it to a proven LAN pair needlessly sends local traffic via
+        // the relay and can overwrite a successful 4 ms direct path.
+        let on_link_direct = selected_pair
+            .is_some_and(|pair| self.is_on_link_host_candidate(pair.remote_endpoint));
 
         if confirmed_direct {
             // Direct validation is deliberately allowed to run in parallel,
@@ -430,17 +437,19 @@ impl PeerConnection {
             // (rather than Direct or an unconfirmed Relay) makes the outbound
             // FIFO retain the plaintext packet and keeps its WireGuard counter
             // from being committed on the wrong path.
-            if self.relay_first_confirmation_pending(local_generation, relay_available) {
+            if !on_link_direct
+                && self.relay_first_confirmation_pending(local_generation, relay_available)
+            {
                 return PathSelection::unavailable(
                     REASON_PATH_RELAY_FIRST_PENDING,
                     "Direct is encrypted-confirmed, but same-generation relay peer ACK is pending",
                 )
                 .with_scores(direct_score, relay_score);
             }
-            if self.relay_first_business_pending(local_generation, relay_available) {
+            if !on_link_direct && self.relay_first_business_pending(local_generation, relay_available) {
                 return PathSelection::relay(
                     REASON_PATH_RELAY_FIRST_BUSINESS,
-                    "same-generation relay peer is confirmed; both relay business directions are required before Direct",
+                    "same-generation relay peer is confirmed; both relay business directions are required before off-link Direct",
                 )
                 .with_scores(direct_score, relay_score);
             }

@@ -62,6 +62,10 @@ pub(crate) struct HardHardSessionRecord {
 pub struct PeerManager {
     /// Active peer connections, indexed by node ID.
     connections: Arc<RwLock<HashMap<String, PeerConnection>>>,
+    /// Last complete diagnostics snapshot.  Diagnostics must never turn a
+    /// contended connection writer into a false empty roster; the snapshot is
+    /// only a fallback while the live lock is unavailable.
+    diagnostics_cache: Arc<std::sync::Mutex<Option<Vec<PeerDiagnostics>>>>,
     /// Virtual IP → node ID mapping for routing.
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
     /// Monotonic local network generation. Incremented when local UDP candidates change.

@@ -21,6 +21,7 @@ impl PeerManager {
     ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),

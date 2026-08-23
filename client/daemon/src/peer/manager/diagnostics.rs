@@ -1,4 +1,19 @@
 impl PeerManager {
+    fn cached_diagnostics(&self) -> Vec<PeerDiagnostics> {
+        self.diagnostics_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn cache_diagnostics(&self, peers: &[PeerDiagnostics]) {
+        *self
+            .diagnostics_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(peers.to_vec());
+    }
+
     /// Record bytes sent to a peer.
     pub async fn record_sent(&self, node_id: &str, n: u64) {
         if let Some(conn) = self.connections.write().await.get_mut(node_id) {
@@ -105,31 +120,34 @@ impl PeerManager {
             .map(|history| history.clone())
             .unwrap_or_default();
         let recovery_reports = self.recovery_epoch_diagnostics();
-        let mut peers: Vec<_> = self
-            .connections
-            .try_read()
-            .map(|connections| {
-                connections
-                    .values()
-                    .map(|conn| {
-                        let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
-                            conn,
-                            None,
-                            None,
-                            generation,
-                            None,
-                            local_nat_capabilities.as_ref(),
-                            relay_available,
-                            Some(&traversal_history),
-                            Some(&fresh_mapping_history),
-                        );
-                        diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
-                        diagnostics
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // `try_read` also fails when a writer is merely queued.  During normal
+        // probe/control activity that made `/peers` intermittently return an
+        // empty roster even though the control poll had already joined the
+        // devices.  Keep the endpoint non-blocking, but return the last
+        // complete snapshot instead of manufacturing a false zero-peer result.
+        let mut peers: Vec<_> = match self.connections.try_read() {
+            Ok(connections) => connections
+                .values()
+                .map(|conn| {
+                    let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+                        conn,
+                        None,
+                        None,
+                        generation,
+                        None,
+                        local_nat_capabilities.as_ref(),
+                        relay_available,
+                        Some(&traversal_history),
+                        Some(&fresh_mapping_history),
+                    );
+                    diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                    diagnostics
+                })
+                .collect(),
+            Err(_) => self.cached_diagnostics(),
+        };
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        self.cache_diagnostics(&peers);
         peers
     }
 
@@ -169,33 +187,31 @@ impl PeerManager {
             .map(|history| history.clone())
             .unwrap_or_default();
         let recovery_reports = self.recovery_epoch_diagnostics();
-        let mut peers: Vec<_> = self
-            .connections
-            .try_read()
-            .map(|connections| {
-                connections
-                    .values()
-                    .map(|conn| {
-                        let current_selection =
-                            conn.select_path_for_data(generation, prefer_direct, relay_available);
-                        let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
-                            conn,
-                            Some(&current_selection),
-                            Some(direct_retry_after),
-                            generation,
-                            local_endpoint,
-                            local_nat_capabilities.as_ref(),
-                            relay_available,
-                            Some(&traversal_history),
-                            Some(&fresh_mapping_history),
-                        );
-                        diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
-                        diagnostics
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut peers: Vec<_> = match self.connections.try_read() {
+            Ok(connections) => connections
+                .values()
+                .map(|conn| {
+                    let current_selection =
+                        conn.select_path_for_data(generation, prefer_direct, relay_available);
+                    let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
+                        conn,
+                        Some(&current_selection),
+                        Some(direct_retry_after),
+                        generation,
+                        local_endpoint,
+                        local_nat_capabilities.as_ref(),
+                        relay_available,
+                        Some(&traversal_history),
+                        Some(&fresh_mapping_history),
+                    );
+                    diagnostics.recovery = recovery_reports.get(&conn.node_id).cloned();
+                    diagnostics
+                })
+                .collect(),
+            Err(_) => self.cached_diagnostics(),
+        };
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        self.cache_diagnostics(&peers);
         peers
     }
 
