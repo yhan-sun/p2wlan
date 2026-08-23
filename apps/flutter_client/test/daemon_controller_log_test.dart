@@ -148,6 +148,34 @@ void main() {
     },
   );
 
+  test(
+    'Windows token failures distinguish ACL errors and redact diagnostics',
+    () {
+      final aclError = WindowsAclProtectionException(
+        directory: false,
+        exitCode: 5,
+        stdout: 'token=should-not-leak',
+        stderr: 'secret=also-should-not-leak',
+      );
+
+      expect(
+        windowsLaunchTokenFailureCodeForError(aclError),
+        DaemonStartupFailureCode.aclFailure,
+      );
+      expect(
+        windowsLaunchTokenFailureCodeForError(
+          StateError('token file write failed'),
+        ),
+        DaemonStartupFailureCode.tokenAccessFailed,
+      );
+      expect(aclError.diagnostic, contains('exitCode=5'));
+      expect(aclError.diagnostic, contains('token=<redacted>'));
+      expect(aclError.diagnostic, contains('secret=<redacted>'));
+      expect(aclError.diagnostic, isNot(contains('should-not-leak')));
+      expect(aclError.diagnostic, isNot(contains('also-should-not-leak')));
+    },
+  );
+
   test('an unrelated relay 404 log is not an auth failure', () async {
     final log = await writeLog(
       'WARN p2pnet_daemon::relay: Received relay runtime error: code=404, '

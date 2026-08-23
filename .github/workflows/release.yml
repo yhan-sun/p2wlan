@@ -455,11 +455,14 @@ jobs:
           --release
           --split-debug-info build/symbols/windows-${{ matrix.arch }}
 
-      - name: Run Windows daemon binary probe integration
+      - name: Run Windows startup integration tests
         working-directory: apps/flutter_client
         env:
           P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
-        run: flutter test test/windows_binary_probe_integration_test.dart
+        run: >
+          flutter test
+          test/windows_binary_probe_integration_test.dart
+          test/windows_tray_event_contract_test.dart
 
       - name: Install Inno Setup
         shell: pwsh

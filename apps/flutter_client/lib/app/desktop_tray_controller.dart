@@ -15,6 +15,11 @@ import 'app_constants.dart';
 import 'app_strings.dart';
 import 'desktop_window_operations.dart';
 
+/// The native Windows tray plug-in dispatches its click notifications through
+/// the `MouseDown` listener callbacks. Other desktop implementations retain
+/// the established `MouseUp` menu behavior.
+enum DesktopTrayPointerAction { showWindow, contextMenu }
+
 class DesktopTrayController with TrayListener, WindowListener {
   DesktopTrayController({
     required this.settingsStore,
@@ -114,13 +119,64 @@ class DesktopTrayController with TrayListener, WindowListener {
   }
 
   @override
+  void onTrayIconMouseDown() {
+    _handleTrayPointer(mouseDown: true, rightButton: false);
+  }
+
+  @override
+  void onTrayIconRightMouseDown() {
+    _handleTrayPointer(mouseDown: true, rightButton: true);
+  }
+
+  @override
   void onTrayIconMouseUp() {
-    unawaited(trayManager.popUpContextMenu());
+    _handleTrayPointer(mouseDown: false, rightButton: false);
   }
 
   @override
   void onTrayIconRightMouseUp() {
-    unawaited(trayManager.popUpContextMenu());
+    _handleTrayPointer(mouseDown: false, rightButton: true);
+  }
+
+  void _handleTrayPointer({
+    required bool mouseDown,
+    required bool rightButton,
+  }) {
+    switch (trayPointerActionForTesting(
+      isWindows: Platform.isWindows,
+      mouseDown: mouseDown,
+      rightButton: rightButton,
+    )) {
+      case DesktopTrayPointerAction.showWindow:
+        unawaited(_showWindow());
+        break;
+      case DesktopTrayPointerAction.contextMenu:
+        unawaited(trayManager.popUpContextMenu());
+        break;
+      case null:
+        break;
+    }
+  }
+
+  /// Maps a native tray notification to one application action.
+  ///
+  /// On Windows, tray_manager 0.5.x sends the callbacks named `MouseDown`
+  /// from the Windows native handler even though the underlying message is a
+  /// button-up notification. Handling only that side avoids a second menu
+  /// after upgrading or changing the native plug-in implementation.
+  @visibleForTesting
+  static DesktopTrayPointerAction? trayPointerActionForTesting({
+    required bool isWindows,
+    required bool mouseDown,
+    required bool rightButton,
+  }) {
+    if (isWindows) {
+      if (!mouseDown) return null;
+      return rightButton
+          ? DesktopTrayPointerAction.contextMenu
+          : DesktopTrayPointerAction.showWindow;
+    }
+    return mouseDown ? null : DesktopTrayPointerAction.contextMenu;
   }
 
   void _scheduleMenuUpdate() {
