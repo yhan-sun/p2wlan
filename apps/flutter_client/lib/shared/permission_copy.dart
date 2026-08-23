@@ -8,6 +8,7 @@ library;
 
 import '../app/app_strings.dart';
 import '../core/capabilities/permission_preflight.dart';
+import '../core/daemon/daemon_controller.dart';
 
 /// Localized recommendation for the whole preflight, keyed by `reasonCode`.
 String permissionRecommendedAction(
@@ -16,7 +17,9 @@ String permissionRecommendedAction(
 ) {
   switch (preflight.reasonCode) {
     case 'elevation_required':
-      return strings.permActionElevationRequired();
+      return preflight.platform == 'Windows'
+          ? strings.permActionWindowsUac()
+          : strings.permActionElevationRequired();
     case 'tun_runtime_verification':
       return strings.permActionTunRuntimeVerification();
     case 'tun_device_missing':
@@ -30,6 +33,36 @@ String permissionRecommendedAction(
     default:
       return strings.permActionGeneric(preflight.platform);
   }
+}
+
+/// Convert the structured daemon result into safe localized onboarding copy.
+/// Raw controller messages stay in diagnostics/logs; the UI never reparses
+/// their text or decides visibility from a string prefix.
+String daemonStartupFailurePresentation(
+  AppStrings strings,
+  DaemonCommandResult result, {
+  DaemonStartupFailureCode? failureCode,
+}) {
+  final code = failureCode ?? result.failureCode;
+  if (code == null) return strings.onboardingStartFailed;
+  return switch (code) {
+    DaemonStartupFailureCode.uacCancelled => strings.windowsUacCancelled,
+    DaemonStartupFailureCode.uacLaunchFailed => strings.windowsUacLaunchFailed,
+    DaemonStartupFailureCode.clientDaemonBuildMismatch =>
+      strings.clientDaemonBuildMismatch,
+    DaemonStartupFailureCode.pidMarkerFailed => strings.windowsPidMarkerFailed,
+    DaemonStartupFailureCode.daemonExitedDuringStartup =>
+      strings.daemonExitedDuringStartup,
+    DaemonStartupFailureCode.daemonBinaryLoadFailed =>
+      strings.daemonBinaryLoadFailed,
+    DaemonStartupFailureCode.aclFailure => strings.daemonAclFailure,
+    DaemonStartupFailureCode.tokenAccessFailed =>
+      strings.daemonTokenAccessFailed,
+    DaemonStartupFailureCode.daemonNotElevated => strings.daemonNotElevated,
+    DaemonStartupFailureCode.controlAuthFailed => strings.daemonAuthFailed,
+    DaemonStartupFailureCode.startupTimeout => strings.daemonStartupTimeout,
+    _ => strings.onboardingStartFailed,
+  };
 }
 
 /// Localized copy for a single check, keyed by its machine `code`.

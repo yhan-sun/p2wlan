@@ -68,8 +68,8 @@ extension DaemonControllerProcessControl on DaemonController {
   /// report success even when Windows immediately rejects a missing DLL, so
   /// without this probe the UI waits for the health timeout and only shows a
   /// misleading generic permission error.
-  Future<String?> _probeWindowsDaemonBinary(File binary) async {
-    if (!Platform.isWindows) return null;
+  Future<DaemonBinaryProbe> _probeWindowsDaemonBinary(File binary) async {
+    if (!Platform.isWindows) return const DaemonBinaryProbe();
     Process? process;
     try {
       process = await Process.start(binary.path, const [
@@ -81,20 +81,37 @@ extension DaemonControllerProcessControl on DaemonController {
         process.exitCode,
       ]).timeout(const Duration(seconds: 6));
       final exitCode = output[2] as int;
-      if (exitCode == 0) return null;
       final stderr = (output[1] as String).trim();
       final stdout = (output[0] as String).trim();
+      if (exitCode == 0) {
+        try {
+          final decoded = jsonDecode(stdout);
+          if (decoded is Map<String, dynamic>) {
+            final identity = DaemonBuildInfo.fromJson(decoded);
+            if (identity.isComplete) {
+              return DaemonBinaryProbe(identity: identity);
+            }
+          }
+        } catch (_) {}
+        return const DaemonBinaryProbe(
+          error: 'daemon --build-info did not return a complete JSON identity',
+        );
+      }
       final detail = stderr.isNotEmpty ? stderr : stdout;
-      return detail.isEmpty
-          ? 'daemon identity probe exited with code $exitCode'
-          : detail;
+      return DaemonBinaryProbe(
+        error: detail.isEmpty
+            ? 'daemon identity probe exited with code $exitCode'
+            : detail,
+      );
     } on TimeoutException {
       try {
         process?.kill();
       } catch (_) {}
-      return 'daemon identity probe timed out after 6 seconds';
+      return const DaemonBinaryProbe(
+        error: 'daemon identity probe timed out after 6 seconds',
+      );
     } on Object catch (error) {
-      return error.toString();
+      return DaemonBinaryProbe(error: error.toString());
     }
   }
 
@@ -140,6 +157,12 @@ extension DaemonControllerProcessControl on DaemonController {
       final file = File(pidPath);
       await file.parent.create(recursive: true);
       await file.writeAsString('$pid', flush: true);
+      final recordedPid = int.tryParse((await file.readAsString()).trim());
+      if (recordedPid != pid) {
+        throw StateError(
+          'PID_MARKER_FAILED: canonical PID marker read back as $recordedPid, expected $pid',
+        );
+      }
       if (Platform.isWindows) await _restrictLaunchPath(pidPath);
     } catch (error) {
       if (Platform.isWindows) {
@@ -148,4 +171,11 @@ extension DaemonControllerProcessControl on DaemonController {
       // Best-effort only; stop() can still recover by diagnostics process id.
     }
   }
+}
+
+class DaemonBinaryProbe {
+  const DaemonBinaryProbe({this.identity, this.error});
+
+  final DaemonBuildInfo? identity;
+  final String? error;
 }

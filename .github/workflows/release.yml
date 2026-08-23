@@ -451,7 +451,7 @@ jobs:
       - name: Build Windows release bundle
         working-directory: apps/flutter_client
         run: >
-          flutter build windows
+          bash ../../scripts/release/build_flutter_client.sh windows
           --release
           --split-debug-info build/symbols/windows-${{ matrix.arch }}
 

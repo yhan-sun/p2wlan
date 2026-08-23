@@ -14,6 +14,9 @@ class _DeveloperSection extends StatelessWidget {
     final theme = Theme.of(context);
     final saving = state._saving;
     final statusStore = state.widget.statusStore;
+    final daemonController = statusStore.daemonController;
+    final clientBuild = daemonController.clientBuildInfo;
+    final daemonBuild = daemonController.lastDaemonBuildInfo;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -57,6 +60,61 @@ class _DeveloperSection extends StatelessWidget {
         _PreferenceRow(
           label: strings.localSettingsFileLabel,
           value: state.widget.settingsStore.configPath ?? '—',
+        ),
+        _PreferenceRow(
+          label: strings.clientBuildIdentity,
+          value: clientBuild.appVersion,
+        ),
+        _PreferenceRow(
+          label: strings.buildCommitLabel,
+          value: clientBuild.gitCommit,
+        ),
+        _PreferenceRow(label: strings.buildIdLabel, value: clientBuild.buildId),
+        _PreferenceRow(
+          label: strings.buildDirtyLabel,
+          value: clientBuild.dirtyLabel,
+        ),
+        _PreferenceRow(
+          label: strings.buildDiffHashLabel,
+          value: clientBuild.diffHash,
+        ),
+        _PreferenceRow(
+          label: strings.buildProfileLabel,
+          value: clientBuild.profile,
+        ),
+        if (daemonBuild != null) ...[
+          _PreferenceRow(
+            label: strings.daemonBuildIdentity,
+            value: daemonBuild.appVersion,
+          ),
+          _PreferenceRow(
+            label: strings.buildCommitLabel,
+            value: daemonBuild.gitCommit,
+          ),
+          _PreferenceRow(
+            label: strings.buildIdLabel,
+            value: daemonBuild.buildId,
+          ),
+          _PreferenceRow(
+            label: strings.buildDirtyLabel,
+            value: daemonBuild.dirtyLabel,
+          ),
+          _PreferenceRow(
+            label: strings.buildDiffHashLabel,
+            value: daemonBuild.diffHash,
+          ),
+          _PreferenceRow(
+            label: strings.buildProfileLabel,
+            value: daemonBuild.profile,
+          ),
+        ],
+        _PreferenceRow(
+          label: strings.clientLogFileLabel,
+          value: daemonController.clientLogPath,
+        ),
+        _PreferenceRow(
+          label: strings.daemonLogFileLabel,
+          value: daemonController.daemonLogPath,
         ),
         if (state.widget.settingsStore.lastError != null) ...[
           const SizedBox(height: AppTokens.space8),

@@ -6,6 +6,8 @@ import 'dart:math' as math;
 import 'package:flutter/services.dart';
 
 import '../api/diagnostics_api.dart';
+import '../build_info.dart';
+import '../capabilities/permission_preflight.dart';
 import '../models/diagnostics_models.dart';
 
 part 'daemon_controller/process_control.dart';
@@ -14,17 +16,20 @@ part 'daemon_controller/diagnostics_paths.dart';
 part 'daemon_controller/launch_token.dart';
 part 'daemon_controller/pids.dart';
 part 'daemon_controller/android_vpn.dart';
+part 'daemon_controller/startup_trace.dart';
 
 class DaemonCommandResult {
   const DaemonCommandResult({
     required this.ok,
     required this.message,
     this.manualCommand,
+    this.failureCode,
   });
 
   final bool ok;
   final String message;
   final String? manualCommand;
+  final DaemonStartupFailureCode? failureCode;
 }
 
 class DaemonController {
@@ -52,9 +57,36 @@ class DaemonController {
 
   DateTime? _lastLaunchExitProbeAt;
   bool? _lastLaunchExitProbeResult;
+  DaemonBuildInfo? _lastDaemonBuildInfo;
+
+  ClientBuildInfo get clientBuildInfo => ClientBuildInfo.current;
+  DaemonBuildInfo? get lastDaemonBuildInfo => _lastDaemonBuildInfo;
+  String get clientLogPath =>
+      '${_defaultLogDir().path}${Platform.pathSeparator}${WindowsStartupTrace.fileName}';
+  String get daemonLogPath =>
+      '${_defaultLogDir().path}${Platform.pathSeparator}p2wlan-daemon.log';
 
   Future<DaemonCommandResult> start(AppSettings settings) async {
     if (Platform.isAndroid) return _startAndroidVpn(settings);
+    _lastDaemonBuildInfo = null;
+    final startupTrace = Platform.isWindows
+        ? WindowsStartupTrace(_defaultLogDir())
+        : null;
+    if (startupTrace != null) {
+      await startupTrace.open();
+      await startupTrace.startRequested();
+      try {
+        final preflight = await runPermissionPreflight();
+        await startupTrace.detail(
+          'permission preflight state=${preflight.state.name} '
+          'reason=${preflight.reasonCode} '
+          'can_create_tun=${preflight.canCreateTunLabel} '
+          'can_modify_routes=${preflight.canModifyRoutesLabel}',
+        );
+      } catch (_) {
+        await startupTrace.detail('permission preflight unavailable');
+      }
+    }
     if (!_supportsProcessControl) {
       return const DaemonCommandResult(
         ok: false,
@@ -63,38 +95,71 @@ class DaemonController {
       );
     }
 
+    await startupTrace?.stageStart(1, 'resolve_daemon');
     final binary = await _resolveDaemonBinary();
     if (binary == null) {
-      return const DaemonCommandResult(
-        ok: false,
+      return _startupFailure(
+        startupTrace,
+        stage: 1,
+        code: DaemonStartupFailureCode.daemonBinaryLoadFailed,
         message:
             'Could not find p2wlan-daemon. Build it with cargo or set P2WLAN_DAEMON_BIN.',
       );
     }
+    await startupTrace?.stageOk(1, 'resolve_daemon');
+    await startupTrace?.detail('daemon binary resolved');
 
-    final windowsProbeError = await _probeWindowsDaemonBinary(binary);
-    if (windowsProbeError != null) {
-      return DaemonCommandResult(
-        ok: false,
+    await startupTrace?.stageStart(2, 'binary_probe');
+    final windowsProbe = await _probeWindowsDaemonBinary(binary);
+    if (windowsProbe.error != null) {
+      return _startupFailure(
+        startupTrace,
+        stage: 2,
+        code: DaemonStartupFailureCode.daemonBinaryLoadFailed,
         message:
-            '[DAEMON_BINARY_LOAD_FAILED] Windows 守护进程无法加载，发布包可能缺少运行库或文件不完整：$windowsProbeError',
+            '[DAEMON_BINARY_LOAD_FAILED] Windows 守护进程无法加载，发布包可能缺少运行库或文件不完整：${windowsProbe.error}',
       );
     }
+    _lastDaemonBuildInfo = windowsProbe.identity;
+    if (Platform.isWindows && windowsProbe.identity != null) {
+      final daemonBuild = windowsProbe.identity!;
+      await startupTrace?.detail(
+        'daemon build identity app_version=${daemonBuild.appVersion} '
+        'git_commit=${daemonBuild.gitCommit} build_id=${daemonBuild.buildId} '
+        'dirty=${daemonBuild.dirtyLabel} diff_hash=${daemonBuild.diffHash} '
+        'profile=${daemonBuild.profile}',
+      );
+      final mismatch = clientBuildInfo.mismatchWith(daemonBuild);
+      if (mismatch != null) {
+        return _startupFailure(
+          startupTrace,
+          stage: 2,
+          code: DaemonStartupFailureCode.clientDaemonBuildMismatch,
+          message:
+              '[CLIENT_DAEMON_BUILD_MISMATCH] Flutter client 与 daemon build identity 不一致（$mismatch），已阻止 TUN 启动。请使用同一次 clean build 重新打包。',
+        );
+      }
+    }
+    await startupTrace?.stageOk(2, 'binary_probe');
 
     // A stale daemon can keep /health returning 200 after its TUN/dataplane
     // has failed.  Do not treat the liveness endpoint as proof that the
     // instance is reusable: clean up the verified old daemon first, then
     // launch the binary selected above.  This also handles a daemon left by
     // an older Debug/Release app bundle on the same diagnostics port.
+    await startupTrace?.stageStart(3, 'stale_daemon_check');
     if (await _hasExistingDaemonForStart(settings.diagnosticsUrl)) {
       final stopped = await stop(settings.diagnosticsUrl);
       if (!stopped.ok) {
-        return DaemonCommandResult(
-          ok: false,
+        return _startupFailure(
+          startupTrace,
+          stage: 3,
+          code: DaemonStartupFailureCode.staleDaemonCleanupFailed,
           message: '检测到旧 p2wlan-daemon，但启动新实例前无法停止它：${stopped.message}',
         );
       }
     }
+    await startupTrace?.stageOk(3, 'stale_daemon_check');
 
     final bind = _diagnosticsBindFromStatusUrl(settings.diagnosticsUrl);
     final configPath = _defaultConfigPath();
@@ -111,16 +176,23 @@ class DaemonController {
         Platform.isMacOS && !_isRootUser() ||
         Platform.isWindows && !await _isWindowsAdministrator() ||
         Platform.isLinux && !_isRootUser();
+    await startupTrace?.detail(
+      'permission preflight requires_elevation=$requiresElevation',
+    );
+    await startupTrace?.stageStart(4, 'current_sid');
     final windowsClientSid = Platform.isWindows
         ? await _windowsCurrentUserSid()
         : null;
     if (Platform.isWindows && windowsClientSid == null) {
-      return const DaemonCommandResult(
-        ok: false,
+      return _startupFailure(
+        startupTrace,
+        stage: 4,
+        code: DaemonStartupFailureCode.tokenAccessFailed,
         message:
             '[TOKEN_ACCESS_FAILED] 无法读取当前 Windows 用户 SID，无法建立安全的跨账户启动 ACL。',
       );
     }
+    await startupTrace?.stageOk(4, 'current_sid');
     File? tokenFile;
     // Windows console daemons cannot safely receive a managed token over a
     // detached stdin: depending on the Windows process mode this can create
@@ -129,12 +201,31 @@ class DaemonController {
     // Windows launches. It also makes the two Windows launch paths behave
     // identically, which prevents a second fallback process from being
     // started after UAC succeeds.
+    await startupTrace?.stageStart(5, 'runtime_acl');
+    try {
+      if (Platform.isWindows) await protectRuntimeDirectory(logDir);
+      await startupTrace?.stageOk(5, 'runtime_acl');
+    } catch (error) {
+      return _startupFailure(
+        startupTrace,
+        stage: 5,
+        code: DaemonStartupFailureCode.aclFailure,
+        message: _startFailureMessage(error),
+      );
+    }
+
+    await startupTrace?.stageStart(6, 'launch_token');
     if (!useManualMode && (requiresElevation || Platform.isWindows)) {
       try {
         tokenFile = await createEphemeralLaunchTokenFile(logDir, authToken);
+        await startupTrace?.stageOk(6, 'launch_token');
       } catch (error) {
-        return DaemonCommandResult(
-          ok: false,
+        return _startupFailure(
+          startupTrace,
+          stage: 6,
+          code: Platform.isWindows
+              ? DaemonStartupFailureCode.tokenAccessFailed
+              : _failureCodeForError(error),
           message: _startFailureMessage(error),
         );
       }
@@ -144,12 +235,17 @@ class DaemonController {
         // still needs the same user/admin ACL on the runtime directory for
         // its log, PID marker, and diagnostics session file.
         await protectRuntimeDirectory(logDir);
+        await startupTrace?.stageOk(6, 'launch_token');
       } catch (error) {
-        return DaemonCommandResult(
-          ok: false,
+        return _startupFailure(
+          startupTrace,
+          stage: 6,
+          code: _failureCodeForError(error),
           message: _startFailureMessage(error),
         );
       }
+    } else {
+      await startupTrace?.stageSkipped(6, 'launch_token');
     }
 
     final args = [
@@ -200,6 +296,7 @@ class DaemonController {
       ],
     ];
 
+    await startupTrace?.stageStart(7, 'log_prepare');
     try {
       await configPath.parent.create(recursive: true);
       await logDir.create(recursive: true);
@@ -228,12 +325,15 @@ class DaemonController {
         }
       }
       await _clearPidMarkerForStart(pidPath);
+      await startupTrace?.stageOk(7, 'log_prepare');
     } catch (error) {
       try {
         await deleteEphemeralLaunchTokenFile(tokenFile);
       } catch (_) {}
-      return DaemonCommandResult(
-        ok: false,
+      return _startupFailure(
+        startupTrace,
+        stage: 7,
+        code: _failureCodeForError(error),
         message: _startFailureMessage(error),
       );
     }
@@ -257,6 +357,7 @@ class DaemonController {
         : null;
 
     int? launchPid;
+    await startupTrace?.stageStart(8, 'uac');
     try {
       if (requiresElevation && Platform.isMacOS) {
         await _startMacosElevated(
@@ -264,13 +365,13 @@ class DaemonController {
           password: settings.macosAdminPassword,
         );
       } else if (requiresElevation && Platform.isWindows) {
-        launchPid = await _startWindowsElevated(
-          binary: binary,
-          args: args,
-          pidPath: pidPath,
-        );
+        launchPid = await _startWindowsElevated(binary: binary, args: args);
+        await _writePidMarker(pidPath, launchPid);
+        await startupTrace?.stageAccepted(8, 'uac');
+        await startupTrace?.childPid(launchPid);
       } else if (requiresElevation && Platform.isLinux) {
         await _startLinuxElevated(binary: binary, args: args);
+        await startupTrace?.stageSkipped(8, 'uac');
       } else {
         final process = await _startDetached(
           binary: binary,
@@ -278,7 +379,17 @@ class DaemonController {
           stdinToken: tokenFile == null && !useManualMode ? authToken : null,
         );
         launchPid = process.pid;
+        if (Platform.isWindows &&
+            !await _waitForWindowsChildIdentity(launchPid)) {
+          throw StateError(
+            'PID_MARKER_FAILED: Windows daemon PID did not resolve to p2wlan-daemon.',
+          );
+        }
         await _writePidMarker(pidPath, launchPid);
+        if (Platform.isWindows) {
+          await startupTrace?.stageSkipped(8, 'uac');
+          await startupTrace?.childPid(launchPid);
+        }
       }
     } catch (error) {
       // The launch itself failed: never leave the temporary credential file
@@ -289,11 +400,20 @@ class DaemonController {
       try {
         await deleteEphemeralLaunchTokenFile(tokenFile);
       } catch (_) {}
-      return DaemonCommandResult(
-        ok: false,
+      return _startupFailure(
+        startupTrace,
+        stage: Platform.isWindows ? 8 : 0,
+        code: _failureCodeForError(error),
         message: _startFailureMessage(error),
         manualCommand: manualCommand,
       );
+    }
+
+    // Stage 09 records the PID returned by the launch path; stage 10 is the
+    // verified Win32 process handoff. Keep both before health polling so the
+    // trace proves whether failure happened in process creation or readiness.
+    if (Platform.isWindows && launchPid != null) {
+      await startupTrace?.daemonAlive();
     }
 
     // The daemon reads the token synchronously at startup, so once the
@@ -304,6 +424,7 @@ class DaemonController {
     _lastLaunchExitProbeAt = null;
     _lastLaunchExitProbeResult = null;
     final timeout = Platform.isMacOS ? _macosReadyTimeout : _directReadyTimeout;
+    await startupTrace?.stageStart(11, 'health_wait');
     final startup = await _waitForHealth(
       settings.diagnosticsUrl,
       timeout,
@@ -323,19 +444,23 @@ class DaemonController {
             DaemonStartupFailureCode.startupTimeout,
             'p2wlan-daemon 未在启动时限内完成诊断端点就绪。',
           );
+      await startupTrace?.failure(11, failure.codeValue);
       if (failure.code == DaemonStartupFailureCode.controlAuthFailed) {
         return DaemonCommandResult(
           ok: false,
           message: '登录已过期，请重新登录。${failure.message}',
           manualCommand: manualCommand,
+          failureCode: failure.code,
         );
       }
       return DaemonCommandResult(
         ok: false,
         message: '[${failure.codeValue}] ${failure.message} 请查看日志：$logPath',
         manualCommand: manualCommand,
+        failureCode: failure.code,
       );
     }
+    await startupTrace?.stageOk(11, 'health_wait');
     return DaemonCommandResult(
       ok: true,
       message: useManualMode
@@ -449,5 +574,35 @@ class DaemonController {
       message:
           'Tried to stop p2wlan-daemon PID(s) ${attempted.join(', ')}, but diagnostics is still reachable.',
     );
+  }
+
+  Future<DaemonCommandResult> _startupFailure(
+    WindowsStartupTrace? trace, {
+    required int stage,
+    required DaemonStartupFailureCode code,
+    required String message,
+    String? manualCommand,
+  }) async {
+    await trace?.failure(stage, code.value);
+    return DaemonCommandResult(
+      ok: false,
+      message: message,
+      manualCommand: manualCommand,
+      failureCode: code,
+    );
+  }
+
+  DaemonStartupFailureCode _failureCodeForError(Object error) {
+    if (Platform.isWindows) {
+      return classifyWindowsLaunchFailure(error.toString()).code;
+    }
+    final normalized = error.toString().toLowerCase();
+    if (normalized.contains('acl') || normalized.contains('permission')) {
+      return DaemonStartupFailureCode.aclFailure;
+    }
+    if (normalized.contains('pid marker')) {
+      return DaemonStartupFailureCode.pidMarkerFailed;
+    }
+    return DaemonStartupFailureCode.uacLaunchFailed;
   }
 }

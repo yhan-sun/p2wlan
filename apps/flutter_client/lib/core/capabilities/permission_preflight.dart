@@ -240,31 +240,48 @@ PermissionPreflight _checkLinuxPermissions() {
 Future<PermissionPreflight> _checkWindowsPermissions() async {
   final isAdmin = await _isWindowsAdministrator();
   final wintun = _findWintunDll();
+  final missingWintun = wintun == null;
+  final needsElevation = !isAdmin && !missingWintun;
   return PermissionPreflight(
     platform: 'Windows',
-    state: !isAdmin
-        ? PermissionPreflightState.elevationRequired
-        : wintun == null
+    state: missingWintun
         ? PermissionPreflightState.failed
+        : needsElevation
+        ? PermissionPreflightState.elevationRequired
         : PermissionPreflightState.satisfied,
-    canCreateTun: isAdmin && wintun != null ? true : false,
-    canModifyRoutes: isAdmin ? true : false,
+    // A non-admin GUI cannot prove what its future elevated daemon can do.
+    // Keep these facts unknown until the real UAC-launched daemon verifies
+    // TUN and route setup.
+    canCreateTun: missingWintun
+        ? false
+        : isAdmin
+        ? true
+        : null,
+    canModifyRoutes: missingWintun
+        ? false
+        : isAdmin
+        ? true
+        : null,
     elevationSupported: true,
-    reasonCode: !isAdmin
-        ? 'elevation_required'
-        : wintun == null
+    reasonCode: missingWintun
         ? 'wintun_missing'
+        : needsElevation
+        ? 'elevation_required'
         : 'ready',
-    message: isAdmin && wintun != null
+    message: missingWintun
+        ? '请把 wintun.dll 放到客户端/daemon 同级目录，或设置 P2WLAN_WINTUN_DLL。'
+        : isAdmin
         ? 'Windows 管理员权限和 Wintun 运行库均已就绪。'
-        : !isAdmin
-        ? '启动 TUN 时请确认 Windows UAC 授权，并确保 wintun.dll 与客户端/daemon 同级或在 PATH 中。'
-        : '请把 wintun.dll 放到客户端/daemon 同级目录，或设置 P2WLAN_WINTUN_DLL。',
+        : '启动本地网络服务需要 Windows 管理员授权。点击“授权并继续”后，请在系统 UAC 窗口中确认。P2WLAN 不会读取或保存 Windows 管理员密码。',
     checks: [
       PermissionCheck(
         label: 'Windows administrator',
-        status: isAdmin ? 'pass' : 'fail',
-        detail: isAdmin ? 'granted' : 'required',
+        status: isAdmin || missingWintun ? (isAdmin ? 'pass' : 'fail') : 'warn',
+        detail: isAdmin
+            ? 'granted'
+            : missingWintun
+            ? 'required'
+            : 'verified by elevated daemon',
         code: 'admin',
       ),
       PermissionCheck(

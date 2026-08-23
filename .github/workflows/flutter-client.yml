@@ -264,13 +264,28 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
+      # Flutter SDK migrations must not become part of the daemon/client
+      # identity. Restore them before compiling either side of the Windows
+      # package so the release stamp is clean and reproducible.
+      - name: Restore SDK-migrated files (pre-build)
+        working-directory: .
+        run: bash scripts/release/hermetic_build.sh restore
+
       - name: Build Windows daemon
         working-directory: .
         run: cargo build -p p2wlan-daemon --release
 
       - name: Build Windows release bundle
         working-directory: apps/flutter_client
-        run: flutter build windows --release
+        run: bash ../../scripts/release/build_flutter_client.sh windows --release
+
+      - name: Restore SDK-migrated files (post-build)
+        working-directory: .
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Verify clean Windows release source
+        working-directory: .
+        run: bash scripts/release/hermetic_build.sh check --release
 
       - name: Bundle Windows daemon
         shell: pwsh

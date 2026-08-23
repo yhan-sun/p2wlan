@@ -24,6 +24,8 @@ enum DaemonStartupFailureCode {
   aclFailure,
   pidMarkerFailed,
   controlAuthFailed,
+  clientDaemonBuildMismatch,
+  staleDaemonCleanupFailed,
 }
 
 extension DaemonStartupFailureCodeText on DaemonStartupFailureCode {
@@ -52,6 +54,10 @@ extension DaemonStartupFailureCodeText on DaemonStartupFailureCode {
     DaemonStartupFailureCode.aclFailure => 'ACL_FAILURE',
     DaemonStartupFailureCode.pidMarkerFailed => 'PID_MARKER_FAILED',
     DaemonStartupFailureCode.controlAuthFailed => 'CONTROL_AUTH_FAILED',
+    DaemonStartupFailureCode.clientDaemonBuildMismatch =>
+      'CLIENT_DAEMON_BUILD_MISMATCH',
+    DaemonStartupFailureCode.staleDaemonCleanupFailed =>
+      'STALE_DAEMON_CLEANUP_FAILED',
   };
 }
 

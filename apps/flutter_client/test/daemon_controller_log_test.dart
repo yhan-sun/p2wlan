@@ -258,6 +258,12 @@ void main() {
     );
     expect(parseWindowsChildPidMarker('__P2WLAN_CHILD_PID__=0'), isNull);
     expect(parseWindowsChildPidMarker('no marker'), isNull);
+    expect(
+      parseWindowsChildPidMarker(
+        '__P2WLAN_CHILD_PID__=\n+\n[string]@{Id=12345}.Id',
+      ),
+      isNull,
+    );
   });
 
   test('does not treat the build-info probe as a running daemon', () {

@@ -575,6 +575,17 @@ class AppStrings {
   String get daemonRunning => isZh ? '运行中' : 'Running';
   String get daemonStopped => isZh ? '未运行' : 'Not running';
   String get localSettingsFileLabel => isZh ? '配置文件位置' : 'Config file location';
+  String get clientBuildIdentity =>
+      isZh ? 'Flutter Client 构建身份' : 'Flutter client build identity';
+  String get daemonBuildIdentity =>
+      isZh ? 'daemon 构建身份' : 'Daemon build identity';
+  String get clientLogFileLabel => isZh ? 'Client 启动日志' : 'Client startup log';
+  String get daemonLogFileLabel => isZh ? 'daemon 日志' : 'Daemon log';
+  String get buildCommitLabel => isZh ? 'Git commit' : 'Git commit';
+  String get buildIdLabel => isZh ? 'Build ID' : 'Build ID';
+  String get buildDirtyLabel => isZh ? 'Dirty' : 'Dirty';
+  String get buildDiffHashLabel => isZh ? 'Diff hash' : 'Diff hash';
+  String get buildProfileLabel => isZh ? 'Profile' : 'Profile';
   String get restartWillApplyLater => isZh
       ? '这些设置将在相关节点下次启动时生效。'
       : 'These settings take effect the next time the relevant node starts.';
@@ -711,6 +722,39 @@ class AppStrings {
   String get onboardingStartFailed => isZh
       ? '无法启动 P2WLAN，请检查权限后重试。'
       : 'Could not start P2WLAN. Check permissions and try again.';
+  String get windowsUacCancelled => isZh
+      ? '已取消 Windows 管理员授权，P2WLAN 未启动。'
+      : 'Windows administrator authorization was cancelled. P2WLAN did not start.';
+  String get windowsUacLaunchFailed => isZh
+      ? 'Windows UAC 启动失败，请在系统提示中允许管理员授权后重试。'
+      : 'Windows UAC could not start the daemon. Allow administrator authorization and try again.';
+  String get clientDaemonBuildMismatch => isZh
+      ? '客户端与 daemon 不是同一次构建，已阻止启动。请重新安装同一个 clean Windows 包。'
+      : 'The client and daemon are from different builds, so startup was blocked. Reinstall one clean Windows package.';
+  String get windowsPidMarkerFailed => isZh
+      ? '无法确认 elevated daemon 的进程身份，已停止启动。'
+      : 'The elevated daemon process identity could not be verified, so startup stopped.';
+  String get daemonExitedDuringStartup => isZh
+      ? 'daemon 在启动完成前退出，请查看启动日志中的阶段和失败代码。'
+      : 'The daemon exited during startup. Check the startup log for its stage and failure code.';
+  String get daemonBinaryLoadFailed => isZh
+      ? 'p2wlan-daemon 或其运行库无法加载，请重新安装完整发布包。'
+      : 'p2wlan-daemon or one of its runtimes could not load. Reinstall the complete package.';
+  String get daemonAclFailure => isZh
+      ? '无法准备 daemon 运行目录权限，请检查本地运行目录后重试。'
+      : 'The daemon runtime directory could not be prepared. Check its local permissions and try again.';
+  String get daemonTokenAccessFailed => isZh
+      ? '无法建立安全的 Windows 启动身份，请重试或重新安装。'
+      : 'A secure Windows launch identity could not be established. Try again or reinstall.';
+  String get daemonNotElevated => isZh
+      ? 'daemon 没有以 Windows 管理员权限运行，请重新授权。'
+      : 'The daemon is not running with a Windows administrator token. Authorize it again.';
+  String get daemonAuthFailed => isZh
+      ? '登录凭据已失效，请重新登录后再启动。'
+      : 'The login credential has expired. Sign in again before starting the daemon.';
+  String get daemonStartupTimeout => isZh
+      ? 'daemon 启动超时，请查看启动日志中的阶段和失败代码。'
+      : 'The daemon did not become ready before the startup timeout. Check the startup log.';
   // --- Network & routes (Troubleshooting advanced) ---
   String get startupInterface => isZh ? '启动网卡配置' : 'Startup interface';
   String get startupMtu => isZh ? '启动 MTU 配置' : 'Startup MTU';
@@ -819,6 +863,9 @@ class AppStrings {
   String permActionElevationRequired() => isZh
       ? '需要管理员授权启动 TUN；首次输入后密码会加密保存在本地配置文件中。'
       : 'Administrator authorization is required for the TUN; after the first entry, the password is encrypted in the local configuration file.';
+  String permActionWindowsUac() => isZh
+      ? '启动本地网络服务需要 Windows 管理员授权。点击“授权并继续”后，请在系统 UAC 窗口中确认。P2WLAN 不会读取或保存 Windows 管理员密码。'
+      : 'Starting the local network service needs Windows administrator authorization. Click “Grant & continue”, then confirm the system UAC prompt. P2WLAN never reads or saves your Windows administrator password.';
   String permActionTunRuntimeVerification() => isZh
       ? '已获得管理员权限；macOS utun 创建需要 daemon 运行时验证。'
       : 'Elevated privileges are active; macOS utun creation is verified at daemon runtime.';

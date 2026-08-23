@@ -86,6 +86,7 @@ class StatusStore extends ChangeNotifier {
   String? _lastStatusError;
   String? _lastDaemonMessage;
   String? _lastDaemonManualCommand;
+  DaemonStartupFailureCode? _lastDaemonFailureCode;
   DateTime? _lastFetchedAt;
   DateTime? _lastSuccessfulStatusAt;
   DateTime? _lastRouteVerificationAt;
@@ -116,6 +117,7 @@ class StatusStore extends ChangeNotifier {
   String? get lastStatusError => _lastStatusError;
   String? get lastDaemonMessage => _lastDaemonMessage;
   String? get lastDaemonManualCommand => _lastDaemonManualCommand;
+  DaemonStartupFailureCode? get lastDaemonFailureCode => _lastDaemonFailureCode;
   DateTime? get lastFetchedAt => _lastFetchedAt;
   DateTime? get lastSuccessfulStatusAt => _lastSuccessfulStatusAt;
   Duration? get lastRequestDuration => _lastRequestDuration;
@@ -467,11 +469,13 @@ class StatusStore extends ChangeNotifier {
     _daemonBusy = true;
     _lastDaemonMessage = null;
     _lastDaemonManualCommand = null;
+    _lastDaemonFailureCode = null;
     notifyListeners();
     try {
       final result = await command();
       _lastDaemonMessage = result.message;
       _lastDaemonManualCommand = result.manualCommand;
+      _lastDaemonFailureCode = result.failureCode;
       if (!result.ok) {
         _lastError = result.message;
       }
@@ -500,6 +504,7 @@ class StatusStore extends ChangeNotifier {
       );
       _lastDaemonMessage = result.message;
       _lastDaemonManualCommand = result.manualCommand;
+      _lastDaemonFailureCode = result.failureCode;
       _lastError = result.message;
       return result;
     } finally {

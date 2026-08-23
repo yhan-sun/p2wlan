@@ -211,7 +211,6 @@ extension DaemonControllerElevation on DaemonController {
   Future<int> _startWindowsElevated({
     required File binary,
     required List<String> args,
-    required String pidPath,
   }) async {
     final argLine = args.map(windowsCommandLineArgQuote).join(' ');
     final script =
@@ -221,22 +220,29 @@ extension DaemonControllerElevation on DaemonController {
         '-FilePath ${_powershellSingleQuoted(binary.path)} '
         '-ArgumentList ${_powershellSingleQuoted(argLine)} -PassThru; '
         // The ACL grants the local Administrators group access to this file,
-        // so an alternate UAC account can publish the marker. A marker write
-        // failure is launch-fatal: without the exact child PID, cleanup could
-        // target the wrong process.
-        'Set-Content -LiteralPath ${_powershellSingleQuoted(pidPath)} '
-        '-Value ([string]\$child.Id) -Encoding ascii -Force; '
-        'Write-Output \'$_windowsChildPidMarker\' + [string]\$child.Id';
+        // so an alternate UAC account can start the child.  The stdout marker
+        // is the only producer-side identity; Dart validates it and writes the
+        // canonical PID file as the interactive user.
+        'Write-Output (\'$_windowsChildPidMarker\' + [string]\$child.Id)';
     final result = await _runWindowsPowerShell(script);
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
       throw StateError(stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr);
     }
     final pid = parseWindowsChildPidMarker(result.stdout.toString());
-    if (pid != null) return pid;
+    if (pid != null && await _waitForWindowsChildIdentity(pid)) return pid;
     throw StateError(
       'PID_MARKER_FAILED: Windows UAC did not return the elevated child PID.',
     );
+  }
+
+  Future<bool> _waitForWindowsChildIdentity(int pid) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (DateTime.now().isBefore(deadline)) {
+      if (await _processLooksLikeDaemon(pid)) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    return await _processLooksLikeDaemon(pid);
   }
 
   Future<String?> _windowsCurrentUserSid() async {
