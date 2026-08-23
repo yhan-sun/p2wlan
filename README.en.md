@@ -224,10 +224,20 @@ Control plane example:
 JWT_SECRET="replace-with-a-long-random-secret" \
 DB_PATH="./data/p2wlan.db" \
 PORT=18080 \
+LOG_UPLOAD_DIR="./data/log-uploads" \
+LOG_UPLOAD_RETENTION_DAYS=14 \
 RELAY_SERVERS="default@relay.example.com:18081" \
 RELAY_REVOCATION_FEED_TOKEN="replace-with-a-second-random-secret" \
 ./p2wlan-control
 ```
+
+When enabled, the desktop client's Settings → Developer & Diagnostics action
+uploads only the current startup log files to `POST /api/v1/support/logs`.
+Uploads require a user JWT, are gzip-compressed and bounded, are stored as
+private `*.json.gz` files under `LOG_UPLOAD_DIR`, and are automatically pruned
+after `LOG_UPLOAD_RETENTION_DAYS` (14 by default). Put HTTPS in front of the
+control server before enabling this for users, because log bundles can contain
+network addresses and connection diagnostics.
 
 Relay example:
 

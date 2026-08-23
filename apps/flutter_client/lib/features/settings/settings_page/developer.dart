@@ -46,8 +46,32 @@ class _DeveloperSection extends StatelessWidget {
               icon: const Icon(Icons.restore, size: 16),
               label: Text(strings.restoreDefaultUrl),
             ),
+            OutlinedButton.icon(
+              key: const Key('settings-upload-current-session-logs'),
+              onPressed: saving || state._uploadingLogs
+                  ? null
+                  : state._uploadCurrentSessionLogs,
+              icon: state._uploadingLogs
+                  ? const SizedBox.square(
+                      dimension: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.upload_file_outlined, size: 16),
+              label: Text(
+                state._uploadingLogs
+                    ? strings.uploadingLogs
+                    : strings.uploadCurrentSessionLogs,
+              ),
+            ),
           ],
         ),
+        if (state._logUploadError != null) ...[
+          const SizedBox(height: AppTokens.space6),
+          Text(
+            state._logUploadError!,
+            style: TextStyle(fontSize: 12, color: theme.colorScheme.error),
+          ),
+        ],
         const SizedBox(height: AppTokens.space10),
         const Divider(height: 1),
         const SizedBox(height: AppTokens.space6),

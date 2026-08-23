@@ -3,6 +3,8 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/api/control_api.dart';
+import 'package:p2wlan_flutter_client/core/build_info.dart';
+import 'package:p2wlan_flutter_client/core/diagnostics/session_log_bundle.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
@@ -231,6 +233,64 @@ void main() {
 
     await deleteFuture;
   });
+
+  test(
+    'uploadSupportLogs sends a compressed redacted current-session bundle',
+    () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final api = ControlApi();
+      addTearDown(api.close);
+
+      final uploadFuture = api.uploadSupportLogs(
+        controlServer: 'http://127.0.0.1:${server.port}',
+        authToken: 'token-123',
+        deviceName: 'Mini',
+        clientBuild: const ClientBuildInfo(
+          appVersion: '0.1.135',
+          gitCommit: 'abc',
+          buildId: 'build',
+          dirtyValue: 'false',
+          diffHash: 'none',
+          profile: 'release',
+        ),
+        daemonBuild: null,
+        files: const [
+          SessionLogFile(name: 'p2wlan-daemon.log', content: 'token=secret\n'),
+        ],
+      );
+      final request = await server.first.timeout(const Duration(seconds: 3));
+      expect(request.method, 'POST');
+      expect(request.uri.path, '/api/v1/support/logs');
+      expect(
+        request.headers.value(HttpHeaders.authorizationHeader),
+        'Bearer token-123',
+      );
+      expect(request.headers.value(HttpHeaders.contentEncodingHeader), 'gzip');
+      final compressed = await request.fold<List<int>>(<int>[], (
+        buffer,
+        chunk,
+      ) {
+        buffer.addAll(chunk);
+        return buffer;
+      });
+      final payload =
+          jsonDecode(utf8.decode(GZipCodec().decode(compressed)))
+              as Map<String, dynamic>;
+      final files = payload['files'] as List<dynamic>;
+      expect(
+        (files.single as Map<String, dynamic>)['content'],
+        'token=<redacted>\n',
+      );
+      request.response
+        ..headers.contentType = ContentType.json
+        ..write('{"success":true,"upload_id":"upload-1"}');
+      await request.response.close();
+
+      final result = await uploadFuture;
+      expect(result.uploadId, 'upload-1');
+    },
+  );
 
   test('updateDevice sends name and virtual IP in PATCH request', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);

@@ -243,6 +243,69 @@ extension _SettingsPageActions on _SettingsPageState {
     await _saveCategory(SettingsCategory.developer);
   }
 
+  Future<void> _uploadCurrentSessionLogs() async {
+    if (_uploadingLogs) return;
+    final strings = AppStrings.fromCode(
+      widget.settingsStore.settings.languageCode,
+    );
+    final settings = widget.settingsStore.settings;
+    final authToken = settings.authToken.trim();
+    if (settings.manualMode ||
+        authToken.isEmpty ||
+        isAuthTokenExpired(authToken)) {
+      _showSnackBar(strings.logsUploadRequiresLogin);
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(strings.uploadLogsTitle),
+        content: Text(strings.uploadLogsBody),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(strings.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(strings.uploadLogsConfirm),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    _updateState(() {
+      _uploadingLogs = true;
+      _logUploadError = null;
+    });
+    try {
+      final bundle = await CurrentSessionLogBundle.collect(
+        daemonLogPath: widget.statusStore.daemonController.daemonLogPath,
+        clientLogPath: widget.statusStore.daemonController.clientLogPath,
+      );
+      final result = await _controlApi.uploadSupportLogs(
+        controlServer: settings.controlServer,
+        authToken: authToken,
+        deviceName: settings.deviceName,
+        clientBuild: ClientBuildInfo.current,
+        daemonBuild: widget.statusStore.daemonController.lastDaemonBuildInfo,
+        files: bundle.files,
+      );
+      if (mounted) {
+        _showSnackBar(strings.logsUploaded(result.uploadId));
+      }
+    } catch (error) {
+      if (mounted) {
+        _updateState(() => _logUploadError = error.toString());
+        _showSnackBar(strings.logsUploadFailed);
+      }
+    } finally {
+      if (mounted) _updateState(() => _uploadingLogs = false);
+    }
+  }
+
   Future<void> _saveLanguage(String languageCode) async {
     _updateState(() => _saving = true);
     try {

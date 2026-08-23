@@ -78,6 +78,11 @@ func main() {
 	mux.HandleFunc("POST /api/v1/challenges", authService.RequireAuth(apiServer.CreateChallenge))
 	mux.HandleFunc("POST /api/v1/devices/credential", authService.RequireAuth(apiServer.SubmitDeviceCredential))
 	mux.HandleFunc("GET /api/v1/networks", authService.RequireAuth(apiServer.ListNetworks))
+	// Support log uploads intentionally accept only a user JWT. Device
+	// credentials are used by daemons and must not grant a client the ability
+	// to upload arbitrary local files. The handler stores a bounded, compressed
+	// bundle in the server's private support-log directory.
+	mux.HandleFunc("POST /api/v1/support/logs", rateLimit(authService.RequireAuth(apiServer.UploadSupportLogs), 3, time.Hour))
 
 	// Dual-auth routes (accept user JWT or device credential)
 	anyAuth := auth.RequireAnyAuth(authService, db)
@@ -295,10 +300,16 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-// limitBodySize wraps an http.Handler with a 1 MB body size limit.
+// limitBodySize wraps an http.Handler with a 1 MB body size limit. Support
+// bundles are gzip-compressed JSON and get a separate bounded limit so normal
+// control-plane routes keep their smaller request surface.
 func limitBodySize(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB
+		limit := int64(1 << 20) // 1 MB for normal control-plane requests
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/support/logs" {
+			limit = 8 << 20 // 8 MB compressed support bundle
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
 		next.ServeHTTP(w, r)
 	})
 }

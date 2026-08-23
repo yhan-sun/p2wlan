@@ -255,6 +255,11 @@ RELAY_AUTH_FAILURE_WINDOW="1m" \
 
 公网部署建议在控制面前放置 HTTPS/WSS 反向代理，并妥善保护 SQLite 文件、诊断端点和中继令牌。relay 的运行时统计会累计认证失败与限速次数，并仅以短哈希来源键暴露失败来源窗口，避免泄漏 ticket/JWT 或客户端 payload 明文。metrics 必须绑定 loopback，通过 SSH tunnel 读取；它只用于诊断，不能证明对端收到数据。
 
+设置页的“上传本次启动日志”会把当前 `p2wlan-daemon.log`（Windows 另含当前
+启动 trace）压缩、脱敏后上传到控制面。服务端使用 `LOG_UPLOAD_DIR`（默认
+`data/log-uploads`）保存私有 `*.json.gz` 文件，并按 `LOG_UPLOAD_RETENTION_DAYS`
+（默认 14 天）自动清理。日志可能包含设备名称、网络地址和连接诊断信息，公网部署必须使用 HTTPS。
+
 ## 安全边界
 
 - 加入同一虚拟网络的设备应被视为同一信任边界内的节点。

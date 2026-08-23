@@ -2,6 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../build_info.dart';
+import '../diagnostics/session_log_bundle.dart';
+import '../security/redactor.dart';
 import '../state/settings_store.dart';
 
 enum AuthMode { login, register }
@@ -25,12 +28,21 @@ class DeviceUpdateResult {
   final String virtualIp;
 }
 
+class SupportLogUploadResult {
+  const SupportLogUploadResult({required this.uploadId, this.receivedAt});
+
+  final String uploadId;
+  final String? receivedAt;
+}
+
 class ControlApi {
   ControlApi({HttpClient? client}) : _client = client ?? HttpClient() {
     _client.connectionTimeout = _requestTimeout;
   }
 
   static const _requestTimeout = Duration(seconds: 8);
+  static const _supportLogUploadTimeout = Duration(seconds: 60);
+  static const _maxSupportLogCompressedBytes = 8 * 1024 * 1024;
 
   final HttpClient _client;
 
@@ -175,6 +187,120 @@ class ControlApi {
     }
   }
 
+  /// Upload only the current local startup log bundle to the authenticated
+  /// control server. The client never sends a private key or a destination
+  /// path; the server allocates the upload id and stores the bundle privately.
+  Future<SupportLogUploadResult> uploadSupportLogs({
+    required String controlServer,
+    required String authToken,
+    required String deviceName,
+    required ClientBuildInfo clientBuild,
+    required DaemonBuildInfo? daemonBuild,
+    required Iterable<SessionLogFile> files,
+  }) async {
+    final token = authToken.trim();
+    if (token.isEmpty) {
+      throw const ControlApiException('登录状态已失效，请重新登录后再上传日志');
+    }
+    final normalizedControlServer = _normalizeAuthControlServer(controlServer);
+    final logFiles = files
+        .map(
+          (file) => {
+            'name': file.name,
+            // Redact again at the network boundary so callers cannot
+            // accidentally bypass the local bundle's redaction step.
+            'content': redactSensitive(file.content),
+          },
+        )
+        .toList(growable: false);
+    if (logFiles.isEmpty) {
+      throw const ControlApiException('没有找到本次启动的日志');
+    }
+
+    final payload = <String, dynamic>{
+      'schema_version': 1,
+      'uploaded_at': DateTime.now().toUtc().toIso8601String(),
+      'device_name': deviceName.trim(),
+      'platform': Platform.operatingSystem,
+      'client_build': {
+        'app_version': clientBuild.appVersion,
+        'git_commit': clientBuild.gitCommit,
+        'build_id': clientBuild.buildId,
+        'dirty': clientBuild.dirtyLabel,
+        'diff_hash': clientBuild.diffHash,
+        'profile': clientBuild.profile,
+      },
+      if (daemonBuild != null)
+        'daemon_build': {
+          'app_version': daemonBuild.appVersion,
+          'daemon_version': daemonBuild.daemonVersion,
+          'git_commit': daemonBuild.gitCommit,
+          'build_id': daemonBuild.buildId,
+          'dirty': daemonBuild.dirtyLabel,
+          'diff_hash': daemonBuild.diffHash,
+          'profile': daemonBuild.profile,
+        },
+      'files': logFiles,
+    };
+    final compressed = GZipCodec().encode(utf8.encode(jsonEncode(payload)));
+    if (compressed.length > _maxSupportLogCompressedBytes) {
+      throw const ControlApiException('日志压缩后仍然过大，请缩短本次启动时间后再试');
+    }
+
+    final endpoint = Uri.parse('$normalizedControlServer/api/v1/support/logs');
+    try {
+      final request = await _client
+          .postUrl(endpoint)
+          .timeout(_supportLogUploadTimeout);
+      request.persistentConnection = false;
+      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      request.headers.contentType = ContentType.json;
+      request.headers.set(HttpHeaders.contentEncodingHeader, 'gzip');
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      request.contentLength = compressed.length;
+      request.add(compressed);
+      final response = await request.close().timeout(_supportLogUploadTimeout);
+      final text = await utf8
+          .decodeStream(response)
+          .timeout(_supportLogUploadTimeout);
+      final decoded = text.trim().isEmpty
+          ? <String, dynamic>{}
+          : jsonDecode(text);
+      final body = decoded is Map
+          ? Map<String, dynamic>.from(decoded)
+          : <String, dynamic>{};
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw ControlApiException(
+          _zhAuthError(
+            body['error']?.toString(),
+            response.statusCode,
+            '登录状态已过期，请重新登录后再上传日志',
+          ),
+        );
+      }
+      final uploadId = body['upload_id']?.toString().trim() ?? '';
+      if (uploadId.isEmpty || body['success'] == false) {
+        throw const ControlApiException('控制服务器没有返回日志上传编号');
+      }
+      return SupportLogUploadResult(
+        uploadId: uploadId,
+        receivedAt: body['received_at']?.toString(),
+      );
+    } on ControlApiException {
+      rethrow;
+    } on TimeoutException {
+      throw ControlApiException('日志上传超时：${endpoint.origin}');
+    } on SocketException catch (error) {
+      throw ControlApiException(_zhNetworkError(error, endpoint));
+    } on HandshakeException {
+      throw ControlApiException('控制服务器 TLS 握手失败：${endpoint.origin}');
+    } on FormatException {
+      throw const ControlApiException('控制服务器返回了无法解析的日志上传结果');
+    } on HttpException {
+      throw ControlApiException('无法连接控制服务器：${endpoint.origin}。请确认服务端已更新并正在运行。');
+    }
+  }
+
   Future<Map<String, dynamic>> _sendJson({
     required String method,
     required Uri uri,
@@ -274,6 +400,7 @@ String _zhAuthError(
   if (statusCode == 403) return '当前账号没有权限执行该操作';
   if (statusCode == 404) return '控制服务器暂不支持该接口，请先更新服务端';
   if (statusCode == 409) return '账号已存在';
+  if (statusCode == 413) return '日志文件过大，请缩短本次启动时间后再试';
   if (normalized.contains('invalid credentials')) return '邮箱或密码错误';
   if (normalized.contains('invalid email')) return '邮箱格式不正确';
   if (normalized.contains('invalid password')) return '密码不符合要求，至少需要 6 个字符';
