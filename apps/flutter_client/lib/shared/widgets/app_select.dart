@@ -226,7 +226,6 @@ class AppSelect<T> extends StatelessWidget {
       context: context,
       useRootNavigator: true,
       position: position,
-      initialValue: value,
       color: colors.surfaceElevated,
       surfaceTintColor: Colors.transparent,
       shadowColor: const Color(0x240F172A),
@@ -242,58 +241,129 @@ class AppSelect<T> extends StatelessWidget {
       ),
       items: [
         for (final option in options)
-          PopupMenuItem<T>(
-            key: ValueKey<Object>(('app-select-option', option.value)),
+          _AppSelectPopoverItem<T>(
+            optionKey: ValueKey<Object>(('app-select-option', option.value)),
             value: option.value,
-            height: 48,
-            padding: EdgeInsets.zero,
-            mouseCursor: SystemMouseCursors.click,
-            child: Container(
-              height: 44,
-              padding: const EdgeInsets.symmetric(
-                horizontal: AppTokens.space12,
-              ),
-              decoration: BoxDecoration(
-                color: option.value == value
-                    ? colors.selectedSurface
-                    : Colors.transparent,
-                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-              ),
-              child: Row(
-                children: [
-                  if (option.icon != null) ...[
-                    Icon(option.icon, size: 18),
-                    const SizedBox(width: AppTokens.space8),
-                  ],
-                  Expanded(
-                    child: Text(
-                      option.label,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: option.value == value
-                            ? Theme.of(context).colorScheme.primary
-                            : colors.textPrimary,
-                        fontSize: 13,
-                        fontWeight: option.value == value
-                            ? FontWeight.w600
-                            : FontWeight.w500,
-                      ),
+            selected: option.value == value,
+            selectedColor: colors.selectedSurface,
+            borderColor: option.value == value
+                ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.22)
+                : Colors.transparent,
+            hoverColor: colors.hoverSurface,
+            splashColor: Theme.of(
+              context,
+            ).colorScheme.primary.withValues(alpha: 0.08),
+            child: Row(
+              children: [
+                if (option.icon != null) ...[
+                  Icon(option.icon, size: 18),
+                  const SizedBox(width: AppTokens.space8),
+                ],
+                Expanded(
+                  child: Text(
+                    option.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: option.value == value
+                          ? Theme.of(context).colorScheme.primary
+                          : colors.textPrimary,
+                      fontSize: 13,
+                      fontWeight: option.value == value
+                          ? FontWeight.w600
+                          : FontWeight.w500,
                     ),
                   ),
-                  if (option.value == value)
-                    Icon(
-                      Icons.check_rounded,
-                      size: 18,
-                      color: Theme.of(context).colorScheme.primary,
-                    )
-                  else
-                    const SizedBox(width: 18),
-                ],
-              ),
+                ),
+                if (option.value == value)
+                  Icon(
+                    Icons.check_rounded,
+                    size: 18,
+                    color: Theme.of(context).colorScheme.primary,
+                  )
+                else
+                  const SizedBox(width: 18),
+              ],
             ),
           ),
       ],
+    );
+  }
+}
+
+/// A popup entry with one clipped shape for its fill, border, hover, focus,
+/// and splash states. Flutter's stock [PopupMenuItem] paints its selected
+/// highlight around the whole rectangular entry when `initialValue` is used,
+/// which visibly cuts through a rounded product menu.
+class _AppSelectPopoverItem<T> extends PopupMenuEntry<T> {
+  const _AppSelectPopoverItem({
+    required this.optionKey,
+    required this.value,
+    required this.selected,
+    required this.selectedColor,
+    required this.borderColor,
+    required this.hoverColor,
+    required this.splashColor,
+    required this.child,
+  });
+
+  final Key optionKey;
+  final T value;
+  final bool selected;
+  final Color selectedColor;
+  final Color borderColor;
+  final Color hoverColor;
+  final Color splashColor;
+  final Widget child;
+
+  @override
+  double get height => 48;
+
+  @override
+  bool represents(T? value) => value == this.value;
+
+  @override
+  State<_AppSelectPopoverItem<T>> createState() =>
+      _AppSelectPopoverItemState<T>();
+}
+
+class _AppSelectPopoverItemState<T> extends State<_AppSelectPopoverItem<T>> {
+  @override
+  Widget build(BuildContext context) {
+    final radius = BorderRadius.circular(AppTokens.radiusMd);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: AppTokens.space2),
+      child: Semantics(
+        button: true,
+        selected: widget.selected,
+        child: Material(
+          key: ValueKey<Object>(('app-select-option-surface', widget.value)),
+          color: widget.selected ? widget.selectedColor : Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: radius,
+            side: BorderSide(color: widget.borderColor),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            key: widget.optionKey,
+            onTap: () => Navigator.pop<T>(context, widget.value),
+            mouseCursor: SystemMouseCursors.click,
+            borderRadius: radius,
+            hoverColor: widget.hoverColor,
+            focusColor: widget.hoverColor,
+            splashColor: widget.splashColor,
+            child: SizedBox(
+              height: 44,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppTokens.space12,
+                ),
+                child: widget.child,
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

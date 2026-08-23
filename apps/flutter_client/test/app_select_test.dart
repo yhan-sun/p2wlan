@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_theme.dart';
+import 'package:p2wlan_flutter_client/app/app_tokens.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/app_select.dart';
 
 void main() {
@@ -39,6 +40,15 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(find.text('Dark'), findsOneWidget);
+
+    for (final option in ['system', 'dark']) {
+      final surface = tester.widget<Material>(
+        find.byKey(ValueKey<Object>(('app-select-option-surface', option))),
+      );
+      final shape = surface.shape! as RoundedRectangleBorder;
+      expect(shape.borderRadius, BorderRadius.circular(AppTokens.radiusMd));
+      expect(surface.clipBehavior, Clip.antiAlias);
+    }
 
     await tester.tap(
       find.byKey(const ValueKey<Object>(('app-select-option', 'dark'))),
