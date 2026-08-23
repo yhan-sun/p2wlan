@@ -67,27 +67,23 @@ void main() {
     expect(probe.failureCode, DaemonStartupFailureCode.daemonBinaryLoadFailed);
   });
 
-  test(
-    'Windows runs the actual p2wlan-daemon.exe --build-info',
-    () async {
-      final binaryPath = _resolveWindowsDaemonBinary();
-      expect(
-        binaryPath,
-        isNotNull,
-        reason:
-            'Set P2WLAN_DAEMON_BIN or build a Windows release daemon before '
-            'running this integration test.',
-      );
+  test('Windows runs the actual p2wlan-daemon.exe --build-info', () async {
+    final binaryPath = _resolveWindowsDaemonBinary();
+    expect(
+      binaryPath,
+      isNotNull,
+      reason:
+          'Set P2WLAN_DAEMON_BIN or build a Windows release daemon before '
+          'running this integration test.',
+    );
 
-      final probe = await probeDaemonBinary(File(binaryPath!));
+    final probe = await probeDaemonBinary(File(binaryPath!));
 
-      expect(probe.error, isNull, reason: probe.error);
-      expect(probe.failureCode, isNull);
-      expect(probe.identity, isNotNull);
-      expect(probe.identity!.isComplete, isTrue);
-    },
-    skip: !Platform.isWindows,
-  );
+    expect(probe.error, isNull, reason: probe.error);
+    expect(probe.failureCode, isNull);
+    expect(probe.identity, isNotNull);
+    expect(probe.identity!.isComplete, isTrue);
+  }, skip: !Platform.isWindows);
 
   test(
     'Windows helper reads the real current-user SID with a normal child',
@@ -112,22 +108,18 @@ void main() {
     skip: !Platform.isWindows,
   );
 
-  test(
-    'Windows helper preserves a non-zero child exit code',
-    () async {
-      final api = DiagnosticsApi(authTokenReader: () async => null);
-      addTearDown(api.close);
-      final controller = DaemonController(diagnosticsApi: api);
+  test('Windows helper preserves a non-zero child exit code', () async {
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
 
-      final result = await controller.runWindowsPowerShellForTesting(
-        r'Write-Output "helper stdout"; $global:LASTEXITCODE = 17',
-      );
+    final result = await controller.runWindowsPowerShellForTesting(
+      r'Write-Output "helper stdout"; $global:LASTEXITCODE = 17',
+    );
 
-      expect(result.exitCode, 17, reason: result.stderr.toString());
-      expect(result.stdout, contains('helper stdout'));
-    },
-    skip: !Platform.isWindows,
-  );
+    expect(result.exitCode, 17, reason: result.stderr.toString());
+    expect(result.stdout, contains('helper stdout'));
+  }, skip: !Platform.isWindows);
 
   test('Windows helper kills a timed-out child', () async {
     final root = await _createTempRoot();
