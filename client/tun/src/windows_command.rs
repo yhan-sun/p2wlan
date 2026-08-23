@@ -2,6 +2,21 @@ use crate::error::{Error, Result};
 
 const MAX_COMMAND_OUTPUT_CHARS: usize = 2048;
 
+/// Build the argv expected by `netsh interface ipv4 set subinterface`.
+/// `netsh` requires the MTU option to be passed as one `mtu=<value>`
+/// argument; splitting the name and value makes it parse `mtu` as the value.
+pub(crate) fn netsh_set_mtu_args(interface: &str, mtu: u32) -> [String; 7] {
+    [
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "subinterface".to_string(),
+        interface.to_string(),
+        format!("mtu={mtu}"),
+        "store=persistent".to_string(),
+    ]
+}
+
 /// Convert a Windows command result into a hard failure when the command did
 /// not complete successfully. Keeping this boundary independent of
 /// `std::process::Output` makes the failure semantics testable without
@@ -49,7 +64,23 @@ fn matches_sensitive_word(word: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::require_success;
+    use super::{netsh_set_mtu_args, require_success};
+
+    #[test]
+    fn mtu_argument_uses_netsh_assignment_syntax() {
+        assert_eq!(
+            netsh_set_mtu_args("P2WLAN Adapter", 1420),
+            [
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                "P2WLAN Adapter",
+                "mtu=1420",
+                "store=persistent",
+            ]
+        );
+    }
 
     #[test]
     fn zero_exit_status_is_ok() {
