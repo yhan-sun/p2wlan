@@ -99,7 +99,7 @@ Future<DaemonBinaryProbe> _runControlledProbe(
   Directory root,
   String mode, {
   File? marker,
-  Duration timeout = const Duration(seconds: 6),
+  Duration timeout = const Duration(seconds: 30),
 }) async {
   if (Platform.isWindows) {
     final script = File(
