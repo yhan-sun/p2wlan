@@ -248,6 +248,24 @@ void main() {
     expect(parseWindowsChildPidMarker('no marker'), isNull);
   });
 
+  test('does not treat the build-info probe as a running daemon', () {
+    expect(
+      isP2wlanDaemonRuntimeCommandLine(
+        '/Applications/P2WLAN.app/Contents/Resources/p2wlan-daemon --build-info',
+      ),
+      isFalse,
+    );
+    expect(
+      isP2wlanDaemonRuntimeCommandLine(
+        '/Applications/P2WLAN.app/Contents/Resources/p2wlan-daemon '
+        '--config /Users/test/Library/Application Support/p2wlan/p2wlan-config.json '
+        '--diagnostics-bind 127.0.0.1:39277 --manual',
+      ),
+      isTrue,
+    );
+    expect(isP2wlanDaemonRuntimeCommandLine('/usr/bin/other-process'), isFalse);
+  });
+
   test('quotes Windows arguments across Start-Process ArgumentList', () {
     expect(windowsCommandLineArgQuote(''), '""');
     expect(

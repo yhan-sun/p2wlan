@@ -1,5 +1,16 @@
 part of '../daemon_controller.dart';
 
+/// Return whether a process command line represents a running daemon rather
+/// than the side-effect-free identity probe used to validate a release
+/// binary.  The probe has the same executable name, but it must never block a
+/// real daemon start or be sent a shutdown signal as if it owned the
+/// diagnostics endpoint.
+bool isP2wlanDaemonRuntimeCommandLine(String command) {
+  final normalized = command.trim();
+  if (!normalized.contains(DaemonController.daemonBinaryName)) return false;
+  return !RegExp(r'(^|\s)--build-info(?:\s|$)').hasMatch(normalized);
+}
+
 extension DaemonControllerPids on DaemonController {
   /// Whether a daemon is already occupying the diagnostics instance this
   /// controller is about to start.
@@ -91,10 +102,7 @@ extension DaemonControllerPids on DaemonController {
 
   Future<bool> _processLooksLikeDaemon(int pid) async {
     final command = await _processCommandLine(pid);
-    if (command != null &&
-        command.contains(DaemonController.daemonBinaryName)) {
-      return true;
-    }
+    if (command != null) return isP2wlanDaemonRuntimeCommandLine(command);
     return Platform.isWindows &&
         await _windowsProcessName(pid) ==
             '${DaemonController.daemonBinaryName}.exe';
@@ -195,7 +203,7 @@ extension DaemonControllerPids on DaemonController {
         final parsedPid = int.tryParse(trimmed.substring(0, splitAt).trim());
         if (parsedPid == null || parsedPid == currentPid) continue;
         final command = trimmed.substring(splitAt).trim();
-        if (command.contains(DaemonController.daemonBinaryName) &&
+        if (isP2wlanDaemonRuntimeCommandLine(command) &&
             command.contains('--diagnostics-bind') &&
             command.contains(bind)) {
           matches.add(parsedPid);
@@ -208,7 +216,7 @@ extension DaemonControllerPids on DaemonController {
   Future<List<int>> _findWindowsDaemonPids() async {
     if (!Platform.isWindows) return const <int>[];
     final result = await _runWindowsPowerShell(
-      r'''$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue); '''
+      r'''$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue | Where-Object { $null -eq $_.CommandLine -or $_.CommandLine -notmatch '(?i)(^|\s)--build-info(\s|$)' }); '''
       r'''if ($processes.Count -eq 0) { $processes = @(Get-Process -Name p2wlan-daemon -ErrorAction SilentlyContinue) }; '''
       r'''$processes | Select-Object -ExpandProperty ProcessId''',
     );
@@ -225,7 +233,7 @@ extension DaemonControllerPids on DaemonController {
     final matches = <int>[];
     if (Platform.isWindows) {
       final result = await _runWindowsPowerShell(
-        r'''$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue); '''
+        r'''$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue | Where-Object { $null -eq $_.CommandLine -or $_.CommandLine -notmatch '(?i)(^|\s)--build-info(\s|$)' }); '''
         r'''if ($processes.Count -eq 0) { $processes = @(Get-Process -Name p2wlan-daemon -ErrorAction SilentlyContinue) }; '''
         r'''$processes | Select-Object -ExpandProperty ProcessId''',
       );
@@ -251,7 +259,7 @@ extension DaemonControllerPids on DaemonController {
         final parsedPid = int.tryParse(trimmed.substring(0, splitAt).trim());
         if (parsedPid == null || parsedPid == currentPid) continue;
         final command = trimmed.substring(splitAt).trim();
-        if (command.contains(DaemonController.daemonBinaryName)) {
+        if (isP2wlanDaemonRuntimeCommandLine(command)) {
           matches.add(parsedPid);
         }
       }
