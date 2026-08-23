@@ -68,15 +68,27 @@ extension DaemonControllerElevation on DaemonController {
         ? ''
         : '; /bin/sleep 1; $repairOwnership';
     final terminateExisting = _macosTerminateRecordedDaemonShell(pidPath);
+    final rotateLog = _macosRotateLogShell(logPath);
     return 'mkdir -p ${_shellQuote(configDir.path)} ${_shellQuote(logDir.path)}; '
         '$repairBefore'
         '$terminateExisting'
+        '$rotateLog'
         ': > ${_shellQuote(logPath)}; chmod 600 ${_shellQuote(logPath)}; '
         '$repairBefore'
         '(P2WLAN_DAEMON_BIN=${_shellQuote(binary.path)} '
         '${_shellQuote(binary.path)} ${args.map(_shellQuote).join(' ')} '
         '>> ${_shellQuote(logPath)} 2>&1 < /dev/null & echo \$! > ${_shellQuote(pidPath)})'
         '$repairAfter';
+  }
+
+  String _macosRotateLogShell(String logPath) {
+    if (!Platform.isMacOS) return '';
+    final current = _shellQuote(logPath);
+    final previous = _shellQuote('$logPath.1');
+    return 'if [ -f $current ]; then '
+        '/bin/rm -f $previous || exit 72; '
+        '/bin/mv $current $previous || exit 73; '
+        'fi; ';
   }
 
   String _macosTerminateRecordedDaemonShell(String pidPath) {

@@ -1,5 +1,16 @@
 part of '../daemon_controller.dart';
 
+/// Keep the current daemon log plus one previous startup log.  The caller
+/// must invoke this after the previous daemon has stopped and before creating
+/// the new current log.
+Future<void> rotateP2wlanLogFiles(File currentLog) async {
+  if (!await currentLog.exists()) return;
+
+  final previousLog = File('${currentLog.path}.1');
+  if (await previousLog.exists()) await previousLog.delete();
+  await currentLog.rename(previousLog.path);
+}
+
 extension DaemonControllerProcessControl on DaemonController {
   bool get _supportsProcessControl {
     return Platform.isMacOS || Platform.isLinux || Platform.isWindows;

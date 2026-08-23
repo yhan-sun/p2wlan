@@ -91,6 +91,18 @@ void main() {
     );
   });
 
+  test('rotates daemon logs and keeps only the previous startup', () async {
+    final current = File('${tempDir.path}/p2wlan-daemon.log');
+    final previous = File('${current.path}.1');
+    await current.writeAsString('current startup');
+    await previous.writeAsString('older startup');
+
+    await rotateP2wlanLogFiles(current);
+
+    expect(await current.exists(), isFalse);
+    expect(await previous.readAsString(), 'current startup');
+  });
+
   test('launch token uses a random name and is deleted explicitly', () async {
     final api = DiagnosticsApi(authTokenReader: () async => null);
     addTearDown(api.close);

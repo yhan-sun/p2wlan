@@ -213,12 +213,19 @@ class DaemonController {
           await _restrictLaunchPath(configPath.path);
         }
       }
-      // Pre-create and truncate the log as the interactive user. Elevated
-      // launches must append to this file rather than creating an
-      // admin-owned file or inheriting stale startup markers.
-      await File(logPath).writeAsString('', flush: true);
-      if (Platform.isWindows) {
-        await _restrictLaunchPath(logPath);
+      // Keep the current log and one previous startup log. macOS elevated
+      // launches rotate inside the sudo shell below so a root-owned log can
+      // be repaired before it is moved; all other desktop paths can rotate as
+      // the interactive user here.
+      if (!(Platform.isMacOS && requiresElevation)) {
+        await rotateP2wlanLogFiles(File(logPath));
+        // Pre-create and truncate as the interactive user. Elevated launches
+        // must append to this file rather than creating an admin-owned file or
+        // inheriting stale startup markers.
+        await File(logPath).writeAsString('', flush: true);
+        if (Platform.isWindows) {
+          await _restrictLaunchPath(logPath);
+        }
       }
       await _clearPidMarkerForStart(pidPath);
     } catch (error) {
