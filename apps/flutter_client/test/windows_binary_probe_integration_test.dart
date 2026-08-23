@@ -66,27 +66,23 @@ void main() {
     expect(probe.failureCode, DaemonStartupFailureCode.daemonBinaryLoadFailed);
   });
 
-  test(
-    'Windows runs the actual p2wlan-daemon.exe --build-info',
-    () async {
-      final binaryPath = _resolveWindowsDaemonBinary();
-      expect(
-        binaryPath,
-        isNotNull,
-        reason:
-            'Set P2WLAN_DAEMON_BIN or build a Windows release daemon before '
-            'running this integration test.',
-      );
+  test('Windows runs the actual p2wlan-daemon.exe --build-info', () async {
+    final binaryPath = _resolveWindowsDaemonBinary();
+    expect(
+      binaryPath,
+      isNotNull,
+      reason:
+          'Set P2WLAN_DAEMON_BIN or build a Windows release daemon before '
+          'running this integration test.',
+    );
 
-      final probe = await probeDaemonBinary(File(binaryPath!));
+    final probe = await probeDaemonBinary(File(binaryPath!));
 
-      expect(probe.error, isNull, reason: probe.error);
-      expect(probe.failureCode, isNull);
-      expect(probe.identity, isNotNull);
-      expect(probe.identity!.isComplete, isTrue);
-    },
-    skip: !Platform.isWindows,
-  );
+    expect(probe.error, isNull, reason: probe.error);
+    expect(probe.failureCode, isNull);
+    expect(probe.identity, isNotNull);
+    expect(probe.identity!.isComplete, isTrue);
+  }, skip: !Platform.isWindows);
 }
 
 Future<Directory> _createTempRoot() {
