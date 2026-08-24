@@ -223,6 +223,45 @@ void main() {
     },
   );
 
+  test(
+    'directional peer throughput exposes upload and download samples',
+    () async {
+      final fixture = await _loadFixture();
+      final peerId = fixture.peers.first.nodeId;
+      final first = _snapshotWithPeerCounters(
+        fixture,
+        peerId: peerId,
+        bytesSent: 1000,
+        bytesReceived: 2000,
+      );
+      final second = _snapshotWithPeerCounters(
+        fixture,
+        peerId: peerId,
+        bytesSent: 9000,
+        bytesReceived: 14000,
+      );
+      final api = _SwitchingDiagnosticsApi(
+        snapshot: second,
+        snapshots: [first, second],
+      );
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      await stores.statusStore.refresh();
+
+      final rate = stores.statusStore.peerDirectionalTransferRates[peerId];
+      expect(rate, isNotNull);
+      expect(rate!.uploadBytesPerSecond, greaterThan(0));
+      expect(rate.downloadBytesPerSecond, greaterThan(0));
+      expect(
+        stores.statusStore.peerTransferRatesBytesPerSecond[peerId],
+        rate.uploadBytesPerSecond + rate.downloadBytesPerSecond,
+      );
+    },
+  );
+
   test('rejects a lower revision from the same daemon process', () async {
     final fixture = await _loadFixture();
     final current = _snapshotCopy(
@@ -448,6 +487,25 @@ DiagnosticsSnapshot _snapshotCopy(
     ..['peer_snapshot_age_ms'] = 0
     ..['uptime_ms'] = uptimeMs;
   if (peers != null) raw['peers'] = peers;
+  return DiagnosticsSnapshot.fromJson(raw);
+}
+
+DiagnosticsSnapshot _snapshotWithPeerCounters(
+  DiagnosticsSnapshot source, {
+  required String peerId,
+  required int bytesSent,
+  required int bytesReceived,
+}) {
+  final raw = jsonDecode(jsonEncode(source.raw)) as Map<String, dynamic>;
+  final peers = raw['peers'] as List<dynamic>;
+  for (final value in peers) {
+    final peer = value as Map<String, dynamic>;
+    if (peer['node_id'] == peerId) {
+      peer['bytes_sent'] = bytesSent;
+      peer['bytes_received'] = bytesReceived;
+      break;
+    }
+  }
   return DiagnosticsSnapshot.fromJson(raw);
 }
 

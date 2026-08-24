@@ -117,6 +117,7 @@ class StatusStore extends ChangeNotifier {
   DateTime? _speedTestStartedAt;
   var _peerTrafficSamples = <String, _PeerTrafficSample>{};
   var _peerTransferRatesBytesPerSecond = <String, int>{};
+  var _peerDirectionalTransferRates = <String, PeerTransferRate>{};
   // Keep catalog order separate from the live peer snapshot. The daemon may
   // return peers in a different order as paths, latency, or last-seen values
   // change; those are presentation fields and must not make rows jump.
@@ -169,6 +170,13 @@ class StatusStore extends ChangeNotifier {
   /// absent until two successful status samples are available.
   Map<String, int> get peerTransferRatesBytesPerSecond =>
       Map.unmodifiable(_peerTransferRatesBytesPerSecond);
+
+  /// Directional peer throughput sampled from consecutive daemon snapshots.
+  /// `upload` is bytes sent by this node and `download` is bytes received by
+  /// this node. The speed-test dialog uses these same authoritative counters
+  /// for its live chart while the test is running.
+  Map<String, PeerTransferRate> get peerDirectionalTransferRates =>
+      Map.unmodifiable(_peerDirectionalTransferRates);
 
   /// Returns peers with online devices first, ordered by the time they became
   /// online during this app session. Offline devices follow in first-seen
@@ -619,6 +627,7 @@ class StatusStore extends ChangeNotifier {
     _snapshotStale = false;
     _peerTrafficSamples = <String, _PeerTrafficSample>{};
     _peerTransferRatesBytesPerSecond = <String, int>{};
+    _peerDirectionalTransferRates = <String, PeerTransferRate>{};
     _lastPeerTrafficSampleAt = null;
     _staleTimer?.cancel();
     _staleTimer = null;
@@ -647,29 +656,40 @@ class StatusStore extends ChangeNotifier {
     }
     final nextSamples = <String, _PeerTrafficSample>{};
     final nextRates = <String, int>{};
+    final nextDirectionalRates = <String, PeerTransferRate>{};
     for (final peer in snapshot.peers) {
       final nodeId = peer.nodeId.trim();
       if (nodeId.isEmpty) continue;
-      final totalBytes = peer.bytesSent + peer.bytesReceived;
       final previous = _peerTrafficSamples[nodeId];
       if (previous != null) {
         final elapsedMicros = fetchedAt
             .difference(previous.fetchedAt)
             .inMicroseconds;
-        final deltaBytes = totalBytes - previous.totalBytes;
-        if (elapsedMicros > 0 && deltaBytes >= 0) {
-          nextRates[nodeId] =
-              (deltaBytes * Duration.microsecondsPerSecond / elapsedMicros)
+        final sentDelta = peer.bytesSent - previous.bytesSent;
+        final receivedDelta = peer.bytesReceived - previous.bytesReceived;
+        if (elapsedMicros > 0 && sentDelta >= 0 && receivedDelta >= 0) {
+          final uploadBytesPerSecond =
+              (sentDelta * Duration.microsecondsPerSecond / elapsedMicros)
                   .round();
+          final downloadBytesPerSecond =
+              (receivedDelta * Duration.microsecondsPerSecond / elapsedMicros)
+                  .round();
+          nextDirectionalRates[nodeId] = PeerTransferRate(
+            uploadBytesPerSecond: uploadBytesPerSecond,
+            downloadBytesPerSecond: downloadBytesPerSecond,
+          );
+          nextRates[nodeId] = uploadBytesPerSecond + downloadBytesPerSecond;
         }
       }
       nextSamples[nodeId] = _PeerTrafficSample(
-        totalBytes: totalBytes,
+        bytesSent: peer.bytesSent,
+        bytesReceived: peer.bytesReceived,
         fetchedAt: fetchedAt,
       );
     }
     _peerTrafficSamples = nextSamples;
     _peerTransferRatesBytesPerSecond = nextRates;
+    _peerDirectionalTransferRates = nextDirectionalRates;
     _lastPeerTrafficSampleAt = fetchedAt;
   }
 
@@ -933,9 +953,24 @@ class StatusStore extends ChangeNotifier {
   }
 }
 
-class _PeerTrafficSample {
-  const _PeerTrafficSample({required this.totalBytes, required this.fetchedAt});
+class PeerTransferRate {
+  const PeerTransferRate({
+    required this.uploadBytesPerSecond,
+    required this.downloadBytesPerSecond,
+  });
 
-  final int totalBytes;
+  final int uploadBytesPerSecond;
+  final int downloadBytesPerSecond;
+}
+
+class _PeerTrafficSample {
+  const _PeerTrafficSample({
+    required this.bytesSent,
+    required this.bytesReceived,
+    required this.fetchedAt,
+  });
+
+  final int bytesSent;
+  final int bytesReceived;
   final DateTime fetchedAt;
 }

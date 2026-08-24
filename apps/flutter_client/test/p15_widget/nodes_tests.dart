@@ -457,6 +457,13 @@ void _registerNodesTests() {
     );
     expect(find.text('123.4 Mbps'), findsOneWidget);
     expect(find.text('56.7 Mbps'), findsOneWidget);
+    expect(find.byKey(const Key('node-speedtest-chart')), findsOneWidget);
+    expect(
+      tester.getSize(find.byKey(const Key('node-speedtest-chart'))).height,
+      150,
+    );
+    expect(find.text('Download 123.4 Mbps'), findsOneWidget);
+    expect(find.text('Upload 56.7 Mbps'), findsOneWidget);
     expect(find.text('147.1 MB / 67.6 MB'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
