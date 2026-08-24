@@ -762,7 +762,18 @@ void _registerDashboardTests() {
     );
 
     expect(find.text('10.20.0.10'), findsOneWidget);
-    expect(find.byKey(const Key('dashboard-stop-button')), findsOneWidget);
+    final stopButton = find.byKey(const Key('dashboard-stop-button'));
+    expect(stopButton, findsOneWidget);
+    expect(
+      find.descendant(of: stopButton, matching: find.text('Stop P2WLAN')),
+      findsOneWidget,
+    );
+    // The destructive action follows the Virtual IP value, not the network
+    // status header, and remains a discoverable full-label button on phones.
+    expect(
+      tester.getCenter(stopButton).dy,
+      greaterThan(tester.getBottomRight(find.text('Virtual IP address')).dy),
+    );
     // Healthy: status polling is automatic; the hero does not add a refresh.
     expect(find.byKey(const Key('dashboard-refresh-button')), findsNothing);
     expect(tester.takeException(), isNull);

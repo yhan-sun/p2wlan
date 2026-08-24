@@ -45,6 +45,8 @@ class _PreferenceRow extends StatelessWidget {
             children: [
               Text(
                 label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.w600,
@@ -55,6 +57,8 @@ class _PreferenceRow extends StatelessWidget {
                 const SizedBox(height: 2),
                 Text(
                   subtitle!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 12,
                     height: 1.3,
@@ -114,50 +118,13 @@ class _PreferenceRow extends StatelessWidget {
             vertical: AppTokens.space6,
           ),
           child: LayoutBuilder(
-            builder: (context, constraints) {
-              // Keep category summaries and simple controls on a shared
-              // baseline on phones. Only stack when the available content
-              // width is genuinely too small; the previous 460px cutoff made
-              // a normal 390px handset stack every value underneath its label
-              // and left the settings page visually misaligned.
-              if (constraints.maxWidth < 340) {
-                final trailingWidth = constraints.maxWidth < 220
-                    ? constraints.maxWidth
-                    : 220.0;
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    labelContent,
-                    const SizedBox(height: AppTokens.space4),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: SizedBox(
-                        width: hasTrailing
-                            ? trailingWidth
-                            : constraints.maxWidth,
-                        child: Align(
-                          alignment: Alignment.centerRight,
-                          child: trailingContent,
-                        ),
-                      ),
-                    ),
-                  ],
-                );
-              }
-              if (hasTrailing) {
-                return Row(
-                  children: [
-                    Expanded(child: labelContent),
-                    const SizedBox(width: AppTokens.space12),
-                    Flexible(
-                      child: Align(
-                        alignment: Alignment.centerRight,
-                        child: trailingContent,
-                      ),
-                    ),
-                  ],
-                );
-              }
+            builder: (context, _) {
+              // Settings rows are intentionally single-line on every phone
+              // width. The previous narrow-screen branch moved values below
+              // their labels even when the row had enough room, which made
+              // the root list and preference controls look vertically loose.
+              // Flexible children now ellipsize instead of changing row
+              // height, preserving a consistent scan line.
               return Row(
                 children: [
                   Expanded(child: labelContent),

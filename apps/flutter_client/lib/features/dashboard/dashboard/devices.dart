@@ -172,29 +172,41 @@ class _DeviceRow extends StatelessWidget {
                     ),
                   ],
                 );
-                final identity = Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                final identity = Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      peer.displayName,
-                      maxLines: constraints.maxWidth < 520 ? 2 : 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: theme.colorScheme.onSurface,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        height: 1.25,
+                    Flexible(
+                      child: Text(
+                        peer.displayName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: theme.colorScheme.onSurface,
+                          fontSize: constraints.maxWidth < 520 ? 11.5 : 13,
+                          fontWeight: FontWeight.w600,
+                          height: 1.2,
+                        ),
                       ),
                     ),
                     Text(
-                      dash(peer.virtualIp),
+                      ' · ',
                       maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: theme.colorScheme.onSurfaceVariant,
-                        fontSize: 11.5,
-                        height: 1.2,
-                        fontFeatures: AppTokens.tabularFontFeatures,
+                        fontSize: constraints.maxWidth < 520 ? 10.5 : 11.5,
+                      ),
+                    ),
+                    Flexible(
+                      child: Text(
+                        dash(peer.virtualIp),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontSize: constraints.maxWidth < 520 ? 10.5 : 11.5,
+                          height: 1.2,
+                          fontFeatures: AppTokens.tabularFontFeatures,
+                        ),
                       ),
                     ),
                   ],
@@ -209,55 +221,23 @@ class _DeviceRow extends StatelessWidget {
                   children: [
                     _HomeMetricText(
                       value: formatTransferRate(speedBytesPerSecond),
-                      width: constraints.maxWidth < 520 ? 54 : 58,
+                      width: constraints.maxWidth < 520 ? 38 : 58,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
-                    const SizedBox(width: 6),
+                    SizedBox(width: constraints.maxWidth < 520 ? 2 : 6),
                     _HomeMetricText(
                       value: formatLatency(peer.latencyMs),
-                      width: constraints.maxWidth < 520 ? 44 : 50,
+                      width: constraints.maxWidth < 520 ? 38 : 50,
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
-                    const SizedBox(width: 6),
+                    SizedBox(width: constraints.maxWidth < 520 ? 2 : 6),
                     _HomeMetricText(
                       value: statusLabel,
-                      width: constraints.maxWidth < 520 ? 54 : 58,
+                      width: constraints.maxWidth < 520 ? 46 : 58,
                       color: statusColor,
                     ),
                   ],
                 );
-
-                if (constraints.maxWidth < 520) {
-                  // A phone cannot fit a readable name beside three fixed
-                  // metrics. Keep the identity on the first line and move the
-                  // compact metric cluster below it; this also removes the
-                  // unusually large speed/RTT gaps seen on narrow screens.
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          leading,
-                          const SizedBox(width: AppTokens.space10),
-                          Expanded(child: identity),
-                          const SizedBox(width: AppTokens.space8),
-                          chevron,
-                        ],
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.only(
-                          left: 42,
-                          top: AppTokens.space4,
-                        ),
-                        child: Align(
-                          alignment: Alignment.centerRight,
-                          child: metrics,
-                        ),
-                      ),
-                    ],
-                  );
-                }
 
                 return Row(
                   crossAxisAlignment: CrossAxisAlignment.center,
@@ -265,15 +245,14 @@ class _DeviceRow extends StatelessWidget {
                     leading,
                     const SizedBox(width: AppTokens.space10),
                     Expanded(child: identity),
-                    const SizedBox(width: AppTokens.space12),
                     SizedBox(
-                      width: 186,
+                      width: constraints.maxWidth < 520 ? 132 : 186,
                       child: Align(
                         alignment: Alignment.centerRight,
                         child: metrics,
                       ),
                     ),
-                    const SizedBox(width: AppTokens.space8),
+                    SizedBox(width: constraints.maxWidth < 520 ? 4 : 8),
                     chevron,
                   ],
                 );
