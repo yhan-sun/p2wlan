@@ -361,6 +361,59 @@ func TestDeviceCredentialEndpointUpdateRefreshesPresence(t *testing.T) {
 	}
 }
 
+func TestReleaseDevicePresenceMarksOnlyMatchingDeviceOffline(t *testing.T) {
+	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	user, err := db.CreateUser("presence-release@example.com", "hash")
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	device, err := db.CreateDevice(user.ID, "default", "presence-release-key", "device", "linux", "")
+	if err != nil {
+		t.Fatalf("CreateDevice: %v", err)
+	}
+	lastSeen := device.LastSeen
+
+	server := NewServer(nil, nil, db)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/devices/"+device.ID+"/offline", nil)
+	req.SetPathValue("id", device.ID)
+	req = req.WithContext(context.WithValue(req.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  device.ID,
+		UserID:    user.ID,
+		NetworkID: device.NetworkID,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}))
+	recorder := httptest.NewRecorder()
+	server.ReleaseDevicePresence(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	released, err := db.GetDevice(device.ID)
+	if err != nil {
+		t.Fatalf("GetDevice: %v", err)
+	}
+	if released.Online || released.LastSeen != lastSeen {
+		t.Fatalf("release should only clear online: %+v", released)
+	}
+
+	wrongReq := httptest.NewRequest(http.MethodPost, "/api/v1/devices/other/offline", nil)
+	wrongReq.SetPathValue("id", "other")
+	wrongReq = wrongReq.WithContext(context.WithValue(wrongReq.Context(), auth.DeviceClaimsKey, &auth.DeviceClaims{
+		DeviceID:  device.ID,
+		UserID:    user.ID,
+		NetworkID: device.NetworkID,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}))
+	wrongRecorder := httptest.NewRecorder()
+	server.ReleaseDevicePresence(wrongRecorder, wrongReq)
+	if wrongRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("mismatched device credential should be rejected, got %d", wrongRecorder.Code)
+	}
+}
+
 // newEndpointUpdateTestServer sets up a server, user, and device owned by that
 // user, ready to exercise UpdateDeviceEndpoint.
 func newEndpointUpdateTestServer(t *testing.T) (*Server, string, string) {

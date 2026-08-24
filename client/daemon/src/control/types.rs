@@ -796,6 +796,10 @@ enum ControlCommand {
         region: String,
         response_tx: tokio::sync::oneshot::Sender<Result<FetchRelayTicketResponse>>,
     },
-    /// Shutdown.
-    Shutdown,
+    /// Shutdown after best-effort release of the server-side presence lease.
+    Shutdown {
+        /// A bounded graceful-shutdown acknowledgement. The control loop
+        /// sends this after the release request has completed or timed out.
+        response_tx: tokio::sync::oneshot::Sender<()>,
+    },
 }

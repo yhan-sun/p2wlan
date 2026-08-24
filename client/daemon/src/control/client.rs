@@ -697,11 +697,25 @@ impl ControlClient {
 
     /// Shutdown the control client.
     pub async fn shutdown(&self) -> Result<()> {
-        let _ = self.cmd_tx.send(ControlCommand::Shutdown);
+        // Stop independent critical-lane endpoint work first. Otherwise an
+        // in-flight critical heartbeat could race a successful presence
+        // release and immediately revive the lease.
         let _ = self
             .critical_ctrl_tx
             .send(CriticalControlCommand::Shutdown)
             .await;
+
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ControlCommand::Shutdown { response_tx })
+            .is_ok()
+        {
+            // The HTTP release itself is capped at one second. Keep a small
+            // decode/channel margin, but never make teardown depend on the
+            // control plane being reachable.
+            let _ = timeout(Duration::from_millis(1_500), response_rx).await;
+        }
         Ok(())
     }
 

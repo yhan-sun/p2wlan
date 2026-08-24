@@ -125,7 +125,20 @@ match cmd {
                             .await;
                             let _ = response_tx.send(result);
                         }
-                        ControlCommand::Shutdown => {
+                        ControlCommand::Shutdown { response_tx } => {
+                            let release_result = async {
+                                let current_http = http.current()?;
+                                release_presence(&current_http, &base_url, &token, &self_node_id)
+                                    .await
+                            }
+                            .await;
+                            if let Err(err) = release_result {
+                                warn!(
+                                    "Best-effort device presence release failed for {}: {}",
+                                    self_node_id, err
+                                );
+                            }
+                            let _ = response_tx.send(());
                             let _ = event_tx.send(ControlEvent::Disconnected);
                             return;
                         }

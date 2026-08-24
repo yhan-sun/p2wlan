@@ -302,6 +302,35 @@ func (s *Server) UpdateDeviceEndpoint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 
+// ReleaseDevicePresence handles POST /api/v1/devices/{id}/offline.
+// A daemon may release only its own lease; an owning user JWT is retained for
+// legacy clients that have not obtained a device credential yet.
+func (s *Server) ReleaseDevicePresence(w http.ResponseWriter, r *http.Request) {
+	pathDeviceID := strings.TrimSpace(r.PathValue("id"))
+	if pathDeviceID == "" {
+		http.Error(w, `{"error":"missing device id"}`, http.StatusBadRequest)
+		return
+	}
+
+	authorized := false
+	if deviceClaims, err := auth.GetDeviceClaims(r.Context()); err == nil {
+		authorized = pathDeviceID == deviceClaims.DeviceID
+	} else if userClaims, err := auth.GetClaims(r.Context()); err == nil {
+		belongs, err := s.db.DeviceBelongsToUser(pathDeviceID, userClaims.UserID)
+		authorized = err == nil && belongs
+	}
+	if !authorized {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if err := s.db.ReleaseDevicePresence(pathDeviceID); err != nil {
+		http.Error(w, `{"error":"presence release failed"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
 // UpdateDevice handles PATCH /api/v1/devices/{id}.
 func (s *Server) UpdateDevice(w http.ResponseWriter, r *http.Request) {
 	pathDeviceID := strings.TrimSpace(r.PathValue("id"))

@@ -107,4 +107,19 @@ func TestDeviceOnlineTTL(t *testing.T) {
 	if refreshed.Endpoint != "" {
 		t.Fatalf("expected empty endpoint after heartbeat, got %q", refreshed.Endpoint)
 	}
+
+	lastSeenBeforeRelease := refreshed.LastSeen
+	if err := db.ReleaseDevicePresence(dev.ID); err != nil {
+		t.Fatalf("ReleaseDevicePresence failed: %v", err)
+	}
+	released, err := db.GetDevice(dev.ID)
+	if err != nil {
+		t.Fatalf("GetDevice after presence release failed: %v", err)
+	}
+	if released.Online {
+		t.Fatal("presence release should mark the device offline")
+	}
+	if released.LastSeen != lastSeenBeforeRelease {
+		t.Fatalf("presence release must preserve last_seen: got %d want %d", released.LastSeen, lastSeenBeforeRelease)
+	}
 }

@@ -187,7 +187,8 @@ async fn run_control_loop(
                             loop {
                                 tokio::select! {
                                     Some(cmd) = cmd_rx.recv() => {
-                                        if matches!(cmd, ControlCommand::Shutdown) {
+                                        if let ControlCommand::Shutdown { response_tx } = cmd {
+                                            let _ = response_tx.send(());
                                             let _ = event_tx.send(ControlEvent::Disconnected);
                                             return;
                                         }
@@ -216,7 +217,8 @@ async fn run_control_loop(
                         tokio::select! {
                             _ = tokio::time::sleep(delay) => {}
                             Some(cmd) = cmd_rx.recv() => {
-                                if matches!(cmd, ControlCommand::Shutdown) {
+                                if let ControlCommand::Shutdown { response_tx } = cmd {
+                                    let _ = response_tx.send(());
                                     let _ = event_tx.send(ControlEvent::Disconnected);
                                     return;
                                 }
@@ -396,7 +398,8 @@ async fn run_control_loop(
                                 });
                                 tokio::select! {
                                     Some(cmd) = cmd_rx.recv() => {
-                                        if matches!(cmd, ControlCommand::Shutdown) {
+                                        if let ControlCommand::Shutdown { response_tx } = cmd {
+                                            let _ = response_tx.send(());
                                             let _ = event_tx.send(ControlEvent::Disconnected);
                                             return;
                                         }
@@ -510,7 +513,8 @@ async fn run_control_loop(
                                 });
                                 tokio::select! {
                                     Some(cmd) = cmd_rx.recv() => {
-                                        if matches!(cmd, ControlCommand::Shutdown) {
+                                        if let ControlCommand::Shutdown { response_tx } = cmd {
+                                            let _ = response_tx.send(());
                                             let _ = event_tx.send(ControlEvent::Disconnected);
                                             return;
                                         }

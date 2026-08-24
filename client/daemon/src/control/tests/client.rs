@@ -574,6 +574,7 @@ struct MockControlServer {
     registered: Arc<AtomicBool>,
     signal_posts: Arc<Mutex<Vec<String>>>,
     endpoint_posts: Arc<Mutex<Vec<String>>>,
+    presence_releases: Arc<Mutex<Vec<String>>>,
     task: JoinHandle<()>,
 }
 
@@ -643,11 +644,13 @@ impl MockControlServer {
         let registered = Arc::new(AtomicBool::new(false));
         let signal_posts = Arc::new(Mutex::new(Vec::new()));
         let endpoint_posts = Arc::new(Mutex::new(Vec::new()));
+        let presence_releases = Arc::new(Mutex::new(Vec::new()));
         let decide = Arc::new(decide);
         let task = {
             let registered = registered.clone();
             let signal_posts = signal_posts.clone();
             let endpoint_posts = endpoint_posts.clone();
+            let presence_releases = presence_releases.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((mut stream, _)) = listener.accept().await else {
@@ -656,14 +659,20 @@ impl MockControlServer {
                     let registered = registered.clone();
                     let signal_posts = signal_posts.clone();
                     let endpoint_posts = endpoint_posts.clone();
+                    let presence_releases = presence_releases.clone();
                     let decide = decide.clone();
                     tokio::spawn(async move {
                         let Some(request) = read_http_request(&mut stream).await else {
                             return;
                         };
                         let line = request.line.clone();
-                        let kind = if line.starts_with("POST") && line.contains("/api/v1/devices")
+                        let kind = if line.starts_with("POST")
+                            && line.contains("/api/v1/devices/")
+                            && line.contains("/offline")
                         {
+                            presence_releases.lock().unwrap().push(line.clone());
+                            "offline"
+                        } else if line.starts_with("POST") && line.contains("/api/v1/devices") {
                             "register"
                         } else if line.starts_with("GET") && line.contains("/api/v1/signals") {
                             "poll"
@@ -717,6 +726,9 @@ impl MockControlServer {
                                     tokio::time::sleep(Duration::from_secs(120)).await;
                                 }
                             },
+                            "offline" => {
+                                mock_respond(stream, 200, r#"{"success":true}"#).await;
+                            }
                             _ => {}
                         }
                     });
@@ -728,6 +740,7 @@ impl MockControlServer {
             registered,
             signal_posts,
             endpoint_posts,
+            presence_releases,
             task,
         }
     }
@@ -1501,6 +1514,36 @@ async fn critical_endpoint_publish_bypasses_stalled_ordinary_lane() {
 
     drop(client);
     stalled.abort();
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn graceful_shutdown_releases_device_presence_after_registration() {
+    let server = MockControlServer::spawn(|_, _| MockAction::Ok).await;
+    let mut config = test_config();
+    config.control.server_url = format!("http://{}", server.address);
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
+    server.wait_registered().await;
+
+    timeout(Duration::from_secs(2), client.shutdown())
+        .await
+        .expect("graceful shutdown must remain bounded")
+        .expect("shutdown command must be accepted");
+
+    let releases = server.presence_releases.lock().unwrap().clone();
+    assert_eq!(releases.len(), 1, "shutdown must release presence exactly once");
+    assert!(releases[0].contains("/api/v1/devices/node-a/offline"));
+
+    drop(client);
     server.task.abort();
 }
 

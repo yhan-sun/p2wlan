@@ -56,7 +56,7 @@ pub(crate) use http::{
 };
 use http::{
     create_tunnel, fetch_relay_ticket_http, normalize_http_base_url, obtain_device_credential,
-    poll_peers, poll_signals, prepare_signal_payload, register_device,
+    poll_peers, poll_signals, prepare_signal_payload, register_device, release_presence,
     route_aware_control_http_clients, send_prepared_signal, send_signal, update_endpoint,
     RouteAwareControlHttpClient, SignalDeliveryTracker, SignalSigningIdentity,
     SIGNAL_REST_PROTOCOL_VERSION,

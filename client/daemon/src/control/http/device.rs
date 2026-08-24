@@ -136,3 +136,37 @@ pub(super) async fn update_endpoint(
 
     Ok(())
 }
+
+pub(super) async fn release_presence(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    device_id: &str,
+) -> Result<()> {
+    let res = http
+        .post(format!("{base_url}/api/v1/devices/{device_id}/offline"))
+        .timeout(PRESENCE_RELEASE_TIMEOUT)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("presence release request failed: {e}")))?;
+
+    if !res.status().is_success() {
+        return Err(DaemonError::ControlPlane(format!(
+            "presence release returned HTTP {}",
+            res.status()
+        )));
+    }
+
+    let body: EndpointUpdateResponse = res
+        .json()
+        .await
+        .map_err(|e| DaemonError::ControlPlane(format!("presence release decode failed: {e}")))?;
+    if !body.success {
+        return Err(DaemonError::ControlPlane(
+            body.error
+                .unwrap_or_else(|| "presence release failed".to_string()),
+        ));
+    }
+    Ok(())
+}

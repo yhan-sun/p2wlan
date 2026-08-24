@@ -274,8 +274,10 @@ func (db *DB) assignVirtualIP(tx *sql.Tx, networkID string) (string, error) {
 }
 
 // DeviceOnlineTTL is how long a device remains "online" without a last_seen update.
-// Defaults to 90 seconds — a few missed heartbeats of the typical 5–15s poll interval.
-const DeviceOnlineTTL = 90
+// The daemon's default control heartbeat is 5 seconds, so three missed
+// heartbeats converge an abnormal exit to offline without flapping on one
+// delayed request.
+const DeviceOnlineTTL = 15
 
 // ListDevicesByNetwork returns all devices in a network.
 // Devices whose last_seen is older than DeviceOnlineTTL are reported as offline
@@ -333,6 +335,14 @@ func (db *DB) MarkStaleDevicesOffline(ttlSeconds int64) error {
 func (db *DB) UpdateDeviceEndpoint(deviceID, endpoint, natType string, relayRTTMS *int64) error {
 	_, err := db.Exec(`UPDATE devices SET endpoint = ?, nat_type = ?, relay_rtt_ms = ?, last_seen = ?, online = 1 WHERE id = ?`,
 		endpoint, natType, relayRTTMS, time.Now().Unix(), deviceID)
+	return err
+}
+
+// ReleaseDevicePresence marks a device offline without deleting its
+// registration or changing its last real heartbeat. It is used by a graceful
+// daemon shutdown; abnormal exits still converge through DeviceOnlineTTL.
+func (db *DB) ReleaseDevicePresence(deviceID string) error {
+	_, err := db.Exec(`UPDATE devices SET online = 0 WHERE id = ?`, deviceID)
 	return err
 }
 

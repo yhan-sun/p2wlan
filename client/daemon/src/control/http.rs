@@ -34,6 +34,9 @@ pub(super) const SIGNAL_REST_PROTOCOL_VERSION: u8 = 1;
 /// cannot stall the single control loop past the device lease TTL.  Signal
 /// long-polling adds its server wait interval to this budget below.
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Presence release is a shutdown hint, never a reason to hold daemon
+/// teardown. The server TTL remains the fallback for a lost process.
+pub(super) const PRESENCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// A responder answer must not be held behind a wedged HTTP request for most
 /// of its short receive-only key lifetime. Delivery remains ambiguous on
 /// timeout, so the daemon retains staged state for authenticated confirmation.

@@ -571,7 +571,11 @@ impl Daemon {
             .await;
 
         info!("Daemon shutting down");
-        // Explicit cleanup: notify control loop and clean routes without relying on Drop.
+        // Release the control-plane presence lease before P2P/TUN teardown.
+        // The request is best effort and bounded; the server TTL covers
+        // crashes, power loss and network failure.
+        let _ = self.control.shutdown().await;
+        // Explicit cleanup: clean routes without relying on Drop.
         if let Some(udp) = self.udp_transport.read().await.clone() {
             udp.detach_all_dynamic_punch_sockets("daemon_shutdown")
                 .await;
@@ -582,7 +586,6 @@ impl Daemon {
         // socket clone through daemon teardown.
         self.udp_transport_publication.clear_current().await;
         self.request_shutdown();
-        let _ = self.control.shutdown().await;
         self.task_manager.shutdown_all(Duration::from_secs(5)).await;
         self.route_manager.cleanup();
         Ok(())
