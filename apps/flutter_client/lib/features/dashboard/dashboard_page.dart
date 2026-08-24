@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -91,6 +90,7 @@ class DashboardPage extends StatelessWidget {
           healthError: statusStore.lastHealthError,
           error: statusStore.lastError,
           snapshot: snapshot,
+          startupCatalogSettling: statusStore.startupCatalogSettling,
         );
         final manualCommand = settingsStore.settings.authToken.trim().isEmpty
             ? statusStore.lastDaemonManualCommand

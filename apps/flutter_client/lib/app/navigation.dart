@@ -53,6 +53,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
   /// list resolves the newest peer and opens its own full detail surface.
   String? _pendingPeerId;
 
+  /// Home opens a peer through the canonical Devices detail flow. Remember
+  /// the originating section so dismissing that detail returns to Home rather
+  /// than leaving the shell on the intermediate Devices section.
+  P2WlanSection? _peerDetailsReturnSection;
+
   /// Last primary (bottom-bar) section, kept so the mobile bar keeps a valid
   /// selection while a secondary section (troubleshooting) is open — no fake
   /// fourth destination, never an out-of-range index.
@@ -220,6 +225,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
         capabilities: widget.capabilities,
         initialPeerId: _pendingPeerId,
         onInitialPeerOpened: _consumePendingPeer,
+        onPeerDetailsClosed: _handlePeerDetailsClosed,
       ),
       P2WlanSection.troubleshooting => DiagnosticsPage(
         settingsStore: widget.settingsStore,
@@ -267,6 +273,10 @@ class _P2WlanShellState extends State<P2WlanShell> {
 
   void _doSelect(P2WlanSection section) {
     setState(() {
+      if (section != P2WlanSection.devices) {
+        _pendingPeerId = null;
+        _peerDetailsReturnSection = null;
+      }
       _section = section;
       if (P2WlanSection.mobilePrimary.contains(section)) {
         _lastPrimarySection = section;
@@ -278,6 +288,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
     if (!mounted) return;
     setState(() {
       _pendingPeerId = peer.nodeId;
+      _peerDetailsReturnSection = P2WlanSection.home;
       _section = P2WlanSection.devices;
       _lastPrimarySection = P2WlanSection.devices;
     });
@@ -286,6 +297,21 @@ class _P2WlanShellState extends State<P2WlanShell> {
   void _consumePendingPeer() {
     if (!mounted || _pendingPeerId == null) return;
     setState(() => _pendingPeerId = null);
+  }
+
+  void _handlePeerDetailsClosed() {
+    final returnSection = _peerDetailsReturnSection;
+    if (!mounted || returnSection == null) return;
+
+    // A detail dialog/route blocks the underlying shell, but keep this guard
+    // so a future non-modal surface cannot unexpectedly change the section
+    // after the user has navigated elsewhere.
+    if (_section != P2WlanSection.devices) {
+      _peerDetailsReturnSection = null;
+      return;
+    }
+    _peerDetailsReturnSection = null;
+    _doSelect(returnSection);
   }
 
   void _handleSystemBack() {

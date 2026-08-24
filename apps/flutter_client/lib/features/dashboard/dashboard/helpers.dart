@@ -106,7 +106,7 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
   );
 }
 
-/// Connected peers for the home overview in the shared first-seen order.
+/// Connected peers for the home overview in the shared online-first order.
 /// Offline devices belong in the Devices section, not this compact Home
 /// preview. The result is capped to keep the page quiet without allowing a
 /// live path/latency update to reshuffle the visible rows.
@@ -156,12 +156,14 @@ String? _dashboardIssueMessage({
   required String? healthError,
   required String? error,
   required DiagnosticsSnapshot? snapshot,
+  required bool startupCatalogSettling,
 }) {
   // Stopped / offline / stale are first-class states handled by the hero
   // itself; the banner exists only for real network problems.
   if (!daemonAvailable) return null;
   if (snapshotStale) return null;
   if (!statusReachable && statusError != null) {
+    if (startupCatalogSettling) return null;
     return strings.statusMessage(statusError) ?? statusError;
   }
   if (!healthReachable && healthError != null) {

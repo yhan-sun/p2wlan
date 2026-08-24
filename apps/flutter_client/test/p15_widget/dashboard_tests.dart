@@ -36,6 +36,36 @@ void _registerDashboardTests() {
     expect(find.text('Network components'), findsNothing);
   });
 
+  testWidgets('macOS start does not show a repeated authorization explainer', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    try {
+      final stores = (await tester.runAsync(
+        () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
+      ))!;
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+
+      await tester.tap(find.byKey(const Key('dashboard-start-button')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('macOS administrator access required'), findsNothing);
+      expect(find.text('Continue'), findsNothing);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
   testWidgets(
     'Home keeps initial and periodic status detection in the background',
     (tester) async {
@@ -146,10 +176,11 @@ void _registerDashboardTests() {
     expect(find.text('Virtual IP address'), findsOneWidget);
     expect(find.textContaining('Network ID'), findsNothing);
 
-    // Key metrics from peer state: online / direct / relay.
+    // Key metrics from peer state plus the local NAT profile.
     expect(_heroCount(tester, 'dashboard-count-online'), '2');
     expect(_heroCount(tester, 'dashboard-count-direct'), '1');
     expect(_heroCount(tester, 'dashboard-count-relay'), '1');
+    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted Cone');
 
     // Device preview section is titled "Devices" and contains connected peers.
     expect(find.text('Devices'), findsOneWidget);
@@ -172,6 +203,40 @@ void _registerDashboardTests() {
     // Healthy → no issue CTA.
     expect(find.text('Check issues'), findsNothing);
   });
+
+  testWidgets(
+    'Home shows a conservative NAT subtype when filtering is unavailable',
+    (tester) async {
+      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+      raw['nat_profile'] = {
+        'mapping_behavior': 'endpoint_independent',
+        'filtering_behavior': 'unknown',
+        'public_endpoint': '198.51.100.20:62000',
+        'confidence': 90,
+      };
+      final snapshot = DiagnosticsSnapshot.fromJson(raw);
+      final stores = (await tester.runAsync(
+        () => _makeStores(
+          api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+        ),
+      ))!;
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+
+      expect(_heroCount(tester, 'dashboard-nat-type'), 'Port-Restricted Cone');
+      expect(find.text('Endpoint independent'), findsNothing);
+    },
+  );
 
   testWidgets('Home distinguishes API reachability from online lease health', (
     tester,
@@ -317,7 +382,6 @@ void _registerDashboardTests() {
 
     for (final technical in [
       'UDP',
-      'Network type',
       'Request duration',
       'Last refresh',
       'Snapshot',
@@ -440,6 +504,55 @@ void _registerDashboardTests() {
     expect(find.text('probe RTT 8 ms'), findsNothing);
     expect(find.text('8 ms'), findsNothing);
   });
+
+  testWidgets(
+    'Home keeps online order and moves a reconnected peer to the end',
+    (tester) async {
+      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final initial = _snapshotWithPeers(base, _fourPeerFixtures());
+      final api = _FakeDiagnosticsApi(health: true, snapshot: initial);
+      final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+
+      double rowTop(String nodeId) =>
+          tester.getTopLeft(find.byKey(Key('home-device-row-$nodeId'))).dy;
+
+      expect(rowTop('node-direct'), lessThan(rowTop('node-relay')));
+      expect(rowTop('node-relay'), lessThan(rowTop('node-probing')));
+
+      final offlinePeers = _fourPeerFixtures();
+      final directOffline = offlinePeers.firstWhere(
+        (peer) => peer['node_id'] == 'node-direct',
+      );
+      directOffline
+        ..['online'] = false
+        ..['state'] = 'unknown'
+        ..['active_path'] = null
+        ..['current_path_selection'] = null;
+      api.snapshot = _snapshotWithPeers(base, offlinePeers);
+      await stores.statusStore.refresh();
+      await tester.pump();
+
+      final restoredPeers = _fourPeerFixtures();
+      api.snapshot = _snapshotWithPeers(base, restoredPeers);
+      await stores.statusStore.refresh();
+      await tester.pump();
+
+      expect(rowTop('node-relay'), lessThan(rowTop('node-probing')));
+      expect(rowTop('node-probing'), lessThan(rowTop('node-direct')));
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('Device rows order speed, latency, then connection path', (
     tester,
@@ -664,15 +777,9 @@ void _registerDashboardTests() {
     await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
-    // The unified detail flow leaves the shell on Devices; return Home before
-    // checking the separate "View all" navigation affordance.
-    await tester.tap(
-      find.descendant(
-        of: find.byType(DesktopSidebar),
-        matching: find.text('Home'),
-      ),
-    );
-    await tester.pumpAndSettle();
+    // A detail opened from Home returns to Home after it is dismissed.
+    expect(find.byType(DashboardPage), findsOneWidget);
+    expect(find.byType(NodesPage), findsNothing);
     await tester.tap(find.byKey(const Key('home-view-all-devices')));
     await tester.pumpAndSettle();
 

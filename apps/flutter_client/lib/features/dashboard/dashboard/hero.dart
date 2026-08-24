@@ -175,7 +175,13 @@ class _NetworkHero extends StatelessWidget {
                   children: [
                     Expanded(child: virtualIp),
                     const SizedBox(width: AppTokens.space24),
-                    SizedBox(width: 300, child: _HomeMetrics(counts: counts)),
+                    SizedBox(
+                      width: 360,
+                      child: _HomeMetrics(
+                        counts: counts,
+                        natProfile: snapshot!.natProfile,
+                      ),
+                    ),
                   ],
                 );
               }
@@ -189,7 +195,10 @@ class _NetworkHero extends StatelessWidget {
                     const _StaleNote(),
                   ] else ...[
                     const SizedBox(height: AppTokens.space16),
-                    _HomeMetrics(counts: counts),
+                    _HomeMetrics(
+                      counts: counts,
+                      natProfile: snapshot!.natProfile,
+                    ),
                   ],
                 ],
               );
@@ -252,29 +261,10 @@ class _NetworkHero extends StatelessWidget {
   }
 
   Future<void> _handleStart(BuildContext context) async {
-    if (defaultTargetPlatform == TargetPlatform.macOS) {
-      final strings = AppStringsScope.of(context);
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) {
-          return AlertDialog(
-            title: Text(strings.macosAuthorizationTitle),
-            content: Text(strings.macosAuthorizationBody),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(false),
-                child: Text(strings.cancel),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.of(dialogContext).pop(true),
-                child: Text(strings.continueAction),
-              ),
-            ],
-          );
-        },
-      );
-      if (confirmed != true) return;
-    }
+    // macOS shows its password field only when the encrypted local
+    // administrator credential is missing or no longer valid. Do not add a
+    // second explanatory dialog here: after the first successful entry,
+    // starting the daemon should be a single click with no repeated prompt.
     await onStartDaemon();
   }
 }
@@ -476,16 +466,29 @@ class _StaleNote extends StatelessWidget {
   }
 }
 
-/// Online / Direct / Relay in one compact statistics surface.
+/// Online / Direct / Relay / NAT in one compact statistics surface.
 class _HomeMetrics extends StatelessWidget {
-  const _HomeMetrics({required this.counts});
+  const _HomeMetrics({required this.counts, required this.natProfile});
 
   final _PeerCounts counts;
+  final NatProfileSnapshot? natProfile;
 
   @override
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final colors = P2WlanColors.of(context);
+    final exactNatType = natProfile?.traversalType;
+    final natType = natProfile?.displayTraversalType;
+    final natValue = natProfile == null
+        ? '—'
+        : strings.natTraversalTypeCompactLabel(natType!);
+    final natTooltip = natProfile == null
+        ? strings.natDetectionUnavailable
+        : natProfile!.displayTypeIsConservativeFallback
+        ? strings.natTypeConservativeFallbackDetail
+        : exactNatType == NatTraversalType.unknown
+        ? strings.natTypeDetectionInProgressDetail
+        : strings.natTraversalTypeLabel(natType!);
     return Container(
       padding: const EdgeInsets.symmetric(
         horizontal: AppTokens.space8,
@@ -500,19 +503,26 @@ class _HomeMetrics extends StatelessWidget {
         children: [
           _MetricCell(
             key: const Key('dashboard-count-online'),
-            value: counts.online,
+            value: '${counts.online}',
             label: strings.onlineDevices,
           ),
           _MetricDivider(color: colors.border),
           _MetricCell(
+            key: const Key('dashboard-nat-type'),
+            value: natValue,
+            label: strings.natType,
+            tooltip: natTooltip,
+          ),
+          _MetricDivider(color: colors.border),
+          _MetricCell(
             key: const Key('dashboard-count-direct'),
-            value: counts.direct,
+            value: '${counts.direct}',
             label: strings.direct,
           ),
           _MetricDivider(color: colors.border),
           _MetricCell(
             key: const Key('dashboard-count-relay'),
-            value: counts.relay,
+            value: '${counts.relay}',
             label: strings.relay,
           ),
         ],
@@ -533,42 +543,59 @@ class _MetricDivider extends StatelessWidget {
 }
 
 class _MetricCell extends StatelessWidget {
-  const _MetricCell({super.key, required this.value, required this.label});
+  const _MetricCell({
+    super.key,
+    required this.value,
+    required this.label,
+    this.tooltip,
+  });
 
-  final int value;
+  final String value;
   final String label;
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final content = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          height: 22,
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              value,
+              maxLines: 1,
+              style: TextStyle(
+                color: theme.colorScheme.onSurface,
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                height: 1.1,
+                fontFeatures: AppTokens.tabularFontFeatures,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            height: 1.2,
+          ),
+        ),
+      ],
+    );
     return Expanded(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            '$value',
-            style: TextStyle(
-              color: theme.colorScheme.onSurface,
-              fontSize: 20,
-              fontWeight: FontWeight.w700,
-              height: 1.1,
-              fontFeatures: AppTokens.tabularFontFeatures,
-            ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              height: 1.2,
-            ),
-          ),
-        ],
-      ),
+      child: tooltip == null
+          ? content
+          : Tooltip(message: tooltip!, child: content),
     );
   }
 }

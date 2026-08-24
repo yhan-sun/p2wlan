@@ -1,5 +1,10 @@
 use futures_util::future::join_all;
 
+/// RFC 5780 CHANGE-REQUEST is best-effort: many public STUN services do not
+/// implement it. Keep the live probe bounded so it cannot hold up the regular
+/// candidate refresh when a server silently drops the request.
+const LIVE_FILTERING_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
 impl UdpTransport {
     /// Gather the first usable candidate set while the normal inbound reader
     /// owns UDP receives.
@@ -26,6 +31,7 @@ impl UdpTransport {
         self.gather_candidate_report_live_parallel_with_timeout(
             stun_servers,
             stun_timeout.min(crate::DIRECT_STARTUP_STUN_TIMEOUT),
+            false,
         )
         .await
     }
@@ -40,7 +46,7 @@ impl UdpTransport {
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
     ) -> Result<CandidateGatherReport> {
-        self.gather_candidate_report_live_parallel_with_timeout(stun_servers, stun_timeout)
+        self.gather_candidate_report_live_parallel_with_timeout(stun_servers, stun_timeout, true)
             .await
     }
 
@@ -48,6 +54,7 @@ impl UdpTransport {
         &self,
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
+        probe_filtering: bool,
     ) -> Result<CandidateGatherReport> {
         let local_addr = self.local_addr()?;
         let primary_servers = stun_servers
@@ -113,8 +120,19 @@ impl UdpTransport {
                     pool_report.candidates,
                     socket_index,
                 )
-                    .await;
+                .await;
             }
+        }
+
+        // The live gather uses the reader-owned STUN waiter registry instead
+        // of reading the UDP socket directly. That means it cannot reuse the
+        // ICE module's standalone active-probe helper; run the same bounded
+        // CHANGE-REQUEST checks through this transport after the normal
+        // observations have produced a profile. Startup deliberately skips
+        // this extra round and the full background refresh fills it in.
+        if probe_filtering {
+            self.probe_live_filtering_behavior(&mut report, &stun_servers, stun_timeout)
+                .await;
         }
 
         // This must happen after pool gathering.  A primary STUN failure is
@@ -129,6 +147,68 @@ impl UdpTransport {
                 .retain(|candidate| candidate.source != p2pnet_nat::CandidateSource::Predicted);
         }
         Ok(report)
+    }
+
+    async fn probe_live_filtering_behavior(
+        &self,
+        report: &mut CandidateGatherReport,
+        stun_servers: &[SocketAddr],
+        stun_timeout: Duration,
+    ) {
+        if report.nat_profile.udp_blocked
+            || report.nat_profile.mapping_behavior
+                != MappingBehavior::EndpointIndependent
+            || report.nat_profile.filtering_behavior != FilteringBehavior::Unknown
+        {
+            return;
+        }
+
+        let Some(server) = report.nat_profile.observations.iter().find_map(|observation| {
+            let server = observation.server.parse::<SocketAddr>().ok()?;
+            (observation.error.is_none()
+                && observation.mapped_address.is_some()
+                && stun_servers.contains(&server))
+            .then_some(server)
+        }) else {
+            return;
+        };
+        let timeout = stun_timeout_for_live_filtering_probe(stun_timeout);
+
+        if let Ok(response) = self
+            .query_stun_live_response(&self.socket, server, timeout, true, true)
+            .await
+        {
+            if let Some(filtering) = classify_live_filtering_response(server, response.source) {
+                report.nat_profile.filtering_behavior = filtering;
+                return;
+            }
+        }
+
+        if let Ok(response) = self
+            .query_stun_live_response(&self.socket, server, timeout, false, true)
+            .await
+        {
+            if response.source.ip() == server.ip() && response.source != server {
+                report.nat_profile.filtering_behavior = FilteringBehavior::AddressDependent;
+            }
+        }
+    }
+}
+
+fn stun_timeout_for_live_filtering_probe(timeout: Duration) -> Duration {
+    timeout.min(LIVE_FILTERING_PROBE_TIMEOUT).max(Duration::from_millis(50))
+}
+
+fn classify_live_filtering_response(
+    server: SocketAddr,
+    response_source: SocketAddr,
+) -> Option<FilteringBehavior> {
+    if response_source.ip() != server.ip() {
+        Some(FilteringBehavior::EndpointIndependent)
+    } else if response_source != server {
+        Some(FilteringBehavior::AddressDependent)
+    } else {
+        None
     }
 }
 

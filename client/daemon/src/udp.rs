@@ -16,9 +16,9 @@ use p2pnet_nat::{
     build_authenticated_punch_ack, build_authenticated_punch_packet_with_nomination,
     build_punch_ack, build_punch_packet, build_punch_packet_with_nonce,
     candidate_report_from_observations, decode_authenticated_punch_packet, decode_punch_packet,
-    gather_candidate_report, peek_authenticated_punch_identity, CandidateGatherReport, IceConfig,
-    MappingBehavior, PunchPacketKind, StunAttribute, StunClient, StunMessage, StunObservation,
-    BINDING_RESPONSE, MAGIC_COOKIE,
+    gather_candidate_report, peek_authenticated_punch_identity, CandidateGatherReport,
+    FilteringBehavior, IceConfig, MappingBehavior, PunchPacketKind, StunAttribute, StunClient,
+    StunMessage, StunObservation, BINDING_RESPONSE, MAGIC_COOKIE,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};

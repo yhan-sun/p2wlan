@@ -67,7 +67,7 @@ void main() {
   });
 
   test(
-    'authorizes sensitive GETs, leaves health public, and retries one 401',
+    'authorizes sensitive GETs and retries a startup 401 with a fresh token',
     () async {
       final fixture = await File(
         '../../contracts/fixtures/status.json',
@@ -75,6 +75,7 @@ void main() {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(() => server.close(force: true));
       var statusRequests = 0;
+      var tokenReady = false;
       final headers = <String?>[];
       server.listen((request) async {
         if (request.uri.path == '/health') {
@@ -93,6 +94,7 @@ void main() {
           statusRequests++;
           headers.add(request.headers.value(HttpHeaders.authorizationHeader));
           if (statusRequests == 1) {
+            tokenReady = true;
             request.response.statusCode = HttpStatus.unauthorized;
             await request.response.close();
             return;
@@ -106,7 +108,7 @@ void main() {
       });
 
       final api = DiagnosticsApi(
-        authTokenReader: () async => 'diag-test-token',
+        authTokenReader: () async => tokenReady ? 'diag-test-token' : null,
       );
       addTearDown(api.close);
       final url = 'http://127.0.0.1:${server.port}/status';
@@ -115,7 +117,7 @@ void main() {
       final status = await api.fetchStatus(url);
       expect(status.nodeId, 'node-a');
       expect(statusRequests, 2, reason: 'one daemon-session retry is allowed');
-      expect(headers, ['Bearer diag-test-token', 'Bearer diag-test-token']);
+      expect(headers, [null, 'Bearer diag-test-token']);
     },
   );
 

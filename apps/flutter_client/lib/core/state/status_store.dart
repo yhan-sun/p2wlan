@@ -93,6 +93,7 @@ class StatusStore extends ChangeNotifier {
   var _appInForeground = true;
   var _snapshotStale = false;
   var _statusSnapshotTimedOut = false;
+  var _startupCatalogSettleDepth = 0;
   var _refreshPending = false;
   var _refreshGeneration = 0;
   Future<void>? _refreshFuture;
@@ -116,11 +117,19 @@ class StatusStore extends ChangeNotifier {
   DateTime? _speedTestStartedAt;
   var _peerTrafficSamples = <String, _PeerTrafficSample>{};
   var _peerTransferRatesBytesPerSecond = <String, int>{};
+  var _peerDirectionalTransferRates = <String, PeerTransferRate>{};
   // Keep catalog order separate from the live peer snapshot. The daemon may
   // return peers in a different order as paths, latency, or last-seen values
   // change; those are presentation fields and must not make rows jump.
   final _peerOrder = <String, int>{};
   var _nextPeerOrder = 0;
+  // Online order is a separate monotonic sequence. A peer receives a new
+  // online position only when it transitions from offline/missing to online;
+  // this moves a reconnected peer behind peers that stayed online, while
+  // preserving first-seen order for the offline section.
+  final _peerOnlineState = <String, bool>{};
+  final _peerOnlineOrder = <String, int>{};
+  var _nextPeerOnlineOrder = 0;
   late String _lastDiagnosticsUrl;
 
   DiagnosticsSnapshot? get snapshot => _snapshot;
@@ -136,6 +145,12 @@ class StatusStore extends ChangeNotifier {
   bool get appInForeground => _appInForeground;
   bool get snapshotStale => _snapshotStale;
   bool get statusSnapshotTimedOut => _statusSnapshotTimedOut;
+
+  /// True while the initial catalog is converging after app/daemon startup.
+  /// The Home page uses this to keep a transient status-auth race out of the
+  /// user-facing issue banner; the underlying error remains available to
+  /// diagnostics once settling finishes.
+  bool get startupCatalogSettling => _startupCatalogSettleDepth > 0;
   String? get lastError => _lastError;
   String? get lastHealthError => _lastHealthError;
   String? get lastStatusError => _lastStatusError;
@@ -156,7 +171,17 @@ class StatusStore extends ChangeNotifier {
   Map<String, int> get peerTransferRatesBytesPerSecond =>
       Map.unmodifiable(_peerTransferRatesBytesPerSecond);
 
-  /// Returns peers in first-seen order and appends newly discovered peers.
+  /// Directional peer throughput sampled from consecutive daemon snapshots.
+  /// `upload` is bytes sent by this node and `download` is bytes received by
+  /// this node. The speed-test dialog uses these same authoritative counters
+  /// for its live chart while the test is running.
+  Map<String, PeerTransferRate> get peerDirectionalTransferRates =>
+      Map.unmodifiable(_peerDirectionalTransferRates);
+
+  /// Returns peers with online devices first, ordered by the time they became
+  /// online during this app session. Offline devices follow in first-seen
+  /// catalog order. A peer that goes offline and later returns receives a new
+  /// online sequence and moves to the end of the online group.
   ///
   /// The returned list is a fresh list and is safe for a view to filter or
   /// sort explicitly. Repeated status/metrics refreshes only replace the
@@ -172,14 +197,70 @@ class StatusStore extends ChangeNotifier {
       // duplicate entries for the same virtual IP/node.
       byKey[key] = peer;
     }
+    _recordPeerPresence(byKey.values);
     final ordered = byKey.values.toList();
-    ordered.sort(
-      (left, right) => _peerOrder[_peerOrderKey(left)]!.compareTo(
-        _peerOrder[_peerOrderKey(right)]!,
-      ),
-    );
+    ordered.sort(_comparePeerPresentationOrder);
     return ordered;
   }
+
+  /// Records lifecycle transitions from a complete status snapshot. This is
+  /// called at refresh time (not only while a page is mounted), so a device
+  /// that disappears and reappears is still moved to the end of the online
+  /// group even when the Devices page was not visible during the transition.
+  void recordPeerPresence(Iterable<PeerSnapshot> peers) {
+    final byKey = <String, PeerSnapshot>{};
+    for (final peer in peers) {
+      byKey[_peerOrderKey(peer)] = peer;
+    }
+    _recordPeerPresence(byKey.values, markMissingOffline: true);
+  }
+
+  void _recordPeerPresence(
+    Iterable<PeerSnapshot> peers, {
+    bool markMissingOffline = false,
+  }) {
+    final currentKeys = <String>{};
+    for (final peer in peers) {
+      final key = _peerOrderKey(peer);
+      currentKeys.add(key);
+      _peerOrder.putIfAbsent(key, () => _nextPeerOrder++);
+      final online = _peerIsOnline(peer);
+      final wasOnline = _peerOnlineState[key];
+      if (online && wasOnline != true) {
+        _peerOnlineOrder[key] = _nextPeerOnlineOrder++;
+      } else if (online && !_peerOnlineOrder.containsKey(key)) {
+        // Defensive fallback for callers that restore a catalog without its
+        // lifecycle map (for example, a hot-reload or an older test seam).
+        _peerOnlineOrder[key] = _nextPeerOnlineOrder++;
+      }
+      _peerOnlineState[key] = online;
+    }
+    if (markMissingOffline) {
+      for (final key in _peerOnlineState.keys.toList()) {
+        if (!currentKeys.contains(key)) _peerOnlineState[key] = false;
+      }
+    }
+  }
+
+  int _comparePeerPresentationOrder(PeerSnapshot left, PeerSnapshot right) {
+    final leftOnline = _peerIsOnline(left);
+    final rightOnline = _peerIsOnline(right);
+    if (leftOnline != rightOnline) return leftOnline ? -1 : 1;
+    if (leftOnline) {
+      final byOnlineOrder =
+          (_peerOnlineOrder[_peerOrderKey(left)] ?? _nextPeerOnlineOrder)
+              .compareTo(
+                _peerOnlineOrder[_peerOrderKey(right)] ?? _nextPeerOnlineOrder,
+              );
+      if (byOnlineOrder != 0) return byOnlineOrder;
+    }
+    return _peerOrder[_peerOrderKey(left)]!.compareTo(
+      _peerOrder[_peerOrderKey(right)]!,
+    );
+  }
+
+  static bool _peerIsOnline(PeerSnapshot peer) =>
+      peer.online && peer.path != 'offline';
 
   static String _peerOrderKey(PeerSnapshot peer) {
     final nodeId = peer.nodeId.trim();
@@ -475,6 +556,7 @@ class StatusStore extends ChangeNotifier {
           return;
         }
         _updatePeerTrafficRates(snapshot, fetchedAt, throttle: throttleMetrics);
+        recordPeerPresence(snapshot.peers);
         _snapshot = snapshot;
         if (_shouldVerifyRoutes(fetchedAt)) {
           try {
@@ -545,6 +627,7 @@ class StatusStore extends ChangeNotifier {
     _snapshotStale = false;
     _peerTrafficSamples = <String, _PeerTrafficSample>{};
     _peerTransferRatesBytesPerSecond = <String, int>{};
+    _peerDirectionalTransferRates = <String, PeerTransferRate>{};
     _lastPeerTrafficSampleAt = null;
     _staleTimer?.cancel();
     _staleTimer = null;
@@ -573,29 +656,40 @@ class StatusStore extends ChangeNotifier {
     }
     final nextSamples = <String, _PeerTrafficSample>{};
     final nextRates = <String, int>{};
+    final nextDirectionalRates = <String, PeerTransferRate>{};
     for (final peer in snapshot.peers) {
       final nodeId = peer.nodeId.trim();
       if (nodeId.isEmpty) continue;
-      final totalBytes = peer.bytesSent + peer.bytesReceived;
       final previous = _peerTrafficSamples[nodeId];
       if (previous != null) {
         final elapsedMicros = fetchedAt
             .difference(previous.fetchedAt)
             .inMicroseconds;
-        final deltaBytes = totalBytes - previous.totalBytes;
-        if (elapsedMicros > 0 && deltaBytes >= 0) {
-          nextRates[nodeId] =
-              (deltaBytes * Duration.microsecondsPerSecond / elapsedMicros)
+        final sentDelta = peer.bytesSent - previous.bytesSent;
+        final receivedDelta = peer.bytesReceived - previous.bytesReceived;
+        if (elapsedMicros > 0 && sentDelta >= 0 && receivedDelta >= 0) {
+          final uploadBytesPerSecond =
+              (sentDelta * Duration.microsecondsPerSecond / elapsedMicros)
                   .round();
+          final downloadBytesPerSecond =
+              (receivedDelta * Duration.microsecondsPerSecond / elapsedMicros)
+                  .round();
+          nextDirectionalRates[nodeId] = PeerTransferRate(
+            uploadBytesPerSecond: uploadBytesPerSecond,
+            downloadBytesPerSecond: downloadBytesPerSecond,
+          );
+          nextRates[nodeId] = uploadBytesPerSecond + downloadBytesPerSecond;
         }
       }
       nextSamples[nodeId] = _PeerTrafficSample(
-        totalBytes: totalBytes,
+        bytesSent: peer.bytesSent,
+        bytesReceived: peer.bytesReceived,
         fetchedAt: fetchedAt,
       );
     }
     _peerTrafficSamples = nextSamples;
     _peerTransferRatesBytesPerSecond = nextRates;
+    _peerDirectionalTransferRates = nextDirectionalRates;
     _lastPeerTrafficSampleAt = fetchedAt;
   }
 
@@ -644,42 +738,63 @@ class StatusStore extends ChangeNotifier {
     bool skipInitialRefresh = false,
     bool silent = false,
   }) async {
-    if (!skipInitialRefresh) {
-      await refresh(silent: silent);
+    // A daemon can answer public /health before its per-process diagnostics
+    // token is visible to the client. Keep the initial status-auth race out
+    // of Home while the same background refresh loop retries it. Do not mask
+    // errors during ordinary refreshes once a snapshot has been established.
+    final maskStartupErrors = _snapshot == null;
+    if (maskStartupErrors) _beginStartupCatalogSettling();
+    try {
+      if (!skipInitialRefresh) {
+        await refresh(silent: silent);
+      }
+      if (!_shouldSettlePeerCatalog()) return;
+
+      final deadline = DateTime.now().add(startupCatalogRefreshTimeout);
+      var refreshCount = 1;
+      var stableCatalogCount = 0;
+      var previousSignature = _peerCatalogSignature(_snapshot);
+      while (refreshCount < _startupCatalogMaxRefreshes &&
+          DateTime.now().isBefore(deadline)) {
+        if (startupCatalogRefreshInterval > Duration.zero) {
+          await Future<void>.delayed(startupCatalogRefreshInterval);
+        } else {
+          await Future<void>.delayed(Duration.zero);
+        }
+
+        await refresh(silent: silent);
+        refreshCount += 1;
+
+        final currentSnapshot = _snapshot;
+        final currentSignature = _peerCatalogSignature(currentSnapshot);
+        if (currentSignature == previousSignature) {
+          stableCatalogCount += 1;
+        } else {
+          stableCatalogCount = 0;
+        }
+        previousSignature = currentSignature;
+
+        if (!_shouldSettlePeerCatalog()) break;
+        if (currentSnapshot?.health.controlConnected == true &&
+            refreshCount >= _startupCatalogMinRefreshes &&
+            stableCatalogCount >= 1) {
+          break;
+        }
+      }
+    } finally {
+      if (maskStartupErrors) _endStartupCatalogSettling();
     }
-    if (!_shouldSettlePeerCatalog()) return;
+  }
 
-    final deadline = DateTime.now().add(startupCatalogRefreshTimeout);
-    var refreshCount = 1;
-    var stableCatalogCount = 0;
-    var previousSignature = _peerCatalogSignature(_snapshot);
-    while (refreshCount < _startupCatalogMaxRefreshes &&
-        DateTime.now().isBefore(deadline)) {
-      if (startupCatalogRefreshInterval > Duration.zero) {
-        await Future<void>.delayed(startupCatalogRefreshInterval);
-      } else {
-        await Future<void>.delayed(Duration.zero);
-      }
+  void _beginStartupCatalogSettling() {
+    _startupCatalogSettleDepth += 1;
+    if (_startupCatalogSettleDepth == 1) notifyListeners();
+  }
 
-      await refresh(silent: silent);
-      refreshCount += 1;
-
-      final currentSnapshot = _snapshot;
-      final currentSignature = _peerCatalogSignature(currentSnapshot);
-      if (currentSignature == previousSignature) {
-        stableCatalogCount += 1;
-      } else {
-        stableCatalogCount = 0;
-      }
-      previousSignature = currentSignature;
-
-      if (!_shouldSettlePeerCatalog()) break;
-      if (currentSnapshot?.health.controlConnected == true &&
-          refreshCount >= _startupCatalogMinRefreshes &&
-          stableCatalogCount >= 1) {
-        break;
-      }
-    }
+  void _endStartupCatalogSettling() {
+    if (_startupCatalogSettleDepth == 0) return;
+    _startupCatalogSettleDepth -= 1;
+    if (_startupCatalogSettleDepth == 0) notifyListeners();
   }
 
   Future<DaemonCommandResult> startDaemon() async {
@@ -838,9 +953,24 @@ class StatusStore extends ChangeNotifier {
   }
 }
 
-class _PeerTrafficSample {
-  const _PeerTrafficSample({required this.totalBytes, required this.fetchedAt});
+class PeerTransferRate {
+  const PeerTransferRate({
+    required this.uploadBytesPerSecond,
+    required this.downloadBytesPerSecond,
+  });
 
-  final int totalBytes;
+  final int uploadBytesPerSecond;
+  final int downloadBytesPerSecond;
+}
+
+class _PeerTrafficSample {
+  const _PeerTrafficSample({
+    required this.bytesSent,
+    required this.bytesReceived,
+    required this.fetchedAt,
+  });
+
+  final int bytesSent;
+  final int bytesReceived;
   final DateTime fetchedAt;
 }

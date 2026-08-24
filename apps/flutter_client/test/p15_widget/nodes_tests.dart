@@ -457,6 +457,13 @@ void _registerNodesTests() {
     );
     expect(find.text('123.4 Mbps'), findsOneWidget);
     expect(find.text('56.7 Mbps'), findsOneWidget);
+    expect(find.byKey(const Key('node-speedtest-chart')), findsOneWidget);
+    expect(
+      tester.getSize(find.byKey(const Key('node-speedtest-chart'))).height,
+      150,
+    );
+    expect(find.text('Download 123.4 Mbps'), findsOneWidget);
+    expect(find.text('Upload 56.7 Mbps'), findsOneWidget);
     expect(find.text('147.1 MB / 67.6 MB'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
@@ -657,11 +664,11 @@ void _registerNodesTests() {
     double rowTop(String nodeId) =>
         tester.getTopLeft(find.byKey(Key('node-row-$nodeId'))).dy;
 
-    // The sort menu exposes Join order / Name / Latency.
+    // The sort menu exposes Online first / Name / Latency.
     await tester.tap(find.byKey(const Key('nodes-sort-button')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('nodes-sort-recommended')), findsOneWidget);
-    expect(find.text('Join order'), findsNWidgets(2));
+    expect(find.text('Online first'), findsNWidgets(2));
     expect(find.byKey(const Key('nodes-sort-name')), findsOneWidget);
     expect(find.byKey(const Key('nodes-sort-latency')), findsOneWidget);
 
@@ -685,76 +692,77 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('Nodes keeps join order stable across live peer updates', (
-    tester,
-  ) async {
-    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
-    final initialPeers = _fourPeerFixtures();
-    final initialSnapshot = _snapshotWithPeers(base, initialPeers);
-    final api = _FakeDiagnosticsApi(health: true, snapshot: initialSnapshot);
-    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
-    addTearDown(stores.dispose);
+  testWidgets(
+    'Nodes keeps online-first order stable across live peer updates',
+    (tester) async {
+      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final initialPeers = _fourPeerFixtures();
+      final initialSnapshot = _snapshotWithPeers(base, initialPeers);
+      final api = _FakeDiagnosticsApi(health: true, snapshot: initialSnapshot);
+      final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+      addTearDown(stores.dispose);
 
-    await stores.statusStore.refresh();
-    await tester.pumpWidget(
-      _TestApp(
-        child: NodesPage(
-          settingsStore: stores.settingsStore,
-          statusStore: stores.statusStore,
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: NodesPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
         ),
-      ),
-    );
-
-    double rowTop(String nodeId) =>
-        tester.getTopLeft(find.byKey(Key('node-row-$nodeId'))).dy;
-
-    final initialOrder = [
-      'node-direct',
-      'node-relay',
-      'node-probing',
-      'node-offline',
-    ];
-    for (var index = 0; index < initialOrder.length - 1; index++) {
-      expect(
-        rowTop(initialOrder[index]),
-        lessThan(rowTop(initialOrder[index + 1])),
       );
-    }
 
-    // The daemon can return a different order after path/latency changes.
-    // The default view must retain the first-seen positions instead.
-    final updatedPeers = [...initialPeers.reversed];
-    final direct = updatedPeers.firstWhere(
-      (peer) => peer['node_id'] == 'node-direct',
-    );
-    direct['active_path'] = null;
-    direct['state'] = 'connecting';
-    direct['current_path_selection'] = {
-      'path': 'direct',
-      'direct_endpoint': '198.51.100.21:61111',
-      'reason_code': 'path_direct_trial',
-      'reason': 'candidate probe succeeded',
-      'direct_confirmed': false,
-      'relay_hedged': false,
-    };
-    final appended = Map<String, dynamic>.from(updatedPeers.first)
-      ..['node_id'] = 'node-appended'
-      ..['device_name'] = 'appended-device'
-      ..['virtual_ip'] = '10.20.0.250';
-    updatedPeers.add(appended);
-    api.snapshot = _snapshotWithPeers(base, updatedPeers);
-    await stores.statusStore.refresh();
-    await tester.pump();
+      double rowTop(String nodeId) =>
+          tester.getTopLeft(find.byKey(Key('node-row-$nodeId'))).dy;
 
-    for (var index = 0; index < initialOrder.length - 1; index++) {
-      expect(
-        rowTop(initialOrder[index]),
-        lessThan(rowTop(initialOrder[index + 1])),
+      final initialOrder = [
+        'node-direct',
+        'node-relay',
+        'node-probing',
+        'node-offline',
+      ];
+      for (var index = 0; index < initialOrder.length - 1; index++) {
+        expect(
+          rowTop(initialOrder[index]),
+          lessThan(rowTop(initialOrder[index + 1])),
+        );
+      }
+
+      // The daemon can return a different order after path/latency changes.
+      // The default view must retain the lifecycle positions instead.
+      final updatedPeers = [...initialPeers.reversed];
+      final direct = updatedPeers.firstWhere(
+        (peer) => peer['node_id'] == 'node-direct',
       );
-    }
-    expect(rowTop('node-offline'), lessThan(rowTop('node-appended')));
-    expect(tester.takeException(), isNull);
-  });
+      direct['active_path'] = null;
+      direct['state'] = 'connecting';
+      direct['current_path_selection'] = {
+        'path': 'direct',
+        'direct_endpoint': '198.51.100.21:61111',
+        'reason_code': 'path_direct_trial',
+        'reason': 'candidate probe succeeded',
+        'direct_confirmed': false,
+        'relay_hedged': false,
+      };
+      final appended = Map<String, dynamic>.from(updatedPeers.first)
+        ..['node_id'] = 'node-appended'
+        ..['device_name'] = 'appended-device'
+        ..['virtual_ip'] = '10.20.0.250';
+      updatedPeers.add(appended);
+      api.snapshot = _snapshotWithPeers(base, updatedPeers);
+      await stores.statusStore.refresh();
+      await tester.pump();
+
+      for (var index = 0; index < initialOrder.length - 1; index++) {
+        expect(
+          rowTop(initialOrder[index]),
+          lessThan(rowTop(initialOrder[index + 1])),
+        );
+      }
+      expect(rowTop('node-offline'), lessThan(rowTop('node-appended')));
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('Nodes wide layout opens details without a persistent pane', (
     tester,

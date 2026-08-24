@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
+import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 
 void main() {
   group('supported languages', () {
@@ -36,6 +37,54 @@ void main() {
       expect(en.diagnostics, isNotEmpty);
       expect(zh.troubleshooting, '故障排查');
       expect(en.troubleshooting, 'Troubleshooting');
+    });
+
+    test('pending NAT classification uses a clear detection state', () {
+      final zh = AppStrings.fromCode('zh-Hans');
+      final en = AppStrings.fromCode('en');
+      expect(zh.natTypeDetectionInProgress, '检测中');
+      expect(zh.natTypeDetectionInProgressDetail, contains('全锥形'));
+      expect(en.natTypeDetectionInProgress, 'Detecting');
+      expect(en.natTypeDetectionInProgressDetail, contains('Full Cone'));
+      expect(zh.natTypeConservativeFallbackDetail, contains('端口受限锥形'));
+      expect(
+        en.natTypeConservativeFallbackDetail,
+        contains('Port-Restricted Cone'),
+      );
+      expect(zh.natTraversalTypeCompactLabel(NatTraversalType.fullCone), '全锥形');
+      expect(
+        zh.natTraversalTypeCompactLabel(NatTraversalType.restrictedCone),
+        '受限锥形',
+      );
+      expect(
+        zh.natTraversalTypeCompactLabel(NatTraversalType.portRestrictedCone),
+        '端口受限锥形',
+      );
+      expect(
+        zh.natTraversalTypeCompactLabel(NatTraversalType.symmetric),
+        '对称型',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.fullCone),
+        'Full Cone',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.restrictedCone),
+        'Restricted Cone',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.portRestrictedCone),
+        'Port-Restricted Cone',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.symmetric),
+        'Symmetric',
+      );
+      expect(zh.natTraversalTypeCompactLabel(NatTraversalType.unknown), '未确认');
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.unknown),
+        'Unconfirmed',
+      );
     });
   });
 

@@ -68,6 +68,10 @@ void _registerNodesShellTests() {
     await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsOneWidget);
+    await tester.tap(find.byKey(const Key('nodes-detail-close')));
+    await tester.pumpAndSettle();
+    expect(find.byType(NodesPage), findsOneWidget);
+    expect(find.byType(DashboardPage), findsNothing);
     expect(tester.takeException(), isNull);
   });
 
@@ -193,6 +197,8 @@ void _registerNodesShellTests() {
     // bar is restored when the system back action pops this route.
     await tester.binding.handlePopRoute();
     await tester.pumpAndSettle();
+    expect(find.byType(DashboardPage), findsOneWidget);
+    expect(find.byType(NodesPage), findsNothing);
     expect(find.byType(NavigationBar), findsOneWidget);
     expect(tester.takeException(), isNull);
   });

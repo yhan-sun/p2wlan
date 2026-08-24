@@ -29,6 +29,14 @@ class DiagnosticsApi {
   static const _speedTestTimeout = Duration(seconds: 45);
   // The daemon holds `/events` for up to ~25s (long-poll); give it margin.
   static const _eventsTimeout = Duration(seconds: 30);
+  // `/health` becomes public as soon as the daemon binds, while the
+  // per-process diagnostics token may be written a moment later. Give that
+  // startup hand-off a short quiet retry window before surfacing HTTP 401.
+  static const _authRetryDelays = [
+    Duration(milliseconds: 100),
+    Duration(milliseconds: 200),
+    Duration(milliseconds: 400),
+  ];
 
   final HttpClient _client;
   final Future<String?> Function() _authTokenReader;
@@ -262,7 +270,7 @@ class DiagnosticsApi {
     Duration timeout, {
     bool authorize = true,
   }) async {
-    for (var attempt = 0; attempt < 2; attempt++) {
+    for (var attempt = 0; attempt <= _authRetryDelays.length; attempt++) {
       final request = await _client.getUrl(uri).timeout(timeout);
       request.headers.set(HttpHeaders.acceptHeader, accept);
       if (authorize) await _authorize(request);
@@ -270,9 +278,11 @@ class DiagnosticsApi {
       final body = await utf8.decodeStream(response).timeout(timeout);
       if (authorize &&
           response.statusCode == HttpStatus.unauthorized &&
-          attempt == 0) {
+          attempt < _authRetryDelays.length) {
         // A daemon restart rotates the local session token. Re-read the file
-        // once before surfacing the session-change error to the caller.
+        // after a short delay before surfacing the session-change error to the
+        // caller; this also covers the initial token-file write race.
+        await Future<void>.delayed(_authRetryDelays[attempt]);
         continue;
       }
       if (response.statusCode < 200 || response.statusCode >= 300) {

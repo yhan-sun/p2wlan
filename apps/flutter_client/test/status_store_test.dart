@@ -66,6 +66,63 @@ void main() {
     },
   );
 
+  test(
+    'stable peer order puts online peers first and moves reconnected peers to the end',
+    () async {
+      final fixture = await _loadFixture();
+      final stores = await _makeStores(DiagnosticsApi());
+      addTearDown(stores.dispose);
+
+      final initial = stores.statusStore.stablePeerOrder(fixture.peers);
+      final firstOnline = initial.first;
+      expect(firstOnline.online, isTrue);
+
+      final offlineRaw =
+          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+      final offlinePeers = [
+        for (final item in offlineRaw['peers'] as List<dynamic>)
+          Map<String, dynamic>.from(item as Map),
+      ];
+      final firstOffline = offlinePeers.firstWhere(
+        (item) => item['node_id'] == firstOnline.nodeId,
+      );
+      firstOffline
+        ..['online'] = false
+        ..['state'] = 'unknown'
+        ..['active_path'] = null
+        ..['current_path_selection'] = null;
+      final offlineSnapshot = DiagnosticsSnapshot.fromJson(
+        offlineRaw..['peers'] = offlinePeers,
+      );
+      final whileOffline = stores.statusStore.stablePeerOrder(
+        offlineSnapshot.peers,
+      );
+      expect(whileOffline.last.nodeId, firstOnline.nodeId);
+
+      final restoredRaw =
+          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+      final restoredPeers = [
+        for (final item in restoredRaw['peers'] as List<dynamic>)
+          Map<String, dynamic>.from(item as Map),
+      ];
+      final restored = stores.statusStore.stablePeerOrder(
+        DiagnosticsSnapshot.fromJson(
+          restoredRaw..['peers'] = restoredPeers,
+        ).peers,
+      );
+      final restoredOnline = restored
+          .where((peer) => peer.online && peer.path != 'offline')
+          .toList();
+      expect(restoredOnline.last.nodeId, firstOnline.nodeId);
+      expect(
+        restored
+            .skipWhile((peer) => peer.online && peer.path != 'offline')
+            .every((peer) => !peer.online || peer.path == 'offline'),
+        isTrue,
+      );
+    },
+  );
+
   test('automatic refresh stays silent while work is in flight', () async {
     final fixture = await _loadFixture();
     final health = Completer<void>();
@@ -166,6 +223,45 @@ void main() {
     },
   );
 
+  test(
+    'directional peer throughput exposes upload and download samples',
+    () async {
+      final fixture = await _loadFixture();
+      final peerId = fixture.peers.first.nodeId;
+      final first = _snapshotWithPeerCounters(
+        fixture,
+        peerId: peerId,
+        bytesSent: 1000,
+        bytesReceived: 2000,
+      );
+      final second = _snapshotWithPeerCounters(
+        fixture,
+        peerId: peerId,
+        bytesSent: 9000,
+        bytesReceived: 14000,
+      );
+      final api = _SwitchingDiagnosticsApi(
+        snapshot: second,
+        snapshots: [first, second],
+      );
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      await stores.statusStore.refresh();
+
+      final rate = stores.statusStore.peerDirectionalTransferRates[peerId];
+      expect(rate, isNotNull);
+      expect(rate!.uploadBytesPerSecond, greaterThan(0));
+      expect(rate.downloadBytesPerSecond, greaterThan(0));
+      expect(
+        stores.statusStore.peerTransferRatesBytesPerSecond[peerId],
+        rate.uploadBytesPerSecond + rate.downloadBytesPerSecond,
+      );
+    },
+  );
+
   test('rejects a lower revision from the same daemon process', () async {
     final fixture = await _loadFixture();
     final current = _snapshotCopy(
@@ -262,6 +358,31 @@ void main() {
       expect(stores.statusStore.snapshot?.peers, isEmpty);
     },
   );
+
+  test('startup catalog settling has an explicit transient state', () async {
+    final fixture = await _loadFixture();
+    final health = Completer<void>();
+    final api = _SwitchingDiagnosticsApi(snapshot: fixture, oldHealth: health);
+    final stores = await _makeStores(
+      api,
+      startupCatalogRefreshInterval: Duration.zero,
+      startupCatalogRefreshTimeout: const Duration(milliseconds: 1),
+    );
+    addTearDown(stores.dispose);
+    await stores.settingsStore.updateSettings(
+      stores.settingsStore.settings.copyWith(authToken: 'managed-token'),
+    );
+
+    final settling = stores.statusStore.refreshUntilPeerCatalogSettled(
+      silent: true,
+    );
+    await api.oldHealthStarted.future;
+    expect(stores.statusStore.startupCatalogSettling, isTrue);
+
+    health.complete();
+    await settling.timeout(const Duration(seconds: 1));
+    expect(stores.statusStore.startupCatalogSettling, isFalse);
+  });
 
   test('event revision triggers an immediate full snapshot refresh', () async {
     final fixture = await _loadFixture();
@@ -366,6 +487,25 @@ DiagnosticsSnapshot _snapshotCopy(
     ..['peer_snapshot_age_ms'] = 0
     ..['uptime_ms'] = uptimeMs;
   if (peers != null) raw['peers'] = peers;
+  return DiagnosticsSnapshot.fromJson(raw);
+}
+
+DiagnosticsSnapshot _snapshotWithPeerCounters(
+  DiagnosticsSnapshot source, {
+  required String peerId,
+  required int bytesSent,
+  required int bytesReceived,
+}) {
+  final raw = jsonDecode(jsonEncode(source.raw)) as Map<String, dynamic>;
+  final peers = raw['peers'] as List<dynamic>;
+  for (final value in peers) {
+    final peer = value as Map<String, dynamic>;
+    if (peer['node_id'] == peerId) {
+      peer['bytes_sent'] = bytesSent;
+      peer['bytes_received'] = bytesReceived;
+      break;
+    }
+  }
   return DiagnosticsSnapshot.fromJson(raw);
 }
 

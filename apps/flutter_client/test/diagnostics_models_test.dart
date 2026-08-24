@@ -120,6 +120,8 @@ void main() {
     };
 
     expect(profile.traversalType, NatTraversalType.unknown);
+    expect(profile.displayTraversalType, NatTraversalType.portRestrictedCone);
+    expect(profile.displayTypeIsConservativeFallback, isTrue);
     expect(profile.probabilityTotal, closeTo(100, 0.01));
     expect(probabilities[NatTraversalType.fullCone], closeTo(30, 0.01));
     expect(probabilities[NatTraversalType.restrictedCone], closeTo(30, 0.01));
