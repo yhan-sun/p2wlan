@@ -43,6 +43,7 @@ class NodesPage extends StatefulWidget {
     this.capabilities,
     this.initialPeerId,
     this.onInitialPeerOpened,
+    this.onPeerDetailsClosed,
   });
 
   final SettingsStore settingsStore;
@@ -63,6 +64,11 @@ class NodesPage extends StatefulWidget {
   /// mounted, so detail actions never diverge by entry point.
   final String? initialPeerId;
   final VoidCallback? onInitialPeerOpened;
+
+  /// Called after a device detail surface opened by this page is dismissed.
+  /// The shell uses this to restore the section that originally opened a
+  /// Home preview detail without changing the canonical detail flow.
+  final VoidCallback? onPeerDetailsClosed;
 
   @override
   State<NodesPage> createState() => _NodesPageState();
@@ -290,7 +296,15 @@ class _NodesPageState extends State<NodesPage> {
 
   void _openPeer(PeerSnapshot peer) {
     final capabilities = widget.capabilities ?? PlatformCapabilities.current();
-    _showPeerDetails(peer, mobile: !capabilities.canUseSystemTray);
+    unawaited(_openPeerAndNotify(peer, mobile: !capabilities.canUseSystemTray));
+  }
+
+  Future<void> _openPeerAndNotify(
+    PeerSnapshot peer, {
+    required bool mobile,
+  }) async {
+    await _showPeerDetails(peer, mobile: mobile);
+    if (mounted) widget.onPeerDetailsClosed?.call();
   }
 
   Future<void> _copy(String value, String key) async {

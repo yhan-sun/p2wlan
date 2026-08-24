@@ -713,15 +713,9 @@ void _registerDashboardTests() {
     await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
-    // The unified detail flow leaves the shell on Devices; return Home before
-    // checking the separate "View all" navigation affordance.
-    await tester.tap(
-      find.descendant(
-        of: find.byType(DesktopSidebar),
-        matching: find.text('Home'),
-      ),
-    );
-    await tester.pumpAndSettle();
+    // A detail opened from Home returns to Home after it is dismissed.
+    expect(find.byType(DashboardPage), findsOneWidget);
+    expect(find.byType(NodesPage), findsNothing);
     await tester.tap(find.byKey(const Key('home-view-all-devices')));
     await tester.pumpAndSettle();
 
