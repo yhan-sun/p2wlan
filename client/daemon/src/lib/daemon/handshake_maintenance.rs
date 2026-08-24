@@ -133,16 +133,15 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     handshake_generation,
                     peer_session_generation,
                 );
-                if reservation.is_some() {
-                    if state.attempts.get(&conn.node_id).copied().unwrap_or(0)
+                if reservation.is_some()
+                    && state.attempts.get(&conn.node_id).copied().unwrap_or(0)
                         >= MAX_HANDSHAKE_ATTEMPTS
-                    {
-                        warn!(
-                            "Handshake for {} reached max attempts; resetting retry budget",
-                            conn.node_id
-                        );
-                        state.attempts.remove(&conn.node_id);
-                    }
+                {
+                    warn!(
+                        "Handshake for {} reached max attempts; resetting retry budget",
+                        conn.node_id
+                    );
+                    state.attempts.remove(&conn.node_id);
                 }
                 reservation
             }) else {

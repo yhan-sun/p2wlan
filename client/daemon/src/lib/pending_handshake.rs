@@ -303,6 +303,7 @@ impl PendingHandshakeState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_reserved_if_current_with_generation(
         &mut self,
         peer_id: String,
@@ -367,6 +368,7 @@ impl PendingHandshakeState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_with_generation(
         &mut self,
         peer_id: String,

@@ -2301,14 +2301,14 @@ impl Daemon {
                             .peers
                             .peer_session_generation_sync(&peer_info.node_id);
                         let update = self.peers.add_peer(&peer_info).await;
-                        if (!peer_info.online || update.public_key_changed)
-                            && previous_peer_session_generation.is_some()
-                        {
-                            self.punch_attempts.retire_peer_session(
-                                &peer_info.node_id,
-                                previous_peer_session_generation
-                                    .expect("checked previous peer session generation"),
-                            );
+                        match previous_peer_session_generation {
+                            Some(previous_generation)
+                                if !peer_info.online || update.public_key_changed =>
+                            {
+                                self.punch_attempts
+                                    .retire_peer_session(&peer_info.node_id, previous_generation);
+                            }
+                            _ => {}
                         }
                         if update.last_seen_only {
                             // The roster heartbeat must reach diagnostics, but it

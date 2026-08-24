@@ -2938,7 +2938,9 @@ impl WireGuardTransport {
                                         )
                                         .await
                                     };
-                                    if session_current && peer_session_generation.is_some() {
+                                    if let (true, Some(peer_session_generation)) =
+                                        (session_current, peer_session_generation)
+                                    {
                                         self.handle_direct_validation_packet(
                                             peers,
                                             udp.as_ref(),
@@ -2948,8 +2950,7 @@ impl WireGuardTransport {
                                             local_endpoint,
                                             socket_index,
                                             direct_socket,
-                                            peer_session_generation
-                                                .expect("peer lifecycle checked immediately above"),
+                                            peer_session_generation,
                                             token,
                                         )
                                         .await;

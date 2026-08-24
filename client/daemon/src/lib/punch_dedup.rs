@@ -302,6 +302,7 @@ impl PunchAttemptDeduplicator {
     /// Claim a relay-coordinated rendezvous session with the complete plan
     /// identity. Same-generation refreshes are folded into an active first
     /// window; only a real generation change can bypass that short protection.
+    #[allow(clippy::too_many_arguments)]
     async fn claim_for_epoch_with_rendezvous_for_peer_session(
         &self,
         peers: &PeerManager,
@@ -407,6 +408,7 @@ impl PunchAttemptDeduplicator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn claim_with_rendezvous(
         &self,
         peer_id: &str,

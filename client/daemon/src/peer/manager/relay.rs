@@ -933,6 +933,7 @@ impl PeerManager {
     /// `write_all` boundary. The peer lifecycle was snapshotted before
     /// encryption; re-checking it here prevents an old queued ciphertext from
     /// registering against a same-node replacement peer.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_relay_probe_expectation_at_write_boundary(
         &self,
         node_id: &str,
@@ -997,6 +998,7 @@ impl PeerManager {
     /// Install a periodic health expectation at the relay writer boundary.
     /// A forced-confirmation expectation owns the per-peer slot and cannot be
     /// displaced by this lower-priority sampler.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_relay_validation_expectation_at_write_boundary(
         &self,
         node_id: &str,
@@ -1021,6 +1023,7 @@ impl PeerManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_relay_probe_expectation_inner(
         &self,
         node_id: &str,
@@ -1866,6 +1869,7 @@ impl PeerManager {
     /// initiator sends a synthetic path-commit request over the confirmed relay
     /// and records its token here so only a matching, same-relay, fresh ACK can
     /// close the relay-first business gate.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_path_commit_expectation_at_write_boundary(
         &self,
         node_id: &str,

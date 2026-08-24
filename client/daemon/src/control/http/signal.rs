@@ -334,7 +334,7 @@ pub(super) async fn poll_signals(
             // event handler re-verifies the fresh label and the per-peer
             // high-water before applying anything.
             ("peer_offer" | "peer_offer_fresh", Some(handshake)) => {
-                PreparedSignalDelivery::Apply(ControlEvent::PeerOffer {
+                PreparedSignalDelivery::Apply(Box::new(ControlEvent::PeerOffer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     session_id: signal.session_id,
@@ -346,10 +346,10 @@ pub(super) async fn poll_signals(
                     punch_at_ms,
                     punch_at_server_ms,
                     sender_public_key: signal.sender_public_key,
-                })
+                }))
             }
             ("peer_answer", Some(handshake)) => {
-                PreparedSignalDelivery::Apply(ControlEvent::PeerAnswer {
+                PreparedSignalDelivery::Apply(Box::new(ControlEvent::PeerAnswer {
                     from_node_id: signal.from_node_id,
                     candidates: signal.candidates,
                     session_id: signal.session_id,
@@ -361,15 +361,15 @@ pub(super) async fn poll_signals(
                     punch_at_ms,
                     punch_at_server_ms,
                     sender_public_key: signal.sender_public_key,
-                })
+                }))
             }
             ("peer_reflexive", Some(_)) => {
                 if let Some(observed_endpoint) = peer_reflexive_endpoint_from_signal(&signal) {
-                    PreparedSignalDelivery::Apply(ControlEvent::PeerReflexive {
+                    PreparedSignalDelivery::Apply(Box::new(ControlEvent::PeerReflexive {
                         from_node_id: signal.from_node_id,
                         observed_endpoint,
                         punch_at_ms,
-                    })
+                    }))
                 } else {
                     warn!(
                         "Ignoring peer_reflexive signal from {}; missing observed endpoint",
@@ -413,7 +413,7 @@ pub(super) async fn poll_signals(
         // through to this crash-unsafe compatibility path.
         if !ack_mode {
             if let PreparedSignalDelivery::Apply(event) = prepared {
-                event_tx.send(event).map_err(|_| {
+                event_tx.send(*event).map_err(|_| {
                     DaemonError::ControlPlane(
                         "control signal event channel closed before dispatch".to_string(),
                     )
@@ -531,7 +531,7 @@ enum TrackedSignalApplication {
 
 #[derive(Debug)]
 enum PreparedSignalDelivery {
-    Apply(ControlEvent),
+    Apply(Box<ControlEvent>),
     TerminalRejected,
 }
 
@@ -599,7 +599,7 @@ fn spawn_signal_application_lane(
                             let delivered = ControlEvent::DeliveredSignal {
                                 signal_id: delivery.signal_id.clone(),
                                 signal_seq: delivery.signal_seq,
-                                event: Box::new(event),
+                                event,
                                 receipt,
                             };
                             if event_tx.send(delivered).is_err() {

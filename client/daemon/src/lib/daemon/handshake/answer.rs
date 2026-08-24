@@ -257,8 +257,8 @@ impl Daemon {
             .get_connection(from_node_id)
             .await
             .map(|connection| connection.state);
-        if should_mark_connecting_after_session_install(replaced_existing_session, current_state) {
-            if !self
+        if should_mark_connecting_after_session_install(replaced_existing_session, current_state)
+            && !self
                 .peers
                 .update_state_if_peer_session_current(
                     from_node_id,
@@ -266,9 +266,8 @@ impl Daemon {
                     ConnectionState::Connecting,
                 )
                 .await
-            {
-                return Ok(false);
-            }
+        {
+            return Ok(false);
         }
         info!(
             "Installed WireGuard initiator session for {from_node_id} (rekey={replaced_existing_session})"

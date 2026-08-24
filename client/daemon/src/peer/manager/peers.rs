@@ -90,11 +90,14 @@ impl PeerMembershipPublishTestGate {
 }
 
 #[cfg(test)]
+type PeerMembershipPublishTestGateSlot =
+    std::sync::Mutex<Option<(String, Arc<PeerMembershipPublishTestGate>)>>;
+
+#[cfg(test)]
 fn peer_membership_publish_test_gate_slot(
-) -> &'static std::sync::Mutex<Option<(String, Arc<PeerMembershipPublishTestGate>)>> {
-    static SLOT: std::sync::OnceLock<
-        std::sync::Mutex<Option<(String, Arc<PeerMembershipPublishTestGate>)>>,
-    > = std::sync::OnceLock::new();
+) -> &'static PeerMembershipPublishTestGateSlot {
+    static SLOT: std::sync::OnceLock<PeerMembershipPublishTestGateSlot> =
+        std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
