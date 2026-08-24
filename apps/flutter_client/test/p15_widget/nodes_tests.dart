@@ -488,8 +488,8 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
 
     // Keep the desktop modal inside the supported window sizes from the UI
-    // brief. This catches height/width regressions without changing mobile
-    // coverage, which intentionally stays on the original dialog branch.
+    // brief. The compact phone branch has its own narrow-layout regression
+    // test below, so this matrix stays focused on desktop sizing.
     for (final size in const [
       Size(800, 600),
       Size(1024, 768),
@@ -558,6 +558,78 @@ void _registerNodesTests() {
     await tester.runAsync(() async {});
     await tester.pumpAndSettle();
     expect(api.speedTestCount, 2);
+  });
+
+  testWidgets('Nodes mobile speed test fits narrow phones and unwinds safely', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(360, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final api = _FakeDiagnosticsApi(
+      health: true,
+      snapshot: snapshot,
+      speedTestResult: SpeedTestResult(
+        peerVirtualIp: '10.20.0.11',
+        durationMs: 10000,
+        downloadMbps: 123.4,
+        uploadMbps: 56.7,
+        downloadBytes: 154250000,
+        uploadBytes: 70875000,
+      ),
+    );
+    final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: NodesPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+          capabilities: PlatformCapabilities.fromPlatform('android'),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
+
+    final speedTestAction = find.byKey(
+      const Key('node-detail-speedtest-peer-relay-002'),
+    );
+    await tester.ensureVisible(speedTestAction);
+    await tester.tap(speedTestAction);
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('node-speedtest-dialog')), findsOneWidget);
+    expect(find.byKey(const Key('node-speedtest-link-info')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('node-speedtest-start')));
+    await tester.pump();
+    await tester.runAsync(() async {});
+    await tester.pumpAndSettle();
+
+    final chart = find.byKey(const Key('node-speedtest-chart'));
+    expect(chart, findsOneWidget);
+    expect(tester.getSize(chart).height, 132);
+    expect(find.text('123.4 Mbps'), findsOneWidget);
+    expect(find.text('56.7 Mbps'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    // Android back first closes the modal, then the detail route; the shell
+    // and mobile navigation remain alive at both steps.
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('node-speedtest-dialog')), findsNothing);
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsNothing);
+    expect(tester.takeException(), isNull);
   });
 
   testWidgets('Nodes searches by name, IP, and node ID', (tester) async {
