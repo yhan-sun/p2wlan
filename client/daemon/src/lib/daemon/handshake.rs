@@ -154,7 +154,7 @@ fn should_mark_connecting_after_session_install(
     !replaced_existing_session
         && matches!(
             current_state,
-            Some(ConnectionState::Idle | ConnectionState::Failed | ConnectionState::Closed)
+            Some(ConnectionState::Idle | ConnectionState::Failed)
         )
 }
 

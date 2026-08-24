@@ -32,7 +32,7 @@ impl TrayMenu {
         let status = MenuItem::with_id("status", "状态：未启动", false, None);
         let network = MenuItem::with_id(
             "network",
-            "虚拟 IP：— · 在线设备：— · 延迟：— · 速度：—",
+            "虚拟 IP：— · 在线设备：— · 本端平均 RTT：— · 速度：—",
             false,
             None,
         );

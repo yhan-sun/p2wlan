@@ -1,11 +1,30 @@
 impl Daemon {
+    #[cfg(test)]
     async fn handle_peer_answer(
         &self,
         from_node_id: &str,
         handshake_response: &[u8],
         session_id: Option<String>,
         probe_ephemeral_public_key: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        self.handle_peer_answer_for_identity(
+            from_node_id,
+            handshake_response,
+            session_id,
+            probe_ephemeral_public_key,
+            None,
+        )
+        .await
+    }
+
+    async fn handle_peer_answer_for_identity(
+        &self,
+        from_node_id: &str,
+        handshake_response: &[u8],
+        session_id: Option<String>,
+        probe_ephemeral_public_key: Option<String>,
+        sender_public_key: Option<&str>,
+    ) -> Result<bool> {
         let lock_wait_started = Instant::now();
         let ingress_generation = self.peers.current_network_generation_sync();
         self.timeline.emit(
@@ -39,6 +58,18 @@ impl Daemon {
                 handshake_token_fingerprint(session_id.as_deref())
             )),
         );
+        if !self
+            .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
+            .await
+        {
+            self.timeline.emit(
+                "peer_answer_rejected",
+                None,
+                Some("stale_sender_identity"),
+                Some(format!("peer={from_node_id}")),
+            );
+            return Ok(false);
+        }
         let response = MessageResponse::from_bytes(handshake_response)
             .map_err(|e| DaemonError::Peer(format!("invalid WireGuard response: {e}")))?;
         // The pending initiator and its answer must cross the local network
@@ -56,7 +87,10 @@ impl Daemon {
                 handshake_token_fingerprint(session_id.as_deref())
             )),
         );
-        let emit_guard = self.transport.acquire_outbound_emit_guard(from_node_id).await;
+        let emit_guard = self
+            .transport
+            .acquire_outbound_emit_guard(from_node_id)
+            .await;
         self.timeline.emit(
             "peer_answer_emit_lock_acquired",
             None,
@@ -70,9 +104,21 @@ impl Daemon {
         let epoch_gate = self.peers.network_epoch_gate();
         let epoch_guard = epoch_gate.lock().await;
         let current_generation = self.peers.current_network_generation_sync();
-        let (keys, expected_session_id, probe_ephemeral_shared) = {
+        let (keys, expected_session_id, probe_ephemeral_shared, peer_session_generation) = {
             let mut state = self.pending_handshakes.lock().await;
             let expected_session_id = state.session_id(from_node_id).map(str::to_string);
+            let Some(peer_session_generation) = state.peer_session_generation(from_node_id) else {
+                warn!("Ignoring WireGuard answer from {from_node_id}: no lifecycle-bound pending handshake");
+                return Ok(false);
+            };
+            if !self
+                .peers
+                .peer_session_is_current_sync(from_node_id, peer_session_generation)
+            {
+                warn!("Ignoring WireGuard answer from {from_node_id}: peer lifecycle changed");
+                state.remove(from_node_id);
+                return Ok(false);
+            }
             let expected_generation = state
                 .network_generation(from_node_id)
                 .unwrap_or(current_generation);
@@ -88,7 +134,7 @@ impl Daemon {
                         "peer={from_node_id} answer_generation={expected_generation} current_generation={current_generation}"
                     )),
                 );
-                return Ok(());
+                return Ok(false);
             }
             if expected_session_id.as_deref() != session_id.as_deref() {
                 warn!(
@@ -104,7 +150,7 @@ impl Daemon {
                         handshake_token_fingerprint(session_id.as_deref())
                     )),
                 );
-                return Ok(());
+                return Ok(false);
             }
 
             // A modern initiator generated its Probe ephemeral key together
@@ -123,7 +169,7 @@ impl Daemon {
                         warn!(
                             "Ignoring WireGuard answer from {from_node_id} without the required probe ephemeral public key"
                         );
-                        return Ok(());
+                        return Ok(false);
                     };
                     match derive_probe_ephemeral_shared(
                         &local_probe_ephemeral,
@@ -134,7 +180,7 @@ impl Daemon {
                             warn!(
                                 "Ignoring malformed probe ephemeral public key from {from_node_id}: {err}"
                             );
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                 }
@@ -143,7 +189,7 @@ impl Daemon {
 
             let Some(initiator) = state.pending.get_mut(from_node_id) else {
                 warn!("No pending WireGuard handshake for answer from {from_node_id}");
-                return Ok(());
+                return Ok(false);
             };
 
             let keys = match initiator.consume_response(&response) {
@@ -152,13 +198,18 @@ impl Daemon {
                     warn!(
                         "Ignoring WireGuard answer from {from_node_id} that does not match the pending handshake: {err}"
                     );
-                    return Ok(());
+                    return Ok(false);
                 }
             };
 
             state.remove(from_node_id);
             state.attempts.remove(from_node_id);
-            (keys, expected_session_id, probe_ephemeral_shared)
+            (
+                keys,
+                expected_session_id,
+                probe_ephemeral_shared,
+                peer_session_generation,
+            )
         };
 
         // Replace the outbound key while retaining the old receive key for a
@@ -190,24 +241,40 @@ impl Daemon {
             .flush_pending_outbound_for_peer(from_node_id)
             .await;
 
+        // PeerUpdated/PeerLeft publishes its new lifecycle before waiting for
+        // this arbiter. If that happened after the epoch commit, cleanup will
+        // remove the just-installed session; do not mutate the replacement's
+        // connection state or start confirmation work in the meantime.
+        if !self
+            .peers
+            .peer_session_is_current_sync(from_node_id, peer_session_generation)
+        {
+            return Ok(false);
+        }
+
         let current_state = self
             .peers
             .get_connection(from_node_id)
             .await
             .map(|connection| connection.state);
-        if should_mark_connecting_after_session_install(
-            replaced_existing_session,
-            current_state,
-        ) {
-            self.peers
-                .update_state(from_node_id, ConnectionState::Connecting)
-                .await;
+        if should_mark_connecting_after_session_install(replaced_existing_session, current_state)
+            && !self
+                .peers
+                .update_state_if_peer_session_current(
+                    from_node_id,
+                    peer_session_generation,
+                    ConnectionState::Connecting,
+                )
+                .await
+        {
+            return Ok(false);
         }
         info!(
             "Installed WireGuard initiator session for {from_node_id} (rekey={replaced_existing_session})"
         );
         if replaced_existing_session || session_id.is_some() {
-            self.start_rekey_confirmation(from_node_id).await;
+            self.start_rekey_confirmation(from_node_id, peer_session_generation)
+                .await;
         }
         self.peers
             .record_direct_event(
@@ -222,10 +289,14 @@ impl Daemon {
                 ),
             )
             .await;
-        Ok(())
+        Ok(true)
     }
 
-    async fn start_rekey_confirmation(&self, peer_id: &str) {
+    async fn start_rekey_confirmation(
+        &self,
+        peer_id: &str,
+        peer_session_generation: PeerSessionGeneration,
+    ) {
         let transport = self.transport.clone();
         let peers = self.peers.clone();
         let udp_transport = self.udp_transport.clone();
@@ -240,6 +311,10 @@ impl Daemon {
             for (sequence, delay) in REKEY_CONFIRMATION_DELAYS.into_iter().enumerate() {
                 if !delay.is_zero() {
                     sleep(delay).await;
+                }
+
+                if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+                    break;
                 }
 
                 // UDP, Relay, and the learned peer-reflexive endpoint can all
@@ -328,5 +403,4 @@ impl Daemon {
                 .await;
         });
     }
-
 }

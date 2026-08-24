@@ -104,6 +104,27 @@ pub struct DiagnosticsSnapshot {
     /// snapshot refetch is needed (see `GET /events?since=N`).
     #[serde(default)]
     pub revision: u64,
+    /// Event revision captured atomically with the peer array. A successful
+    /// response always has `captured_revision == revision`; clients can reject
+    /// a mixed or legacy response without interpreting nested peer fields.
+    #[serde(default)]
+    pub captured_revision: u64,
+    /// Daemon-monotonic capture time in milliseconds. This shares the
+    /// `/status.uptime_ms` and timeline-event `at_ms` clock; it is not Unix time.
+    #[serde(default)]
+    pub captured_at_ms: u64,
+    /// Whether `peers` came from an older validated capture. The current
+    /// endpoint fails closed with 503 under sustained lock contention, so a
+    /// successful response always sets this to false.
+    #[serde(default)]
+    pub peer_snapshot_stale: bool,
+    /// Age of the validated peer capture when this response was assembled.
+    #[serde(default)]
+    pub peer_snapshot_age_ms: u64,
+    /// Versioned stable hash of the serialized peer array. It contains no
+    /// credentials and lets clients distinguish capture shapes cheaply.
+    #[serde(default)]
+    pub peer_snapshot_shape: String,
     /// Authoritative daemon readiness phase (see `derive_ready_phase`). Clients
     /// must render this instead of inferring readiness from `virtual_ip` alone.
     #[serde(default)]
@@ -203,16 +224,32 @@ impl StatusResponse {
 pub struct EventsResponse {
     #[serde(rename = "contractVersion")]
     pub contract_version: u32,
+    /// Daemon process incarnation. Event sequence numbers restart at zero, so
+    /// clients must pair this with `revision` when advancing their cursor.
+    #[serde(default)]
+    pub process_id: u32,
     pub revision: u64,
+    /// Oldest sequence still retained in the bounded event ring; zero when the
+    /// ring is empty.
+    #[serde(default)]
+    pub oldest_seq: u64,
+    /// True when `since` belongs to an older process or fell behind an evicted
+    /// ring segment. The client must fetch a full `/status` snapshot before
+    /// consuming further deltas.
+    #[serde(default)]
+    pub reset_required: bool,
     pub events: Vec<StatusEvent>,
 }
 
 impl EventsResponse {
-    pub fn new(revision: u64, events: Vec<StatusEvent>) -> Self {
+    pub fn from_poll(poll: StatusEventPoll) -> Self {
         Self {
             contract_version: DIAGNOSTICS_CONTRACT_VERSION,
-            revision,
-            events,
+            process_id: poll.process_id,
+            revision: poll.revision,
+            oldest_seq: poll.oldest_seq,
+            reset_required: poll.reset_required,
+            events: poll.events,
         }
     }
 }
@@ -358,6 +395,10 @@ pub struct DiagnosticsContext {
     /// Bounded monotonic status event log backing `/events` and the
     /// `/status.revision` counter.
     status_events: Arc<StatusEventBus>,
+    /// Last fully validated peer capture. It is retained with its own revision,
+    /// age and shape for diagnostics, but is never mixed into a newer snapshot
+    /// when the live peer locks are contended.
+    peer_snapshot_cache: Arc<std::sync::Mutex<Option<CachedPeerSnapshot>>>,
     /// Path to the daemon's own log file (when the operator set `--log-file`),
     /// used by the bounded `GET /logs/tail` endpoint. `None` when logging to
     /// stdout.
@@ -404,10 +445,20 @@ impl DiagnosticsContext {
             shutdown_tx,
             timeline,
             status_events,
+            peer_snapshot_cache: Arc::new(std::sync::Mutex::new(None)),
             log_path,
             auth_token,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct CachedPeerSnapshot {
+    peers: Vec<PeerDiagnostics>,
+    capture_revision: u64,
+    captured_at: std::time::Instant,
+    captured_at_ms: u64,
+    shape: String,
 }
 
 /// Compare a bearer token against the daemon's per-process diagnostics auth
@@ -444,9 +495,10 @@ mod auth_matches_tests {
 /// being allocated > connected (relayed or direct) > still discovering peers.
 pub fn derive_ready_phase(
     health: &crate::tasks::HealthSnapshot,
-    relay_connected: bool,
+    _relay_transport_connected: bool,
     peers: &[PeerDiagnostics],
     virtual_ip: &str,
+    manual_mode: bool,
 ) -> &'static str {
     use crate::tasks::HealthStatus;
     if health.status == HealthStatus::ShuttingDown {
@@ -459,13 +511,13 @@ pub fn derive_ready_phase(
         return "error";
     }
     if !health.control_connected {
-        if virtual_ip.trim().is_empty() {
-            // No control plane yet and no VIP: the control connection is the
-            // first thing that must come up.
-            return "connecting_control";
+        if manual_mode && !virtual_ip.trim().is_empty() {
+            // `connected_manual` is reserved for an explicitly configured
+            // local-only network. A managed daemon retaining an old VIP while
+            // its control/device lease is down is not manual connectivity.
+            return "connected_manual";
         }
-        // Local-only/manual mode: no control plane, but we have a VIP.
-        return "connected_manual";
+        return "connecting_control";
     }
     if virtual_ip.trim().is_empty() {
         // Connected to control but the VIP has not been assigned yet. This is
@@ -475,11 +527,20 @@ pub fn derive_ready_phase(
     }
     let has_direct = peers
         .iter()
-        .any(|p| p.active_path.as_ref() == Some(&NetworkPath::Direct));
-    let has_relay = relay_connected
-        || peers
-            .iter()
-            .any(|p| p.active_path.as_ref() == Some(&NetworkPath::Relay));
+        .any(|peer| peer.online && peer.active_path.as_ref() == Some(&NetworkPath::Direct));
+    // A shared relay TCP/TLS transport only proves local writer readiness. It
+    // is not peer delivery evidence. Relay readiness requires the peer's
+    // same-generation encrypted forced-relay ACK reflected in active_path and
+    // relay_confirmed_*.
+    let has_relay = peers.iter().any(|peer| {
+        peer.online
+            && peer.active_path.as_ref() == Some(&NetworkPath::Relay)
+            && peer.relay_confirmed_generation.is_some()
+            && peer
+                .relay_confirmed_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| !endpoint.is_empty())
+    });
     if has_direct {
         "connected_direct"
     } else if has_relay {
@@ -487,5 +548,60 @@ pub fn derive_ready_phase(
     } else {
         // Connected to control, VIP allocated, but no peer path yet.
         "discovering_peers"
+    }
+}
+
+#[cfg(test)]
+mod ready_phase_tests {
+    use super::*;
+    use crate::tasks::{HealthSnapshot, HealthStatus};
+
+    fn health(control_connected: bool) -> HealthSnapshot {
+        HealthSnapshot {
+            status: HealthStatus::Healthy,
+            reason: None,
+            critical_tasks: Vec::new(),
+            control_connected,
+            last_control_success_secs_ago: None,
+            control_api_reachable: control_connected,
+            device_lease_healthy: control_connected,
+            last_device_lease_success_secs_ago: None,
+            reauth_required: false,
+        }
+    }
+
+    #[test]
+    fn managed_disconnect_with_retained_vip_is_not_manual() {
+        assert_eq!(
+            derive_ready_phase(&health(false), false, &[], "10.20.0.1", false),
+            "connecting_control"
+        );
+        assert_eq!(
+            derive_ready_phase(&health(false), false, &[], "10.20.0.1", true),
+            "connected_manual"
+        );
+    }
+
+    #[test]
+    fn relay_transport_without_peer_confirmation_is_still_discovering() {
+        assert_eq!(
+            derive_ready_phase(&health(true), true, &[], "10.20.0.1", false),
+            "discovering_peers"
+        );
+    }
+
+    #[test]
+    fn offline_peer_cannot_make_the_daemon_ready() {
+        let connection = crate::peer::PeerConnection::new("offline-peer", "10.20.0.2");
+        let mut peer = PeerDiagnostics::from(&connection);
+        peer.online = false;
+        peer.active_path = Some(NetworkPath::Relay);
+        peer.relay_confirmed_generation = Some(0);
+        peer.relay_confirmed_endpoint = Some("relay.example:443".to_string());
+
+        assert_eq!(
+            derive_ready_phase(&health(true), true, &[peer], "10.20.0.1", false),
+            "discovering_peers"
+        );
     }
 }

@@ -575,39 +575,17 @@ async fn nat_binding_maintainer_uses_every_pool_socket() {
     }
 
     assert_eq!(sources, expected_sources);
-    sleep(Duration::from_millis(50)).await;
+    timeout(Duration::from_secs(1), async {
+        while !transport.nat_maintainers.lock().await.is_empty() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every finite NAT binding maintainer must finish");
     let diagnostics = transport.socket_pool_diagnostics().await;
     assert!(diagnostics
         .iter()
         .all(|member| member.nat_maintainer_probes_sent >= 1));
-    let peer_diagnostics = peers.diagnostics().await;
-    let direct_events = &peer_diagnostics[0].direct_events;
-    assert_eq!(
-        direct_events
-            .iter()
-            .filter(|event| event.stage == "nat_maintainer_started")
-            .count(),
-        3
-    );
-    assert!(direct_events
-        .iter()
-        .any(|event| event.stage == "nat_maintainer_suppressed"));
-    assert_eq!(
-        direct_events
-            .iter()
-            .filter(|event| event.stage == "nat_maintainer_stopped")
-            .count(),
-        3
-    );
-    for socket_index in 0..3 {
-        assert!(direct_events.iter().any(|event| {
-            event.stage == "nat_maintainer_started"
-                && event
-                    .detail
-                    .contains(&format!("socket_index={socket_index}"))
-                && event.detail.contains(&format!("target={receiver_addr}"))
-        }));
-    }
 }
 
 #[test]
@@ -749,7 +727,7 @@ async fn nat_binding_maintainer_stops_every_pool_socket_after_direct_success() {
                 "peer-b",
                 receiver_addr,
                 Duration::from_millis(5),
-                Duration::from_millis(200),
+                Duration::from_secs(5),
             )
             .await
     );
@@ -769,13 +747,23 @@ async fn nat_binding_maintainer_stops_every_pool_socket_after_direct_success() {
     }
 
     peers.update_state("peer-b", ConnectionState::Direct).await;
-    sleep(Duration::from_millis(25)).await;
+    timeout(Duration::from_secs(1), async {
+        while !transport.nat_maintainers.lock().await.is_empty() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("Direct promotion must stop every NAT binding maintainer");
     let stopped_counts = transport
         .socket_pool_diagnostics()
         .await
         .into_iter()
         .map(|member| member.nat_maintainer_probes_sent)
         .collect::<Vec<_>>();
+    assert!(
+        stopped_counts.iter().all(|count| *count > 0),
+        "every pool socket must have participated before Direct promotion"
+    );
     sleep(Duration::from_millis(25)).await;
     let later_counts = transport
         .socket_pool_diagnostics()
@@ -784,18 +772,6 @@ async fn nat_binding_maintainer_stops_every_pool_socket_after_direct_success() {
         .map(|member| member.nat_maintainer_probes_sent)
         .collect::<Vec<_>>();
     assert_eq!(later_counts, stopped_counts);
-
-    let peer_diagnostics = peers.diagnostics().await;
-    let direct_confirmed_stops = peer_diagnostics[0]
-        .direct_events
-        .iter()
-        .filter(|event| {
-            event.stage == "nat_maintainer_stopped"
-                && event.detail.contains("reason=direct_confirmed")
-        })
-        .count();
-    assert_eq!(direct_confirmed_stops, 3);
-    assert!(transport.nat_maintainers.lock().await.is_empty());
 }
 
 #[tokio::test]

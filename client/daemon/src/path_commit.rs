@@ -130,6 +130,8 @@ pub(crate) fn parse_path_commit_token(packet: &[u8]) -> Option<PathCommitToken> 
 /// consume it — mirroring the relay path-probe's acceptance rules.
 #[derive(Debug, Clone)]
 pub(crate) struct PathCommitExpectation {
+    /// Process-local online peer lifecycle at the actual relay emit boundary.
+    pub(crate) peer_session_generation: crate::peer::PeerSessionGeneration,
     /// Network generation the probe was built in.
     pub(crate) generation: u64,
     /// Request id of the outstanding probe.
@@ -138,6 +140,8 @@ pub(crate) struct PathCommitExpectation {
     pub(crate) owner_token: u64,
     /// Relay endpoint the probe was sent over (diagnostics).
     pub(crate) relay_endpoint: String,
+    /// Local relay transport incarnation that carried the request.
+    pub(crate) relay_connection_id: u64,
     /// When the probe was sent; the expectation expires after
     /// [`PATH_COMMIT_EXPECTATION_TTL`].
     pub(crate) sent_at: Instant,
@@ -163,6 +167,10 @@ impl PathCommitExpectation {
     /// must not commit the current path.
     pub(crate) fn accepts(&self, token: &PathCommitToken, now: Instant, ack_ingress: &str) -> bool {
         self.matches(token) && self.fresh(now) && self.relay_endpoint == ack_ingress
+    }
+
+    pub(crate) fn accepts_connection(&self, connection_id: Option<u64>) -> bool {
+        connection_id == Some(self.relay_connection_id)
     }
 }
 
@@ -224,10 +232,12 @@ mod tests {
     #[test]
     fn path_commit_expectation_matches_exact_token_and_expires() {
         let expectation = PathCommitExpectation {
+            peer_session_generation: crate::peer::PeerSessionGeneration::for_test(1),
             generation: 3,
             request_id: 42,
             owner_token: 0xabc,
             relay_endpoint: "tcp://relay.test:18081".to_string(),
+            relay_connection_id: 17,
             sent_at: Instant::now(),
         };
         let ack = PathCommitToken {
@@ -239,6 +249,8 @@ mod tests {
         assert!(expectation.matches(&ack));
         assert!(expectation.fresh(Instant::now()));
         assert!(expectation.accepts(&ack, Instant::now(), "tcp://relay.test:18081"));
+        assert!(expectation.accepts_connection(Some(17)));
+        assert!(!expectation.accepts_connection(None));
         // A wrong ingress relay must not accept.
         assert!(!expectation.accepts(&ack, Instant::now(), "tcp://other.test:9999"));
         // A wrong generation must not match.
@@ -249,5 +261,11 @@ mod tests {
             owner_token: 0xabc,
         };
         assert!(!expectation.matches(&wrong));
+        let mut expired = expectation.clone();
+        expired.sent_at = Instant::now()
+            .checked_sub(PATH_COMMIT_EXPECTATION_TTL + Duration::from_millis(1))
+            .unwrap();
+        assert!(!expired.fresh(Instant::now()));
+        assert!(!expired.accepts(&ack, Instant::now(), "tcp://relay.test:18081"));
     }
 }

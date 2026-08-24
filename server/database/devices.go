@@ -91,7 +91,11 @@ func (db *DB) CreateDeviceWithOptions(userID, networkID, publicKey, deviceName, 
 		}
 
 		now := time.Now().Unix()
-		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, virtual_ip = ?, app_version = CASE WHEN ? != '' THEN ? ELSE app_version END, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END WHERE id = ?`,
+		// A registration is a new daemon incarnation, while endpoint/NAT/relay
+		// RTT describe the previous process's runtime transport. Clear all three
+		// atomically before publishing online=1; the first authenticated endpoint
+		// PATCH will publish facts for the new incarnation.
+		_, err = tx.Exec(`UPDATE devices SET device_name = ?, platform = ?, virtual_ip = ?, app_version = CASE WHEN ? != '' THEN ? ELSE app_version END, endpoint = '', nat_type = 'unknown', relay_rtt_ms = NULL, last_seen = ?, online = 1, ed25519_public_key = CASE WHEN ? != '' THEN ? ELSE ed25519_public_key END WHERE id = ?`,
 			deviceName, platform, virtualIP, appVersion, appVersion, now, ed25519PublicKey, ed25519PublicKey, existing.ID)
 		if err != nil {
 			return nil, err
@@ -103,10 +107,12 @@ func (db *DB) CreateDeviceWithOptions(userID, networkID, publicKey, deviceName, 
 		existing.DeviceName = deviceName
 		existing.Platform = platform
 		existing.VirtualIP = virtualIP
+		existing.Endpoint = ""
+		existing.NATType = "unknown"
+		existing.RelayRTTMS = nil
 		if appVersion != "" {
 			existing.AppVersion = appVersion
 		}
-		existing.RelayRTTMS = nullInt64Ptr(existingRelayRTTMS)
 		existing.LastSeen = now
 		existing.Online = true
 		return &existing, nil

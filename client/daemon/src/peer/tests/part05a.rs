@@ -49,7 +49,7 @@ async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .record_relay_observation("peer1", relay_endpoint, None)
+        .record_relay_observation("peer1", relay_endpoint)
         .await;
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
@@ -247,7 +247,7 @@ async fn one_way_business_does_not_permanently_block_direct_when_pathcommit_prov
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .record_relay_observation("peer1", relay_endpoint, None)
+        .record_relay_observation("peer1", relay_endpoint)
         .await;
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
@@ -296,7 +296,7 @@ async fn pathcommit_proof_does_not_relie_on_natural_business_and_resets_on_gener
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .record_relay_observation("peer1", relay_endpoint, None)
+        .record_relay_observation("peer1", relay_endpoint)
         .await;
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
@@ -616,7 +616,12 @@ async fn encrypted_business_ingress_can_confirm_relay_before_probe_ack() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(17),
+        )
         .await;
 
     // This models the real ordering seen in dual-end logs: the peer's
@@ -664,7 +669,12 @@ async fn preconfirmation_business_from_replaced_relay_transport_is_rejected() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .mark_relay_transport_ready_with_transport(
+            "peer1",
+            relay_endpoint,
+            generation,
+            Some(12),
+        )
         .await;
 
     // The business packet belonged to the old connection incarnation.  A
@@ -891,6 +901,47 @@ async fn encrypted_validation_rtt_replaces_delayed_candidate_probe_rtt() {
 }
 
 #[tokio::test]
+async fn alternate_endpoint_probe_rtt_does_not_replace_active_direct_health() {
+    let manager = PeerManager::new(test_config());
+    let selected: SocketAddr = "198.51.100.32:51831".parse().unwrap();
+    let alternate: SocketAddr = "198.51.100.32:51832".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", selected)).await;
+    manager
+        .add_candidates("peer1", &[selected.to_string(), alternate.to_string()])
+        .await;
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            selected,
+            Some(Duration::from_millis(8)),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(selected)).await;
+
+    let before = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(before.endpoint, Some(selected));
+    assert_eq!(before.direct_health.rtt_ewma_ms, Some(8));
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            alternate,
+            Some(Duration::from_millis(408)),
+        )
+        .await;
+
+    let after = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(after.endpoint, Some(selected));
+    assert_eq!(after.direct_health.rtt_ewma_ms, Some(8));
+    assert_eq!(after.direct_health.latency_ms, Some(8));
+    let alternate_pair = after
+        .candidate_pairs
+        .iter()
+        .find(|pair| pair.remote_endpoint == alternate)
+        .expect("alternate ACK must remain useful candidate evidence");
+    assert_eq!(alternate_pair.rtt_ewma_ms.or(alternate_pair.rtt_ms), Some(408));
+}
+
+#[tokio::test]
 async fn slow_encrypted_direct_validation_confirms_and_promotes_direct() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.61:51861".parse().unwrap();
@@ -899,7 +950,12 @@ async fn slow_encrypted_direct_validation_confirms_and_promotes_direct() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .record_relay_observation("peer1", relay_endpoint, Some(Duration::from_millis(35)))
+        .record_relay_success_with_latency(
+            "peer1",
+            relay_endpoint,
+            false,
+            Duration::from_millis(35),
+        )
         .await;
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
@@ -984,7 +1040,12 @@ async fn slow_direct_probe_does_not_start_validation_over_confirmed_relay() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .record_relay_observation("peer1", relay_endpoint, Some(Duration::from_millis(35)))
+        .record_relay_success_with_latency(
+            "peer1",
+            relay_endpoint,
+            false,
+            Duration::from_millis(35),
+        )
         .await;
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
@@ -1035,7 +1096,12 @@ async fn slow_probe_evidence_does_not_replace_active_endpoint() {
         .await;
     let generation = manager.current_network_generation().await;
     manager
-        .record_relay_observation("peer1", relay_endpoint, Some(Duration::from_millis(35)))
+        .record_relay_success_with_latency(
+            "peer1",
+            relay_endpoint,
+            false,
+            Duration::from_millis(35),
+        )
         .await;
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
@@ -1075,7 +1141,12 @@ async fn slow_confirmed_direct_is_not_active_over_confirmed_relay() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .record_relay_observation("peer1", relay_endpoint, Some(Duration::from_millis(35)))
+        .record_relay_success_with_latency(
+            "peer1",
+            relay_endpoint,
+            false,
+            Duration::from_millis(35),
+        )
         .await;
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
@@ -1249,6 +1320,23 @@ async fn candidate_refresh_retains_low_latency_private_direct() {
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
+    manager
+        .record_relay_success_with_latency(
+            "peer1",
+            "relay.test:443",
+            false,
+            Duration::from_millis(31),
+        )
+        .await;
+    assert_eq!(
+        manager
+            .get_connection("peer1")
+            .await
+            .unwrap()
+            .relay_health
+            .rtt_ewma_ms,
+        Some(31)
+    );
     assert_eq!(manager.current_network_generation().await, 0);
 
     let generation = manager
@@ -1260,6 +1348,9 @@ async fn candidate_refresh_retains_low_latency_private_direct() {
     assert_eq!(conn.state, ConnectionState::Direct);
     assert_eq!(conn.direct_generation, generation);
     assert_eq!(conn.endpoint, Some(endpoint));
+    assert_eq!(conn.direct_health.rtt_ewma_ms, Some(7));
+    assert!(conn.relay_health.latency_ms.is_none());
+    assert!(conn.relay_health.rtt_ewma_ms.is_none());
     assert!(conn.candidate_pairs.iter().any(|pair| {
         pair.local_generation == 0
             && pair.remote_endpoint == endpoint
@@ -1745,4 +1836,366 @@ async fn relay_connection_metadata_survives_direct_promotion_for_recovery() {
         .await;
     assert_eq!(diagnostics[0].state, ConnectionState::Direct);
     assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
+}
+
+#[tokio::test]
+async fn untimed_relay_ingress_does_not_refresh_timed_validation_freshness() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.71:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+
+    manager
+        .record_relay_observation("peer1", relay_endpoint)
+        .await;
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert!(connection.relay_health.last_observation_at.is_some());
+    assert_eq!(connection.relay_health.observation_count, 1);
+    assert!(connection.relay_health.last_success_at.is_none());
+    assert!(connection.relay_health.latency_ms.is_none());
+    assert!(connection.relay_health.rtt_ewma_ms.is_none());
+    assert!(manager
+        .relay_validation_targets(Duration::from_secs(15))
+        .await
+        .iter()
+        .any(|(peer_id, _)| peer_id == "peer1"));
+}
+
+#[tokio::test]
+async fn relay_probe_ack_records_monotonic_rtt_and_replacement_clears_it() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.72:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(41))
+        .await;
+    assert!(manager.register_relay_probe_expectation_for_transport(
+        "peer1",
+        generation,
+        7,
+        0xabc,
+        relay_endpoint,
+        41,
+    ));
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(
+        manager
+            .consume_relay_probe_ack_with_transport(
+                "peer1",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 7,
+                    owner_token: 0xabc,
+                },
+                relay_endpoint,
+                Some(41),
+            )
+            .await
+    );
+
+    let confirmed = manager.get_connection("peer1").await.unwrap();
+    assert!(confirmed.relay_health.last_success_at.is_some());
+    assert!(confirmed
+        .relay_health
+        .latency_ms
+        .is_some_and(|rtt| rtt >= 10));
+    assert_eq!(
+        confirmed.relay_health.rtt_ewma_ms,
+        confirmed.relay_health.latency_ms
+    );
+
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(42))
+        .await;
+    let replaced = manager.get_connection("peer1").await.unwrap();
+    assert!(replaced.relay_health.last_success_at.is_none());
+    assert!(replaced.relay_health.latency_ms.is_none());
+    assert!(replaced.relay_health.rtt_ewma_ms.is_none());
+    assert!(replaced.relay_health.jitter_ms.is_none());
+}
+
+#[tokio::test]
+async fn relay_probe_rtt_starts_at_writer_boundary_not_local_enqueue_time() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.76:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    let peer_session_generation = manager.peer_session_generation_sync("peer1").unwrap();
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(81))
+        .await;
+
+    let queued_at = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .unwrap();
+    let write_boundary = Instant::now();
+    assert!(manager.register_relay_probe_expectation_at_write_boundary(
+        "peer1",
+        generation,
+        11,
+        0x789,
+        relay_endpoint,
+        81,
+        peer_session_generation,
+        write_boundary,
+    ));
+    tokio::time::sleep(Duration::from_millis(12)).await;
+    assert!(
+        manager
+            .consume_relay_probe_ack_with_transport(
+                "peer1",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 11,
+                    owner_token: 0x789,
+                },
+                relay_endpoint,
+                Some(81),
+            )
+            .await
+    );
+    let latency_ms = manager
+        .get_connection("peer1")
+        .await
+        .unwrap()
+        .relay_health
+        .latency_ms
+        .unwrap();
+    assert!(latency_ms >= 8, "writer-boundary RTT should include the ACK wait");
+    assert!(
+        latency_ms < 500,
+        "the five-second local queue wait must not enter relay RTT"
+    );
+    assert!(write_boundary > queued_at);
+}
+
+#[tokio::test]
+async fn periodic_relay_sample_cannot_overwrite_forced_confirmation_expectation() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.77:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    let peer_session_generation = manager.peer_session_generation_sync("peer1").unwrap();
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(82))
+        .await;
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(82))
+            .await
+    );
+    assert!(manager.register_relay_probe_expectation_at_write_boundary(
+        "peer1",
+        generation,
+        12,
+        0xaaa,
+        relay_endpoint,
+        82,
+        peer_session_generation,
+        Instant::now(),
+    ));
+    let permit = manager
+        .relay_validation_write_permit_for_transport(
+            "peer1",
+            generation,
+            relay_endpoint,
+            82,
+        )
+        .await
+        .unwrap();
+    assert!(!manager.register_relay_validation_expectation_at_write_boundary(
+        "peer1",
+        generation,
+        13,
+        0xbbb,
+        relay_endpoint,
+        82,
+        permit,
+        Instant::now(),
+    ));
+    let installed = manager.relay_probe_expectations.lock().unwrap();
+    let installed = installed.get("peer1").unwrap();
+    assert_eq!(installed.request_id, 12);
+    assert_eq!(
+        installed.purpose,
+        crate::relay_probe::RelayProbePurpose::Confirmation
+    );
+}
+
+#[tokio::test]
+async fn relay_probe_ack_rejects_closed_peer_and_retired_peer_lifecycle() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.73:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let old_lifecycle = manager.peer_session_generation_sync("peer1").unwrap();
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(51))
+        .await;
+    assert!(manager.register_relay_probe_expectation_for_transport(
+        "peer1",
+        generation,
+        8,
+        0xdef,
+        relay_endpoint,
+        51,
+    ));
+    manager.update_state("peer1", ConnectionState::Closed).await;
+    assert!(
+        !manager
+            .consume_relay_probe_ack_with_transport(
+                "peer1",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 8,
+                    owner_token: 0xdef,
+                },
+                relay_endpoint,
+                Some(51),
+            )
+            .await
+    );
+
+    manager.remove_peer("peer1").await;
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(51))
+        .await;
+    assert_ne!(
+        manager.peer_session_generation_sync("peer1"),
+        Some(old_lifecycle)
+    );
+    manager.relay_probe_expectations.lock().unwrap().insert(
+        "peer1".to_string(),
+        crate::relay_probe::RelayProbeExpectation {
+            purpose: crate::relay_probe::RelayProbePurpose::Confirmation,
+            peer_session_generation: old_lifecycle,
+            generation,
+            request_id: 9,
+            owner_token: 0x123,
+            relay_endpoint: relay_endpoint.to_string(),
+            relay_connection_id: Some(51),
+            sent_at: Instant::now(),
+            rtt_sample_eligible: true,
+        },
+    );
+    assert!(
+        !manager
+            .consume_relay_probe_ack_with_transport(
+                "peer1",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 9,
+                    owner_token: 0x123,
+                },
+                relay_endpoint,
+                Some(51),
+            )
+            .await
+    );
+    let current = manager.get_connection("peer1").await.unwrap();
+    assert!(current.relay_confirmed_at.is_none());
+    assert!(current.relay_health.latency_ms.is_none());
+}
+
+#[tokio::test]
+async fn relay_business_marker_rejects_retired_connection_incarnation() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.74:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(62))
+        .await;
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(62),)
+            .await
+    );
+
+    assert!(
+        !manager
+            .mark_relay_first_business_sent_for_generation_with_transport(
+                "peer1",
+                generation,
+                relay_endpoint,
+                Some(61),
+            )
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation_with_transport(
+                "peer1",
+                generation,
+                relay_endpoint,
+                Some(62),
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn path_commit_ack_is_bound_to_relay_connection_incarnation() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "198.51.100.75:51831".parse().unwrap();
+    let relay_endpoint = "tls://relay.test:443";
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(71))
+        .await;
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(71),)
+            .await
+    );
+    let peer_session_generation = manager.peer_session_generation_sync("peer1").unwrap();
+    assert!(manager.register_path_commit_expectation_at_write_boundary(
+        "peer1",
+        generation,
+        10,
+        0x456,
+        relay_endpoint,
+        71,
+        peer_session_generation,
+        Instant::now(),
+    ));
+    let token = crate::path_commit::PathCommitToken {
+        kind: crate::path_commit::PathCommitKind::Ack,
+        generation,
+        request_id: 10,
+        owner_token: 0x456,
+    };
+
+    assert!(
+        !manager
+            .consume_path_commit_ack_with_transport("peer1", token, relay_endpoint, Some(72),)
+            .await
+    );
+    assert!(
+        manager
+            .consume_path_commit_ack_with_transport("peer1", token, relay_endpoint, Some(71),)
+            .await
+    );
+    assert_eq!(
+        manager
+            .get_connection("peer1")
+            .await
+            .unwrap()
+            .relay_first
+            .business_pathcommit_generation,
+        Some(generation)
+    );
 }

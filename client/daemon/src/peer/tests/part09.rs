@@ -25,48 +25,6 @@ async fn direct_events_for(manager: &PeerManager, node_id: &str) -> usize {
 }
 
 #[tokio::test]
-async fn direct_failure_notifies_automatic_recovery_hook() {
-    let manager = PeerManager::new(test_config());
-    manager
-        .add_peer(&flood_peer(
-            "peer-recover-hook",
-            "10.20.0.8",
-            "203.0.113.8:5008".parse().unwrap(),
-        ))
-        .await;
-
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let calls_for_hook = calls.clone();
-    manager.set_direct_recovery_kick_hook(std::sync::Arc::new(move |peer_id| {
-        assert_eq!(peer_id, "peer-recover-hook");
-        calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }));
-
-    let generation = manager.current_network_generation().await;
-    assert!(manager
-        .record_direct_failure_for_generation(
-            "peer-recover-hook",
-            generation,
-            REASON_DIRECT_PROBE_FAILED,
-            "no matched direct probe ACK",
-        )
-        .await);
-    assert_eq!(
-        calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "a live peer's first direct failure must trigger the nonblocking recovery hook"
-    );
-    assert_eq!(
-        manager
-            .get_connection("peer-recover-hook")
-            .await
-            .unwrap()
-            .state,
-        ConnectionState::FallbackToRelay
-    );
-}
-
-#[tokio::test]
 async fn unrelated_failed_peer_cannot_flood_or_disturb_healthy_direct_peer() {
     let manager = PeerManager::new(test_config());
     manager

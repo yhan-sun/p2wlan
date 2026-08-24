@@ -27,8 +27,8 @@ async fn run_control_loop(
     let signal_signing_identity = SignalSigningIdentity::from_config(&config);
     // Bounded cache of recently processed signal IDs: a redelivered batch
     // (lost ACK, expired lease) is deduped by signal id.
-    let recent_signal_ids: Arc<tokio::sync::Mutex<VecDeque<String>>> =
-        Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+    let recent_signal_ids: Arc<tokio::sync::Mutex<SignalDeliveryTracker>> =
+        Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
 
     info!("Connecting to control plane at {base_url}");
 
@@ -49,7 +49,7 @@ async fn run_control_loop(
                 match registration {
                     Ok((node_id, virtual_ip, cidr, server_relay_servers, relay_catalog)) => {
                         if let Some(health) = health.as_ref() {
-                            health.mark_control_success().await;
+                            health.mark_device_lease_success().await;
                         }
                         timeline.emit(
                             "control_registered",
@@ -345,7 +345,7 @@ async fn run_control_loop(
                             }
                             heartbeat_failures = 0;
                             if let Some(health) = health.as_ref() {
-                                health.mark_control_success().await;
+                                health.mark_device_lease_success().await;
                             }
                             let _ = event_tx.send(ControlEvent::ControlHealthy);
                         }
@@ -356,7 +356,8 @@ async fn run_control_loop(
                                 "Device lease refresh failed (attempt {heartbeat_failures}): {err_str}"
                             );
                             if let Some(health) = health.as_ref() {
-                                health.set_control_connected(false);
+                                health.set_control_api_reachable(false);
+                                health.set_device_lease_healthy(false);
                             }
                             let _ = event_tx.send(ControlEvent::Disconnected);
 
@@ -545,7 +546,8 @@ async fn run_control_loop(
                 else => {
                     // Command channel closed — exit.
                     if let Some(health) = health.as_ref() {
-                        health.set_control_connected(false);
+                        health.set_control_api_reachable(false);
+                        health.set_device_lease_healthy(false);
                     }
                     let _ = event_tx.send(ControlEvent::Disconnected);
                     return;
@@ -563,7 +565,8 @@ async fn run_control_loop(
             s.registered = false;
         }
         if let Some(health) = health.as_ref() {
-            health.set_control_connected(false);
+            health.set_control_api_reachable(false);
+            health.set_device_lease_healthy(false);
         }
         let _ = event_tx.send(ControlEvent::Disconnected);
         info!("Re-entering control registration cycle");

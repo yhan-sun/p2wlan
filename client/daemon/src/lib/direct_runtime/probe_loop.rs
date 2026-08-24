@@ -44,8 +44,18 @@ async fn run_direct_probe_loop(
             // scheduler: one plan per (peer_id, generation, epoch), shared
             // budgets, newest-wins pending targets.
             let epoch = target.recovery_epoch;
+            let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+                continue;
+            };
             let Some(session) = punch_deduplicator
-                .claim_for_epoch(&peer_id, epoch, PUNCH_PRIORITY_BACKGROUND, None)
+                .claim_for_epoch_for_peer_session(
+                    &peers,
+                    &peer_id,
+                    peer_session_generation,
+                    epoch,
+                    PUNCH_PRIORITY_BACKGROUND,
+                    None,
+                )
                 .await
             else {
                 peers
@@ -118,7 +128,17 @@ async fn run_direct_probe_loop(
             }
             let attempts = peers.recommended_punch_attempts(attempts).await;
             let generation = peers.current_network_generation().await;
+            if session.is_cancelled()
+                || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
+                continue;
+            }
             tokio::spawn(async move {
+                if session.is_cancelled()
+                    || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+                {
+                    return;
+                }
                 // The retry's receive delta is meaningful only for the
                 // Probe-v2 binding in force when this task was admitted.
                 // Keep that value fixed across an in-flight rekey rather
@@ -144,7 +164,10 @@ async fn run_direct_probe_loop(
                     },
                 );
                 let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
-                    if session.is_cancelled() {
+                    if session.is_cancelled()
+                        || !peers
+                            .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                    {
                         return;
                     }
                     // Direct may have been confirmed between target selection
@@ -163,6 +186,12 @@ async fn run_direct_probe_loop(
                                 "skipped background UDP retry because Direct was confirmed after target selection",
                             )
                             .await;
+                        return;
+                    }
+                    if session.is_cancelled()
+                        || !peers
+                            .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                    {
                         return;
                     }
                     // Pre-flight liveness gate (default OFF).  If a fresh Blocked verdict is
@@ -274,6 +303,12 @@ async fn run_direct_probe_loop(
                                 ),
                             )
                             .await;
+                        if session.is_cancelled()
+                            || !peers
+                                .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                        {
+                            return;
+                        }
                         let fast_result = udp
                             .punch_candidates_fast_prefix_until_not_direct_report(
                                 &peer_id,
@@ -348,12 +383,24 @@ async fn run_direct_probe_loop(
                                 .await;
                             return;
                         }
+                        if session.is_cancelled()
+                            || !peers
+                                .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                        {
+                            return;
+                        }
                     }
 
                     // Fresh mapping is an optimization for later Direct
                     // windows. It must not delay this retry's first ordinary
                     // sweep; the old ordering spent the fresh-mapping
                     // measurement in front of every retry.
+                    if session.is_cancelled()
+                        || !peers
+                            .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                    {
+                        return;
+                    }
                     let fresh_mapping_task = {
                         let udp = udp.clone();
                         let peers = peers.clone();
@@ -361,82 +408,169 @@ async fn run_direct_probe_loop(
                         let signal = signal.clone();
                         let cancellation = session.cancellation_handle();
                         tokio::spawn(async move {
-                        let fresh_generation = {
-                        let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
-                        let mut generation = if !peers.try_begin_fresh_generation(&peer_id).await {
-                            peers
-                                .record_direct_event(
+                            let targets =
+                                peers.stable_remote_punch_targets_for(&peer_id).await;
+                            if cancellation.is_cancelled()
+                                || !peers.peer_session_is_current_sync(
                                     &peer_id,
-                                    "fresh_mapping_epoch_quota_exhausted",
-                                    None,
-                                    None,
-                                    None,
-                                    format!(
-                                        "fresh-mapping generation skipped: the recovery epoch {epoch} already used its fresh-generation quota"
-                                    ),
+                                    peer_session_generation,
+                                )
+                            {
+                                return;
+                            }
+                            let Some(reservation) = peers
+                                .try_begin_fresh_generation_for_epoch(&peer_id, epoch)
+                                .await
+                            else {
+                                if cancellation.is_cancelled()
+                                    || !peers.peer_session_is_current_sync(
+                                        &peer_id,
+                                        peer_session_generation,
+                                    )
+                                {
+                                    return;
+                                }
+                                peers
+                                    .record_direct_event(
+                                        &peer_id,
+                                        "fresh_mapping_epoch_quota_exhausted",
+                                        None,
+                                        None,
+                                        None,
+                                        format!(
+                                            "fresh-mapping generation skipped: the recovery epoch {epoch} already used its fresh-generation quota"
+                                        ),
+                                    )
+                                    .await;
+                                return;
+                            };
+                            if cancellation.is_cancelled()
+                                || !peers.peer_session_is_current_sync(
+                                    &peer_id,
+                                    peer_session_generation,
+                                )
+                            {
+                                reservation.refund().await;
+                                return;
+                            }
+                            let recovery_identity = reservation.identity();
+                            reservation.commit();
+                            let mut generation = udp
+                                .run_fresh_mapping_generation(
+                                    &peer_id,
+                                    &signal.stun_servers,
+                                    signal.stun_timeout,
+                                    &targets,
+                                    probe_interval,
+                                    attempts.min(2),
+                                    Some(&cancellation),
                                 )
                                 .await;
-                            FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded)
-                        } else {
-                            udp.run_fresh_mapping_generation(
-                                &peer_id,
-                                &signal.stun_servers,
-                                signal.stun_timeout,
-                                &targets,
-                                probe_interval,
-                                attempts.min(2),
-                                Some(&cancellation),
-                            )
-                            .await
-                        };
-                        match &mut generation {
-                            FreshMappingOutcome::Accepted(result, handoff) => {
-                                if cancellation.is_cancelled() {
-                                    peers
-                                        .record_direct_event(
+                            if cancellation.is_cancelled()
+                                || !peers.peer_session_is_current_sync(
+                                    &peer_id,
+                                    peer_session_generation,
+                                )
+                            {
+                                return;
+                            }
+                            match &mut generation {
+                                FreshMappingOutcome::Accepted(result, handoff) => {
+                                    if cancellation.is_cancelled()
+                                        || !peers.peer_session_is_current_sync(
                                             &peer_id,
-                                            "fresh_mapping_skipped",
-                                            None,
-                                            None,
-                                            None,
-                                            "fresh-mapping generation completed but its punch session was superseded; not advertising the prediction",
+                                            peer_session_generation,
                                         )
-                                        .await;
-                                } else {
-                                    // The durable handoff happens only after
-                                    // the prediction is really advertised: a
-                                    // send failure or a cancellation during
-                                    // the advertise keeps the socket
-                                    // rollable.
-                                    let advertised = if !peers
-                                        .try_consume_recovery_http_quota(&peer_id)
-                                        .await
                                     {
-                                        peers
-                                            .record_direct_event(
-                                                &peer_id,
-                                                "fresh_mapping_epoch_http_quota_exhausted",
-                                                None,
-                                                None,
-                                                None,
-                                                format!(
-                                                    "fresh-mapping prediction was not advertised: the recovery epoch {epoch} used its HTTP publish quota"
-                                                ),
-                                            )
-                                            .await;
-                                        false
+                                        return;
                                     } else {
-                                        advertise_fresh_mapping_prediction(
-                                            &signal,
-                                            &peers,
-                                            &peer_id,
-                                            &*result,
-                                            &cancellation,
-                                        )
-                                        .await
-                                    };
-                                    if advertised {
-                                        if !handoff.finalize().await {
+                                        // The durable handoff happens only after
+                                        // the prediction is really advertised: a
+                                        // send failure or a cancellation during
+                                        // the advertise keeps the socket
+                                        // rollable.
+                                        let advertised = if !peers
+                                            .try_consume_recovery_http_quota_for_identity(
+                                                &peer_id,
+                                                recovery_identity,
+                                            )
+                                            .await
+                                        {
+                                            if cancellation.is_cancelled()
+                                                || !peers.peer_session_is_current_sync(
+                                                    &peer_id,
+                                                    peer_session_generation,
+                                                )
+                                            {
+                                                return;
+                                            }
+                                            peers
+                                                .record_direct_event(
+                                                    &peer_id,
+                                                    "fresh_mapping_epoch_http_quota_exhausted",
+                                                    None,
+                                                    None,
+                                                    None,
+                                                    format!(
+                                                        "fresh-mapping prediction was not advertised: the recovery epoch {epoch} used its HTTP publish quota"
+                                                    ),
+                                                )
+                                                .await;
+                                            false
+                                        } else if cancellation.is_cancelled()
+                                            || !peers.peer_session_is_current_sync(
+                                                &peer_id,
+                                                peer_session_generation,
+                                            )
+                                        {
+                                            return;
+                                        } else {
+                                            advertise_fresh_mapping_prediction(
+                                                &signal,
+                                                &peers,
+                                                &peer_id,
+                                                &*result,
+                                                &cancellation,
+                                            )
+                                            .await
+                                        };
+                                        if advertised
+                                            && !cancellation.is_cancelled()
+                                            && peers.peer_session_is_current_sync(
+                                                &peer_id,
+                                                peer_session_generation,
+                                            )
+                                        {
+                                            let finalized = handoff.finalize().await;
+                                            if cancellation.is_cancelled()
+                                                || !peers.peer_session_is_current_sync(
+                                                    &peer_id,
+                                                    peer_session_generation,
+                                                )
+                                            {
+                                                return;
+                                            }
+                                            if !finalized {
+                                                peers
+                                                    .record_direct_event(
+                                                        &peer_id,
+                                                        "fresh_mapping_skipped",
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        "fresh-mapping prediction was advertised but the socket was rolled back before the durable handoff; continuing with ordinary punching",
+                                                    )
+                                                    .await;
+                                            }
+                                        } else {
+                                            if cancellation.is_cancelled()
+                                                || !peers.peer_session_is_current_sync(
+                                                    &peer_id,
+                                                    peer_session_generation,
+                                                )
+                                            {
+                                                return;
+                                            }
                                             peers
                                                 .record_direct_event(
                                                     &peer_id,
@@ -444,47 +578,47 @@ async fn run_direct_probe_loop(
                                                     None,
                                                     None,
                                                     None,
-                                                    "fresh-mapping prediction was advertised but the socket was rolled back before the durable handoff; continuing with ordinary punching",
+                                                    "fresh-mapping prediction was not advertised; the generation's socket rolls back to the previous path",
                                                 )
                                                 .await;
                                         }
-                                    } else {
-                                        peers
-                                            .record_direct_event(
-                                                &peer_id,
-                                                "fresh_mapping_skipped",
-                                                None,
-                                                None,
-                                                None,
-                                                "fresh-mapping prediction was not advertised; the generation's socket rolls back to the previous path",
-                                            )
-                                            .await;
                                     }
                                 }
+                                FreshMappingOutcome::Rejected(reason) => {
+                                    if cancellation.is_cancelled()
+                                        || !peers.peer_session_is_current_sync(
+                                            &peer_id,
+                                            peer_session_generation,
+                                        )
+                                    {
+                                        return;
+                                    }
+                                    peers
+                                        .record_direct_event(
+                                            &peer_id,
+                                            "fresh_mapping_skipped",
+                                            None,
+                                            None,
+                                            None,
+                                            format!(
+                                                "fresh-mapping generation skipped: {}",
+                                                reason.label()
+                                            ),
+                                        )
+                                        .await;
+                                }
                             }
-                            FreshMappingOutcome::Rejected(reason) => {
-                                peers
-                                    .record_direct_event(
-                                        &peer_id,
-                                        "fresh_mapping_skipped",
-                                        None,
-                                        None,
-                                        None,
-                                        format!(
-                                            "fresh-mapping generation skipped: {}",
-                                            reason.label()
-                                        ),
-                                    )
-                                    .await;
-                            }
-                        }
-                        generation
-                    };
-                        drop(fresh_generation);
+                            drop(generation);
                         })
                     };
 
                     for endpoint in peers.direct_nat_maintainer_targets_for(&peer_id).await {
+                        if session.is_cancelled()
+                            || !peers
+                                .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                        {
+                            return;
+                        }
                         udp.spawn_nat_binding_maintainer(
                             &peer_id,
                             endpoint,
@@ -497,6 +631,12 @@ async fn run_direct_probe_loop(
                     // warm at a low sustained rate for as long as the relay
                     // carries the data plane, independent of the recovery
                     // epoch's one-time credit/plan quotas.
+                    if session.is_cancelled()
+                        || !peers
+                            .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                    {
+                        return;
+                    }
                     udp.spawn_relay_backoff_heartbeat(
                         &peer_id,
                         RELAY_BACKOFF_HEARTBEAT_INTERVAL,
@@ -514,6 +654,12 @@ async fn run_direct_probe_loop(
                     } else {
                         attempts
                     };
+                    if session.is_cancelled()
+                        || !peers
+                            .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                    {
+                        return;
+                    }
                     let punch_result = if stable_remote_scatter {
                         udp.punch_candidates_stable_unique_scatter_until_not_direct(
                             &peer_id,
@@ -537,8 +683,14 @@ async fn run_direct_probe_loop(
                             probe_interval,
                             effective_attempts,
                         )
-                        .await
+                            .await
                     };
+                    if session.is_cancelled()
+                        || !peers
+                            .peer_session_is_current_sync(&peer_id, peer_session_generation)
+                    {
+                        return;
+                    }
 
                     match punch_result {
                         Ok(report) if report.packets_sent == 0 => {
@@ -877,24 +1029,19 @@ async fn run_direct_probe_loop(
                                 timeout_detail.clone(),
                             )
                             .await;
-                        if let (true, Some(plan)) = (stable_remote_scatter, birthday_plan.as_ref()) {
+                        if let (true, Some(plan)) = (stable_remote_scatter, birthday_plan.as_ref())
+                        {
                             // The deadline can cut the session short even
                             // though the whole planned window was already
                             // sent (the session was only waiting out the ACK
                             // grace): advance the cursor so the next cycle
                             // does not rescan the same 3,000 ports.
-                            let covered_all = last_punch_report
-                                .as_ref()
-                                .is_some_and(|report| {
-                                    report.unique_target_endpoints as usize >= candidates.len()
-                                });
+                            let covered_all = last_punch_report.as_ref().is_some_and(|report| {
+                                report.unique_target_endpoints as usize >= candidates.len()
+                            });
                             if covered_all {
                                 let cursor_advanced = peers
-                                    .commit_birthday_probe_cursor(
-                                        &peer_id,
-                                        plan,
-                                        true,
-                                    )
+                                    .commit_birthday_probe_cursor(&peer_id, plan, true)
                                     .await;
                                 peers
                                     .record_direct_event(

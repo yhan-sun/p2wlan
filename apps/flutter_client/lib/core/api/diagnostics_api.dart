@@ -122,14 +122,13 @@ class DiagnosticsApi {
   Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
+    int? processId,
     Duration timeout = _eventsTimeout,
   }) async {
+    final query = <String, String>{'since': since.toString()};
+    if (processId != null) query['process_id'] = processId.toString();
     final body = await _getTextWithTimeout(
-      _endpoint(
-        diagnosticsUrl,
-        '/events',
-        queryParameters: {'since': since.toString()},
-      ),
+      _endpoint(diagnosticsUrl, '/events', queryParameters: query),
       'application/json',
       timeout,
     );

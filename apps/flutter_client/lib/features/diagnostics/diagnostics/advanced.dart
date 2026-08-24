@@ -154,6 +154,19 @@ class _RuntimeDetailsPanel extends StatelessWidget {
         value: strings.optionalBoolLabel(health?.controlConnected),
       ),
       _KvRow(
+        label: strings.controlApiReachable,
+        value: strings.optionalBoolLabel(health?.controlApiReachable),
+      ),
+      _KvRow(
+        label: strings.deviceLeaseHealthy,
+        value: strings.optionalBoolLabel(health?.deviceLeaseHealthy),
+      ),
+      if (health?.lastDeviceLeaseSuccessSecsAgo case final age?)
+        _KvRow(
+          label: strings.lastDeviceLeaseSuccess,
+          value: formatDuration(Duration(seconds: age)),
+        ),
+      _KvRow(
         label: strings.udpSockets,
         value: snapshot == null ? '—' : formatInt(snapshot!.udpSocketCount),
       ),

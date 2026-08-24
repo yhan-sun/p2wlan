@@ -21,6 +21,13 @@ class DiagnosticsSnapshot {
     required this.health,
     this.contractVersion = 0,
     this.revision = 0,
+    this.capturedRevision = 0,
+    this.capturedAtMs = 0,
+    this.peerSnapshotStale = false,
+    this.peerSnapshotAgeMs = 0,
+    this.peerSnapshotShape = '',
+    this.networkGeneration = 0,
+    this.uptimeMs = 0,
     this.readyPhase = 'unknown',
   });
 
@@ -35,6 +42,17 @@ class DiagnosticsSnapshot {
   /// Monotonic daemon status revision. Clients compare to their last-seen
   /// value to decide whether a full snapshot refetch is needed.
   final int revision;
+
+  /// Revision and capture metadata for the peer portion of this exact
+  /// snapshot. A stale/cache fallback must never masquerade as a newly fetched
+  /// peer catalog merely because the HTTP request returned 200.
+  final int capturedRevision;
+  final int capturedAtMs;
+  final bool peerSnapshotStale;
+  final int peerSnapshotAgeMs;
+  final String peerSnapshotShape;
+  final int networkGeneration;
+  final int uptimeMs;
 
   /// Authoritative daemon readiness phase (e.g. `connected_direct`,
   /// `connected_relay`, `discovering_peers`, `error`). Render this instead of
@@ -78,6 +96,16 @@ class DiagnosticsSnapshot {
       stats: PeerManagerStatsSnapshot.fromJson(_map(json['stats'])),
       health: HealthSnapshot.fromJson(_map(json['health'])),
       revision: _int(json['revision'], 0),
+      capturedRevision: _int(
+        json['captured_revision'],
+        _int(json['revision'], 0),
+      ),
+      capturedAtMs: _int(json['captured_at_ms']),
+      peerSnapshotStale: _bool(json['peer_snapshot_stale']),
+      peerSnapshotAgeMs: _int(json['peer_snapshot_age_ms']),
+      peerSnapshotShape: _string(json['peer_snapshot_shape']),
+      networkGeneration: _int(json['network_generation']),
+      uptimeMs: _int(json['uptime_ms']),
       readyPhase: _string(json['ready_phase'], 'unknown'),
     );
   }
@@ -360,25 +388,51 @@ class HealthSnapshot {
     required this.status,
     required this.reason,
     required this.controlConnected,
+    required this.controlApiReachable,
+    required this.deviceLeaseHealthy,
     required this.lastControlSuccessSecsAgo,
+    required this.lastDeviceLeaseSuccessSecsAgo,
     required this.reauthRequired,
     required this.criticalTasks,
   });
 
   final String status;
   final String? reason;
+
+  /// Composite truth used by older clients: both the control API and the
+  /// server-side device lease must be healthy.
   final bool controlConnected;
+
+  /// Whether ordinary authenticated control API requests are succeeding.
+  final bool controlApiReachable;
+
+  /// Whether heartbeat/endpoint updates are keeping this device's online
+  /// lease alive on the control server.
+  final bool deviceLeaseHealthy;
   final int? lastControlSuccessSecsAgo;
+  final int? lastDeviceLeaseSuccessSecsAgo;
   final bool reauthRequired;
   final List<TaskStatusSnapshot> criticalTasks;
 
   factory HealthSnapshot.fromJson(JsonMap json) {
+    final controlConnected = _bool(json['control_connected']);
     return HealthSnapshot(
       status: _string(json['status'], 'unknown'),
       reason: _nullableString(json['reason']),
-      controlConnected: _bool(json['control_connected']),
+      controlConnected: controlConnected,
+      // Keep compatibility with pre-split daemons without creating a false
+      // contradiction in the same UI snapshot.
+      controlApiReachable: json.containsKey('control_api_reachable')
+          ? _bool(json['control_api_reachable'])
+          : controlConnected,
+      deviceLeaseHealthy: json.containsKey('device_lease_healthy')
+          ? _bool(json['device_lease_healthy'])
+          : controlConnected,
       lastControlSuccessSecsAgo: _intOrNull(
         json['last_control_success_secs_ago'],
+      ),
+      lastDeviceLeaseSuccessSecsAgo: _intOrNull(
+        json['last_device_lease_success_secs_ago'],
       ),
       reauthRequired: _bool(json['reauth_required']),
       criticalTasks: [

@@ -163,14 +163,113 @@ pub(crate) enum ProbeKeyRole {
     Compatibility,
 }
 
+/// Process-local identity of one peer lifecycle.
+///
+/// This is deliberately separate from network and candidate generations: a
+/// peer can leave and rejoin under the same node ID, rotate its public key, go
+/// offline and come back, or restart while reusing otherwise identical
+/// candidates.  Authenticated UDP work snapshots this value together with the
+/// key that verified the packet and must re-check it before adopting evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PeerSessionGeneration(u64);
+
+impl PeerSessionGeneration {
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerMembershipEntry {
+    session_generation: PeerSessionGeneration,
+    online: bool,
+}
+
+#[derive(Debug, Default)]
+struct PeerMembershipState {
+    peers: HashMap<String, PeerMembershipEntry>,
+    next_session_generation: u64,
+}
+
+impl PeerMembershipState {
+    /// Publish a fully initialized peer, rotating its lifecycle identity when
+    /// requested.  Exhaustion fails closed instead of reusing a generation.
+    fn publish(&mut self, node_id: &str, online: bool, rotate: bool) -> bool {
+        if !rotate {
+            if let Some(entry) = self.peers.get_mut(node_id) {
+                entry.online = online;
+                return true;
+            }
+        }
+
+        let Some(next) = self.next_session_generation.checked_add(1) else {
+            self.peers.remove(node_id);
+            return false;
+        };
+        self.next_session_generation = next;
+        self.peers.insert(
+            node_id.to_string(),
+            PeerMembershipEntry {
+                session_generation: PeerSessionGeneration(next),
+                online,
+            },
+        );
+        true
+    }
+
+    fn remove(&mut self, node_id: &str) {
+        self.peers.remove(node_id);
+    }
+
+    fn contains(&self, node_id: &str) -> bool {
+        self.peers.contains_key(node_id)
+    }
+
+    fn active_generation(&self, node_id: &str) -> Option<PeerSessionGeneration> {
+        self.peers
+            .get(node_id)
+            .filter(|entry| entry.online)
+            .map(|entry| entry.session_generation)
+    }
+
+    fn active_generation_is_current(&self, node_id: &str, expected: PeerSessionGeneration) -> bool {
+        self.active_generation(node_id) == Some(expected)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProbeKeyCandidate {
     pub(crate) key: ProbeMacKey,
     pub(crate) role: ProbeKeyRole,
+    /// Peer lifecycle that owned this key when it was snapshotted.
+    pub(crate) session_generation: PeerSessionGeneration,
     /// Probe session that derived this key. This is diagnostics metadata only:
     /// authentication still relies exclusively on the MAC key and existing
     /// pending-binding transaction checks.
     pub(crate) session_id: Option<String>,
+}
+
+/// Deterministic one-shot pause after Probe-v2 MAC verification.  Production
+/// builds contain neither the field nor the branch; UDP tests use this to put
+/// a lifecycle transition exactly between verification and adoption.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct AuthenticatedProbeVerifyGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Barrier,
+    pub(crate) pending_emit_wait_started: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AuthenticatedProbeVerifyGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Barrier::new(2),
+            pending_emit_wait_started: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +292,22 @@ pub enum CandidateSetApplyResult {
     IgnoredStale,
     IgnoredExpired,
     PeerMissing,
+}
+
+/// Admission result for the identity-bound remote-incarnation preflight.
+///
+/// A signal whose server-bound sender key no longer matches the peer's current
+/// public key is terminally rejected before it can reset transport state.  A
+/// legacy signal without sender identity remains compatible and simply has no
+/// restart work when its generation is unencoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteCandidateIncarnationClaim {
+    IdentityMismatch,
+    NoReset,
+    Reset {
+        old_incarnation: u64,
+        new_incarnation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

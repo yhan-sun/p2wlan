@@ -36,10 +36,10 @@ fn update_latency_ewma(ewma_ms: &mut Option<u64>, jitter_ms: &mut Option<u64>, s
 
 fn record_relay_pong(
     diagnostics: &mut RelaySelectionDiagnostics,
-    ping_timestamp_ms: u64,
     received_at_ms: u64,
+    round_trip_time: Duration,
 ) {
-    let rtt_ms = received_at_ms.saturating_sub(ping_timestamp_ms);
+    let rtt_ms = duration_millis(round_trip_time);
     diagnostics.selected_last_pong_at_unix_ms = Some(received_at_ms);
     diagnostics.selected_last_pong_age_ms = Some(0);
     diagnostics.selected_last_pong_rtt_ms = Some(rtt_ms);

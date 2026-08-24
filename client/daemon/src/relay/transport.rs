@@ -13,6 +13,13 @@ pub struct RelayTransport {
     /// an old Wi-Fi/Ethernet interface is replaced promptly after handover.
     route_signature: Vec<String>,
     client: Arc<RelayClient>,
+    /// Synchronous lifetime gate for callbacks queued in the relay client's
+    /// writer.  A same-endpoint make-before-break replacement does not change
+    /// the peer/network generation, so those callbacks must also be retired
+    /// with the exact transport incarnation.  The guard is deliberately held
+    /// across expectation registration: retirement either wins first and the
+    /// callback is rejected, or waits and then cancels the registered entry.
+    write_boundaries_live: Arc<std::sync::Mutex<bool>>,
     peers: Arc<PeerManager>,
     /// Ticket audience of the connection's auth ticket, when authenticated.
     ticket_audience: Option<String>,
@@ -141,6 +148,7 @@ impl RelayTransport {
                 connect_latency_ms: duration_millis(started.elapsed()),
                 route_signature,
                 client: Arc::new(client),
+                write_boundaries_live: Arc::new(std::sync::Mutex::new(true)),
                 peers,
                 ticket_audience: None,
                 ticket_region: None,
@@ -196,6 +204,7 @@ impl RelayTransport {
             // not arm the production route watcher.
             route_signature: Vec::new(),
             client: Arc::new(p2pnet_relay::client::RelayClient::new_for_test()),
+            write_boundaries_live: Arc::new(std::sync::Mutex::new(true)),
             peers,
             ticket_audience: None,
             ticket_region: None,
@@ -236,13 +245,47 @@ impl RelayTransport {
     /// a new generation must not inherit a writer that can emit the old
     /// ciphertext later.
     pub fn abort_writer(&self) {
+        self.retire_write_boundaries();
         self.client.abort();
+    }
+
+    /// Retire callbacks queued by this exact relay connection.  The caller
+    /// must subsequently remove expectations for `connection_id()`; holding
+    /// this gate until any in-flight callback completes makes that removal a
+    /// linearization point even when a writer dequeues concurrently.
+    pub(crate) fn retire_write_boundaries(&self) {
+        *self
+            .write_boundaries_live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
     }
 
     /// Send a single encrypted packet through the relay.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<()> {
+        self.send_packet_inner(packet, None).await
+    }
+
+    /// Send a control packet whose expectation must be installed at the relay
+    /// client's real writer boundary, after local command-queue delay.
+    pub(crate) async fn send_packet_with_write_boundary<F>(
+        &self,
+        packet: &EncryptedPeerPacket,
+        write_boundary: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(Instant) -> bool + Send + 'static,
+    {
+        self.send_packet_inner(packet, Some(Box::new(write_boundary)))
+            .await
+    }
+
+    async fn send_packet_inner(
+        &self,
+        packet: &EncryptedPeerPacket,
+        write_boundary: Option<Box<dyn FnOnce(Instant) -> bool + Send + 'static>>,
+    ) -> Result<()> {
         debug!(
-            event = "relay_outbound_write_started",
+            event = "relay_outbound_write_submitted",
             peer_id = %packet.peer_id,
             relay_connection_id = self.relay_connection_id,
             relay_region = %self.relay_region,
@@ -251,13 +294,37 @@ impl RelayTransport {
             is_business = packet.is_business,
             wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
             relay_endpoint = %self.relay_endpoint,
-            "opaque encrypted frame entered the relay client's writer"
+            "opaque encrypted frame submitted to the relay client's bounded command queue"
         );
-        if let Err(error) = self
-            .client
-            .send_data(&packet.peer_id, &packet.wire_bytes)
-            .await
-        {
+        let send_result = match write_boundary {
+            Some(write_boundary) => {
+                let write_boundaries_live = Arc::clone(&self.write_boundaries_live);
+                self.client
+                    .send_data_with_write_boundary(
+                        &packet.peer_id,
+                        &packet.wire_bytes,
+                        move |sent_at| {
+                            let live = write_boundaries_live
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if !*live {
+                                return false;
+                            }
+                            // Keep the transport-incarnation guard while the
+                            // manager installs its expectation. Replacement
+                            // retirement then cannot race past registration.
+                            write_boundary(sent_at)
+                        },
+                    )
+                    .await
+            }
+            None => {
+                self.client
+                    .send_data(&packet.peer_id, &packet.wire_bytes)
+                    .await
+            }
+        };
+        if let Err(error) = send_result {
             warn!(
                 event = "relay_outbound_write_failed",
                 peer_id = %packet.peer_id,
@@ -381,18 +448,28 @@ impl RelayTransport {
                             .await;
                     }
                 }
-                RelayMessage::Pong { timestamp } => {
+                RelayMessage::Pong {
+                    timestamp,
+                    round_trip_time,
+                } => {
                     let received_at_ms = now_unix_millis();
-                    if let Some(ref diags) = relay_selection {
-                        let mut d = diags.write().await;
-                        record_relay_pong(&mut d, timestamp, received_at_ms);
+                    if let Some(round_trip_time) = round_trip_time {
+                        if let Some(ref diags) = relay_selection {
+                            let mut d = diags.write().await;
+                            record_relay_pong(&mut d, received_at_ms, round_trip_time);
+                        }
+                        debug!(
+                            "Received matched ping-pong keepalive response from relay {} with token {} rtt={}ms",
+                            self.relay_endpoint,
+                            timestamp,
+                            duration_millis(round_trip_time)
+                        );
+                    } else {
+                        debug!(
+                            "Ignored relay pong with unknown or expired token {} from {}",
+                            timestamp, self.relay_endpoint
+                        );
                     }
-                    debug!(
-                        "Received ping-pong keepalive response from relay {} with timestamp {} rtt={}ms",
-                        self.relay_endpoint,
-                        timestamp,
-                        received_at_ms.saturating_sub(timestamp)
-                    );
                 }
                 RelayMessage::Data { from_node, data } => {
                     debug!(

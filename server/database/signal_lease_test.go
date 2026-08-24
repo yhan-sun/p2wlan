@@ -196,7 +196,7 @@ func TestSignalBatchAckValidatesWholeBatch(t *testing.T) {
 	}
 }
 
-func TestSignalBatchAckScopesToOneOutstandingBatch(t *testing.T) {
+func TestSignalLeaseBlocksLaterRowsPerPairButNotOtherSenders(t *testing.T) {
 	db := openSignalLeaseDB(t)
 	senderA, target := createLeasePair(t, db)
 	targetDevice, err := db.GetDevice(target)
@@ -207,76 +207,76 @@ func TestSignalBatchAckScopesToOneOutstandingBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create sender b: %v", err)
 	}
-	senderC, err := db.CreateDevice(targetDevice.UserID, targetDevice.NetworkID, "sender-e-key", "lease-sender-e", "", "")
+
+	firstCreated, err := db.CreateSignalWithTraversalMetadata(
+		senderA, target, "peer_offer", []string{"203.0.113.10:45000"}, nil,
+		"g1", 0, 1, 0,
+	)
 	if err != nil {
-		t.Fatalf("create sender c: %v", err)
+		t.Fatalf("create first sender-a signal: %v", err)
 	}
-
-	// Three senders keep every (from,to) pair under its 256-row queue bound
-	// while placing 501 rows behind one receiver, forcing two live leases.
-	senders := []string{senderA, senderB.ID, senderC.ID}
-	for i := 0; i < 501; i++ {
-		if _, err := db.CreateSignalWithTraversalMetadata(
-			senders[i%len(senders)], target, "peer_reflexive",
-			[]string{fmt.Sprintf("203.0.113.10:%d", 45000+i)}, nil,
-			"", 0, int64(i+1), 0,
-		); err != nil {
-			t.Fatalf("create signal %d: %v", i, err)
-		}
-	}
-
 	first, _, err := db.ListSignalsWithLease(target)
 	if err != nil {
 		t.Fatalf("first lease poll: %v", err)
 	}
-	if len(first) != MaxSignalBatch {
-		t.Fatalf("expected first batch of %d, got %d", MaxSignalBatch, len(first))
+	if len(first) != 1 || first[0].ID != firstCreated.ID {
+		t.Fatalf("expected sender-a G1 as the first lease, got %+v", first)
 	}
+
+	// Create sender A's G2 only after G1 has an active lease. Sender B is an
+	// independent pair and must remain deliverable while A's queue is fenced.
+	secondCreated, err := db.CreateSignalWithTraversalMetadata(
+		senderA, target, "peer_offer", []string{"203.0.113.10:45001"}, nil,
+		"g2", 0, 2, 0,
+	)
+	if err != nil {
+		t.Fatalf("create sender-a G2: %v", err)
+	}
+	otherCreated, err := db.CreateSignalWithTraversalMetadata(
+		senderB.ID, target, "peer_offer", []string{"203.0.113.20:45000"}, nil,
+		"b1", 0, 1, 0,
+	)
+	if err != nil {
+		t.Fatalf("create sender-b G1: %v", err)
+	}
+
 	second, _, err := db.ListSignalsWithLease(target)
 	if err != nil {
 		t.Fatalf("second lease poll: %v", err)
 	}
-	if len(second) != 1 {
-		t.Fatalf("expected second batch of one row, got %d", len(second))
+	if len(second) != 1 || second[0].ID != otherCreated.ID {
+		t.Fatalf("sender B must progress while sender A G2 remains fenced; got %+v", second)
 	}
 
-	secondEntries := []struct{ ID, Token string }{{second[0].ID, second[0].DeliveryToken}}
-	secondToken := BatchTokenFor(secondEntries)
-	deleted, err := db.AckSignalBatch(target, secondToken)
+	// Even the legacy delete-on-GET path must not overtake sender A's active G1.
+	legacy, err := db.ListAndDeleteSignals(target)
 	if err != nil {
-		t.Fatalf("ack second batch: %v", err)
+		t.Fatalf("legacy poll while sender-a G1 is leased: %v", err)
 	}
-	if deleted != 1 {
-		t.Fatalf("second batch ACK must delete exactly one row, deleted %d", deleted)
+	if len(legacy) != 0 {
+		t.Fatalf("legacy delivery must not overtake sender-a G1, got %+v", legacy)
 	}
 
-	// The first lease remains active and must not be consumed by the second
-	// batch's ACK.  Its own batch ACK still succeeds afterwards.
-	var firstLeaseRows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM signals WHERE to_node_id = ? AND delivery_batch_token != ''`, target).Scan(&firstLeaseRows); err != nil {
-		t.Fatalf("count remaining leased rows: %v", err)
-	}
-	if firstLeaseRows != MaxSignalBatch {
-		t.Fatalf("second batch ACK must preserve first lease (%d rows), got %d", MaxSignalBatch, firstLeaseRows)
-	}
-	firstEntries := make([]struct{ ID, Token string }, 0, len(first))
-	for _, signal := range first {
-		firstEntries = append(firstEntries, struct{ ID, Token string }{signal.ID, signal.DeliveryToken})
-	}
-	firstToken := BatchTokenFor(firstEntries)
-	deleted, err = db.AckSignalBatch(target, firstToken)
+	deleted, err := db.AckSignals(target, []SignalAck{
+		{ID: second[0].ID, DeliveryToken: second[0].DeliveryToken},
+		{ID: first[0].ID, DeliveryToken: first[0].DeliveryToken},
+	})
 	if err != nil {
-		t.Fatalf("ack first batch: %v", err)
+		t.Fatalf("ack independent heads: %v", err)
 	}
-	if deleted != MaxSignalBatch {
-		t.Fatalf("first batch ACK must delete %d rows, deleted %d", MaxSignalBatch, deleted)
+	if deleted != 2 {
+		t.Fatalf("expected two head deletions, got %d", deleted)
 	}
-	remaining, err := db.ListAndDeleteSignals(target)
+
+	third, _, err := db.ListSignalsWithLease(target)
 	if err != nil {
-		t.Fatalf("final poll: %v", err)
+		t.Fatalf("poll after sender-a head ACK: %v", err)
 	}
-	if len(remaining) != 0 {
-		t.Fatalf("all leased rows should be acknowledged, got %d", len(remaining))
+	if len(third) != 1 || third[0].ID != secondCreated.ID {
+		t.Fatalf("sender-a G2 must become deliverable only after G1 ACK; got %+v", third)
+	}
+	if third[0].SignalSeq != 2 {
+		t.Fatalf("sender-a G2 sequence changed: got %d", third[0].SignalSeq)
 	}
 }
 

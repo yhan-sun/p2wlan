@@ -5,7 +5,23 @@ impl PeerManager {
     /// address that was not present in the control-plane candidate set because
     /// the probe MAC proves the sender controls the peer identity.
     pub async fn learn_authenticated_endpoint(&self, node_id: &str, endpoint: SocketAddr) -> bool {
-        let generation = self.current_network_generation().await;
+        let epoch_gate = self.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        self.learn_authenticated_endpoint_in_epoch(&epoch_guard, node_id, endpoint)
+            .await
+    }
+
+    /// Learn authenticated endpoint evidence inside an existing network-epoch
+    /// transaction. The explicit guard prevents UDP adoption from accidentally
+    /// calling the public lock-taking wrapper while it already owns the same
+    /// non-reentrant mutex.
+    pub(crate) async fn learn_authenticated_endpoint_in_epoch(
+        &self,
+        epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        node_id: &str,
+        endpoint: SocketAddr,
+    ) -> bool {
+        let generation = self.current_network_generation_sync();
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
@@ -30,8 +46,7 @@ impl PeerManager {
             conn.candidates.push(endpoint_text.clone());
         }
         let source = conn.learned_candidate_source(endpoint, CandidatePairSource::PeerReflexive);
-        conn.candidate_sources
-            .insert(endpoint_text, source);
+        conn.candidate_sources.insert(endpoint_text, source);
         conn.mark_candidate_pair_probing_with_source(endpoint, generation, source);
         let pruned = conn.prune_stale_peer_reflexive_candidates_for_ip(endpoint, generation);
         if pruned > 0 {
@@ -59,8 +74,12 @@ impl PeerManager {
         // the strongest possible recovery signal, strictly stronger than any
         // control-plane heartbeat.  Unquarantine so the learned endpoint can
         // actually be probed instead of being frozen out of the target set.
-        self.unquarantine_peer(node_id, "authenticated inbound punch observed")
-            .await;
+        self.unquarantine_peer_in_epoch(
+            epoch_guard,
+            node_id,
+            "authenticated inbound punch observed",
+        )
+        .await;
         true
     }
 
@@ -203,5 +222,4 @@ impl PeerManager {
     pub async fn select_endpoint_from_addr(&self, endpoint: SocketAddr) -> Option<String> {
         self.learn_endpoint_from_addr(endpoint).await
     }
-
 }

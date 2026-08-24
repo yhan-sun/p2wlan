@@ -125,6 +125,10 @@ pub(super) fn peer_metadata_changed(known: &PeerInfo, peer: &PeerInfo) -> bool {
         || known.nat_type != peer.nat_type
         || known.virtual_ip != peer.virtual_ip
         || known.online != peer.online
+        // `last_seen` is user-visible diagnostics and part of peer liveness.
+        // Suppressing heartbeat-only updates left PeerManager permanently on
+        // the join-time value even while ClientState kept advancing it.
+        || known.last_seen != peer.last_seen
         || known.relay_rtt_ms != peer.relay_rtt_ms
 }
 

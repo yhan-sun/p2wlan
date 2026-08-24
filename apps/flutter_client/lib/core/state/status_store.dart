@@ -18,6 +18,7 @@ class StatusStore extends ChangeNotifier {
     this.backgroundRefreshInterval = defaultBackgroundPollingInterval,
     this.maxSnapshotAge = defaultMaxSnapshotAge,
     this.enableFreshnessTimer = false,
+    this.enableEventPolling = true,
     this.startupCatalogRefreshTimeout = defaultStartupCatalogRefreshTimeout,
     this.startupCatalogRefreshInterval = defaultStartupCatalogRefreshInterval,
     this.routeVerificationInterval = Duration.zero,
@@ -64,12 +65,16 @@ class StatusStore extends ChangeNotifier {
   final Duration backgroundRefreshInterval;
   final Duration maxSnapshotAge;
   final bool enableFreshnessTimer;
+  final bool enableEventPolling;
   final Duration startupCatalogRefreshTimeout;
   final Duration startupCatalogRefreshInterval;
   final Duration routeVerificationInterval;
 
   Timer? _timer;
   Timer? _staleTimer;
+  Future<void>? _eventLoopFuture;
+  var _eventLoopGeneration = 0;
+  var _disposed = false;
   DiagnosticsSnapshot? _snapshot;
   var _healthReachable = false;
   var _routeHealthy = false;
@@ -147,10 +152,16 @@ class StatusStore extends ChangeNotifier {
       if (enabled && refreshImmediately) {
         unawaited(refreshUntilPeerCatalogSettled(silent: true));
       }
+      if (enabled) _ensureEventLoop();
       return;
     }
     _autoRefreshEnabled = enabled;
     _schedulePolling();
+    if (enabled) {
+      _ensureEventLoop();
+    } else {
+      _eventLoopGeneration += 1;
+    }
     if (enabled && refreshImmediately) {
       unawaited(refreshUntilPeerCatalogSettled(silent: true));
     }
@@ -176,6 +187,100 @@ class StatusStore extends ChangeNotifier {
         ? autoRefreshInterval
         : backgroundRefreshInterval;
     _timer = Timer.periodic(interval, (_) => unawaited(refresh(silent: true)));
+  }
+
+  void _ensureEventLoop() {
+    if (!enableEventPolling ||
+        !_autoRefreshEnabled ||
+        _disposed ||
+        _snapshot == null ||
+        _eventLoopFuture != null) {
+      return;
+    }
+    final generation = _eventLoopGeneration;
+    final url = settingsStore.settings.diagnosticsUrl;
+    late final Future<void> loop;
+    loop = _runEventLoop(url, generation);
+    _eventLoopFuture = loop;
+    unawaited(
+      loop.whenComplete(() {
+        if (identical(_eventLoopFuture, loop)) {
+          _eventLoopFuture = null;
+          if (!_disposed && _autoRefreshEnabled && _snapshot != null) {
+            scheduleMicrotask(_ensureEventLoop);
+          }
+        }
+      }),
+    );
+  }
+
+  Future<void> _runEventLoop(String url, int generation) async {
+    var cursor = _snapshot?.revision ?? 0;
+    var processId = _snapshot?.processId;
+    while (!_disposed &&
+        _autoRefreshEnabled &&
+        generation == _eventLoopGeneration &&
+        url == settingsStore.settings.diagnosticsUrl &&
+        _snapshot != null) {
+      EventsResponse response;
+      try {
+        response = await diagnosticsApi.fetchEvents(
+          url,
+          since: cursor,
+          processId: processId,
+        );
+      } catch (_) {
+        if (_disposed || generation != _eventLoopGeneration) return;
+        await Future<void>.delayed(const Duration(seconds: 1));
+        continue;
+      }
+      if (_disposed ||
+          !_autoRefreshEnabled ||
+          generation != _eventLoopGeneration ||
+          url != settingsStore.settings.diagnosticsUrl) {
+        return;
+      }
+
+      final current = _snapshot;
+      if (current == null) return;
+      if (current.processId != processId) {
+        // The long poll completed against a daemon incarnation that has since
+        // been replaced. Start the next request at the new process revision.
+        processId = current.processId;
+        cursor = current.revision;
+        continue;
+      }
+
+      final ringGap = response.oldestSeq > 0 && response.oldestSeq > cursor + 1;
+      final revisionReset = response.revision < cursor;
+      final eventProcessChanged =
+          response.processId != null &&
+          processId != null &&
+          response.processId != processId;
+      final hasChange =
+          response.revision > cursor ||
+          response.events.any((event) => event.seq > cursor);
+      if (response.resetRequired ||
+          ringGap ||
+          revisionReset ||
+          eventProcessChanged ||
+          hasChange) {
+        final beforeRevision = current.revision;
+        await refresh(silent: true);
+        if (_disposed || generation != _eventLoopGeneration) return;
+        final refreshed = _snapshot;
+        if (refreshed == null) return;
+        processId = refreshed.processId;
+        cursor = refreshed.revision;
+        if (refreshed.processId == current.processId &&
+            cursor <= beforeRevision &&
+            response.revision > cursor) {
+          // Avoid a tight loop if an event races a temporarily unavailable
+          // snapshot; the next long poll/refetch will converge.
+          await Future<void>.delayed(const Duration(milliseconds: 250));
+        }
+      }
+    }
   }
 
   /// Refreshes the daemon snapshot. Automatic polling passes [silent] so the
@@ -253,6 +358,15 @@ class StatusStore extends ChangeNotifier {
         }
         final fetchedAt = DateTime.now();
         _statusSnapshotTimedOut = false;
+        if (!_snapshotCanReplace(snapshot, _snapshot)) {
+          // An older response from the same daemon process must never roll the
+          // UI, latency, or peer catalog backwards. It is still evidence that
+          // the HTTP endpoint is alive, but it is not a successful status
+          // snapshot and therefore does not refresh the stale deadline.
+          _lastError = null;
+          _lastFetchedAt = fetchedAt;
+          return;
+        }
         _updatePeerTrafficRates(snapshot, fetchedAt);
         _snapshot = snapshot;
         if (_shouldVerifyRoutes(fetchedAt)) {
@@ -267,7 +381,15 @@ class StatusStore extends ChangeNotifier {
         _lastError = null;
         _lastFetchedAt = fetchedAt;
         _lastSuccessfulStatusAt = _lastFetchedAt;
-        _markSnapshotFresh();
+        if (!snapshot.peerSnapshotStale &&
+            snapshot.capturedRevision == snapshot.revision) {
+          _markSnapshotFresh();
+        } else {
+          _snapshotStale = true;
+          _staleTimer?.cancel();
+          _staleTimer = null;
+        }
+        _ensureEventLoop();
       } catch (error) {
         if (generation != _refreshGeneration) {
           _refreshPending = true;
@@ -369,6 +491,36 @@ class StatusStore extends ChangeNotifier {
     });
   }
 
+  static bool _snapshotCanReplace(
+    DiagnosticsSnapshot candidate,
+    DiagnosticsSnapshot? current,
+  ) {
+    if (current == null) return true;
+
+    final candidateProcess = candidate.processId;
+    final currentProcess = current.processId;
+    if (candidateProcess != null &&
+        currentProcess != null &&
+        candidateProcess != currentProcess) {
+      return true;
+    }
+
+    // PID reuse is possible. A lower uptime is affirmative evidence of a new
+    // daemon incarnation even when the OS reused the same numeric PID.
+    final restarted =
+        candidate.uptimeMs > 0 &&
+        current.uptimeMs > 0 &&
+        candidate.uptimeMs < current.uptimeMs;
+    if (restarted) return true;
+
+    if (candidate.revision < current.revision) return false;
+    if (candidate.revision == current.revision &&
+        candidate.networkGeneration < current.networkGeneration) {
+      return false;
+    }
+    return true;
+  }
+
   Future<void> refreshUntilPeerCatalogSettled({
     bool skipInitialRefresh = false,
     bool silent = false,
@@ -382,8 +534,6 @@ class StatusStore extends ChangeNotifier {
     var refreshCount = 1;
     var stableCatalogCount = 0;
     var previousSignature = _peerCatalogSignature(_snapshot);
-    var bestSnapshot = _snapshot;
-
     while (refreshCount < _startupCatalogMaxRefreshes &&
         DateTime.now().isBefore(deadline)) {
       if (startupCatalogRefreshInterval > Duration.zero) {
@@ -396,10 +546,6 @@ class StatusStore extends ChangeNotifier {
       refreshCount += 1;
 
       final currentSnapshot = _snapshot;
-      if (_isPeerCatalogMoreComplete(currentSnapshot, bestSnapshot)) {
-        bestSnapshot = currentSnapshot;
-      }
-
       final currentSignature = _peerCatalogSignature(currentSnapshot);
       if (currentSignature == previousSignature) {
         stableCatalogCount += 1;
@@ -414,11 +560,6 @@ class StatusStore extends ChangeNotifier {
           stableCatalogCount >= 1) {
         break;
       }
-    }
-
-    if (_isPeerCatalogMoreComplete(bestSnapshot, _snapshot)) {
-      _snapshot = bestSnapshot;
-      notifyListeners();
     }
   }
 
@@ -543,34 +684,12 @@ class StatusStore extends ChangeNotifier {
     return peerKeys.join('\n');
   }
 
-  static bool _isPeerCatalogMoreComplete(
-    DiagnosticsSnapshot? candidate,
-    DiagnosticsSnapshot? current,
-  ) {
-    if (candidate == null) return false;
-    if (current == null) return true;
-    if (candidate.health.controlConnected != current.health.controlConnected) {
-      return candidate.health.controlConnected;
-    }
-    if (candidate.peers.length != current.peers.length) {
-      return candidate.peers.length > current.peers.length;
-    }
-    final candidateLastSuccess = candidate.health.lastControlSuccessSecsAgo;
-    final currentLastSuccess = current.health.lastControlSuccessSecsAgo;
-    if (candidateLastSuccess != null && currentLastSuccess == null) {
-      return true;
-    }
-    if (candidateLastSuccess == null || currentLastSuccess == null) {
-      return false;
-    }
-    return candidateLastSuccess < currentLastSuccess;
-  }
-
   void _handleSettingsChanged() {
     final nextDiagnosticsUrl = settingsStore.settings.diagnosticsUrl;
     if (nextDiagnosticsUrl == _lastDiagnosticsUrl) return;
     _lastDiagnosticsUrl = nextDiagnosticsUrl;
     _refreshGeneration += 1;
+    _eventLoopGeneration += 1;
     _refreshPending = true;
     _healthReachable = false;
     _clearSnapshot();
@@ -589,6 +708,8 @@ class StatusStore extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _eventLoopGeneration += 1;
     _timer?.cancel();
     _staleTimer?.cancel();
     settingsStore.removeListener(_handleSettingsChanged);

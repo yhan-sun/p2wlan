@@ -274,7 +274,10 @@ func enforceSignalQueueBounds(tx *sql.Tx, fromNodeID, toNodeID string, payloadBy
 //
 // Rows currently HELD by an ACK-mode delivery lease are never returned or
 // deleted here: a legacy delete-on-GET poll must not steal a signal a
-// lease-mode client already received but has not yet ACKed.
+// lease-mode client already received but has not yet ACKed.  An active lease
+// also fences every LATER row of the same (from,to) pair.  Without that pair
+// head fence a legacy poll could consume G2 while an ACK-mode client was still
+// processing G1, violating the signal_seq ordering contract.
 func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 	tx, err := db.Begin()
 	if err != nil {
@@ -287,9 +290,17 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 		return nil, err
 	}
 
-	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, sender_public_key, signal_seq, created_at
-		FROM signals WHERE to_node_id = ? AND created_at >= ? AND lease_expires_at <= ?
-		ORDER BY signal_seq ASC, created_at ASC, id ASC LIMIT ?`, toNodeID, now-signalTTLSeconds, now, MaxSignalBatch)
+	rows, err := tx.Query(`SELECT s.id, s.from_node_id, s.to_node_id, s.type, s.protocol_version, s.candidates, s.candidate_sources, s.candidate_generation, s.candidates_expires_at_ms, s.session_id, s.probe_ephemeral_public_key, s.handshake, s.punch_at_ms, s.sender_public_key, s.signal_seq, s.created_at
+		FROM signals AS s
+		WHERE s.to_node_id = ? AND s.created_at >= ? AND s.lease_expires_at <= ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM signals AS earlier
+			WHERE earlier.from_node_id = s.from_node_id
+			  AND earlier.to_node_id = s.to_node_id
+			  AND earlier.signal_seq < s.signal_seq
+			  AND earlier.lease_expires_at > ?
+		  )
+		ORDER BY s.signal_seq ASC, s.created_at ASC, s.id ASC LIMIT ?`, toNodeID, now-signalTTLSeconds, now, now, MaxSignalBatch)
 	if err != nil {
 		return nil, err
 	}
@@ -364,6 +375,10 @@ func (db *DB) ListAndDeleteSignals(toNodeID string) ([]Signal, error) {
 // Delivery order is the per-pair monotonic server sequence.  A row is only
 // delivered when it is free: no active lease (either never leased or the
 // lease EXPIRED, so a client that died mid-processing gets a redelivery).
+// An active lease on an earlier row fences every later row of THAT pair. Other
+// senders remain independent and can still be leased in the same poll. Rows
+// that are free together may be leased in one ordered batch; after a batch is
+// split by MaxSignalBatch, its leased prefix fences the remaining suffix.
 // The lease keeps the row invisible to every other poll — including the
 // legacy delete-on-GET path — until the client ACKs it (idempotently) or the
 // lease expires.
@@ -383,9 +398,17 @@ func (db *DB) ListSignalsWithLease(toNodeID string) ([]Signal, int64, error) {
 		return nil, 0, err
 	}
 
-	rows, err := tx.Query(`SELECT id, from_node_id, to_node_id, type, protocol_version, candidates, candidate_sources, candidate_generation, candidates_expires_at_ms, session_id, probe_ephemeral_public_key, handshake, punch_at_ms, sender_public_key, signal_seq, created_at
-		FROM signals WHERE to_node_id = ? AND created_at >= ? AND lease_expires_at <= ?
-		ORDER BY signal_seq ASC, created_at ASC, id ASC LIMIT ?`, toNodeID, now-signalTTLSeconds, now, MaxSignalBatch)
+	rows, err := tx.Query(`SELECT s.id, s.from_node_id, s.to_node_id, s.type, s.protocol_version, s.candidates, s.candidate_sources, s.candidate_generation, s.candidates_expires_at_ms, s.session_id, s.probe_ephemeral_public_key, s.handshake, s.punch_at_ms, s.sender_public_key, s.signal_seq, s.created_at
+		FROM signals AS s
+		WHERE s.to_node_id = ? AND s.created_at >= ? AND s.lease_expires_at <= ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM signals AS earlier
+			WHERE earlier.from_node_id = s.from_node_id
+			  AND earlier.to_node_id = s.to_node_id
+			  AND earlier.signal_seq < s.signal_seq
+			  AND earlier.lease_expires_at > ?
+		  )
+		ORDER BY s.signal_seq ASC, s.created_at ASC, s.id ASC LIMIT ?`, toNodeID, now-signalTTLSeconds, now, now, MaxSignalBatch)
 	if err != nil {
 		return nil, 0, err
 	}

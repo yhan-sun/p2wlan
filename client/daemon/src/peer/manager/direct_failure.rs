@@ -1,3 +1,10 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectFailureCommitOutcome {
+    Rejected,
+    IgnoredConfirmedDirect,
+    Applied,
+}
+
 impl PeerManager {
     /// Record a failed direct-path event and enter relay fallback state.
     pub async fn record_direct_failure(&self, node_id: &str, reason: impl Into<String>) {
@@ -60,10 +67,73 @@ impl PeerManager {
         reason: impl Into<String>,
         local_endpoint: Option<SocketAddr>,
     ) -> bool {
-        if generation != self.current_network_generation().await {
+        // Snapshot before the first await. If this work was admitted for one
+        // lifecycle and PeerLeft/offline/rejoin wins the epoch gate first, the
+        // exact-generation check below rejects the stale commit instead of
+        // treating the replacement's `online=true` as equivalent (ABA).
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
             return false;
-        }
+        };
+        self.record_direct_failure_for_generation_and_peer_session_with_local_endpoint(
+            node_id,
+            generation,
+            peer_session_generation,
+            code,
+            reason,
+            local_endpoint,
+        )
+        .await
+    }
+
+    /// Commit a delayed failure only for the lifecycle that admitted the work.
+    /// Callers such as handshake timeout owners already carry this stamp and
+    /// must not re-snapshot after a leave/rejoin boundary.
+    pub(crate) async fn record_direct_failure_for_generation_and_peer_session_with_local_endpoint(
+        &self,
+        node_id: &str,
+        generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+        local_endpoint: Option<SocketAddr>,
+    ) -> bool {
+        self.record_direct_failure_commit_for_peer_session(
+            node_id,
+            generation,
+            peer_session_generation,
+            code,
+            reason,
+            local_endpoint,
+            false,
+        )
+        .await
+            != DirectFailureCommitOutcome::Rejected
+    }
+
+    /// Shared exact-lifecycle commit. `ignore_confirmed_direct` is used by
+    /// opportunistic probe-batch timeouts: the Direct-state check and the
+    /// failure mutation must occur in the same epoch critical section, or a
+    /// promotion between two separate checks can be torn down by a late batch.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_direct_failure_commit_for_peer_session(
+        &self,
+        node_id: &str,
+        generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+        local_endpoint: Option<SocketAddr>,
+        ignore_confirmed_direct: bool,
+    ) -> DirectFailureCommitOutcome {
         let reason = reason.into();
+        let code = code.into();
+        let epoch_gate = self.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        if generation != self.current_network_generation_sync()
+            || !self.peer_session_is_current_sync(node_id, peer_session_generation)
+        {
+            return DirectFailureCommitOutcome::Rejected;
+        }
         // NOTE: a no-ACK probe batch must NOT move the recovery stage into
         // RelayBackoff — the stage machine advances Initial -> Predicted ->
         // ScatterSmall -> ScatterExtended on no-ACK feedback (see
@@ -71,13 +141,35 @@ impl PeerManager {
         // RelayBackoff here would short-circuit that progression and cap the
         // scan at 96 ports forever.  Only true hard failures (send errors,
         // handshake timeouts) call `mark_recovery_relay_backoff` explicitly.
-        let (probed_sources, request_recovery_kick) = {
+        let probed_sources = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
-                return false;
+                return DirectFailureCommitOutcome::Rejected;
             };
-            let request_recovery_kick = conn.online && conn.state != ConnectionState::Closed;
-            let code = code.into();
+            if !conn.online || conn.state == ConnectionState::Closed {
+                return DirectFailureCommitOutcome::Rejected;
+            }
+            if ignore_confirmed_direct
+                && conn.state == ConnectionState::Direct
+                && conn.direct_generation == generation
+            {
+                conn.record_direct_event(
+                    generation,
+                    "direct_probe_batch_timeout_ignored",
+                    conn.endpoint,
+                    Some(conn.candidate_pairs.len()),
+                    None,
+                    format!("{reason}; ignored because encrypted Direct is already confirmed"),
+                );
+                debug!(
+                    event = "direct_probe_batch_timeout_ignored",
+                    peer_id = %node_id,
+                    remote_endpoint = ?conn.endpoint,
+                    reason = %reason,
+                    "ignored background/reclaim Direct probe failure for confirmed Direct peer"
+                );
+                return DirectFailureCommitOutcome::IgnoredConfirmedDirect;
+            }
             conn.direct_health
                 .record_failure(code.clone(), reason.clone());
             conn.record_direct_event(
@@ -115,16 +207,11 @@ impl PeerManager {
                     conn.direct_health.last_error.as_deref().unwrap_or("direct path failed")
                 );
             }
-            (probed_sources, request_recovery_kick)
+            probed_sources
         };
+        drop(epoch_guard);
         self.record_traversal_failures(probed_sources).await;
-        if request_recovery_kick {
-            // The callback is deliberately invoked only after the connection
-            // lock is released.  It must be nonblocking and may spawn the
-            // candidate publication / punch retry asynchronously.
-            self.request_direct_recovery_kick(node_id);
-        }
-        true
+        DirectFailureCommitOutcome::Applied
     }
 
     /// Record a failed background/reclaim probe batch.
@@ -139,48 +226,38 @@ impl PeerManager {
         reason: impl Into<String>,
     ) -> bool {
         let reason = reason.into();
-        if generation != self.current_network_generation().await {
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
             return false;
-        }
-
-        {
-            let mut conns = self.connections.write().await;
-            let Some(conn) = conns.get_mut(node_id) else {
-                return false;
-            };
-            if conn.state == ConnectionState::Direct && conn.direct_generation == generation {
-                conn.record_direct_event(
+        };
+        let outcome = self
+            .record_direct_failure_commit_for_peer_session(
+                node_id,
+                generation,
+                peer_session_generation,
+                REASON_DIRECT_PROBE_FAILED,
+                reason.clone(),
+                None,
+                true,
+            )
+            .await;
+        match outcome {
+            DirectFailureCommitOutcome::Rejected => false,
+            DirectFailureCommitOutcome::IgnoredConfirmedDirect => true,
+            DirectFailureCommitOutcome::Applied => {
+                // A batch with zero matched ACKs is the explicit feedback that
+                // widens the recovery stage. Bind this secondary ledger write
+                // to the same peer lifecycle so a leave/rejoin after the state
+                // commit cannot advance the replacement's epoch.
+                self.advance_recovery_stage_after_no_ack_for_peer_session(
+                    node_id,
                     generation,
-                    "direct_probe_batch_timeout_ignored",
-                    conn.endpoint,
-                    Some(conn.candidate_pairs.len()),
-                    None,
-                    format!(
-                        "{reason}; ignored because encrypted Direct is already confirmed"
-                    ),
-                );
-                debug!(
-                    event = "direct_probe_batch_timeout_ignored",
-                    peer_id = %node_id,
-                    remote_endpoint = ?conn.endpoint,
-                    reason = %reason,
-                    "ignored background/reclaim Direct probe failure for confirmed Direct peer"
-                );
-                return true;
+                    peer_session_generation,
+                    &reason,
+                )
+                .await;
+                true
             }
         }
-        // A batch with zero matched ACKs is the explicit feedback that widens
-        // the recovery stage: initial -> predicted -> small scatter -> extended
-        // scatter.  The epoch's hard probe credit still caps the total.
-        self.advance_recovery_stage_after_no_ack(node_id, &reason).await;
-
-        self.record_direct_failure_for_generation(
-            node_id,
-            generation,
-            REASON_DIRECT_PROBE_FAILED,
-            reason,
-        )
-        .await
     }
 
     /// Record an expected miss from one stable-side birthday window.
@@ -198,15 +275,28 @@ impl PeerManager {
         completed_epoch: bool,
         reason: impl Into<String>,
     ) -> bool {
-        if endpoints.is_empty() || generation != self.current_network_generation().await {
+        if endpoints.is_empty() {
             return false;
         }
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+            return false;
+        };
         let reason = reason.into();
+        let epoch_gate = self.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        if generation != self.current_network_generation_sync()
+            || !self.peer_session_is_current_sync(node_id, peer_session_generation)
+        {
+            return false;
+        }
         let probed_sources = {
             let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
+            if !conn.online || conn.state == ConnectionState::Closed {
+                return false;
+            }
 
             if conn.state == ConnectionState::Direct && conn.direct_generation == generation {
                 conn.record_direct_event(
@@ -215,9 +305,7 @@ impl PeerManager {
                     conn.endpoint,
                     Some(endpoints.len()),
                     None,
-                    format!(
-                        "{reason}; ignored because encrypted Direct is already confirmed"
-                    ),
+                    format!("{reason}; ignored because encrypted Direct is already confirmed"),
                 );
                 return true;
             }
@@ -255,6 +343,7 @@ impl PeerManager {
             probed_sources
         };
 
+        drop(epoch_guard);
         self.record_traversal_failures(probed_sources).await;
         true
     }
@@ -280,7 +369,14 @@ impl PeerManager {
         generation: u64,
         local_endpoint: Option<SocketAddr>,
     ) -> bool {
-        if generation != self.current_network_generation().await {
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+            return false;
+        };
+        let epoch_gate = self.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        if generation != self.current_network_generation_sync()
+            || !self.peer_session_is_current_sync(node_id, peer_session_generation)
+        {
             return false;
         }
 
@@ -289,7 +385,10 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
-            if conn.direct_generation != generation || conn.state != ConnectionState::Direct {
+            if !conn.online
+                || conn.direct_generation != generation
+                || conn.state != ConnectionState::Direct
+            {
                 return false;
             }
 
@@ -325,6 +424,7 @@ impl PeerManager {
             }
             source
         };
+        drop(epoch_guard);
         self.record_traversal_failures(vec![source]).await;
         true
     }

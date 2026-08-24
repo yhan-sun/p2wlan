@@ -547,7 +547,16 @@ impl PeerManager {
                     // window stays warm during a transient black hole; only
                     // peers without a relay safety net retain the classic
                     // failure backoff.  See `PathHealth::retry_due_relay_flat`.
-                    let retry_due = if self.has_relay_safety_net(&peer_id).await {
+                    // Derive the safety-net verdict from this same immutable
+                    // connection snapshot. Re-entering `connections.read()`
+                    // here can deadlock Tokio's writer-preferring `RwLock`:
+                    // a queued writer waits for `conns`, while a nested reader
+                    // queues behind that writer and can never let `conns` go.
+                    let relay_safety_net = matches!(
+                        conn.state,
+                        ConnectionState::Relay | ConnectionState::FallbackToRelay
+                    ) || conn.active_path() == Some(NetworkPath::Relay);
+                    let retry_due = if relay_safety_net {
                         conn.direct_retry_due_relay_flat(base_retry_after)
                     } else {
                         conn.direct_retry_due(base_retry_after)

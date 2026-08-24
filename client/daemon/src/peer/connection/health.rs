@@ -466,10 +466,14 @@ impl PeerConnection {
         );
     }
 
-    /// Invalidate all Direct evidence when the remote publishes a newer
-    /// candidate set. The old pairs remain in the bounded history for
-    /// diagnostics, but their remote epoch no longer matches the active set.
-    pub(super) fn mark_remote_candidate_generation_changed(
+    /// Invalidate all Direct evidence for a real remote transport handover.
+    ///
+    /// The wire candidate generation is only a freshness revision and is not
+    /// sufficient to call this method: an unchanged set, or a revised set that
+    /// retains the encrypted-confirmed Direct endpoint, continues on the same
+    /// transport epoch. The old pairs remain in bounded history here, but their
+    /// epoch no longer matches the replacement transport context.
+    pub(super) fn mark_remote_transport_handover(
         &mut self,
         local_generation: u64,
         reason: impl Into<String>,
@@ -514,6 +518,38 @@ impl PeerConnection {
             ),
         );
         next_epoch
+    }
+
+    /// Keep an encrypted-confirmed Direct transport across a newer candidate
+    /// freshness revision that still advertises the selected endpoint.
+    ///
+    /// This is the remote-side make-before-break counterpart to local candidate
+    /// refresh retention.  It intentionally leaves the remote epoch, selected
+    /// pair, Direct commit sequence and validation owner unchanged; changing
+    /// any of those would turn a routine rekey/candidate refresh into a path
+    /// teardown even though the live UDP transport is still present.
+    pub(super) fn mark_remote_candidate_revision_with_direct_continuity(
+        &mut self,
+        local_generation: u64,
+        retained_endpoint: SocketAddr,
+        candidate_revision: u64,
+        retired_pair_count: usize,
+    ) {
+        debug_assert_eq!(self.state, ConnectionState::Direct);
+        debug_assert!(self
+            .selected_direct_endpoint_for_consent(local_generation)
+            .is_some_and(|endpoint| endpoint == retained_endpoint));
+        self.record_direct_event(
+            local_generation,
+            "remote_candidate_revision_direct_retained",
+            Some(retained_endpoint),
+            Some(self.candidate_pairs.len()),
+            None,
+            format!(
+                "accepted candidate freshness revision {candidate_revision} with encrypted-confirmed endpoint continuity; remote transport epoch={} retired_alternate_pairs={retired_pair_count}",
+                self.remote_candidate_epoch,
+            ),
+        );
     }
 
     fn mark_candidate_refresh_generation_changed(

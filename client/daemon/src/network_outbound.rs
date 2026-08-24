@@ -1301,6 +1301,7 @@ fn relay_send_failure(err: &crate::error::DaemonError) -> SendOutcome {
             error,
             p2pnet_relay::RelayError::CommandQueueFull
                 | p2pnet_relay::RelayError::WriterStoppedBeforeAccept
+                | p2pnet_relay::RelayError::WriteBoundaryRejected
         ) {
             return SendOutcome::Retryable(RetryableSendFailure::RelaySendNotHanded {
                 err: err.to_string(),
@@ -1722,7 +1723,12 @@ async fn send_via_relay(
         Ok(()) => {
             let first_business = packet.is_business
                 && peers
-                    .mark_relay_first_business_sent_for_generation(&packet.peer_id, generation)
+                    .mark_relay_first_business_sent_for_generation_with_transport(
+                        &packet.peer_id,
+                        generation,
+                        relay.endpoint(),
+                        Some(relay.connection_id()),
+                    )
                     .await;
             debug!(
                 event = "relay_data_write_completed",
@@ -1954,6 +1960,7 @@ mod tests {
         for error in [
             p2pnet_relay::RelayError::CommandQueueFull,
             p2pnet_relay::RelayError::WriterStoppedBeforeAccept,
+            p2pnet_relay::RelayError::WriteBoundaryRejected,
         ] {
             let outcome = relay_send_failure(&crate::error::DaemonError::RelaySend {
                 endpoint: "tcp://relay.test:1".to_string(),

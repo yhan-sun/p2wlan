@@ -10,7 +10,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use p2pnet_tun::{Ipv4Packet, Protocol};
 use p2pnet_wireguard::{MessageTransport, TransportSession};
@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::dataplane::{InboundPacket, OutboundPacket};
 use crate::error::{DaemonError, Result};
-use crate::peer::PeerManager;
+use crate::peer::{PeerManager, PeerSessionGeneration};
 use crate::relay::RelayTransport;
 
 /// Stable, non-reversible diagnostic fingerprint for an opaque encrypted
@@ -52,7 +52,6 @@ pub(crate) fn wire_counter(bytes: &[u8]) -> Option<u64> {
 
 const RELAY_VALIDATION_PAYLOAD_PREFIX: &[u8] = b"p2wlan-relay-validation";
 const RELAY_VALIDATION_TIMESTAMP_BYTES: usize = 8;
-const RELAY_VALIDATION_MAX_RTT: Duration = Duration::from_secs(600);
 /// Keep a short startup/rekey cushion for user traffic that reaches the TUN
 /// before the WireGuard session is installed. The queue is deliberately small
 /// and per-peer so a not-ready peer cannot build unbounded memory pressure.
@@ -353,6 +352,7 @@ struct PromotedResponderToken {
     expires_at: Instant,
 }
 
+#[cfg(test)]
 pub(crate) fn build_relay_validation_payload(sent_at_ms: u64) -> Vec<u8> {
     let mut payload = Vec::with_capacity(
         RELAY_VALIDATION_PAYLOAD_PREFIX.len() + RELAY_VALIDATION_TIMESTAMP_BYTES,
@@ -384,28 +384,6 @@ fn is_relay_validation_packet(packet: &[u8]) -> bool {
         .strip_prefix(RELAY_VALIDATION_PAYLOAD_PREFIX)
         .and_then(|payload| payload.get(..RELAY_VALIDATION_TIMESTAMP_BYTES))
         .is_some()
-}
-
-fn relay_validation_rtt(packet: &[u8]) -> Option<Duration> {
-    let ip = Ipv4Packet::new(packet).ok()?;
-    if ip.protocol() != Protocol::Icmp {
-        return None;
-    }
-    let icmp = ip.payload();
-    if !is_relay_validation_packet(packet) || icmp[0] != 0 {
-        return None;
-    }
-    let timestamp = icmp
-        .get(8..)?
-        .strip_prefix(RELAY_VALIDATION_PAYLOAD_PREFIX)?
-        .get(..RELAY_VALIDATION_TIMESTAMP_BYTES)?;
-    let sent_at_ms = u64::from_be_bytes(timestamp.try_into().ok()?);
-    let now_ms = unix_time_millis();
-    if sent_at_ms > now_ms {
-        return None;
-    }
-    let rtt = Duration::from_millis(now_ms.saturating_sub(sent_at_ms));
-    (rtt <= RELAY_VALIDATION_MAX_RTT).then_some(rtt)
 }
 
 fn is_rekey_confirmation_packet(packet: &[u8]) -> bool {
@@ -518,14 +496,6 @@ pub(crate) fn parse_direct_validation_token(packet: &[u8]) -> Option<DirectValid
         sequence,
         owner_token,
     })
-}
-
-fn unix_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
 }
 
 /// A WireGuard transport packet addressed to a peer.
@@ -699,6 +669,7 @@ pub(crate) fn is_real_overlay_business_packet(packet: &[u8]) -> bool {
         && !is_rekey_confirmation_packet(packet)
         && parse_direct_validation_token(packet).is_none()
         && crate::relay_probe::parse_relay_probe_token(packet).is_none()
+        && crate::path_commit::parse_path_commit_token(packet).is_none()
 }
 
 /// Source of the UDP transport used by WireGuard inbound after decryption.
@@ -1369,13 +1340,27 @@ impl WireGuardTransport {
     /// Probe authentication is bound to the same handshake token and therefore
     /// proves that the peer received and adopted the corresponding WireGuard
     /// answer. Promote WireGuard first; the UDP layer then promotes Probe-v2.
+    #[cfg(test)]
     pub async fn confirm_responder_session(
         &self,
         peer_id: &str,
         token: &str,
     ) -> ResponderSessionConfirmation {
-        let emit_lock = self.outbound_emit_lock(peer_id).await;
-        let _emit_guard = emit_lock.lock().await;
+        let emit_guard = self.acquire_outbound_emit_guard(peer_id).await;
+        self.confirm_responder_session_with_emit_guard(peer_id, token, &emit_guard)
+            .await
+    }
+
+    /// Confirm a responder session while the caller already owns the peer's
+    /// counter-ordering guard. Cross-layer UDP adoption uses this form so its
+    /// lock order stays `emit -> adoption -> epoch -> sessions`; acquiring
+    /// emit after the global epoch gate would invert the outbound data path.
+    pub(crate) async fn confirm_responder_session_with_emit_guard(
+        &self,
+        peer_id: &str,
+        token: &str,
+        _emit_guard: &OwnedMutexGuard<()>,
+    ) -> ResponderSessionConfirmation {
         let now = Instant::now();
         let (result, flush_pending) = {
             let mut sessions = self.sessions.lock().await;
@@ -1423,7 +1408,6 @@ impl WireGuardTransport {
                 (ResponderSessionConfirmation::Missing, false)
             }
         };
-        drop(_emit_guard);
         if flush_pending {
             // Probe-v2 still has to commit the matching key before the caller
             // can ACK or learn Direct. Do not make that cross-layer commit
@@ -2926,6 +2910,14 @@ impl WireGuardTransport {
                                 // ICMP echo reply or user traffic.
                                 if owns_direct_packet {
                                     let token_kind = token.kind;
+                                    // Snapshot the peer lifecycle before the
+                                    // transport-session check awaits.  A
+                                    // same-ID remove/re-add after this point
+                                    // must not let the old authenticated
+                                    // request enqueue work for the replacement
+                                    // peer incarnation.
+                                    let peer_session_generation =
+                                        peers.peer_session_generation_sync(&inbound.peer_id);
                                     let session_guard = if token_kind == DirectValidationKind::Ack {
                                         self.acquire_current_session_evidence_guard(
                                             &inbound.peer_id,
@@ -2946,7 +2938,9 @@ impl WireGuardTransport {
                                         )
                                         .await
                                     };
-                                    if session_current {
+                                    if let (true, Some(peer_session_generation)) =
+                                        (session_current, peer_session_generation)
+                                    {
                                         self.handle_direct_validation_packet(
                                             peers,
                                             udp.as_ref(),
@@ -2956,6 +2950,7 @@ impl WireGuardTransport {
                                             local_endpoint,
                                             socket_index,
                                             direct_socket,
+                                            peer_session_generation,
                                             token,
                                         )
                                         .await;
@@ -3071,23 +3066,17 @@ impl WireGuardTransport {
                                 let session_current =
                                     inbound.session_instance.is_none() || session_guard.is_some();
                                 if session_current {
-                                    if let Some(rtt) = relay_validation_rtt(&inbound.packet) {
-                                        peers
-                                            .record_relay_observation(
-                                                &inbound.peer_id,
-                                                relay_endpoint,
-                                                Some(rtt),
-                                            )
-                                            .await;
-                                    } else {
-                                        peers
-                                            .record_relay_observation(
-                                                &inbound.peer_id,
-                                                relay_endpoint,
-                                                None,
-                                            )
-                                            .await;
-                                    }
+                                    // Every authenticated relay packet is a
+                                    // liveness observation.  RTT is committed
+                                    // only by the matching relay-probe ACK,
+                                    // whose process-local Instant is bound to
+                                    // the actual relay handoff.  The legacy
+                                    // wall-clock validation payload remains
+                                    // recognizable for wire compatibility but
+                                    // is never interpreted as a timing sample.
+                                    peers
+                                        .record_relay_observation(&inbound.peer_id, relay_endpoint)
+                                        .await;
                                     debug!(
                                     "Observed decrypted relay ingress through {relay_endpoint} for peer {}; relay confirmation still requires a matching encrypted ACK",
                                     inbound.peer_id
@@ -3110,6 +3099,7 @@ impl WireGuardTransport {
                     if internal_rekey_confirmation
                         || direct_validation.is_some()
                         || relay_probe.is_some()
+                        || path_commit.is_some()
                     {
                         continue;
                     }
@@ -3351,6 +3341,7 @@ impl WireGuardTransport {
         local_endpoint: Option<SocketAddr>,
         socket_index: Option<usize>,
         direct_socket: Option<Arc<tokio::net::UdpSocket>>,
+        peer_session_generation: PeerSessionGeneration,
         token: crate::transport::DirectValidationToken,
     ) {
         match token.kind {
@@ -3406,7 +3397,8 @@ impl WireGuardTransport {
                         .await;
                     return;
                 };
-                // No generation gate here: network generations are PER-SIDE
+                // No REMOTE network-generation comparison here: network
+                // generations are PER-SIDE
                 // counters (each daemon advances its own on candidate
                 // refreshes), so the initiator's generation can never be
                 // compared with the responder's.  The request is already
@@ -3417,19 +3409,42 @@ impl WireGuardTransport {
                 // trigger a benign idempotent ACK.
 
                 // The request is authenticated (decrypted under the peer's
-                // WireGuard session) and arrived over the direct path.  Make
-                // its local promotion one transaction with PeerLeft/key
-                // cleanup: adoption -> network epoch -> explicit local
-                // generation promotion -> generation-bound socket affinity.
+                // WireGuard session) and arrived over the direct path. Make
+                // its validation ingress one transaction with PeerLeft/key
+                // cleanup: adoption -> network epoch -> lifecycle re-check ->
+                // generation snapshot -> scheduler enqueue.
                 // The token generation is remote-local and therefore cannot
                 // be compared with `local_generation`; it is echoed only for
                 // the initiator's owned ACK expectation.
+                // Revalidate the local peer lifecycle at the same
+                // adoption -> network-epoch boundary used by lifecycle
+                // cleanup.  The outer transport-session check deliberately
+                // released its emit guard so this request can later acquire
+                // that guard to encrypt its ACK without self-deadlocking.
+                let adoption_guard = udp.lock_peer_adoption_for_direct_validation(peer_id).await;
+                let epoch_gate = peers.network_epoch_gate();
+                let epoch_guard = epoch_gate.lock().await;
+                if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+                    drop(epoch_guard);
+                    drop(adoption_guard);
+                    peers.emit_timeline(
+                        "stale_session_evidence",
+                        Some("direct"),
+                        Some("peer_lifecycle_replaced_or_removed"),
+                        Some(format!(
+                            "peer={peer_id} direct_validation={:?} request_id={}",
+                            token.kind, token.request_id,
+                        )),
+                    );
+                    return;
+                }
+
                 // An authenticated request is evidence for the local
                 // validation worker, not proof of the local path. Enqueue it
                 // newest-wins and let the worker send our own request. This
                 // keeps an inbound request from cancelling the local
                 // request/ACK transaction in the R7/R8 cross-over race.
-                let local_generation = peers.current_network_generation().await;
+                let local_generation = peers.current_network_generation_sync();
 
                 peers
                     .record_direct_validation_event_with_metadata(
@@ -3454,6 +3469,16 @@ impl WireGuardTransport {
                         ),
                     )
                     .await;
+                udp.enqueue_direct_validation_observation(crate::udp::PeerReflexiveObservation {
+                    peer_id: peer_id.to_string(),
+                    observed_endpoint: source,
+                });
+                // ACK encryption takes the per-peer WireGuard emit guard.
+                // Release the UDP lifecycle transaction first to preserve the
+                // canonical emit -> adoption -> epoch order used by teardown
+                // and ACK evidence commits.
+                drop(epoch_guard);
+                drop(adoption_guard);
                 info!(
                     event = "direct_validation_request_received",
                     peer_id = %peer_id,
@@ -3462,10 +3487,6 @@ impl WireGuardTransport {
                     "received authenticated encrypted validation request request_id={}",
                     token.request_id
                 );
-                udp.enqueue_direct_validation_observation(crate::udp::PeerReflexiveObservation {
-                    peer_id: peer_id.to_string(),
-                    observed_endpoint: source,
-                });
                 // Answer idempotently — also when already Direct — so the
                 // initiator always gets the confirmation it needs.  The ACK
                 // uses the request's own IP header with source/destination
@@ -4127,6 +4148,13 @@ impl WireGuardTransport {
                 return;
             }
         }
+        if !peers.peer_online(peer_id).await {
+            debug!(
+                peer_id = %peer_id,
+                "ignored relay probe for offline or closed peer {peer_id}"
+            );
+            return;
+        }
         match token.kind {
             crate::relay_probe::RelayProbeKind::Request => {
                 // Without a live relay transport there is nothing to answer
@@ -4264,6 +4292,13 @@ impl WireGuardTransport {
                 return;
             }
         }
+        if !peers.peer_online(peer_id).await {
+            debug!(
+                peer_id = %peer_id,
+                "ignored path-commit packet for offline or closed peer {peer_id}"
+            );
+            return;
+        }
         match token.kind {
             crate::path_commit::PathCommitKind::Request => {
                 let Some(relay_transport) = relay_transport else {
@@ -4340,7 +4375,12 @@ impl WireGuardTransport {
                 // sent on; only then does it commit the relay-first business
                 // path-commit marker (P0-4 one-way liveness).
                 let confirmed = peers
-                    .consume_path_commit_ack(peer_id, token, relay_endpoint)
+                    .consume_path_commit_ack_with_transport(
+                        peer_id,
+                        token,
+                        relay_endpoint,
+                        relay_connection_id,
+                    )
                     .await;
                 if !confirmed {
                     debug!(

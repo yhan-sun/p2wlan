@@ -124,6 +124,216 @@ void main() {
       expect(api.verifyRoutesCount, 1);
     },
   );
+
+  test('rejects a lower revision from the same daemon process', () async {
+    final fixture = await _loadFixture();
+    final current = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 10,
+      uptimeMs: 10000,
+    );
+    final delayedOld = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 9,
+      uptimeMs: 11000,
+      peers: const <dynamic>[],
+    );
+    final api = _SwitchingDiagnosticsApi(
+      snapshot: current,
+      snapshots: [current, delayedOld],
+    );
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+
+    expect(stores.statusStore.snapshot?.revision, 10);
+    expect(stores.statusStore.snapshot?.peers, isNotEmpty);
+  });
+
+  test('accepts a lower revision from a replacement daemon process', () async {
+    final fixture = await _loadFixture();
+    final oldProcess = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 10,
+      uptimeMs: 10000,
+    );
+    final newProcess = _snapshotCopy(
+      fixture,
+      processId: 43,
+      revision: 1,
+      uptimeMs: 100,
+      peers: const <dynamic>[],
+    );
+    final api = _SwitchingDiagnosticsApi(
+      snapshot: newProcess,
+      snapshots: [oldProcess, newProcess],
+    );
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+
+    expect(stores.statusStore.snapshot?.processId, 43);
+    expect(stores.statusStore.snapshot?.revision, 1);
+    expect(stores.statusStore.snapshot?.peers, isEmpty);
+  });
+
+  test(
+    'startup settling never restores an older larger peer catalog',
+    () async {
+      final fixture = await _loadFixture();
+      final oldCatalog = _snapshotCopy(
+        fixture,
+        processId: 42,
+        revision: 10,
+        uptimeMs: 10000,
+      );
+      final currentCatalog = _snapshotCopy(
+        fixture,
+        processId: 42,
+        revision: 11,
+        uptimeMs: 10100,
+        peers: const <dynamic>[],
+      );
+      final api = _SwitchingDiagnosticsApi(
+        snapshot: currentCatalog,
+        snapshots: [oldCatalog, currentCatalog],
+      );
+      final stores = await _makeStores(
+        api,
+        startupCatalogRefreshInterval: Duration.zero,
+        startupCatalogRefreshTimeout: const Duration(seconds: 1),
+      );
+      addTearDown(stores.dispose);
+      await stores.settingsStore.updateSettings(
+        stores.settingsStore.settings.copyWith(authToken: 'managed-token'),
+      );
+
+      await stores.statusStore.refreshUntilPeerCatalogSettled();
+
+      expect(stores.statusStore.snapshot?.revision, 11);
+      expect(stores.statusStore.snapshot?.peers, isEmpty);
+    },
+  );
+
+  test('event revision triggers an immediate full snapshot refresh', () async {
+    final fixture = await _loadFixture();
+    final first = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 1,
+      uptimeMs: 100,
+    );
+    final second = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 2,
+      uptimeMs: 200,
+      peers: const <dynamic>[],
+    );
+    final api = _SwitchingDiagnosticsApi(
+      snapshot: second,
+      snapshots: [first, second],
+      events: const [
+        EventsResponse(
+          contractVersion: 1,
+          processId: 42,
+          revision: 2,
+          oldestSeq: 2,
+          events: [DiagnosticEvent(seq: 2, event: 'peer_left', atMs: 200)],
+        ),
+      ],
+    );
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    stores.statusStore.setAutoRefresh(enabled: true);
+    await _waitUntil(() => api.statusFetchCount >= 2);
+
+    expect(stores.statusStore.snapshot?.revision, 2);
+    expect(stores.statusStore.snapshot?.peers, isEmpty);
+    stores.statusStore.setAutoRefresh(enabled: false);
+  });
+
+  test(
+    'event poll carries process identity and resets on daemon restart',
+    () async {
+      final fixture = await _loadFixture();
+      final oldProcess = _snapshotCopy(
+        fixture,
+        processId: 42,
+        revision: 1,
+        uptimeMs: 5000,
+      );
+      final newProcess = _snapshotCopy(
+        fixture,
+        processId: 43,
+        revision: 1,
+        uptimeMs: 100,
+        peers: const <dynamic>[],
+      );
+      final api = _SwitchingDiagnosticsApi(
+        snapshot: newProcess,
+        snapshots: [oldProcess, newProcess],
+        events: const [
+          EventsResponse(
+            contractVersion: 1,
+            processId: 43,
+            revision: 1,
+            oldestSeq: 1,
+            resetRequired: true,
+            events: [],
+          ),
+        ],
+      );
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      stores.statusStore.setAutoRefresh(enabled: true);
+      await _waitUntil(() => api.statusFetchCount >= 2);
+
+      expect(api.eventProcessIds.first, 42);
+      expect(api.eventCursors.first, 1);
+      expect(stores.statusStore.snapshot?.processId, 43);
+      expect(stores.statusStore.snapshot?.peers, isEmpty);
+      stores.statusStore.setAutoRefresh(enabled: false);
+    },
+  );
+}
+
+DiagnosticsSnapshot _snapshotCopy(
+  DiagnosticsSnapshot source, {
+  required int processId,
+  required int revision,
+  required int uptimeMs,
+  List<dynamic>? peers,
+}) {
+  final raw = Map<String, dynamic>.from(source.raw)
+    ..['process_id'] = processId
+    ..['revision'] = revision
+    ..['captured_revision'] = revision
+    ..['captured_at_ms'] = uptimeMs
+    ..['peer_snapshot_stale'] = false
+    ..['peer_snapshot_age_ms'] = 0
+    ..['uptime_ms'] = uptimeMs;
+  if (peers != null) raw['peers'] = peers;
+  return DiagnosticsSnapshot.fromJson(raw);
+}
+
+Future<void> _waitUntil(bool Function() predicate) async {
+  await (() async {
+    while (!predicate()) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+  })().timeout(const Duration(seconds: 5));
 }
 
 Future<DiagnosticsSnapshot> _loadFixture() async {
@@ -139,6 +349,10 @@ Future<_Stores> _makeStores(
   DiagnosticsApi api, {
   Duration maxSnapshotAge = StatusStore.defaultMaxSnapshotAge,
   Duration routeVerificationInterval = Duration.zero,
+  Duration startupCatalogRefreshInterval =
+      StatusStore.defaultStartupCatalogRefreshInterval,
+  Duration startupCatalogRefreshTimeout =
+      StatusStore.defaultStartupCatalogRefreshTimeout,
 }) async {
   final tempDir = await Directory.systemTemp.createTemp('p2wlan_status_store_');
   final settingsStore = SettingsStore(
@@ -152,6 +366,8 @@ Future<_Stores> _makeStores(
     maxSnapshotAge: maxSnapshotAge,
     enableFreshnessTimer: true,
     routeVerificationInterval: routeVerificationInterval,
+    startupCatalogRefreshInterval: startupCatalogRefreshInterval,
+    startupCatalogRefreshTimeout: startupCatalogRefreshTimeout,
   );
   return _Stores(tempDir, settingsStore, statusStore);
 }
@@ -171,13 +387,25 @@ class _Stores {
 }
 
 class _SwitchingDiagnosticsApi implements DiagnosticsApi {
-  _SwitchingDiagnosticsApi({required this.snapshot, this.oldHealth});
+  _SwitchingDiagnosticsApi({
+    required this.snapshot,
+    this.oldHealth,
+    List<DiagnosticsSnapshot>? snapshots,
+    List<EventsResponse>? events,
+  }) : snapshots = [...?snapshots],
+       events = [...?events];
 
   final DiagnosticsSnapshot snapshot;
   final Completer<void>? oldHealth;
+  final List<DiagnosticsSnapshot> snapshots;
+  final List<EventsResponse> events;
+  final pendingEvents = Completer<EventsResponse>();
   final oldHealthStarted = Completer<void>();
   final healthUrls = <String>[];
+  final eventProcessIds = <int?>[];
+  final eventCursors = <int>[];
   var verifyRoutesCount = 0;
+  var statusFetchCount = 0;
 
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async {
@@ -190,8 +418,10 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   }
 
   @override
-  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async =>
-      snapshot;
+  Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
+    statusFetchCount += 1;
+    return snapshots.isEmpty ? snapshot : snapshots.removeAt(0);
+  }
 
   @override
   Future<bool> requestShutdown(String diagnosticsUrl) async => true;
@@ -209,8 +439,14 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
+    int? processId,
     Duration timeout = const Duration(seconds: 30),
-  }) async => throw UnimplementedError();
+  }) async {
+    eventProcessIds.add(processId);
+    eventCursors.add(since);
+    if (events.isNotEmpty) return events.removeAt(0);
+    return pendingEvents.future;
+  }
 
   @override
   Future<PeersPageResponse> fetchPeers(

@@ -92,6 +92,9 @@ async fn spawn_c0_synchronized_fresh_pair(
     if peers.is_direct(&peer_id).await {
         return false;
     }
+    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+        return false;
+    };
 
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
         peers
@@ -107,9 +110,11 @@ async fn spawn_c0_synchronized_fresh_pair(
         return false;
     };
     let generation = peers.current_network_generation().await;
-    let session = match punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+    let Some(claim) = punch_deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            &peers,
             &peer_id,
+            peer_session_generation,
             generation,
             epoch,
             PUNCH_PRIORITY_FRESH_PREDICTION,
@@ -117,7 +122,10 @@ async fn spawn_c0_synchronized_fresh_pair(
             Some(punch_at_ms),
         )
         .await
-    {
+    else {
+        return false;
+    };
+    let session = match claim {
         RendezvousPunchClaim::Claimed(session) => session,
         RendezvousPunchClaim::Deferred(deferred) => {
             peers
@@ -139,10 +147,14 @@ async fn spawn_c0_synchronized_fresh_pair(
                 .await;
             return false;
         }
+        RendezvousPunchClaim::RejectedStalePeerSession => return false,
     };
     let delay = relay_assisted_punch_delay(Some(punch_at_ms));
     let session_id = session.session_id();
     tokio::spawn(async move {
+        if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+            return;
+        }
         peers
             .record_direct_event_for_generation_with_socket(
                 &peer_id,
@@ -181,15 +193,16 @@ async fn spawn_c0_synchronized_fresh_pair(
                 }
             }
         }
-        if session.is_cancelled() || peers.is_direct(&peer_id).await {
+        if peers.is_direct(&peer_id).await
+            || session.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+        {
             return;
         }
         let dispatch_at_ms = session.mark_first_send_started();
         let mut send_result = None;
-        let outcome = run_owned_punch_session_with_deadline(
-            &session,
-            C0_RENDEZVOUS_DEADLINE,
-            async {
+        let outcome =
+            run_owned_punch_session_with_deadline(&session, C0_RENDEZVOUS_DEADLINE, async {
                 send_result = Some(
                     udp.punch_candidates_from_dynamic_socket_index(
                         &peer_id,
@@ -200,9 +213,8 @@ async fn spawn_c0_synchronized_fresh_pair(
                     )
                     .await,
                 );
-            },
-        )
-        .await;
+            })
+            .await;
 
         match outcome {
             PunchSessionOutcome::Cancelled | PunchSessionOutcome::DeadlineExceeded => {
@@ -264,28 +276,32 @@ async fn spawn_c0_synchronized_fresh_pair(
                     ).await;
                 }
                 Some(Err(error)) => {
-                    peers.record_direct_event_for_generation_with_socket(
-                        &peer_id,
-                        generation,
-                        "c0_rendezvous_error",
-                        targets.first().copied(),
-                        None,
-                        Some(targets.len()),
-                        None,
-                        format!("C=0 fresh-fresh pair bounded send failed: {error}"),
-                    ).await;
+                    peers
+                        .record_direct_event_for_generation_with_socket(
+                            &peer_id,
+                            generation,
+                            "c0_rendezvous_error",
+                            targets.first().copied(),
+                            None,
+                            Some(targets.len()),
+                            None,
+                            format!("C=0 fresh-fresh pair bounded send failed: {error}"),
+                        )
+                        .await;
                 }
                 None => {
-                    peers.record_direct_event_for_generation_with_socket(
-                        &peer_id,
-                        generation,
-                        "c0_rendezvous_error",
-                        targets.first().copied(),
-                        None,
-                        Some(targets.len()),
-                        None,
-                        "C=0 fresh-fresh pair bounded send did not start".to_string(),
-                    ).await;
+                    peers
+                        .record_direct_event_for_generation_with_socket(
+                            &peer_id,
+                            generation,
+                            "c0_rendezvous_error",
+                            targets.first().copied(),
+                            None,
+                            Some(targets.len()),
+                            None,
+                            "C=0 fresh-fresh pair bounded send did not start".to_string(),
+                        )
+                        .await;
                 }
             },
         }

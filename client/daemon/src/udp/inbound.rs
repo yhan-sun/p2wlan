@@ -2,6 +2,7 @@ impl UdpTransport {
     /// Commit a modern responder handshake transaction from an authenticated
     /// pending Probe-v2 packet. WireGuard is promoted first; Probe is only
     /// promoted for the same exact token after that succeeds.
+    #[cfg(test)]
     async fn confirm_pending_probe_adoption(&self, peer_id: &str, token: &str) -> bool {
         let Some(wireguard) = self.wireguard_transport.as_ref() else {
             return false;
@@ -11,6 +12,39 @@ impl UdpTransport {
             .confirm_probe_and_transport_transaction(peer_id, token, || async {
                 matches!(
                     wireguard.confirm_responder_session(peer_id, token).await,
+                    ResponderSessionConfirmation::Promoted
+                        | ResponderSessionConfirmation::AlreadyActive
+                )
+            })
+            .await
+        {
+            return false;
+        }
+        wireguard
+            .acknowledge_promoted_responder_token(peer_id, token)
+            .await;
+        true
+    }
+
+    /// Commit the same cross-layer transaction when the inbound handler
+    /// acquired WireGuard's emit guard before UDP adoption and the global
+    /// network-epoch gate.
+    async fn confirm_pending_probe_adoption_with_emit_guard(
+        &self,
+        peer_id: &str,
+        token: &str,
+        emit_guard: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> bool {
+        let Some(wireguard) = self.wireguard_transport.as_ref() else {
+            return false;
+        };
+        if !self
+            .peers
+            .confirm_probe_and_transport_transaction(peer_id, token, || async {
+                matches!(
+                    wireguard
+                        .confirm_responder_session_with_emit_guard(peer_id, token, emit_guard)
+                        .await,
                     ResponderSessionConfirmation::Promoted
                         | ResponderSessionConfirmation::AlreadyActive
                 )
@@ -130,7 +164,7 @@ impl UdpTransport {
         socket: Arc<UdpSocket>,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
     ) -> Result<()> {
-        self.run_inbound_socket_inner(socket_index, socket, inbound_tx, None)
+        self.run_inbound_socket_inner(socket_index, socket, inbound_tx, None, None)
             .await
     }
 
@@ -144,16 +178,54 @@ impl UdpTransport {
         socket_index: usize,
         socket: Arc<UdpSocket>,
         mut shutdown_rx: watch::Receiver<bool>,
+        reader_ready_tx: oneshot::Sender<bool>,
     ) {
         let Some(inbound_tx) = self.inbound_channel() else {
-            debug!(
-                "Dropped dynamic UDP socket reader {socket_index}: no inbound channel attached"
-            );
+            debug!("Dropped dynamic UDP socket reader {socket_index}: no inbound channel attached");
             return;
         };
         let _ = self
-            .run_inbound_socket_inner(socket_index, socket, inbound_tx, Some(&mut shutdown_rx))
+            .run_inbound_socket_inner(
+                socket_index,
+                socket,
+                inbound_tx,
+                Some(&mut shutdown_rx),
+                Some(reader_ready_tx),
+            )
             .await;
+    }
+
+    /// Receive one datagram and publish the dynamic-reader readiness handshake
+    /// from the first real pending poll of the socket future. A task spawn is
+    /// not a scheduling barrier, and consuming an already-queued unrelated
+    /// datagram is not a rearm barrier either: retain the sender across every
+    /// immediately-ready packet until `recv_from` actually returns `Pending`
+    /// and registers readiness for the next datagram.
+    async fn recv_from_with_reader_ready(
+        socket: &UdpSocket,
+        buf: &mut [u8],
+        reader_ready_tx: &mut Option<oneshot::Sender<bool>>,
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        let receive = socket.recv_from(buf);
+        tokio::pin!(receive);
+        std::future::poll_fn(|context| {
+            let result = std::future::Future::poll(receive.as_mut(), context);
+            match &result {
+                std::task::Poll::Pending => {
+                    if let Some(reader_ready_tx) = reader_ready_tx.take() {
+                        let _ = reader_ready_tx.send(true);
+                    }
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    if let Some(reader_ready_tx) = reader_ready_tx.take() {
+                        let _ = reader_ready_tx.send(false);
+                    }
+                }
+                std::task::Poll::Ready(Ok(_)) => {}
+            }
+            result
+        })
+        .await
     }
 
     async fn run_inbound_socket_inner(
@@ -162,6 +234,7 @@ impl UdpTransport {
         socket: Arc<UdpSocket>,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
         mut shutdown_rx: Option<&mut watch::Receiver<bool>>,
+        mut reader_ready_tx: Option<oneshot::Sender<bool>>,
     ) -> Result<()> {
         let mut buf = vec![0u8; 65_535];
 
@@ -199,7 +272,11 @@ impl UdpTransport {
                                 Ok(()) => continue,
                             }
                         }
-                        packet = socket.recv_from(&mut buf) => packet,
+                        packet = Self::recv_from_with_reader_ready(
+                            &socket,
+                            &mut buf,
+                            &mut reader_ready_tx,
+                        ) => packet,
                     }
                 }
                 None => socket.recv_from(&mut buf).await,
@@ -231,7 +308,10 @@ impl UdpTransport {
             if let Some(transaction_id) = stun_transaction_id(data) {
                 let waiter = self.stun_waiters.lock().await.remove(&transaction_id);
                 if let Some(waiter) = waiter {
-                    let _ = waiter.send((data.to_vec(), source));
+                    let _ = waiter.send(StunResponse {
+                        data: data.to_vec(),
+                        source,
+                    });
                 } else {
                     trace!("Ignored unmatched STUN response from {source}");
                 }
@@ -246,9 +326,8 @@ impl UdpTransport {
             let known_peer_ip = self.peers.has_known_public_candidate_ip(source.ip()).await;
             if known_peer_ip {
                 self.update_socket_diagnostics(socket_index, |metrics| {
-                    metrics.known_peer_ip_datagrams_received = metrics
-                        .known_peer_ip_datagrams_received
-                        .saturating_add(1)
+                    metrics.known_peer_ip_datagrams_received =
+                        metrics.known_peer_ip_datagrams_received.saturating_add(1)
                 })
                 .await;
             }
@@ -304,10 +383,12 @@ impl UdpTransport {
                     );
                     continue;
                 }
-                let Some((packet, key_candidate)) = key_candidates.into_iter().find_map(|candidate| {
-                    decode_authenticated_punch_packet(data, &candidate.key)
-                        .map(|packet| (packet, candidate))
-                }) else {
+                let Some((packet, key_candidate)) =
+                    key_candidates.into_iter().find_map(|candidate| {
+                        decode_authenticated_punch_packet(data, &candidate.key)
+                            .map(|packet| (packet, candidate))
+                    })
+                else {
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.authenticated_probe_invalid_mac =
                             metrics.authenticated_probe_invalid_mac.saturating_add(1)
@@ -324,7 +405,34 @@ impl UdpTransport {
                     _ => None,
                 };
                 let matched_probe_session_id = key_candidate.session_id.clone();
+                let peer_session_generation = key_candidate.session_generation;
                 let key = key_candidate.key;
+                #[cfg(test)]
+                let authenticated_probe_verify_gate = self
+                    .peers
+                    .pause_after_authenticated_probe_verify_for_test(&identity.source_node_id)
+                    .await;
+                // A pending Probe key may promote the matching WireGuard
+                // responder session. Reserve its counter-ordering turn before
+                // either branch acquires adoption -> epoch, preserving the
+                // canonical cross-layer order `emit -> adoption -> epoch`.
+                // The lifecycle stamp below is still authoritative if the
+                // peer changes while this per-peer lock is contended.
+                let pending_emit_guard =
+                    match (pending_token.as_ref(), self.wireguard_transport.as_ref()) {
+                        (Some(_), Some(wireguard)) => {
+                            #[cfg(test)]
+                            if let Some(gate) = authenticated_probe_verify_gate.as_ref() {
+                                gate.pending_emit_wait_started.notify_one();
+                            }
+                            Some(
+                                wireguard
+                                    .acquire_outbound_emit_guard(&identity.source_node_id)
+                                    .await,
+                            )
+                        }
+                        _ => None,
+                    };
                 // Probe v2 carries the *sender's* local generation.  Timeout
                 // diagnostics are scoped to this daemon's punch generation,
                 // so never use the remote counter as the local map key.
@@ -333,15 +441,36 @@ impl UdpTransport {
                 let received_local_generation = self.peers.current_network_generation().await;
                 match packet.kind {
                     PunchPacketKind::Punch => {
+                        // Bind every effect of the authenticated packet to the
+                        // exact peer lifecycle that owned the MAC key.  The
+                        // lifecycle writers use the shared epoch gate while
+                        // publishing a new session generation; holding
+                        // adoption -> epoch here therefore makes the check,
+                        // replay/rate admission, ACK and all evidence adoption
+                        // one transaction.  A verified packet from an old
+                        // same-ID incarnation is rejected before it can even
+                        // consume the replacement session's replay budget.
+                        let adoption = self.adoption_lock_for(&identity.source_node_id).await;
+                        let adoption_guard = adoption.lock().await;
+                        let epoch_guard = self.network_epoch_gate.lock().await;
+                        if !self.peers.peer_session_is_current_sync(
+                            &identity.source_node_id,
+                            peer_session_generation,
+                        ) {
+                            trace!(
+                                "Ignored authenticated UDP punch from {}; peer lifecycle changed after MAC verification",
+                                identity.source_node_id
+                            );
+                            continue;
+                        }
                         self.update_peer_probe_rx_diagnostics(
                             &identity.source_node_id,
                             received_local_generation,
                             matched_probe_session_id.as_deref(),
                             |snapshot| {
                                 if known_peer_ip {
-                                    snapshot.known_peer_ip_datagrams_received = snapshot
-                                        .known_peer_ip_datagrams_received
-                                        .saturating_add(1);
+                                    snapshot.known_peer_ip_datagrams_received =
+                                        snapshot.known_peer_ip_datagrams_received.saturating_add(1);
                                 }
                                 snapshot.authenticated_probe_packets_received = snapshot
                                     .authenticated_probe_packets_received
@@ -349,8 +478,7 @@ impl UdpTransport {
                             },
                         )
                         .await;
-                        let punch_generation =
-                            packet.generation.unwrap_or(identity.generation);
+                        let punch_generation = packet.generation.unwrap_or(identity.generation);
                         match self
                             .admit_authenticated_punch(
                                 &identity.source_node_id,
@@ -363,13 +491,18 @@ impl UdpTransport {
                         {
                             AuthenticatedPunchAdmission::Accepted => {
                                 if let Some(token) = pending_token.as_deref() {
-                                    if self
-                                        .confirm_pending_probe_adoption(
-                                            &identity.source_node_id,
-                                            token,
-                                        )
-                                        .await
-                                    {
+                                    let promoted = match pending_emit_guard.as_ref() {
+                                        Some(emit_guard) => {
+                                            self.confirm_pending_probe_adoption_with_emit_guard(
+                                                &identity.source_node_id,
+                                                token,
+                                                emit_guard,
+                                            )
+                                            .await
+                                        }
+                                        None => false,
+                                    };
+                                    if promoted {
                                         debug!(
                                             "Promoted matching WireGuard and Probe v2 bindings for peer {} after accepted authenticated punch",
                                             identity.source_node_id
@@ -480,7 +613,11 @@ impl UdpTransport {
 
                         let learned = self
                             .peers
-                            .learn_authenticated_endpoint(&identity.source_node_id, source)
+                            .learn_authenticated_endpoint_in_epoch(
+                                &epoch_guard,
+                                &identity.source_node_id,
+                                source,
+                            )
                             .await;
                         if !learned {
                             trace!(
@@ -489,24 +626,11 @@ impl UdpTransport {
                             );
                             continue;
                         }
-                        // The adoption section (socket pin, direct success
-                        // accounting, peer-reflexive notification) runs under
-                        // the peer's adoption lock, re-verifying the peer
-                        // still exists: a PeerLeft cleanup that raced this
-                        // punch must not leave affinity or candidate state
-                        // for a peer that no longer exists (a same-ID rejoin
-                        // would otherwise inherit it).
-                        let adoption = self.adoption_lock_for(&identity.source_node_id).await;
-                        let _adoption_guard = adoption.lock().await;
-                        if !self.peers.peer_exists_sync(&identity.source_node_id) {
-                            trace!(
-                                "Ignored authenticated UDP punch from {}; peer was removed before adoption",
-                                identity.source_node_id
-                            );
-                            continue;
-                        }
                         self.peers
-                            .record_predicted_window_hit_if_predicted(&identity.source_node_id, source)
+                            .record_predicted_window_hit_if_predicted(
+                                &identity.source_node_id,
+                                source,
+                            )
                             .await;
                         self.peers
                             .record_direct_probe_success_with_local_endpoint(
@@ -524,13 +648,23 @@ impl UdpTransport {
                                 )
                                 .await;
                         }
-                        self.remember_peer_socket(
-                            &identity.source_node_id,
-                            socket_index,
-                            SocketEvidence::Fresh,
-                        )
-                        .await;
-                        self.notify_peer_reflexive_observation(&identity.source_node_id, source).await;
+                        let _ = self
+                            .remember_peer_socket_for_generation_in_epoch(
+                                &epoch_guard,
+                                &identity.source_node_id,
+                                socket_index,
+                                generation,
+                                SocketEvidence::Fresh,
+                            )
+                            .await;
+                        self.notify_peer_reflexive_observation(&identity.source_node_id, source)
+                            .await;
+
+                        // Triggered probes register pending state under the
+                        // epoch gate themselves. Release this transaction
+                        // first to preserve the single acquisition order.
+                        drop(epoch_guard);
+                        drop(adoption_guard);
 
                         if ack_sent {
                             debug!(
@@ -552,9 +686,8 @@ impl UdpTransport {
                     }
                     PunchPacketKind::Ack => {
                         self.update_socket_diagnostics(socket_index, |metrics| {
-                            metrics.authenticated_probe_acks_observed = metrics
-                                .authenticated_probe_acks_observed
-                                .saturating_add(1)
+                            metrics.authenticated_probe_acks_observed =
+                                metrics.authenticated_probe_acks_observed.saturating_add(1)
                         })
                         .await;
                         // The whole match -> verify -> adopt sequence runs
@@ -567,10 +700,19 @@ impl UdpTransport {
                         // the lock runs after and removes everything this
                         // ACK created; the cleanup that wins the lock bumps
                         // the epoch and the fence below refuses the adoption.
-                        let adoption = self
-                            .adoption_lock_for(&identity.source_node_id)
-                            .await;
+                        let adoption = self.adoption_lock_for(&identity.source_node_id).await;
                         let _adoption_guard = adoption.lock().await;
+                        let epoch_guard = self.network_epoch_gate.lock().await;
+                        if !self.peers.peer_session_is_current_sync(
+                            &identity.source_node_id,
+                            peer_session_generation,
+                        ) {
+                            trace!(
+                                "Ignored authenticated UDP ACK from {}; peer lifecycle changed after MAC verification",
+                                identity.source_node_id
+                            );
+                            continue;
+                        }
                         let ack_match = {
                             let generation = self.peers.current_network_generation().await;
                             let remote_candidate_epoch = self
@@ -616,10 +758,13 @@ impl UdpTransport {
                             };
                             let expired = pending
                                 .as_ref()
-                                .filter(|pending| matches_identity(pending) && pending.is_expired(now))
+                                .filter(|pending| {
+                                    matches_identity(pending) && pending.is_expired(now)
+                                })
                                 .cloned();
-                            let matched = pending
-                                .filter(|pending| matches_identity(pending) && !pending.is_expired(now));
+                            let matched = pending.filter(|pending| {
+                                matches_identity(pending) && !pending.is_expired(now)
+                            });
                             if matched.is_some() || expired.is_some() {
                                 pending_probes.remove(&packet.nonce);
                             }
@@ -628,12 +773,10 @@ impl UdpTransport {
 
                         let (ack_match, expired_pending, hard_hard_token) = ack_match;
                         if let Some(expired) = expired_pending {
-                            self.clear_hard_hard_pending_probe_token(packet.nonce)
-                                .await;
+                            self.clear_hard_hard_pending_probe_token(packet.nonce).await;
                             self.update_socket_diagnostics(socket_index, |metrics| {
-                                metrics.authenticated_probe_acks_unmatched = metrics
-                                    .authenticated_probe_acks_unmatched
-                                    .saturating_add(1)
+                                metrics.authenticated_probe_acks_unmatched =
+                                    metrics.authenticated_probe_acks_unmatched.saturating_add(1)
                             })
                             .await;
                             self.update_peer_probe_rx_diagnostics(
@@ -691,8 +834,7 @@ impl UdpTransport {
                                     )
                                     .await
                                 {
-                                    self.clear_hard_hard_pending_probe_token(packet.nonce)
-                                        .await;
+                                    self.clear_hard_hard_pending_probe_token(packet.nonce).await;
                                     self.update_socket_diagnostics(socket_index, |metrics| {
                                         metrics.authenticated_probe_acks_unmatched = metrics
                                             .authenticated_probe_acks_unmatched
@@ -714,18 +856,22 @@ impl UdpTransport {
                             // still re-verified so a cleanup that won the
                             // lock first refuses the whole adoption.
                             if !self.peer_still_clean(&pending).await {
-                                self.clear_hard_hard_pending_probe_token(packet.nonce)
-                                    .await;
+                                self.clear_hard_hard_pending_probe_token(packet.nonce).await;
                                 continue;
                             }
                             if let Some(token) = pending_token.as_deref() {
-                                if self
-                                    .confirm_pending_probe_adoption(
-                                        &identity.source_node_id,
-                                        token,
-                                    )
-                                    .await
-                                {
+                                let promoted = match pending_emit_guard.as_ref() {
+                                    Some(emit_guard) => {
+                                        self.confirm_pending_probe_adoption_with_emit_guard(
+                                            &identity.source_node_id,
+                                            token,
+                                            emit_guard,
+                                        )
+                                        .await
+                                    }
+                                    None => false,
+                                };
+                                if promoted {
                                     debug!(
                                         "Promoted matching WireGuard and Probe v2 bindings for peer {} after matched authenticated ACK",
                                         identity.source_node_id
@@ -750,8 +896,7 @@ impl UdpTransport {
                                     continue;
                                 }
                             }
-                            self.clear_hard_hard_pending_probe_token(packet.nonce)
-                                .await;
+                            self.clear_hard_hard_pending_probe_token(packet.nonce).await;
                             let latency = pending.sent_at.elapsed();
                             let generation = pending.generation;
                             let probe_session_id = pending.probe_session_id.as_deref();
@@ -778,20 +923,26 @@ impl UdpTransport {
                                     snapshot.authenticated_probe_acks_observed = snapshot
                                         .authenticated_probe_acks_observed
                                         .saturating_add(1);
-                                    snapshot.probe_acks_received = snapshot
-                                        .probe_acks_received
-                                        .saturating_add(1);
+                                    snapshot.probe_acks_received =
+                                        snapshot.probe_acks_received.saturating_add(1);
                                 },
                             )
                             .await;
-                            self.remember_peer_socket(
-                                &identity.source_node_id,
-                                socket_index,
-                                SocketEvidence::Stamped(socket_epoch),
-                            )
-                            .await;
+                            let _ = self
+                                .remember_peer_socket_for_generation_in_epoch(
+                                    &epoch_guard,
+                                    &identity.source_node_id,
+                                    socket_index,
+                                    generation,
+                                    SocketEvidence::Stamped(socket_epoch),
+                                )
+                                .await;
                             self.peers
-                                .learn_authenticated_endpoint(&identity.source_node_id, source)
+                                .learn_authenticated_endpoint_in_epoch(
+                                    &epoch_guard,
+                                    &identity.source_node_id,
+                                    source,
+                                )
                                 .await;
                             let accepted = self
                                 .peers
@@ -841,11 +992,8 @@ impl UdpTransport {
                                         ),
                                     )
                                     .await;
-                                self.trigger_encrypted_validation(
-                                    &identity.source_node_id,
-                                    source,
-                                )
-                                .await;
+                                self.trigger_encrypted_validation(&identity.source_node_id, source)
+                                    .await;
                                 if purpose == PendingProbePurpose::ConsentCheck {
                                     self.peers
                                         .record_direct_event(
@@ -875,9 +1023,8 @@ impl UdpTransport {
                             }
                         } else {
                             self.update_socket_diagnostics(socket_index, |metrics| {
-                                metrics.authenticated_probe_acks_unmatched = metrics
-                                    .authenticated_probe_acks_unmatched
-                                    .saturating_add(1)
+                                metrics.authenticated_probe_acks_unmatched =
+                                    metrics.authenticated_probe_acks_unmatched.saturating_add(1)
                             })
                             .await;
                             self.update_peer_probe_rx_diagnostics(
@@ -956,7 +1103,8 @@ impl UdpTransport {
                                         SocketEvidence::Fresh,
                                     )
                                     .await;
-                                    self.notify_peer_reflexive_observation(&peer_id, source).await;
+                                    self.notify_peer_reflexive_observation(&peer_id, source)
+                                        .await;
                                     self.trigger_peer_reflexive_check(
                                         socket_index,
                                         &peer_id,
@@ -973,42 +1121,84 @@ impl UdpTransport {
                     }
                     PunchPacketKind::Ack => {
                         self.update_socket_diagnostics(socket_index, |metrics| {
-                            metrics.legacy_probe_acks_observed = metrics
-                                .legacy_probe_acks_observed
-                                .saturating_add(1)
+                            metrics.legacy_probe_acks_observed =
+                                metrics.legacy_probe_acks_observed.saturating_add(1)
                         })
                         .await;
+                        // Legacy ACKs have no authenticated sender identity.
+                        // Enter the transaction only through the peer ID stamped
+                        // on this exact pending nonce; an unmatched source must
+                        // never be allowed to learn or mutate a peer.
+                        let pending_peer_id = self
+                            .pending_probes
+                            .lock()
+                            .await
+                            .get(&packet.nonce)
+                            .and_then(|pending| pending.peer_id.clone());
+                        let Some(transaction_peer_id) = pending_peer_id else {
+                            self.update_socket_diagnostics(socket_index, |metrics| {
+                                metrics.legacy_probe_acks_unmatched =
+                                    metrics.legacy_probe_acks_unmatched.saturating_add(1)
+                            })
+                            .await;
+                            trace!(
+                                "Ignored legacy UDP punch ACK from {source}: no peer-owned pending nonce"
+                            );
+                            continue;
+                        };
+
+                        // Match and every resulting mutation are one peer and
+                        // generation transaction. Lifecycle cleanup takes the
+                        // adoption lock; local generation and remote-candidate
+                        // writers take the epoch gate.
+                        let adoption = self.adoption_lock_for(&transaction_peer_id).await;
+                        let _adoption_guard = adoption.lock().await;
+                        let epoch_guard = self.network_epoch_gate.lock().await;
+                        let generation = self.peers.current_network_generation_sync();
+                        let remote_candidate_epoch = self
+                            .peers
+                            .current_remote_candidate_epoch(&transaction_peer_id)
+                            .await
+                            .unwrap_or(0);
+                        let cleanup_epoch =
+                            self.peer_probe_cleanup_epoch(&transaction_peer_id).await;
+                        let direct_commit_seq = self
+                            .peers
+                            .direct_commit_seq_sync(&transaction_peer_id)
+                            .unwrap_or(0);
                         let (ack_match, expired_pending) = {
-                            let generation = self.peers.current_network_generation().await;
                             let mut pending_probes = self.pending_probes.lock().await;
                             let now = Instant::now();
                             let pending = pending_probes.get(&packet.nonce).cloned();
-                            let direct_commit_seq = pending
-                                .as_ref()
-                                .and_then(|pending| pending.peer_id.as_deref())
-                                .and_then(|peer_id| self.peers.direct_commit_seq_sync(peer_id))
-                                .unwrap_or(0);
                             let expired = pending
                                 .as_ref()
                                 .filter(|pending| {
-                                    legacy_ack_matches_pending(
-                                        pending,
-                                        source,
-                                        generation,
-                                        socket_index,
-                                        direct_commit_seq,
-                                    ) && pending.is_expired(now)
+                                    pending.peer_id.as_deref() == Some(transaction_peer_id.as_str())
+                                        && legacy_ack_matches_pending(
+                                            pending,
+                                            source,
+                                            generation,
+                                            remote_candidate_epoch,
+                                            socket_index,
+                                            cleanup_epoch,
+                                            direct_commit_seq,
+                                        )
+                                        && pending.is_expired(now)
                                 })
                                 .cloned();
                             let matched = pending
                                 .filter(|pending| {
-                                    legacy_ack_matches_pending(
-                                        pending,
-                                        source,
-                                        generation,
-                                        socket_index,
-                                        direct_commit_seq,
-                                    ) && !pending.is_expired(now)
+                                    pending.peer_id.as_deref() == Some(transaction_peer_id.as_str())
+                                        && legacy_ack_matches_pending(
+                                            pending,
+                                            source,
+                                            generation,
+                                            remote_candidate_epoch,
+                                            socket_index,
+                                            cleanup_epoch,
+                                            direct_commit_seq,
+                                        )
+                                        && !pending.is_expired(now)
                                 })
                                 .map(|pending| {
                                     (
@@ -1030,9 +1220,8 @@ impl UdpTransport {
                         };
                         if let Some(expired) = expired_pending {
                             self.update_socket_diagnostics(socket_index, |metrics| {
-                                metrics.legacy_probe_acks_unmatched = metrics
-                                    .legacy_probe_acks_unmatched
-                                    .saturating_add(1)
+                                metrics.legacy_probe_acks_unmatched =
+                                    metrics.legacy_probe_acks_unmatched.saturating_add(1)
                             })
                             .await;
                             if let Some(peer_id) = expired.peer_id.as_deref() {
@@ -1059,17 +1248,10 @@ impl UdpTransport {
                             }
                             continue;
                         }
-                        let ack_matched = ack_match.is_some();
-                        let pending_peer_id = ack_match
-                            .as_ref()
-                            .and_then(|(_, _, peer_id, _, _, _, _, _, _)| peer_id.clone());
                         // The peer identity comes from the matched pending
                         // probe (never from the source address alone, which
                         // would let a spoofed ACK drive endpoint learning).
-                        let peer_id = match pending_peer_id.as_ref() {
-                            Some(peer_id) => Some(peer_id.clone()),
-                            None => self.peers.learn_endpoint_from_addr(source).await,
-                        };
+                        let peer_id = Some(transaction_peer_id.clone());
                         if let Some(peer_id) = peer_id {
                             // The whole fence -> learn -> adopt sequence runs
                             // under the peer's adoption lock, and the cleanup
@@ -1078,12 +1260,9 @@ impl UdpTransport {
                             // socket or promote Direct after the peer was
                             // cleaned (offline, PeerLeft, endpoint/public-key
                             // change).
-                            let adoption = self.adoption_lock_for(&peer_id).await;
-                            let _adoption_guard = adoption.lock().await;
-                            let pending_cleanup_epoch =
-                                ack_match
-                                    .as_ref()
-                                    .map(|(_, _, _, _, _, _, _, epoch, _)| *epoch);
+                            let pending_cleanup_epoch = ack_match
+                                .as_ref()
+                                .map(|(_, _, _, _, _, _, _, epoch, _)| *epoch);
                             let still_clean = match pending_cleanup_epoch {
                                 Some(stamped) => {
                                     self.peer_probe_cleanup_epoch(&peer_id).await == stamped
@@ -1117,36 +1296,66 @@ impl UdpTransport {
                                     generation,
                                     probe_session_id.as_deref(),
                                     |snapshot| {
-                                        snapshot.legacy_probe_acks_observed = snapshot
-                                            .legacy_probe_acks_observed
-                                            .saturating_add(1);
-                                        snapshot.probe_acks_received = snapshot
-                                            .probe_acks_received
-                                            .saturating_add(1);
+                                        snapshot.legacy_probe_acks_observed =
+                                            snapshot.legacy_probe_acks_observed.saturating_add(1);
+                                        snapshot.probe_acks_received =
+                                            snapshot.probe_acks_received.saturating_add(1);
                                     },
                                 )
                                 .await;
-                                self.peers
+                                // Recheck every stamped authority immediately
+                                // before the first mutation.  Adoption + epoch
+                                // keep these values stable through the success
+                                // commit, closing both local-generation and
+                                // remote-candidate ABA races.
+                                let stamps_current = self.peers.current_network_generation_sync()
+                                    == generation
+                                    && self
+                                        .peers
+                                        .current_remote_candidate_epoch(&peer_id)
+                                        .await
+                                        .unwrap_or(0)
+                                        == remote_candidate_epoch
+                                    && self.peer_probe_cleanup_epoch(&peer_id).await
+                                        == pending_cleanup_epoch.unwrap_or(u64::MAX)
+                                    && self.peers.direct_commit_seq_sync(&peer_id).unwrap_or(0)
+                                        == direct_commit_seq_at_send;
+                                if !stamps_current {
+                                    trace!(
+                                        "Ignored legacy UDP punch ACK from {source} for peer {peer_id}: lifecycle or generation changed before adoption"
+                                    );
+                                    continue;
+                                }
+                                if !self
+                                    .peers
                                     .learn_correlated_probe_endpoint(&peer_id, source)
+                                    .await
+                                {
+                                    continue;
+                                }
+                                let _affinity_adopted = self
+                                    .remember_peer_socket_for_generation_in_epoch(
+                                        &epoch_guard,
+                                        &peer_id,
+                                        socket_index,
+                                        generation,
+                                        SocketEvidence::Stamped(socket_epoch),
+                                    )
                                     .await;
-                                self.remember_peer_socket(
-                                    &peer_id,
-                                    socket_index,
-                                    SocketEvidence::Stamped(socket_epoch),
-                                )
-                                .await;
                                 let accepted = self
                                     .peers
-                                    .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
+                                    .record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(
                                         &peer_id,
                                         source,
                                         Some(latency),
                                         generation,
                                         local_endpoint,
+                                        Some(remote_candidate_epoch),
                                     )
                                     .await;
                                 if accepted {
-                                    self.notify_peer_reflexive_observation(&peer_id, source).await;
+                                    self.notify_peer_reflexive_observation(&peer_id, source)
+                                        .await;
                                     // Legacy peers still need the same
                                     // per-pending-probe attribution. The ACK
                                     // remains only an ingress signal for the
@@ -1169,8 +1378,7 @@ impl UdpTransport {
                                             ),
                                         )
                                         .await;
-                                    self.trigger_encrypted_validation(&peer_id, source)
-                                        .await;
+                                    self.trigger_encrypted_validation(&peer_id, source).await;
                                     if purpose == PendingProbePurpose::ConsentCheck {
                                         self.peers
                                             .record_direct_event(
@@ -1197,22 +1405,18 @@ impl UdpTransport {
                                 }
                             } else {
                                 self.update_socket_diagnostics(socket_index, |metrics| {
-                                    metrics.legacy_probe_acks_unmatched = metrics
-                                        .legacy_probe_acks_unmatched
-                                        .saturating_add(1)
+                                    metrics.legacy_probe_acks_unmatched =
+                                        metrics.legacy_probe_acks_unmatched.saturating_add(1)
                                 })
                                 .await;
                                 trace!("Ignored stale or unmatched UDP punch ACK from {source}");
                             }
                         } else {
-                            if !ack_matched {
-                                self.update_socket_diagnostics(socket_index, |metrics| {
-                                    metrics.legacy_probe_acks_unmatched = metrics
-                                        .legacy_probe_acks_unmatched
-                                        .saturating_add(1)
-                                })
-                                .await;
-                            }
+                            self.update_socket_diagnostics(socket_index, |metrics| {
+                                metrics.legacy_probe_acks_unmatched =
+                                    metrics.legacy_probe_acks_unmatched.saturating_add(1)
+                            })
+                            .await;
                             trace!("Received UDP punch ACK from unknown candidate {source}");
                         }
                     }

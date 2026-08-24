@@ -89,6 +89,7 @@ impl ControlClient {
             let critical_event_tx = event_tx.clone();
             let critical_relay_selection = relay_selection.clone();
             let critical_http = http.clone();
+            let critical_health = health.clone();
             tokio::spawn(async move {
                 run_critical_control_loop(
                     critical_http,
@@ -100,6 +101,7 @@ impl ControlClient {
                     critical_auth_rx,
                     critical_event_tx,
                     critical_relay_selection,
+                    critical_health,
                 )
                 .await;
             });
@@ -348,11 +350,11 @@ impl ControlClient {
     /// Send a peer offer with candidate sources and an optional synchronized punch window.
     ///
     /// `fresh_ownership` optionally carries the punch-session cancellation for
-    /// a fresh-mapping prediction advertisement: the HTTP worker refuses to
-    /// send once the session was superseded, so a stale prediction can never
-    /// reach the wire after its owner was cancelled.  The outcome reports
-    /// whether the signal was really sent (`Sent`), was revoked before the
-    /// request (`Cancelled`) or failed (`Failed`).
+    /// a fresh-mapping prediction advertisement. The HTTP worker drops queued
+    /// or in-flight work once the session is superseded; an in-flight request
+    /// may already have reached the server, so `Cancelled` means delivery is
+    /// ambiguous and the retired socket must not be finalized. `Sent` means
+    /// the server accepted the request; `Failed` means the attempt failed.
     pub(crate) async fn send_peer_offer_with_sources_and_punch_at(
         &self,
         to_node_id: &str,
@@ -422,9 +424,10 @@ impl ControlClient {
     /// refresh can never overwrite the predicted window on the server, and the
     /// server's per-pair ordering delivers it in send order.
     ///
-    /// Returns `Err(PeerOfferSendFailure::Cancelled)` when the ownership was
-    /// revoked before the HTTP request: the caller must NOT treat the
-    /// prediction as advertised and must NOT finalize the generation's socket.
+    /// Returns `Err(PeerOfferSendFailure::Cancelled)` when ownership is
+    /// revoked while queued or while the HTTP request is in flight: the caller
+    /// must NOT treat the prediction as advertised and must NOT finalize the
+    /// generation's socket.
     pub(crate) async fn send_fresh_peer_offer_with_sources_and_punch_at(
         &self,
         to_node_id: &str,

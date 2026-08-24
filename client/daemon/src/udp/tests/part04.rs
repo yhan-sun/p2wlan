@@ -62,16 +62,13 @@ impl SimulatedNat {
             observers.push(socket.local_addr().unwrap());
             observer_holders.push(socket);
         }
-        let peer_public_socket = Arc::new(
-            UdpSocket::bind(SocketAddr::new(nat_ip, 0)).await.unwrap(),
-        );
+        let peer_public_socket =
+            Arc::new(UdpSocket::bind(SocketAddr::new(nat_ip, 0)).await.unwrap());
         let peer_public = peer_public_socket.local_addr().unwrap();
-        let peer_private_socket = UdpSocket::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            0,
-        ))
-        .await
-        .unwrap();
+        let peer_private_socket =
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0))
+                .await
+                .unwrap();
         let peer_private = peer_private_socket.local_addr().unwrap();
         drop(observer_holders);
 
@@ -137,9 +134,7 @@ impl SimulatedNat {
                             let forwarder = loop {
                                 match UdpSocket::bind(SocketAddr::new(nat_ip, port)).await {
                                     Ok(forwarder) => break Arc::new(forwarder),
-                                    Err(error)
-                                        if error.kind() == std::io::ErrorKind::AddrInUse =>
-                                    {
+                                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
                                         let mut next = next_port.lock().await;
                                         port = *next;
                                         *next = next.wrapping_add(step as u16);
@@ -175,7 +170,10 @@ impl SimulatedNat {
                 loop {
                     let sockets = {
                         let forwarders = forwarders.lock().await;
-                        forwarders.iter().map(|(p, s)| (*p, s.clone())).collect::<Vec<_>>()
+                        forwarders
+                            .iter()
+                            .map(|(p, s)| (*p, s.clone()))
+                            .collect::<Vec<_>>()
                     };
                     if sockets.is_empty() {
                         sleep(Duration::from_millis(2)).await;
@@ -219,9 +217,8 @@ impl SimulatedNat {
                         let port = {
                             let mut mappings = mappings.lock().await;
                             let mut next = next_port.lock().await;
-                            let port = *mappings
-                                .entry((client_src, observer))
-                                .or_insert_with(|| {
+                            let port =
+                                *mappings.entry((client_src, observer)).or_insert_with(|| {
                                     let port = *next;
                                     *next = next.wrapping_add(step as u16);
                                     port
@@ -235,9 +232,9 @@ impl SimulatedNat {
                                     request.transaction_id,
                                 );
                                 response.add_attribute(
-                                    p2pnet_nat::StunAttribute::XorMappedAddress(
-                                        SocketAddr::new(nat_ip, port),
-                                    ),
+                                    p2pnet_nat::StunAttribute::XorMappedAddress(SocketAddr::new(
+                                        nat_ip, port,
+                                    )),
                                 );
                                 let _ = socket.send_to(&response.encode(), client_src).await;
                             }
@@ -340,6 +337,109 @@ async fn generation_env() -> (Arc<PeerManager>, Arc<UdpTransport>, SimulatedNat)
         .with_local_node_id("peer-a")
         .with_inbound_channel(tx);
     (peers, Arc::new(transport), nat)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_attach_waits_for_first_reader_poll_before_immediate_stun() {
+    let (_peers, transport, nat) = generation_env().await;
+    let (socket_index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    let mut attach = Box::pin(transport.attach_dynamic_punch_socket(
+        "peer-b",
+        socket_index,
+        socket.clone(),
+        0,
+        1,
+        None,
+    ));
+
+    // Poll only the attach future, without yielding to any spawned task.  It
+    // must reach the post-insert reader-ready handshake and remain pending;
+    // merely spawning the reader is not sufficient to complete the attach.
+    let first_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(attach.as_mut(), context))
+    })
+    .await;
+    assert!(
+        matches!(first_poll, std::task::Poll::Pending),
+        "attach returned before the spawned reader received its first poll"
+    );
+    assert!(
+        transport
+            .socket_state
+            .try_lock()
+            .expect("attach must not retain the socket-state lock while awaiting reader readiness")
+            .dynamic
+            .contains_key(&socket_index),
+        "the first poll must reach the post-insert reader-ready handshake"
+    );
+
+    let guard = timeout(Duration::from_secs(1), attach)
+        .await
+        .expect("the spawned reader must publish readiness")
+        .expect("the dynamic socket must attach");
+    let observations = transport
+        .measure_fresh_mapping_batch(&socket, &nat.observers, FRESH_MAPPING_STUN_TIMEOUT, || true)
+        .await;
+    assert_eq!(
+        observations.len(),
+        3,
+        "every immediate sequential observer response must reach the ready dynamic reader"
+    );
+
+    transport
+        .detach_dynamic_socket_by_index(socket_index, "reader_ready_test_complete")
+        .await;
+    drop(guard);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_reader_ready_ignores_prequeued_unrelated_datagram() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sender
+        .send_to(b"queued", receiver.local_addr().unwrap())
+        .await
+        .unwrap();
+    receiver
+        .readable()
+        .await
+        .expect("the unrelated datagram must be queued before the reader poll");
+
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let mut ready_tx = Some(ready_tx);
+    let mut first_buf = [0u8; 32];
+    let (first_len, _) =
+        UdpTransport::recv_from_with_reader_ready(&receiver, &mut first_buf, &mut ready_tx)
+            .await
+            .unwrap();
+    assert_eq!(&first_buf[..first_len], b"queued");
+    assert!(
+        matches!(
+            ready_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "consuming an already-queued packet must not acknowledge readiness for the next packet"
+    );
+
+    let mut next_buf = [0u8; 32];
+    let mut next_receive = Box::pin(UdpTransport::recv_from_with_reader_ready(
+        &receiver,
+        &mut next_buf,
+        &mut ready_tx,
+    ));
+    let first_poll = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(next_receive.as_mut(), context))
+    })
+    .await;
+    assert!(matches!(first_poll, std::task::Poll::Pending));
+    assert_eq!(ready_rx.await, Ok(true));
+
+    sender
+        .send_to(b"next", receiver.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (next_len, _) = next_receive.await.unwrap();
+    assert_eq!(&next_buf[..next_len], b"next");
 }
 
 /// Full measure-then-punch round trip through the simulated NAT.
@@ -457,15 +557,28 @@ async fn fresh_mapping_generation_predicts_step1_and_ack_returns_on_same_socket(
     .await
     .expect("matched ACK observed");
 
-    // The peer saw the punch from exactly the predicted top-1 port.
+    // The peer saw every punch from exactly the predicted top-1 port. ACK
+    // processing is deliberately asynchronous, so a loaded runtime may emit
+    // one or more bounded retry rounds before the Direct transition becomes
+    // visible to the sender; packet multiplicity is not the path invariant.
     let seen_sources = seen.lock().await.clone();
-    assert_eq!(seen_sources.len(), 1, "peer saw {seen_sources:?}");
-    let (source, _generation) = seen_sources[0];
-    assert_eq!(source.port(), base + 3);
-    assert_eq!(source.ip(), nat.nat_ip);
+    assert!(!seen_sources.is_empty(), "peer saw no predicted punch");
+    assert!(
+        seen_sources.len() <= 6,
+        "two attempts with two bounded retransmissions each must not exceed six punches; peer saw {seen_sources:?}"
+    );
+    assert!(
+        seen_sources
+            .iter()
+            .all(|(source, _generation)| source.port() == base + 3 && source.ip() == nat.nat_ip),
+        "every retry must use the predicted top-1 endpoint; peer saw {seen_sources:?}"
+    );
 
     // The NAT really assigned the predicted port for the dynamic socket.
-    assert_eq!(nat.assigned_punch_port(result.socket_local_endpoint).await, base + 3);
+    assert_eq!(
+        nat.assigned_punch_port(result.socket_local_endpoint).await,
+        base + 3
+    );
 
     // Prediction-result accounting: actual == predicted, error 0.
     let actual_public = SocketAddr::new(nat.nat_ip, base + 3);
@@ -480,7 +593,10 @@ async fn fresh_mapping_generation_predicts_step1_and_ack_returns_on_same_socket(
     // Accepted result always corresponds to a socket that can receive ACKs.
     assert!(transport.has_dynamic_socket_for_peer("peer-b").await);
     assert_eq!(
-        transport.dynamic_socket_index_for_peer("peer-b").await.unwrap(),
+        transport
+            .dynamic_socket_index_for_peer("peer-b")
+            .await
+            .unwrap(),
         result.socket_index
     );
     let dynamic_rx = transport
@@ -603,10 +719,12 @@ async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends()
         .attach_dynamic_punch_socket("peer-b", socket_index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(handoff
-        .commit_and_pin(&transport, "peer-b", socket_index, 0, 1)
-        .await
-        .committed);
+    assert!(
+        handoff
+            .commit_and_pin(&transport, "peer-b", socket_index, 0, 1)
+            .await
+            .committed
+    );
     assert!(handoff.finalize().await);
     transport
         .detach_dynamic_socket_by_index(socket_index, "test_exact_socket_detached")
@@ -626,10 +744,7 @@ async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends()
     assert_eq!(report.unique_target_endpoints, 0);
     assert!(!peers.is_direct("peer-b").await);
     assert_eq!(
-        peers
-            .select_path_for_data("peer-b", true, true)
-            .await
-            .path,
+        peers.select_path_for_data("peer-b", true, true).await.path,
         Some(NetworkPath::Relay),
         "a detached exact Hard↔Hard socket must leave Relay as the data path"
     );
@@ -807,11 +922,10 @@ async fn provisional_socket_guard_detaches_only_when_abandoned() {
         )
         .await
         .unwrap();
-    let outcome = guard.commit_and_pin(&transport, "peer-b", committed_index, 0, 2).await;
-    assert!(
-        outcome.committed,
-        "provisional socket must commit"
-    );
+    let outcome = guard
+        .commit_and_pin(&transport, "peer-b", committed_index, 0, 2)
+        .await;
+    assert!(outcome.committed, "provisional socket must commit");
     cancellation.cancel();
     drop(guard);
     timeout(Duration::from_secs(2), async {
@@ -846,7 +960,9 @@ async fn provisional_socket_guard_detaches_only_when_abandoned() {
         )
         .await
         .unwrap();
-    let outcome = guard.commit_and_pin(&transport, "peer-b", final_index, 0, 3).await;
+    let outcome = guard
+        .commit_and_pin(&transport, "peer-b", final_index, 0, 3)
+        .await;
     assert!(outcome.committed, "the final generation must commit");
     guard.finalize().await;
     cancellation.cancel();
@@ -877,12 +993,9 @@ async fn slow_observers(count: usize, delay: Duration) -> Vec<SocketAddr> {
     let mut observers = Vec::new();
     for _ in 0..count {
         let socket = Arc::new(
-            UdpSocket::bind(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                0,
-            ))
-            .await
-            .unwrap(),
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0))
+                .await
+                .unwrap(),
         );
         observers.push(socket.local_addr().unwrap());
         let socket = socket.clone();
@@ -896,9 +1009,10 @@ async fn slow_observers(count: usize, delay: Duration) -> Vec<SocketAddr> {
                         .min(u16::MAX as u32) as u16;
                     let mut response = StunMessage::new(p2pnet_nat::BINDING_RESPONSE);
                     response.transaction_id = request.transaction_id;
-                    response.add_attribute(StunAttribute::XorMappedAddress(
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), observed_port),
-                    ));
+                    response.add_attribute(StunAttribute::XorMappedAddress(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        observed_port,
+                    )));
                     let _ = socket.send_to(&response.encode(), source).await;
                 }
             }
@@ -1003,12 +1117,9 @@ async fn slow_observers_with_counter(
     let mut observers = Vec::new();
     for _ in 0..count {
         let socket = Arc::new(
-            UdpSocket::bind(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                0,
-            ))
-            .await
-            .unwrap(),
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0))
+                .await
+                .unwrap(),
         );
         observers.push(socket.local_addr().unwrap());
         let socket = socket.clone();
@@ -1021,9 +1132,10 @@ async fn slow_observers_with_counter(
                     sleep(delay).await;
                     let mut response = StunMessage::new(p2pnet_nat::BINDING_RESPONSE);
                     response.transaction_id = _request.transaction_id;
-                    response.add_attribute(StunAttribute::XorMappedAddress(
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42100),
-                    ));
+                    response.add_attribute(StunAttribute::XorMappedAddress(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        42100,
+                    )));
                     let _ = socket.send_to(&response.encode(), source).await;
                 }
             }
@@ -1036,8 +1148,8 @@ async fn slow_observers_with_counter(
 async fn direct_promotion_cancels_in_flight_fresh_mapping() {
     let (peers, transport, nat) = generation_env().await;
     let request_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let slow = slow_observers_with_counter(4, Duration::from_millis(300), request_count.clone())
-        .await;
+    let slow =
+        slow_observers_with_counter(4, Duration::from_millis(300), request_count.clone()).await;
     let outcome = {
         let transport = transport.clone();
         tokio::spawn(async move {
@@ -1054,13 +1166,16 @@ async fn direct_promotion_cancels_in_flight_fresh_mapping() {
                 .await
         })
     };
-    // Let only the first STUN sample reach the observers, then confirm the
-    // peer Direct while the remaining samples are still in flight.
-    sleep(Duration::from_millis(80)).await;
-    assert!(
-        request_count.load(std::sync::atomic::Ordering::Relaxed) >= 1,
-        "the measurement must have started before Direct was confirmed"
-    );
+    // Wait on the observable barrier instead of assuming the spawned
+    // measurement is scheduled within 80 ms. Then confirm the peer Direct
+    // while the deliberately delayed STUN responses are still in flight.
+    timeout(Duration::from_secs(1), async {
+        while request_count.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the measurement must start before Direct is confirmed");
     peers
         .record_direct_success("peer-b", Some(nat.peer_public))
         .await;
@@ -1159,11 +1274,7 @@ async fn stale_ack_does_not_downgrade_committed_socket_affinity() {
     // probe was stamped before the second generation committed, so the
     // adoption must be refused.
     transport
-        .remember_peer_socket(
-            "peer-b",
-            first.socket_index,
-            SocketEvidence::Stamped(0),
-        )
+        .remember_peer_socket("peer-b", first.socket_index, SocketEvidence::Stamped(0))
         .await;
     assert_eq!(
         transport.dynamic_socket_index_for_peer("peer-b").await,
@@ -1243,9 +1354,7 @@ async fn fresh_mapping_generation_respects_network_generation_invalidation() {
     assert!(matches!(outcome, FreshMappingOutcome::Accepted(..)));
     assert!(peers.fresh_mapping_for_peer("peer-b").await.is_some());
 
-    peers
-        .advance_network_generation("test wifi handover")
-        .await;
+    peers.advance_network_generation("test wifi handover").await;
     assert!(peers.fresh_mapping_for_peer("peer-b").await.is_none());
 }
 
@@ -1352,14 +1461,8 @@ async fn relay_availability_does_not_cancel_punch_generation() {
 async fn strict_filtering_both_sides_synchronized_punch_ack_returns_on_same_socket() {
     let a_identity = NodeIdentity::generate();
     let b_identity = NodeIdentity::generate();
-    let a_peers = Arc::new(PeerManager::new(config_for_identity(
-        &a_identity,
-        "peer-a",
-    )));
-    let b_peers = Arc::new(PeerManager::new(config_for_identity(
-        &b_identity,
-        "peer-b",
-    )));
+    let a_peers = Arc::new(PeerManager::new(config_for_identity(&a_identity, "peer-a")));
+    let b_peers = Arc::new(PeerManager::new(config_for_identity(&b_identity, "peer-b")));
     a_peers
         .add_peer(&peer_with_public_key(
             "peer-b",
@@ -1465,7 +1568,9 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
 
     // Fill the cap with non-Direct peers.
     let mut indices = Vec::new();
-    for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8"] {
+    for peer_id in [
+        "peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8",
+    ] {
         peers
             .add_peer(&peer_with_public_key(
                 peer_id,
@@ -1480,10 +1585,15 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
             .await
             .unwrap();
         assert!(
-            guard.commit_and_pin(&transport, peer_id, index, 0, 1).await.committed,
+            guard
+                .commit_and_pin(&transport, peer_id, index, 0, 1)
+                .await
+                .committed,
             "committed socket must pin the peer"
         );
-        transport.remember_peer_socket(peer_id, index, SocketEvidence::Stamped(0)).await;
+        transport
+            .remember_peer_socket(peer_id, index, SocketEvidence::Stamped(0))
+            .await;
         indices.push((peer_id.to_string(), index));
     }
     assert_eq!(transport.dynamic_socket_count().await, 8);
@@ -1495,8 +1605,15 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
         .attach_dynamic_punch_socket("peer-9", index9, socket9, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard9.commit_and_pin(&transport, "peer-9", index9, 0, 1).await.committed);
-    transport.remember_peer_socket("peer-9", index9, SocketEvidence::Stamped(0)).await;
+    assert!(
+        guard9
+            .commit_and_pin(&transport, "peer-9", index9, 0, 1)
+            .await
+            .committed
+    );
+    transport
+        .remember_peer_socket("peer-9", index9, SocketEvidence::Stamped(0))
+        .await;
     assert_eq!(transport.dynamic_socket_count().await, 8);
 
     // The evicted peer's affinity is gone: it falls back to the pool socket.
@@ -1508,7 +1625,10 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
     // With no socket pool, the fallback is exactly the primary pool socket.
     assert_eq!(transport.socket_count(), 1);
     let fallback = transport.socket_for_peer(Some(&evicted_peer)).await;
-    assert!(fallback.is_some(), "evicted peer must fall back to the pool");
+    assert!(
+        fallback.is_some(),
+        "evicted peer must fall back to the pool"
+    );
     assert_eq!(
         fallback.unwrap().1.local_addr().unwrap(),
         transport.local_addr().unwrap(),
@@ -1517,7 +1637,9 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
 
     // A Direct peer's socket is never evicted: mark peer-2 Direct and fill
     // again; the Direct socket must survive.
-    peers.record_direct_success_for_generation("peer-2", None, 0).await;
+    peers
+        .record_direct_success_for_generation("peer-2", None, 0)
+        .await;
     let (index10, socket10) = transport.bind_fresh_punch_socket().await.unwrap();
     transport
         .attach_dynamic_punch_socket("peer-10", index10, socket10, 0, 1, None)
@@ -1532,12 +1654,10 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
             .contains_key(&indices[1].1),
         "Direct peer's dynamic socket must not be evicted"
     );
-    assert!(
-        transport
-            .dynamic_socket_index_for_peer("peer-2")
-            .await
-            .is_some()
-    );
+    assert!(transport
+        .dynamic_socket_index_for_peer("peer-2")
+        .await
+        .is_some());
 
     transport
         .detach_all_dynamic_punch_sockets("test_shutdown")
@@ -1564,8 +1684,15 @@ async fn network_generation_change_detaches_dynamic_socket_on_next_use() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await.committed);
-    transport.remember_peer_socket("peer-b", index, SocketEvidence::Stamped(0)).await;
+    assert!(
+        guard
+            .commit_and_pin(&transport, "peer-b", index, 0, 1)
+            .await
+            .committed
+    );
+    transport
+        .remember_peer_socket("peer-b", index, SocketEvidence::Stamped(0))
+        .await;
     assert_eq!(
         transport.dynamic_socket_index_for_peer("peer-b").await,
         Some(index)
@@ -1654,7 +1781,9 @@ async fn fresh_mapping_cancelled_mid_punch_is_superseded_and_keeps_predecessor()
             Some(nat.peer_public),
         ))
         .await;
-    peers.update_nat_profile(hard_nat_profile().await.nat_profile).await;
+    peers
+        .update_nat_profile(hard_nat_profile().await.nat_profile)
+        .await;
     let (tx, _rx) = mpsc::channel(64);
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
@@ -1761,7 +1890,12 @@ async fn cancelled_provisional_commit_never_succeeds_and_cleans_up() {
         .await
         .unwrap();
     let cancellation = Arc::new(crate::PunchSessionCancellation::default());
-    let guard = ProvisionalSocketGuard::spawn((*transport).clone(), index, "peer-b".to_string(), cancellation.clone());
+    let guard = ProvisionalSocketGuard::spawn(
+        (*transport).clone(),
+        index,
+        "peer-b".to_string(),
+        cancellation.clone(),
+    );
     cancellation.cancel();
     // Race the watcher and the commit: yield so the watcher can run, then
     // attempt the commit.  Whichever wins, the commit must fail.
@@ -1770,7 +1904,10 @@ async fn cancelled_provisional_commit_never_succeeds_and_cleans_up() {
     }
     timeout(Duration::from_secs(5), async {
         assert!(
-            !guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await.committed,
+            !guard
+                .commit_and_pin(&transport, "peer-b", index, 0, 1)
+                .await
+                .committed,
             "a cancelled session must never commit its provisional socket"
         );
     })
@@ -1786,7 +1923,10 @@ async fn cancelled_provisional_commit_never_succeeds_and_cleans_up() {
     })
     .await
     .expect("the provisional socket must be detached");
-    assert_eq!(transport.dynamic_socket_index_for_peer("peer-b").await, None);
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer("peer-b").await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -1818,7 +1958,8 @@ async fn concurrent_watcher_and_commit_agree_on_ownership() {
             // transition must succeed and the socket must remain attached,
             // Committed and pinned.
             let outcome = timeout(Duration::from_secs(5), async {
-                guard.commit_and_pin(&transport, "peer-b", index, 0, 10 + round as u64)
+                guard
+                    .commit_and_pin(&transport, "peer-b", index, 0, 10 + round as u64)
                     .await
                     .committed
             })
@@ -1861,7 +2002,8 @@ async fn concurrent_watcher_and_commit_agree_on_ownership() {
             // and the socket must be gone.
             cancellation.cancel();
             let outcome = timeout(Duration::from_secs(5), async {
-                guard.commit_and_pin(&transport, "peer-b", index, 0, 10 + round as u64)
+                guard
+                    .commit_and_pin(&transport, "peer-b", index, 0, 10 + round as u64)
                     .await
                     .committed
             })
@@ -1881,7 +2023,10 @@ async fn concurrent_watcher_and_commit_agree_on_ownership() {
             })
             .await
             .expect("the provisional socket must be detached");
-            assert_eq!(transport.dynamic_socket_index_for_peer("peer-b").await, None);
+            assert_eq!(
+                transport.dynamic_socket_index_for_peer("peer-b").await,
+                None
+            );
         }
     }
 }
@@ -1919,7 +2064,11 @@ async fn pool_ack_restores_failed_generation_fallback() {
     // current epoch (evidence at least as new as the pin).
     let pool_epoch = {
         let state = transport.socket_state.lock().await;
-        state.affinity.get("peer-b").map(|pin| pin.epoch).unwrap_or(0)
+        state
+            .affinity
+            .get("peer-b")
+            .map(|pin| pin.epoch)
+            .unwrap_or(0)
     };
     assert_eq!(pool_epoch, predecessor_epoch);
     transport
@@ -1995,7 +2144,9 @@ async fn socket_state_lock_order_never_deadlocks_under_concurrent_access() {
                     }
                     _ => {
                         if round % 7 == 0 {
-                            transport.detach_dynamic_socket_by_index(*index, "stress").await;
+                            transport
+                                .detach_dynamic_socket_by_index(*index, "stress")
+                                .await;
                         } else {
                             let _ = transport
                                 .socket_for_index_or_dynamic(*index, Some(peer_id))
@@ -2051,7 +2202,9 @@ async fn dynamic_socket_cap_rejects_when_all_entries_nonevictable() {
 
     // All 8 sockets belong to Direct peers: nothing is evictable.
     let mut socket_guards = Vec::new();
-    for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8"] {
+    for peer_id in [
+        "peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8",
+    ] {
         peers
             .add_peer(&peer_with_public_key(
                 peer_id,
@@ -2069,7 +2222,9 @@ async fn dynamic_socket_cap_rejects_when_all_entries_nonevictable() {
         // the cap assertion.  The test is about nonevictable entries; a
         // dropped guard is allowed to asynchronously detach its socket.
         socket_guards.push(guard);
-        peers.record_direct_success_for_generation(peer_id, None, 0).await;
+        peers
+            .record_direct_success_for_generation(peer_id, None, 0)
+            .await;
     }
     assert_eq!(transport.dynamic_socket_count().await, 8);
 
@@ -2084,6 +2239,88 @@ async fn dynamic_socket_cap_rejects_when_all_entries_nonevictable() {
         "no safe eviction target must yield a clear capacity rejection"
     );
     assert_eq!(transport.dynamic_socket_count().await, 8);
+}
+
+/// A delayed attach from an old network generation must be rejected before
+/// the cap transaction selects an eviction target.  Otherwise a stale task can
+/// destroy a current-generation socket and only discover its own staleness at
+/// the later measurement/commit fence.
+#[tokio::test]
+async fn stale_or_cancelled_attach_cannot_evict_current_generation_at_cap() {
+    let local_identity = NodeIdentity::generate();
+    let peers = Arc::new(PeerManager::new(config_for_identity(
+        &local_identity,
+        "peer-a",
+    )));
+    let (tx, _rx) = mpsc::channel(64);
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap()
+        .with_local_node_id("peer-a")
+        .with_inbound_channel(tx);
+    let current_generation = peers
+        .advance_network_generation("dynamic_attach_cap_generation")
+        .await;
+    assert!(current_generation > 0);
+
+    let mut guards = Vec::new();
+    let mut current_indices = Vec::new();
+    for peer_id in [
+        "peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8",
+    ] {
+        let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
+        let guard = transport
+            .attach_dynamic_punch_socket(peer_id, index, socket, current_generation, 1, None)
+            .await
+            .unwrap();
+        current_indices.push(index);
+        guards.push(guard);
+    }
+    assert_eq!(
+        transport.dynamic_socket_count().await,
+        MAX_DYNAMIC_PUNCH_SOCKETS
+    );
+
+    let (stale_index, stale_socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    let stale = transport
+        .attach_dynamic_punch_socket(
+            "peer-stale",
+            stale_index,
+            stale_socket,
+            current_generation - 1,
+            1,
+            None,
+        )
+        .await;
+    assert!(matches!(stale, Err(DynamicSocketAttachError::Superseded)));
+
+    let cancellation = Arc::new(crate::PunchSessionCancellation::default());
+    cancellation.cancel();
+    let (cancelled_index, cancelled_socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    let cancelled = transport
+        .attach_dynamic_punch_socket(
+            "peer-cancelled",
+            cancelled_index,
+            cancelled_socket,
+            current_generation,
+            1,
+            Some(&cancellation),
+        )
+        .await;
+    assert!(matches!(
+        cancelled,
+        Err(DynamicSocketAttachError::Superseded)
+    ));
+
+    let state = transport.socket_state.lock().await;
+    assert_eq!(state.dynamic.len(), MAX_DYNAMIC_PUNCH_SOCKETS);
+    assert!(current_indices
+        .iter()
+        .all(|index| state.dynamic.contains_key(index)));
+    assert!(!state.dynamic.contains_key(&stale_index));
+    assert!(!state.dynamic.contains_key(&cancelled_index));
+    drop(state);
+    drop(guards);
 }
 
 #[tokio::test]
@@ -2102,7 +2339,10 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
 
     // 7 Direct peers fill most of the cap; the 8th socket is peer-0's own
     // predecessor (its current working path).
-    for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7"] {
+    let mut direct_socket_guards = Vec::new();
+    for peer_id in [
+        "peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7",
+    ] {
         peers
             .add_peer(&peer_with_public_key(
                 peer_id,
@@ -2112,13 +2352,20 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
-        transport
+        let guard = transport
             .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1, None)
             .await
             .unwrap();
-        peers.record_direct_success_for_generation(peer_id, None, 0).await;
+        // A provisional socket is intentionally owned by its guard. Keep the
+        // owner alive while asserting capacity; dropping it is a request to
+        // detach the socket, not a harmless temporary-value cleanup.
+        direct_socket_guards.push(guard);
+        peers
+            .record_direct_success_for_generation(peer_id, None, 0)
+            .await;
     }
-    let (predecessor_index, predecessor_socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    let (predecessor_index, predecessor_socket) =
+        transport.bind_fresh_punch_socket().await.unwrap();
     let predecessor_guard = transport
         .attach_dynamic_punch_socket("peer-0", predecessor_index, predecessor_socket, 0, 1, None)
         .await
@@ -2126,7 +2373,7 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
     assert!(
         predecessor_guard
             .commit_and_pin(&transport, "peer-0", predecessor_index, 0, 1)
-.await
+            .await
             .committed
     );
     transport
@@ -2140,7 +2387,10 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
     let result = transport
         .attach_dynamic_punch_socket("peer-0", index9, socket9, 0, 2, None)
         .await;
-    assert!(matches!(result, Err(DynamicSocketAttachError::CapacityRejected)));
+    assert!(matches!(
+        result,
+        Err(DynamicSocketAttachError::CapacityRejected)
+    ));
     assert_eq!(transport.dynamic_socket_count().await, 8);
     assert_eq!(
         transport.dynamic_socket_index_for_peer("peer-0").await,
@@ -2164,7 +2414,10 @@ async fn dynamic_socket_cap_holds_under_concurrent_attach() {
     let transport = transport.with_inbound_channel(tx);
 
     // 8 non-Direct peers fill the cap.
-    for peer_id in ["peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8"] {
+    let mut socket_guards = Vec::new();
+    for peer_id in [
+        "peer-1", "peer-2", "peer-3", "peer-4", "peer-5", "peer-6", "peer-7", "peer-8",
+    ] {
         peers
             .add_peer(&peer_with_public_key(
                 peer_id,
@@ -2174,17 +2427,21 @@ async fn dynamic_socket_cap_holds_under_concurrent_attach() {
             ))
             .await;
         let (index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
-        transport
+        let guard = transport
             .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1, None)
             .await
             .unwrap();
+        socket_guards.push(guard);
     }
     assert_eq!(transport.dynamic_socket_count().await, 8);
 
     // 12 tasks attach concurrently; the cap must never be exceeded and every
     // accepted attach must win a real slot.
     let mut tasks = Vec::new();
-    for peer_id in ["peer-9", "peer-10", "peer-11", "peer-12", "peer-13", "peer-14", "peer-15", "peer-16", "peer-17", "peer-18", "peer-19", "peer-20"] {
+    for peer_id in [
+        "peer-9", "peer-10", "peer-11", "peer-12", "peer-13", "peer-14", "peer-15", "peer-16",
+        "peer-17", "peer-18", "peer-19", "peer-20",
+    ] {
         peers
             .add_peer(&peer_with_public_key(
                 peer_id,
@@ -2199,29 +2456,35 @@ async fn dynamic_socket_cap_holds_under_concurrent_attach() {
             let result = transport
                 .attach_dynamic_punch_socket(peer_id, index, socket, 0, 1, None)
                 .await;
-            (peer_id, index, result.is_ok())
+            (peer_id, index, result.ok())
         }));
     }
-    let accepted = timeout(Duration::from_secs(30), async {
+    let (accepted, mut accepted_guards) = timeout(Duration::from_secs(30), async {
         let mut accepted = 0usize;
+        let mut accepted_guards = Vec::new();
         for task in tasks {
-            let (peer_id, index, ok) = task.await.unwrap();
-            if ok {
+            let (peer_id, index, guard) = task.await.unwrap();
+            if let Some(guard) = guard {
                 accepted += 1;
                 transport
                     .remember_peer_socket(peer_id, index, SocketEvidence::Stamped(0))
                     .await;
+                accepted_guards.push(guard);
             }
         }
-        accepted
+        (accepted, accepted_guards)
     })
     .await
     .expect("concurrent attaches must finish without deadlock");
-    assert!(accepted >= 4, "eviction must admit some of the 12 attach attempts");
-    let count = transport.dynamic_socket_count().await;
+    socket_guards.append(&mut accepted_guards);
     assert!(
-        count <= MAX_DYNAMIC_PUNCH_SOCKETS,
-        "the cap must hold under concurrent attach, got {count}"
+        accepted >= 4,
+        "eviction must admit some of the 12 attach attempts"
+    );
+    let count = transport.dynamic_socket_count().await;
+    assert_eq!(
+        count, MAX_DYNAMIC_PUNCH_SOCKETS,
+        "every accepted attach must retain a live slot while its owner is held"
     );
     // Affinity never points at an evicted socket: every dynamic pin resolves.
     let state = transport.socket_state.lock().await;
@@ -2276,7 +2539,9 @@ async fn peer_update_cancels_inflight_generation_like_the_control_handler() {
     // The exact PeerUpdated endpoint-change sequence.
     dedup.cancel("peer-b");
     transport.clear_pending_probes_for_peer("peer-b").await;
-    peers.clear_fresh_mapping("peer-b", "endpoint_changed").await;
+    peers
+        .clear_fresh_mapping("peer-b", "endpoint_changed")
+        .await;
 
     let outcome = timeout(Duration::from_secs(5), generation_task)
         .await
@@ -2349,7 +2614,9 @@ async fn public_key_change_detaches_every_dynamic_socket_and_clears_probes() {
         .detach_dynamic_punch_socket("peer-b", "public_key_changed")
         .await;
     transport.clear_pending_probes_for_peer("peer-b").await;
-    peers.clear_fresh_mapping("peer-b", "public_key_changed").await;
+    peers
+        .clear_fresh_mapping("peer-b", "public_key_changed")
+        .await;
     peers
         .reset_remote_fresh_generation("peer-b", "public_key_changed")
         .await;
@@ -2420,7 +2687,10 @@ async fn provisional_socket_cleaned_when_future_dropped_without_cancellation() {
     })
     .await
     .expect("a dropped future must never leak its provisional socket");
-    assert_eq!(transport.dynamic_socket_index_for_peer("peer-b").await, None);
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer("peer-b").await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -2467,7 +2737,12 @@ async fn stale_watcher_never_detaches_new_incarnation_socket() {
     drop(old_guard);
     timeout(Duration::from_secs(2), async {
         loop {
-            let attached = transport.socket_state.lock().await.dynamic.contains_key(&old_index);
+            let attached = transport
+                .socket_state
+                .lock()
+                .await
+                .dynamic
+                .contains_key(&old_index);
             if !attached {
                 break;
             }
@@ -2477,7 +2752,12 @@ async fn stale_watcher_never_detaches_new_incarnation_socket() {
     .await
     .expect("the stale watcher must remove its own old socket");
     assert!(
-        transport.socket_state.lock().await.dynamic.contains_key(&new_index),
+        transport
+            .socket_state
+            .lock()
+            .await
+            .dynamic
+            .contains_key(&new_index),
         "the stale watcher must never detach the new incarnation socket"
     );
     assert_eq!(
@@ -2540,7 +2820,9 @@ async fn cancelled_after_commit_restores_predecessor_pin() {
         .attach_dynamic_punch_socket("peer-b", index_a, socket_a, 0, 1, None)
         .await
         .unwrap();
-    let outcome_a = guard_a.commit_and_pin(&transport, "peer-b", index_a, 0, 1).await;
+    let outcome_a = guard_a
+        .commit_and_pin(&transport, "peer-b", index_a, 0, 1)
+        .await;
     assert!(outcome_a.committed);
     guard_a.finalize().await;
     assert_eq!(
@@ -2556,9 +2838,13 @@ async fn cancelled_after_commit_restores_predecessor_pin() {
         .attach_dynamic_punch_socket("peer-b", index_b, socket_b, 0, 2, Some(&cancellation))
         .await
         .unwrap();
-    let outcome_b = guard_b.commit_and_pin(&transport, "peer-b", index_b, 0, 2).await;
+    let outcome_b = guard_b
+        .commit_and_pin(&transport, "peer-b", index_b, 0, 2)
+        .await;
     assert!(outcome_b.committed);
-    let predecessor = outcome_b.predecessor.expect("pin A must be the predecessor");
+    let predecessor = outcome_b
+        .predecessor
+        .expect("pin A must be the predecessor");
     assert_eq!(predecessor.socket_index, index_a);
     let installed_b = outcome_b.installed.expect("commit must install a pin");
 
@@ -2569,7 +2855,12 @@ async fn cancelled_after_commit_restores_predecessor_pin() {
     drop(guard_b);
     timeout(Duration::from_secs(2), async {
         loop {
-            let attached = transport.socket_state.lock().await.dynamic.contains_key(&index_b);
+            let attached = transport
+                .socket_state
+                .lock()
+                .await
+                .dynamic
+                .contains_key(&index_b);
             if !attached {
                 break;
             }
@@ -2616,7 +2907,12 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
         .attach_dynamic_punch_socket("peer-b", index_1, socket_1, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard_1.commit_and_pin(&transport, "peer-b", index_1, 0, 1).await.committed);
+    assert!(
+        guard_1
+            .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
+            .await
+            .committed
+    );
     guard_1.finalize().await;
 
     // G2 commits (predecessor = G1).
@@ -2626,7 +2922,9 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
         .attach_dynamic_punch_socket("peer-b", index_2, socket_2, 0, 2, Some(&cancellation_2))
         .await
         .unwrap();
-    let outcome_2 = guard_2.commit_and_pin(&transport, "peer-b", index_2, 0, 2).await;
+    let outcome_2 = guard_2
+        .commit_and_pin(&transport, "peer-b", index_2, 0, 2)
+        .await;
     assert!(outcome_2.committed);
 
     // G3 commits on top of G2 (predecessor = G2's pin).
@@ -2635,7 +2933,9 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
         .attach_dynamic_punch_socket("peer-b", index_3, socket_3, 0, 3, None)
         .await
         .unwrap();
-    let outcome_3 = guard_3.commit_and_pin(&transport, "peer-b", index_3, 0, 3).await;
+    let outcome_3 = guard_3
+        .commit_and_pin(&transport, "peer-b", index_3, 0, 3)
+        .await;
     assert!(outcome_3.committed, "G3 must commit");
     assert_eq!(
         outcome_3.predecessor.map(|pin| pin.socket_index),
@@ -2659,7 +2959,12 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
         "G2's rollback must never overwrite G3's pin"
     );
     assert!(
-        transport.socket_state.lock().await.dynamic.contains_key(&index_3),
+        transport
+            .socket_state
+            .lock()
+            .await
+            .dynamic
+            .contains_key(&index_3),
         "G3's socket must stay attached"
     );
     // G2's own socket may be removed by G3's success path; if it is still
@@ -2726,7 +3031,12 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
     }
 
     // Commit: now admissible.
-    assert!(guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await.committed);
+    assert!(
+        guard
+            .commit_and_pin(&transport, "peer-b", index, 0, 1)
+            .await
+            .committed
+    );
     transport
         .remember_peer_socket("peer-b", index, SocketEvidence::Fresh)
         .await;
@@ -2752,7 +3062,12 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         .attach_dynamic_punch_socket("peer-c", index_c, socket_c, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard_c.commit_and_pin(&transport, "peer-c", index_c, 0, 1).await.committed);
+    assert!(
+        guard_c
+            .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
+            .await
+            .committed
+    );
     transport
         .remember_peer_socket("peer-b", index_c, SocketEvidence::Fresh)
         .await;
@@ -2775,7 +3090,12 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         .attach_dynamic_punch_socket("peer-b", index_old, socket_old, 0, 2, None)
         .await
         .unwrap();
-    assert!(guard_old.commit_and_pin(&transport, "peer-b", index_old, 0, 2).await.committed);
+    assert!(
+        guard_old
+            .commit_and_pin(&transport, "peer-b", index_old, 0, 2)
+            .await
+            .committed
+    );
     let committed_epoch = {
         let state = transport.socket_state.lock().await;
         state.affinity.get("peer-b").map(|pin| pin.epoch).unwrap()
@@ -2786,11 +3106,19 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         .remember_peer_socket("peer-b", index_old, SocketEvidence::Fresh)
         .await;
     transport
-        .remember_peer_socket("peer-b", index_old, SocketEvidence::Stamped(committed_epoch + 1))
+        .remember_peer_socket(
+            "peer-b",
+            index_old,
+            SocketEvidence::Stamped(committed_epoch + 1),
+        )
         .await;
     {
         let state = transport.socket_state.lock().await;
-        let pin = state.affinity.get("peer-b").copied().expect("the commit pin stays");
+        let pin = state
+            .affinity
+            .get("peer-b")
+            .copied()
+            .expect("the commit pin stays");
         assert_eq!(
             pin.socket_index, index_old,
             "the committed pin is untouched by the stale-evidence attempt"
@@ -2801,7 +3129,9 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         );
     }
 
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// A probe resolved through the resolver must record the ACTUAL sending
@@ -2824,7 +3154,12 @@ async fn detached_dynamic_socket_fallback_ack_still_matches_on_actual_socket() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await.committed);
+    assert!(
+        guard
+            .commit_and_pin(&transport, "peer-b", index, 0, 1)
+            .await
+            .committed
+    );
 
     let endpoint: SocketAddr = "127.0.0.1:59999".parse().unwrap();
     let generation = peers.current_network_generation().await;
@@ -2841,14 +3176,22 @@ async fn detached_dynamic_socket_fallback_ack_still_matches_on_actual_socket() {
         .await
         .unwrap();
     {
-        let pending = transport.pending_probes.lock().await.get(&nonce1).cloned().unwrap();
+        let pending = transport
+            .pending_probes
+            .lock()
+            .await
+            .get(&nonce1)
+            .cloned()
+            .unwrap();
         assert_eq!(pending.socket_index, index);
     }
 
     // 2. Detach the dynamic socket, then resolve+send again through the same
     // path: the resolver falls back to the pool socket (index 0) and the
     // pending entry must record that actual socket.
-    transport.detach_dynamic_socket_by_index(index, "test_detach").await;
+    transport
+        .detach_dynamic_socket_by_index(index, "test_detach")
+        .await;
     let nonce2 = transport
         .send_probe_from_socket_with_nomination(
             index,
@@ -2860,7 +3203,13 @@ async fn detached_dynamic_socket_fallback_ack_still_matches_on_actual_socket() {
         .await
         .unwrap();
     {
-        let pending = transport.pending_probes.lock().await.get(&nonce2).cloned().unwrap();
+        let pending = transport
+            .pending_probes
+            .lock()
+            .await
+            .get(&nonce2)
+            .cloned()
+            .unwrap();
         assert_eq!(
             pending.socket_index, 0,
             "the pending probe must record the actual sending (fallback) socket"
@@ -2871,13 +3220,19 @@ async fn detached_dynamic_socket_fallback_ack_still_matches_on_actual_socket() {
     // matched even though the probe was requested through a detached index.
     let key = peers.probe_key_for_peer("peer-b").await.unwrap();
     let ack = build_authenticated_punch_ack(nonce2, "peer-b", "peer-a", generation, &key);
-    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
-    sender.send_to(&ack, transport.local_addr().unwrap()).await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    sender
+        .send_to(&ack, transport.local_addr().unwrap())
+        .await
+        .unwrap();
 
     timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = transport.probe_rx_snapshot().await;
-            if snapshot.probe_acks_received >= 1 && snapshot.authenticated_probe_acks_observed >= 1 {
+            if snapshot.probe_acks_received >= 1 && snapshot.authenticated_probe_acks_observed >= 1
+            {
                 break;
             }
             tokio::task::yield_now().await;
@@ -2896,7 +3251,9 @@ async fn detached_dynamic_socket_fallback_ack_still_matches_on_actual_socket() {
         "the matched ACK must adopt the actual sending socket"
     );
 
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// `clear_pending_probes_for_peer` drops every pending probe of the peer and
@@ -2943,7 +3300,10 @@ async fn peer_cleanup_drops_pending_probes_and_advances_the_cleanup_epoch() {
     let pending = transport.pending_probes.lock().await;
     assert!(!pending.contains_key(&nonce1));
     assert!(!pending.contains_key(&nonce2));
-    assert!(pending.contains_key(&nonce_other), "other peers' probes stay");
+    assert!(
+        pending.contains_key(&nonce_other),
+        "other peers' probes stay"
+    );
     drop(pending);
     assert_eq!(
         transport.peer_probe_cleanup_epoch("peer-b").await,
@@ -2955,7 +3315,9 @@ async fn peer_cleanup_drops_pending_probes_and_advances_the_cleanup_epoch() {
     transport.clear_pending_probes_for_peer("peer-b").await;
     assert_eq!(transport.peer_probe_cleanup_epoch("peer-b").await, 2);
     transport.clear_pending_probes_for_peer("peer-c").await;
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// A pending probe whose peer was cleaned up since it was sent can never be
@@ -3022,7 +3384,11 @@ async fn ack_handler_cannot_reinsert_pending_after_peer_cleanup() {
             .restore_pending_probe_if_peer_still_clean(nonce_ok, pending_ok.clone())
             .await
     );
-    assert!(transport.pending_probes.lock().await.contains_key(&nonce_ok));
+    assert!(transport
+        .pending_probes
+        .lock()
+        .await
+        .contains_key(&nonce_ok));
 
     // A cleanup racing the restore must win in the final state: whichever
     // interleaving the scheduler chooses, the pending entry is gone when both
@@ -3059,7 +3425,11 @@ async fn ack_handler_cannot_reinsert_pending_after_peer_cleanup() {
     transport.clear_pending_probes_for_peer("peer-b").await;
     let restored = restore_handle.await.unwrap();
     assert!(
-        !transport.pending_probes.lock().await.contains_key(&nonce_race),
+        !transport
+            .pending_probes
+            .lock()
+            .await
+            .contains_key(&nonce_race),
         "the racing cleanup must not be undone by the restore"
     );
     // If the restore claimed success it must have observed a stable epoch;
@@ -3067,7 +3437,9 @@ async fn ack_handler_cannot_reinsert_pending_after_peer_cleanup() {
     // pending entry is gone, which is the invariant.
     let _ = restored;
     let _ = peers;
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// Dropping the attach future while it waits for the socket-state lock must
@@ -3169,7 +3541,10 @@ async fn attach_dropped_after_insert_before_return_leaks_nothing() {
     })
     .await
     .expect("the guard watcher must detach the provisional entry after a dropped attach");
-    assert_eq!(transport.dynamic_socket_index_for_peer("peer-b").await, None);
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer("peer-b").await,
+        None
+    );
 }
 
 /// The network generation changes between the punch loop and the commit: the
@@ -3185,9 +3560,13 @@ async fn network_generation_change_between_punch_and_commit_refuses_commit() {
     assert_eq!(transport.dynamic_socket_count().await, 1);
 
     // The network changes while the generation is in its punch loop.
-    peers.advance_network_generation("network_switched_during_punch").await;
+    peers
+        .advance_network_generation("network_switched_during_punch")
+        .await;
 
-    let outcome = guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await;
+    let outcome = guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await;
     assert!(
         !outcome.committed,
         "a generation whose network changed before the commit must be refused"
@@ -3229,7 +3608,12 @@ async fn resolve_then_detach_ack_still_matches() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await.committed);
+    assert!(
+        guard
+            .commit_and_pin(&transport, "peer-b", index, 0, 1)
+            .await
+            .committed
+    );
     guard.finalize().await;
 
     // Resolve with a send lease (what the probe path does), then detach the
@@ -3262,7 +3646,13 @@ async fn resolve_then_detach_ack_still_matches() {
     });
     timeout(Duration::from_secs(2), async {
         loop {
-            if !transport.socket_state.lock().await.dynamic.contains_key(&index) {
+            if !transport
+                .socket_state
+                .lock()
+                .await
+                .dynamic
+                .contains_key(&index)
+            {
                 break;
             }
             tokio::task::yield_now().await;
@@ -3271,7 +3661,12 @@ async fn resolve_then_detach_ack_still_matches() {
     .await
     .expect("the detach must remove the entry immediately");
     assert!(
-        !transport.socket_state.lock().await.dynamic.contains_key(&index),
+        !transport
+            .socket_state
+            .lock()
+            .await
+            .dynamic
+            .contains_key(&index),
         "the entry must be gone while the lease is still held"
     );
 
@@ -3292,7 +3687,9 @@ async fn resolve_then_detach_ack_still_matches() {
         .unwrap();
     let key = peers.probe_key_for_peer("peer-b").await.unwrap();
     let ack = build_authenticated_punch_ack(nonce, "peer-b", "peer-a", generation, &key);
-    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
     sender
         .send_to(&ack, resolved_socket.local_addr().unwrap())
         .await
@@ -3320,7 +3717,9 @@ async fn resolve_then_detach_ack_still_matches() {
         .await
         .expect("the detach must complete once the lease drains")
         .expect("detach task panicked");
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// A dynamic socket index that belongs to another peer must never be handed
@@ -3342,7 +3741,12 @@ async fn cross_peer_dynamic_socket_index_refused() {
         .attach_dynamic_punch_socket("peer-c", index_c, socket_c, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard_c.commit_and_pin(&transport, "peer-c", index_c, 0, 1).await.committed);
+    assert!(
+        guard_c
+            .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
+            .await
+            .committed
+    );
 
     // peer-b asks to send through peer-c's dynamic index: the resolver must
     // refuse (wrong owner) and fall back to peer-b's pool socket (index 0).
@@ -3357,7 +3761,13 @@ async fn cross_peer_dynamic_socket_index_refused() {
         )
         .await
         .unwrap();
-    let pending = transport.pending_probes.lock().await.get(&nonce).cloned().unwrap();
+    let pending = transport
+        .pending_probes
+        .lock()
+        .await
+        .get(&nonce)
+        .cloned()
+        .unwrap();
     assert_eq!(
         pending.socket_index, 0,
         "a cross-peer dynamic socket index must fall back to the peer's own pool socket"
@@ -3368,7 +3778,9 @@ async fn cross_peer_dynamic_socket_index_refused() {
         "peer-b must never be pinned to peer-c's socket"
     );
     guard_c.finalize().await;
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 /// After `clear_pending_probes_for_peer`, a late authenticated ACK for an
 /// old nonce must not match, must not re-pin the socket, and must not
@@ -3403,8 +3815,13 @@ async fn ack_after_cleanup_cannot_match_old_pending_or_adopt() {
 
     // The late ACK for the old nonce arrives.
     let ack = build_authenticated_punch_ack(nonce, "peer-b", "peer-a", generation, &key);
-    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
-    sender.send_to(&ack, transport.local_addr().unwrap()).await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    sender
+        .send_to(&ack, transport.local_addr().unwrap())
+        .await
+        .unwrap();
 
     sleep(Duration::from_millis(200)).await;
     let snapshot = transport.probe_rx_snapshot().await;
@@ -3456,16 +3873,29 @@ async fn legacy_ack_after_cleanup_cannot_adopt() {
         )
         .await
         .unwrap();
-    let pending = legacy_transport.pending_probes.lock().await.get(&nonce).cloned().unwrap();
+    let pending = legacy_transport
+        .pending_probes
+        .lock()
+        .await
+        .get(&nonce)
+        .cloned()
+        .unwrap();
     assert!(
         !pending.accepts_authenticated_ack && pending.accepts_legacy_ack,
         "this probe must be legacy-only"
     );
 
-    legacy_transport.clear_pending_probes_for_peer("peer-b").await;
+    legacy_transport
+        .clear_pending_probes_for_peer("peer-b")
+        .await;
     let ack = build_punch_ack(nonce).to_vec();
-    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
-    sender.send_to(&ack, legacy_transport.local_addr().unwrap()).await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    sender
+        .send_to(&ack, legacy_transport.local_addr().unwrap())
+        .await
+        .unwrap();
 
     sleep(Duration::from_millis(200)).await;
     let snapshot = legacy_transport.probe_rx_snapshot().await;
@@ -3478,9 +3908,189 @@ async fn legacy_ack_after_cleanup_cannot_adopt() {
         "a cleaned peer's late legacy ACK must never promote Direct"
     );
     assert!(
-        legacy_transport.affinity_pin_for_test("peer-b").await.is_none(),
+        legacy_transport
+            .affinity_pin_for_test("peer-b")
+            .await
+            .is_none(),
         "a cleaned peer's late legacy ACK must never pin a socket"
     );
+}
+
+/// A legacy ACK that is already queued behind the peer adoption lock must be
+/// matched against the generation that is current when it acquires the full
+/// adoption -> epoch transaction.  An old nonce cannot write new-generation
+/// endpoint, candidate-pair, or socket-affinity state before its final success
+/// gate rejects it.
+#[tokio::test]
+async fn legacy_ack_waiting_for_adoption_cannot_cross_network_generation() {
+    let (peers, _transport, _nat) = generation_env().await;
+    let (tx, _rx) = mpsc::channel(64);
+    let legacy_transport = Arc::new(
+        UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_inbound_channel(tx.clone()),
+    );
+    let inbound_transport = legacy_transport.clone();
+    tokio::spawn(async move {
+        let _ = (*inbound_transport).clone().run_inbound(tx).await;
+    });
+
+    let probed_endpoint: SocketAddr = "127.0.0.1:59992".parse().unwrap();
+    let nonce = legacy_transport
+        .send_probe_from_socket_with_nomination(
+            0,
+            Some("peer-b"),
+            probed_endpoint,
+            false,
+            PendingProbePurpose::ConnectivityCheck,
+        )
+        .await
+        .unwrap();
+    let old_generation = peers.current_network_generation_sync();
+
+    let adoption = legacy_transport.adoption_lock_for("peer-b").await;
+    let adoption_guard = adoption.lock().await;
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ack_source = sender.local_addr().unwrap();
+    sender
+        .send_to(
+            &build_punch_ack(nonce),
+            legacy_transport.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let new_generation = peers
+        .advance_network_generation("legacy_ack_generation_race")
+        .await;
+    assert!(new_generation > old_generation);
+    drop(adoption_guard);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if legacy_transport
+                .probe_rx_snapshot()
+                .await
+                .legacy_probe_acks_unmatched
+                >= 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the old-generation legacy ACK must be rejected");
+
+    let conn = peers.get_connection("peer-b").await.unwrap();
+    assert_ne!(conn.endpoint, Some(ack_source));
+    assert!(!conn.candidates.contains(&ack_source.to_string()));
+    assert!(conn
+        .candidate_pairs
+        .iter()
+        .all(|pair| pair.remote_endpoint != ack_source));
+    assert_eq!(legacy_transport.affinity_pin_for_test("peer-b").await, None);
+    assert!(!peers.is_direct("peer-b").await);
+}
+
+/// The same transaction is bound to the remote candidate-set epoch.  A
+/// handover that wins while the ACK waits on adoption makes the old pending
+/// nonce terminally stale, even when its source IP could otherwise pass the
+/// legacy port-drift rule.
+#[tokio::test]
+async fn legacy_ack_waiting_for_adoption_cannot_cross_remote_candidate_handover() {
+    let (peers, _transport, _nat) = generation_env().await;
+    let (tx, _rx) = mpsc::channel(64);
+    let legacy_transport = Arc::new(
+        UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_inbound_channel(tx.clone()),
+    );
+    let inbound_transport = legacy_transport.clone();
+    tokio::spawn(async move {
+        let _ = (*inbound_transport).clone().run_inbound(tx).await;
+    });
+
+    let probed_endpoint: SocketAddr = "127.0.0.1:59991".parse().unwrap();
+    let nonce = legacy_transport
+        .send_probe_from_socket_with_nomination(
+            0,
+            Some("peer-b"),
+            probed_endpoint,
+            false,
+            PendingProbePurpose::ConnectivityCheck,
+        )
+        .await
+        .unwrap();
+    let pending_remote_epoch = legacy_transport
+        .pending_probes
+        .lock()
+        .await
+        .get(&nonce)
+        .unwrap()
+        .remote_candidate_epoch;
+
+    let adoption = legacy_transport.adoption_lock_for("peer-b").await;
+    let adoption_guard = adoption.lock().await;
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ack_source = sender.local_addr().unwrap();
+    sender
+        .send_to(
+            &build_punch_ack(nonce),
+            legacy_transport.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let replacement = "198.51.100.210:41000".to_string();
+    assert_eq!(
+        peers
+            .add_candidates_with_metadata(
+                "peer-b",
+                std::slice::from_ref(&replacement),
+                &HashMap::new(),
+                1,
+                None,
+            )
+            .await,
+        crate::peer::CandidateSetApplyResult::Applied
+    );
+    assert!(
+        peers
+            .current_remote_candidate_epoch("peer-b")
+            .await
+            .unwrap_or(0)
+            > pending_remote_epoch
+    );
+    drop(adoption_guard);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if legacy_transport
+                .probe_rx_snapshot()
+                .await
+                .legacy_probe_acks_unmatched
+                >= 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retired-candidate legacy ACK must be rejected");
+
+    let conn = peers.get_connection("peer-b").await.unwrap();
+    assert_ne!(conn.endpoint, Some(ack_source));
+    assert!(!conn.candidates.contains(&ack_source.to_string()));
+    assert!(conn
+        .candidate_pairs
+        .iter()
+        .all(|pair| pair.remote_endpoint != ack_source));
+    assert_eq!(legacy_transport.affinity_pin_for_test("peer-b").await, None);
+    assert!(!peers.is_direct("peer-b").await);
 }
 
 /// Peer offline -> rejoin with a NEW public key: old nonces and old endpoints
@@ -3522,9 +4132,15 @@ async fn peer_rejoin_after_offline_invalidates_old_nonce_and_endpoint() {
 
     // The old ACK (old key, old nonce) arrives late: it must not match, pin
     // or promote anything.
-    let old_ack = build_authenticated_punch_ack(old_nonce, "peer-b", "peer-a", generation, &old_key);
-    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
-    sender.send_to(&old_ack, transport.local_addr().unwrap()).await.unwrap();
+    let old_ack =
+        build_authenticated_punch_ack(old_nonce, "peer-b", "peer-a", generation, &old_key);
+    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    sender
+        .send_to(&old_ack, transport.local_addr().unwrap())
+        .await
+        .unwrap();
 
     sleep(Duration::from_millis(200)).await;
     assert!(
@@ -3549,8 +4165,12 @@ async fn peer_rejoin_after_offline_invalidates_old_nonce_and_endpoint() {
         )
         .await
         .unwrap();
-    let fresh_ack = build_authenticated_punch_ack(fresh_nonce, "peer-b", "peer-a", generation, &new_key);
-    sender.send_to(&fresh_ack, transport.local_addr().unwrap()).await.unwrap();
+    let fresh_ack =
+        build_authenticated_punch_ack(fresh_nonce, "peer-b", "peer-a", generation, &new_key);
+    sender
+        .send_to(&fresh_ack, transport.local_addr().unwrap())
+        .await
+        .unwrap();
     timeout(Duration::from_secs(2), async {
         loop {
             let snapshot = transport.probe_rx_snapshot().await;
@@ -3603,7 +4223,13 @@ async fn sender_insert_and_cleanup_race_never_leaves_a_stale_epoch_entry() {
         )
         .await
         .unwrap();
-    let pending = transport.pending_probes.lock().await.get(&nonce_b).cloned().unwrap();
+    let pending = transport
+        .pending_probes
+        .lock()
+        .await
+        .get(&nonce_b)
+        .cloned()
+        .unwrap();
     assert_eq!(
         pending.cleanup_epoch, epoch_after_cleanup,
         "a probe sent after a cleanup must be stamped with the new epoch"
@@ -3663,7 +4289,12 @@ async fn finalized_socket_survives_immediate_guard_drop() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, Some(&cancellation))
         .await
         .unwrap();
-    assert!(guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await.committed);
+    assert!(
+        guard
+            .commit_and_pin(&transport, "peer-b", index, 0, 1)
+            .await
+            .committed
+    );
 
     // The durable handoff completes BEFORE the cancellation is even fired:
     // the handshake waits for the watcher's ack, so no racing stop signal can
@@ -3696,7 +4327,9 @@ async fn finalized_socket_survives_immediate_guard_drop() {
         transport.socket_for_peer(Some("peer-b")).await.is_some(),
         "the peer's data resolution must keep using the finalized socket"
     );
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// The watcher's post-commit rollback must keep a socket that was re-pinned
@@ -3712,7 +4345,9 @@ async fn rollback_keeps_repinned_socket_as_durable() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, Some(&cancellation))
         .await
         .unwrap();
-    let outcome = guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await;
+    let outcome = guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await;
     assert!(outcome.committed);
 
     // Fresh inbound evidence re-pins the SAME socket (a new epoch, so the
@@ -3757,7 +4392,9 @@ async fn rollback_keeps_repinned_socket_as_durable() {
         Some(index),
         "the re-pinned socket must stay the peer's data path"
     );
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// G2's rollback when a newer commit (G3) owns the affinity must detach G2's
@@ -3773,7 +4410,12 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
         .attach_dynamic_punch_socket("peer-b", index_1, socket_1, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard_1.commit_and_pin(&transport, "peer-b", index_1, 0, 1).await.committed);
+    assert!(
+        guard_1
+            .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
+            .await
+            .committed
+    );
     guard_1.finalize().await;
 
     // G2 commits (predecessor = G1), then G3 commits on top of G2.
@@ -3783,13 +4425,20 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
         .attach_dynamic_punch_socket("peer-b", index_2, socket_2, 0, 2, Some(&cancellation_2))
         .await
         .unwrap();
-    assert!(guard_2.commit_and_pin(&transport, "peer-b", index_2, 0, 2).await.committed);
+    assert!(
+        guard_2
+            .commit_and_pin(&transport, "peer-b", index_2, 0, 2)
+            .await
+            .committed
+    );
     let (index_3, socket_3) = transport.bind_fresh_punch_socket().await.unwrap();
     let guard_3 = transport
         .attach_dynamic_punch_socket("peer-b", index_3, socket_3, 0, 3, None)
         .await
         .unwrap();
-    let outcome_3 = guard_3.commit_and_pin(&transport, "peer-b", index_3, 0, 3).await;
+    let outcome_3 = guard_3
+        .commit_and_pin(&transport, "peer-b", index_3, 0, 3)
+        .await;
     assert!(outcome_3.committed);
 
     // G2 is cancelled: its rollback must detach G2's OWN socket (the affinity
@@ -3815,11 +4464,18 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
         "G3's pin must survive G2's rollback untouched"
     );
     assert!(
-        transport.socket_state.lock().await.dynamic.contains_key(&index_3),
+        transport
+            .socket_state
+            .lock()
+            .await
+            .dynamic
+            .contains_key(&index_3),
         "G3's socket must stay attached"
     );
     guard_3.finalize().await;
-    transport.detach_all_dynamic_punch_sockets("test_cleanup").await;
+    transport
+        .detach_all_dynamic_punch_sockets("test_cleanup")
+        .await;
 }
 
 /// A detach that races a probe send must keep the reader alive until the
@@ -3841,7 +4497,12 @@ async fn detach_keeps_reader_alive_until_pending_probe_ack() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(guard.commit_and_pin(&transport, "peer-b", index, 0, 1).await.committed);
+    assert!(
+        guard
+            .commit_and_pin(&transport, "peer-b", index, 0, 1)
+            .await
+            .committed
+    );
     guard.finalize().await;
 
     // Send a probe from the dynamic socket and detach it immediately, while
@@ -3858,7 +4519,9 @@ async fn detach_keeps_reader_alive_until_pending_probe_ack() {
         .await
         .unwrap();
     assert!(transport.pending_probes.lock().await.contains_key(&nonce));
-    transport.detach_dynamic_socket_by_index(index, "test_detach").await;
+    transport
+        .detach_dynamic_socket_by_index(index, "test_detach")
+        .await;
     assert!(
         !transport.pending_probes.lock().await.contains_key(&nonce),
         "the detach's drain must remove the socket's pending probe after the grace"
@@ -3869,8 +4532,13 @@ async fn detach_keeps_reader_alive_until_pending_probe_ack() {
     let key = peers.probe_key_for_peer("peer-b").await.unwrap();
     let generation = peers.current_network_generation().await;
     let ack = build_authenticated_punch_ack(nonce, "peer-b", "peer-a", generation, &key);
-    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).await.unwrap();
-    sender.send_to(&ack, transport.local_addr().unwrap()).await.unwrap();
+    let sender = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    sender
+        .send_to(&ack, transport.local_addr().unwrap())
+        .await
+        .unwrap();
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -3924,7 +4592,11 @@ async fn adoption_lock_serializes_cleanup_against_ack_adoption() {
     {
         let state = transport.socket_state.lock().await;
         assert_eq!(
-            state.probe_cleanup_epochs.get("peer-b").copied().unwrap_or(0),
+            state
+                .probe_cleanup_epochs
+                .get("peer-b")
+                .copied()
+                .unwrap_or(0),
             0,
             "the cleanup epoch must not move while the adoption lock is held"
         );
@@ -3943,7 +4615,11 @@ async fn adoption_lock_serializes_cleanup_against_ack_adoption() {
     {
         let state = transport.socket_state.lock().await;
         assert_eq!(
-            state.probe_cleanup_epochs.get("peer-b").copied().unwrap_or(0),
+            state
+                .probe_cleanup_epochs
+                .get("peer-b")
+                .copied()
+                .unwrap_or(0),
             1,
             "the cleanup epoch must advance exactly once"
         );

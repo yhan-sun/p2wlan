@@ -1,6 +1,13 @@
 /// Health counters for one transport path.
 #[derive(Debug, Clone, Default)]
 pub struct PathHealth {
+    /// Last authenticated packet observed on this path, whether or not that
+    /// packet carried a round-trip timing token.  Relay ingress uses this as a
+    /// liveness diagnostic only; it must not refresh [`Self::last_success_at`],
+    /// which is reserved for timed/confirmed health samples.
+    pub last_observation_at: Option<Instant>,
+    /// Authenticated, untimed path observations seen in this lifecycle.
+    pub observation_count: u64,
     /// Last successful path event.
     pub last_success_at: Option<Instant>,
     /// Last failed path event.
@@ -29,6 +36,11 @@ pub struct PathHealth {
 }
 
 impl PathHealth {
+    pub(super) fn record_observation(&mut self) {
+        self.last_observation_at = Some(Instant::now());
+        self.observation_count = self.observation_count.saturating_add(1);
+    }
+
     pub(super) fn record_success(&mut self) {
         self.last_success_at = Some(Instant::now());
         self.consecutive_failures = 0;
@@ -64,11 +76,20 @@ impl PathHealth {
         self.last_error = Some(reason.into());
     }
 
-    pub(super) fn record_generation_change(&mut self, reason: impl Into<String>) {
+    /// Drop latency/freshness that belonged to a retired network or transport
+    /// incarnation.  Failure/history counters remain diagnostic history, but
+    /// no old RTT is allowed to score or render as a sample of the replacement.
+    pub(super) fn clear_timing_for_lifecycle_change(&mut self) {
+        self.last_observation_at = None;
+        self.observation_count = 0;
         self.last_success_at = None;
         self.latency_ms = None;
         self.rtt_ewma_ms = None;
         self.jitter_ms = None;
+    }
+
+    pub(super) fn record_generation_change(&mut self, reason: impl Into<String>) {
+        self.clear_timing_for_lifecycle_change();
         self.consecutive_failures = 0;
         self.last_liveness = None;
         self.record_failure(REASON_NETWORK_GENERATION_CHANGED, reason);

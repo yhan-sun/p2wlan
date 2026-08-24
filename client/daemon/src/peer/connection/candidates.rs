@@ -16,7 +16,7 @@ impl PeerConnection {
     /// legacy `PeerInfo.endpoint` behavior and accept any endpoint; after a
     /// refresh, only signaled or current-epoch learned endpoints are valid.
     pub(crate) fn is_current_remote_endpoint(&self, endpoint: SocketAddr) -> bool {
-        if self.remote_candidate_epoch == 0 {
+        if self.remote_candidate_epoch == 0 && self.signaled_candidates.is_empty() {
             return true;
         }
         let candidate = endpoint.to_string();
@@ -24,6 +24,37 @@ impl PeerConnection {
             || self.candidate_pairs.iter().any(|pair| {
                 pair.remote_endpoint == endpoint && self.pair_belongs_to_current_remote_epoch(pair)
             })
+    }
+
+    /// Remove current-epoch pairs for authoritative signaled endpoints that a
+    /// newer candidate revision withdrew while retaining the selected Direct
+    /// endpoint. Authenticated Learned/PeerReflexive endpoints remain valid
+    /// independent evidence; ordinary Signaled/Host/STUN/Predicted endpoints
+    /// must not accept a delayed validation after disappearing from the set.
+    pub(super) fn retire_withdrawn_signaled_candidate_pairs(
+        &mut self,
+        incoming_signaled: &HashSet<String>,
+        reason: &str,
+    ) -> usize {
+        let peer_id = self.node_id.clone();
+        let remote_epoch = self.remote_candidate_epoch;
+        let before = self.candidate_pairs.len();
+        self.candidate_pairs.retain_mut(|pair| {
+            let withdrawn = pair.remote_candidate_epoch == remote_epoch
+                && !incoming_signaled.contains(&pair.remote_endpoint.to_string())
+                && !matches!(
+                    pair.source,
+                    CandidatePairSource::Learned | CandidatePairSource::PeerReflexive
+                );
+            if !withdrawn {
+                return true;
+            }
+            let old_state = pair.state;
+            pair.record_remote_candidate_generation_change(reason);
+            log_candidate_pair_state_changed(&peer_id, pair, old_state, reason);
+            false
+        });
+        before.saturating_sub(self.candidate_pairs.len())
     }
 
     fn candidate_endpoints(&self) -> Vec<SocketAddr> {

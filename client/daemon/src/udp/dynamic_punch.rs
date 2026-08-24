@@ -5,6 +5,10 @@ use p2pnet_nat::mapping::{
 };
 
 const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
+/// A spawned dynamic reader should reach its first socket receive poll
+/// immediately.  Bound the handshake so a broken runtime/task cannot leave a
+/// fresh-mapping generation waiting forever before its first STUN request.
+const DYNAMIC_READER_READY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Adaptive-prediction learner state for one network generation, scoped by
 /// destination so a stride learned toward STUN observers is not blindly applied
@@ -152,12 +156,13 @@ impl UdpTransport {
         let direct_peers = self.peers.direct_peer_ids().await;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (reader_ready_tx, reader_ready_rx) = oneshot::channel();
         let reader_handle = {
             let transport = self.clone();
             let socket = socket.clone();
             tokio::spawn(async move {
                 transport
-                    .run_dynamic_inbound_socket(socket_index, socket, shutdown_rx)
+                    .run_dynamic_inbound_socket(socket_index, socket, shutdown_rx, reader_ready_tx)
                     .await
             })
         };
@@ -186,52 +191,80 @@ impl UdpTransport {
         // already gone, so the cap can never be exceeded even while another
         // attach runs concurrently.
         let mut evicted = Vec::new();
+        let mut superseded = false;
         let capacity_ok = {
             let _epoch_gate = self.network_epoch_gate.lock().await;
-            let mut state = self.socket_state.lock().await;
-            if state.dynamic.len() >= MAX_DYNAMIC_PUNCH_SOCKETS {
-                let mut candidates = state
-                    .dynamic
-                    .iter()
-                    .map(|(index, entry)| (*index, entry.peer_id.clone(), entry.created_at))
-                    .collect::<Vec<_>>();
-                candidates.sort_by_key(|(_, _, created_at)| *created_at);
-                for (evict_index, evicted_peer, _) in candidates {
-                    // Never evict the previous generation's socket for the peer we
-                    // are about to attach a new generation for: the old mapping is
-                    // the peer's current working path until the new generation
-                    // commits.  Direct peers are never evicted either — and the
-                    // Direct check is re-verified here, under this lock, against
-                    // the synchronous mirror: a peer that became Direct after the
-                    // pre-lock snapshot must not lose its dedicated socket.
-                    // The Direct check is re-verified here, under this lock,
-                    // against the peer manager's synchronous mirror: a peer
-                    // that became Direct after the pre-lock snapshot must not
-                    // lose its dedicated socket.
-                    if evicted_peer == peer_id || self.peers.is_direct_sync(&evicted_peer) {
-                        continue;
-                    }
-                    let _ = direct_peers; // ordering hint only
-                    let evicted_entry = state
-                        .dynamic
-                        .remove(&evict_index)
-                        .expect("eviction candidate still present under the socket-state lock");
-                    // Drop any affinity that pointed at the evicted socket so the
-                    // peer cleanly falls back to its pool socket.
-                    if state
-                        .affinity
-                        .get(&evicted_peer)
-                        .is_some_and(|pin| pin.socket_index == evict_index)
-                    {
-                        state.affinity.remove(&evicted_peer);
-                    }
-                    evicted.push(evicted_entry);
-                    if state.dynamic.len() < MAX_DYNAMIC_PUNCH_SOCKETS {
-                        break;
-                    }
-                }
+            // The caller captured `network_generation` before binding this
+            // socket.  Recheck it only after acquiring the epoch gate and
+            // before even inspecting an eviction target: a delayed old task
+            // must not evict a current-generation socket and then discover its
+            // staleness during measurement/commit. Cancellation is the same
+            // ownership loss and is rejected at this boundary too.
+            if self.peers.current_network_generation_sync() != network_generation
+                || cancellation.is_some_and(|cancellation| cancellation.is_cancelled())
+            {
+                superseded = true;
+                false
+            } else {
+                let mut state = self.socket_state.lock().await;
                 if state.dynamic.len() >= MAX_DYNAMIC_PUNCH_SOCKETS {
-                    false
+                    let mut candidates = state
+                        .dynamic
+                        .iter()
+                        .map(|(index, entry)| (*index, entry.peer_id.clone(), entry.created_at))
+                        .collect::<Vec<_>>();
+                    candidates.sort_by_key(|(_, _, created_at)| *created_at);
+                    for (evict_index, evicted_peer, _) in candidates {
+                        // Never evict the previous generation's socket for the peer we
+                        // are about to attach a new generation for: the old mapping is
+                        // the peer's current working path until the new generation
+                        // commits. Direct peers are never evicted either.
+                        // Re-verify against the synchronous mirror under this
+                        // lock so a peer which became Direct after the pre-lock
+                        // snapshot cannot lose its dedicated socket.
+                        if evicted_peer == peer_id || self.peers.is_direct_sync(&evicted_peer) {
+                            continue;
+                        }
+                        let _ = direct_peers; // ordering hint only
+                        let evicted_entry = state
+                            .dynamic
+                            .remove(&evict_index)
+                            .expect("eviction candidate still present under the socket-state lock");
+                        // Drop any affinity that pointed at the evicted socket so the
+                        // peer cleanly falls back to its pool socket.
+                        if state
+                            .affinity
+                            .get(&evicted_peer)
+                            .is_some_and(|pin| pin.socket_index == evict_index)
+                        {
+                            state.affinity.remove(&evicted_peer);
+                        }
+                        evicted.push(evicted_entry);
+                        if state.dynamic.len() < MAX_DYNAMIC_PUNCH_SOCKETS {
+                            break;
+                        }
+                    }
+                    if state.dynamic.len() >= MAX_DYNAMIC_PUNCH_SOCKETS {
+                        false
+                    } else {
+                        state.dynamic.insert(
+                            socket_index,
+                            DynamicPunchSocket {
+                                socket_index,
+                                socket: socket.clone(),
+                                peer_id: peer_id.to_string(),
+                                network_generation,
+                                punch_generation,
+                                created_at: Instant::now(),
+                                authenticated_evidence: 0,
+                                phase: DynamicSocketPhase::Provisional,
+                                shutdown_tx,
+                                reader: reader_handle.take().expect("reader handle owned"),
+                                send_leases: Arc::new(DynamicSocketLeaseState::default()),
+                            },
+                        );
+                        true
+                    }
                 } else {
                     state.dynamic.insert(
                         socket_index,
@@ -251,24 +284,6 @@ impl UdpTransport {
                     );
                     true
                 }
-            } else {
-                state.dynamic.insert(
-                    socket_index,
-                    DynamicPunchSocket {
-                        socket_index,
-                        socket: socket.clone(),
-                        peer_id: peer_id.to_string(),
-                        network_generation,
-                        punch_generation,
-                        created_at: Instant::now(),
-                        authenticated_evidence: 0,
-                        phase: DynamicSocketPhase::Provisional,
-                        shutdown_tx,
-                        reader: reader_handle.take().expect("reader handle owned"),
-                        send_leases: Arc::new(DynamicSocketLeaseState::default()),
-                    },
-                );
-                true
             }
         };
         if !capacity_ok {
@@ -282,11 +297,32 @@ impl UdpTransport {
                 self.detach_dynamic_entry(entry, "dynamic_socket_cap_reached")
                     .await;
             }
-            return Err(DynamicSocketAttachError::CapacityRejected);
+            return Err(if superseded {
+                DynamicSocketAttachError::Superseded
+            } else {
+                DynamicSocketAttachError::CapacityRejected
+            });
         }
         for entry in evicted {
             self.detach_dynamic_entry(entry, "dynamic_socket_cap_reached")
                 .await;
+        }
+        // Do not let the caller issue the first STUN request until the spawned
+        // reader has actually polled `recv_from` once.  Spawning alone is not a
+        // scheduling barrier: on a busy runtime the request and response can
+        // otherwise complete while the reader has never registered socket
+        // readiness, making the sole STUN waiter time out.  The sender fires
+        // from the same poll that registers readiness (see
+        // `recv_from_with_reader_ready`).
+        let reader_ready = matches!(
+            timeout(DYNAMIC_READER_READY_TIMEOUT, reader_ready_rx).await,
+            Ok(Ok(true))
+        );
+        if !reader_ready {
+            self.detach_dynamic_socket_by_index(socket_index, "dynamic_reader_start_failed")
+                .await;
+            drop(provisional_guard);
+            return Err(DynamicSocketAttachError::ReaderStartupFailed);
         }
         self.dynamic_socket_diagnostics.lock().await.insert(
             socket_index,
@@ -409,13 +445,16 @@ impl UdpTransport {
     ) {
         let matches = {
             let state = self.socket_state.lock().await;
-            state.dynamic.get(&identity.socket_index).is_some_and(|entry| {
-                entry.peer_id == identity.peer_id
-                    && entry.network_generation == identity.network_generation
-                    && entry.punch_generation == identity.punch_generation
-                    && entry.phase.is_usable()
-                    && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
-            })
+            state
+                .dynamic
+                .get(&identity.socket_index)
+                .is_some_and(|entry| {
+                    entry.peer_id == identity.peer_id
+                        && entry.network_generation == identity.network_generation
+                        && entry.punch_generation == identity.punch_generation
+                        && entry.phase.is_usable()
+                        && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
+                })
         };
         if matches {
             self.detach_dynamic_socket_by_index(identity.socket_index, reason)
@@ -428,17 +467,21 @@ impl UdpTransport {
         identity: &crate::peer::HardHardFreshSocketIdentity,
     ) -> bool {
         let state = self.socket_state.lock().await;
-        state.dynamic.get(&identity.socket_index).is_some_and(|entry| {
-            entry.peer_id == identity.peer_id
-                && entry.network_generation == identity.network_generation
-                && entry.punch_generation == identity.punch_generation
-                && entry.phase.is_usable()
-                && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
-                && state.affinity.get(&identity.peer_id).is_some_and(|pin| {
-                    pin.socket_index == identity.socket_index
-                })
-                && self.peers.current_network_generation_sync() == identity.network_generation
-        })
+        state
+            .dynamic
+            .get(&identity.socket_index)
+            .is_some_and(|entry| {
+                entry.peer_id == identity.peer_id
+                    && entry.network_generation == identity.network_generation
+                    && entry.punch_generation == identity.punch_generation
+                    && entry.phase.is_usable()
+                    && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
+                    && state
+                        .affinity
+                        .get(&identity.peer_id)
+                        .is_some_and(|pin| pin.socket_index == identity.socket_index)
+                    && self.peers.current_network_generation_sync() == identity.network_generation
+            })
     }
 
     /// Exact-socket ownership plus authenticated evidence observed on that
@@ -451,18 +494,22 @@ impl UdpTransport {
         identity: &crate::peer::HardHardFreshSocketIdentity,
     ) -> bool {
         let state = self.socket_state.lock().await;
-        state.dynamic.get(&identity.socket_index).is_some_and(|entry| {
-            entry.peer_id == identity.peer_id
-                && entry.network_generation == identity.network_generation
-                && entry.punch_generation == identity.punch_generation
-                && entry.phase.is_usable()
-                && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
-                && entry.authenticated_evidence > 0
-                && state.affinity.get(&identity.peer_id).is_some_and(|pin| {
-                    pin.socket_index == identity.socket_index
-                })
-                && self.peers.current_network_generation_sync() == identity.network_generation
-        })
+        state
+            .dynamic
+            .get(&identity.socket_index)
+            .is_some_and(|entry| {
+                entry.peer_id == identity.peer_id
+                    && entry.network_generation == identity.network_generation
+                    && entry.punch_generation == identity.punch_generation
+                    && entry.phase.is_usable()
+                    && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
+                    && entry.authenticated_evidence > 0
+                    && state
+                        .affinity
+                        .get(&identity.peer_id)
+                        .is_some_and(|pin| pin.socket_index == identity.socket_index)
+                    && self.peers.current_network_generation_sync() == identity.network_generation
+            })
     }
 
     /// Return the authenticated-evidence counter for one dynamic socket.
@@ -701,16 +748,18 @@ impl UdpTransport {
             }
             let responded_at_ms = monotonic_millis();
             let parsed = match result {
-                Ok(Ok((data, source))) if source == *observer => match StunMessage::decode(&data) {
-                    Ok(response)
-                        if response.transaction_id == transaction_id
-                            && response.msg_type == p2pnet_nat::BINDING_RESPONSE =>
-                    {
-                        response.get_reflexive_address()
+                Ok(Ok(StunResponse { data, source })) if source == *observer => {
+                    match StunMessage::decode(&data) {
+                        Ok(response)
+                            if response.transaction_id == transaction_id
+                                && response.msg_type == p2pnet_nat::BINDING_RESPONSE =>
+                        {
+                            response.get_reflexive_address()
+                        }
+                        Ok(_) => None,
+                        Err(_) => None,
                     }
-                    Ok(_) => None,
-                    Err(_) => None,
-                },
+                }
                 _ => None,
             };
             if let Some(observed) = parsed {
@@ -958,10 +1007,14 @@ impl UdpTransport {
             Err(error) => {
                 warn!("Failed to attach fresh-mapping punch socket for peer {peer_id}: {error:?}");
                 return FreshMappingOutcome::Rejected(match error {
+                    DynamicSocketAttachError::Superseded => FreshMappingRejection::Superseded,
                     DynamicSocketAttachError::CapacityRejected => {
                         FreshMappingRejection::CapacityRejected
                     }
-                    DynamicSocketAttachError::NoInboundChannel => FreshMappingRejection::BindFailed,
+                    DynamicSocketAttachError::NoInboundChannel
+                    | DynamicSocketAttachError::ReaderStartupFailed => {
+                        FreshMappingRejection::BindFailed
+                    }
                 });
             }
         };
@@ -1347,58 +1400,58 @@ impl UdpTransport {
         };
         let mut sent = 0u32;
         if !measure_only {
-        for round in 0..attempts {
-            if cancellation.is_some_and(|c| c.is_cancelled()) {
-                debug!(
+            for round in 0..attempts {
+                if cancellation.is_some_and(|c| c.is_cancelled()) {
+                    debug!(
                     "Fresh-mapping punch generation {punch_generation} aborted mid-punch; session superseded"
                 );
-                break;
-            }
-            if self.peers.is_direct(peer_id).await {
-                // Direct was confirmed while this generation was measuring or
-                // punching: stop emitting peer-facing probes from the
-                // generation's socket immediately.
-                debug!(
+                    break;
+                }
+                if self.peers.is_direct(peer_id).await {
+                    // Direct was confirmed while this generation was measuring or
+                    // punching: stop emitting peer-facing probes from the
+                    // generation's socket immediately.
+                    debug!(
                     "Fresh-mapping punch generation {punch_generation} aborted mid-punch; Direct was confirmed"
                 );
-                break;
-            }
-            if self.peers.current_network_generation_sync() != network_generation {
-                debug!(
+                    break;
+                }
+                if self.peers.current_network_generation_sync() != network_generation {
+                    debug!(
                     "Fresh-mapping punch generation {punch_generation} aborted mid-punch; the network generation changed"
                 );
-                break;
-            }
-            for target in &stable_targets {
-                match self
-                    .send_probe_on_socket(
-                        socket_index,
-                        socket.clone(),
-                        Some(peer_id),
-                        *target,
-                        true,
-                        PendingProbePurpose::ConnectivityCheck,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        sent = sent.saturating_add(1);
-                        if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
-                            sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
+                    break;
+                }
+                for target in &stable_targets {
+                    match self
+                        .send_probe_on_socket(
+                            socket_index,
+                            socket.clone(),
+                            Some(peer_id),
+                            *target,
+                            true,
+                            PendingProbePurpose::ConnectivityCheck,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            sent = sent.saturating_add(1);
+                            if !OUTBOUND_CONNECTIVITY_PROBE_SPACING.is_zero() {
+                                sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
+                            }
                         }
-                    }
-                    Err(error) => {
-                        debug!(
+                        Err(error) => {
+                            debug!(
                             "Fresh-mapping punch from socket {socket_index} to {} failed: {error}",
                             target
                         );
+                        }
+                    }
+                    if round + 1 < attempts && !probe_interval.is_zero() {
+                        sleep(probe_interval.min(Duration::from_millis(50))).await;
                     }
                 }
-                if round + 1 < attempts && !probe_interval.is_zero() {
-                    sleep(probe_interval.min(Duration::from_millis(50))).await;
-                }
             }
-        }
         }
         let last_punch_sent_at_ms = monotonic_millis();
 
@@ -1748,8 +1801,7 @@ impl UdpTransport {
                     );
                     break;
                 }
-                if let Some((local_profile_generation, remote_profile_generation)) = profile_fence
-                {
+                if let Some((local_profile_generation, remote_profile_generation)) = profile_fence {
                     let profile_current = self
                         .peers
                         .hard_hard_plan_for_peer(peer_id)

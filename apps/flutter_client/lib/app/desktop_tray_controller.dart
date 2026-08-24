@@ -415,7 +415,7 @@ class DesktopTrayController with TrayListener, WindowListener {
     final virtualIp = snapshot?.virtualIp.trim();
     final peerCount = snapshot?.stats.totalPeers ?? 0;
     final metricsSnapshot = _metricsSnapshot;
-    return '${strings.virtualIp}: ${virtualIp == null || virtualIp.isEmpty ? '—' : virtualIp} · ${strings.peerCount}: $peerCount · 延迟: ${formatLatency(_averageLatency(metricsSnapshot))} · 速度: ${formatTransferRate(_aggregateSpeed(metricsSnapshot))}';
+    return '${strings.virtualIp}: ${virtualIp == null || virtualIp.isEmpty ? '—' : virtualIp} · ${strings.peerCount}: $peerCount · ${strings.localAverageRtt}: ${formatLatency(_averageLatency(metricsSnapshot))} · ${strings.transferSpeed}: ${formatTransferRate(_aggregateSpeed(metricsSnapshot))}';
   }
 
   DiagnosticsSnapshot? get _metricsSnapshot {
@@ -452,7 +452,9 @@ class DesktopTrayController with TrayListener, WindowListener {
     AppStrings strings,
     DiagnosticsSnapshot? snapshot,
   ) {
-    final peers = snapshot?.peers ?? const <PeerSnapshot>[];
+    final peers = (snapshot?.peers ?? const <PeerSnapshot>[])
+        .where((peer) => peer.online)
+        .toList(growable: false);
     if (peers.isEmpty) {
       return [MenuItem(label: strings.noOnlineDevices, disabled: true)];
     }

@@ -94,21 +94,45 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
         &pending,
         "203.0.113.10:40123".parse().unwrap(),
         7,
+        0,
         2,
+        0,
         0,
     ));
     assert!(!legacy_ack_matches_pending(
         &pending,
         "203.0.113.11:40123".parse().unwrap(),
         7,
+        0,
         2,
+        0,
         0,
     ));
     assert!(!legacy_ack_matches_pending(
         &pending,
         "203.0.113.10:40123".parse().unwrap(),
         8,
+        0,
         2,
+        0,
+        0,
+    ));
+    assert!(!legacy_ack_matches_pending(
+        &pending,
+        "203.0.113.10:40123".parse().unwrap(),
+        7,
+        1,
+        2,
+        0,
+        0,
+    ));
+    assert!(!legacy_ack_matches_pending(
+        &pending,
+        "203.0.113.10:40123".parse().unwrap(),
+        7,
+        0,
+        2,
+        1,
         0,
     ));
     assert!(
@@ -116,7 +140,9 @@ fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
             &pending,
             "203.0.113.10:40123".parse().unwrap(),
             7,
+            0,
             2,
+            0,
             1,
         ),
         "a pending probe from before a Direct/candidate commit must not match after the commit sequence advances"
@@ -223,9 +249,7 @@ async fn peer_probe_rx_snapshot_does_not_cross_peer_or_generation() {
             .await
     );
     assert_eq!(
-        transport
-            .probe_rx_snapshot_for_peer("peer-a", 7)
-            .await,
+        transport.probe_rx_snapshot_for_peer("peer-a", 7).await,
         UdpProbeRxSnapshot::default(),
         "the new current session must not inherit old-session ACK evidence"
     );
@@ -358,20 +382,12 @@ async fn inbound_counts_known_peer_ip_and_unmatched_authenticated_ack() {
     // The frame carries peer-b's generation, which deliberately differs from
     // peer-a's local punch generation. Its diagnostics must still land under
     // peer-a/generation, and cannot be presented as evidence for peer-c.
-    let ack = build_authenticated_punch_ack(
-        [42u8; 8],
-        "peer-b",
-        "peer-a",
-        generation + 41,
-        &key,
-    );
+    let ack = build_authenticated_punch_ack([42u8; 8], "peer-b", "peer-a", generation + 41, &key);
     sender.send_to(&ack, local_addr).await.unwrap();
 
     timeout(Duration::from_secs(1), async {
         loop {
-            if transport.socket_pool_diagnostics().await[0]
-                .authenticated_probe_acks_unmatched
-                >= 1
+            if transport.socket_pool_diagnostics().await[0].authenticated_probe_acks_unmatched >= 1
             {
                 break;
             }
@@ -482,20 +498,17 @@ async fn matched_authenticated_ack_is_scoped_to_its_peer_and_enqueues_validation
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let sender_addr = sender.local_addr().unwrap();
     let generation = peers.current_network_generation().await;
-    let nonce = transport.send_probe(Some("peer-b"), sender_addr).await.unwrap();
+    let nonce = transport
+        .send_probe(Some("peer-b"), sender_addr)
+        .await
+        .unwrap();
     let mut sent_probe = [0u8; 512];
     timeout(Duration::from_secs(1), sender.recv_from(&mut sent_probe))
         .await
         .unwrap()
         .unwrap();
     let key = peers.probe_key_for_peer("peer-b").await.unwrap();
-    let ack = build_authenticated_punch_ack(
-        nonce,
-        "peer-b",
-        "peer-a",
-        generation + 17,
-        &key,
-    );
+    let ack = build_authenticated_punch_ack(nonce, "peer-b", "peer-a", generation + 17, &key);
     sender.send_to(&ack, local_addr).await.unwrap();
 
     timeout(Duration::from_secs(1), async {

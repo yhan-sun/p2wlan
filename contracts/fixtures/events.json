@@ -1,6 +1,9 @@
 {
   "contractVersion": 1,
+  "process_id": 44413,
   "revision": 3,
+  "oldest_seq": 1,
+  "reset_required": false,
   "events": [
     {
       "seq": 1,
