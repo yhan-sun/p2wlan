@@ -352,15 +352,21 @@ impl NatPacketLink {
         if dropped.load(Ordering::Acquire) {
             return;
         }
+        // `primary` models the exact NAT mapping which originated the
+        // competing ordinary punch. Route the reply only to that owner: a
+        // duplicate to the Hard-Hard dynamic socket can consume the one-shot
+        // ACK expectation first and make the intended primary winner depend on
+        // platform task scheduling.
+        if let Some(primary) = primary {
+            let _ = source_socket.send_to(data, primary).await;
+            return;
+        }
         if target_udp.has_dynamic_socket_for_peer(target_peer).await {
             if let Some((_, socket)) = target_udp.socket_for_peer(Some(target_peer)).await {
                 if let Ok(target) = socket.local_addr() {
                     let _ = source_socket.send_to(data, target).await;
                 }
             }
-        }
-        if let Some(primary) = primary {
-            let _ = source_socket.send_to(data, primary).await;
         }
     }
 
@@ -1523,6 +1529,12 @@ async fn hard_hard_insufficient_stun_falls_through_to_ordinary_punch() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn hard_hard_responder_without_stun_worker_falls_back_to_admitted_fresh_punch() {
+    // The Hard-Hard clock override is process-global so spawned E2E workers can
+    // observe it. Serialize this real-clock assertion with those fixtures, and
+    // clear any previous override only after owning their shared guard.
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    set_hard_hard_test_now_ms(None);
+    let _clock = HardHardClockReset;
     let (daemon, peers, udp, _control) = build_hard_hard_ordinary_fallback_fixture().await;
     let local_endpoint = udp.local_addr().unwrap();
     daemon
