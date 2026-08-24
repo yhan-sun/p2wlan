@@ -1151,6 +1151,16 @@ class AppStrings {
     };
   }
 
+  /// Explains why a complete cone subtype is not shown yet while preserving
+  /// the mapping evidence that is already useful to the user.
+  String natPartialClassificationTooltip(String mapping, String filtering) {
+    final mappingLabel = natBehaviorLabel(mapping);
+    final filteringLabel = natBehaviorLabel(filtering);
+    return isZh
+        ? '已确认映射：$mappingLabel；过滤行为：$filteringLabel，等待更多探测。'
+        : 'Mapping: $mappingLabel; filtering: $filteringLabel. Waiting for more probes.';
+  }
+
   String natTraversalShortLabel(NatTraversalType type) {
     return switch (type) {
       NatTraversalType.fullCone => isZh ? '全锥形' : 'FullCone',

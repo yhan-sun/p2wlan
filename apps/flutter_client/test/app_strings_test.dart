@@ -37,6 +37,20 @@ void main() {
       expect(zh.troubleshooting, '故障排查');
       expect(en.troubleshooting, 'Troubleshooting');
     });
+
+    test('partial NAT classification keeps mapping evidence visible', () {
+      final zh = AppStrings.fromCode('zh-Hans');
+      final en = AppStrings.fromCode('en');
+      expect(zh.natBehaviorLabel('endpoint_independent'), '端点无关');
+      expect(
+        zh.natPartialClassificationTooltip('endpoint_independent', 'unknown'),
+        '已确认映射：端点无关；过滤行为：未知，等待更多探测。',
+      );
+      expect(
+        en.natPartialClassificationTooltip('endpoint_independent', 'unknown'),
+        'Mapping: Endpoint independent; filtering: Unknown. Waiting for more probes.',
+      );
+    });
   });
 
   group('key user-facing getters are present', () {

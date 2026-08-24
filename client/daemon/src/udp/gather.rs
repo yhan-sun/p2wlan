@@ -1,3 +1,13 @@
+/// A STUN response received through the reader-owned transaction dispatcher.
+///
+/// Normal candidate gathering only needs the reflexive address, while RFC
+/// 5780 filtering probes also need the actual source address so a changed
+/// source can be classified without giving the probe its own UDP reader.
+struct LiveStunResponse {
+    source: SocketAddr,
+    mapped_address: Option<SocketAddr>,
+}
+
 impl UdpTransport {
     /// Return the local UDP socket address.
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -98,8 +108,51 @@ impl UdpTransport {
         stun_timeout: Duration,
     ) -> StunObservation {
         let started = Instant::now();
+        let result = self
+            .query_stun_live_response(socket, server, stun_timeout, false, false)
+            .await
+            .and_then(|response| {
+                response
+                    .mapped_address
+                    .ok_or_else(|| "STUN response has no mapped address".to_string())
+            });
+
+        match result {
+            Ok(mapped_address) => StunObservation {
+                server: server.to_string(),
+                mapped_address: Some(mapped_address.to_string()),
+                rtt_ms: Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
+                error: None,
+            },
+            Err(error) => StunObservation {
+                server: server.to_string(),
+                mapped_address: None,
+                rtt_ms: None,
+                error: Some(error),
+            },
+        }
+    }
+
+    /// Send one STUN request through the reader-owned waiter registry. Normal
+    /// requests require a response from the queried server; CHANGE-REQUEST
+    /// probes intentionally accept a response from the server's alternate
+    /// address so the caller can classify filtering behavior.
+    async fn query_stun_live_response(
+        &self,
+        socket: &UdpSocket,
+        server: SocketAddr,
+        stun_timeout: Duration,
+        change_ip: bool,
+        change_port: bool,
+    ) -> std::result::Result<LiveStunResponse, String> {
         let mut request = StunMessage::binding_request();
         request.add_attribute(StunAttribute::Software("P2WLAN/0.1".to_string()));
+        if change_ip || change_port {
+            request.add_attribute(StunAttribute::ChangeRequest {
+                change_ip,
+                change_port,
+            });
+        }
         let transaction_id = request.transaction_id;
         let encoded = request.encode();
         let (response_tx, response_rx) = oneshot::channel();
@@ -118,7 +171,7 @@ impl UdpTransport {
                 .await
                 .map_err(|_| format!("no response from {server} after {stun_timeout:?}"))?
                 .map_err(|_| "STUN response dispatcher closed".to_string())?;
-            if source != server {
+            if !change_ip && !change_port && source != server {
                 return Err(format!(
                     "response source mismatch: expected {server}, received {source}"
                 ));
@@ -137,27 +190,15 @@ impl UdpTransport {
                     response.msg_type
                 ));
             }
-            response
-                .get_reflexive_address()
-                .ok_or_else(|| "STUN response has no mapped address".to_string())
+            Ok(LiveStunResponse {
+                source,
+                mapped_address: response.get_reflexive_address(),
+            })
         }
         .await;
 
         self.stun_waiters.lock().await.remove(&transaction_id);
-        match result {
-            Ok(mapped_address) => StunObservation {
-                server: server.to_string(),
-                mapped_address: Some(mapped_address.to_string()),
-                rtt_ms: Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)),
-                error: None,
-            },
-            Err(error) => StunObservation {
-                server: server.to_string(),
-                mapped_address: None,
-                rtt_ms: None,
-                error: Some(error),
-            },
-        }
+        result
     }
 
     async fn append_pool_socket_candidates_direct(

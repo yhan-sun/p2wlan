@@ -174,6 +174,39 @@ void _registerDashboardTests() {
     expect(find.text('Check issues'), findsNothing);
   });
 
+  testWidgets('Home keeps mapping evidence while NAT subtype is pending', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+    raw['nat_profile'] = {
+      'mapping_behavior': 'endpoint_independent',
+      'filtering_behavior': 'unknown',
+      'public_endpoint': '198.51.100.20:62000',
+      'confidence': 90,
+    };
+    final snapshot = DiagnosticsSnapshot.fromJson(raw);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(_heroCount(tester, 'dashboard-nat-type'), 'Endpoint independent');
+    expect(find.text('Unknown'), findsNothing);
+  });
+
   testWidgets('Home distinguishes API reachability from online lease health', (
     tester,
   ) async {

@@ -101,6 +101,124 @@ async fn run_outbound_sends_wireguard_datagram_that_peer_can_decrypt() {
     worker.abort();
 }
 
+#[test]
+fn live_filtering_classifier_distinguishes_changed_sources() {
+    let server = "192.0.2.10:3478".parse().unwrap();
+
+    assert_eq!(
+        classify_live_filtering_response(server, "198.51.100.10:3479".parse().unwrap()),
+        Some(FilteringBehavior::EndpointIndependent)
+    );
+    assert_eq!(
+        classify_live_filtering_response(server, "192.0.2.10:3479".parse().unwrap()),
+        Some(FilteringBehavior::AddressDependent)
+    );
+    assert_eq!(classify_live_filtering_response(server, server), None);
+}
+
+#[test]
+fn live_filtering_probe_timeout_is_bounded_without_becoming_too_short() {
+    assert_eq!(
+        stun_timeout_for_live_filtering_probe(Duration::from_secs(2)),
+        LIVE_FILTERING_PROBE_TIMEOUT
+    );
+    assert_eq!(
+        stun_timeout_for_live_filtering_probe(Duration::from_millis(10)),
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        stun_timeout_for_live_filtering_probe(Duration::from_millis(120)),
+        Duration::from_millis(120)
+    );
+}
+
+#[tokio::test]
+async fn live_filtering_probe_classifies_changed_port_response() {
+    let peers = peer_manager();
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    let inbound_worker = tokio::spawn(transport.clone().run_inbound(tx));
+
+    let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let alternate = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server = primary.local_addr().unwrap();
+    let server_worker = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let (len, client_addr) = primary.recv_from(&mut buf).await.unwrap();
+        let request = StunMessage::decode(&buf[..len]).unwrap();
+        assert_eq!(
+            request
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    StunAttribute::ChangeRequest {
+                        change_ip,
+                        change_port,
+                    } => Some((*change_ip, *change_port)),
+                    _ => None,
+                }),
+            Some((true, true))
+        );
+        let mut response = StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+        response.add_attribute(StunAttribute::XorMappedAddress(
+            "203.0.113.7:45678".parse().unwrap(),
+        ));
+        alternate
+            .send_to(&response.encode(), client_addr)
+            .await
+            .unwrap();
+    });
+
+    let mut report = candidate_report_from_observations(
+        transport.local_addr().unwrap(),
+        false,
+        vec![StunObservation {
+            server: server.to_string(),
+            mapped_address: Some("203.0.113.7:45678".to_string()),
+            rtt_ms: Some(5),
+            error: None,
+        }],
+    );
+    assert_eq!(
+        report.nat_profile.mapping_behavior,
+        MappingBehavior::Unknown,
+        "one observation is not enough to prove endpoint-independent mapping"
+    );
+
+    // Seed a second matching observation, as the normal parallel gather does
+    // before running the filtering probe.
+    report = candidate_report_from_observations(
+        transport.local_addr().unwrap(),
+        false,
+        vec![
+            StunObservation {
+                server: server.to_string(),
+                mapped_address: Some("203.0.113.7:45678".to_string()),
+                rtt_ms: Some(5),
+                error: None,
+            },
+            StunObservation {
+                server: "192.0.2.10:3478".to_string(),
+                mapped_address: Some("203.0.113.7:45678".to_string()),
+                rtt_ms: Some(5),
+                error: None,
+            },
+        ],
+    );
+    transport
+        .probe_live_filtering_behavior(&mut report, &[server], Duration::from_secs(1))
+        .await;
+
+    assert_eq!(
+        report.nat_profile.filtering_behavior,
+        FilteringBehavior::AddressDependent
+    );
+    server_worker.await.unwrap();
+    inbound_worker.abort();
+}
+
 #[tokio::test]
 async fn run_inbound_emits_received_encrypted_datagram() {
     let peers = peer_manager();

@@ -496,6 +496,23 @@ class _HomeMetrics extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final colors = P2WlanColors.of(context);
+    final natType = natProfile?.traversalType;
+    final natValue = natProfile == null
+        ? '—'
+        : natType == NatTraversalType.unknown
+        // A stable endpoint-independent mapping is already a meaningful
+        // result. Filtering sub-type probing is best-effort because many
+        // public STUN servers do not implement RFC 5780 CHANGE-REQUEST.
+        ? strings.natBehaviorLabel(natProfile!.mappingBehavior)
+        : strings.natTraversalTypeCompactLabel(natType!);
+    final natTooltip = natProfile == null
+        ? strings.natDetectionUnavailable
+        : natType == NatTraversalType.unknown
+        ? strings.natPartialClassificationTooltip(
+            natProfile!.mappingBehavior,
+            natProfile!.filteringBehavior,
+          )
+        : strings.natTraversalTypeLabel(natType!);
     return Container(
       padding: const EdgeInsets.symmetric(
         horizontal: AppTokens.space8,
@@ -516,15 +533,9 @@ class _HomeMetrics extends StatelessWidget {
           _MetricDivider(color: colors.border),
           _MetricCell(
             key: const Key('dashboard-nat-type'),
-            value: natProfile == null
-                ? '—'
-                : strings.natTraversalTypeCompactLabel(
-                    natProfile!.traversalType,
-                  ),
+            value: natValue,
             label: strings.natType,
-            tooltip: natProfile == null
-                ? strings.natDetectionUnavailable
-                : strings.natTraversalTypeLabel(natProfile!.traversalType),
+            tooltip: natTooltip,
           ),
           _MetricDivider(color: colors.border),
           _MetricCell(
