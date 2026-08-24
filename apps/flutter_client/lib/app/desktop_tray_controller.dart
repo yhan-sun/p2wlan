@@ -76,7 +76,7 @@ class DesktopTrayController with TrayListener, WindowListener {
       );
       if (!_initialized) return;
       if (Platform.isMacOS || Platform.isLinux) {
-        await trayManager.setTitle(desktopVisibleTitleForTesting());
+        await trayManager.setTitle(trayMenuBarTitleForTesting());
       }
       await _updateTrayIcon(force: true);
       await _queueMenuUpdate();
@@ -245,7 +245,7 @@ class DesktopTrayController with TrayListener, WindowListener {
       Platform.isMacOS ? p2wlanAppName : '$taskbarTitle - $statusLabel',
     );
     if (Platform.isMacOS || Platform.isLinux) {
-      await trayManager.setTitle(taskbarTitle);
+      await trayManager.setTitle(trayMenuBarTitleForTesting());
     }
     await _updateDesktopWindowIndicators(taskbarTitle);
 
@@ -370,11 +370,17 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   @visibleForTesting
   String desktopVisibleTitleForTesting() {
-    // macOS renders this title beside the menu-bar icon and uses the window
-    // title for the Dock/taskbar item. Keep those stable; connection metrics
-    // remain available in the tray menu instead of changing OS chrome every
-    // polling cycle.
+    // Keep the stable app title for the Dock/window. The macOS menu-bar item
+    // intentionally uses trayMenuBarTitleForTesting() and stays icon-only;
+    // connection metrics remain available in the tray menu.
     return Platform.isMacOS ? p2wlanAppName : trayTitleForTesting();
+  }
+
+  @visibleForTesting
+  String trayMenuBarTitleForTesting() {
+    // Keep the macOS status item icon-only. The tooltip still carries the
+    // accessible app name, while the Dock/window title remains P2WLAN.
+    return Platform.isMacOS ? '' : desktopVisibleTitleForTesting();
   }
 
   @visibleForTesting

@@ -96,6 +96,21 @@ void main() {
     expect(controller.dockBadgeForTesting(), isEmpty);
   });
 
+  test('macOS tray item keeps only the icon in the menu bar', () async {
+    final stores = await _makeStores(api: DiagnosticsApi());
+    addTearDown(stores.dispose);
+
+    final controller = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    );
+
+    expect(
+      controller.trayMenuBarTitleForTesting(),
+      Platform.isMacOS ? isEmpty : 'P2WLAN',
+    );
+  });
+
   test('desktop tray title includes verified latency', () async {
     final snapshot = await _loadFixtureSnapshot();
     final stores = await _makeStores(
