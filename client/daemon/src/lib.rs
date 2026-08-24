@@ -173,6 +173,13 @@ const RESPONDER_HANDSHAKE_CACHE_TTL: Duration = Duration::from_secs(120);
 /// refresh publishes/trickles UDP candidates later, so a slow STUN or gateway
 /// probe must not hold the WireGuard session hostage for several seconds.
 const CANDIDATE_READY_TIMEOUT_MS: u64 = 300;
+/// Host candidates are published immediately after the UDP socket binds, but
+/// the first full STUN/prediction snapshot is committed a moment later. Give
+/// that startup gather a bounded opportunity to win the first offer so a
+/// brand-new session does not advertise only the provisional host endpoint.
+/// Relay availability still wins immediately, and the timeout preserves a
+/// bounded fallback when STUN is unavailable.
+const INITIAL_CANDIDATE_READY_TIMEOUT_MS: u64 = 750;
 /// The first UDP candidate window is a latency-sensitive hint, not the final
 /// NAT diagnosis.  Bound each observer wait so one silent STUN endpoint
 /// cannot delay the first public candidate and the first Direct punch.  The

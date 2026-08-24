@@ -357,18 +357,19 @@ async fn run_udp_direct_instance(
                 // This fast path must never wait behind an older refresh: a
                 // rebound UDP instance must still observe shutdown promptly.
                 if let Ok(_host_commit_guard) = candidate_refresh_lock.try_lock() {
-                    publish_candidate_snapshot_to_store(
+                    publish_candidate_snapshot_to_store_with_readiness(
                         &candidate_snapshot,
                         host_candidates.clone(),
                         host_sources.clone(),
                         host_network_identity.clone(),
+                        false,
                     )
                     .await;
                     *local_candidates.write().await = host_candidates.clone();
                     *udp_local_candidate_sources.write().await = host_sources;
                     *local_network_identity.write().await = host_network_identity;
                     info!(
-                        "Published {} host UDP candidates before STUN refresh",
+                        "Published {} provisional host UDP candidates before STUN refresh (initial_gather_complete=false)",
                         host_candidates.len()
                     );
                 }
@@ -491,7 +492,7 @@ async fn run_udp_direct_instance(
         // silent SSDP gateway must never delay the local candidate commit
         // (which every responder answer reads).
         info!(
-            "Prepared {} UDP candidate endpoints for signaling",
+            "Prepared {} UDP candidate endpoints for signaling (initial_gather_complete=true)",
             candidate_endpoints.len()
         );
         publish_candidate_snapshot_to_store(

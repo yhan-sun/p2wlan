@@ -212,28 +212,51 @@ impl Daemon {
 
         // Candidate gathering may wait on a live STUN fan-out. Keep the owner
         // reservation; the arbiter was already released before actor I/O.
+        // Host candidates are published before that gather completes, so a
+        // provisional non-empty snapshot must not immediately win the first
+        // offer. Give the full startup snapshot a bounded opportunity while
+        // preserving the relay-first fast path.
         let (candidates, candidate_sources) = {
-            let snapshot = self.cached_local_candidate_set().await;
+            let initial_snapshot = self.initial_candidate_set_if_ready().await;
             let mut relay_available = self.relay_available_tx.subscribe();
             let relay_is_available = *relay_available.borrow();
-            if let Some(snapshot) = relay_first_candidate_shortcut(
-                snapshot.0,
-                snapshot.1,
-                relay_is_available,
-            ) {
-                if snapshot.0.is_empty() {
-                    self.peers
-                        .record_direct_event(
-                            &peer_info.node_id,
-                            "relay_first_empty_candidate_offer",
-                            None,
-                            Some(0),
-                            None,
-                            "relay transport is available; encrypted handshake is not gated on STUN candidates",
-                        )
-                        .await;
+            if let Some(initial_snapshot) = initial_snapshot {
+                if let Some(snapshot) = relay_first_candidate_shortcut(
+                    initial_snapshot.0,
+                    initial_snapshot.1,
+                    relay_is_available,
+                ) {
+                    if snapshot.0.is_empty() {
+                        self.peers
+                            .record_direct_event(
+                                &peer_info.node_id,
+                                "relay_first_empty_candidate_offer",
+                                None,
+                                Some(0),
+                                None,
+                                "relay transport is available; encrypted handshake is not gated on STUN candidates",
+                            )
+                            .await;
+                    }
+                    snapshot
+                } else {
+                    self.wait_for_local_candidate_set().await
                 }
-                snapshot
+            } else if relay_is_available {
+                // The relay is already usable, so do not hold the encrypted
+                // session behind a slow first STUN gather. The full candidate
+                // snapshot is still published independently by UDP startup.
+                self.peers
+                    .record_direct_event(
+                        &peer_info.node_id,
+                        "relay_first_empty_candidate_offer",
+                        None,
+                        Some(0),
+                        None,
+                        "relay transport is available before the initial UDP candidate snapshot; encrypted handshake is not gated on STUN candidates",
+                    )
+                    .await;
+                (Vec::new(), HashMap::new())
             } else {
                 // Once the relay transport is up, an empty candidate list is
                 // intentional: the control-plane handshake still establishes
@@ -261,10 +284,10 @@ impl Daemon {
                                 .await;
                             (Vec::new(), HashMap::new())
                         } else {
-                            self.wait_for_local_candidate_set().await
+                            self.wait_for_initial_candidate_set().await
                         }
                     }
-                    candidates = self.wait_for_local_candidate_set() => candidates,
+                    candidates = self.wait_for_initial_candidate_set() => candidates,
                     changed = reservation.cancellation.changed() => {
                         if changed.is_err() || *reservation.cancellation.borrow() {
                             return Ok(None);
