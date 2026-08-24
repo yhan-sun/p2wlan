@@ -568,6 +568,109 @@ async fn responder_remote_incarnation_reset_does_not_self_lock_lifecycle_arbiter
 }
 
 #[tokio::test]
+async fn remote_incarnation_replay_republishes_unchanged_local_candidates() {
+    use crate::control::TestControlSignal;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
+        0x4000_0000_0000_0000 | (incarnation << 21) | counter
+    }
+
+    let mut daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let peer_id = "peer-remote-replay-candidates";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: "203.0.113.90:49000".to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.90".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let local_candidates = vec![
+        "203.0.113.91:49001".to_string(),
+        "203.0.113.91:49002".to_string(),
+    ];
+    let local_sources = HashMap::from([
+        (local_candidates[0].clone(), "stun_observed".to_string()),
+        (local_candidates[1].clone(), "predicted".to_string()),
+    ]);
+    daemon
+        .publish_candidate_snapshot(local_candidates.clone(), local_sources, Vec::new())
+        .await;
+    let before_replay = daemon.current_local_candidate_set().await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    *daemon.udp_transport.write().await = Some(udp);
+
+    let signals = StdArc::new(StdMutex::new(Vec::<TestControlSignal>::new()));
+    let signals_for_forwarder = signals.clone();
+    let local_public_key = daemon.local_identity().unwrap().public_key();
+    daemon.control.set_test_signal_forwarder(
+        daemon.config.node.node_id.clone(),
+        hex::encode(local_public_key),
+        StdArc::new(move |signal| {
+            signals_for_forwarder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(signal);
+        }),
+    );
+
+    let old_generation = encoded_generation(300, 1);
+    let new_generation = encoded_generation(301, 1);
+    assert_eq!(
+        daemon
+            .peers
+            .add_candidates_with_metadata(
+                peer_id,
+                &["203.0.113.90:49000".to_string()],
+                &HashMap::new(),
+                old_generation,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    assert!(
+        daemon
+            .reset_peer_for_remote_incarnation_if_needed(
+                peer_id,
+                new_generation,
+                RemoteIncarnationResetWork::ClearAll,
+            )
+            .await
+    );
+
+    // Simulate the lifecycle replay scheduled by the control-event path. The
+    // local snapshot/hash is unchanged, so this publication must come from
+    // the explicit replay rather than a candidate-refresh hash transition.
+    daemon
+        .publish_current_candidates_to_peer(peer_id, "test remote incarnation replay")
+        .await;
+
+    let signal = signals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop()
+        .expect("remote incarnation replay must publish a candidate-only offer");
+    assert_eq!(signal.to_node_id, peer_id);
+    assert!(signal.handshake_init.is_empty());
+    assert_eq!(signal.candidates, local_candidates);
+    assert_eq!(daemon.current_local_candidate_set().await, before_replay);
+}
+
+#[tokio::test]
 async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
     let daemon = Daemon::new(config);
