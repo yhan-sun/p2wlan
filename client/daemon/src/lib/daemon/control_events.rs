@@ -43,6 +43,23 @@ fn remove_deferred_initiator_handshake(
     queue.retain(|peer_info| peer_info.node_id != peer_id);
 }
 
+/// Re-advertise the current local candidate snapshot without blocking the
+/// serial control receiver. A remote daemon restart can invalidate the peer's
+/// copy of our candidates even when our own candidate snapshot did not change;
+/// this worker is the explicit lifecycle replay for that case.
+fn schedule_candidate_republication<'a>(
+    daemon: &'a Daemon,
+    work: &mut FuturesUnordered<ControlEventWork<'a>>,
+    peer_id: String,
+    reason: &'static str,
+) {
+    work.push(Box::pin(async move {
+        daemon
+            .publish_current_candidates_to_peer(&peer_id, reason)
+            .await;
+    }));
+}
+
 /// Responder offers have their own cooperative lane.  Candidate refresh,
 /// peer-reflexive HTTP and event-triggered initiator preparation may occupy
 /// the bounded general slow-work set, but a WireGuard answer must still be
@@ -1473,7 +1490,7 @@ impl Daemon {
                 offer = newest;
                 continue;
             }
-            if self
+            let remote_incarnation_reset = match self
                 .reset_peer_for_remote_incarnation_if_needed_for_identity(
                     &offer.from_node_id,
                     offer.candidate_generation,
@@ -1481,23 +1498,26 @@ impl Daemon {
                     RemoteIncarnationResetWork::PreserveResponder,
                 )
                 .await
-                .is_none()
             {
-                // The queued signal belongs to a retired public-key identity.
-                // Finish this exact owner turn normally so a newer queued offer
-                // can run and the per-peer responder lane cannot stay wedged.
-                offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
-                let Some(next) = self
-                    .pending_handshakes
-                    .lock()
-                    .await
-                    .finish_responder_work(&peer_id, reservation.owner)
-                else {
-                    return;
-                };
-                offer = next;
-                continue;
-            }
+                Some(changed) => changed,
+                None => {
+                    // The queued signal belongs to a retired public-key
+                    // identity. Finish this exact owner turn normally so a
+                    // newer queued offer can run and the per-peer responder
+                    // lane cannot stay wedged.
+                    offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+                    let Some(next) = self
+                        .pending_handshakes
+                        .lock()
+                        .await
+                        .finish_responder_work(&peer_id, reservation.owner)
+                    else {
+                        return;
+                    };
+                    offer = next;
+                    continue;
+                }
+            };
             let Some(peer_session_generation) =
                 self.peers.peer_session_generation_sync(&offer.from_node_id)
             else {
@@ -1575,6 +1595,19 @@ impl Daemon {
             };
             self.apply_deferred_peer_offer_punch(&offer, candidate_apply_result, fresh_punch)
                 .await;
+
+            if remote_incarnation_reset && !*reservation.cancellation.borrow() {
+                // This is the critical Air-first recovery edge: the remote
+                // restart invalidated its stored copy of our candidates, while
+                // our local candidate hash may be unchanged. Replay it now so
+                // the two sides enter the same punch window without requiring
+                // a local daemon restart.
+                self.publish_current_candidates_to_peer(
+                    &peer_id,
+                    "remote incarnation candidate replay",
+                )
+                .await;
+            }
 
             if offer.handshake_init.is_empty() {
                 offer.complete_delivery(
@@ -2066,7 +2099,16 @@ impl Daemon {
                     }
                     _ = responder_work.next(), if !responder_work.is_empty() => {
                         // Responder workers own their per-peer pending state and
-                        // release it on every terminal/cancellation path.
+                        // release it on every terminal/cancellation path. Their
+                        // completion can also free a pending initiator's
+                        // reservation, so retry deferred roster work here even
+                        // when the general slow-work lane is otherwise idle.
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            )
+                            .await;
                     }
                     event = control_rx.recv() => {
                         let Some(event) = event else {
@@ -2262,6 +2304,26 @@ impl Daemon {
                                             .run_event_initiator_handshake(peer_info, reservation)
                                             .await;
                                     }));
+                                } else {
+                                    // Do not lose the roster edge merely because an
+                                    // older initiator is still preparing or waiting
+                                    // for its answer. The newest peer snapshot will
+                                    // be retried after a slow-work slot is released.
+                                    let queued = enqueue_deferred_initiator_handshake(
+                                        &mut deferred_initiators,
+                                        peer_info.clone(),
+                                    );
+                                    let reason_code = if queued {
+                                        "initiator_reservation_busy_queued"
+                                    } else {
+                                        "initiator_reservation_busy_queue_full"
+                                    };
+                                    self.timeline.emit(
+                                        "initiator_handshake_deferred",
+                                        None,
+                                        Some(reason_code),
+                                        Some(format!("peer={}", peer_info.node_id)),
+                                    );
                                 }
                             }
 
@@ -2428,6 +2490,19 @@ impl Daemon {
                                 )
                                 .await;
                         }
+                        if was_offline || update.public_key_changed {
+                            // A peer that comes back online has lost its copy of
+                            // our candidate snapshot. Replay it even when our
+                            // local snapshot/hash is unchanged; waiting for the
+                            // next NAT/ STUN change recreates the Air-first cold
+                            // start failure.
+                            schedule_candidate_republication(
+                                daemon,
+                                &mut responder_work,
+                                peer_info.node_id.clone(),
+                                "peer online lifecycle",
+                            );
+                        }
                         let should_start_initiator =
                             self.should_start_initiator_handshake(&peer_info);
                         if should_start_initiator
@@ -2485,6 +2560,25 @@ impl Daemon {
                                         .run_event_initiator_handshake(peer_info, reservation)
                                         .await;
                                 }));
+                            } else {
+                                // Preserve the newest online/endpoint update
+                                // instead of silently dropping the handshake
+                                // trigger while the previous owner is live.
+                                let queued = enqueue_deferred_initiator_handshake(
+                                    &mut deferred_initiators,
+                                    peer_info.clone(),
+                                );
+                                let reason_code = if queued {
+                                    "initiator_reservation_busy_queued"
+                                } else {
+                                    "initiator_reservation_busy_queue_full"
+                                };
+                                self.timeline.emit(
+                                    "initiator_handshake_deferred",
+                                    None,
+                                    Some(reason_code),
+                                    Some(format!("peer={}", peer_info.node_id)),
+                                );
                             }
                         }
                     }
@@ -2732,7 +2826,7 @@ impl Daemon {
                             continue;
                         }
 
-                        if self
+                        let remote_incarnation_reset = match self
                             .reset_peer_for_remote_incarnation_if_needed_for_identity(
                                 &from_node_id,
                                 candidate_generation,
@@ -2740,15 +2834,30 @@ impl Daemon {
                                 RemoteIncarnationResetWork::ClearAll,
                             )
                             .await
-                            .is_none()
                         {
-                            debug!(
-                                "Ignored peer offer from {from_node_id}: signal sender public key is stale"
-                            );
-                            if let Some(receipt) = delivery_receipt.as_ref() {
-                                receipt.complete(control::SignalApplyOutcome::TerminalRejected);
+                            Some(changed) => changed,
+                            None => {
+                                debug!(
+                                    "Ignored peer offer from {from_node_id}: signal sender public key is stale"
+                                );
+                                if let Some(receipt) = delivery_receipt.as_ref() {
+                                    receipt.complete(control::SignalApplyOutcome::TerminalRejected);
+                                }
+                                continue;
                             }
-                            continue;
+                        };
+                        if remote_incarnation_reset {
+                            // The peer's restart invalidated its copy of our
+                            // candidate snapshot. Replay our current set in a
+                            // separate worker; the responder admission below
+                            // remains latency-critical and is not delayed by
+                            // candidate publication.
+                            schedule_candidate_republication(
+                                daemon,
+                                &mut responder_work,
+                                from_node_id.clone(),
+                                "remote incarnation reset",
+                            );
                         }
                         // Admit the latency-critical responder before touching
                         // candidate/fresh-prediction state.  A candidate refresh
@@ -3040,7 +3149,7 @@ impl Daemon {
                         // remote daemon restarted. Fence the retired transport but
                         // preserve the exact local initiator that this answer is
                         // about to complete.
-                        if self
+                        let remote_incarnation_reset = match self
                             .reset_peer_for_remote_incarnation_if_needed_for_identity(
                                 &from_node_id,
                                 candidate_generation,
@@ -3052,16 +3161,18 @@ impl Daemon {
                                 },
                             )
                             .await
-                            .is_none()
                         {
-                            debug!(
-                                "Ignored peer answer from {from_node_id}: signal sender public key is stale"
-                            );
-                            if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                                receipt.complete(control::SignalApplyOutcome::TerminalRejected);
+                            Some(changed) => changed,
+                            None => {
+                                debug!(
+                                    "Ignored peer answer from {from_node_id}: signal sender public key is stale"
+                                );
+                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                    receipt.complete(control::SignalApplyOutcome::TerminalRejected);
+                                }
+                                continue;
                             }
-                            continue;
-                        }
+                        };
                         // Consume the WireGuard answer before candidate refresh or
                         // fresh-mapping work. Those paths may perform HTTP/STUN
                         // I/O and must remain a background upgrade; delaying the
@@ -3163,6 +3274,19 @@ impl Daemon {
                                     );
                                 }
                             }
+                        }
+                        if remote_incarnation_reset {
+                            // The answer proves the remote incarnation is new,
+                            // but it does not carry our local candidate set. A
+                            // restart can therefore leave the peer punching an
+                            // obsolete local mapping forever. Replay our current
+                            // candidates after the answer transaction commits.
+                            schedule_candidate_republication(
+                                daemon,
+                                &mut responder_work,
+                                from_node_id.clone(),
+                                "remote incarnation answer",
+                            );
                         }
                         if let Some(receipt) = answer_delivery_receipt {
                             receipt.complete(answer_signal_outcome);
@@ -3266,6 +3390,17 @@ impl Daemon {
                         if let Some(receipt) = signal_delivery_receipt {
                             receipt.complete(control::SignalApplyOutcome::Applied);
                         }
+                        // An answer or lifecycle event may release an
+                        // initiator reservation without completing a future
+                        // in either cooperative lane. Revisit the newest
+                        // deferred roster edge before waiting for another
+                        // unrelated event.
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            )
+                            .await;
                     }
                 }
         }
