@@ -345,6 +345,64 @@ async fn direct_validation_target_keeps_lan_over_public_churn() {
 }
 
 #[tokio::test]
+async fn direct_validation_target_prefers_public_over_off_link_private() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.2", None))
+        .await;
+    peers
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.1.10".parse().unwrap(),
+            24,
+        )])
+        .await;
+
+    let remote_private: SocketAddr = "192.168.50.20:51820".parse().unwrap();
+    let public_endpoint: SocketAddr = "198.51.100.20:51820".parse().unwrap();
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+
+    let owner = match udp
+        .begin_or_merge_direct_validation("peer-b", remote_private, 0)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("the first off-link private observation must own the session"),
+    };
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-b", public_endpoint, 0)
+            .await,
+        DirectValidationSessionStart::Merged
+    ));
+    assert_eq!(
+        udp.direct_validation_target("peer-b")
+            .await
+            .unwrap()
+            .endpoint,
+        public_endpoint,
+        "a usable public candidate must outrank an off-link private endpoint"
+    );
+
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-b", remote_private, 0)
+            .await,
+        DirectValidationSessionStart::Merged
+    ));
+    assert_eq!(
+        udp.direct_validation_target("peer-b")
+            .await
+            .unwrap()
+            .endpoint,
+        public_endpoint,
+        "later off-link private churn must not displace the public hole-punch target"
+    );
+    udp.finish_direct_validation_session("peer-b", owner).await;
+}
+
+#[tokio::test]
 async fn remote_candidate_refresh_cancels_direct_validation_owner() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
