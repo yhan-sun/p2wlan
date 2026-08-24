@@ -465,17 +465,16 @@ impl PeerConnection {
                         SLOW_DIRECT_RELAY_RETRY_COOLDOWN,
                     )
                 })
+                && policy != crate::config::PathPolicy::DirectSticky
             {
-                if policy != crate::config::PathPolicy::DirectSticky {
-                    return PathSelection::relay(
-                        REASON_PATH_DIRECT_SLOW_RELAY_RETAINED,
-                        format!(
-                            "probe-only Direct evidence is quarantined for {}ms after a slow ACK",
-                            SLOW_DIRECT_RELAY_RETRY_COOLDOWN.as_millis()
-                        ),
-                    )
-                    .with_scores(direct_score, relay_score);
-                }
+                return PathSelection::relay(
+                    REASON_PATH_DIRECT_SLOW_RELAY_RETAINED,
+                    format!(
+                        "probe-only Direct evidence is quarantined for {}ms after a slow ACK",
+                        SLOW_DIRECT_RELAY_RETRY_COOLDOWN.as_millis()
+                    ),
+                )
+                .with_scores(direct_score, relay_score);
             }
 
             // `direct-sticky` deliberately ignores score and historical
