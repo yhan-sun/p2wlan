@@ -1,3 +1,65 @@
+#[test]
+fn authoritative_rtt_replaces_probe_once_then_keeps_ewma_history() {
+    let mut health = PathHealth::default();
+    health.record_success_with_latency(Duration::from_millis(500));
+
+    // The first encrypted validation sample must discard the delayed
+    // candidate-probe history instead of inheriting its queueing delay.
+    health.record_success_with_authoritative_latency(Duration::from_millis(20));
+    assert_eq!(health.latency_ms, Some(20));
+    assert_eq!(health.rtt_ewma_ms, Some(20));
+
+    // A later authoritative sample is part of the same active-path series;
+    // it must not reset the EWMA to the newest raw value.
+    health.record_success_with_authoritative_latency(Duration::from_millis(40));
+    assert_eq!(health.latency_ms, Some(40));
+    assert!(health.rtt_ewma_ms.is_some_and(|ewma| (20..40).contains(&ewma)));
+}
+
+#[test]
+fn candidate_pair_authoritative_rtt_keeps_ewma_history() {
+    let endpoint: SocketAddr = "203.0.113.20:51820".parse().unwrap();
+    let mut pair = CandidatePair::new_with_source(endpoint, 0, CandidatePairSource::StunObserved);
+    pair.record_success(Some(Duration::from_millis(500)), false, None);
+    pair.record_authoritative_success(Duration::from_millis(20), true, None);
+    pair.record_authoritative_success(Duration::from_millis(40), true, None);
+
+    assert_eq!(pair.rtt_ms, Some(40));
+    assert!(pair
+        .rtt_ewma_ms
+        .is_some_and(|ewma| (20..40).contains(&ewma)));
+}
+
+#[tokio::test]
+async fn direct_probe_rtt_is_scoped_to_each_peer() {
+    let manager = PeerManager::new(test_config());
+    let samples = [
+        ("peer-rtt-a", "203.0.113.31:51820", 8),
+        ("peer-rtt-b", "203.0.113.32:51820", 41),
+        ("peer-rtt-c", "203.0.113.33:51820", 103),
+    ];
+
+    for (node_id, endpoint, latency_ms) in samples {
+        let endpoint: SocketAddr = endpoint.parse().unwrap();
+        manager.add_peer(&test_peer(node_id, endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                node_id,
+                endpoint,
+                Some(Duration::from_millis(latency_ms)),
+            )
+            .await;
+    }
+
+    for (node_id, endpoint, latency_ms) in samples {
+        let conn = manager.get_connection(node_id).await.unwrap();
+        let endpoint: SocketAddr = endpoint.parse().unwrap();
+        assert_eq!(conn.endpoint, Some(endpoint));
+        assert_eq!(conn.direct_health.latency_ms, Some(latency_ms));
+        assert_eq!(conn.direct_health.rtt_ewma_ms, Some(latency_ms));
+    }
+}
+
 #[tokio::test]
 async fn direct_traversal_timeline_records_probe_flow() {
     let config = test_config();

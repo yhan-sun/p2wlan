@@ -1,5 +1,10 @@
 part of '../diagnostics_models.dart';
 
+// The daemon's default Direct/Relay data-plane keepalive cadence is 25s. A
+// verified RTT is displayable for three probe intervals; after that the UI
+// must fail closed instead of presenting a historical number as live.
+const int _rttFreshnessWindowMs = 3 * 25 * 1000;
+
 class PeerSnapshot {
   PeerSnapshot({
     required this.nodeId,
@@ -248,11 +253,18 @@ class PathHealthSnapshot {
   final int? latencyMs;
   final int? rttEwmaMs;
 
-  /// The UI shows the most recent verified sample so it tracks an operator's
-  /// live ping more closely. Older daemons did not expose [latencyMs] on every
-  /// snapshot, so retain the smoothed RTT as a backwards-compatible fallback.
+  /// The UI shows the smoothed RTT for this verified path. The raw sample is
+  /// only a compatibility fallback for older daemons. Once the daemon reports
+  /// that the last sample is older than the freshness window, fail closed and
+  /// render `--` rather than a stale latency.
+  ///
   /// This is the encrypted overlay/data-path RTT, not an ICMP echo measurement.
-  int? get displayLatencyMs => latencyMs ?? rttEwmaMs;
+  int? get displayLatencyMs {
+    if (lastSuccessAgeMs != null && lastSuccessAgeMs! > _rttFreshnessWindowMs) {
+      return null;
+    }
+    return rttEwmaMs ?? latencyMs;
+  }
 
   String? get visibleLastError {
     if (_isNetworkGenerationRefresh(lastErrorCode, lastError)) return null;

@@ -164,7 +164,7 @@ void main() {
   });
 
   test(
-    'peer latency prefers the latest verified sample and relay selection exposes pong latency',
+    'peer latency prefers the verified EWMA and relay selection exposes pong latency',
     () {
       final peer = PeerSnapshot.fromJson({
         'node_id': 'direct-peer',
@@ -176,7 +176,11 @@ void main() {
         'active_path': 'direct',
         'direct_type': 'public_udp',
         'is_relay': false,
-        'direct': {'latency_ms': 48, 'rtt_ewma_ms': 31},
+        'direct': {
+          'last_success_age_ms': 100,
+          'latency_ms': 48,
+          'rtt_ewma_ms': 31,
+        },
         'relay': <String, dynamic>{},
       });
       final relaySelection = RelaySelectionSnapshot.fromJson({
@@ -185,11 +189,47 @@ void main() {
         'selected_rtt_ewma_ms': 25,
       });
 
-      expect(peer.latencyMs, 48);
+      expect(peer.latencyMs, 31);
       expect(peer.appVersion, '0.1.68');
       expect(relaySelection.latencyMs, 25);
     },
   );
+
+  test('verified RTT becomes unavailable after the freshness window', () {
+    final fresh = PeerSnapshot.fromJson({
+      'node_id': 'fresh-peer',
+      'device_name': 'fresh',
+      'virtual_ip': '10.20.0.70',
+      'online': true,
+      'state': 'direct',
+      'active_path': 'direct',
+      'direct_type': 'public_udp',
+      'direct': {
+        'last_success_age_ms': 75000,
+        'latency_ms': 48,
+        'rtt_ewma_ms': 31,
+      },
+      'relay': <String, dynamic>{},
+    });
+    final stale = PeerSnapshot.fromJson({
+      'node_id': 'stale-peer',
+      'device_name': 'stale',
+      'virtual_ip': '10.20.0.71',
+      'online': true,
+      'state': 'direct',
+      'active_path': 'direct',
+      'direct_type': 'public_udp',
+      'direct': {
+        'last_success_age_ms': 75001,
+        'latency_ms': 48,
+        'rtt_ewma_ms': 31,
+      },
+      'relay': <String, dynamic>{},
+    });
+
+    expect(fresh.latencyMs, 31);
+    expect(stale.latencyMs, isNull);
+  });
 
   test('remote relay RTT is not presented as local peer RTT', () {
     final peer = PeerSnapshot.fromJson({

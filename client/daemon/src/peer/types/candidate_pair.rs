@@ -130,6 +130,10 @@ pub struct CandidatePair {
     pub rtt_ewma_ms: Option<u64>,
     /// Smoothed absolute RTT variation for this pair.
     pub jitter_ms: Option<u64>,
+    /// Number of authoritative encrypted data-plane RTT samples in the
+    /// current lifecycle. The first one replaces candidate-probe history;
+    /// later authoritative samples continue the EWMA.
+    authoritative_sample_count: u64,
     /// Successful reachability samples observed for this pair.
     pub success_count: u64,
     /// Failed reachability samples observed for this pair.
@@ -167,6 +171,7 @@ impl CandidatePair {
             rtt_ms: None,
             rtt_ewma_ms: None,
             jitter_ms: None,
+            authoritative_sample_count: 0,
             success_count: 0,
             failure_count: 0,
         }
@@ -237,25 +242,25 @@ impl CandidatePair {
     }
 
     /// Record an encrypted validation success whose RTT is authoritative for
-    /// this generation.  Do not EWMA-blend it with a delayed candidate probe:
-    /// that would keep a usable Direct path looking like a 500ms+ path and
-    /// immediately trigger the relay quality floor.
+    /// this generation. The first authoritative sample replaces a delayed
+    /// candidate probe; later samples continue the pair's EWMA.
     pub(super) fn record_authoritative_success(
         &mut self,
         latency: Duration,
         selected: bool,
         local_endpoint: Option<SocketAddr>,
     ) {
+        if self.authoritative_sample_count == 0 {
+            self.rtt_ewma_ms = None;
+            self.jitter_ms = None;
+        }
         self.record_success(Some(latency), selected, local_endpoint);
         // An exact encrypted Request -> ACK supersedes any earlier
         // probe-only slow-path quarantine for this endpoint.  Keeping that
         // marker would make the selector retain relay even after the current
         // generation had a fresh, authenticated Direct proof.
         self.last_slow_validation_at = None;
-        let latency_ms = duration_millis(latency);
-        self.rtt_ms = Some(latency_ms);
-        self.rtt_ewma_ms = Some(latency_ms);
-        self.jitter_ms = Some(0);
+        self.authoritative_sample_count = self.authoritative_sample_count.saturating_add(1);
     }
 
     /// Record bidirectional reachability without treating the pair as a
@@ -357,11 +362,13 @@ impl CandidatePair {
     pub(super) fn record_generation_change(&mut self, reason: impl Into<String>) {
         self.record_failure(REASON_NETWORK_GENERATION_CHANGED, reason, None);
         self.state = CandidatePairState::Degraded;
+        self.authoritative_sample_count = 0;
     }
 
     pub(super) fn record_remote_candidate_generation_change(&mut self, reason: impl Into<String>) {
         self.record_failure(REASON_REMOTE_CANDIDATE_GENERATION_CHANGED, reason, None);
         self.state = CandidatePairState::Degraded;
+        self.authoritative_sample_count = 0;
     }
 
     pub(super) fn retained_for_generation(&self, local_generation: u64) -> Self {
@@ -382,6 +389,7 @@ impl CandidatePair {
         // the old generation and must not suppress the new generation's own
         // Direct validation.
         retained.last_slow_validation_at = None;
+        retained.authoritative_sample_count = 0;
         retained
     }
 

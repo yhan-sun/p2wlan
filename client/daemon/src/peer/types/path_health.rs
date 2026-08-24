@@ -29,6 +29,10 @@ pub struct PathHealth {
     pub rtt_ewma_ms: Option<u64>,
     /// Smoothed absolute RTT variation for this path.
     pub jitter_ms: Option<u64>,
+    /// Number of authoritative encrypted data-plane RTT samples in the
+    /// current lifecycle. The first one replaces candidate-probe history;
+    /// later authoritative samples continue the EWMA.
+    authoritative_sample_count: u64,
     /// Successful path samples observed.
     pub success_count: u64,
     /// Failed path samples observed.
@@ -56,16 +60,21 @@ impl PathHealth {
         update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
     }
 
-    /// Record an authoritative data-plane RTT.  Candidate probes are useful
-    /// for ranking, but their timestamp can include NAT-sweep queueing.  An
-    /// encrypted Request -> ACK exchange is stronger evidence and must replace
-    /// that stale sample rather than being blended into it.
+    /// Record an authoritative data-plane RTT. Candidate probes are useful
+    /// for ranking, but their timestamp can include NAT-sweep queueing. The
+    /// first encrypted Request -> ACK exchange replaces that stale sample;
+    /// subsequent authoritative samples continue the same EWMA instead of
+    /// resetting it on every ACK.
     pub(super) fn record_success_with_authoritative_latency(&mut self, latency: Duration) {
+        if self.authoritative_sample_count == 0 {
+            self.rtt_ewma_ms = None;
+            self.jitter_ms = None;
+        }
         self.record_success();
         let latency_ms = duration_millis(latency);
         self.latency_ms = Some(latency_ms);
-        self.rtt_ewma_ms = Some(latency_ms);
-        self.jitter_ms = Some(0);
+        update_latency_ewma(&mut self.rtt_ewma_ms, &mut self.jitter_ms, latency_ms);
+        self.authoritative_sample_count = self.authoritative_sample_count.saturating_add(1);
     }
 
     pub(super) fn record_failure(&mut self, code: impl Into<String>, reason: impl Into<String>) {
@@ -86,6 +95,7 @@ impl PathHealth {
         self.latency_ms = None;
         self.rtt_ewma_ms = None;
         self.jitter_ms = None;
+        self.authoritative_sample_count = 0;
     }
 
     pub(super) fn record_generation_change(&mut self, reason: impl Into<String>) {
