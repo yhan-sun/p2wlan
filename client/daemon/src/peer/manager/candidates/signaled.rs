@@ -312,6 +312,12 @@ impl PeerManager {
         if remote_transport_handover {
             self.cancel_direct_validation_for_remote_candidate_change(node_id)
                 .await;
+            // Candidate handover retires the complete direct transport
+            // context. Control-event ingress also clears this ledger after
+            // applying the offer, but refresh callers use this manager API
+            // directly; leaving a Hard↔Hard record alive here lets its late
+            // response/sweep reuse the retired candidate epoch.
+            self.clear_hard_hard_sessions(Some(node_id)).await;
         }
         CandidateSetApplyResult::Applied
     }

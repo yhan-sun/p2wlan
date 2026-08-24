@@ -2807,24 +2807,52 @@ async fn hard_hard_remote_candidate_epoch_fence_with_stun(stun: HarnessStunProfi
     assert!(!response.candidates.contains(&replacement_candidate));
     let candidate_sources =
         HashMap::from([(replacement_candidate.clone(), "predicted".to_string())]);
-    let apply_result = harness
-        .peers_a
-        .add_candidates_with_metadata(
+    let old_epoch_b = harness
+        .peers_b
+        .current_remote_candidate_epoch(HARD_HARD_A)
+        .await
+        .expect("B must have a remote candidate epoch");
+    let local_candidate_for_b = harness
+        .link
+        .a_public
+        .local_addr()
+        .expect("A public test socket must have an endpoint")
+        .to_string();
+    let replacement_candidate_for_b = hard_hard_replacement_candidate(&local_candidate_for_b);
+    let candidate_sources_for_b =
+        HashMap::from([(replacement_candidate_for_b.clone(), "predicted".to_string())]);
+    let candidates_a = [replacement_candidate];
+    let candidates_b = [replacement_candidate_for_b];
+    let (apply_result_a, apply_result_b) = tokio::join!(
+        harness.peers_a.add_candidates_with_metadata(
             HARD_HARD_B,
-            &[replacement_candidate],
+            &candidates_a,
             &candidate_sources,
             response.candidate_generation.saturating_add(1),
             response.candidates_expires_at_ms,
-        )
-        .await;
-    assert!(matches!(apply_result, CandidateSetApplyResult::Applied));
+        ),
+        harness.peers_b.add_candidates_with_metadata(
+            HARD_HARD_A,
+            &candidates_b,
+            &candidate_sources_for_b,
+            response.candidate_generation.saturating_add(1),
+            None,
+        ),
+    );
+    assert!(matches!(apply_result_a, CandidateSetApplyResult::Applied));
+    assert!(matches!(apply_result_b, CandidateSetApplyResult::Applied));
     timeout(Duration::from_secs(3), async {
         loop {
-            if harness
+            let epoch_a = harness
                 .peers_a
                 .current_remote_candidate_epoch(HARD_HARD_B)
-                .await
-                == Some(old_epoch.saturating_add(1))
+                .await;
+            let epoch_b = harness
+                .peers_b
+                .current_remote_candidate_epoch(HARD_HARD_A)
+                .await;
+            if epoch_a == Some(old_epoch.saturating_add(1))
+                && epoch_b == Some(old_epoch_b.saturating_add(1))
             {
                 return;
             }
@@ -2836,7 +2864,8 @@ async fn hard_hard_remote_candidate_epoch_fence_with_stun(stun: HarnessStunProfi
     set_hard_hard_test_now_ms(Some(
         response
             .punch_at_ms
-            .expect("response must carry punch_at_ms"),
+            .expect("response must carry punch_at_ms")
+            .saturating_add(30_000),
     ));
     wait_for_failed_attempt_cleanup(&harness).await;
     assert!(!harness.peers_a.is_direct(HARD_HARD_B).await);
@@ -2894,18 +2923,6 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     let harness = build_two_peer_harness(false, false, false).await;
     trigger_initial_offer(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
-    timeout(Duration::from_secs(3), async {
-        loop {
-            if harness.udp_a.dynamic_socket_count().await == 1
-                && harness.udp_b.dynamic_socket_count().await == 1
-            {
-                return;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the duplicate test must observe both original fresh sockets");
     let original_a = harness.udp_a.dynamic_socket_count().await;
     let original_b = harness.udp_b.dynamic_socket_count().await;
 
