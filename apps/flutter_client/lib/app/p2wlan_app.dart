@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../app/desktop_tray_controller.dart';
 import '../app/desktop_window_status_controller.dart';
@@ -16,6 +18,7 @@ import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../features/auth/login_page.dart';
 import '../features/onboarding/onboarding_page.dart';
+import '../shared/widgets/windows_window_controls.dart';
 import 'app_constants.dart';
 import 'navigation.dart';
 
@@ -157,6 +160,25 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
           theme: AppTheme.lightTheme,
           darkTheme: AppTheme.darkTheme,
           themeMode: themeMode,
+          builder: (context, child) {
+            final content = child ?? const SizedBox.shrink();
+            if (kIsWeb || !Platform.isWindows) return content;
+
+            // Hidden Windows title bars still need a native resize hit area at
+            // the top edge. The package frame preserves that behavior while
+            // leaving the entire visible caption to Flutter.
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                VirtualWindowFrame(child: content),
+                const Positioned(
+                  top: 0,
+                  right: 0,
+                  child: WindowsWindowControls(),
+                ),
+              ],
+            );
+          },
           home: AppStringsScope(
             strings: strings,
             child: !_ready
@@ -212,16 +234,28 @@ class _BootScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        child: SizedBox.square(
-          dimension: 24,
-          child: CircularProgressIndicator(
-            strokeWidth: 2,
-            valueColor: AlwaysStoppedAnimation<Color>(
-              P2WlanColors.of(context).textMuted,
+      body: Stack(
+        children: [
+          if (!kIsWeb && Platform.isWindows)
+            const Positioned(
+              top: 0,
+              left: 0,
+              right: WindowsWindowControls.width,
+              height: 56,
+              child: DragToMoveArea(child: SizedBox.expand()),
+            ),
+          Center(
+            child: SizedBox.square(
+              dimension: 24,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  P2WlanColors.of(context).textMuted,
+                ),
+              ),
             ),
           ),
-        ),
+        ],
       ),
     );
   }

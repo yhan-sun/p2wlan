@@ -34,15 +34,14 @@ Future<void> _configureDesktopWindowChrome() async {
     }
     await windowManager.setTitle('P2WLAN');
 
-    if (Platform.isMacOS) {
+    if (Platform.isMacOS || Platform.isWindows) {
       await windowManager.setTitleBarStyle(
         TitleBarStyle.hidden,
-        windowButtonVisibility: true,
+        // macOS keeps its native traffic lights. Windows renders the
+        // caption buttons in Flutter so the whole top edge shares one style.
+        windowButtonVisibility: Platform.isMacOS,
       );
     }
-    // Windows deliberately keeps the runner's native frame. This preserves
-    // the system minimize/maximize/close buttons and avoids changing window
-    // styles while a virtual or remote display is being initialized.
   });
 }
 

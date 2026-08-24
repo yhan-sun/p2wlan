@@ -18,6 +18,7 @@ import '../shared/layout/app_breakpoints.dart';
 import '../shared/widgets/app_nav_rail.dart';
 import '../shared/widgets/desktop_sidebar.dart';
 import '../shared/widgets/status_badge.dart';
+import '../shared/widgets/windows_window_controls.dart';
 
 class P2WlanShell extends StatefulWidget {
   const P2WlanShell({
@@ -188,6 +189,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
                     _select(P2WlanSection.troubleshooting),
               ),
               const SizedBox(width: 8),
+              if (_usesWindowsChrome)
+                const SizedBox(width: WindowsWindowControls.width),
             ],
     );
   }
@@ -350,6 +353,8 @@ bool get _isDesktopShell =>
         defaultTargetPlatform == TargetPlatform.linux);
 
 bool get _usesMacosChrome => !kIsWeb && Platform.isMacOS;
+
+bool get _usesWindowsChrome => !kIsWeb && Platform.isWindows;
 
 bool get _canDragWindowFromAppBar {
   return !kIsWeb && (Platform.isMacOS || Platform.isWindows);

@@ -13,6 +13,7 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
+import '../../shared/widgets/windows_window_controls.dart';
 import 'login_errors.dart';
 
 class LoginPage extends StatefulWidget {
@@ -96,7 +97,7 @@ class _LoginPageState extends State<LoginPage> {
             const Positioned(
               top: 0,
               left: 0,
-              right: 56,
+              right: WindowsWindowControls.width,
               height: 52,
               child: DragToMoveArea(child: SizedBox.expand()),
             ),

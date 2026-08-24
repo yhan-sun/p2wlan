@@ -1,4 +1,8 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:window_manager/window_manager.dart';
 
 import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
@@ -8,6 +12,7 @@ import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/permission_copy.dart';
+import '../../shared/widgets/windows_window_controls.dart';
 import 'onboarding_model.dart';
 
 /// Resumable first-run / node-setup flow for a local P2WLAN node.
@@ -182,87 +187,101 @@ class _OnboardingPageState extends State<OnboardingPage> {
         final facts = _facts();
         final step = _model.step(facts);
         return Scaffold(
-          body: SafeArea(
-            child: Center(
-              child: SingleChildScrollView(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 560),
-                  child: Padding(
-                    padding: const EdgeInsets.all(32),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Icon(
-                          Icons.router_rounded,
-                          size: 40,
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                        const SizedBox(height: AppTokens.space16),
-                        Text(
-                          strings.onboardingTitle,
-                          style: Theme.of(context).textTheme.headlineSmall,
-                        ),
-                        const SizedBox(height: AppTokens.space8),
-                        Text(
-                          strings.onboardingSubtitle,
-                          style: Theme.of(context).textTheme.bodyMedium
-                              ?.copyWith(
-                                color: P2WlanColors.of(context).textMuted,
-                              ),
-                        ),
-                        const SizedBox(height: 28),
-                        _OnboardingStepper(
-                          model: _model,
-                          step: step,
-                          visible: _visibleSteps,
-                          facts: facts,
-                          permissionGranted: facts.permissionGranted,
-                        ),
-                        const SizedBox(height: 28),
-                        _StepBody(
-                          step: step,
-                          strings: strings,
-                          busy: _busy,
-                          preflight: _preflight,
-                        ),
-                        if (_error != null) ...[
-                          const SizedBox(height: AppTokens.space16),
-                          Text(
-                            _error!,
-                            style: TextStyle(
-                              color: P2WlanColors.of(context).dangerText,
+          body: Stack(
+            children: [
+              if (_usesWindowsOnboardingChrome)
+                const Positioned(
+                  top: 0,
+                  left: 0,
+                  right: WindowsWindowControls.width,
+                  height: 56,
+                  child: DragToMoveArea(child: SizedBox.expand()),
+                ),
+              SafeArea(
+                child: Center(
+                  child: SingleChildScrollView(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 560),
+                      child: Padding(
+                        padding: const EdgeInsets.all(32),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(
+                              Icons.router_rounded,
+                              size: 40,
+                              color: Theme.of(context).colorScheme.primary,
                             ),
-                          ),
-                        ],
-                        const SizedBox(height: AppTokens.space24),
-                        _PrimaryAction(
-                          step: step,
-                          strings: strings,
-                          busy: _busy,
-                          skippable: _model.canSkip(step),
-                          onPrimary: () => _onPrimaryAction(step),
-                          onSkip: () {
-                            if (step == OnboardingStep.virtualIp) {
-                              // A VIP may take a moment; virtual IP step is not
-                              // skippable but we allow "keep waiting" (no-op).
-                            } else if (_model.canSkip(step)) {
-                              _completeOnce();
-                            }
-                          },
+                            const SizedBox(height: AppTokens.space16),
+                            Text(
+                              strings.onboardingTitle,
+                              style: Theme.of(context).textTheme.headlineSmall,
+                            ),
+                            const SizedBox(height: AppTokens.space8),
+                            Text(
+                              strings.onboardingSubtitle,
+                              style: Theme.of(context).textTheme.bodyMedium
+                                  ?.copyWith(
+                                    color: P2WlanColors.of(context).textMuted,
+                                  ),
+                            ),
+                            const SizedBox(height: 28),
+                            _OnboardingStepper(
+                              model: _model,
+                              step: step,
+                              visible: _visibleSteps,
+                              facts: facts,
+                              permissionGranted: facts.permissionGranted,
+                            ),
+                            const SizedBox(height: 28),
+                            _StepBody(
+                              step: step,
+                              strings: strings,
+                              busy: _busy,
+                              preflight: _preflight,
+                            ),
+                            if (_error != null) ...[
+                              const SizedBox(height: AppTokens.space16),
+                              Text(
+                                _error!,
+                                style: TextStyle(
+                                  color: P2WlanColors.of(context).dangerText,
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: AppTokens.space24),
+                            _PrimaryAction(
+                              step: step,
+                              strings: strings,
+                              busy: _busy,
+                              skippable: _model.canSkip(step),
+                              onPrimary: () => _onPrimaryAction(step),
+                              onSkip: () {
+                                if (step == OnboardingStep.virtualIp) {
+                                  // A VIP may take a moment; virtual IP step is not
+                                  // skippable but we allow "keep waiting" (no-op).
+                                } else if (_model.canSkip(step)) {
+                                  _completeOnce();
+                                }
+                              },
+                            ),
+                          ],
                         ),
-                      ],
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
+            ],
           ),
         );
       },
     );
   }
 }
+
+bool get _usesWindowsOnboardingChrome => !kIsWeb && Platform.isWindows;
 
 class _OnboardingStepper extends StatelessWidget {
   const _OnboardingStepper({
