@@ -443,7 +443,23 @@ void _registerNodesTests() {
     await tester.pumpAndSettle();
 
     expect(find.byKey(const Key('node-speedtest-dialog')), findsOneWidget);
-    expect(find.text('Test duration: 10 seconds'), findsOneWidget);
+    final speedDialog = find.byKey(const Key('node-speedtest-dialog'));
+    expect(
+      find.descendant(of: speedDialog, matching: find.text('Virtual IP')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: speedDialog, matching: find.text('Path')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: speedDialog, matching: find.text('Download speed')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: speedDialog, matching: find.text('Upload speed')),
+      findsOneWidget,
+    );
     expect(find.text('relay-nas'), findsWidgets);
 
     await tester.tap(find.byKey(const Key('node-speedtest-start')));
@@ -464,12 +480,29 @@ void _registerNodesTests() {
     expect(find.byKey(const Key('node-speedtest-chart')), findsOneWidget);
     expect(
       tester.getSize(find.byKey(const Key('node-speedtest-chart'))).height,
-      150,
+      214,
     );
-    expect(find.text('Download 123.4 Mbps'), findsOneWidget);
-    expect(find.text('Upload 56.7 Mbps'), findsOneWidget);
+    expect(find.text('Average download'), findsOneWidget);
+    expect(find.text('Average upload'), findsOneWidget);
     expect(find.text('147.1 MB / 67.6 MB'), findsOneWidget);
     expect(tester.takeException(), isNull);
+
+    // Keep the desktop modal inside the supported window sizes from the UI
+    // brief. This catches height/width regressions without changing mobile
+    // coverage, which intentionally stays on the original dialog branch.
+    for (final size in const [
+      Size(1024, 768),
+      Size(1280, 800),
+      Size(1440, 900),
+    ]) {
+      tester.view.physicalSize = size;
+      await tester.pump();
+      final dialogRect = tester.getRect(speedDialog);
+      expect(dialogRect.width, lessThanOrEqualTo(size.width));
+      expect(dialogRect.height, lessThanOrEqualTo(size.height));
+      expect(find.byKey(const Key('node-speedtest-start')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    }
   });
 
   testWidgets('Nodes shows a speed-test failure and allows retry', (

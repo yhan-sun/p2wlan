@@ -834,6 +834,34 @@ class StatusStore extends ChangeNotifier {
     }
   }
 
+  /// Fetches the authoritative peer counters used by the desktop speed-test
+  /// chart. This intentionally bypasses the normal one-second presentation
+  /// cadence: the speed-test surface owns a short-lived 200ms sampler while
+  /// the test is running, without changing the rest of the app's polling
+  /// policy or notifying every page for each telemetry sample.
+  Future<PeerSnapshot?> fetchSpeedTestPeerSnapshot(PeerSnapshot peer) async {
+    final nodeId = peer.nodeId.trim();
+    final virtualIp = peer.virtualIp.trim();
+    if (nodeId.isEmpty && virtualIp.isEmpty) return null;
+    try {
+      final snapshot = await diagnosticsApi.fetchStatus(
+        settingsStore.settings.diagnosticsUrl,
+      );
+      for (final candidate in snapshot.peers) {
+        if (nodeId.isNotEmpty && candidate.nodeId.trim() == nodeId) {
+          return candidate;
+        }
+        if (virtualIp.isNotEmpty && candidate.virtualIp.trim() == virtualIp) {
+          return candidate;
+        }
+      }
+    } catch (_) {
+      // A single telemetry request may miss while the daemon is busy. The
+      // chart keeps its last real sample and the next 200ms tick retries.
+    }
+    return null;
+  }
+
   bool speedTestMatches(PeerSnapshot peer) {
     final peerVirtualIp = peer.virtualIp.trim();
     return peerVirtualIp.isNotEmpty && peerVirtualIp == _speedTestPeerVirtualIp;

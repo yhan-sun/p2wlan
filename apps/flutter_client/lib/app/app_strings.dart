@@ -249,6 +249,12 @@ class AppStrings {
       : 'Testing $peer. Wait for this test to finish.';
   String get speedTestDownload => isZh ? '下行' : 'Download';
   String get speedTestUpload => isZh ? '上行' : 'Upload';
+  String get speedTestDownloadRate => isZh ? '下行速度' : 'Download speed';
+  String get speedTestUploadRate => isZh ? '上行速度' : 'Upload speed';
+  String get speedTestAverageDownload => isZh ? '平均下行' : 'Average download';
+  String get speedTestAverageUpload => isZh ? '平均上行' : 'Average upload';
+  String get speedTestLocalRtt => isZh ? '本端 RTT' : 'Local RTT';
+  String get speedTestMbps => 'Mbps';
   String get speedTestTransferred => isZh ? '传输数据' : 'Transferred';
   String get speedTestElapsed => isZh ? '已用时间' : 'Elapsed';
   String speedTestProgress(int elapsedSeconds) =>
