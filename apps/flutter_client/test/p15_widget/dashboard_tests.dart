@@ -146,10 +146,11 @@ void _registerDashboardTests() {
     expect(find.text('Virtual IP address'), findsOneWidget);
     expect(find.textContaining('Network ID'), findsNothing);
 
-    // Key metrics from peer state: online / direct / relay.
+    // Key metrics from peer state plus the local NAT profile.
     expect(_heroCount(tester, 'dashboard-count-online'), '2');
     expect(_heroCount(tester, 'dashboard-count-direct'), '1');
     expect(_heroCount(tester, 'dashboard-count-relay'), '1');
+    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted');
 
     // Device preview section is titled "Devices" and contains connected peers.
     expect(find.text('Devices'), findsOneWidget);
@@ -317,7 +318,6 @@ void _registerDashboardTests() {
 
     for (final technical in [
       'UDP',
-      'Network type',
       'Request duration',
       'Last refresh',
       'Snapshot',

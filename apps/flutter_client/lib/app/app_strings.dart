@@ -208,6 +208,7 @@ class AppStrings {
   String get relayPaths => isZh ? '中继路径' : 'Relay paths';
   String get bytesSent => isZh ? '已发送' : 'Bytes sent';
   String get bytesReceived => isZh ? '已接收' : 'Bytes received';
+  String get natType => isZh ? 'NAT 类型' : 'NAT type';
   String get natNetworkType => isZh ? '网络类型' : 'Network type';
   String get natAutoDetected => isZh ? '自动检测' : 'Auto detected';
   String get natDetectionUnavailable =>
@@ -1047,6 +1048,21 @@ class AppStrings {
       NatTraversalType.symmetric =>
         isZh ? '对称型 NAT（Symmetric）' : 'Symmetric NAT',
       NatTraversalType.openInternet => isZh ? '公网直连' : 'Open Internet',
+      NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',
+      NatTraversalType.unknown => isZh ? '未确认' : 'Unknown',
+    };
+  }
+
+  /// Compact label for dense surfaces such as the Home metrics row. The full
+  /// classification remains available through [natTraversalTypeLabel] (and
+  /// the metric tooltip), while this version stays readable on phones.
+  String natTraversalTypeCompactLabel(NatTraversalType type) {
+    return switch (type) {
+      NatTraversalType.fullCone => isZh ? '全锥形' : 'Full cone',
+      NatTraversalType.restrictedCone => isZh ? '受限锥形' : 'Restricted',
+      NatTraversalType.portRestrictedCone => isZh ? '端口受限' : 'Port restricted',
+      NatTraversalType.symmetric => isZh ? '对称型' : 'Symmetric',
+      NatTraversalType.openInternet => isZh ? '公网直连' : 'Open',
       NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',
       NatTraversalType.unknown => isZh ? '未确认' : 'Unknown',
     };

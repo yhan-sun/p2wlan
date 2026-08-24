@@ -175,7 +175,13 @@ class _NetworkHero extends StatelessWidget {
                   children: [
                     Expanded(child: virtualIp),
                     const SizedBox(width: AppTokens.space24),
-                    SizedBox(width: 300, child: _HomeMetrics(counts: counts)),
+                    SizedBox(
+                      width: 360,
+                      child: _HomeMetrics(
+                        counts: counts,
+                        natProfile: snapshot!.natProfile,
+                      ),
+                    ),
                   ],
                 );
               }
@@ -189,7 +195,10 @@ class _NetworkHero extends StatelessWidget {
                     const _StaleNote(),
                   ] else ...[
                     const SizedBox(height: AppTokens.space16),
-                    _HomeMetrics(counts: counts),
+                    _HomeMetrics(
+                      counts: counts,
+                      natProfile: snapshot!.natProfile,
+                    ),
                   ],
                 ],
               );
@@ -476,11 +485,12 @@ class _StaleNote extends StatelessWidget {
   }
 }
 
-/// Online / Direct / Relay in one compact statistics surface.
+/// Online / Direct / Relay / NAT in one compact statistics surface.
 class _HomeMetrics extends StatelessWidget {
-  const _HomeMetrics({required this.counts});
+  const _HomeMetrics({required this.counts, required this.natProfile});
 
   final _PeerCounts counts;
+  final NatProfileSnapshot? natProfile;
 
   @override
   Widget build(BuildContext context) {
@@ -500,19 +510,32 @@ class _HomeMetrics extends StatelessWidget {
         children: [
           _MetricCell(
             key: const Key('dashboard-count-online'),
-            value: counts.online,
+            value: '${counts.online}',
             label: strings.onlineDevices,
           ),
           _MetricDivider(color: colors.border),
           _MetricCell(
+            key: const Key('dashboard-nat-type'),
+            value: natProfile == null
+                ? '—'
+                : strings.natTraversalTypeCompactLabel(
+                    natProfile!.traversalType,
+                  ),
+            label: strings.natType,
+            tooltip: natProfile == null
+                ? strings.natDetectionUnavailable
+                : strings.natTraversalTypeLabel(natProfile!.traversalType),
+          ),
+          _MetricDivider(color: colors.border),
+          _MetricCell(
             key: const Key('dashboard-count-direct'),
-            value: counts.direct,
+            value: '${counts.direct}',
             label: strings.direct,
           ),
           _MetricDivider(color: colors.border),
           _MetricCell(
             key: const Key('dashboard-count-relay'),
-            value: counts.relay,
+            value: '${counts.relay}',
             label: strings.relay,
           ),
         ],
@@ -533,42 +556,59 @@ class _MetricDivider extends StatelessWidget {
 }
 
 class _MetricCell extends StatelessWidget {
-  const _MetricCell({super.key, required this.value, required this.label});
+  const _MetricCell({
+    super.key,
+    required this.value,
+    required this.label,
+    this.tooltip,
+  });
 
-  final int value;
+  final String value;
   final String label;
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final content = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          height: 22,
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              value,
+              maxLines: 1,
+              style: TextStyle(
+                color: theme.colorScheme.onSurface,
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                height: 1.1,
+                fontFeatures: AppTokens.tabularFontFeatures,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          label,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            height: 1.2,
+          ),
+        ),
+      ],
+    );
     return Expanded(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            '$value',
-            style: TextStyle(
-              color: theme.colorScheme.onSurface,
-              fontSize: 20,
-              fontWeight: FontWeight.w700,
-              height: 1.1,
-              fontFeatures: AppTokens.tabularFontFeatures,
-            ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: theme.colorScheme.onSurfaceVariant,
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              height: 1.2,
-            ),
-          ),
-        ],
-      ),
+      child: tooltip == null
+          ? content
+          : Tooltip(message: tooltip!, child: content),
     );
   }
 }
