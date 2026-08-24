@@ -197,7 +197,7 @@ String _filterLabel(AppStrings strings, _NodeFilter filter) {
 
 String _sortLabel(AppStrings strings, _NodeSort sort) {
   return switch (sort) {
-    _NodeSort.recommended => strings.sortByJoinOrder,
+    _NodeSort.recommended => strings.sortByOnlineFirst,
     _NodeSort.name => strings.sortByName,
     _NodeSort.latency => strings.sortByLatency,
   };

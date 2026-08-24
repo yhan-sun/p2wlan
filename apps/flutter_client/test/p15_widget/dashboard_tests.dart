@@ -441,6 +441,55 @@ void _registerDashboardTests() {
     expect(find.text('8 ms'), findsNothing);
   });
 
+  testWidgets(
+    'Home keeps online order and moves a reconnected peer to the end',
+    (tester) async {
+      final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final initial = _snapshotWithPeers(base, _fourPeerFixtures());
+      final api = _FakeDiagnosticsApi(health: true, snapshot: initial);
+      final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+
+      double rowTop(String nodeId) =>
+          tester.getTopLeft(find.byKey(Key('home-device-row-$nodeId'))).dy;
+
+      expect(rowTop('node-direct'), lessThan(rowTop('node-relay')));
+      expect(rowTop('node-relay'), lessThan(rowTop('node-probing')));
+
+      final offlinePeers = _fourPeerFixtures();
+      final directOffline = offlinePeers.firstWhere(
+        (peer) => peer['node_id'] == 'node-direct',
+      );
+      directOffline
+        ..['online'] = false
+        ..['state'] = 'unknown'
+        ..['active_path'] = null
+        ..['current_path_selection'] = null;
+      api.snapshot = _snapshotWithPeers(base, offlinePeers);
+      await stores.statusStore.refresh();
+      await tester.pump();
+
+      final restoredPeers = _fourPeerFixtures();
+      api.snapshot = _snapshotWithPeers(base, restoredPeers);
+      await stores.statusStore.refresh();
+      await tester.pump();
+
+      expect(rowTop('node-relay'), lessThan(rowTop('node-probing')));
+      expect(rowTop('node-probing'), lessThan(rowTop('node-direct')));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('Device rows order speed, latency, then connection path', (
     tester,
   ) async {

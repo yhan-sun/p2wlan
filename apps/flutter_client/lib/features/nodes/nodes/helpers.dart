@@ -102,9 +102,10 @@ List<PeerSnapshot> _applySort(List<PeerSnapshot> peers, _NodeSort sort) {
   final sorted = [...peers];
   switch (sort) {
     case _NodeSort.recommended:
-      // The input is already the StatusStore's first-seen order. Keeping this
-      // branch a no-op is what prevents live path/latency updates from moving
-      // rows. Name and latency remain explicit, user-selected sorts.
+      // The input is already the StatusStore's online-first lifecycle order.
+      // Keeping this branch a no-op is what prevents live path/latency updates
+      // from moving rows. Name and latency remain explicit, user-selected
+      // sorts.
       break;
     case _NodeSort.name:
       sorted.sort(_compareByName);

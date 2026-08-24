@@ -106,7 +106,7 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
   );
 }
 
-/// Connected peers for the home overview in the shared first-seen order.
+/// Connected peers for the home overview in the shared online-first order.
 /// Offline devices belong in the Devices section, not this compact Home
 /// preview. The result is capped to keep the page quiet without allowing a
 /// live path/latency update to reshuffle the visible rows.
