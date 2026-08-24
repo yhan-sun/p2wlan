@@ -36,6 +36,36 @@ void _registerDashboardTests() {
     expect(find.text('Network components'), findsNothing);
   });
 
+  testWidgets('macOS start does not show a repeated authorization explainer', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    try {
+      final stores = (await tester.runAsync(
+        () => _makeStores(api: _FakeDiagnosticsApi(health: false)),
+      ))!;
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: DashboardPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+
+      await tester.tap(find.byKey(const Key('dashboard-start-button')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('macOS administrator access required'), findsNothing);
+      expect(find.text('Continue'), findsNothing);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
   testWidgets(
     'Home keeps initial and periodic status detection in the background',
     (tester) async {

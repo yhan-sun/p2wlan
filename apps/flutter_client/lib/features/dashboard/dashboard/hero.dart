@@ -261,29 +261,10 @@ class _NetworkHero extends StatelessWidget {
   }
 
   Future<void> _handleStart(BuildContext context) async {
-    if (defaultTargetPlatform == TargetPlatform.macOS) {
-      final strings = AppStringsScope.of(context);
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) {
-          return AlertDialog(
-            title: Text(strings.macosAuthorizationTitle),
-            content: Text(strings.macosAuthorizationBody),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(false),
-                child: Text(strings.cancel),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.of(dialogContext).pop(true),
-                child: Text(strings.continueAction),
-              ),
-            ],
-          );
-        },
-      );
-      if (confirmed != true) return;
-    }
+    // macOS shows its password field only when the encrypted local
+    // administrator credential is missing or no longer valid. Do not add a
+    // second explanatory dialog here: after the first successful entry,
+    // starting the daemon should be a single click with no repeated prompt.
     await onStartDaemon();
   }
 }
