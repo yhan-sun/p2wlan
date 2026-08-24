@@ -491,6 +491,10 @@ void _registerDashboardTests() {
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('relay-nas'), findsOneWidget);
     expect(find.text('probing-phone'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('10.20.0.11')).dy,
+      greaterThan(tester.getTopLeft(find.text('direct-laptop')).dy),
+    );
     expect(find.text('offline-printer'), findsNothing);
     // Metric labels add one more occurrence each.
     expect(find.text('Direct'), findsNWidgets(2));

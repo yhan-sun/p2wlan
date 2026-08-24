@@ -80,8 +80,10 @@ class _PeerListRow extends StatelessWidget {
 }
 
 /// First level: status, name/IP, speed, latency, connection path, and a quiet
-/// affordance for opening details. The three metrics stay on one line;
-/// technical metadata still stays behind the detail surface.
+/// affordance for opening details. The identity uses two short lines so the
+/// device name keeps its full width instead of competing with the IP address.
+/// The three metrics stay on one line; technical metadata still stays behind
+/// the detail surface.
 class _RowContent extends StatelessWidget {
   const _RowContent({
     required this.peer,
@@ -150,9 +152,10 @@ class _RowContent extends StatelessWidget {
   }
 }
 
-/// Phone layout for a peer row. Keep the complete interaction on one compact
-/// line: identity, transfer rate, RTT, path, and the detail affordance. The
-/// identity truncates gracefully instead of growing the row to two lines.
+/// Phone layout for a peer row. Keep the complete interaction in one compact
+/// row: a two-line identity on the left, transfer rate, RTT, path, and the
+/// detail affordance on the right. The identity grows vertically rather than
+/// squeezing the device name and IP into a single line.
 class _CompactRowContent extends StatelessWidget {
   const _CompactRowContent({
     required this.peer,
@@ -297,53 +300,50 @@ class _PeerPrimaryText extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final error = peer.lastError?.trim();
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Flexible(
-          child: Text(
-            dash(peer.displayName),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 13.5,
-              fontWeight: FontWeight.w700,
-              color: theme.colorScheme.onSurface,
+        Row(
+          children: [
+            Flexible(
+              child: Text(
+                dash(peer.displayName),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w700,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
             ),
-          ),
+            if (error != null && error.isNotEmpty) ...[
+              const SizedBox(width: AppTokens.space6),
+              Tooltip(
+                message: error,
+                child: Icon(
+                  Icons.warning_amber_rounded,
+                  size: 15,
+                  color: P2WlanColors.of(context).probing,
+                ),
+              ),
+            ],
+          ],
         ),
+        const SizedBox(height: 2),
         Text(
-          ' · ',
+          dash(peer.virtualIp),
           maxLines: 1,
+          overflow: TextOverflow.ellipsis,
           style: TextStyle(
-            fontSize: 11,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
             color: theme.colorScheme.onSurfaceVariant,
+            fontFeatures: AppTokens.tabularFontFeatures,
+            height: 1.15,
           ),
         ),
-        Flexible(
-          child: Text(
-            dash(peer.virtualIp),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              color: theme.colorScheme.onSurfaceVariant,
-              fontFeatures: AppTokens.tabularFontFeatures,
-            ),
-          ),
-        ),
-        if (error != null && error.isNotEmpty) ...[
-          const SizedBox(width: AppTokens.space6),
-          Tooltip(
-            message: error,
-            child: Icon(
-              Icons.warning_amber_rounded,
-              size: 15,
-              color: P2WlanColors.of(context).probing,
-            ),
-          ),
-        ],
       ],
     );
   }

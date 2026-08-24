@@ -172,41 +172,31 @@ class _DeviceRow extends StatelessWidget {
                     ),
                   ],
                 );
-                final identity = Row(
+                final identity = Column(
                   mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Flexible(
-                      child: Text(
-                        peer.displayName,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: theme.colorScheme.onSurface,
-                          fontSize: constraints.maxWidth < 520 ? 11.5 : 13,
-                          fontWeight: FontWeight.w600,
-                          height: 1.2,
-                        ),
+                    Text(
+                      peer.displayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontSize: constraints.maxWidth < 520 ? 11.5 : 13,
+                        fontWeight: FontWeight.w600,
+                        height: 1.2,
                       ),
                     ),
+                    const SizedBox(height: 2),
                     Text(
-                      ' · ',
+                      dash(peer.virtualIp),
                       maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: theme.colorScheme.onSurfaceVariant,
                         fontSize: constraints.maxWidth < 520 ? 10.5 : 11.5,
-                      ),
-                    ),
-                    Flexible(
-                      child: Text(
-                        dash(peer.virtualIp),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: theme.colorScheme.onSurfaceVariant,
-                          fontSize: constraints.maxWidth < 520 ? 10.5 : 11.5,
-                          height: 1.2,
-                          fontFeatures: AppTokens.tabularFontFeatures,
-                        ),
+                        height: 1.2,
+                        fontFeatures: AppTokens.tabularFontFeatures,
                       ),
                     ),
                   ],

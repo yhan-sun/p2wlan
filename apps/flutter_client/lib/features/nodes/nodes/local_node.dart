@@ -83,39 +83,31 @@ class _LocalNodePanel extends StatelessWidget {
                   ),
                   const SizedBox(width: AppTokens.space10),
                   Expanded(
-                    child: Row(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Flexible(
-                          child: Text(
-                            dash(deviceName),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w700,
-                              color: theme.colorScheme.onSurface,
-                            ),
-                          ),
-                        ),
                         Text(
-                          ' · ',
+                          dash(deviceName),
                           maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
-                            fontSize: 11,
-                            color: theme.colorScheme.onSurfaceVariant,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                            color: theme.colorScheme.onSurface,
                           ),
                         ),
-                        Flexible(
-                          child: Text(
-                            dash(virtualIp),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w600,
-                              color: theme.colorScheme.onSurfaceVariant,
-                              fontFeatures: AppTokens.tabularFontFeatures,
-                            ),
+                        const SizedBox(height: 2),
+                        Text(
+                          dash(virtualIp),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: theme.colorScheme.onSurfaceVariant,
+                            fontFeatures: AppTokens.tabularFontFeatures,
+                            height: 1.15,
                           ),
                         ),
                       ],

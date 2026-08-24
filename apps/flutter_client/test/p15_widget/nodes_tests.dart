@@ -118,6 +118,10 @@ void _registerNodesTests() {
 
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('10.20.0.11'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('10.20.0.11')).dy,
+      greaterThan(tester.getTopLeft(find.text('direct-laptop')).dy),
+    );
     expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
     expect(
       tester.getSize(find.byKey(const Key('node-row-peer-direct-001'))).height,
