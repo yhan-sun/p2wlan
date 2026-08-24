@@ -59,7 +59,12 @@ void main() {
     await tester.tap(find.text('设置').last);
     await tester.pump(const Duration(milliseconds: 250));
     // Language lives inside the General category detail.
-    await tester.tap(find.text('常规'));
+    await tester.tap(
+      find.descendant(
+        of: find.byKey(const Key('settings-category-rail')),
+        matching: find.text('常规'),
+      ),
+    );
     await tester.pump(const Duration(milliseconds: 250));
     await tester.tap(find.text('简体中文').last);
     await tester.pumpAndSettle();
@@ -78,13 +83,23 @@ void main() {
     }
 
     expect(find.text('Settings'), findsWidgets);
-    // Back to the settings root, then open Developer & Diagnostics.
-    await tester.tap(find.byIcon(Icons.arrow_back_rounded));
-    await tester.pump(const Duration(milliseconds: 250));
-    expect(find.text('Developer & Diagnostics'), findsOneWidget);
-    await tester.ensureVisible(find.text('Developer & Diagnostics'));
+    // The compact desktop layout keeps the category rail mounted while the
+    // detail is open; narrower root-detail layouts expose a back button first.
+    final categoryRail = find.byKey(const Key('settings-category-rail'));
+    if (categoryRail.evaluate().isEmpty) {
+      await tester.tap(find.byIcon(Icons.arrow_back_rounded));
+      await tester.pump(const Duration(milliseconds: 250));
+    }
+    final developer = categoryRail.evaluate().isEmpty
+        ? find.text('Developer & Diagnostics')
+        : find.descendant(
+            of: categoryRail,
+            matching: find.text('Developer & Diagnostics'),
+          );
+    expect(developer, findsOneWidget);
+    await tester.ensureVisible(developer);
     await tester.pump();
-    await tester.tap(find.text('Developer & Diagnostics'));
+    await tester.tap(developer);
     await tester.pump(const Duration(milliseconds: 250));
     expect(find.text('Diagnostics URL'), findsWidgets);
   });

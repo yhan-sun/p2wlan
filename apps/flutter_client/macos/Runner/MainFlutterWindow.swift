@@ -137,7 +137,10 @@ class MainFlutterWindow: NSWindow {
     self.titlebarAppearsTransparent = true
     self.styleMask.insert(.fullSizeContentView)
     self.isMovableByWindowBackground = true
-    self.minSize = NSSize(width: 860, height: 560)
+    // Keep the two-level desktop settings layout usable at the smallest
+    // window size. The Flutter shell switches to its compact rail before
+    // this boundary, while the settings category rail remains visible.
+    self.minSize = NSSize(width: 800, height: 520)
     self.contentViewController = flutterViewController
     self.setFrame(windowFrame, display: true)
 

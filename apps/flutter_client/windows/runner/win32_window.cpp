@@ -29,8 +29,11 @@ constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme"
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
 
-constexpr int kMinWindowWidth = 860;
-constexpr int kMinWindowHeight = 560;
+// Keep the desktop settings category rail visible at the smallest supported
+// window. The Flutter shell accounts for the native frame and switches to a
+// compact global rail below this range.
+constexpr int kMinWindowWidth = 800;
+constexpr int kMinWindowHeight = 520;
 
 using EnableNonClientDpiScaling = BOOL __stdcall(HWND hwnd);
 

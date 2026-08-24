@@ -12,7 +12,11 @@ enum AppBreakpoint { compact, medium, expanded }
 
 abstract final class AppBreakpoints {
   static const compactMaxWidth = 600.0;
-  static const desktopSidebarMinWidth = 800.0;
+
+  /// Keep the labeled desktop sidebar on the smallest supported desktop
+  /// window. The native runners reserve a little space for their frame, so
+  /// this is intentionally below the native 800px minimum track width.
+  static const desktopSidebarMinWidth = 760.0;
   static const expandedMinWidth = 1024.0;
 
   static AppBreakpoint of(double width) {

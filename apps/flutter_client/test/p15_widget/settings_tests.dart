@@ -40,9 +40,13 @@ Future<void> _openCategory(WidgetTester tester, String label) async {
     await tester.tap(find.byIcon(Icons.arrow_back_rounded));
     await tester.pumpAndSettle();
   }
-  await tester.ensureVisible(find.text(label));
+  final rail = find.byKey(const Key('settings-category-rail'));
+  final category = rail.evaluate().isNotEmpty
+      ? find.descendant(of: rail, matching: find.text(label))
+      : find.text(label);
+  await tester.ensureVisible(category);
   await tester.pumpAndSettle();
-  await tester.tap(find.text(label));
+  await tester.tap(category);
   await tester.pumpAndSettle();
 }
 
@@ -180,13 +184,14 @@ void _registerSettingsTests() {
     );
     await tester.pumpAndSettle();
 
-    // Status is reported, the credential itself is never rendered.
+    // Status is reported in the Account & Network detail; the credential
+    // itself is never rendered.
+    await _openCategory(tester, 'Account & Network');
     expect(find.text('Securely saved'), findsOneWidget);
     expect(find.textContaining('secret-token'), findsNothing);
     // The token input is hidden until explicitly requested.
     expect(_settingsTextField('Auth token'), findsNothing);
 
-    await _openCategory(tester, 'Account & Network');
     await tester.tap(find.text('Change credential'));
     await tester.pump();
     final tokenField = _settingsTextField('Auth token');
@@ -495,7 +500,9 @@ void _registerSettingsTests() {
     );
     await tester.pumpAndSettle();
 
-    // The Account & Network category row summary carries the credential state.
+    // The Account & Network detail carries the credential state on the
+    // compact desktop settings layout.
+    await _openCategory(tester, 'Account & Network');
     expect(find.text('Securely saved'), findsOneWidget);
 
     await tester.runAsync(

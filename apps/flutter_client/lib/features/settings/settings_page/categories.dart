@@ -52,10 +52,12 @@ List<SettingsCategory> visibleSettingsCategories(PlatformCapabilities caps) {
   return categories;
 }
 
-/// Whether the desktop sidebar+detail layout is used. The Settings section is
-/// rendered inside the shell body, which at a full desktop window (>= ~1280px)
-/// leaves about 900+px of content width after the global sidebar — that is
-/// where the internal category rail appears.
-const _settingsSidebarBreakpoint = 880.0;
+/// Desktop keeps the category rail down to the smallest supported window. The
+/// global desktop sidebar and the settings rail are deliberately allowed to
+/// coexist in a narrow two-pane layout; individual preference rows stack when
+/// the detail column gets tight. Touch platforms retain the larger breakpoint
+/// so a tablet still gets the same full-screen category route as a phone.
+const _settingsDesktopSidebarBreakpoint = 520.0;
+const _settingsTouchSidebarBreakpoint = 880.0;
 
 enum _SettingsLayout { expanded, rootDetail }

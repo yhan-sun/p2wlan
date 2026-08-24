@@ -95,6 +95,7 @@ class _SettingsCategoryRail extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     return SizedBox(
+      key: const Key('settings-category-rail'),
       width: 176,
       child: ListView(
         padding: const EdgeInsets.symmetric(vertical: AppTokens.space6),

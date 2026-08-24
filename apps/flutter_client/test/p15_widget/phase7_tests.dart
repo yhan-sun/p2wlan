@@ -292,7 +292,7 @@ void _registerPhase7Tests() {
       addTearDown(stores.dispose);
 
       // Switch language — immediate save, no dirty bar, no guard on leave.
-      await tester.tap(find.text('General'));
+      await _openCategory(tester, 'General');
       await tester.pumpAndSettle();
       await _openAppSelect(tester, const ValueKey('settings-language-select'));
       await tester.pumpAndSettle();

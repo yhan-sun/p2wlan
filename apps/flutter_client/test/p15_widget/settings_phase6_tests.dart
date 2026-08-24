@@ -144,20 +144,17 @@ void _registerSettingsPhase6Tests() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('medium 700 and 900: category nav without double rail', (
+  testWidgets('desktop 700 and 900: category rail stays visible', (
     tester,
   ) async {
     for (final size in const [Size(700, 1000), Size(900, 1000)]) {
       final stores = await _pumpSettingsShell(tester, size);
       addTearDown(stores.dispose);
 
-      // Global medium shell: rail only, no sidebar footer.
-      expect(find.byType(AppNavRail), findsOneWidget);
-      expect(find.byType(DesktopSidebar), findsNothing);
-
-      // Settings root list (no settings mini-sidebar at medium widths).
-      expect(find.text('General'), findsOneWidget);
-      expect(find.text('Account & Network'), findsOneWidget);
+      // The global shell may be compact at 700 and full at 900, but desktop
+      // Settings keeps its own category rail at both widths.
+      expect(find.byKey(const Key('settings-category-rail')), findsOneWidget);
+      expect(find.text('Device name'), findsOneWidget);
       await tester.tap(find.text('Advanced Network'));
       await tester.pumpAndSettle();
       expect(find.text('Interface name'), findsOneWidget);
@@ -276,7 +273,7 @@ void _registerSettingsPhase6Tests() {
 
     expect(find.text('Unsaved changes'), findsNothing);
 
-    await tester.tap(find.text('General'));
+    await _openCategory(tester, 'General');
     await tester.pumpAndSettle();
     await tester.enterText(_settingsTextField('Device name'), '  pyu-mac  ');
     await tester.pump();
@@ -304,7 +301,7 @@ void _registerSettingsPhase6Tests() {
     expect(find.text('Unsaved changes'), findsOneWidget);
 
     // Switch away and back; the draft must survive (never re-created).
-    await tester.tap(find.text('General'));
+    await _openCategory(tester, 'General');
     await tester.pumpAndSettle();
     expect(find.text('Unsaved changes'), findsNothing);
     await tester.tap(find.text('Advanced Network'));
@@ -323,8 +320,7 @@ void _registerSettingsPhase6Tests() {
     final stores = await storesWith(tester, _FakeDiagnosticsApi(health: false));
     await pump(tester, stores, size: const Size(800, 1200));
 
-    await tester.tap(find.text('General'));
-    await tester.pumpAndSettle();
+    await _openCategory(tester, 'General');
 
     await _openAppSelect(tester, const ValueKey('settings-theme-select'));
     await tester.pumpAndSettle();
@@ -661,9 +657,10 @@ void _registerSettingsPhase6Tests() {
 
       await pump(tester, stores, size: const Size(800, 2400));
 
+      await _openCategory(tester, 'Account & Network');
       expect(find.text('Securely saved'), findsOneWidget);
 
-      await tester.tap(find.text('Advanced Network'));
+      await _openCategory(tester, 'Advanced Network');
       await tester.pumpAndSettle();
 
       final manualSwitch = find.byType(Switch).first;
@@ -672,9 +669,8 @@ void _registerSettingsPhase6Tests() {
       await _tapSave(tester);
       await _waitFor(tester, () => stores.settingsStore.settings.manualMode);
 
-      // Return to the settings root to check the Account credential summary.
-      await tester.tap(find.byIcon(Icons.arrow_back_rounded));
-      await tester.pumpAndSettle();
+      // Switch to Account & Network to check the credential status.
+      await _openCategory(tester, 'Account & Network');
 
       expect(find.text('Manual mode, no credential needed'), findsOneWidget);
       expect(find.text('Securely saved'), findsNothing);

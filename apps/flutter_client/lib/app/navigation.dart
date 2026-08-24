@@ -86,10 +86,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final breakpoint = AppBreakpoints.of(constraints.maxWidth);
-        // Desktop navigation is platform-aware: an 860px desktop window is
-        // still a desktop sidebar, while a 700px desktop window gets the
-        // compact icon-only sidebar. Non-desktop tablets keep the labeled rail
-        // until the regular expanded content breakpoint.
+        // Desktop navigation is platform-aware: the smallest supported
+        // desktop window still keeps the labeled sidebar, while a narrower
+        // development/test surface gets the compact icon-only sidebar.
+        // Non-desktop tablets keep the labeled rail until the regular expanded
+        // content breakpoint.
         final useDesktopSidebar =
             breakpoint == AppBreakpoint.expanded ||
             (_isDesktopShell &&

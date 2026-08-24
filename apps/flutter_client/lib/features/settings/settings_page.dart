@@ -307,7 +307,7 @@ class _SettingsPageState extends State<SettingsPage> {
 
   bool _handleBackRequest() {
     if (!mounted ||
-        _lastLayoutWidth >= _settingsSidebarBreakpoint ||
+        _lastLayoutWidth >= _settingsLayoutBreakpoint ||
         _selectedCategory == null) {
       return false;
     }
@@ -364,6 +364,10 @@ class _SettingsPageState extends State<SettingsPage> {
   List<SettingsCategory> get _visibleCategories =>
       visibleSettingsCategories(_capabilities);
 
+  double get _settingsLayoutBreakpoint => _capabilities.canUseSystemTray
+      ? _settingsDesktopSidebarBreakpoint
+      : _settingsTouchSidebarBreakpoint;
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
@@ -393,7 +397,7 @@ class _SettingsPageState extends State<SettingsPage> {
       builder: (context, constraints) {
         _lastLayoutWidth = constraints.maxWidth;
         final isNarrow = constraints.maxWidth < 520;
-        final layout = constraints.maxWidth >= _settingsSidebarBreakpoint
+        final layout = constraints.maxWidth >= _settingsLayoutBreakpoint
             ? _SettingsLayout.expanded
             : _SettingsLayout.rootDetail;
         return Padding(
