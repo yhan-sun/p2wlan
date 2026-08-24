@@ -30,7 +30,6 @@ use tray_icon::{
 
 const STATUS_URL: &str = p2wlan_desktop_host::DEFAULT_DIAGNOSTICS_STATUS_URL;
 const COPY_PEER_IP_PREFIX: &str = "copy-peer-ip:";
-const MAX_TRAY_DEVICES: usize = 12;
 const DAEMON_NAME: &str = if cfg!(windows) {
     "p2wlan-daemon.exe"
 } else {

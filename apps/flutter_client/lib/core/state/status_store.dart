@@ -22,6 +22,7 @@ class StatusStore extends ChangeNotifier {
     this.startupCatalogRefreshTimeout = defaultStartupCatalogRefreshTimeout,
     this.startupCatalogRefreshInterval = defaultStartupCatalogRefreshInterval,
     this.routeVerificationInterval = Duration.zero,
+    this.metricsUpdateInterval = defaultMetricsUpdateInterval,
   }) : daemonController =
            daemonController ??
            DaemonController(
@@ -38,6 +39,12 @@ class StatusStore extends ChangeNotifier {
   /// A near-real-time view while the app is visible, without a push protocol.
   static const defaultActivePollingInterval = Duration(seconds: 1);
   static const defaultBackgroundPollingInterval = Duration(seconds: 10);
+
+  /// Presentation metrics (RTT and transfer rate) are deliberately sampled
+  /// at this cadence even when the daemon event stream is more chatty. This
+  /// keeps the list readable and prevents a burst of peer events from
+  /// turning the UI into a high-frequency telemetry view.
+  static const defaultMetricsUpdateInterval = Duration(seconds: 1);
   static const defaultRouteVerificationInterval = Duration(seconds: 10);
   static const defaultMaxSnapshotAge = Duration(seconds: 90);
   static const defaultStartupCatalogRefreshTimeout = Duration(seconds: 6);
@@ -69,6 +76,7 @@ class StatusStore extends ChangeNotifier {
   final Duration startupCatalogRefreshTimeout;
   final Duration startupCatalogRefreshInterval;
   final Duration routeVerificationInterval;
+  final Duration metricsUpdateInterval;
 
   Timer? _timer;
   Timer? _staleTimer;
@@ -88,6 +96,7 @@ class StatusStore extends ChangeNotifier {
   var _refreshPending = false;
   var _refreshGeneration = 0;
   Future<void>? _refreshFuture;
+  Future<void>? _automaticRefreshFuture;
   String? _lastError;
   String? _lastHealthError;
   String? _lastStatusError;
@@ -96,6 +105,8 @@ class StatusStore extends ChangeNotifier {
   DaemonStartupFailureCode? _lastDaemonFailureCode;
   DateTime? _lastFetchedAt;
   DateTime? _lastSuccessfulStatusAt;
+  DateTime? _lastAutomaticRefreshAt;
+  DateTime? _lastPeerTrafficSampleAt;
   DateTime? _lastRouteVerificationAt;
   Duration? _lastRequestDuration;
   var _speedTestRunning = false;
@@ -156,6 +167,9 @@ class StatusStore extends ChangeNotifier {
       return;
     }
     _autoRefreshEnabled = enabled;
+    if (!enabled) {
+      _lastAutomaticRefreshAt = null;
+    }
     _schedulePolling();
     if (enabled) {
       _ensureEventLoop();
@@ -186,7 +200,10 @@ class StatusStore extends ChangeNotifier {
     final interval = _appInForeground
         ? autoRefreshInterval
         : backgroundRefreshInterval;
-    _timer = Timer.periodic(interval, (_) => unawaited(refresh(silent: true)));
+    _timer = Timer.periodic(
+      interval,
+      (_) => unawaited(_refreshAutomatically()),
+    );
   }
 
   void _ensureEventLoop() {
@@ -266,7 +283,7 @@ class StatusStore extends ChangeNotifier {
           eventProcessChanged ||
           hasChange) {
         final beforeRevision = current.revision;
-        await refresh(silent: true);
+        await _refreshAutomatically();
         if (_disposed || generation != _eventLoopGeneration) return;
         final refreshed = _snapshot;
         if (refreshed == null) return;
@@ -281,6 +298,50 @@ class StatusStore extends ChangeNotifier {
         }
       }
     }
+  }
+
+  /// Runs an automatic refresh at the configured foreground/background
+  /// cadence. The daemon's event stream can complete several times per
+  /// second; serialising these refreshes here keeps both the snapshot and its
+  /// derived metrics on the same predictable clock.
+  Future<void> _refreshAutomatically() {
+    final existing = _automaticRefreshFuture;
+    if (existing != null) return existing;
+
+    final future = _runAutomaticRefresh();
+    _automaticRefreshFuture = future;
+    unawaited(
+      future.then<void>(
+        (_) {
+          if (identical(_automaticRefreshFuture, future)) {
+            _automaticRefreshFuture = null;
+          }
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          if (identical(_automaticRefreshFuture, future)) {
+            _automaticRefreshFuture = null;
+          }
+        },
+      ),
+    );
+    return future;
+  }
+
+  Future<void> _runAutomaticRefresh() async {
+    final interval = _appInForeground
+        ? autoRefreshInterval
+        : backgroundRefreshInterval;
+    final last = _lastAutomaticRefreshAt;
+    if (last != null) {
+      final elapsed = DateTime.now().difference(last);
+      final remaining = interval - elapsed;
+      if (remaining > Duration.zero) {
+        await Future<void>.delayed(remaining);
+      }
+    }
+    if (_disposed || !_autoRefreshEnabled) return;
+    _lastAutomaticRefreshAt = DateTime.now();
+    await refresh(silent: true);
   }
 
   /// Refreshes the daemon snapshot. Automatic polling passes [silent] so the
@@ -311,7 +372,11 @@ class StatusStore extends ChangeNotifier {
         _refreshPending = false;
         final generation = _refreshGeneration;
         final url = settingsStore.settings.diagnosticsUrl;
-        await _refreshOnce(url, generation);
+        await _refreshOnce(
+          url,
+          generation,
+          throttleMetrics: !_showRefreshActivity,
+        );
       } while (_refreshPending);
       completer.complete();
     } catch (error, stackTrace) {
@@ -326,7 +391,11 @@ class StatusStore extends ChangeNotifier {
     }
   }
 
-  Future<void> _refreshOnce(String url, int generation) async {
+  Future<void> _refreshOnce(
+    String url,
+    int generation, {
+    required bool throttleMetrics,
+  }) async {
     final stopwatch = Stopwatch()..start();
     try {
       final health = await diagnosticsApi.fetchHealth(url);
@@ -367,7 +436,7 @@ class StatusStore extends ChangeNotifier {
           _lastFetchedAt = fetchedAt;
           return;
         }
-        _updatePeerTrafficRates(snapshot, fetchedAt);
+        _updatePeerTrafficRates(snapshot, fetchedAt, throttle: throttleMetrics);
         _snapshot = snapshot;
         if (_shouldVerifyRoutes(fetchedAt)) {
           try {
@@ -438,6 +507,7 @@ class StatusStore extends ChangeNotifier {
     _snapshotStale = false;
     _peerTrafficSamples = <String, _PeerTrafficSample>{};
     _peerTransferRatesBytesPerSecond = <String, int>{};
+    _lastPeerTrafficSampleAt = null;
     _staleTimer?.cancel();
     _staleTimer = null;
     _lastRouteVerificationAt = null;
@@ -451,8 +521,18 @@ class StatusStore extends ChangeNotifier {
 
   void _updatePeerTrafficRates(
     DiagnosticsSnapshot snapshot,
-    DateTime fetchedAt,
-  ) {
+    DateTime fetchedAt, {
+    required bool throttle,
+  }) {
+    final lastSampleAt = _lastPeerTrafficSampleAt;
+    if (throttle &&
+        lastSampleAt != null &&
+        fetchedAt.difference(lastSampleAt) < metricsUpdateInterval) {
+      // Keep the previous baseline until the next presentation tick. Using a
+      // sub-second sample here would make the calculated rate depend on event
+      // delivery jitter rather than actual traffic over a stable interval.
+      return;
+    }
     final nextSamples = <String, _PeerTrafficSample>{};
     final nextRates = <String, int>{};
     for (final peer in snapshot.peers) {
@@ -478,6 +558,7 @@ class StatusStore extends ChangeNotifier {
     }
     _peerTrafficSamples = nextSamples;
     _peerTransferRatesBytesPerSecond = nextRates;
+    _lastPeerTrafficSampleAt = fetchedAt;
   }
 
   void _markSnapshotFresh() {
@@ -712,6 +793,7 @@ class StatusStore extends ChangeNotifier {
     _eventLoopGeneration += 1;
     _timer?.cancel();
     _staleTimer?.cancel();
+    _automaticRefreshFuture = null;
     settingsStore.removeListener(_handleSettingsChanged);
     diagnosticsApi.close();
     super.dispose();

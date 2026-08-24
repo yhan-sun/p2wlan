@@ -115,7 +115,12 @@ class _PreferenceRow extends StatelessWidget {
           ),
           child: LayoutBuilder(
             builder: (context, constraints) {
-              if (constraints.maxWidth < 460) {
+              // Keep category summaries and simple controls on a shared
+              // baseline on phones. Only stack when the available content
+              // width is genuinely too small; the previous 460px cutoff made
+              // a normal 390px handset stack every value underneath its label
+              // and left the settings page visually misaligned.
+              if (constraints.maxWidth < 340) {
                 final trailingWidth = constraints.maxWidth < 220
                     ? constraints.maxWidth
                     : 220.0;
@@ -144,9 +149,11 @@ class _PreferenceRow extends StatelessWidget {
                   children: [
                     Expanded(child: labelContent),
                     const SizedBox(width: AppTokens.space12),
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: trailingContent,
+                    Flexible(
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: trailingContent,
+                      ),
                     ),
                   ],
                 );

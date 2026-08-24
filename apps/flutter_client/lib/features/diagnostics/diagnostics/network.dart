@@ -166,7 +166,9 @@ class _NetworkDiagnosticsSectionState
         _AdvancedSubsection(
           title: strings.virtualNetwork,
           trailing: StatusBadge(
-            label: running ? 'UP' : 'DOWN',
+            label: running
+                ? strings.virtualNetworkUp
+                : strings.virtualNetworkDown,
             tone: running ? StatusTone.good : StatusTone.neutral,
           ),
           rows: [
@@ -260,33 +262,52 @@ class _NetworkDiagnosticsSectionState
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (canVerify || canRepair) ...[
-            Row(
-              children: [
-                if (canVerify) ...[
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: running && !busy ? _verifyRoutes : null,
-                      icon: _verifying
-                          ? const SizedBox.square(
-                              dimension: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.check_circle_outline_rounded),
-                      label: Text(strings.checkRoutes),
-                    ),
-                  ),
-                  if (canRepair) const SizedBox(width: AppTokens.space10),
-                ],
-                if (canRepair)
-                  Expanded(
-                    child: _routeRepairButton(
-                      strings: strings,
-                      running: running,
-                      busy: busy,
-                      routeOk: routeOk,
-                    ),
-                  ),
-              ],
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final verifyButton = OutlinedButton.icon(
+                  onPressed: running && !busy ? _verifyRoutes : null,
+                  icon: _verifying
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.check_circle_outline_rounded),
+                  label: Text(strings.checkRoutes),
+                );
+                final repairButton = _routeRepairButton(
+                  strings: strings,
+                  running: running,
+                  busy: busy,
+                  routeOk: routeOk,
+                );
+
+                // Two expanded buttons become hard to read (and can overflow
+                // with large accessibility text) on a phone. Keep the
+                // desktop/tablet pair compact, but give each action a full
+                // width touch target on narrow layouts.
+                if (constraints.maxWidth < 520) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (canVerify)
+                        SizedBox(width: double.infinity, child: verifyButton),
+                      if (canVerify && canRepair)
+                        const SizedBox(height: AppTokens.space8),
+                      if (canRepair)
+                        SizedBox(width: double.infinity, child: repairButton),
+                    ],
+                  );
+                }
+
+                return Row(
+                  children: [
+                    if (canVerify) Expanded(child: verifyButton),
+                    if (canVerify && canRepair)
+                      const SizedBox(width: AppTokens.space10),
+                    if (canRepair) Expanded(child: repairButton),
+                  ],
+                );
+              },
             ),
             // Repair is never highlighted when the route is already installed.
             if (canRepair && routeOk) ...[

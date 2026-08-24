@@ -18,7 +18,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let refresh_in_flight = Arc::new(AtomicBool::new(false));
     let refresh_proxy = proxy.clone();
     thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(5));
+        // Keep the standalone tray on the same cadence as the Flutter
+        // client's foreground presentation metrics.
+        thread::sleep(Duration::from_secs(1));
         if refresh_proxy.send_event(UserEvent::Refresh).is_err() {
             break;
         }
@@ -28,7 +30,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("P2WLAN")
-        .with_title("P2WLAN")
+        // macOS menu bar items are intentionally icon-only; the tooltip still
+        // carries the accessible product/status text. Other platforms keep a
+        // short title for taskbar discoverability.
+        .with_title(if cfg!(target_os = "macos") {
+            ""
+        } else {
+            "P2WLAN"
+        })
         .with_icon(tray_icon_image(false)?)
         .with_icon_as_template(false)
         .build()?;

@@ -4,6 +4,7 @@ class PeerSnapshot {
   PeerSnapshot({
     required this.nodeId,
     required this.deviceName,
+    this.platform = '',
     required this.appVersion,
     required this.virtualIp,
     required this.endpoint,
@@ -29,6 +30,10 @@ class PeerSnapshot {
 
   final String nodeId;
   final String deviceName;
+
+  /// Platform reported by newer daemons/control-plane snapshots. Older
+  /// snapshots omit it and the UI falls back to a conservative name heuristic.
+  final String platform;
   final String appVersion;
   final String virtualIp;
   final String? endpoint;
@@ -66,6 +71,9 @@ class PeerSnapshot {
     return PeerSnapshot(
       nodeId: _string(json['node_id']),
       deviceName: _string(json['device_name']),
+      platform: _string(
+        json['platform'] ?? json['device_platform'] ?? json['os'],
+      ),
       appVersion: _string(json['app_version']),
       virtualIp: _string(json['virtual_ip']),
       endpoint: _nullableString(json['endpoint']),
@@ -240,7 +248,11 @@ class PathHealthSnapshot {
   final int? latencyMs;
   final int? rttEwmaMs;
 
-  int? get displayLatencyMs => rttEwmaMs ?? latencyMs;
+  /// The UI shows the most recent verified sample so it tracks an operator's
+  /// live ping more closely. Older daemons did not expose [latencyMs] on every
+  /// snapshot, so retain the smoothed RTT as a backwards-compatible fallback.
+  /// This is the encrypted overlay/data-path RTT, not an ICMP echo measurement.
+  int? get displayLatencyMs => latencyMs ?? rttEwmaMs;
 
   String? get visibleLastError {
     if (_isNetworkGenerationRefresh(lastErrorCode, lastError)) return null;

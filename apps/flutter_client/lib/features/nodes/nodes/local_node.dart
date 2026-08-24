@@ -76,7 +76,7 @@ class _LocalNodePanel extends StatelessWidget {
                       borderRadius: BorderRadius.circular(AppTokens.radiusSm),
                     ),
                     child: Icon(
-                      Icons.computer_rounded,
+                      localDeviceIcon(),
                       size: 17,
                       color: theme.colorScheme.primary,
                     ),
@@ -88,12 +88,16 @@ class _LocalNodePanel extends StatelessWidget {
                       children: [
                         Text(
                           dash(deviceName),
-                          maxLines: 1,
+                          // Keep long hostnames readable on phones; the
+                          // status/edit affordances already consume the
+                          // trailing space in this row.
+                          maxLines: 2,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 13.5,
                             fontWeight: FontWeight.w700,
                             color: theme.colorScheme.onSurface,
+                            height: 1.2,
                           ),
                         ),
                         const SizedBox(height: 2),

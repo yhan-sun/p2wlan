@@ -363,8 +363,8 @@ class AppStrings {
   String get deviceLeaseHealthy => isZh ? '服务端在线租约' : 'Server online lease';
   String get lastDeviceLeaseSuccess => isZh ? '上次租约刷新' : 'Last lease refresh';
   String get reauthRequired => isZh ? '需要重新认证' : 'Reauth required';
-  String get udpSockets => isZh ? 'UDP sockets' : 'UDP sockets';
-  String get socketPoolActive => isZh ? 'Socket pool 启用' : 'Socket pool active';
+  String get udpSockets => isZh ? 'UDP Socket 数' : 'UDP sockets';
+  String get socketPoolActive => isZh ? 'Socket 池状态' : 'Socket pool active';
   String get relayConnected => isZh ? '中继连接' : 'Relay connected';
   String get peerCount => isZh ? '设备数' : 'Device count';
   String get healthReason => isZh ? '健康原因' : 'Health reason';
@@ -585,10 +585,10 @@ class AppStrings {
   String get socketPoolHelper => isZh
       ? '困难 NAT 下增加受控 UDP 映射，推荐 3。'
       : 'Adds bounded UDP mappings for hard NATs; 3 is recommended.';
-  String get socketPoolOff => 'off';
-  String get socketPool2 => '2 sockets';
-  String get socketPool3 => '3 sockets';
-  String get socketPool4 => '4 sockets';
+  String get socketPoolOff => isZh ? '关闭' : 'Off';
+  String get socketPool2 => isZh ? '2 个 Socket' : '2 sockets';
+  String get socketPool3 => isZh ? '3 个 Socket' : '3 sockets';
+  String get socketPool4 => isZh ? '4 个 Socket' : '4 sockets';
   String get relayCandidates => isZh ? 'Relay 候选' : 'Relay candidates';
   String get relayCandidatesHelper => isZh
       ? '可选，逗号分隔，格式 region@ip:port 或 ip:port。'
@@ -628,7 +628,10 @@ class AppStrings {
   String get buildIdLabel => isZh ? 'Build ID' : 'Build ID';
   String get buildDirtyLabel => isZh ? 'Dirty' : 'Dirty';
   String get buildDiffHashLabel => isZh ? 'Diff hash' : 'Diff hash';
-  String get buildProfileLabel => isZh ? 'Profile' : 'Profile';
+  String get buildProfileLabel => isZh ? '构建配置' : 'Profile';
+  String get protocolProfileLabel => isZh ? '配置档' : 'Profile';
+  String get statusOk => isZh ? '正常' : 'OK';
+  String get statusWarn => isZh ? '警告' : 'WARN';
   String get restartWillApplyLater => isZh
       ? '这些设置将在相关节点下次启动时生效。'
       : 'These settings take effect the next time the relevant node starts.';
@@ -802,6 +805,8 @@ class AppStrings {
   String get startupInterface => isZh ? '启动网卡配置' : 'Startup interface';
   String get startupMtu => isZh ? '启动 MTU 配置' : 'Startup MTU';
   String get virtualAdapter => isZh ? '虚拟网卡' : 'Virtual Adapter';
+  String get virtualNetworkUp => isZh ? '正常' : 'UP';
+  String get virtualNetworkDown => isZh ? '未运行' : 'DOWN';
   String get routeUnknown => isZh ? '未知（未校验）' : 'Unknown (unverified)';
   String get routeInstalled => isZh ? '已安装' : 'Installed';
   String get routeConflict => isZh ? '冲突' : 'Conflict';

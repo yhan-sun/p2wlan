@@ -50,7 +50,10 @@ class _ProtocolMtuPanel extends StatelessWidget {
               label: strings.isZh ? '运行 MTU' : 'Runtime MTU',
               value: _value(mtu['configured_mtu']),
             ),
-            MetricTile(label: 'Profile', value: _value(mtu['profile'])),
+            MetricTile(
+              label: strings.protocolProfileLabel,
+              value: _value(mtu['profile']),
+            ),
             MetricTile(
               label: strings.isZh ? 'Relay-safe' : 'Relay-safe',
               value: _value(mtu['relay_safe_mtu']),
@@ -100,13 +103,14 @@ class _TaskRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
     final ok = task.error == null && (task.running || task.finished);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
       child: LayoutBuilder(
         builder: (context, constraints) {
           final badge = StatusBadge(
-            label: ok ? 'OK' : 'WARN',
+            label: ok ? strings.statusOk : strings.statusWarn,
             tone: ok ? StatusTone.good : StatusTone.warn,
           );
           final name = Text(

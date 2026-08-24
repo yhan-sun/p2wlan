@@ -139,12 +139,22 @@ class _MenuButton<T> extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final colors = P2WlanColors.of(context);
     return PopupMenuButton<T>(
       key: buttonKey,
       tooltip: tooltip,
       initialValue: initialValue,
       onSelected: onSelected,
       itemBuilder: itemBuilder,
+      color: colors.surfaceElevated,
+      surfaceTintColor: Colors.transparent,
+      shadowColor: const Color(0x240F172A),
+      elevation: 10,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+        side: BorderSide(color: colors.border),
+      ),
       child: MouseRegion(
         cursor: SystemMouseCursors.click,
         child: Padding(

@@ -98,10 +98,17 @@ class _RowContent extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (compact) {
+      return _CompactRowContent(
+        peer: peer,
+        speedBytesPerSecond: speedBytesPerSecond,
+        strings: strings,
+      );
+    }
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        _StatusDot(peer: peer, strings: strings),
+        _PeerLeading(peer: peer, strings: strings),
         const SizedBox(width: AppTokens.space10),
         Expanded(
           child: _PeerPrimaryText(peer: peer, strings: strings),
@@ -143,6 +150,82 @@ class _RowContent extends StatelessWidget {
   }
 }
 
+/// Phone layout for a peer row. The identity owns the first line so long
+/// device names are not squeezed into the narrow gap left by three metrics.
+/// Metrics form a compact right-aligned cluster underneath instead of having
+/// desktop-sized empty columns between speed and RTT.
+class _CompactRowContent extends StatelessWidget {
+  const _CompactRowContent({
+    required this.peer,
+    required this.speedBytesPerSecond,
+    required this.strings,
+  });
+
+  final PeerSnapshot peer;
+  final int? speedBytesPerSecond;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final statusLabel = _rowPathLabel(strings, peer);
+    final statusColor = _rowStatusColor(context, peer);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _PeerLeading(peer: peer, strings: strings),
+            const SizedBox(width: AppTokens.space10),
+            Expanded(
+              child: _PeerPrimaryText(
+                peer: peer,
+                strings: strings,
+                maxNameLines: 2,
+              ),
+            ),
+            const SizedBox(width: AppTokens.space8),
+            Icon(
+              Icons.chevron_right_rounded,
+              size: 20,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ],
+        ),
+        Padding(
+          padding: const EdgeInsets.only(left: 42, top: AppTokens.space4),
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _PeerMetricText(
+                  value: formatTransferRate(speedBytesPerSecond),
+                  width: 54,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 6),
+                _PeerMetricText(
+                  value: formatLatency(peer.latencyMs),
+                  width: 44,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+                const SizedBox(width: 6),
+                _PeerMetricText(
+                  value: statusLabel,
+                  width: 54,
+                  color: statusColor,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _PeerMetricText extends StatelessWidget {
   const _PeerMetricText({
     required this.value,
@@ -175,22 +258,53 @@ class _PeerMetricText extends StatelessWidget {
   }
 }
 
-class _StatusDot extends StatelessWidget {
-  const _StatusDot({required this.peer, required this.strings});
+class _PeerLeading extends StatelessWidget {
+  const _PeerLeading({required this.peer, required this.strings});
 
   final PeerSnapshot peer;
   final AppStrings strings;
 
   @override
   Widget build(BuildContext context) {
+    final colors = P2WlanColors.of(context);
+    final theme = Theme.of(context);
+    final statusColor = _rowStatusColor(context, peer);
     return Semantics(
       label: _rowPathLabel(strings, peer),
-      child: Container(
-        width: 8,
-        height: 8,
-        decoration: BoxDecoration(
-          color: _rowStatusColor(context, peer),
-          shape: BoxShape.circle,
+      child: SizedBox(
+        width: 32,
+        height: 32,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: colors.selectedSurface,
+                borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+              ),
+              child: SizedBox.expand(
+                child: Icon(
+                  key: Key('node-device-icon-${peer.nodeId}'),
+                  peerDeviceIcon(peer),
+                  size: 17,
+                  color: theme.colorScheme.primary,
+                ),
+              ),
+            ),
+            Positioned(
+              right: -1,
+              bottom: -1,
+              child: Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(
+                  color: statusColor,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: colors.surface, width: 1.5),
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -198,10 +312,15 @@ class _StatusDot extends StatelessWidget {
 }
 
 class _PeerPrimaryText extends StatelessWidget {
-  const _PeerPrimaryText({required this.peer, required this.strings});
+  const _PeerPrimaryText({
+    required this.peer,
+    required this.strings,
+    this.maxNameLines = 1,
+  });
 
   final PeerSnapshot peer;
   final AppStrings strings;
+  final int maxNameLines;
 
   @override
   Widget build(BuildContext context) {
@@ -215,7 +334,7 @@ class _PeerPrimaryText extends StatelessWidget {
             Flexible(
               child: Text(
                 dash(peer.displayName),
-                maxLines: 1,
+                maxLines: maxNameLines,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
                   fontSize: 13.5,

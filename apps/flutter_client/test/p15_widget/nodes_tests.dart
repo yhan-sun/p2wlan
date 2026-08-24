@@ -170,14 +170,14 @@ void _registerNodesTests() {
     expect(find.text('relay-nas'), findsOneWidget);
     // The cover keeps the useful path and latency visible.
     expect(find.text('Relay'), findsOneWidget);
-    expect(find.text('52 ms'), findsOneWidget);
+    expect(find.text('58 ms'), findsOneWidget);
     expect(find.text('25 ms'), findsNothing);
 
     await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
     await tester.pumpAndSettle();
     expect(find.byType(Dialog), findsOneWidget);
     expect(
-      find.descendant(of: find.byType(Dialog), matching: find.text('52 ms')),
+      find.descendant(of: find.byType(Dialog), matching: find.text('58 ms')),
       findsOneWidget,
     );
     expect(tester.takeException(), isNull);

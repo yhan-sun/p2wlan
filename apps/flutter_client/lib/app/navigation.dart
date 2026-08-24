@@ -5,9 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../app/app_strings.dart';
+import '../app/app_tokens.dart';
 import '../app/navigation_model.dart';
 import '../app/p2wlan_colors.dart';
 import '../core/capabilities/platform_capabilities.dart';
+import '../core/models/diagnostics_models.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../features/dashboard/dashboard_page.dart';
@@ -45,6 +47,11 @@ class _P2WlanShellState extends State<P2WlanShell> {
   static const _sectionFadeDuration = Duration(milliseconds: 150);
 
   var _section = P2WlanSection.home;
+
+  /// Home previews hand the selected peer to the Devices page. Keeping only
+  /// the id avoids passing a stale snapshot while the list is mounting; the
+  /// list resolves the newest peer and opens its own full detail surface.
+  String? _pendingPeerId;
 
   /// Last primary (bottom-bar) section, kept so the mobile bar keeps a valid
   /// selection while a secondary section (troubleshooting) is open — no fake
@@ -203,12 +210,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
         showHeader: false,
         capabilities: widget.capabilities,
         onOpenDevices: () => _select(P2WlanSection.devices),
-        onOpenPeer: (peer) => showPeerDetailsSurface(
-          context,
-          peer,
-          statusStore: widget.statusStore,
-          capabilities: widget.capabilities,
-        ),
+        onOpenPeer: _openPeerFromHome,
         onOpenTroubleshooting: () => _select(P2WlanSection.troubleshooting),
       ),
       P2WlanSection.devices => NodesPage(
@@ -216,6 +218,8 @@ class _P2WlanShellState extends State<P2WlanShell> {
         statusStore: widget.statusStore,
         showHeader: showPageHeader,
         capabilities: widget.capabilities,
+        initialPeerId: _pendingPeerId,
+        onInitialPeerOpened: _consumePendingPeer,
       ),
       P2WlanSection.troubleshooting => DiagnosticsPage(
         settingsStore: widget.settingsStore,
@@ -268,6 +272,20 @@ class _P2WlanShellState extends State<P2WlanShell> {
         _lastPrimarySection = section;
       }
     });
+  }
+
+  void _openPeerFromHome(PeerSnapshot peer) {
+    if (!mounted) return;
+    setState(() {
+      _pendingPeerId = peer.nodeId;
+      _section = P2WlanSection.devices;
+      _lastPrimarySection = P2WlanSection.devices;
+    });
+  }
+
+  void _consumePendingPeer() {
+    if (!mounted || _pendingPeerId == null) return;
+    setState(() => _pendingPeerId = null);
   }
 
   void _handleSystemBack() {
@@ -379,6 +397,15 @@ class _MobileShellMenu extends StatelessWidget {
     return PopupMenuButton<_MobileMenuAction>(
       icon: const Icon(Icons.more_horiz_rounded),
       tooltip: strings.menu,
+      color: P2WlanColors.of(context).surfaceElevated,
+      surfaceTintColor: Colors.transparent,
+      shadowColor: const Color(0x240F172A),
+      elevation: 10,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppTokens.radiusLg),
+        side: BorderSide(color: P2WlanColors.of(context).border),
+      ),
       onSelected: (action) => switch (action) {
         _MobileMenuAction.troubleshooting => onOpenTroubleshooting(),
         _MobileMenuAction.refresh => statusStore.refresh(),

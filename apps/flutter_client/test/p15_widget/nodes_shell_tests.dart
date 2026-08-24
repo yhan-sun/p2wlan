@@ -172,4 +172,28 @@ void _registerNodesShellTests() {
     expect(find.byType(P2WlanShell), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('mobile Home preview reuses the Devices detail flow', (
+    tester,
+  ) async {
+    await pumpShell(
+      tester,
+      const Size(390, 844),
+      capabilities: PlatformCapabilities.fromPlatform('android'),
+    );
+
+    await tester.tap(find.byKey(const Key('home-device-row-peer-direct-001')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
+    expect(
+      find.byKey(const Key('node-detail-speedtest-peer-direct-001')),
+      findsOneWidget,
+    );
+    // The full-screen detail is a route above the shell; the shell navigation
+    // bar is restored when the system back action pops this route.
+    await tester.binding.handlePopRoute();
+    await tester.pumpAndSettle();
+    expect(find.byType(NavigationBar), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }
