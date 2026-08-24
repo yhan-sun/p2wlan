@@ -15,9 +15,11 @@ import 'app_constants.dart';
 import 'app_strings.dart';
 import 'desktop_window_operations.dart';
 
-/// The native Windows tray plug-in dispatches its click notifications through
-/// the `MouseDown` listener callbacks. Other desktop implementations retain
-/// the established `MouseUp` menu behavior.
+/// Windows tray events have used both `MouseDown` and `MouseUp` callback names
+/// across tray_manager builds (the native message is a button-up notification
+/// in the current plug-in). The controller accepts either left-click callback
+/// and de-duplicates the pair; other desktop implementations retain the
+/// established mouse-up context menu behavior.
 enum DesktopTrayPointerAction { showWindow, contextMenu }
 
 class DesktopTrayController with TrayListener, WindowListener {
@@ -52,6 +54,8 @@ class DesktopTrayController with TrayListener, WindowListener {
   String? _lastDesktopTitle;
   String? _lastDockBadge;
   Future<DaemonCommandResult>? _stopDaemonFuture;
+  Timer? _windowsLeftClickDedupeTimer;
+  var _windowsLeftClickHandled = false;
 
   static bool get isSupported {
     return !kIsWeb &&
@@ -84,6 +88,9 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void> dispose() async {
     if (!_initialized) return;
     _initialized = false;
+    _windowsLeftClickDedupeTimer?.cancel();
+    _windowsLeftClickDedupeTimer = null;
+    _windowsLeftClickHandled = false;
     _menuUpdateRequested = false;
     settingsStore.removeListener(_scheduleMenuUpdate);
     statusStore.removeListener(_scheduleMenuUpdate);
@@ -142,11 +149,27 @@ class DesktopTrayController with TrayListener, WindowListener {
     required bool mouseDown,
     required bool rightButton,
   }) {
-    switch (trayPointerActionForTesting(
+    final action = trayPointerActionForTesting(
       isWindows: Platform.isWindows,
       mouseDown: mouseDown,
       rightButton: rightButton,
-    )) {
+    );
+    if (Platform.isWindows && action == DesktopTrayPointerAction.showWindow) {
+      // Some tray_manager Windows builds deliver a left click through both
+      // callback names. Accept either one, but only restore the window once.
+      if (_windowsLeftClickHandled) return;
+      _windowsLeftClickHandled = true;
+      _windowsLeftClickDedupeTimer?.cancel();
+      _windowsLeftClickDedupeTimer = Timer(
+        const Duration(milliseconds: 200),
+        () {
+          _windowsLeftClickHandled = false;
+          _windowsLeftClickDedupeTimer = null;
+        },
+      );
+    }
+
+    switch (action) {
       case DesktopTrayPointerAction.showWindow:
         unawaited(_showWindow());
         break;
@@ -160,10 +183,10 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   /// Maps a native tray notification to one application action.
   ///
-  /// On Windows, tray_manager 0.5.x sends the callbacks named `MouseDown`
-  /// from the Windows native handler even though the underlying message is a
-  /// button-up notification. Handling only that side avoids a second menu
-  /// after upgrading or changing the native plug-in implementation.
+  /// On Windows, a left click is a show-window action regardless of whether
+  /// the native plug-in reports it as mouse-down or mouse-up. Right-click is
+  /// intentionally handled on the down callback only, so a native click does
+  /// not open the context menu twice.
   @visibleForTesting
   static DesktopTrayPointerAction? trayPointerActionForTesting({
     required bool isWindows,
@@ -171,10 +194,10 @@ class DesktopTrayController with TrayListener, WindowListener {
     required bool rightButton,
   }) {
     if (isWindows) {
-      if (!mouseDown) return null;
-      return rightButton
-          ? DesktopTrayPointerAction.contextMenu
-          : DesktopTrayPointerAction.showWindow;
+      if (rightButton) {
+        return mouseDown ? DesktopTrayPointerAction.contextMenu : null;
+      }
+      return DesktopTrayPointerAction.showWindow;
     }
     return mouseDown ? null : DesktopTrayPointerAction.contextMenu;
   }
