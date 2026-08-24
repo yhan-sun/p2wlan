@@ -30,6 +30,9 @@ void main() {
     expect(snapshot.udpLocalAddr, '192.0.2.10:60207');
     expect(snapshot.health.status, 'healthy');
     expect(snapshot.health.controlConnected, isTrue);
+    expect(snapshot.health.controlApiReachable, isTrue);
+    expect(snapshot.health.deviceLeaseHealthy, isTrue);
+    expect(snapshot.health.lastDeviceLeaseSuccessSecsAgo, 1);
     expect(snapshot.relayConnected, isTrue);
     expect(snapshot.relaySelection.selectedRegion, 'cn-east');
     expect(snapshot.relaySelection.selectedEndpoint, '203.0.113.10:18081');
@@ -68,6 +71,16 @@ void main() {
     expect(relayPeer.connectionType, 'relay');
     expect(relayPeer.latencyMs, 43);
     expect(relayPeer.lastError, 'direct probe timed out');
+  });
+
+  test('old health snapshots inherit the composite control state', () {
+    final health = HealthSnapshot.fromJson({
+      'status': 'healthy',
+      'control_connected': true,
+    });
+
+    expect(health.controlApiReachable, isTrue);
+    expect(health.deviceLeaseHealthy, isTrue);
   });
 
   test('classifies NAT traversal types from mapping and filtering', () {
@@ -176,7 +189,7 @@ void main() {
     },
   );
 
-  test('relay peer latency falls back to remote relay RTT', () {
+  test('remote relay RTT is not presented as local peer RTT', () {
     final peer = PeerSnapshot.fromJson({
       'node_id': 'relay-peer',
       'device_name': 'relay-device',
@@ -193,7 +206,24 @@ void main() {
       'relay': <String, dynamic>{},
     });
 
-    expect(peer.latencyMs, 38);
+    expect(peer.latencyMs, isNull);
+  });
+
+  test('online peer without a verified path remains probing, not offline', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'online-pending-peer',
+      'device_name': 'pending-device',
+      'virtual_ip': '10.20.0.51',
+      'online': true,
+      'state': 'idle',
+      'active_path': null,
+      'direct': <String, dynamic>{},
+      'relay': <String, dynamic>{},
+    });
+
+    expect(peer.path, 'probing');
+    expect(peer.connectionType, 'probing');
+    expect(peer.latencyMs, isNull);
   });
 
   test('network generation refresh is not surfaced as peer error', () {
@@ -291,6 +321,38 @@ void main() {
     expect(peer.path, 'offline');
     expect(peer.connectionType, 'offline');
     expect(peer.latencyMs, isNull);
+  });
+
+  test('missing online lifecycle evidence fails closed', () {
+    for (final fixture in <Map<String, dynamic>>[
+      {
+        'state': 'direct',
+        'active_path': 'direct',
+        'direct_type': 'public_udp',
+        'direct': {'latency_ms': 7},
+        'relay': <String, dynamic>{},
+      },
+      {
+        'state': 'relay',
+        'active_path': 'relay',
+        'direct_type': 'relay',
+        'relay_confirmed_endpoint': 'relay.test:443',
+        'relay_confirmed_generation': 2,
+        'direct': <String, dynamic>{},
+        'relay': {'latency_ms': 19},
+      },
+    ]) {
+      final peer = PeerSnapshot.fromJson({
+        'node_id': 'partial-peer',
+        'device_name': 'partial',
+        'virtual_ip': '10.20.0.60',
+        ...fixture,
+      });
+      expect(peer.online, isFalse);
+      expect(peer.path, 'offline');
+      expect(peer.connectionType, 'offline');
+      expect(peer.latencyMs, isNull);
+    }
   });
 
   test('candidate probe RTT is never displayed as connection latency', () {

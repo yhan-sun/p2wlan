@@ -47,8 +47,6 @@ pub(crate) struct RelayNotFoundGraceState {
     pub event_recorded: bool,
 }
 
-
-
 /// Base quarantine duration for a stale/404 peer.
 pub(crate) const STALE_PEER_QUARANTINE_BASE: Duration = Duration::from_secs(60);
 /// Long-term cap for the quarantine backoff.
@@ -105,9 +103,17 @@ impl PeerManager {
         // keeping the old grace would let a later stale relay error mutate the
         // new incarnation's state.
         self.clear_relay_not_found_grace(peer_id).await;
+        // This is the quarantine lifecycle transaction.  Every authoritative
+        // publisher (quarantine, unquarantine, PeerLeft) takes the epoch first,
+        // then updates metadata and the synchronous deadline mirror.  Keep the
+        // guard through cancellation and relay-state revocation so an
+        // unquarantine cannot publish between the isolation flag and cleanup.
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
         let now = Instant::now();
         let mut fresh = false;
         let backoff;
+        let until;
         {
             let mut quarantined = self.quarantined_peers.lock().await;
             let state = quarantined
@@ -123,15 +129,22 @@ impl PeerManager {
                 .checked_mul(1_u32 << exponent)
                 .unwrap_or(STALE_PEER_QUARANTINE_MAX)
                 .min(STALE_PEER_QUARANTINE_MAX);
-            state.until = Some(now + backoff);
+            until = now + backoff;
+            state.until = Some(until);
             state.last_peer_not_found_at = Some(now);
             state.reason = Some(reason.to_string());
         }
+        self.quarantine_deadline_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(peer_id.to_string(), until);
 
         // Cancel the recovery plan and the fresh-mapping state; the network
         // generation is deliberately untouched.
-        self.recovery_epoch_end(peer_id, "stale_peer_quarantined").await;
-        self.clear_fresh_mapping(peer_id, "stale_peer_quarantined").await;
+        self.recovery_epoch_end(peer_id, "stale_peer_quarantined")
+            .await;
+        self.clear_fresh_mapping(peer_id, "stale_peer_quarantined")
+            .await;
         // Drop the forced-relay expectation together with the quarantined
         // recovery state.  This makes quarantine a terminal boundary for the
         // old relay registration: a late ACK has no token to consume, and a
@@ -154,37 +167,38 @@ impl PeerManager {
         // the peer's RelayPeerConfirmed: the peer is not registered on the
         // relay, so a future relay path needs a fresh forced-probe
         // confirmation.  Direct stays authoritative.
-        let _relay_confirm_revoked = {
-            let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
+        {
             let mut conns = self.connections.write().await;
-            match conns.get_mut(peer_id) {
-                Some(conn) if conn.relay_confirmed_at.is_some() => {
-                    conn.relay_confirmed_at = None;
-                    conn.relay_confirmed_generation = None;
-                    conn.relay_confirmed_endpoint = None;
-                    conn.relay_confirmed_connection_id = None;
-                    conn.relay_first.gate_generation = None;
-                    conn.relay_first.gate_started_at = None;
-                    conn.relay_first.business_sent_generation = None;
-                    conn.relay_first.business_received_generation = None;
-                    conn.relay_first.business_exchange_generation = None;
-                    conn.relay_first.business_pathcommit_generation = None;
-                    conn.relay_first.preconfirmation = None;
-                    conn.relay_ready_generation = None;
-                    conn.relay_ready_at = None;
-                    conn.relay_ready_endpoint = None;
-                    conn.relay_ready_connection_id = None;
+            if let Some(conn) = conns.get_mut(peer_id) {
+                let relay_confirmed = conn.relay_confirmed_at.is_some();
+                // Clear readiness even when no probe ACK ever confirmed it.
+                // Otherwise a transport published immediately before the
+                // quarantine boundary survives as a stale READY incarnation.
+                conn.relay_confirmed_at = None;
+                conn.relay_confirmed_generation = None;
+                conn.relay_confirmed_endpoint = None;
+                conn.relay_confirmed_connection_id = None;
+                conn.relay_first.gate_generation = None;
+                conn.relay_first.gate_started_at = None;
+                conn.relay_first.business_sent_generation = None;
+                conn.relay_first.business_received_generation = None;
+                conn.relay_first.business_exchange_generation = None;
+                conn.relay_first.business_pathcommit_generation = None;
+                conn.relay_first.preconfirmation = None;
+                conn.relay_ready_generation = None;
+                conn.relay_ready_at = None;
+                conn.relay_ready_endpoint = None;
+                conn.relay_ready_connection_id = None;
+                if relay_confirmed {
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                     if conn.state == ConnectionState::Relay {
                         conn.transition(ConnectionState::FallbackToRelay);
                     }
                     self.bump_relay_confirm_seq(peer_id);
-                    true
                 }
-                _ => false,
             }
-        };
+        }
+        drop(_epoch_guard);
         if fresh {
             let consecutive = self.quarantine_consecutive(peer_id).await;
             info!(
@@ -226,11 +240,33 @@ impl PeerManager {
     /// Re-open recovery for a quarantined peer on authoritative control-plane
     /// evidence (new online state, endpoint, incarnation or offer).
     pub(crate) async fn unquarantine_peer(&self, peer_id: &str, reason: &str) {
+        let epoch_gate = self.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        self.unquarantine_peer_in_epoch(&epoch_guard, peer_id, reason)
+            .await;
+    }
+
+    /// Clear quarantine while the caller already owns the network-epoch
+    /// transaction. Authenticated UDP adoption uses this variant so endpoint
+    /// learning can remain atomic with its lifecycle check without trying to
+    /// acquire the non-reentrant epoch mutex a second time.
+    pub(crate) async fn unquarantine_peer_in_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        peer_id: &str,
+        reason: &str,
+    ) {
         let removed = {
             let mut quarantined = self.quarantined_peers.lock().await;
             quarantined.remove(peer_id).is_some()
         };
-        if removed {
+        let mirror_removed = self
+            .quarantine_deadline_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(peer_id)
+            .is_some();
+        if removed || mirror_removed {
             info!(
                 event = "stale_peer_unquarantined",
                 peer_id = %peer_id,
@@ -245,7 +281,9 @@ impl PeerManager {
                 None,
                 None,
                 None,
-                format!("peer recovery re-opened by authoritative control-plane evidence: {reason}"),
+                format!(
+                    "peer recovery re-opened by authoritative control-plane evidence: {reason}"
+                ),
             )
             .await;
         }
@@ -260,25 +298,28 @@ impl PeerManager {
     /// must not keep receiving probe attempts or be re-confirmed by a late
     /// ACK from the old registration.
     pub(crate) async fn peer_quarantined(&self, peer_id: &str) -> bool {
-        let now = Instant::now();
-        self.quarantined_peers
-            .lock()
-            .await
-            .get(peer_id)
-            .is_some_and(|state| state.until.is_some_and(|until| now < until))
+        self.peer_quarantined_sync(peer_id)
     }
 
-    /// Lock-free quarantine check for paths that already hold other locks.
+    /// No-await authoritative quarantine check for dataplane admission paths.
+    ///
+    /// This deliberately uses a blocking standard mutex for a tiny map lookup
+    /// instead of `tokio::Mutex::try_lock`: contention must wait briefly, not
+    /// manufacture a false "not quarantined" verdict.
     pub(crate) fn peer_quarantined_sync(&self, peer_id: &str) -> bool {
         let now = Instant::now();
-        self.quarantined_peers
-            .try_lock()
-            .map(|quarantined| {
-                quarantined
-                    .get(peer_id)
-                    .is_some_and(|state| state.until.is_some_and(|until| now < until))
-            })
-            .unwrap_or(false)
+        let mut deadlines = self
+            .quarantine_deadline_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match deadlines.get(peer_id).copied() {
+            Some(until) if now < until => true,
+            Some(_) => {
+                deadlines.remove(peer_id);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Consecutive quarantine episodes for a peer (0 when none).
@@ -294,10 +335,7 @@ impl PeerManager {
     /// Register the hook used to cancel an active punch session when a peer
     /// is quarantined.  The daemon registers its `PunchAttemptDeduplicator`
     /// here once at startup.
-    pub(crate) fn set_punch_cancel_hook(
-        &self,
-        hook: Arc<dyn Fn(&str) + Send + Sync>,
-    ) {
+    pub(crate) fn set_punch_cancel_hook(&self, hook: Arc<dyn Fn(&str) + Send + Sync>) {
         *self
             .punch_cancel_hook
             .lock()
@@ -334,7 +372,5 @@ impl PeerManager {
 }
 
 /// Internal helper type alias to keep the struct field declaration compact.
-pub(crate) type PunchCancelHook =
-    Arc<dyn Fn(&str) + Send + Sync>;
-pub(crate) type PunchCancelHookSlot =
-    Arc<std::sync::Mutex<Option<PunchCancelHook>>>;
+pub(crate) type PunchCancelHook = Arc<dyn Fn(&str) + Send + Sync>;
+pub(crate) type PunchCancelHookSlot = Arc<std::sync::Mutex<Option<PunchCancelHook>>>;

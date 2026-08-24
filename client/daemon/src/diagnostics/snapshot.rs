@@ -16,30 +16,48 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     let mut relay_selection = context.relay_selection.read().await.clone();
     relay_selection.refresh_runtime_ages();
 
-    let peers = context
-        .peers
-        .diagnostics_with_path_selection(
-            context.config.relay.prefer_direct,
-            relay_connected,
-            direct_retry_after,
-            udp_local_endpoint,
-        )
-        .await;
+    let stable_peers = capture_stable_peer_snapshot(
+        &context,
+        relay_connected,
+        direct_retry_after,
+        udp_local_endpoint,
+    )
+    .await;
+    let cached_peer_count = stable_peers.cached_peer_count;
+    let peers = stable_peers.peers;
     let mut stats = PeerManagerStats::from_diagnostics(&peers);
+    debug_assert_eq!(stats.total_peers, cached_peer_count);
     let outbound_loss = context.peers.outbound_loss_stats().await;
     stats.outbound_drops = outbound_loss.drops;
     stats.outbound_send_failures = outbound_loss.send_failures;
     stats.outbound_loss_events = outbound_loss.events;
     let candidate_snapshot = context.candidate_snapshot.read().await.clone();
-    let (local_candidates, candidate_snapshot_version, candidate_snapshot_hash) = candidate_snapshot
-        .map(|snapshot| (snapshot.candidates, Some(snapshot.version), Some(snapshot.hash)))
-        .unwrap_or_else(|| (Vec::new(), None, None));
-    let network_generation = context.peers.current_network_generation_sync();
+    let (local_candidates, candidate_snapshot_version, candidate_snapshot_hash) =
+        candidate_snapshot
+            .map(|snapshot| {
+                (
+                    snapshot.candidates,
+                    Some(snapshot.version),
+                    Some(snapshot.hash),
+                )
+            })
+            .unwrap_or_else(|| (Vec::new(), None, None));
+    // This generation was fenced by the same double-read as `peers`. Reading
+    // it again here could pair old peer data with a newly advanced generation.
+    let network_generation = stable_peers.network_generation;
     let nat_profile = context.nat_profile.read().await.clone();
     let nat_capabilities = nat_profile.as_ref().map(|profile| {
         NatCapabilities::from_profile(profile)
             .with_profile_generation(context.peers.current_local_profile_generation_sync())
     });
+    let gateway_mapping = context.gateway_mapping.read().await.clone();
+    let traversal_history = context.peers.traversal_history_diagnostics().await;
+    let uptime_ms = context.timeline.uptime_ms();
+    let peer_snapshot_age_ms = stable_peers
+        .captured_at
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
 
     DiagnosticsSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -49,13 +67,19 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         network_id: context.config.network.network_id.clone(),
         network_generation,
         network_hint: NetworkHint::Unknown,
-        uptime_ms: context.timeline.uptime_ms(),
-        revision: context.status_events.current_seq(),
+        uptime_ms,
+        revision: stable_peers.capture_revision,
+        captured_revision: stable_peers.capture_revision,
+        captured_at_ms: stable_peers.captured_at_ms,
+        peer_snapshot_stale: false,
+        peer_snapshot_age_ms,
+        peer_snapshot_shape: stable_peers.shape,
         ready_phase: derive_ready_phase(
             &health_snap,
             relay_connected,
             &peers,
             &context.config.network.virtual_ip,
+            context.config.network.manual,
         )
         .to_string(),
         protocol: ProtocolDiagnostics::current(),
@@ -72,7 +96,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         candidate_snapshot_hash,
         nat_profile,
         nat_capabilities,
-        gateway_mapping: context.gateway_mapping.read().await.clone(),
+        gateway_mapping,
         relay_servers: context.config.relay.servers.clone(),
         relay_connected,
         relay_selection,
@@ -81,11 +105,224 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
             context.config.control.proxy_mode,
         ),
         connection_timeline: context.timeline.snapshot(),
-        traversal_history: context.peers.traversal_history_diagnostics().await,
+        traversal_history,
         peers,
         stats,
         health: health_snap,
     }
+}
+
+struct StablePeerSnapshot {
+    peers: Vec<PeerDiagnostics>,
+    cached_peer_count: usize,
+    network_generation: u64,
+    capture_revision: u64,
+    captured_at_ms: u64,
+    captured_at: std::time::Instant,
+    shape: String,
+}
+
+/// Build a peer array without using PeerManager's best-effort full-diagnostics
+/// cache. Each peer-scoped read is live-only (`try_read` returns None under
+/// contention), and the event revision plus a second connection-state shape
+/// are checked before accepting the capture. The outer `/status` timeout turns
+/// sustained contention into a 503 rather than old peers carrying a new
+/// revision.
+async fn capture_stable_peer_snapshot(
+    context: &DiagnosticsContext,
+    relay_connected: bool,
+    direct_retry_after: Duration,
+    udp_local_endpoint: Option<std::net::SocketAddr>,
+) -> StablePeerSnapshot {
+    loop {
+        let revision_before = context.status_events.current_seq();
+        let generation_before = context.peers.current_network_generation_sync();
+        let mut node_ids: Vec<_> = context
+            .peers
+            .all_connections()
+            .await
+            .into_iter()
+            .map(|connection| connection.node_id)
+            .collect();
+        node_ids.sort();
+
+        let mut peers = Vec::with_capacity(node_ids.len());
+        let mut retry = false;
+        for node_id in &node_ids {
+            match context
+                .peers
+                .diagnostic_with_path_selection(
+                    node_id,
+                    context.config.relay.prefer_direct,
+                    relay_connected,
+                    direct_retry_after,
+                    udp_local_endpoint,
+                )
+                .await
+            {
+                Some((generation, peer)) if generation == generation_before => peers.push(peer),
+                _ => {
+                    retry = true;
+                    break;
+                }
+            }
+        }
+        if retry {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+
+        let live_after = context.peers.all_connections().await;
+        let revision_after = context.status_events.current_seq();
+        let generation_after = context.peers.current_network_generation_sync();
+        if revision_before != revision_after
+            || generation_before != generation_after
+            || !peer_snapshot_core_matches(&peers, &live_after)
+        {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        let captured_at_ms = context.timeline.uptime_ms();
+        let shape = peer_snapshot_shape(&peers);
+        let cached = CachedPeerSnapshot {
+            peers: peers.clone(),
+            capture_revision: revision_after,
+            captured_at: std::time::Instant::now(),
+            captured_at_ms,
+            shape: shape.clone(),
+        };
+        let capture_revision = cached.capture_revision;
+        let captured_at_ms = cached.captured_at_ms;
+        let captured_at = cached.captured_at;
+        let shape = cached.shape.clone();
+        let cached_peer_count = cached.peers.len();
+        *context
+            .peer_snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cached);
+        return StablePeerSnapshot {
+            peers,
+            cached_peer_count,
+            network_generation: generation_after,
+            capture_revision,
+            captured_at_ms,
+            captured_at,
+            shape,
+        };
+    }
+}
+
+fn peer_snapshot_shape(peers: &[PeerDiagnostics]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let encoded = serde_json::to_vec(peers).unwrap_or_default();
+    format!("v1:{}", hex::encode(Sha256::digest(encoded)))
+}
+
+/// Compare every peer field that can change the rendered liveness/path/latency
+/// result. Age counters are deliberately excluded: they advance between two
+/// otherwise atomic reads and do not represent a state transition.
+fn peer_snapshot_core_matches(
+    peers: &[PeerDiagnostics],
+    connections: &[crate::peer::PeerConnection],
+) -> bool {
+    use std::hash::{Hash, Hasher};
+
+    fn hash_diagnostics(peers: &[PeerDiagnostics]) -> u64 {
+        let mut sorted: Vec<_> = peers.iter().collect();
+        sorted.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for peer in sorted {
+            peer.node_id.hash(&mut hasher);
+            peer.device_name.hash(&mut hasher);
+            peer.app_version.hash(&mut hasher);
+            peer.virtual_ip.hash(&mut hasher);
+            peer.endpoint.hash(&mut hasher);
+            peer.nat_type.hash(&mut hasher);
+            peer.online.hash(&mut hasher);
+            peer.last_seen.hash(&mut hasher);
+            peer.remote_relay_latency_ms.hash(&mut hasher);
+            format!("{:?}", peer.state).hash(&mut hasher);
+            peer.probe_session_id.hash(&mut hasher);
+            peer.relay_server.hash(&mut hasher);
+            peer.candidates.hash(&mut hasher);
+            peer.direct.latency_ms.hash(&mut hasher);
+            peer.direct.rtt_ewma_ms.hash(&mut hasher);
+            peer.direct.jitter_ms.hash(&mut hasher);
+            peer.direct.consecutive_failures.hash(&mut hasher);
+            peer.direct.last_error.hash(&mut hasher);
+            peer.direct.last_error_code.hash(&mut hasher);
+            peer.direct.success_count.hash(&mut hasher);
+            peer.direct.failure_count.hash(&mut hasher);
+            peer.relay.latency_ms.hash(&mut hasher);
+            peer.relay.rtt_ewma_ms.hash(&mut hasher);
+            peer.relay.jitter_ms.hash(&mut hasher);
+            peer.relay.consecutive_failures.hash(&mut hasher);
+            peer.relay.last_error.hash(&mut hasher);
+            peer.relay.last_error_code.hash(&mut hasher);
+            peer.relay.success_count.hash(&mut hasher);
+            peer.relay.failure_count.hash(&mut hasher);
+            peer.direct_generation.hash(&mut hasher);
+            peer.relay_ready_generation.hash(&mut hasher);
+            peer.relay_ready_endpoint.hash(&mut hasher);
+            peer.relay_ready_connection_id.hash(&mut hasher);
+            peer.relay_confirmed_generation.hash(&mut hasher);
+            peer.relay_confirmed_endpoint.hash(&mut hasher);
+            peer.relay_confirmed_connection_id.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn hash_connections(connections: &[crate::peer::PeerConnection]) -> u64 {
+        let mut sorted: Vec<_> = connections.iter().collect();
+        sorted.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for peer in sorted {
+            peer.node_id.hash(&mut hasher);
+            peer.device_name.hash(&mut hasher);
+            peer.app_version.hash(&mut hasher);
+            peer.virtual_ip.hash(&mut hasher);
+            peer.endpoint
+                .map(|endpoint| endpoint.to_string())
+                .hash(&mut hasher);
+            peer.nat_type.hash(&mut hasher);
+            peer.online.hash(&mut hasher);
+            peer.last_seen.hash(&mut hasher);
+            peer.remote_relay_rtt_ms.hash(&mut hasher);
+            format!("{:?}", peer.state).hash(&mut hasher);
+            peer.probe_session_id.hash(&mut hasher);
+            peer.relay_server.hash(&mut hasher);
+            peer.candidates.hash(&mut hasher);
+            peer.direct_health.latency_ms.hash(&mut hasher);
+            peer.direct_health.rtt_ewma_ms.hash(&mut hasher);
+            peer.direct_health.jitter_ms.hash(&mut hasher);
+            peer.direct_health.consecutive_failures.hash(&mut hasher);
+            peer.direct_health.last_error.hash(&mut hasher);
+            peer.direct_health.last_error_code.hash(&mut hasher);
+            peer.direct_health.success_count.hash(&mut hasher);
+            peer.direct_health.failure_count.hash(&mut hasher);
+            peer.relay_health.latency_ms.hash(&mut hasher);
+            peer.relay_health.rtt_ewma_ms.hash(&mut hasher);
+            peer.relay_health.jitter_ms.hash(&mut hasher);
+            peer.relay_health.consecutive_failures.hash(&mut hasher);
+            peer.relay_health.last_error.hash(&mut hasher);
+            peer.relay_health.last_error_code.hash(&mut hasher);
+            peer.relay_health.success_count.hash(&mut hasher);
+            peer.relay_health.failure_count.hash(&mut hasher);
+            peer.direct_generation.hash(&mut hasher);
+            peer.relay_ready_generation.hash(&mut hasher);
+            peer.relay_ready_endpoint.hash(&mut hasher);
+            peer.relay_ready_connection_id.hash(&mut hasher);
+            peer.relay_confirmed_generation.hash(&mut hasher);
+            peer.relay_confirmed_endpoint.hash(&mut hasher);
+            peer.relay_confirmed_connection_id.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    peers.len() == connections.len() && hash_diagnostics(peers) == hash_connections(connections)
 }
 
 async fn build_peer_scoped_snapshot(

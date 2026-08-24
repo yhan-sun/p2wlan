@@ -4,7 +4,7 @@
 //! fetch, endpoint lease refresh, signal send/poll, peer polling and tunnel
 //! creation. Split out of `control.rs`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,7 +20,8 @@ use crate::error::{DaemonError, Result};
 use super::{
     ClientState, ControlErrorResponse, ControlEvent, CreateTunnelResponse, EndpointUpdateResponse,
     FetchRelayTicketResponse, ListNodesResponse, ListSignalsResponse, PeerInfo,
-    RegisterDeviceResponse, RelayCatalogEntry, SignalCreateResponse, SignalResponse,
+    RegisterDeviceResponse, RelayCatalogEntry, SignalApplyOutcome, SignalCreateResponse,
+    SignalDeliveryReceipt, SignalDeliveryWaiter, SignalResponse,
 };
 
 /// Candidate-set revisions must be strictly increasing within a daemon.  Wall

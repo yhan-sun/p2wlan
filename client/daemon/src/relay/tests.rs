@@ -36,7 +36,7 @@ fn peer_manager() -> Arc<PeerManager> {
 fn relay_pong_updates_runtime_health() {
     let mut diagnostics = RelaySelectionDiagnostics::default();
 
-    record_relay_pong(&mut diagnostics, 900, 1_000);
+    record_relay_pong(&mut diagnostics, 1_000, Duration::from_millis(100));
     assert_eq!(diagnostics.selected_last_pong_at_unix_ms, Some(1_000));
     assert_eq!(diagnostics.selected_last_pong_age_ms, Some(0));
     assert_eq!(diagnostics.selected_last_pong_rtt_ms, Some(100));
@@ -44,7 +44,7 @@ fn relay_pong_updates_runtime_health() {
     assert_eq!(diagnostics.selected_jitter_ms, Some(0));
     assert_eq!(diagnostics.selected_pong_count, 1);
 
-    record_relay_pong(&mut diagnostics, 1_000, 1_120);
+    record_relay_pong(&mut diagnostics, 1_120, Duration::from_millis(120));
     assert_eq!(diagnostics.selected_last_pong_rtt_ms, Some(120));
     assert_eq!(diagnostics.selected_rtt_ewma_ms, Some(103));
     assert_eq!(diagnostics.selected_jitter_ms, Some(5));
@@ -126,6 +126,66 @@ async fn relay_transport_sends_encrypted_datagrams() {
     assert_eq!(conn_b.relay_server, None);
 
     inbound_worker.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_retirement_rejects_old_late_writer_boundary() {
+    let server = RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+    let peers = peer_manager();
+    peers.add_peer(&peer("node-b", "10.20.0.2")).await;
+    let (relay, _relay_rx) = RelayTransport::connect(&relay_endpoint, "node-a", peers)
+        .await
+        .unwrap();
+
+    // Hold the send task until the supervisor-equivalent retirement has
+    // linearized. This models an old connection clone whose command/hook is
+    // resumed after a same-endpoint replacement was already published.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let callback_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_called_in_task = Arc::clone(&callback_called);
+    let old_transport = relay.clone();
+    let send = tokio::spawn(async move {
+        release_rx.await.unwrap();
+        old_transport
+            .send_packet_with_write_boundary(
+                &EncryptedPeerPacket {
+                    peer_id: "node-b".to_string(),
+                    dst_ip: "10.20.0.2".to_string(),
+                    wire_bytes: vec![4, 1, 2, 3],
+                    is_business: false,
+                },
+                move |_| {
+                    callback_called_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                    true
+                },
+            )
+            .await
+    });
+
+    relay.retire_write_boundaries();
+    release_tx.send(()).unwrap();
+    let result = timeout(Duration::from_secs(1), send)
+        .await
+        .expect("retired writer must complete the rejected command")
+        .expect("send task must not panic")
+        .expect_err("an old transport hook cannot survive replacement retirement");
+    assert!(
+        matches!(
+            result,
+            DaemonError::RelaySend {
+                error: p2pnet_relay::RelayError::WriteBoundaryRejected,
+                ..
+            }
+        ),
+        "unexpected retired-boundary error: {result:?}"
+    );
+    assert!(
+        !callback_called.load(std::sync::atomic::Ordering::SeqCst),
+        "the old manager-registration hook must not run after retirement"
+    );
+
     server.shutdown().await;
 }
 

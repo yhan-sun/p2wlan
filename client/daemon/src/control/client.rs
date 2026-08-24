@@ -89,6 +89,7 @@ impl ControlClient {
             let critical_event_tx = event_tx.clone();
             let critical_relay_selection = relay_selection.clone();
             let critical_http = http.clone();
+            let critical_health = health.clone();
             tokio::spawn(async move {
                 run_critical_control_loop(
                     critical_http,
@@ -100,6 +101,7 @@ impl ControlClient {
                     critical_auth_rx,
                     critical_event_tx,
                     critical_relay_selection,
+                    critical_health,
                 )
                 .await;
             });

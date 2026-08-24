@@ -73,6 +73,23 @@ pub(crate) enum RemoteFreshAdmission {
     Stale,
 }
 
+/// Atomic production outcome for one remote fresh-prediction apply.
+///
+/// Control workers optimistically call `prepare` before entering the candidate
+/// plane.  The actual candidate replacement and durable high-water commit are
+/// serialized separately, so an older transaction which was prepared first
+/// but resumed late can be rejected before it mutates the live candidate set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFreshTransactionOutcome {
+    /// Candidates were applied and the exact prediction identity was committed.
+    Committed,
+    /// Candidate validation/application failed; the identity stays unconsumed.
+    NotApplied(CandidateSetApplyResult),
+    /// A same-or-newer prediction committed after this worker's optimistic
+    /// prepare.  This worker made no candidate mutation.
+    Superseded,
+}
+
 /// The immutable candidate snapshot one fresh-prediction identity was
 /// committed with.  Bound to the identity at commit time: an idempotent
 /// retry of the same identity can only ever punch toward this snapshot, and a
@@ -211,7 +228,11 @@ impl PeerManager {
     /// Allocate the next per-peer punch generation number.
     pub(crate) async fn next_punch_generation(&self, peer_id: &str) -> u64 {
         let mut generations = self.punch_generations.write().await;
-        let next = generations.get(peer_id).copied().unwrap_or(0).wrapping_add(1);
+        let next = generations
+            .get(peer_id)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
         generations.insert(peer_id.to_string(), next);
         next
     }
@@ -336,6 +357,66 @@ impl PeerManager {
         }
     }
 
+    /// Apply and durably commit one fresh prediction as a single serialized
+    /// production transaction.
+    ///
+    /// `prepare_remote_fresh_prediction` deliberately does not reserve an ID:
+    /// control offer/answer workers must stay responsive and an apply which is
+    /// rejected must not consume the identity.  Consequently, multiple workers
+    /// may have observed `Accepted`.  Re-check the durable high-water under this
+    /// gate before replacing candidates and retain the gate through commit (or
+    /// rollback) so a late older worker can never erase a newer winner.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn apply_and_commit_remote_fresh_prediction_for_identity(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+        sender_public_key: Option<&str>,
+    ) -> RemoteFreshTransactionOutcome {
+        let _transaction = self.remote_fresh_transaction_gate.lock().await;
+        if self
+            .remote_fresh_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .is_some_and(|current| id <= *current)
+        {
+            return RemoteFreshTransactionOutcome::Superseded;
+        }
+
+        let apply_result = self
+            .apply_remote_fresh_candidates_for_identity(
+                peer_id,
+                id,
+                candidates,
+                candidate_sources,
+                candidate_generation,
+                candidates_expires_at_ms,
+                sender_public_key,
+            )
+            .await;
+        if apply_result != CandidateSetApplyResult::Applied {
+            return RemoteFreshTransactionOutcome::NotApplied(apply_result);
+        }
+        if self
+            .commit_remote_fresh_prediction_for_identity(peer_id, id, sender_public_key)
+            .await
+        {
+            RemoteFreshTransactionOutcome::Committed
+        } else {
+            // Identity replacement remains allowed to interleave between the
+            // candidate apply and commit.  Its reset clears the pending apply;
+            // otherwise precisely undo this uncommitted mutation before the
+            // transaction gate is released.
+            self.rollback_remote_fresh_apply(peer_id, id).await;
+            RemoteFreshTransactionOutcome::Superseded
+        }
+    }
+
     /// Apply the fresh signal's candidates and record the apply so the
     /// commit can either promote it to the durable snapshot or roll it back.
     ///
@@ -370,7 +451,7 @@ impl PeerManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn apply_remote_fresh_candidates_for_identity(
+    async fn apply_remote_fresh_candidates_for_identity(
         &self,
         peer_id: &str,
         id: crate::FreshPredictionId,
@@ -465,7 +546,7 @@ impl PeerManager {
     /// `add_peer`. If a public-key change wins first, any delayed pending apply
     /// is discarded; if this commit wins first, the subsequent identity reset
     /// clears the old high-water and snapshot.
-    pub(crate) async fn commit_remote_fresh_prediction_for_identity(
+    async fn commit_remote_fresh_prediction_for_identity(
         &self,
         peer_id: &str,
         id: crate::FreshPredictionId,
@@ -620,7 +701,7 @@ impl PeerManager {
     /// high-water (see `remove_peer`): a late old-incarnation signal must
     /// stay rejected after the peer rejoins, and the new incarnation's
     /// strictly-monotonic counter supersedes it anyway.
-    pub(crate) async fn reset_remote_fresh_generation(&self, peer_id: &str, reason: &str) {
+    pub(crate) fn reset_remote_fresh_generation_sync(&self, peer_id: &str, reason: &str) {
         let removed = self
             .remote_fresh_generations
             .lock()
@@ -647,6 +728,11 @@ impl PeerManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn reset_remote_fresh_generation(&self, peer_id: &str, reason: &str) {
+        self.reset_remote_fresh_generation_sync(peer_id, reason);
+    }
+
     /// Current fresh-mapping state for a peer, when still fresh and valid for
     /// the current network generation.
     pub(crate) async fn fresh_mapping_for_peer(&self, peer_id: &str) -> Option<LocalFreshMapping> {
@@ -659,7 +745,13 @@ impl PeerManager {
 
     /// Invalidate the fresh-mapping state for one peer.
     pub(crate) async fn clear_fresh_mapping(&self, peer_id: &str, reason: &str) {
-        if self.local_fresh_mappings.write().await.remove(peer_id).is_some() {
+        if self
+            .local_fresh_mappings
+            .write()
+            .await
+            .remove(peer_id)
+            .is_some()
+        {
             info!(
                 event = "fresh_mapping_invalidated",
                 peer_id = %peer_id,
@@ -761,7 +853,10 @@ impl PeerManager {
         // notifications can never both pass the check, so exactly the first
         // inserter records the hit/miss event.
         let inserted = {
-            let mut history = self.fresh_mapping_history.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut history = self
+                .fresh_mapping_history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let entry = history.entry(peer_id.to_string()).or_default();
             if entry.iter().any(|recorded| {
                 recorded.punch_generation == result.punch_generation
@@ -833,8 +928,7 @@ impl PeerManager {
         // flow (config.network.fresh_mapping_harness_loopback).
         let allow_loopback = self.config.network.fresh_mapping_harness_loopback;
         let eligible = |endpoint: SocketAddr| {
-            is_public_probe_endpoint(endpoint)
-                || (allow_loopback && endpoint.ip().is_loopback())
+            is_public_probe_endpoint(endpoint) || (allow_loopback && endpoint.ip().is_loopback())
         };
         let conns = self.connections.read().await;
         let Some(conn) = conns.get(node_id) else {

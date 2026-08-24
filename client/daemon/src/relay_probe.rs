@@ -119,8 +119,22 @@ pub(crate) fn parse_relay_probe_token(packet: &[u8]) -> Option<RelayProbeToken> 
 
 /// The expectation the initiator registers before sending a forced-relay
 /// probe.  Only a matching ACK whose real ingress is relay may consume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayProbePurpose {
+    /// Availability/initial relay confirmation; must take priority over a
+    /// periodic health sample sharing the per-peer expectation slot.
+    Confirmation,
+    /// Periodic RTT refresh for an already-confirmed relay path.
+    Validation,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RelayProbeExpectation {
+    pub(crate) purpose: RelayProbePurpose,
+    /// Process-local peer lifecycle that was online when this request crossed
+    /// the actual relay emit boundary.  A same-node leave/rejoin must not let
+    /// the retired request confirm the replacement peer.
+    pub(crate) peer_session_generation: crate::peer::PeerSessionGeneration,
     /// Network generation the probe was built in.
     pub(crate) generation: u64,
     /// Request id of the outstanding probe.
@@ -138,6 +152,10 @@ pub(crate) struct RelayProbeExpectation {
     /// When the probe was sent; the expectation expires after
     /// [`RELAY_PROBE_EXPECTATION_TTL`].
     pub(crate) sent_at: Instant,
+    /// A retransmission reuses the same wire token for availability, so an ACK
+    /// cannot identify which attempt it answered.  Such an ACK may still
+    /// confirm reachability, but must not publish an ambiguous RTT sample.
+    pub(crate) rtt_sample_eligible: bool,
 }
 
 impl RelayProbeExpectation {
@@ -214,12 +232,15 @@ mod tests {
     #[test]
     fn expectation_matches_exact_token_and_expires() {
         let expectation = RelayProbeExpectation {
+            purpose: RelayProbePurpose::Confirmation,
+            peer_session_generation: crate::peer::PeerSessionGeneration::for_test(1),
             generation: 3,
             request_id: 42,
             owner_token: 0xabc,
             relay_endpoint: "tcp://relay.test:18081".to_string(),
             relay_connection_id: None,
             sent_at: Instant::now(),
+            rtt_sample_eligible: true,
         };
         let ack = RelayProbeToken {
             kind: RelayProbeKind::Ack,
@@ -246,5 +267,11 @@ mod tests {
             owner_token: 0xabc,
         };
         assert!(expectation.matches(&request));
+        let mut expired = expectation.clone();
+        expired.sent_at = Instant::now()
+            .checked_sub(RELAY_PROBE_EXPECTATION_TTL + Duration::from_millis(1))
+            .unwrap();
+        assert!(!expired.fresh(Instant::now()));
+        assert!(!expired.accepts(&ack, Instant::now(), "tcp://relay.test:18081"));
     }
 }

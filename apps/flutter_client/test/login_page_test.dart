@@ -706,6 +706,7 @@ class _OfflineDiagnosticsApi implements DiagnosticsApi {
   Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
+    int? processId,
     Duration timeout = const Duration(seconds: 30),
   }) => throw const DiagnosticsApiException('offline');
 

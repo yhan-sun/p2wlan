@@ -24,9 +24,9 @@ use crate::relay::{
     select_relay_with_cooldowns, RelayCandidateConfig, RelaySelectionDiagnostics,
     RelaySelectionOutcome, RelayTicketCache, RelayTransport,
 };
-use crate::transport::{
-    build_relay_validation_payload, ReceivedEncryptedPacket, WireGuardTransport,
-};
+#[cfg(test)]
+use crate::transport::build_relay_validation_payload;
+use crate::transport::{ReceivedEncryptedPacket, WireGuardTransport};
 
 use super::{is_stun_clear_value, unix_time_millis};
 
@@ -38,6 +38,44 @@ const RELAY_ROUTE_STABILITY_SAMPLES: u8 = 2;
 const RELAY_PEER_VALIDATION_INTERVAL: Duration = Duration::from_secs(5);
 const RELAY_PEER_VALIDATION_READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RELAY_PEER_VALIDATION_MAX_AGE: Duration = Duration::from_secs(15);
+
+/// Per-command deadline ownership shared by the timeout branch and the relay
+/// writer callback. The mutex deliberately spans expectation registration:
+/// if the writer wins, timeout waits for registration and can then remove it;
+/// if timeout wins, the late-dequeued hook observes `live == false` and cannot
+/// register or write. A bare AtomicBool has a Claiming→register race here.
+#[derive(Clone, Debug)]
+struct RelayWriteBoundaryPermit {
+    live: Arc<std::sync::Mutex<bool>>,
+}
+
+impl RelayWriteBoundaryPermit {
+    fn new() -> Self {
+        Self {
+            live: Arc::new(std::sync::Mutex::new(true)),
+        }
+    }
+
+    fn commit(&self, register: impl FnOnce() -> bool) -> bool {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*live {
+            return false;
+        }
+        let accepted = register();
+        *live = false;
+        accepted
+    }
+
+    fn revoke(&self) {
+        *self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+    }
+}
 
 pub(super) fn infer_default_relay_servers(control_server_url: &str) -> Vec<String> {
     if std::env::var("P2WLAN_DISABLE_DEFAULT_RELAY").as_deref() == Ok("1") {
@@ -449,6 +487,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
+                                current_transport.abort_writer();
                                 self.record_connection_close_diagnostics(&result)
                                     .await;
                                 return result;
@@ -471,6 +510,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
+                                current_transport.abort_writer();
                                 return Err(DaemonError::Relay(
                                     "relay inbound task ended without a classified close"
                                         .to_string(),
@@ -518,13 +558,16 @@ impl RelaySupervisor {
                                 std::sync::atomic::Ordering::SeqCst,
                             );
                             *self.relay_transport.write().await = Some(new_transport.clone());
-                            // Publish the replacement first, then clear all
-                            // same-endpoint expectations and confirmations.
-                            // This ordering closes a race where the old probe
-                            // loop could register one more expectation between
-                            // a cancellation and the slot swap. The next tick
-                            // registers a fresh expectation against the new
-                            // connection incarnation.
+                            // Publish the replacement first, synchronously
+                            // retire callbacks queued by the old writer, then
+                            // clear the old incarnation's expectations and
+                            // confirmations. Retirement holds the same mutex
+                            // as boundary registration: an old hook either is
+                            // rejected, or finishes registering before the
+                            // exact cancellation below. Network and peer
+                            // generations alone cannot close this race because
+                            // a same-endpoint renewal changes neither.
+                            current_transport.retire_write_boundaries();
                             self.peers
                                 .cancel_relay_probe_expectations_for_transport(
                                     endpoint,
@@ -585,6 +628,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
+                                current_transport.abort_writer();
                                 self.record_connection_close_diagnostics(&ended).await;
                                 return ended;
                             }
@@ -606,6 +650,7 @@ impl RelaySupervisor {
                                     1,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
+                                current_transport.abort_writer();
                                 self.record_connection_close_diagnostics(&ended).await;
                                 return ended;
                             }
@@ -1153,7 +1198,9 @@ pub(super) async fn run_relay_peer_validation_loop(
         }
         last_relay_endpoint = Some(relay_endpoint.clone());
 
+        let generation = peers.current_network_generation().await;
         let validation_id = unix_time_millis() as u16;
+        let validation_owner = unix_time_millis();
         let mut sends = Vec::new();
         for (sequence, (peer_id, peer_virtual_ip)) in targets.into_iter().enumerate() {
             let Ok(peer_ip) = peer_virtual_ip.parse::<Ipv4Addr>() else {
@@ -1167,35 +1214,139 @@ pub(super) async fn run_relay_peer_validation_loop(
             let send_peer_id = peer_id;
             let send_peer_virtual_ip = peer_virtual_ip;
             let send_sequence = sequence as u16;
+            let request_id = validation_id.wrapping_add(send_sequence);
+            let owner_token = validation_owner.wrapping_add(sequence as u64);
+            let send_generation = generation;
+            let send_relay_endpoint = relay_endpoint.clone();
+            let send_connection_id = relay.connection_id();
+            let send_peers = Arc::clone(&peers);
+            let expectation_peer_id = send_peer_id.clone();
+            let expectation_endpoint = send_relay_endpoint.clone();
             sends.push(async move {
-                let packet = RelayValidationPacket {
-                    peer_id: &send_peer_id,
-                    peer_virtual_ip: &send_peer_virtual_ip,
+                let deadline_permit = RelayWriteBoundaryPermit::new();
+                let boundary_permit = deadline_permit.clone();
+                // Periodic health uses the same authenticated request/ACK
+                // protocol as forced confirmation.  Its wire token is only an
+                // identity; RTT is measured with the local Instant installed
+                // at the relay writer boundary below, never at local enqueue
+                // time and never with the wall-clock payload.
+                let payload = crate::relay_probe::build_relay_probe_payload(
+                    crate::relay_probe::RelayProbeKind::Request,
+                    send_generation,
+                    request_id,
+                    owner_token,
+                );
+                let packet = Ipv4Packet::build_icmp_echo_request(
                     local_ip,
                     peer_ip,
-                    validation_id,
-                    sequence: send_sequence,
-                };
+                    request_id,
+                    send_sequence,
+                    &payload,
+                );
                 let result = tokio::time::timeout(
                     RELAY_CONTROL_SEND_TIMEOUT,
-                    send_relay_validation_packet(packet, &send_transport, &send_relay),
+                    send_transport.encrypt_and_emit_outbound(
+                        OutboundPacket {
+                            peer_id: send_peer_id.clone(),
+                            dst_ip: send_peer_virtual_ip,
+                            packet,
+                        },
+                        move |encrypted| async move {
+                            let Some(peer_session_generation) = send_peers
+                                .relay_validation_write_permit_for_transport(
+                                    &expectation_peer_id,
+                                    send_generation,
+                                    &expectation_endpoint,
+                                    send_connection_id,
+                                )
+                                .await
+                            else {
+                                return Err(DaemonError::Peer(format!(
+                                    "peer {} is no longer confirmed on relay connection {}",
+                                    expectation_peer_id, send_connection_id
+                                )));
+                            };
+                            send_relay
+                                .send_packet_with_write_boundary(&encrypted, move |sent_at| {
+                                    boundary_permit.commit(|| {
+                                        send_peers.register_relay_validation_expectation_at_write_boundary(
+                                            &expectation_peer_id,
+                                            send_generation,
+                                            request_id,
+                                            owner_token,
+                                            &expectation_endpoint,
+                                            send_connection_id,
+                                            peer_session_generation,
+                                            sent_at,
+                                        )
+                                    })
+                                })
+                                .await
+                        },
+                    ),
                 )
                 .await;
-                (send_peer_id, result)
+                (
+                    send_peer_id,
+                    send_generation,
+                    request_id,
+                    owner_token,
+                    send_connection_id,
+                    deadline_permit,
+                    result,
+                )
             });
         }
 
         let mut sent_count = 0usize;
         let mut transport_failed = false;
-        for (peer_id, result) in join_all(sends).await {
+        for (
+            peer_id,
+            generation,
+            request_id,
+            owner_token,
+            connection_id,
+            deadline_permit,
+            result,
+        ) in join_all(sends).await
+        {
             match result {
-                Ok(Ok(())) => sent_count = sent_count.saturating_add(1),
+                Ok(Ok(true)) => sent_count = sent_count.saturating_add(1),
+                Ok(Ok(false)) => {
+                    deadline_permit.revoke();
+                    peers.cancel_relay_probe_expectation_if_matches(
+                        &peer_id,
+                        generation,
+                        request_id,
+                        owner_token,
+                        Some(connection_id),
+                    );
+                    debug!(
+                        "Relay peer validation skipped for {peer_id}: WireGuard session is not ready"
+                    );
+                }
                 Ok(Err(err)) => {
+                    deadline_permit.revoke();
+                    peers.cancel_relay_probe_expectation_if_matches(
+                        &peer_id,
+                        generation,
+                        request_id,
+                        owner_token,
+                        Some(connection_id),
+                    );
                     debug!("Relay peer validation skipped for {peer_id}: {err}");
                 }
                 Err(_) => {
-                    transport_failed = true;
+                    deadline_permit.revoke();
                     relay.abort_writer();
+                    peers.cancel_relay_probe_expectation_if_matches(
+                        &peer_id,
+                        generation,
+                        request_id,
+                        owner_token,
+                        Some(connection_id),
+                    );
+                    transport_failed = true;
                     warn!(
                         event = "relay_validation_send_timeout",
                         peer_id = %peer_id,
@@ -1212,6 +1363,7 @@ pub(super) async fn run_relay_peer_validation_loop(
     }
 }
 
+#[cfg(test)]
 pub(super) struct RelayValidationPacket<'a> {
     pub(super) peer_id: &'a str,
     pub(super) peer_virtual_ip: &'a str,
@@ -1349,6 +1501,10 @@ pub(super) async fn run_relay_peer_probe_loop(
                     Some(relay.connection_id()),
                 )
                 .await;
+            let Some(send_peer_session_generation) = peers.peer_session_generation_sync(peer_id)
+            else {
+                continue;
+            };
             // Stable per-peer token: chosen once, reused for every re-send
             // until the manager reports that the outstanding expectation was
             // consumed/invalidated. In that case rotate before installing the
@@ -1367,19 +1523,10 @@ pub(super) async fn run_relay_peer_probe_loop(
                     token
                 }
             };
-            // (Re)register the expectation with the SAME token.  This refreshes
-            // the expectation's validity window, so an ACK that lags the probe
-            // by up to the expectation TTL still matches.
-            peers.register_relay_probe_expectation_for_transport(
-                peer_id,
-                *target_generation,
-                request_id,
-                owner_token,
-                &relay_endpoint,
-                relay.connection_id(),
-            );
-            // Pace the re-send cadence (the expectation above is refreshed on
-            // every tick regardless, so a late ACK always has a live window).
+            // Pace re-sends before registering any timing expectation.  The
+            // expectation is installed only after encryption, after the relay
+            // client's command-queue wait, and immediately before write_all,
+            // so local queue/emit-lock delay is not misreported as network RTT.
             if last_sent
                 .get(peer_id)
                 .is_some_and(|at| now.saturating_duration_since(*at) < RELAY_PROBE_RETRY_INTERVAL)
@@ -1400,7 +1547,14 @@ pub(super) async fn run_relay_peer_probe_loop(
             let send_peer_virtual_ip = peer_virtual_ip.clone();
             let send_relay_endpoint = relay_endpoint.clone();
             let send_generation = *target_generation;
+            let send_owner_token = owner_token;
+            let send_relay_connection_id = relay.connection_id();
+            let send_peers = Arc::clone(&peers);
+            let expectation_peer_id = send_peer_id.clone();
+            let expectation_endpoint = send_relay_endpoint.clone();
             sends.push(async move {
+                let deadline_permit = RelayWriteBoundaryPermit::new();
+                let boundary_permit = deadline_permit.clone();
                 let result = tokio::time::timeout(
                     RELAY_CONTROL_SEND_TIMEOUT,
                     send_transport.encrypt_and_emit_outbound(
@@ -1409,7 +1563,25 @@ pub(super) async fn run_relay_peer_probe_loop(
                             dst_ip: send_peer_virtual_ip,
                             packet,
                         },
-                        |encrypted| async move { send_relay.send_packet(&encrypted).await },
+                        move |encrypted| async move {
+                            send_relay
+                                .send_packet_with_write_boundary(&encrypted, move |sent_at| {
+                                    boundary_permit.commit(|| {
+                                        send_peers
+                                            .register_relay_probe_expectation_at_write_boundary(
+                                                &expectation_peer_id,
+                                                send_generation,
+                                                request_id,
+                                                send_owner_token,
+                                                &expectation_endpoint,
+                                                send_relay_connection_id,
+                                                send_peer_session_generation,
+                                                sent_at,
+                                            )
+                                    })
+                                })
+                                .await
+                        },
                     ),
                 )
                 .await;
@@ -1417,7 +1589,10 @@ pub(super) async fn run_relay_peer_probe_loop(
                     send_peer_id,
                     send_generation,
                     request_id,
+                    send_owner_token,
                     send_relay_endpoint,
+                    send_relay_connection_id,
+                    deadline_permit,
                     result,
                 )
             });
@@ -1426,7 +1601,17 @@ pub(super) async fn run_relay_peer_probe_loop(
         // Do not serialize probe delivery across peers.  A blocked writer is a
         // relay-connection failure, but it must not make peer B wait behind
         // peer A's 500ms boundary before B can even allocate/send its probe.
-        for (peer_id, generation, request_id, endpoint, result) in join_all(sends).await {
+        for (
+            peer_id,
+            generation,
+            request_id,
+            owner_token,
+            endpoint,
+            connection_id,
+            deadline_permit,
+            result,
+        ) in join_all(sends).await
+        {
             match result {
                 Ok(Ok(true)) => {
                     last_sent.insert(peer_id.clone(), now);
@@ -1459,6 +1644,16 @@ pub(super) async fn run_relay_peer_probe_loop(
                     );
                 }
                 Ok(Ok(false)) => {
+                    deadline_permit.revoke();
+                    peers.cancel_relay_probe_expectation_if_matches(
+                        &peer_id,
+                        generation,
+                        request_id,
+                        owner_token,
+                        Some(connection_id),
+                    );
+                    probe_tokens.remove(&peer_id);
+                    last_sent.remove(&peer_id);
                     timeline.emit(
                         "relay_probe_send_skipped",
                         Some("relay"),
@@ -1470,6 +1665,16 @@ pub(super) async fn run_relay_peer_probe_loop(
                     debug!("Relay probe skipped for {peer_id}: WireGuard session is not ready");
                 }
                 Ok(Err(err)) => {
+                    deadline_permit.revoke();
+                    peers.cancel_relay_probe_expectation_if_matches(
+                        &peer_id,
+                        generation,
+                        request_id,
+                        owner_token,
+                        Some(connection_id),
+                    );
+                    probe_tokens.remove(&peer_id);
+                    last_sent.remove(&peer_id);
                     timeline.emit(
                         "relay_probe_send_failed",
                         Some("relay"),
@@ -1481,11 +1686,21 @@ pub(super) async fn run_relay_peer_probe_loop(
                     debug!("Relay probe send failed for {peer_id} via {endpoint}: {err}");
                 }
                 Err(_) => {
+                    deadline_permit.revoke();
+                    relay.abort_writer();
+                    peers.cancel_relay_probe_expectation_if_matches(
+                        &peer_id,
+                        generation,
+                        request_id,
+                        owner_token,
+                        Some(connection_id),
+                    );
+                    probe_tokens.remove(&peer_id);
+                    last_sent.remove(&peer_id);
                     // The probe already consumed its counter when encryption
                     // succeeded.  Never retry that ciphertext.  Invalidating
                     // the writer also wakes any other completion waiters and
                     // lets the supervisor establish a replacement transport.
-                    relay.abort_writer();
                     timeline.emit(
                         "relay_probe_send_timeout",
                         Some("relay"),
@@ -1542,8 +1757,9 @@ pub(super) async fn run_relay_peer_probe_loop(
         // business) get a bounded path-commit request.  Its ack proves the
         // bidirectional relay-data invariant and releases the gate for
         // one-directional traffic (audit P0-4).  A fresh token is used per
-        // request and the expectation is registered before the send, so a
-        // late ack can only match the outstanding request.
+        // request and the expectation is registered at the real relay writer
+        // boundary, so queue delay cannot expire it and a late ack can only
+        // match the outstanding request.
         let path_targets = peers.path_commit_targets().await;
         if !path_targets.is_empty() {
             let mut path_sends = Vec::new();
@@ -1560,16 +1776,14 @@ pub(super) async fn run_relay_peer_probe_loop(
                     // do not pile up duplicate probes.
                     continue;
                 }
+                let Some(send_peer_session_generation) =
+                    peers.peer_session_generation_sync(peer_id)
+                else {
+                    continue;
+                };
                 next_request_id = next_request_id.wrapping_add(1);
                 let request_id = next_request_id;
                 let owner_token = unix_time_millis();
-                peers.register_path_commit_expectation(
-                    peer_id,
-                    *target_generation,
-                    request_id,
-                    owner_token,
-                    &relay_endpoint,
-                );
                 let payload = crate::path_commit::build_path_commit_payload(
                     crate::path_commit::PathCommitKind::Request,
                     *target_generation,
@@ -1582,7 +1796,15 @@ pub(super) async fn run_relay_peer_probe_loop(
                 let send_relay = relay.clone();
                 let send_peer_id = peer_id.clone();
                 let send_peer_virtual_ip = peer_virtual_ip.clone();
+                let send_generation = *target_generation;
+                let send_owner_token = owner_token;
+                let send_connection_id = relay.connection_id();
+                let send_peers = Arc::clone(&peers);
+                let expectation_peer_id = send_peer_id.clone();
+                let expectation_endpoint = relay_endpoint.clone();
                 path_sends.push(async move {
+                    let deadline_permit = RelayWriteBoundaryPermit::new();
+                    let boundary_permit = deadline_permit.clone();
                     let result = tokio::time::timeout(
                         RELAY_CONTROL_SEND_TIMEOUT,
                         send_transport.encrypt_and_emit_outbound(
@@ -1591,14 +1813,49 @@ pub(super) async fn run_relay_peer_probe_loop(
                                 dst_ip: send_peer_virtual_ip,
                                 packet,
                             },
-                            |encrypted| async move { send_relay.send_packet(&encrypted).await },
+                            move |encrypted| async move {
+                                send_relay
+                                    .send_packet_with_write_boundary(&encrypted, move |sent_at| {
+                                        boundary_permit.commit(|| {
+                                            send_peers
+                                                .register_path_commit_expectation_at_write_boundary(
+                                                    &expectation_peer_id,
+                                                    send_generation,
+                                                    request_id,
+                                                    send_owner_token,
+                                                    &expectation_endpoint,
+                                                    send_connection_id,
+                                                    send_peer_session_generation,
+                                                    sent_at,
+                                                )
+                                        })
+                                    })
+                                    .await
+                            },
                         ),
                     )
                     .await;
-                    (send_peer_id, request_id, result)
+                    (
+                        send_peer_id,
+                        send_generation,
+                        request_id,
+                        send_owner_token,
+                        send_connection_id,
+                        deadline_permit,
+                        result,
+                    )
                 });
             }
-            for (peer_id, request_id, result) in join_all(path_sends).await {
+            for (
+                peer_id,
+                generation,
+                request_id,
+                owner_token,
+                connection_id,
+                deadline_permit,
+                result,
+            ) in join_all(path_sends).await
+            {
                 match result {
                     Ok(Ok(true)) => debug!(
                         event = "path_commit_sent",
@@ -1607,12 +1864,33 @@ pub(super) async fn run_relay_peer_probe_loop(
                         request_id = request_id,
                         "path_commit_sent peer_id={peer_id} relay_endpoint={relay_endpoint} request_id={request_id}"
                     ),
-                    Ok(_) => debug!(
-                        "path-commit request to {peer_id} was not sent (WireGuard session not ready)"
-                    ),
-                    Err(err) => debug!(
-                        "path-commit request to {peer_id} over {relay_endpoint} failed: {err}"
-                    ),
+                    Ok(_) => {
+                        deadline_permit.revoke();
+                        peers.cancel_path_commit_expectation_if_matches(
+                            &peer_id,
+                            generation,
+                            request_id,
+                            owner_token,
+                            connection_id,
+                        );
+                        debug!(
+                            "path-commit request to {peer_id} was not sent (WireGuard session not ready)"
+                        );
+                    }
+                    Err(err) => {
+                        deadline_permit.revoke();
+                        relay.abort_writer();
+                        peers.cancel_path_commit_expectation_if_matches(
+                            &peer_id,
+                            generation,
+                            request_id,
+                            owner_token,
+                            connection_id,
+                        );
+                        debug!(
+                            "path-commit request to {peer_id} over {relay_endpoint} failed: {err}"
+                        );
+                    }
                 }
             }
         }
@@ -1639,6 +1917,7 @@ fn emit_probe_attempt_summaries(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn send_relay_validation_packet(
     validation: RelayValidationPacket<'_>,
     transport: &WireGuardTransport,
@@ -1674,6 +1953,71 @@ pub(super) async fn send_relay_validation_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoked_write_boundary_permit_rejects_late_dequeue() {
+        let permit = RelayWriteBoundaryPermit::new();
+        let registration_called = std::sync::atomic::AtomicBool::new(false);
+        permit.revoke();
+
+        assert!(!permit.commit(|| {
+            registration_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }));
+        assert!(
+            !registration_called.load(std::sync::atomic::Ordering::SeqCst),
+            "a command dequeued after its deadline must not register an expectation"
+        );
+    }
+
+    #[test]
+    fn deadline_revoke_waits_for_inflight_registration_before_exact_cancel() {
+        let permit = RelayWriteBoundaryPermit::new();
+        let hook_permit = permit.clone();
+        let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registered_in_hook = Arc::clone(&registered);
+        let (hook_started_tx, hook_started_rx) = std::sync::mpsc::channel();
+        let (release_hook_tx, release_hook_rx) = std::sync::mpsc::channel();
+        let hook = std::thread::spawn(move || {
+            hook_permit.commit(|| {
+                hook_started_tx.send(()).unwrap();
+                release_hook_rx.recv().unwrap();
+                registered_in_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+        });
+        hook_started_rx.recv().unwrap();
+
+        let registered_at_timeout = Arc::clone(&registered);
+        let (revoke_started_tx, revoke_started_rx) = std::sync::mpsc::channel();
+        let (revoke_done_tx, revoke_done_rx) = std::sync::mpsc::channel();
+        let revoker = std::thread::spawn(move || {
+            revoke_started_tx.send(()).unwrap();
+            permit.revoke();
+            // Models the timeout branch's exact expectation cancellation,
+            // which runs only after revoke has synchronized with the hook.
+            registered_at_timeout.store(false, std::sync::atomic::Ordering::SeqCst);
+            revoke_done_tx.send(()).unwrap();
+        });
+        revoke_started_rx.recv().unwrap();
+        assert!(
+            revoke_done_rx
+                .recv_timeout(Duration::from_millis(30))
+                .is_err(),
+            "revoke must not race past an in-flight manager registration"
+        );
+
+        release_hook_tx.send(()).unwrap();
+        assert!(hook.join().unwrap());
+        revoke_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("revoke must finish after registration releases the permit");
+        revoker.join().unwrap();
+        assert!(
+            !registered.load(std::sync::atomic::Ordering::SeqCst),
+            "exact cancellation after synchronized revoke must remove the just-registered entry"
+        );
+    }
 
     #[tokio::test]
     async fn relay_route_monitor_requires_two_nonempty_matching_changes() {

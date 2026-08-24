@@ -81,12 +81,17 @@ impl RelayClient {
         let (close_tx, close_rx) = watch::channel(false);
         // Shared close-reason attribution shared by both background tasks.
         let close_reason = Arc::new(std::sync::Mutex::new(RelayCloseReason::Unknown));
+        let ping_expectations = new_ping_expectations(effective_idle_timeout(
+            config.idle_timeout,
+            config.keepalive_interval,
+        ));
 
         // Write task: processes commands and writes to the TCP stream
         let write_close_tx = close_tx.clone();
         let mut write_close_rx = close_rx.clone();
         let max_payload = config.max_frame_payload;
         let write_reason = close_reason.clone();
+        let write_ping_expectations = ping_expectations.clone();
         let keepalive_interval = config.keepalive_interval;
         let _write_task = tokio::spawn(async move {
             let mut writer = writer;
@@ -119,57 +124,83 @@ impl RelayClient {
                                     break;
                                 }
                             }
-                            ClientCommand::SendData { dst, data, completion } => {
+                            ClientCommand::SendData {
+                                dst,
+                                data,
+                                write_boundary,
+                                completion,
+                            } => {
                                 let data_len = data.len();
-                                let write_started = std::time::Instant::now();
                                 debug!(
-                                    event = "relay_write_started",
+                                    event = "relay_write_dequeued",
                                     peer_id = %dst,
                                     bytes = data_len,
-                                    "legacy relay writer dequeued an accepted data command and is entering write_all"
+                                    "legacy relay writer dequeued an accepted data command"
                                 );
                                 let result = match Frame::forward(&dst, &data) {
                                     Ok(frame) if frame.payload.len() > max_payload => {
                                         Err(RelayError::FrameTooLarge(frame.payload.len(), max_payload))
                                     }
                                     Ok(frame) => {
-                                        write_all_or_shutdown(
-                                            &mut writer,
-                                            &frame.encode(),
-                                            &mut write_close_rx,
-                                        )
-                                        .await
+                                        let encoded = frame.encode();
+                                        let write_started = std::time::Instant::now();
+                                        let boundary_accepted = write_boundary
+                                            .map(|hook| hook(write_started))
+                                            .unwrap_or(true);
+                                        if !boundary_accepted {
+                                            Err(RelayError::WriteBoundaryRejected)
+                                        } else {
+                                            debug!(
+                                                event = "relay_write_started",
+                                                peer_id = %dst,
+                                                bytes = data_len,
+                                                "legacy relay writer passed the write-boundary guard and is entering write_all"
+                                            );
+                                            write_all_or_shutdown(
+                                                &mut writer,
+                                                &encoded,
+                                                &mut write_close_rx,
+                                            )
+                                            .await
+                                        }
                                     }
                                     Err(err) => Err(err),
                                 };
                                 let failed = result.is_err();
+                                let boundary_rejected =
+                                    matches!(&result, Err(RelayError::WriteBoundaryRejected));
                                 if !failed {
                                     debug!(
                                         event = "relay_write_completed",
                                         peer_id = %dst,
                                         bytes = data_len,
-                                        write_duration_ms = write_started.elapsed().as_millis() as u64,
                                         "relay writer completed write_all; this is not a peer-delivery acknowledgement"
+                                    );
+                                } else if boundary_rejected {
+                                    debug!(
+                                        event = "relay_write_boundary_rejected",
+                                        peer_id = %dst,
+                                        bytes = data_len,
+                                        "legacy relay frame rejected at the writer boundary before write_all"
                                     );
                                 } else {
                                     warn!(
                                         event = "relay_write_failed",
                                         peer_id = %dst,
                                         bytes = data_len,
-                                        write_duration_ms = write_started.elapsed().as_millis() as u64,
                                         reason_code = "relay_write_uncertain_or_failed",
                                         error = ?result.as_ref().err(),
                                         "legacy relay writer failed after command acceptance; ciphertext delivery is uncertain"
                                     );
                                 }
                                 let _ = completion.send(result);
-                                if failed {
+                                if failed && !boundary_rejected {
                                     note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
                                     break;
                                 }
                             }
                             ClientCommand::Ping => {
-                                let frame = Frame::ping();
+                                let (ping_token, frame) = begin_ping(&write_ping_expectations);
                                 if let Err(err) = write_all_or_shutdown(
                                     &mut writer,
                                     &frame.encode(),
@@ -177,6 +208,7 @@ impl RelayClient {
                                 )
                                 .await
                                 {
+                                    cancel_ping(&write_ping_expectations, ping_token);
                                     warn!("Relay ping write error: {}", err);
                                     note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
                                     break;
@@ -185,7 +217,7 @@ impl RelayClient {
                         }
                     }
                     _ = keepalive.tick() => {
-                        let frame = Frame::ping();
+                        let (ping_token, frame) = begin_ping(&write_ping_expectations);
                         if let Err(err) = write_all_or_shutdown(
                             &mut writer,
                             &frame.encode(),
@@ -193,6 +225,7 @@ impl RelayClient {
                         )
                         .await
                         {
+                            cancel_ping(&write_ping_expectations, ping_token);
                             warn!("Relay keepalive write error: {}", err);
                             note_close_reason(&write_reason, RelayCloseReason::LocalWriteFailed);
                             break;
@@ -219,6 +252,7 @@ impl RelayClient {
         let idle_timeout = effective_idle_timeout(config.idle_timeout, config.keepalive_interval);
         let registration_timeout = config.register_timeout;
         let read_reason = close_reason.clone();
+        let read_ping_expectations = ping_expectations;
         tokio::spawn(async move {
             let mut buf = vec![0u8; max_payload + FRAME_HEADER_SIZE];
 
@@ -412,8 +446,12 @@ impl RelayClient {
                         } else {
                             0
                         };
+                        let round_trip_time = consume_ping_rtt(&read_ping_expectations, ts);
                         if msg_tx_clone
-                            .try_send(RelayMessage::Pong { timestamp: ts })
+                            .try_send(RelayMessage::Pong {
+                                timestamp: ts,
+                                round_trip_time,
+                            })
                             .is_err()
                         {
                             break;

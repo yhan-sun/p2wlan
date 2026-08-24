@@ -35,13 +35,14 @@ impl PeerManager {
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
     ) -> CandidateSetApplyResult {
-        self.add_candidates_with_metadata_for_identity(
+        self.add_candidates_with_metadata_for_identity_with_hard_hard_retire(
             node_id,
             candidates,
             candidate_sources,
             candidate_generation,
             candidates_expires_at_ms,
             None,
+            true,
         )
         .await
     }
@@ -60,6 +61,29 @@ impl PeerManager {
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
         sender_public_key: Option<&str>,
+    ) -> CandidateSetApplyResult {
+        self.add_candidates_with_metadata_for_identity_with_hard_hard_retire(
+            node_id,
+            candidates,
+            candidate_sources,
+            candidate_generation,
+            candidates_expires_at_ms,
+            sender_public_key,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_candidates_with_metadata_for_identity_with_hard_hard_retire(
+        &self,
+        node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+        sender_public_key: Option<&str>,
+        retire_hard_hard: bool,
     ) -> CandidateSetApplyResult {
         let epoch_gate = self.network_epoch_gate();
         let _epoch_guard = epoch_gate.lock().await;
@@ -312,6 +336,14 @@ impl PeerManager {
         if remote_transport_handover {
             self.cancel_direct_validation_for_remote_candidate_change(node_id)
                 .await;
+            if retire_hard_hard {
+                // Candidate handover retires the complete direct transport
+                // context. Control-event ingress applies the candidate set
+                // before its hh1 response/offer handler, so identity-bound
+                // control updates deliberately retain the current ledger
+                // until that handler can validate the session role.
+                self.clear_hard_hard_sessions(Some(node_id)).await;
+            }
         }
         CandidateSetApplyResult::Applied
     }

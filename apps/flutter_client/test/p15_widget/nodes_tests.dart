@@ -1159,7 +1159,9 @@ void _registerNodesTests() {
     tester.view.resetDevicePixelRatio();
   });
 
-  testWidgets('Nodes online count matches the online filter', (tester) async {
+  testWidgets('Nodes keeps online peers visible while their path is probing', (
+    tester,
+  ) async {
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
     final ghostPeer = _peerJson(
       nodeId: 'node-ghost',
@@ -1192,16 +1194,17 @@ void _registerNodesTests() {
       ),
     );
 
-    // The peer reports online=true but has no verified usable path (its
-    // computed path is offline). Summary and the Online filter must agree.
-    expect(find.text('2 devices · 1 online'), findsOneWidget);
+    // Roster online-ness is authoritative even before a usable path is
+    // verified. Summary and the Online filter must agree without presenting
+    // the peer as offline.
+    expect(find.text('2 devices · 2 online'), findsOneWidget);
 
     await tester.tap(find.byKey(const Key('nodes-filter-button')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('nodes-filter-online')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('node-row-node-laptop')), findsOneWidget);
-    expect(find.byKey(const Key('node-row-node-ghost')), findsNothing);
+    expect(find.byKey(const Key('node-row-node-ghost')), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

@@ -21,6 +21,9 @@ class _NetworkComponentsSection extends StatelessWidget {
         label: strings.componentControlServer,
         value: snapshot.health.controlConnected
             ? strings.componentStatusNormal
+            : snapshot.health.controlApiReachable &&
+                  !snapshot.health.deviceLeaseHealthy
+            ? strings.componentStatusLeaseLost
             : strings.componentStatusDisconnected,
         tone: snapshot.health.controlConnected
             ? StatusTone.good

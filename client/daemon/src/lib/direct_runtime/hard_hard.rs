@@ -24,9 +24,7 @@ struct HardHardResponderMeasurementGate {
 }
 
 #[cfg(test)]
-struct HardHardResponderMeasurementGateCompletion(
-    Option<Arc<HardHardResponderMeasurementGate>>,
-);
+struct HardHardResponderMeasurementGateCompletion(Option<Arc<HardHardResponderMeasurementGate>>);
 
 #[cfg(test)]
 impl Drop for HardHardResponderMeasurementGateCompletion {
@@ -43,8 +41,8 @@ static HARD_HARD_RESPONDER_MEASUREMENT_GATE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[cfg(test)]
-fn install_hard_hard_responder_measurement_gate_for_test(
-) -> Arc<HardHardResponderMeasurementGate> {
+fn install_hard_hard_responder_measurement_gate_for_test() -> Arc<HardHardResponderMeasurementGate>
+{
     let gate = Arc::new(HardHardResponderMeasurementGate {
         reached: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -69,7 +67,6 @@ async fn pause_hard_hard_responder_after_measurement_for_test(
     }
     HardHardResponderMeasurementGateCompletion(gate)
 }
-
 /// Until an initiator record is installed in the manager ledger, no other
 /// owner will cancel its shared handle when the short-lived punch permit is
 /// dropped.  Make every pre-ledger return (including cancellation/panic
@@ -107,6 +104,10 @@ pub(crate) enum HardHardInitiatorStart {
     ExistingSession,
     /// Another punch permit already owns this peer's recovery window.
     ExistingPunchOwner,
+    /// The UDP publication lease which requested this attempt was already
+    /// withdrawn.  This invocation is handled by stopping; it must not fall
+    /// through and attach an ordinary worker to the same retired socket.
+    InvocationCancelled,
     /// Hard↔Hard did not acquire an owner; the caller must continue through
     /// the ordinary synchronized-punch path.
     NotStarted(HardHardInitiatorNotStarted),
@@ -122,7 +123,6 @@ pub(crate) enum HardHardRemoteStart {
     NotStarted,
     Rejected,
 }
-
 impl HardHardInitiatorStart {
     pub(crate) fn is_handled(self) -> bool {
         !matches!(self, Self::NotStarted(_))
@@ -133,7 +133,8 @@ impl HardHardInitiatorStart {
             Self::NotStarted(reason) => Some(reason.label()),
             Self::Started
             | Self::ExistingSession
-            | Self::ExistingPunchOwner => None,
+            | Self::ExistingPunchOwner
+            | Self::InvocationCancelled => None,
         }
     }
 }
@@ -278,18 +279,14 @@ impl HardHardCoordination {
 }
 
 #[cfg(test)]
-static HARD_HARD_TEST_NOW_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static HARD_HARD_TEST_NOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Override only the Hard↔Hard rendezvous clock for deterministic integration
 /// tests. Production builds do not contain this state, and all other runtime
 /// deadlines continue to use their existing constants and timers.
 #[cfg(test)]
 pub(crate) fn set_hard_hard_test_now_ms(now_ms: Option<u64>) {
-    HARD_HARD_TEST_NOW_MS.store(
-        now_ms.unwrap_or(0),
-        std::sync::atomic::Ordering::Release,
-    );
+    HARD_HARD_TEST_NOW_MS.store(now_ms.unwrap_or(0), std::sync::atomic::Ordering::Release);
 }
 
 fn hard_hard_now_ms() -> u64 {
@@ -368,6 +365,27 @@ fn hard_hard_prediction_targets(candidates: &[String]) -> Vec<SocketAddr> {
         .collect()
 }
 
+async fn hard_hard_plan_claim_fence_is_current(
+    peers: &PeerManager,
+    peer_id: &str,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+    plan: crate::peer::HardHardPlanSnapshot,
+    epoch: u64,
+    punch_at_ms: u64,
+) -> bool {
+    hard_hard_punch_window_is_usable(hard_hard_now_ms(), punch_at_ms)
+        && !peers.is_direct(peer_id).await
+        && peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+        && peers
+            .hard_hard_plan_for_peer(peer_id)
+            .await
+            .is_some_and(|current| hard_hard_plan_matches(current, plan))
+        && matches!(
+            peers.recovery_epoch_admit(peer_id).await,
+            RecoveryAdmission::Accepted { epoch: current } if current == epoch
+        )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HardHardPunchWindow {
     TooSoon,
@@ -430,7 +448,7 @@ async fn claim_hard_hard_responder_session(
     plan: crate::peer::HardHardPlanSnapshot,
     epoch: u64,
     punch_at_ms: u64,
-) -> Option<PunchSessionPermit> {
+) -> Option<(PunchSessionPermit, crate::peer::RecoveryEpochIdentity)> {
     let Some(reservation) = peers
         .try_begin_fresh_generation_for_epoch(peer_id, epoch)
         .await
@@ -447,31 +465,64 @@ async fn claim_hard_hard_responder_session(
             .await;
         return None;
     };
-    if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+    if !hard_hard_plan_claim_fence_is_current(
+        peers,
+        peer_id,
+        peer_session_generation,
+        plan,
+        epoch,
+        punch_at_ms,
+    )
+    .await
+    {
         reservation.refund().await;
         return None;
     }
-    let claim = punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+    let Some(claim) = punch_deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            peers,
             peer_id,
+            peer_session_generation,
             plan.local_network_generation,
             epoch,
             PUNCH_PRIORITY_FRESH_PREDICTION,
             None,
             Some(punch_at_ms),
         )
-        .await;
+        .await
+    else {
+        reservation.refund().await;
+        return None;
+    };
     let deferred = match claim {
         RendezvousPunchClaim::Claimed(session) => {
+            if !hard_hard_plan_claim_fence_is_current(
+                peers,
+                peer_id,
+                peer_session_generation,
+                plan,
+                epoch,
+                punch_at_ms,
+            )
+            .await
+            {
+                drop(session);
+                reservation.refund().await;
+                return None;
+            }
+            let recovery_identity = reservation.identity();
             reservation.commit();
-            return Some(session);
+            return Some((session, recovery_identity));
         }
         RendezvousPunchClaim::Deferred(deferred) => deferred,
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            reservation.refund().await;
+            return None;
+        }
     };
     let epoch_identity = reservation.identity();
     reservation.refund().await;
-    let Some(retry_delay) =
-        hard_hard_protected_claim_retry_delay(deferred, unix_time_millis())
+    let Some(retry_delay) = hard_hard_protected_claim_retry_delay(deferred, unix_time_millis())
     else {
         peers
             .record_direct_event(
@@ -507,19 +558,15 @@ async fn claim_hard_hard_responder_session(
         .await;
     sleep(retry_delay).await;
 
-    let retry_fence_is_current = hard_hard_punch_window_is_usable(
-        hard_hard_now_ms(),
+    let retry_fence_is_current = hard_hard_plan_claim_fence_is_current(
+        peers,
+        peer_id,
+        peer_session_generation,
+        plan,
+        epoch,
         punch_at_ms,
-    ) && !peers.is_direct(peer_id).await
-        && peers.peer_session_is_current_sync(peer_id, peer_session_generation)
-        && peers
-            .hard_hard_plan_for_peer(peer_id)
-            .await
-            .is_some_and(|current| hard_hard_plan_matches(current, plan))
-        && matches!(
-            peers.recovery_epoch_admit(peer_id).await,
-            RecoveryAdmission::Accepted { epoch: current } if current == epoch
-        );
+    )
+    .await;
     if !retry_fence_is_current {
         peers
             .record_direct_event(
@@ -554,9 +601,11 @@ async fn claim_hard_hard_responder_session(
         retry_reservation.refund().await;
         return None;
     }
-    match punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+    let Some(retry_claim) = punch_deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            peers,
             peer_id,
+            peer_session_generation,
             plan.local_network_generation,
             epoch,
             PUNCH_PRIORITY_FRESH_PREDICTION,
@@ -564,10 +613,29 @@ async fn claim_hard_hard_responder_session(
             Some(punch_at_ms),
         )
         .await
-    {
+    else {
+        retry_reservation.refund().await;
+        return None;
+    };
+    match retry_claim {
         RendezvousPunchClaim::Claimed(session) => {
+            if !hard_hard_plan_claim_fence_is_current(
+                peers,
+                peer_id,
+                peer_session_generation,
+                plan,
+                epoch,
+                punch_at_ms,
+            )
+            .await
+            {
+                drop(session);
+                retry_reservation.refund().await;
+                return None;
+            }
+            let recovery_identity = retry_reservation.identity();
             retry_reservation.commit();
-            Some(session)
+            Some((session, recovery_identity))
         }
         RendezvousPunchClaim::Deferred(retry) => {
             retry_reservation.refund().await;
@@ -585,6 +653,10 @@ async fn claim_hard_hard_responder_session(
                     ),
                 )
                 .await;
+            None
+        }
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            retry_reservation.refund().await;
             None
         }
     }
@@ -616,6 +688,40 @@ fn hard_hard_initiator_response_record_matches(
         && !current.cancellation.is_cancelled()
 }
 
+async fn hard_hard_initiator_response_claim_fence_is_current(
+    peers: &PeerManager,
+    peer_id: &str,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+    plan: crate::peer::HardHardPlanSnapshot,
+    record: &HardHardSessionRecord,
+    epoch: u64,
+) -> bool {
+    let current_record = peers
+        .hard_hard_session_by_token(peer_id, &record.session_token)
+        .await;
+    let current_plan = peers.hard_hard_plan_for_peer(peer_id).await;
+    // The initiator already owns a measured socket. A reciprocal response is
+    // deliberately allowed at the canonical punch instant (the test/control
+    // forwarder may advance the shared clock to exactly `punch_at_ms`) and
+    // through the bounded sweep deadline. Reusing the responder's
+    // pre-measurement minimum-lead check here incorrectly rejects the on-time
+    // response and leaves only the responder sweeping.
+    record
+        .punch_at_ms
+        .saturating_add(HARD_HARD_SWEEP_DEADLINE.as_millis() as u64)
+        >= hard_hard_now_ms()
+        && !peers.is_direct(peer_id).await
+        && peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+        && current_record
+            .as_ref()
+            .is_some_and(|current| hard_hard_initiator_response_record_matches(current, record))
+        && current_plan.is_some_and(|current| hard_hard_plan_matches(current, plan))
+        && matches!(
+            peers.recovery_epoch_admit(peer_id).await,
+            RecoveryAdmission::Accepted { epoch: current } if current == epoch
+        )
+}
+
 /// A reciprocal response may collide with the short first-send protection of
 /// an ordinary rendezvous which started while the initiator awaited its peer.
 /// Preserve that already-dispatched send, then retry the higher-priority fresh
@@ -631,22 +737,51 @@ async fn claim_hard_hard_initiator_response_session(
     record: &HardHardSessionRecord,
     epoch: u64,
 ) -> Option<PunchSessionPermit> {
+    if !hard_hard_initiator_response_claim_fence_is_current(
+        peers,
+        peer_id,
+        peer_session_generation,
+        plan,
+        record,
+        epoch,
+    )
+    .await
+    {
+        return None;
+    }
     let claim = punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            peers,
             peer_id,
+            peer_session_generation,
             record.local_network_generation,
             epoch,
             PUNCH_PRIORITY_FRESH_PREDICTION,
             None,
             Some(record.punch_at_ms),
         )
-        .await;
+        .await?;
     let deferred = match claim {
-        RendezvousPunchClaim::Claimed(session) => return Some(session),
+        RendezvousPunchClaim::Claimed(session) => {
+            if hard_hard_initiator_response_claim_fence_is_current(
+                peers,
+                peer_id,
+                peer_session_generation,
+                plan,
+                record,
+                epoch,
+            )
+            .await
+            {
+                return Some(session);
+            }
+            drop(session);
+            return None;
+        }
         RendezvousPunchClaim::Deferred(deferred) => deferred,
+        RendezvousPunchClaim::RejectedStalePeerSession => return None,
     };
-    let Some(retry_delay) =
-        hard_hard_protected_claim_retry_delay(deferred, unix_time_millis())
+    let Some(retry_delay) = hard_hard_protected_claim_retry_delay(deferred, unix_time_millis())
     else {
         peers
             .record_direct_event(
@@ -682,24 +817,15 @@ async fn claim_hard_hard_initiator_response_session(
         .await;
     sleep(retry_delay).await;
 
-    let current_record = peers
-        .hard_hard_session_by_token(peer_id, &record.session_token)
-        .await;
-    let current_plan = peers.hard_hard_plan_for_peer(peer_id).await;
-    let session_and_plan_are_current = hard_hard_punch_window_is_usable(
-        hard_hard_now_ms(),
-        record.punch_at_ms,
-    ) && !peers.is_direct(peer_id).await
-        && peers.peer_session_is_current_sync(peer_id, peer_session_generation)
-        && current_record.as_ref().is_some_and(|current| {
-            hard_hard_initiator_response_record_matches(current, record)
-        })
-        && current_plan.is_some_and(|current| hard_hard_plan_matches(current, plan));
-    let retry_fence_is_current = session_and_plan_are_current
-        && matches!(
-            peers.recovery_epoch_admit(peer_id).await,
-            RecoveryAdmission::Accepted { epoch: current } if current == epoch
-        );
+    let retry_fence_is_current = hard_hard_initiator_response_claim_fence_is_current(
+        peers,
+        peer_id,
+        peer_session_generation,
+        plan,
+        record,
+        epoch,
+    )
+    .await;
     if !retry_fence_is_current {
         peers
             .record_direct_event(
@@ -714,18 +840,36 @@ async fn claim_hard_hard_initiator_response_session(
         return None;
     }
 
-    match punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+    let retry_claim = punch_deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            peers,
             peer_id,
+            peer_session_generation,
             record.local_network_generation,
             epoch,
             PUNCH_PRIORITY_FRESH_PREDICTION,
             None,
             Some(record.punch_at_ms),
         )
-        .await
-    {
-        RendezvousPunchClaim::Claimed(session) => Some(session),
+        .await?;
+    match retry_claim {
+        RendezvousPunchClaim::Claimed(session) => {
+            if hard_hard_initiator_response_claim_fence_is_current(
+                peers,
+                peer_id,
+                peer_session_generation,
+                plan,
+                record,
+                epoch,
+            )
+            .await
+            {
+                Some(session)
+            } else {
+                drop(session);
+                None
+            }
+        }
         RendezvousPunchClaim::Deferred(retry) => {
             peers
                 .record_direct_event(
@@ -743,6 +887,7 @@ async fn claim_hard_hard_initiator_response_session(
                 .await;
             None
         }
+        RendezvousPunchClaim::RejectedStalePeerSession => None,
     }
 }
 
@@ -796,11 +941,7 @@ async fn hard_hard_wait_for_exact_direct_confirmation(
 ) -> bool {
     let deadline = Instant::now() + HARD_HARD_DIRECT_CONFIRMATION_GRACE;
     loop {
-        if session.is_cancelled()
-            || !peers
-                .hard_hard_session_identity_is_current(identity)
-                .await
-        {
+        if session.is_cancelled() || !peers.hard_hard_session_identity_is_current(identity).await {
             return false;
         }
 
@@ -869,7 +1010,14 @@ pub(crate) async fn spawn_hard_hard_initiator(
     punch_deduplicator: PunchAttemptDeduplicator,
     peer_id: String,
     signal: HolePunchSignalContext,
+    invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> HardHardInitiatorStart {
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        return HardHardInitiatorStart::InvocationCancelled;
+    }
+    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+        return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded);
+    };
     if peers.hard_hard_session_is_active(&peer_id).await {
         return HardHardInitiatorStart::ExistingSession;
     }
@@ -906,6 +1054,9 @@ pub(crate) async fn spawn_hard_hard_initiator(
             HardHardInitiatorNotStarted::InsufficientStunObservers,
         );
     }
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        return HardHardInitiatorStart::InvocationCancelled;
+    }
     let epoch = match peers.recovery_epoch_admit(&peer_id).await {
         RecoveryAdmission::Accepted { epoch } => epoch,
         RecoveryAdmission::Superseded => {
@@ -937,10 +1088,29 @@ pub(crate) async fn spawn_hard_hard_initiator(
             HardHardInitiatorNotStarted::FreshGenerationQuotaExhausted,
         );
     };
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+        fresh_generation_reservation.refund().await;
+        return HardHardInitiatorStart::InvocationCancelled;
+    }
     let punch_at_ms = hard_hard_now_ms().saturating_add(HARD_HARD_PUNCH_LEAD.as_millis() as u64);
-    let session = match punch_deduplicator
-        .claim_for_epoch_with_rendezvous(
+    if !hard_hard_plan_claim_fence_is_current(
+        &peers,
+        &peer_id,
+        peer_session_generation,
+        plan,
+        epoch,
+        punch_at_ms,
+    )
+    .await
+    {
+        fresh_generation_reservation.refund().await;
+        return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::PlanChanged);
+    }
+    let Some(claim) = punch_deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            &peers,
             &peer_id,
+            peer_session_generation,
             plan.local_network_generation,
             epoch,
             PUNCH_PRIORITY_FRESH_PREDICTION,
@@ -948,10 +1118,31 @@ pub(crate) async fn spawn_hard_hard_initiator(
             Some(punch_at_ms),
         )
         .await
-    {
+    else {
+        fresh_generation_reservation.refund().await;
+        return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded);
+    };
+    let (session, recovery_identity) = match claim {
         RendezvousPunchClaim::Claimed(session) => {
+            if !hard_hard_plan_claim_fence_is_current(
+                &peers,
+                &peer_id,
+                peer_session_generation,
+                plan,
+                epoch,
+                punch_at_ms,
+            )
+            .await
+            {
+                drop(session);
+                fresh_generation_reservation.refund().await;
+                return HardHardInitiatorStart::NotStarted(
+                    HardHardInitiatorNotStarted::PlanChanged,
+                );
+            }
+            let recovery_identity = fresh_generation_reservation.identity();
             fresh_generation_reservation.commit();
-            session
+            (session, recovery_identity)
         }
         RendezvousPunchClaim::Deferred(deferred) => {
             fresh_generation_reservation.refund().await;
@@ -972,10 +1163,17 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 .await;
             return HardHardInitiatorStart::ExistingPunchOwner;
         }
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            fresh_generation_reservation.refund().await;
+            return HardHardInitiatorStart::NotStarted(
+                HardHardInitiatorNotStarted::RecoverySuperseded,
+            );
+        }
     };
     let token = hard_hard_session_token(session.session_id());
     let coordination = hard_hard_coordination_from_plan(token, HardHardRole::Initiator, plan);
     let cancellation = session.cancellation_handle();
+    bind_hard_hard_session_to_punch_invocation(invocation_shutdown_rx, cancellation.clone());
     tokio::spawn(async move {
         // Keep the dedup permit until the measured session is installed in the
         // authoritative manager ledger. Without this capture `session` was
@@ -1009,6 +1207,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             return;
         };
         if cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             || peers.is_direct(&peer_id).await
             || peers
                 .hard_hard_plan_for_peer(&peer_id)
@@ -1060,12 +1259,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             remote_prediction_confidence: 0,
             prediction_window,
             remote_prediction: Vec::new(),
-            fresh_socket: hard_hard_socket_identity(
-                &peer_id,
-                &coordination.token,
-                &result,
-                plan,
-            ),
+            fresh_socket: hard_hard_socket_identity(&peer_id, &coordination.token, &result, plan),
             punch_at_ms,
             expires_at_ms: hard_hard_now_ms()
                 .saturating_add(HARD_HARD_SESSION_TTL.as_millis() as u64),
@@ -1074,7 +1268,16 @@ pub(crate) async fn spawn_hard_hard_initiator(
             created_at: Instant::now(),
             cancellation: cancellation.clone(),
         };
-        if !peers.hard_hard_register_session(record).await {
+        if cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            || !peers.hard_hard_register_session(record).await
+        {
+            peers.hard_hard_remove_session(&peer_id, &session_id).await;
+            return;
+        }
+        if cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+        {
             peers.hard_hard_remove_session(&peer_id, &session_id).await;
             return;
         }
@@ -1086,7 +1289,14 @@ pub(crate) async fn spawn_hard_hard_initiator(
         // soon as such a response arrives.  Holding this permit through the
         // publish would fold and silently lose an extremely fast response.
         drop(session_owner);
-        let advertised = if peers.try_consume_recovery_http_quota(&peer_id).await {
+        let advertised = if !cancellation.is_cancelled()
+            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            && peers
+                .try_consume_recovery_http_quota_for_identity(&peer_id, recovery_identity)
+                .await
+            && !cancellation.is_cancelled()
+            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+        {
             matches!(
                 signal
                     .control
@@ -1105,7 +1315,11 @@ pub(crate) async fn spawn_hard_hard_initiator(
         } else {
             false
         };
-        if !advertised || cancellation.is_cancelled() || peers.is_direct(&peer_id).await {
+        if !advertised
+            || peers.is_direct(&peer_id).await
+            || cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+        {
             peers
                 .record_direct_event(
                     &peer_id,
@@ -1158,12 +1372,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             peers.clone(),
             peer_id.clone(),
             session_id.clone(),
-            hard_hard_socket_identity(
-                &peer_id,
-                &coordination.token,
-                &result,
-                plan,
-            ),
+            hard_hard_socket_identity(&peer_id, &coordination.token, &result, plan),
             cancellation.clone(),
             hard_hard_now_ms().saturating_add(HARD_HARD_SESSION_TTL.as_millis() as u64),
         );
@@ -1278,7 +1487,7 @@ pub(crate) async fn spawn_hard_hard_responder(
     let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
         return HardHardRemoteStart::NotStarted;
     };
-    let Some(session) = claim_hard_hard_responder_session(
+    let Some((session, recovery_identity)) = claim_hard_hard_responder_session(
         &peers,
         &punch_deduplicator,
         &peer_id,
@@ -1343,8 +1552,7 @@ pub(crate) async fn spawn_hard_hard_responder(
         else {
             return;
         };
-        let response_coordination =
-            coordination.as_response(current_plan, result.model.confidence);
+        let response_coordination = coordination.as_response(current_plan, result.model.confidence);
         let prediction_window = hard_hard_prediction_targets(&candidates);
         if prediction_window.is_empty() {
             return;
@@ -1377,10 +1585,26 @@ pub(crate) async fn spawn_hard_hard_responder(
             created_at: Instant::now(),
             cancellation: cancellation.clone(),
         };
-        if !peers.hard_hard_register_session(record).await {
+        if cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            || !peers.hard_hard_register_session(record).await
+        {
             return;
         }
-        let sent = if peers.try_consume_recovery_http_quota(&peer_id).await {
+        if cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+        {
+            peers.hard_hard_remove_session(&peer_id, &session_id).await;
+            return;
+        }
+        let sent = if !cancellation.is_cancelled()
+            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            && peers
+                .try_consume_recovery_http_quota_for_identity(&peer_id, recovery_identity)
+                .await
+            && !cancellation.is_cancelled()
+            && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+        {
             matches!(
                 signal
                     .control
@@ -1399,7 +1623,11 @@ pub(crate) async fn spawn_hard_hard_responder(
         } else {
             false
         };
-        if !sent || cancellation.is_cancelled() || !handoff.finalize().await {
+        if !sent
+            || cancellation.is_cancelled()
+            || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            || !handoff.finalize().await
+        {
             peers
                 .record_direct_event(
                     &peer_id,
@@ -1413,18 +1641,15 @@ pub(crate) async fn spawn_hard_hard_responder(
             peers.hard_hard_remove_session(&peer_id, &session_id).await;
             return;
         }
-        let fresh_socket = hard_hard_socket_identity(
-            &peer_id,
-            &coordination.token,
-            &result,
-            current_plan,
-        );
+        let fresh_socket =
+            hard_hard_socket_identity(&peer_id, &coordination.token, &result, current_plan);
         let cleanup_udp = udp.clone();
         let swept = hard_hard_wait_and_sweep(
             udp,
             peers.clone(),
             session,
             peer_id.clone(),
+            peer_session_generation,
             fresh_socket.clone(),
             coordination.token.clone(),
             remote_prediction,
@@ -1437,12 +1662,9 @@ pub(crate) async fn spawn_hard_hard_responder(
             "responder",
         )
         .await;
-        let direct_on_fresh_socket = hard_hard_exact_direct_confirmation_is_current(
-            &cleanup_udp,
-            &peers,
-            &fresh_socket,
-        )
-        .await;
+        let direct_on_fresh_socket =
+            hard_hard_exact_direct_confirmation_is_current(&cleanup_udp, &peers, &fresh_socket)
+                .await;
         if swept {
             if direct_on_fresh_socket || !peers.is_direct(&peer_id).await {
                 spawn_hard_hard_expiry_cleanup(
@@ -1452,9 +1674,7 @@ pub(crate) async fn spawn_hard_hard_responder(
                     session_id.clone(),
                     fresh_socket.clone(),
                     cancellation,
-                    hard_hard_now_ms().saturating_add(
-                        HARD_HARD_SESSION_TTL.as_millis() as u64,
-                    ),
+                    hard_hard_now_ms().saturating_add(HARD_HARD_SESSION_TTL.as_millis() as u64),
                 );
             } else {
                 peers
@@ -1538,9 +1758,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
     if !record.initiator
         || record.state != HardHardSessionState::AwaitingPeer
         || record.attempt_count >= 1
-        || record.local_network_generation
-            != peers
-                .current_network_generation_sync()
+        || record.local_network_generation != peers.current_network_generation_sync()
         || !hard_hard_plan_matches(current_plan, expected_plan)
         || coordination.local_profile_generation != record.remote_profile_generation
         || coordination.remote_profile_generation != record.local_profile_generation
@@ -1624,6 +1842,8 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
     if !udp
         .hard_hard_socket_identity_is_current(&record.fresh_socket)
         .await
+        || session.is_cancelled()
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
     {
         peers
             .hard_hard_remove_session(&peer_id, &record.session_id)
@@ -1637,21 +1857,21 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         peers.clone(),
         session,
         peer_id.clone(),
+        peer_session_generation,
         fresh_socket.clone(),
         record.session_token.clone(),
         remote_prediction,
         punch_at_ms,
         record.local_network_generation,
-        (record.local_profile_generation, record.remote_profile_generation),
+        (
+            record.local_profile_generation,
+            record.remote_profile_generation,
+        ),
         "initiator",
     )
     .await;
-    let direct_on_fresh_socket = hard_hard_exact_direct_confirmation_is_current(
-        &cleanup_udp,
-        &peers,
-        &fresh_socket,
-    )
-    .await;
+    let direct_on_fresh_socket =
+        hard_hard_exact_direct_confirmation_is_current(&cleanup_udp, &peers, &fresh_socket).await;
     if swept {
         if direct_on_fresh_socket || !peers.is_direct(&peer_id).await {
             spawn_hard_hard_expiry_cleanup(
@@ -1678,10 +1898,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
                 )
                 .await;
             cleanup_udp
-                .detach_hard_hard_socket_if_identity(
-                    &fresh_socket,
-                    "hard_hard_direct_other_socket",
-                )
+                .detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_direct_other_socket")
                 .await;
             peers
                 .hard_hard_remove_session(&record.peer_id, &record.session_id)
@@ -1721,6 +1938,7 @@ async fn hard_hard_wait_and_sweep(
     peers: Arc<PeerManager>,
     session: PunchSessionPermit,
     peer_id: String,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
     fresh_socket: crate::peer::HardHardFreshSocketIdentity,
     session_token: String,
     targets: Vec<SocketAddr>,
@@ -1737,22 +1955,21 @@ async fn hard_hard_wait_and_sweep(
             _ = session.cancelled() => return false,
         }
     }
-    if session.is_cancelled()
-        || peers.is_direct(&peer_id).await
+    if peers.is_direct(&peer_id).await
         || peers.current_network_generation_sync() != network_generation
         || !udp
             .hard_hard_socket_identity_is_current(&fresh_socket)
             .await
+        || session.is_cancelled()
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
     {
         return false;
     }
     let dispatch_at_ms = session.mark_first_send_started();
     let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
     let mut report = None;
-    let outcome = run_owned_punch_session_with_deadline(
-        &session,
-        HARD_HARD_SWEEP_DEADLINE,
-        async {
+    let outcome =
+        run_owned_punch_session_with_deadline(&session, HARD_HARD_SWEEP_DEADLINE, async {
             report = Some(
                 udp.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
                     &peer_id,
@@ -1765,9 +1982,8 @@ async fn hard_hard_wait_and_sweep(
                 )
                 .await,
             );
-        },
-    )
-    .await;
+        })
+        .await;
     match (outcome, report) {
         (PunchSessionOutcome::Completed, Some(Ok(report))) => {
             let direct_confirmed = if report.packets_sent == 0 {
@@ -1828,7 +2044,7 @@ async fn hard_hard_wait_and_sweep(
                     None,
                     format!("origin={origin} exact-socket sweep error: {error}"),
                 )
-            .await;
+                .await;
             false
         }
         (PunchSessionOutcome::DeadlineExceeded, _) => {
@@ -1841,7 +2057,7 @@ async fn hard_hard_wait_and_sweep(
                     None,
                     format!("origin={origin} exact-socket sweep exceeded bounded deadline"),
                 )
-            .await;
+                .await;
             false
         }
         (PunchSessionOutcome::Cancelled, _) => false,
@@ -1864,14 +2080,11 @@ fn spawn_hard_hard_expiry_cleanup(
             _ = sleep(Duration::from_millis(delay)) => {}
             _ = cancellation.cancelled() => {}
         }
-        let retain_fresh_socket = hard_hard_exact_direct_socket_is_current_for_cleanup(
-            &udp,
-            &peers,
-            &fresh_socket,
-        )
-        .await;
+        let retain_fresh_socket =
+            hard_hard_exact_direct_socket_is_current_for_cleanup(&udp, &peers, &fresh_socket).await;
         if !retain_fresh_socket {
-            udp.detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_session_expired").await;
+            udp.detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_session_expired")
+                .await;
         }
         peers.hard_hard_remove_session(&peer_id, &session_id).await;
     });
@@ -1888,8 +2101,7 @@ mod hard_hard_tests {
         SocketAddr,
     ) {
         let peers = Arc::new(PeerManager::new(
-            Config::generate_default("https://ctrl.test", "hard-hard-exact-proof")
-                .unwrap(),
+            Config::generate_default("https://ctrl.test", "hard-hard-exact-proof").unwrap(),
         ));
         let remote: SocketAddr = "198.51.100.20:41000".parse().unwrap();
         peers
@@ -1916,9 +2128,11 @@ mod hard_hard_tests {
             .current_remote_candidate_epoch("peer-exact-proof")
             .await
             .unwrap();
-        assert!(peers
-            .bind_remote_nat_profile_to_candidate_epoch("peer-exact-proof", 7)
-            .await);
+        assert!(
+            peers
+                .bind_remote_nat_profile_to_candidate_epoch("peer-exact-proof", 7)
+                .await
+        );
 
         let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(8);
         let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
@@ -1928,19 +2142,14 @@ mod hard_hard_tests {
         let (socket_index, socket) = udp.bind_fresh_punch_socket().await.unwrap();
         let socket_local_endpoint = socket.local_addr().unwrap();
         let handoff = udp
-            .attach_dynamic_punch_socket(
-                "peer-exact-proof",
-                socket_index,
-                socket,
-                0,
-                1,
-                None,
-            )
+            .attach_dynamic_punch_socket("peer-exact-proof", socket_index, socket, 0, 1, None)
             .await
             .unwrap();
-        assert!(handoff
-            .commit_and_pin_for_test(&udp, "peer-exact-proof", socket_index, 0, 1)
-            .await);
+        assert!(
+            handoff
+                .commit_and_pin_for_test(&udp, "peer-exact-proof", socket_index, 0, 1)
+                .await
+        );
         assert!(handoff.finalize().await);
         udp.remember_peer_socket(
             "peer-exact-proof",
@@ -1961,30 +2170,32 @@ mod hard_hard_tests {
             socket_local_endpoint,
         };
         let now = hard_hard_now_ms();
-        assert!(peers
-            .hard_hard_register_session(crate::peer::HardHardSessionRecord {
-                session_id: "proof-session".to_string(),
-                session_token: identity.session_token.clone(),
-                peer_id: identity.peer_id.clone(),
-                initiator: true,
-                remote_network_generation: 0,
-                local_network_generation: identity.network_generation,
-                remote_candidate_epoch: identity.remote_candidate_epoch,
-                local_profile_generation: identity.local_profile_generation,
-                remote_profile_generation: identity.remote_profile_generation,
-                local_prediction_confidence: 90,
-                remote_prediction_confidence: 90,
-                prediction_window: vec![remote],
-                remote_prediction: vec![remote],
-                fresh_socket: identity.clone(),
-                punch_at_ms: now.saturating_add(5_000),
-                expires_at_ms: now.saturating_add(30_000),
-                state: crate::peer::HardHardSessionState::AwaitingPeer,
-                attempt_count: 0,
-                created_at: Instant::now(),
-                cancellation: Arc::new(crate::PunchSessionCancellation::default()),
-            })
-            .await);
+        assert!(
+            peers
+                .hard_hard_register_session(crate::peer::HardHardSessionRecord {
+                    session_id: "proof-session".to_string(),
+                    session_token: identity.session_token.clone(),
+                    peer_id: identity.peer_id.clone(),
+                    initiator: true,
+                    remote_network_generation: 0,
+                    local_network_generation: identity.network_generation,
+                    remote_candidate_epoch: identity.remote_candidate_epoch,
+                    local_profile_generation: identity.local_profile_generation,
+                    remote_profile_generation: identity.remote_profile_generation,
+                    local_prediction_confidence: 90,
+                    remote_prediction_confidence: 90,
+                    prediction_window: vec![remote],
+                    remote_prediction: vec![remote],
+                    fresh_socket: identity.clone(),
+                    punch_at_ms: now.saturating_add(5_000),
+                    expires_at_ms: now.saturating_add(30_000),
+                    state: crate::peer::HardHardSessionState::AwaitingPeer,
+                    attempt_count: 0,
+                    created_at: Instant::now(),
+                    cancellation: Arc::new(crate::PunchSessionCancellation::default()),
+                })
+                .await
+        );
         (peers, udp, identity, remote)
     }
 
@@ -1993,50 +2204,56 @@ mod hard_hard_tests {
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
         let other_local: SocketAddr = "127.0.0.1:41001".parse().unwrap();
         let commit_before = peers.direct_commit_seq_sync(&identity.peer_id);
-        assert!(peers
-            .record_direct_success_for_generation_with_local_endpoint(
-                &identity.peer_id,
-                Some(remote),
-                identity.network_generation,
-                Some(other_local),
-            )
-            .await);
+        assert!(
+            peers
+                .record_direct_success_for_generation_with_local_endpoint(
+                    &identity.peer_id,
+                    Some(remote),
+                    identity.network_generation,
+                    Some(other_local),
+                )
+                .await
+        );
         assert!(peers.is_direct(&identity.peer_id).await);
         assert_ne!(
             peers.direct_commit_seq_sync(&identity.peer_id),
             commit_before,
             "the competing ordinary Direct path must have a distinct commit"
         );
-        assert!(udp
-            .hard_hard_socket_identity_is_current(&identity)
-            .await);
-        assert!(udp
-            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
-            .await);
+        assert!(udp.hard_hard_socket_identity_is_current(&identity).await);
+        assert!(
+            udp.hard_hard_socket_identity_has_authenticated_evidence(&identity)
+                .await
+        );
         assert!(
             !hard_hard_exact_direct_confirmation_is_current(&udp, &peers, &identity).await,
             "peer-global Direct on another local socket must not be Hard↔Hard success"
         );
         let events = peers.diagnostics().await[0].direct_events.clone();
         assert!(
-            !events.iter().any(|event| event.stage == "hard_hard_sweep_completed"),
+            !events
+                .iter()
+                .any(|event| event.stage == "hard_hard_sweep_completed"),
             "a competing Direct path must not create a Hard↔Hard success event"
         );
-        udp.detach_all_dynamic_punch_sockets("test_exact_proof").await;
+        udp.detach_all_dynamic_punch_sockets("test_exact_proof")
+            .await;
     }
 
     #[tokio::test]
     async fn hard_hard_exact_proof_requires_selected_pair_and_authenticated_evidence() {
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
         let commit_before = peers.direct_commit_seq_sync(&identity.peer_id);
-        assert!(peers
-            .record_direct_success_for_generation_with_local_endpoint(
-                &identity.peer_id,
-                Some(remote),
-                identity.network_generation,
-                Some(identity.socket_local_endpoint),
-            )
-            .await);
+        assert!(
+            peers
+                .record_direct_success_for_generation_with_local_endpoint(
+                    &identity.peer_id,
+                    Some(remote),
+                    identity.network_generation,
+                    Some(identity.socket_local_endpoint),
+                )
+                .await
+        );
         assert_ne!(
             peers.direct_commit_seq_sync(&identity.peer_id),
             commit_before,
@@ -2046,15 +2263,16 @@ mod hard_hard_tests {
             hard_hard_exact_direct_confirmation_is_current(&udp, &peers, &identity).await,
             "selected pair, current generations, affinity, and authenticated evidence must agree"
         );
-        assert!(udp
-            .hard_hard_socket_identity_is_current(&identity)
-            .await);
+        assert!(udp.hard_hard_socket_identity_is_current(&identity).await);
         let (data_socket_index, data_socket) = udp
             .socket_for_peer(Some(&identity.peer_id))
             .await
             .expect("the proven Hard↔Hard socket must remain the data socket");
         assert_eq!(data_socket_index, identity.socket_index);
-        assert_eq!(data_socket.local_addr().unwrap(), identity.socket_local_endpoint);
+        assert_eq!(
+            data_socket.local_addr().unwrap(),
+            identity.socket_local_endpoint
+        );
         let selection = peers
             .select_path_for_data(&identity.peer_id, true, true)
             .await;
@@ -2094,12 +2312,12 @@ mod hard_hard_tests {
             mismatched_endpoint,
         ] {
             assert!(
-                !hard_hard_exact_direct_confirmation_is_current(&udp, &peers, &mismatched)
-                    .await,
+                !hard_hard_exact_direct_confirmation_is_current(&udp, &peers, &mismatched).await,
                 "every HardHardFreshSocketIdentity field must be authoritative"
             );
         }
-        udp.detach_all_dynamic_punch_sockets("test_exact_proof").await;
+        udp.detach_all_dynamic_punch_sockets("test_exact_proof")
+            .await;
     }
 
     #[test]
@@ -2138,7 +2356,10 @@ mod hard_hard_tests {
         assert_eq!(response.remote_profile_generation, 13);
         assert_eq!(response.local_prediction_confidence, 71);
         assert_eq!(response.remote_prediction_confidence, 83);
-        assert_eq!(HardHardCoordination::parse(&response.encode()), Some(response));
+        assert_eq!(
+            HardHardCoordination::parse(&response.encode()),
+            Some(response)
+        );
     }
 
     #[test]
@@ -2146,11 +2367,9 @@ mod hard_hard_tests {
         assert!(!HardHardCoordination::looks_like("peer-session"));
         assert!(HardHardCoordination::parse("hh1:x:token:1:2:1:2").is_none());
         assert!(HardHardCoordination::parse("hh1:i:not*hex:1:2:1:2").is_none());
-        assert!(HardHardCoordination::parse(&format!(
-            "hh1:i:{}:1:2:1:2",
-            "a".repeat(33)
-        ))
-        .is_none());
+        assert!(
+            HardHardCoordination::parse(&format!("hh1:i:{}:1:2:1:2", "a".repeat(33))).is_none()
+        );
         assert!(HardHardCoordination::parse("hh1:i:token:1:2:1:2:bad").is_none());
         assert!(HardHardCoordination::parse("hh1:i:token:1:2:1:2:1:2:extra").is_none());
     }
@@ -2211,7 +2430,10 @@ mod hard_hard_tests {
         assert_eq!(response.local_network_generation, 41);
         assert_eq!(response.remote_network_generation, 17);
         assert_eq!(response.remote_prediction_confidence, 91);
-        assert_eq!(HardHardCoordination::parse(&response.encode()), Some(response));
+        assert_eq!(
+            HardHardCoordination::parse(&response.encode()),
+            Some(response)
+        );
     }
 
     #[test]
@@ -2221,10 +2443,7 @@ mod hard_hard_tests {
             let observations = (0..4)
                 .map(|sequence| p2pnet_nat::mapping::MappingObservation {
                     sequence,
-                    observer: SocketAddr::new(
-                        "192.0.2.1".parse().unwrap(),
-                        3478 + sequence,
-                    ),
+                    observer: SocketAddr::new("192.0.2.1".parse().unwrap(), 3478 + sequence),
                     observed: SocketAddr::new(
                         "198.51.100.10".parse().unwrap(),
                         start.wrapping_add(step.wrapping_mul(sequence)),
@@ -2242,12 +2461,9 @@ mod hard_hard_tests {
                 started_at_ms: 1_000,
                 finished_at_ms: 1_100,
             };
-            let model = p2pnet_nat::mapping::build_model_for_batch(
-                &batch,
-                Duration::from_secs(5),
-                1_100,
-            )
-            .expect("the deterministic APDM sequence must model");
+            let model =
+                p2pnet_nat::mapping::build_model_for_batch(&batch, Duration::from_secs(5), 1_100)
+                    .expect("the deterministic APDM sequence must model");
             p2pnet_nat::mapping::predict_ports(&model, start.wrapping_add(step * 3))
                 .into_iter()
                 .map(|candidate| candidate.port)
@@ -2292,12 +2508,9 @@ mod hard_hard_tests {
             started_at_ms: 2_000,
             finished_at_ms: 2_010,
         };
-        let model = p2pnet_nat::mapping::build_model_for_batch(
-            &batch,
-            Duration::from_secs(5),
-            2_010,
-        )
-        .unwrap();
+        let model =
+            p2pnet_nat::mapping::build_model_for_batch(&batch, Duration::from_secs(5), 2_010)
+                .unwrap();
         let window = p2pnet_nat::mapping::predict_ports(&model, 65_532);
         assert!(!window.iter().any(|candidate| candidate.port == 0));
         assert_eq!(window.first().map(|candidate| candidate.port), Some(4));
@@ -2369,20 +2582,23 @@ mod hard_hard_tests {
         }
 
         let manager = crate::peer::PeerManager::new(
-            crate::Config::generate_default("https://ctrl.test", "hard-hard-tests")
-                .unwrap(),
+            crate::Config::generate_default("https://ctrl.test", "hard-hard-tests").unwrap(),
         );
         let first_cancel = Arc::new(crate::PunchSessionCancellation::default());
-        assert!(manager
-            .hard_hard_register_session(record(
-                "peer-session-ledger",
-                "a1",
-                first_cancel.clone()
-            ))
-            .await);
-        assert!(manager
-            .hard_hard_session_token_is_current("peer-session-ledger", "a1")
-            .await);
+        assert!(
+            manager
+                .hard_hard_register_session(record(
+                    "peer-session-ledger",
+                    "a1",
+                    first_cancel.clone()
+                ))
+                .await
+        );
+        assert!(
+            manager
+                .hard_hard_session_token_is_current("peer-session-ledger", "a1")
+                .await
+        );
         assert_eq!(
             manager
                 .hard_hard_prepare_response("peer-session-ledger", "a1", 3)
@@ -2413,38 +2629,46 @@ mod hard_hard_tests {
         );
 
         let second_cancel = Arc::new(crate::PunchSessionCancellation::default());
-        assert!(manager
-            .hard_hard_register_session(record(
-                "peer-session-ledger",
-                "b2",
-                second_cancel.clone()
-            ))
-            .await);
+        assert!(
+            manager
+                .hard_hard_register_session(record(
+                    "peer-session-ledger",
+                    "b2",
+                    second_cancel.clone()
+                ))
+                .await
+        );
         assert!(first_cancel.is_cancelled());
-        assert!(!manager
-            .hard_hard_session_token_is_current("peer-session-ledger", "a1")
-            .await);
-        assert!(manager
-            .hard_hard_session_token_is_current("peer-session-ledger", "b2")
-            .await);
+        assert!(
+            !manager
+                .hard_hard_session_token_is_current("peer-session-ledger", "a1")
+                .await
+        );
+        assert!(
+            manager
+                .hard_hard_session_token_is_current("peer-session-ledger", "b2")
+                .await
+        );
 
         for index in 0..100u64 {
             let token = format!("{index:x}");
             let cancellation = Arc::new(crate::PunchSessionCancellation::default());
-            assert!(manager
-                .hard_hard_register_session(record(
-                    "peer-session-ledger",
-                    &token,
-                    cancellation,
-                ))
-                .await);
+            assert!(
+                manager
+                    .hard_hard_register_session(
+                        record("peer-session-ledger", &token, cancellation,)
+                    )
+                    .await
+            );
         }
         manager
             .clear_hard_hard_sessions(Some("peer-session-ledger"))
             .await;
-        assert!(!manager
-            .hard_hard_session_is_active("peer-session-ledger")
-            .await);
+        assert!(
+            !manager
+                .hard_hard_session_is_active("peer-session-ledger")
+                .await
+        );
         assert!(second_cancel.is_cancelled());
     }
 }

@@ -217,7 +217,17 @@ impl Frame {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        Self::new(MSG_PING, now.to_be_bytes().to_vec())
+        Self::ping_with_timestamp(now)
+    }
+
+    /// Create a Ping frame with a caller-provided opaque echo token.
+    ///
+    /// Protocol v1 historically names the field `timestamp`, but relays do
+    /// not interpret it. Clients that measure RTT should bind the echoed token
+    /// to a local monotonic send-time expectation instead of subtracting it
+    /// from the receiving wall clock.
+    pub fn ping_with_timestamp(timestamp: u64) -> Self {
+        Self::new(MSG_PING, timestamp.to_be_bytes().to_vec())
     }
 
     /// Create a Pong frame echoing a Ping timestamp.

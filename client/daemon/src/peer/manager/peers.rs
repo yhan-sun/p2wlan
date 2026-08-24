@@ -73,6 +73,67 @@ fn push_probe_binding_compatibility_keys(
     }
 }
 
+#[cfg(test)]
+pub(crate) struct PeerMembershipPublishTestGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl PeerMembershipPublishTestGate {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+type PeerMembershipPublishTestGateSlot =
+    std::sync::Mutex<Option<(String, Arc<PeerMembershipPublishTestGate>)>>;
+
+#[cfg(test)]
+fn peer_membership_publish_test_gate_slot(
+) -> &'static PeerMembershipPublishTestGateSlot {
+    static SLOT: std::sync::OnceLock<PeerMembershipPublishTestGateSlot> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_peer_membership_publish_test_gate(
+    peer_id: &str,
+) -> Arc<PeerMembershipPublishTestGate> {
+    let gate = Arc::new(PeerMembershipPublishTestGate::new());
+    *peer_membership_publish_test_gate_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((peer_id.to_string(), gate.clone()));
+    gate
+}
+
+#[cfg(test)]
+async fn pause_after_peer_membership_publish_for_test(peer_id: &str) {
+    let gate = {
+        let mut installed = peer_membership_publish_test_gate_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if installed
+            .as_ref()
+            .is_some_and(|(expected, _)| expected == peer_id)
+        {
+            installed.take().map(|(_, gate)| gate)
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        gate.reached.notify_one();
+        gate.release.notified().await;
+    }
+}
+
 impl PeerManager {
     /// Mirror a connection's accepted remote daemon incarnation into the
     /// bounded identity ledger. Callers already own `network_epoch_gate` and
@@ -135,9 +196,9 @@ impl PeerManager {
                 RemoteCandidateIncarnationClaim::NoReset
             };
         };
-        if sender_public_key.is_some_and(|public_key| {
-            public_key.is_empty() || conn.public_key.trim() != public_key
-        }) {
+        if sender_public_key
+            .is_some_and(|public_key| public_key.is_empty() || conn.public_key.trim() != public_key)
+        {
             return RemoteCandidateIncarnationClaim::IdentityMismatch;
         }
         let Some(new_incarnation) =
@@ -145,9 +206,9 @@ impl PeerManager {
         else {
             return RemoteCandidateIncarnationClaim::NoReset;
         };
-        let Some(claim_floor) = crate::control::candidate_generation_predecessor_floor(
-            candidate_generation,
-        ) else {
+        let Some(claim_floor) =
+            crate::control::candidate_generation_predecessor_floor(candidate_generation)
+        else {
             return RemoteCandidateIncarnationClaim::NoReset;
         };
         conn.last_candidate_generation = conn.last_candidate_generation.max(claim_floor);
@@ -296,7 +357,6 @@ impl PeerManager {
         let mut unquarantine_after_lock: Option<&'static str> = None;
         let mut cancel_heartbeat_after_lock = false;
         let mut revoke_relay_after_lock = false;
-        let mut reset_remote_fresh_after_lock: Option<&'static str> = None;
         let mut clear_hard_hard_after_lock = false;
         let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
@@ -314,6 +374,11 @@ impl PeerManager {
         let old_public_key = conn.public_key.clone();
         let old_signaled_endpoint = conn.signaled_endpoint;
         let old_online = conn.online;
+        let old_device_name = conn.device_name.clone();
+        let old_app_version = conn.app_version.clone();
+        let old_nat_type = conn.nat_type.clone();
+        let old_last_seen = conn.last_seen;
+        let old_remote_relay_rtt_ms = conn.remote_relay_rtt_ms;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
 
@@ -347,11 +412,7 @@ impl PeerManager {
         // would be judged stale against it forever. The identity ledger survives
         // `remove_peer`, so the comparison works even when the connection was
         // recreated.
-        let (
-            identity_changed,
-            retained_candidate_incarnation,
-            retained_candidate_generation,
-        ) = {
+        let (identity_changed, retained_candidate_incarnation, retained_candidate_generation) = {
             let mut identities = self
                 .remote_identity_ledger
                 .lock()
@@ -398,14 +459,20 @@ impl PeerManager {
         conn.last_candidate_generation = retained_candidate_generation;
         if identity_changed {
             clear_hard_hard_after_lock = true;
-            // Fresh-generation cleanup takes its own mutexes and emits a
-            // diagnostic event. Defer it until the peer/ip write guards are
-            // released so a slow cleanup can never stop control-event intake.
-            reset_remote_fresh_after_lock = Some(if public_key_changed {
-                "public_key_changed"
-            } else {
-                "identity_key_changed_on_rejoin"
-            });
+            // Clear the old identity's fresh high-water before membership for
+            // the replacement is published below.  Unknown-peer responder work
+            // wakes from that publication without taking `connections`; if the
+            // reset were deferred until after publication, the new identity's
+            // first (lower) prediction could be judged stale against the old
+            // key's high-water and be lost permanently.
+            self.reset_remote_fresh_generation_sync(
+                &info.node_id,
+                if public_key_changed {
+                    "public_key_changed"
+                } else {
+                    "identity_key_changed_on_rejoin"
+                },
+            );
         }
         conn.nat_type = info.nat_type.clone();
         // An explicit offline transition revokes RelayPeerConfirmed: the peer
@@ -434,6 +501,16 @@ impl PeerManager {
             }
         };
         let endpoint_changed = !is_new && old_signaled_endpoint != signaled_endpoint;
+        let last_seen_only = !is_new
+            && old_last_seen != info.last_seen
+            && !virtual_ip_changed
+            && !public_key_changed
+            && !endpoint_changed
+            && old_device_name == info.device_name
+            && old_app_version == info.app_version
+            && old_nat_type == info.nat_type
+            && old_online == info.online
+            && old_remote_relay_rtt_ms == info.relay_rtt_ms;
         // PeerUpdated may carry a new host/private endpoint while an
         // encrypted-confirmed public pair is live. Keep the confirmed pair as
         // the active endpoint; the new value remains in signaled_endpoint and
@@ -493,8 +570,7 @@ impl PeerManager {
         // v0.1.110 nodes kept restarting 404 grace and quarantine churn on
         // every control-plane heartbeat while their relay registration was
         // permanently absent).
-        let clear_relay_not_found_grace_after_lock = info.online
-            && (is_new || public_key_changed);
+        let clear_relay_not_found_grace_after_lock = info.online && (is_new || public_key_changed);
 
         // Authoritative recovery re-open for a quarantined peer is limited to
         // identity/incarnation change (public-key rotation) and new
@@ -512,10 +588,11 @@ impl PeerManager {
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
-        // Publish only after the connection is fully initialized. The
-        // process-local generation rotates at every structural/identity/online
-        // lifecycle boundary, but ordinary metadata and endpoint churn retain
-        // the same authenticated session identity.
+        // Publish membership only after the connection is fully initialized.
+        // Readers of the no-await mirror may then safely dispatch candidate
+        // work without mistaking an in-progress PeerJoined for a ready peer.
+        // Rotate the process-local generation only at a structural, identity,
+        // or online lifecycle boundary; metadata and endpoint churn retain it.
         let rotate_peer_session = is_new || public_key_changed || old_online != info.online;
         let published = self
             .peer_membership
@@ -528,12 +605,11 @@ impl PeerManager {
                 info.node_id
             );
         }
+        #[cfg(test)]
+        pause_after_peer_membership_publish_for_test(&info.node_id).await;
         drop(conns);
         drop(ip_map);
         drop(epoch_guard);
-        if let Some(reason) = reset_remote_fresh_after_lock {
-            self.reset_remote_fresh_generation(&info.node_id, reason).await;
-        }
         if clear_hard_hard_after_lock {
             self.clear_hard_hard_sessions(Some(&info.node_id)).await;
         }
@@ -554,6 +630,7 @@ impl PeerManager {
             virtual_ip_changed,
             endpoint_changed,
             public_key_changed,
+            last_seen_only,
         }
     }
 
@@ -568,6 +645,15 @@ impl PeerManager {
         let (removed_virtual_ip, removed_relay_expectation) = {
             let epoch_gate = self.network_epoch_gate();
             let _epoch_guard = epoch_gate.lock().await;
+            // PeerLeft is an authoritative quarantine lifecycle boundary.
+            // Remove both the backoff metadata and the no-await dataplane
+            // mirror under the same epoch used for membership removal, before
+            // any later re-add can publish the replacement lifecycle.
+            self.quarantined_peers.lock().await.remove(node_id);
+            self.quarantine_deadline_mirror
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id);
             let mut conns = self.connections.write().await;
             if let Some(conn) = conns.get(node_id) {
                 self.remote_identity_ledger
@@ -580,8 +666,10 @@ impl PeerManager {
                         conn.last_candidate_generation,
                     );
             }
-            // This is the lifecycle linearization point. No later no-await
-            // authentication/adoption check may observe the removed peer.
+            // This is the lifecycle linearization point: once the mirror is
+            // cleared, no new UDP adoption or control candidate work may treat
+            // the old connection as present, even though physical map cleanup
+            // follows immediately under the same writer.
             self.peer_membership
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -613,11 +701,6 @@ impl PeerManager {
         }
         self.cancel_relay_backoff_heartbeat(node_id);
         self.clear_relay_not_found_grace(node_id).await;
-        // A PeerLeft is authoritative evidence that the peer's incarnation is
-        // gone: drop any relay-404 quarantine so a later rejoin (a NEW node
-        // ID / registration) starts clean instead of inheriting the dead
-        // incarnation's isolation.
-        self.quarantined_peers.lock().await.remove(node_id);
         self.direct_peers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -648,9 +731,51 @@ impl PeerManager {
                 false
             }
         };
-        if updated && !matches!(state, ConnectionState::Relay | ConnectionState::FallbackToRelay) {
+        if updated
+            && !matches!(
+                state,
+                ConnectionState::Relay | ConnectionState::FallbackToRelay
+            )
+        {
             self.cancel_relay_backoff_heartbeat(node_id);
         }
+    }
+
+    /// Transition connection state only for the exact online peer lifecycle
+    /// that admitted delayed handshake work. The epoch gate makes the
+    /// generation check and connection mutation one commit, so a same-node
+    /// leave/rejoin cannot receive the old task's state transition.
+    pub(crate) async fn update_state_if_peer_session_current(
+        &self,
+        node_id: &str,
+        expected: PeerSessionGeneration,
+        state: ConnectionState,
+    ) -> bool {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if !self.peer_session_is_current_sync(node_id, expected) {
+            return false;
+        }
+        let updated = {
+            let mut conns = self.connections.write().await;
+            let Some(conn) = conns.get_mut(node_id) else {
+                return false;
+            };
+            if !conn.online || conn.state == ConnectionState::Closed {
+                return false;
+            }
+            conn.transition(state);
+            true
+        };
+        if updated
+            && !matches!(
+                state,
+                ConnectionState::Relay | ConnectionState::FallbackToRelay
+            )
+        {
+            self.cancel_relay_backoff_heartbeat(node_id);
+        }
+        updated
     }
 
     /// Atomically re-check the state observed before an asynchronous punch
@@ -922,12 +1047,7 @@ impl PeerManager {
                 metadata,
                 &detail,
             );
-            self.emit_timeline_debug(
-                event,
-                Some("direct"),
-                reason_code,
-                Some(timeline_detail),
-            );
+            self.emit_timeline_debug(event, Some("direct"), reason_code, Some(timeline_detail));
         }
     }
 
@@ -1051,15 +1171,18 @@ impl PeerManager {
         if conn.pending_probe_bindings.len() >= MAX_PENDING_PROBE_SESSION_BINDINGS_PER_PEER {
             return ProbeBindingStage::Busy;
         }
-        conn.pending_probe_bindings.insert(token.clone(), PendingProbeSessionBinding {
-            binding: ProbeSessionBinding {
-                token: Some(token),
-                session_id: normalize_probe_session_id(session_id),
-                ephemeral_shared,
+        conn.pending_probe_bindings.insert(
+            token.clone(),
+            PendingProbeSessionBinding {
+                binding: ProbeSessionBinding {
+                    token: Some(token),
+                    session_id: normalize_probe_session_id(session_id),
+                    ephemeral_shared,
+                },
+                expires_at: now + PENDING_PROBE_SESSION_BINDING_GRACE,
+                promote_on_match,
             },
-            expires_at: now + PENDING_PROBE_SESSION_BINDING_GRACE,
-            promote_on_match,
-        });
+        );
         ProbeBindingStage::Staged
     }
 
@@ -1576,7 +1699,10 @@ mod direct_validation_timeline_tests {
             direct_validation_timeline_event("direct_validation_timed_out"),
             Some("direct_validation_timed_out")
         );
-        assert_eq!(direct_validation_timeline_event("birthday_probe_sent"), None);
+        assert_eq!(
+            direct_validation_timeline_event("birthday_probe_sent"),
+            None
+        );
         assert_eq!(
             direct_validation_default_reason("direct_validation_timed_out"),
             Some("direct_validation_timeout")

@@ -232,7 +232,10 @@ async fn remote_incarnation_cleanup_and_finish_are_one_adoption_transaction() {
     let generation = peers.current_network_generation().await;
     let (stale_punch, _stale_nonce) =
         build_authenticated_punch_packet("peer-b", "peer-a", generation, &probe_key);
-    stale_sender.send_to(&stale_punch, local_addr).await.unwrap();
+    stale_sender
+        .send_to(&stale_punch, local_addr)
+        .await
+        .unwrap();
     timeout(Duration::from_secs(1), verify_gate.reached.notified())
         .await
         .expect("old packet must pause after MAC verification");
@@ -282,12 +285,18 @@ async fn remote_incarnation_cleanup_and_finish_are_one_adoption_transaction() {
     let fresh_source = fresh_sender.local_addr().unwrap();
     let (fresh_punch, fresh_nonce) =
         build_authenticated_punch_packet("peer-b", "peer-a", generation, &probe_key);
-    fresh_sender.send_to(&fresh_punch, local_addr).await.unwrap();
-    let mut fresh_ack = [0u8; 512];
-    let (n, _) = timeout(Duration::from_secs(1), fresh_sender.recv_from(&mut fresh_ack))
+    fresh_sender
+        .send_to(&fresh_punch, local_addr)
         .await
-        .expect("current-lifecycle packet must receive an ACK")
         .unwrap();
+    let mut fresh_ack = [0u8; 512];
+    let (n, _) = timeout(
+        Duration::from_secs(1),
+        fresh_sender.recv_from(&mut fresh_ack),
+    )
+    .await
+    .expect("current-lifecycle packet must receive an ACK")
+    .unwrap();
     let ack = decode_authenticated_punch_packet(&fresh_ack[..n], &probe_key).unwrap();
     assert_eq!(ack.kind, PunchPacketKind::Ack);
     assert_eq!(ack.nonce, fresh_nonce);
@@ -733,9 +742,7 @@ async fn authenticated_pending_probe_promotes_matching_wireguard_and_probe_trans
         crate::transport::ResponderSessionStage::Staged { had_active: true }
     );
     assert_eq!(
-        wireguard
-            .commit_responder_session("peer-b", "txn-1")
-            .await,
+        wireguard.commit_responder_session("peer-b", "txn-1").await,
         crate::transport::ResponderSessionCommit::PendingConfirmation
     );
 
@@ -748,10 +755,12 @@ async fn authenticated_pending_probe_promotes_matching_wireguard_and_probe_trans
         peers.probe_key_for_peer("peer-b").await,
         Some(pending_probe_key)
     );
-    assert!(!wireguard
-        .session_status("peer-b")
-        .await
-        .has_pending_responder);
+    assert!(
+        !wireguard
+            .session_status("peer-b")
+            .await
+            .has_pending_responder
+    );
 
     let packet = Ipv4Packet::build_icmp_echo_request(
         Ipv4Addr::new(10, 20, 0, 1),
@@ -770,7 +779,9 @@ async fn authenticated_pending_probe_promotes_matching_wireguard_and_probe_trans
         .unwrap()
         .unwrap();
     assert_eq!(
-        new_remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        new_remote
+            .decrypt_from_bytes(&encrypted.wire_bytes)
+            .unwrap(),
         packet
     );
 }
@@ -813,10 +824,14 @@ async fn pending_probe_cannot_promote_without_matching_wireguard_token() {
         .await
         .unwrap()
         .with_wireguard_transport(wireguard);
-    assert!(!udp
-        .confirm_pending_probe_adoption("peer-b", "missing-wg")
-        .await);
-    assert_eq!(peers.probe_key_for_peer("peer-b").await, Some(old_probe_key));
+    assert!(
+        !udp.confirm_pending_probe_adoption("peer-b", "missing-wg")
+            .await
+    );
+    assert_eq!(
+        peers.probe_key_for_peer("peer-b").await,
+        Some(old_probe_key)
+    );
     assert!(peers
         .probe_key_candidates_for_peer("peer-b")
         .await
@@ -831,16 +846,23 @@ async fn missing_probe_transaction_cannot_partially_promote_wireguard() {
     let token = "missing-probe-side";
     let (peers, wireguard, udp, old_probe_key, _pending_probe_key) =
         pending_probe_inbound_fixture(token).await;
-    assert!(peers
-        .discard_pending_probe_session_binding("peer-b", token)
-        .await);
+    assert!(
+        peers
+            .discard_pending_probe_session_binding("peer-b", token)
+            .await
+    );
 
     assert!(!udp.confirm_pending_probe_adoption("peer-b", token).await);
-    assert_eq!(peers.probe_key_for_peer("peer-b").await, Some(old_probe_key));
-    assert!(wireguard
-        .session_status("peer-b")
-        .await
-        .has_pending_responder);
+    assert_eq!(
+        peers.probe_key_for_peer("peer-b").await,
+        Some(old_probe_key)
+    );
+    assert!(
+        wireguard
+            .session_status("peer-b")
+            .await
+            .has_pending_responder
+    );
 }
 
 async fn pending_probe_inbound_fixture(
@@ -941,14 +963,32 @@ async fn accepted_pending_probe_punch_promotes_only_after_admission() {
     assert_eq!(ack.kind, PunchPacketKind::Ack);
     assert_eq!(ack.nonce, nonce);
 
+    // The receive path intentionally emits the NAT-window ACK before endpoint
+    // learning and probe bookkeeping. Wait for the admitted transaction to
+    // finish instead of treating ACK delivery as completion of those later
+    // local mutations.
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let conn = peers.get_connection("peer-b").await.unwrap();
+            if conn.endpoint == Some(sender_addr) && conn.direct_health.success_count > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted pending Probe punch must finish endpoint and health adoption");
+
     assert_eq!(
         peers.probe_key_for_peer("peer-b").await,
         Some(pending_probe_key)
     );
-    assert!(!wireguard
-        .session_status("peer-b")
-        .await
-        .has_pending_responder);
+    assert!(
+        !wireguard
+            .session_status("peer-b")
+            .await
+            .has_pending_responder
+    );
     let conn = peers.get_connection("peer-b").await.unwrap();
     assert_eq!(conn.endpoint, Some(sender_addr));
     assert!(conn.direct_health.success_count > 0);
@@ -990,11 +1030,16 @@ async fn replayed_pending_probe_punch_is_not_acked_or_promoted() {
             .is_err()
     );
 
-    assert_eq!(peers.probe_key_for_peer("peer-b").await, Some(old_probe_key));
-    assert!(wireguard
-        .session_status("peer-b")
-        .await
-        .has_pending_responder);
+    assert_eq!(
+        peers.probe_key_for_peer("peer-b").await,
+        Some(old_probe_key)
+    );
+    assert!(
+        wireguard
+            .session_status("peer-b")
+            .await
+            .has_pending_responder
+    );
     let conn = peers.get_connection("peer-b").await.unwrap();
     assert_eq!(conn.endpoint, None);
     assert_eq!(conn.direct_health.success_count, 0);
@@ -1046,10 +1091,7 @@ async fn pending_probe_ack_requires_authenticated_ack_admission() {
 
     timeout(Duration::from_secs(1), async {
         loop {
-            if udp.socket_pool_diagnostics().await[0]
-                .authenticated_probe_acks_unmatched
-                >= 1
-            {
+            if udp.socket_pool_diagnostics().await[0].authenticated_probe_acks_unmatched >= 1 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1058,16 +1100,24 @@ async fn pending_probe_ack_requires_authenticated_ack_admission() {
     .await
     .unwrap();
 
-    assert_eq!(peers.probe_key_for_peer("peer-b").await, Some(old_probe_key));
-    assert!(wireguard
-        .session_status("peer-b")
-        .await
-        .has_pending_responder);
+    assert_eq!(
+        peers.probe_key_for_peer("peer-b").await,
+        Some(old_probe_key)
+    );
+    assert!(
+        wireguard
+            .session_status("peer-b")
+            .await
+            .has_pending_responder
+    );
     assert!(udp.pending_probes.lock().await.contains_key(&nonce));
     let conn = peers.get_connection("peer-b").await.unwrap();
     assert_eq!(conn.endpoint, None);
     assert_eq!(conn.direct_health.success_count, 0);
-    assert_eq!(udp.socket_pool_diagnostics().await[0].probe_acks_received, 0);
+    assert_eq!(
+        udp.socket_pool_diagnostics().await[0].probe_acks_received,
+        0
+    );
 
     worker.abort();
 }
@@ -1123,11 +1173,17 @@ async fn unavailable_pending_probe_ack_keeps_nonce_without_learning_direct() {
     .unwrap();
 
     assert!(udp.pending_probes.lock().await.contains_key(&nonce));
-    assert_eq!(peers.probe_key_for_peer("peer-b").await, Some(old_probe_key));
+    assert_eq!(
+        peers.probe_key_for_peer("peer-b").await,
+        Some(old_probe_key)
+    );
     let conn = peers.get_connection("peer-b").await.unwrap();
     assert_eq!(conn.endpoint, None);
     assert_eq!(conn.direct_health.success_count, 0);
-    assert_eq!(udp.socket_pool_diagnostics().await[0].probe_acks_received, 0);
+    assert_eq!(
+        udp.socket_pool_diagnostics().await[0].probe_acks_received,
+        0
+    );
 
     worker.abort();
 }
@@ -1165,21 +1221,13 @@ async fn expired_authenticated_probe_ack_is_terminal_and_cannot_learn_direct() {
 
     let (tx, _rx) = mpsc::channel(4);
     let worker = tokio::spawn(udp.clone().run_inbound(tx));
-    let ack = build_authenticated_punch_ack(
-        nonce,
-        "peer-b",
-        "peer-a",
-        generation,
-        &pending_probe_key,
-    );
+    let ack =
+        build_authenticated_punch_ack(nonce, "peer-b", "peer-a", generation, &pending_probe_key);
     sender.send_to(&ack, local_addr).await.unwrap();
 
     timeout(Duration::from_secs(1), async {
         loop {
-            if udp.socket_pool_diagnostics().await[0]
-                .authenticated_probe_acks_unmatched
-                >= 1
-            {
+            if udp.socket_pool_diagnostics().await[0].authenticated_probe_acks_unmatched >= 1 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1222,7 +1270,10 @@ async fn unavailable_pending_probe_transaction_is_not_acked_or_learned() {
             .await
             .is_err()
     );
-    assert_eq!(peers.probe_key_for_peer("peer-b").await, Some(old_probe_key));
+    assert_eq!(
+        peers.probe_key_for_peer("peer-b").await,
+        Some(old_probe_key)
+    );
     assert!(peers
         .probe_key_candidates_for_peer("peer-b")
         .await

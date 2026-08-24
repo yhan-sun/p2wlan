@@ -232,6 +232,7 @@ mod tests {
             None,
             Some("diag-test-token".to_string()),
         );
+        let context_probe = context.clone();
         let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));
 
         let mut health_stream = TcpStream::connect(addr).await.unwrap();
@@ -299,6 +300,30 @@ mod tests {
         assert_eq!(snapshot.node_id, "node-a");
         assert_eq!(snapshot.network_generation, 0);
         assert_eq!(
+            snapshot.captured_revision, snapshot.revision,
+            "peer data must carry the exact revision it was captured under"
+        );
+        assert_eq!(snapshot.peers.len(), 1);
+        assert!(snapshot.peer_snapshot_shape.starts_with("v1:"));
+        assert!(!snapshot.peer_snapshot_stale);
+        assert!(snapshot.captured_at_ms <= snapshot.uptime_ms);
+        assert!(snapshot.peer_snapshot_age_ms <= snapshot.uptime_ms);
+        {
+            let cache = context_probe
+                .peer_snapshot_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cached = cache.as_ref().expect("validated peer capture is cached");
+            assert_eq!(cached.capture_revision, snapshot.captured_revision);
+            assert_eq!(cached.captured_at_ms, snapshot.captured_at_ms);
+            assert_eq!(cached.peers.len(), snapshot.peers.len());
+            assert_eq!(cached.shape, snapshot.peer_snapshot_shape);
+            assert!(
+                cached.captured_at.elapsed().as_millis()
+                    >= snapshot.peer_snapshot_age_ms as u128
+            );
+        }
+        assert_eq!(
             snapshot.protocol.handshake,
             "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
         );
@@ -337,6 +362,30 @@ mod tests {
             .as_ref()
             .expect("current path selection should be included in /status");
         assert_eq!(current_path.reason_code, REASON_PATH_UNAVAILABLE);
+
+        let mut events_stream = TcpStream::connect(addr).await.unwrap();
+        let previous_process_id = std::process::id().wrapping_add(1);
+        events_stream
+            .write_all(
+                format!(
+                    "GET /events?since={}&process_id={} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\n\r\n",
+                    snapshot.revision, previous_process_id
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut events_response = String::new();
+        events_stream
+            .read_to_string(&mut events_response)
+            .await
+            .unwrap();
+        assert!(events_response.starts_with("HTTP/1.1 200 OK"));
+        let events_body = events_response.split("\r\n\r\n").nth(1).unwrap();
+        let events: EventsResponse = serde_json::from_str(events_body).unwrap();
+        assert_eq!(events.process_id, std::process::id());
+        assert_eq!(events.revision, snapshot.revision);
+        assert!(events.reset_required);
 
         let mut scoped_stream = TcpStream::connect(addr).await.unwrap();
         scoped_stream
@@ -447,5 +496,49 @@ mod tests {
         assert!(authed_shutdown_response.contains("shutting down"));
 
         worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_peer_diagnostics_shape_is_rejected_after_live_health_change() {
+        let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        let peers = PeerManager::new(config);
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "node-shape".to_string(),
+                device_name: "Shape peer".to_string(),
+                app_version: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: "127.0.0.1:51820".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                last_seen: 1,
+                relay_rtt_ms: None,
+            })
+            .await;
+        let stale = peers
+            .diagnostics_with_path_selection(
+                true,
+                false,
+                DIRECT_RETRY_BASE_INTERVAL,
+                None,
+            )
+            .await;
+        assert!(peer_snapshot_core_matches(
+            &stale,
+            &peers.all_connections().await
+        ));
+
+        peers
+            .record_direct_failure_with_code(
+                "node-shape",
+                REASON_DIRECT_PROBE_FAILED,
+                "shape changed",
+            )
+            .await;
+        assert!(
+            !peer_snapshot_core_matches(&stale, &peers.all_connections().await),
+            "an old cached latency/health shape must not validate against current peer state"
+        );
     }
 }

@@ -73,6 +73,11 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 continue;
             }
             let handshake_guard = handshake_arbiter.acquire(&conn.node_id).await;
+            let Some(peer_session_generation) =
+                peers.peer_session_generation_sync(&conn.node_id)
+            else {
+                continue;
+            };
             // Establish missing sessions and refresh sessions that need rekey.
             let status = transport.session_status(&conn.node_id).await;
             if status.has_pending_responder {
@@ -111,32 +116,37 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             let stale_session_id = pending
                 .lock()
                 .await
-                .remove_stale_pending_for_generation(&conn.node_id, handshake_generation);
+                .remove_stale_pending_for_generation(
+                    &conn.node_id,
+                    handshake_generation,
+                    peer_session_generation,
+                );
             if let Some(session_id) = stale_session_id {
                 peers
                     .discard_pending_probe_session_binding(&conn.node_id, &session_id)
                     .await;
             }
-            let reserved = {
+            let Some(reservation) = ({
                 let mut state = pending.lock().await;
-                if !state.reserve_start_at_generation(&conn.node_id, handshake_generation) {
-                    false
-                } else {
-                    if state.attempts.get(&conn.node_id).copied().unwrap_or(0)
+                let reservation = state.reserve_start_with_owner_at_generation(
+                    &conn.node_id,
+                    handshake_generation,
+                    peer_session_generation,
+                );
+                if reservation.is_some()
+                    && state.attempts.get(&conn.node_id).copied().unwrap_or(0)
                         >= MAX_HANDSHAKE_ATTEMPTS
-                    {
-                        warn!(
-                            "Handshake for {} reached max attempts; resetting retry budget",
-                            conn.node_id
-                        );
-                        state.attempts.remove(&conn.node_id);
-                    }
-                    true
+                {
+                    warn!(
+                        "Handshake for {} reached max attempts; resetting retry budget",
+                        conn.node_id
+                    );
+                    state.attempts.remove(&conn.node_id);
                 }
-            };
-            if !reserved {
+                reservation
+            }) else {
                 continue;
-            }
+            };
 
             // PeerConnection doesn't store public key; look up from control.
             // Best-effort: if control has the peer, use it.
@@ -145,28 +155,43 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // the peer may also rekey from its side.
             let control_peers = control.peers().await;
             let Some(peer_info) = control_peers.get(&conn.node_id) else {
-                pending.lock().await.cancel_reservation(&conn.node_id);
+                pending
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 debug!("No control peer info for handshake with {}", conn.node_id);
                 continue;
             };
             let Ok(private_key) = decode_x25519_key(&node_private_key, "node private key") else {
-                pending.lock().await.cancel_reservation(&conn.node_id);
+                pending
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 continue;
             };
             let Ok(peer_public) = decode_x25519_key(&peer_info.public_key, "peer public key")
             else {
-                pending.lock().await.cancel_reservation(&conn.node_id);
+                pending
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 continue;
             };
             let identity = NodeIdentity::from_private_key(private_key);
             if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
                 // Let the deterministically selected peer initiate.
-                pending.lock().await.cancel_reservation(&conn.node_id);
+                pending
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 continue;
             }
             let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
             let Ok(initiation) = initiator.create_initiation() else {
-                pending.lock().await.cancel_reservation(&conn.node_id);
+                pending
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 continue;
             };
             let initiation_bytes = initiation.to_bytes();
@@ -238,14 +263,23 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // rekey. This avoids a brief no-session window that pushes traffic
             // through relay during otherwise healthy Direct paths.
             let current_status = transport.session_status(&conn.node_id).await;
-            if should_cancel_maintenance_offer(
+            if *reservation.cancellation.borrow()
+                || !peers.peer_session_is_current_sync(
+                    &conn.node_id,
+                    reservation.peer_session_generation,
+                )
+                || should_cancel_maintenance_offer(
                 is_rekey,
                 current_status.has_active,
                 current_status.needs_rekey,
                 current_status.expired,
                 current_status.has_pending_responder,
-            ) {
-                pending.lock().await.cancel_reservation(&conn.node_id);
+            )
+            {
+                pending
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 continue;
             }
 
@@ -254,18 +288,28 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             let Some((attempt_no, pending_id)) = ({
                 let epoch_gate = peers.network_epoch_gate();
                 let _epoch_guard = epoch_gate.lock().await;
-                if peers.current_network_generation_sync() != handshake_generation {
-                    pending.lock().await.cancel_reservation(&conn.node_id);
+                if peers.current_network_generation_sync() != handshake_generation
+                    || !peers.peer_session_is_current_sync(
+                        &conn.node_id,
+                        reservation.peer_session_generation,
+                    )
+                {
+                    pending
+                        .lock()
+                        .await
+                        .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                     continue;
                 }
                 let mut state = pending.lock().await;
                 state
-                    .insert_reserved_with_generation(
+                    .insert_reserved_if_current_with_generation(
                         conn.node_id.clone(),
+                        reservation.owner,
                         initiator,
                         Some(session_id.clone()),
                         Some(probe_ephemeral),
                         handshake_generation,
+                        reservation.peer_session_generation,
                     )
                     .map(|pending_id| {
                         let attempts = state.attempts.entry(conn.node_id.clone()).or_insert(0);
@@ -358,26 +402,19 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 HANDSHAKE_TIMEOUT_SECS
             };
             let generation = handshake_generation;
+            let timeout_peer_session_generation = reservation.peer_session_generation;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
-                let status = transport2.session_status(&timeout_peer).await;
-                if !is_rekey && !status.has_active {
-                    warn!("Handshake timeout for peer {timeout_peer}");
-                    peers2
-                        .record_direct_failure_for_generation(
-                            &timeout_peer,
-                            generation,
-                            REASON_HANDSHAKE_TIMEOUT,
-                            "handshake timed out",
-                        )
-                        .await;
-                    peers2
-                        .mark_recovery_relay_backoff(&timeout_peer, "handshake timed out")
-                        .await;
-                }
+                // The pending owner is the timeout's first authority. Remove
+                // only that exact transaction before publishing any failure;
+                // an answer/retry/rejoin that replaced it makes this task a
+                // no-op. The stored lifecycle stamp closes the same-node ABA.
                 let removed = {
                     let mut state = pending2.lock().await;
-                    if state.is_current(&timeout_peer, pending_id) {
+                    if state.is_current(&timeout_peer, pending_id)
+                        && state.peer_session_generation(&timeout_peer)
+                            == Some(timeout_peer_session_generation)
+                    {
                         state.remove(&timeout_peer);
                         if attempt_no >= MAX_HANDSHAKE_ATTEMPTS {
                             state.attempts.remove(&timeout_peer);
@@ -387,11 +424,47 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                         false
                     }
                 };
-                if removed {
-                    peers2
-                        .discard_pending_probe_session_binding(&timeout_peer, &timeout_session_id)
-                        .await;
+                if !removed {
+                    return;
                 }
+
+                if peers2.peer_session_is_current_sync(
+                    &timeout_peer,
+                    timeout_peer_session_generation,
+                ) {
+                    let status = transport2.session_status(&timeout_peer).await;
+                    if !is_rekey
+                        && !status.has_active
+                        && peers2.peer_session_is_current_sync(
+                            &timeout_peer,
+                            timeout_peer_session_generation,
+                        )
+                    {
+                        warn!("Handshake timeout for peer {timeout_peer}");
+                        let failed = peers2
+                            .record_direct_failure_for_generation_and_peer_session_with_local_endpoint(
+                                &timeout_peer,
+                                generation,
+                                timeout_peer_session_generation,
+                                REASON_HANDSHAKE_TIMEOUT,
+                                "handshake timed out",
+                                None,
+                            )
+                            .await;
+                        if failed {
+                            peers2
+                                .mark_recovery_relay_backoff_for_peer_session(
+                                    &timeout_peer,
+                                    timeout_peer_session_generation,
+                                    "handshake timed out",
+                                )
+                                .await;
+                        }
+                    }
+                }
+                peers2
+                    .discard_pending_probe_session_binding(&timeout_peer, &timeout_session_id)
+                    .await;
             });
         }
     }

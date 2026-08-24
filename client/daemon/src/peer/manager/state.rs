@@ -223,7 +223,7 @@ pub struct PeerManager {
     ///
     /// The serial control-signal consumer must be able to decide whether an
     /// offer raced PeerJoined without waiting behind an unrelated, long-lived
-    /// `connections` writer. The same mirror also gives UDP adoption paths a
+    /// `connections` writer.  The same mirror also gives UDP adoption paths a
     /// precise lifecycle fence instead of treating `try_read` contention as a
     /// missing peer. Structural add/remove, identity, online, and remote
     /// incarnation transitions update this state while they own the network
@@ -286,10 +286,10 @@ pub struct PeerManager {
     /// to the four generation domains and the exact dynamic socket that was
     /// measured.  Entries are short-lived and bounded; they are not a path
     /// selector or a Direct authority.
-    hard_hard_sessions:
-        Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
+    hard_hard_sessions: Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
     /// Time-limited prediction-error fingerprint per peer.
-    fresh_mapping_history: Arc<std::sync::Mutex<HashMap<String, VecDeque<FreshMappingPredictionResult>>>>,
+    fresh_mapping_history:
+        Arc<std::sync::Mutex<HashMap<String, VecDeque<FreshMappingPredictionResult>>>>,
     /// Per-peer high-water of the remote's fresh-mapping prediction identity.
     ///
     /// The remote signals fresh predictions as `predicted_fresh:<boot>:<gen>`.
@@ -299,8 +299,7 @@ pub struct PeerManager {
     /// high-water follows the peer's incarnation: public-key identity changes
     /// reset it, while a plain PeerLeft does not (a late old-incarnation
     /// signal must stay rejected after the peer rejoins).
-    remote_fresh_generations:
-        Arc<std::sync::Mutex<HashMap<String, crate::FreshPredictionId>>>,
+    remote_fresh_generations: Arc<std::sync::Mutex<HashMap<String, crate::FreshPredictionId>>>,
     /// Immutable candidate snapshots bound to committed fresh identities.
     ///
     /// An idempotent retry of an identity can only ever punch toward the
@@ -313,6 +312,15 @@ pub struct PeerManager {
     /// commit can roll exactly its own candidates back.
     pending_fresh_applies:
         Arc<std::sync::Mutex<HashMap<(String, crate::FreshPredictionId), PendingFreshApply>>>,
+    /// Serializes one remote fresh-prediction apply + commit transaction.
+    ///
+    /// `prepare` is intentionally optimistic, so two control workers can both
+    /// observe an admissible identity.  Only one of them may replace the live
+    /// candidate set before the durable high-water is committed; otherwise a
+    /// late older apply can erase the newer winner and then lose its CAS.  The
+    /// production transaction re-checks the high-water while holding this gate
+    /// and keeps it through apply + commit/rollback.
+    remote_fresh_transaction_gate: Arc<tokio::sync::Mutex<()>>,
     /// Bounded identity tombstones surviving `remove_peer`.
     ///
     /// The remote fresh-prediction space is bound to the peer's identity: a
@@ -389,14 +397,22 @@ pub struct PeerManager {
     /// one-directional traffic (audit P0-4).
     path_commit_expectations:
         Arc<std::sync::Mutex<HashMap<String, crate::path_commit::PathCommitExpectation>>>,
-    /// Authoritative stale-peer quarantine state (relay 404 isolation).
+    /// Stale-peer quarantine metadata (relay 404 reason/backoff history).
+    ///
+    /// Dataplane admission never reads this async map: benign Tokio-lock
+    /// contention must not turn an active quarantine into a false negative.
     quarantined_peers: Arc<tokio::sync::Mutex<HashMap<String, PeerQuarantineState>>>,
+    /// Authoritative no-await quarantine deadline mirror.
+    ///
+    /// Quarantine, unquarantine, and peer removal publish this map while they
+    /// own `network_epoch_gate`; synchronous relay/UDP admission paths take
+    /// this ordinary mutex and therefore cannot fail open on lock contention.
+    quarantine_deadline_mirror: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     /// Short-lived relay registration grace state. A relay `peer_not_found`
     /// can race a reconnect/handoff while control still reports the same
     /// incarnation online; keep the active recovery alive until this bounded
     /// confirmation window expires.
-    relay_not_found_grace:
-        Arc<tokio::sync::Mutex<HashMap<String, RelayNotFoundGraceState>>>,
+    relay_not_found_grace: Arc<tokio::sync::Mutex<HashMap<String, RelayNotFoundGraceState>>>,
     /// Hook cancelling an active punch session when a peer is quarantined;
     /// registered by the daemon with its `PunchAttemptDeduplicator`.
     punch_cancel_hook: PunchCancelHookSlot,
@@ -414,9 +430,8 @@ pub struct PeerManager {
     /// without log greps.  The daemon shares the SAME sink with the WireGuard
     /// transport (session-not-ready queue loss) so one `/status.stats` shows
     /// every loss source.
-    outbound_loss_slot: Arc<
-        std::sync::Mutex<Option<Arc<tokio::sync::Mutex<OutboundLossCounters>>>>,
-    >,
+    outbound_loss_slot:
+        Arc<std::sync::Mutex<Option<Arc<tokio::sync::Mutex<OutboundLossCounters>>>>>,
     outbound_loss_default: Arc<tokio::sync::Mutex<OutboundLossCounters>>,
     /// Configuration.
     config: Config,
@@ -468,6 +483,9 @@ pub struct PeerUpdate {
     pub virtual_ip_changed: bool,
     pub endpoint_changed: bool,
     pub public_key_changed: bool,
+    /// The control-plane heartbeat advanced only user-visible liveness time;
+    /// no identity, reachability, NAT, path or relay metadata changed.
+    pub last_seen_only: bool,
 }
 
 fn derive_probe_mac_key(config: &Config, peer_public_key: &str) -> Option<ProbeMacKey> {
@@ -499,10 +517,7 @@ fn derive_ephemeral_session_probe_mac_key(
     hmac(base_key, &input)
 }
 
-fn probe_mac_key_for_binding(
-    base_key: ProbeMacKey,
-    binding: &ProbeSessionBinding,
-) -> ProbeMacKey {
+fn probe_mac_key_for_binding(base_key: ProbeMacKey, binding: &ProbeSessionBinding) -> ProbeMacKey {
     match binding.session_id.as_deref() {
         Some(session_id) if !session_id.is_empty() => match binding.ephemeral_shared.as_ref() {
             Some(shared) => derive_ephemeral_session_probe_mac_key(&base_key, session_id, shared),
@@ -522,7 +537,10 @@ fn active_probe_binding(conn: &PeerConnection) -> ProbeSessionBinding {
 
 fn effective_probe_mac_key(conn: &PeerConnection) -> Option<ProbeMacKey> {
     let base_key = conn.probe_mac_key?;
-    Some(probe_mac_key_for_binding(base_key, &active_probe_binding(conn)))
+    Some(probe_mac_key_for_binding(
+        base_key,
+        &active_probe_binding(conn),
+    ))
 }
 
 fn probe_key_type(conn: &PeerConnection) -> &'static str {

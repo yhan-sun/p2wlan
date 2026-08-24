@@ -183,9 +183,103 @@ pub struct PeerInfo {
 // Control Plane Client
 // ============================================================
 
+/// Terminal disposition of one leased REST signal after the daemon state
+/// machine has consumed it.  The control client ACKs the server row only for
+/// [`Applied`](SignalApplyOutcome::Applied) or
+/// [`TerminalRejected`](SignalApplyOutcome::TerminalRejected); a transient
+/// failure deliberately leaves the row leased so it can be redelivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalApplyOutcome {
+    Pending,
+    Applied,
+    TerminalRejected,
+    Retry,
+}
+
+/// Cloneable completion shared by the REST poller and the daemon event
+/// consumer.  This closes the old crash window where a signal was ACKed after
+/// merely entering an in-memory channel but before the state machine applied
+/// it.
+#[derive(Debug, Clone)]
+pub struct SignalDeliveryReceipt {
+    outcome: watch::Sender<SignalApplyOutcome>,
+}
+
+/// Receive-only side retained by the control delivery lane. Keeping this
+/// separate from [`SignalDeliveryReceipt`] means dropping every state-machine
+/// owner closes the channel and turns an abandoned application into `Retry`
+/// instead of leaking a permanently pending delivery task.
+#[derive(Debug, Clone)]
+pub(crate) struct SignalDeliveryWaiter {
+    outcome: watch::Receiver<SignalApplyOutcome>,
+}
+
+impl SignalDeliveryReceipt {
+    pub fn pending() -> Self {
+        let (outcome, _receiver) = watch::channel(SignalApplyOutcome::Pending);
+        Self { outcome }
+    }
+
+    pub fn complete(&self, outcome: SignalApplyOutcome) {
+        debug_assert!(outcome != SignalApplyOutcome::Pending);
+        // Delivery has exactly one terminal disposition. Multiple cleanup
+        // paths may retain a clone of the receipt, so a late cancellation must
+        // never overwrite an earlier successful commit (or vice versa).
+        self.outcome.send_if_modified(|current| {
+            if *current != SignalApplyOutcome::Pending {
+                return false;
+            }
+            *current = outcome;
+            true
+        });
+    }
+
+    pub fn current(&self) -> SignalApplyOutcome {
+        *self.outcome.borrow()
+    }
+
+    pub(crate) fn waiter(&self) -> SignalDeliveryWaiter {
+        SignalDeliveryWaiter {
+            outcome: self.outcome.subscribe(),
+        }
+    }
+
+    pub async fn wait(&self) -> SignalApplyOutcome {
+        self.waiter().wait().await
+    }
+}
+
+impl SignalDeliveryWaiter {
+    pub(crate) fn same_delivery(&self, other: &Self) -> bool {
+        self.outcome.same_channel(&other.outcome)
+    }
+
+    pub(crate) async fn wait(mut self) -> SignalApplyOutcome {
+        loop {
+            let current = *self.outcome.borrow_and_update();
+            if current != SignalApplyOutcome::Pending {
+                return current;
+            }
+            if self.outcome.changed().await.is_err() {
+                return SignalApplyOutcome::Retry;
+            }
+        }
+    }
+}
+
 /// Events emitted by the control plane client.
 #[derive(Debug, Clone)]
 pub enum ControlEvent {
+    /// A durable REST signal coupled to an application receipt.  Non-REST
+    /// producers continue to emit the inner event directly; the daemon event
+    /// loop unwraps this envelope and completes the receipt only at the real
+    /// state-machine commit/rejection boundary.
+    DeliveredSignal {
+        signal_id: String,
+        signal_seq: Option<u64>,
+        event: Box<ControlEvent>,
+        receipt: SignalDeliveryReceipt,
+    },
     /// Registration confirmed. Contains assigned virtual IP and relay servers.
     Registered {
         /// Server-assigned node ID when registration used the REST control plane.

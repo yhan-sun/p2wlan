@@ -151,6 +151,8 @@ class AppStrings {
   String get componentPeerConnectivity => isZh ? '设备连接' : 'Device connectivity';
   String get componentStatusNormal => isZh ? '正常' : 'Normal';
   String get componentStatusDisconnected => isZh ? '未连接' : 'Disconnected';
+  String get componentStatusLeaseLost =>
+      isZh ? '在线租约刷新失败' : 'Online lease refresh failed';
   String get componentStatusConnecting => isZh ? '连接中' : 'Connecting';
   String get componentStatusError => isZh ? '异常' : 'Error';
   String get componentStatusUnknown => isZh ? '未知' : 'Unknown';
@@ -169,6 +171,9 @@ class AppStrings {
   String get issueControlDisconnected => isZh
       ? '控制面未连接，设备目录和配置同步可能不可用。'
       : 'Control plane is disconnected; device catalog and config sync may be unavailable.';
+  String get issueDeviceLeaseLost => isZh
+      ? '本设备的服务端在线租约刷新失败，对端可能已将本机标记为离线。'
+      : "This device's server-side online lease could not be refreshed; peers may now see it as offline.";
   String get issueReauthRequired => isZh
       ? '控制面要求重新认证，请检查 Token 或重新登录。'
       : 'Control plane requires re-authentication. Check the token or sign in again.';
@@ -353,6 +358,10 @@ class AppStrings {
   String get statusLoaded => isZh ? '状态已加载' : 'Status loaded';
   String get noSnapshot => isZh ? '无快照' : 'No snapshot';
   String get controlConnected => isZh ? '控制面连接' : 'Control connected';
+  String get controlApiReachable =>
+      isZh ? '控制 API 可达' : 'Control API reachable';
+  String get deviceLeaseHealthy => isZh ? '服务端在线租约' : 'Server online lease';
+  String get lastDeviceLeaseSuccess => isZh ? '上次租约刷新' : 'Last lease refresh';
   String get reauthRequired => isZh ? '需要重新认证' : 'Reauth required';
   String get udpSockets => isZh ? 'UDP sockets' : 'UDP sockets';
   String get socketPoolActive => isZh ? 'Socket pool 启用' : 'Socket pool active';
@@ -391,7 +400,9 @@ class AppStrings {
   String get path => isZh ? '路径' : 'Path';
   String get type => isZh ? '类型' : 'Type';
   String get route => isZh ? '路由' : 'Route';
-  String get latency => isZh ? '延迟' : 'Latency';
+  String get latency => isZh ? '本端 RTT' : 'Local RTT';
+  String get localAverageRtt => isZh ? '本端平均 RTT' : 'Local average RTT';
+  String get transferSpeed => isZh ? '传输速度' : 'Transfer speed';
   String get endpoint => isZh ? '端点' : 'Endpoint';
   String get connectionType => isZh ? '连接类型' : 'Connection type';
   String get direct => isZh ? '直连' : 'Direct';
@@ -405,7 +416,7 @@ class AppStrings {
   String get filterAll => isZh ? '全部' : 'All';
   String get sortRecommended => isZh ? '默认排序' : 'Default';
   String get sortByName => isZh ? '名称' : 'Name';
-  String get sortByLatency => isZh ? '延迟' : 'Latency';
+  String get sortByLatency => isZh ? '本端 RTT' : 'Local RTT';
   String deviceCountSummary(int total, int online) => isZh
       ? '$total 台设备 · $online 在线'
       : total == 1

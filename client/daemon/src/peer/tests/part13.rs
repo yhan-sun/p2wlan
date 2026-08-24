@@ -37,7 +37,9 @@ async fn quarantine_via_relay_404(manager: &PeerManager, node_id: &str) {
             format!("peer not found: {node_id}"),
         )
         .await;
-    manager.test_force_relay_not_found_grace_elapsed(node_id).await;
+    manager
+        .test_force_relay_not_found_grace_elapsed(node_id)
+        .await;
     manager
         .record_relay_failure(
             node_id,
@@ -48,6 +50,91 @@ async fn quarantine_via_relay_404(manager: &PeerManager, node_id: &str) {
     assert!(
         manager.peer_quarantined(node_id).await,
         "a confirmed relay 404 must quarantine the peer"
+    );
+}
+
+#[tokio::test]
+async fn quarantine_metadata_contention_cannot_publish_relay_ready() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "220.165.178.32:9090".parse().unwrap();
+    manager.add_peer(&test_peer("peer-stale", endpoint)).await;
+    let generation = manager.current_network_generation().await;
+
+    // Prove READY would normally be publishable, then quarantine must revoke
+    // even this unconfirmed transport incarnation.
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer-stale",
+            "relay.test:443",
+            generation,
+            Some(41),
+        )
+        .await;
+    assert_eq!(
+        manager
+            .get_connection("peer-stale")
+            .await
+            .unwrap()
+            .relay_ready_connection_id,
+        Some(41)
+    );
+    manager
+        .quarantine_peer("peer-stale", "confirmed relay peer_not_found")
+        .await;
+
+    // Simulate unrelated diagnostics/backoff work owning the async metadata
+    // map.  The old try_lock-based dataplane predicate failed open here and
+    // let a replacement relay transport restore READY.
+    let _metadata_guard = manager.quarantined_peers.lock().await;
+    assert!(manager.peer_quarantined_sync("peer-stale"));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.mark_relay_transport_ready_with_transport(
+            "peer-stale",
+            "relay.test:443",
+            generation,
+            Some(42),
+        ),
+    )
+    .await
+    .expect("relay-ready admission must not wait for quarantine metadata");
+
+    let connection = manager.get_connection("peer-stale").await.unwrap();
+    assert_eq!(connection.relay_ready_at, None);
+    assert_eq!(connection.relay_ready_generation, None);
+    assert_eq!(connection.relay_ready_endpoint, None);
+    assert_eq!(connection.relay_ready_connection_id, None);
+}
+
+#[tokio::test]
+async fn quarantine_metadata_contention_cannot_build_probe_plan() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "220.165.178.32:9090".parse().unwrap();
+    manager.add_peer(&test_peer("peer-stale", endpoint)).await;
+    assert!(
+        manager
+            .direct_probe_target_set_for("peer-stale")
+            .await
+            .is_some(),
+        "the control peer must be probe-eligible before quarantine"
+    );
+    manager
+        .quarantine_peer("peer-stale", "confirmed relay peer_not_found")
+        .await;
+
+    // Holding the async metadata map used to make peer_quarantined_sync's
+    // try_lock return false.  Probe planning must instead consult the
+    // independent authoritative mirror and reject without blocking.
+    let _metadata_guard = manager.quarantined_peers.lock().await;
+    let target = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.direct_probe_target_set_for("peer-stale"),
+    )
+    .await
+    .expect("probe admission must not wait for quarantine metadata");
+    assert!(
+        target.is_none(),
+        "metadata contention must never turn an active quarantine into a probe plan"
     );
 }
 
@@ -90,7 +177,9 @@ async fn relay_404_quarantine_survives_last_seen_growth() {
 async fn relay_404_quarantine_survives_endpoint_churn() {
     let manager = PeerManager::new(test_config());
     let first: SocketAddr = "220.165.178.32:9090".parse().unwrap();
-    manager.add_peer(&stale_peer("peer-stale", first, 1000)).await;
+    manager
+        .add_peer(&stale_peer("peer-stale", first, 1000))
+        .await;
     quarantine_via_relay_404(&manager, "peer-stale").await;
 
     // Ordinary NAT endpoint churn (the same stale incarnation behind a
@@ -133,11 +222,7 @@ async fn relay_404_grace_survives_online_transition_and_last_seen_growth() {
     back_online.online = true;
     manager.add_peer(&back_online).await;
     manager
-        .record_relay_failure(
-            "peer-stale",
-            "peer_not_found",
-            "peer not found: peer-stale",
-        )
+        .record_relay_failure("peer-stale", "peer_not_found", "peer not found: peer-stale")
         .await;
     assert!(
         manager
@@ -155,18 +240,20 @@ async fn relay_404_grace_survives_online_transition_and_last_seen_growth() {
         .add_peer(&stale_peer("peer-stale", endpoint, 2000))
         .await;
     assert!(
-        manager.relay_not_found_grace.lock().await.contains_key("peer-stale"),
+        manager
+            .relay_not_found_grace
+            .lock()
+            .await
+            .contains_key("peer-stale"),
         "online transition + last_seen growth must not clear the relay-404 grace window"
     );
     // When the grace window expires with the registration still absent, the
     // peer is quarantined exactly once (episode 1).
-    manager.test_force_relay_not_found_grace_elapsed("peer-stale").await;
     manager
-        .record_relay_failure(
-            "peer-stale",
-            "peer_not_found",
-            "peer not found: peer-stale",
-        )
+        .test_force_relay_not_found_grace_elapsed("peer-stale")
+        .await;
+    manager
+        .record_relay_failure("peer-stale", "peer_not_found", "peer not found: peer-stale")
         .await;
     assert!(manager.peer_quarantined("peer-stale").await);
     assert_eq!(manager.quarantine_consecutive("peer-stale").await, 1);
@@ -195,7 +282,9 @@ async fn identity_change_and_authenticated_evidence_reopen_quarantine() {
     assert!(manager.peer_quarantined("peer-stale").await);
     let live: SocketAddr = "220.165.178.32:7955".parse().unwrap();
     assert!(
-        manager.learn_authenticated_endpoint("peer-stale", live).await,
+        manager
+            .learn_authenticated_endpoint("peer-stale", live)
+            .await,
         "an authenticated inbound punch must be learnable"
     );
     assert!(
@@ -254,17 +343,12 @@ async fn quarantine_absorbs_repeated_404_without_new_failure_samples() {
     // sample, no state churn, no episode growth.
     for _ in 0..12 {
         manager
-            .record_relay_failure(
-                "peer-stale",
-                "peer_not_found",
-                "peer not found: peer-stale",
-            )
+            .record_relay_failure("peer-stale", "peer_not_found", "peer not found: peer-stale")
             .await;
     }
     let conn = manager.get_connection("peer-stale").await.unwrap();
     assert_eq!(
-        conn.relay_health.failure_count,
-        failures_after_quarantine,
+        conn.relay_health.failure_count, failures_after_quarantine,
         "repeated 404s inside one quarantine episode must not add peer-health failure samples"
     );
     assert_eq!(
@@ -282,8 +366,12 @@ async fn stale_peers_do_not_starve_healthy_peers_in_shared_scheduler() {
     let healthy_a: SocketAddr = "220.163.6.190:6609".parse().unwrap();
     let healthy_b: SocketAddr = "220.163.6.190:6610".parse().unwrap();
 
-    manager.add_peer(&stale_peer("stale-a", stale_a, 1000)).await;
-    manager.add_peer(&stale_peer("stale-b", stale_b, 1000)).await;
+    manager
+        .add_peer(&stale_peer("stale-a", stale_a, 1000))
+        .await;
+    manager
+        .add_peer(&stale_peer("stale-b", stale_b, 1000))
+        .await;
     quarantine_via_relay_404(&manager, "stale-a").await;
     quarantine_via_relay_404(&manager, "stale-b").await;
 
@@ -309,11 +397,17 @@ async fn stale_peers_do_not_starve_healthy_peers_in_shared_scheduler() {
     let sets = manager
         .direct_probe_targets_due(Duration::from_secs(1))
         .await;
-    assert_eq!(sets.len(), 2, "both healthy peers must receive recovery work");
+    assert_eq!(
+        sets.len(),
+        2,
+        "both healthy peers must receive recovery work"
+    );
     assert!(
         sets.iter().all(|set| set.peer_id.starts_with("healthy-")),
         "quarantined stale peers must never occupy scheduler work slots: {:?}",
-        sets.iter().map(|set| set.peer_id.clone()).collect::<Vec<_>>()
+        sets.iter()
+            .map(|set| set.peer_id.clone())
+            .collect::<Vec<_>>()
     );
     for set in &sets {
         assert!(
@@ -373,8 +467,10 @@ async fn recovery_target_cap_scales_with_socket_count_for_complete_windows() {
         "relay downgrades the ceiling to the bounded heartbeat 96, but the port-dependent remote still sweeps it via StableUniqueScatter (one socket): 96 distinct ports, NOT 96/3 (field evidence v0.1.116: the relay safety net is confirmed within ~100 ms in availability runs, so a relay gate must not shrink the stable side to 32 unique ports)"
     );
     // No socket (unit context) must not degenerate to zero candidates.
-    assert!(recovery_target_cap(Some(RecoveryStage::Initial), false, 0, false)
-        .is_some_and(|cap| cap > 0));
+    assert!(
+        recovery_target_cap(Some(RecoveryStage::Initial), false, 0, false)
+            .is_some_and(|cap| cap > 0)
+    );
 }
 
 #[tokio::test]

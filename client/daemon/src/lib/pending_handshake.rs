@@ -38,6 +38,10 @@ struct PendingPeerOffer {
     /// per-peer responder worker while the control-plane answer is sent; a
     /// local handover during that wait makes the old offer terminal.
     network_generation: u64,
+    /// Exact online peer lifecycle present when the signal was admitted.
+    /// Unknown-peer offers fill this after identity restoration. A queued
+    /// offer must match this generation at responder commit.
+    peer_session_generation: Option<PeerSessionGeneration>,
     candidates_expires_at_ms: Option<u64>,
     sender_public_key: Option<String>,
     handshake_init: Vec<u8>,
@@ -45,6 +49,17 @@ struct PendingPeerOffer {
     punch_at_server_ms: Option<u64>,
     session_id: Option<String>,
     probe_ephemeral_public_key: Option<String>,
+    /// Durable REST delivery is acknowledged only when this exact offer reaches
+    /// a terminal responder result. Coalesced offers retain their own receipt.
+    delivery_receipt: Option<control::SignalDeliveryReceipt>,
+}
+
+impl PendingPeerOffer {
+    fn complete_delivery(&self, outcome: control::SignalApplyOutcome) {
+        if let Some(receipt) = self.delivery_receipt.as_ref() {
+            receipt.complete(outcome);
+        }
+    }
 }
 
 /// A peer-reflexive control-plane observation awaiting its bounded worker.
@@ -56,6 +71,16 @@ struct PendingPeerReflexive {
     from_node_id: String,
     observed_endpoint: String,
     punch_at_ms: Option<u64>,
+    peer_session_generation: Option<PeerSessionGeneration>,
+    delivery_receipt: Option<control::SignalDeliveryReceipt>,
+}
+
+impl PendingPeerReflexive {
+    fn complete_delivery(&self, outcome: control::SignalApplyOutcome) {
+        if let Some(receipt) = self.delivery_receipt.as_ref() {
+            receipt.complete(outcome);
+        }
+    }
 }
 
 /// Owner token for an event-triggered initiator preparation.
@@ -67,6 +92,7 @@ struct PendingPeerReflexive {
 struct HandshakeStartReservation {
     owner: u64,
     network_generation: u64,
+    peer_session_generation: PeerSessionGeneration,
     cancellation: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -125,6 +151,7 @@ struct PendingHandshakeState {
     /// after a network handover and install old key material as if it were a
     /// fresh session.
     pending_network_generations: HashMap<String, u64>,
+    pending_peer_session_generations: HashMap<String, PeerSessionGeneration>,
     pending_probe_ephemeral: HashMap<String, DhKeyPair>,
     /// Peers for which a handshake is being prepared.  Candidate gathering and
     /// control-peer lookups await, so a plain `pending` check is not enough to
@@ -135,6 +162,7 @@ struct PendingHandshakeState {
     /// reserved. A reservation that survived a network handover is cancelled
     /// before a new-generation attempt is admitted.
     starting_network_generations: HashMap<String, u64>,
+    starting_peer_session_generations: HashMap<String, PeerSessionGeneration>,
     /// Owner token for every `starting` reservation.  This is deliberately
     /// separate from `pending_ids`: a preparation has no WireGuard session ID
     /// yet, but it still must not be allowed to clean up a newer reservation.
@@ -183,31 +211,33 @@ impl PendingHandshakeState {
 
     #[cfg(test)]
     fn reserve_start_with_owner(&mut self, peer_id: &str) -> Option<HandshakeStartReservation> {
-        self.reserve_start_with_owner_at_generation(peer_id, 0)
-    }
-
-    fn reserve_start_at_generation(&mut self, peer_id: &str, network_generation: u64) -> bool {
-        self.reserve_start_with_owner_at_generation(peer_id, network_generation)
-            .is_some()
+        self.reserve_start_with_owner_at_generation(peer_id, 0, PeerSessionGeneration::for_test(1))
     }
 
     fn reserve_start_with_owner_at_generation(
         &mut self,
         peer_id: &str,
         network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
     ) -> Option<HandshakeStartReservation> {
         if self.pending.contains_key(peer_id) {
             // A pending transaction from an older network incarnation can no
             // longer produce a valid session. The caller removes its Probe
             // binding before admitting the replacement.
-            if self.pending_network_generations.get(peer_id) != Some(&network_generation) {
+            if self.pending_network_generations.get(peer_id) != Some(&network_generation)
+                || self.pending_peer_session_generations.get(peer_id)
+                    != Some(&peer_session_generation)
+            {
                 self.remove(peer_id);
             } else {
                 return None;
             }
         }
         if self.starting.contains(peer_id) {
-            if self.starting_network_generations.get(peer_id) != Some(&network_generation) {
+            if self.starting_network_generations.get(peer_id) != Some(&network_generation)
+                || self.starting_peer_session_generations.get(peer_id)
+                    != Some(&peer_session_generation)
+            {
                 self.cancel_reservation(peer_id);
             } else {
                 return None;
@@ -222,12 +252,15 @@ impl PendingHandshakeState {
         self.starting.insert(peer_id.to_string());
         self.starting_network_generations
             .insert(peer_id.to_string(), network_generation);
+        self.starting_peer_session_generations
+            .insert(peer_id.to_string(), peer_session_generation);
         self.starting_ids.insert(peer_id.to_string(), owner);
         self.starting_cancellations
             .insert(peer_id.to_string(), cancellation_tx);
         Some(HandshakeStartReservation {
             owner,
             network_generation,
+            peer_session_generation,
             cancellation,
         })
     }
@@ -235,6 +268,7 @@ impl PendingHandshakeState {
     fn cancel_reservation(&mut self, peer_id: &str) {
         self.starting.remove(peer_id);
         self.starting_network_generations.remove(peer_id);
+        self.starting_peer_session_generations.remove(peer_id);
         self.starting_ids.remove(peer_id);
         if let Some(cancellation) = self.starting_cancellations.remove(peer_id) {
             cancellation.send_replace(true);
@@ -247,33 +281,6 @@ impl PendingHandshakeState {
         }
         self.cancel_reservation(peer_id);
         true
-    }
-
-    fn insert_reserved_with_generation(
-        &mut self,
-        peer_id: String,
-        initiator: HandshakeInitiator,
-        session_id: Option<String>,
-        probe_ephemeral: Option<DhKeyPair>,
-        network_generation: u64,
-    ) -> Option<u64> {
-        if !self.starting_ids.contains_key(&peer_id)
-            || self.starting_network_generations.get(&peer_id) != Some(&network_generation)
-        {
-            return None;
-        }
-        self.starting.remove(&peer_id);
-        self.starting_network_generations.remove(&peer_id);
-        self.starting_ids.remove(&peer_id);
-        let cancellation = self.starting_cancellations.remove(&peer_id);
-        Some(self.insert_with_generation(
-            peer_id,
-            initiator,
-            session_id,
-            probe_ephemeral,
-            cancellation,
-            network_generation,
-        ))
     }
 
     #[cfg(test)]
@@ -292,9 +299,11 @@ impl PendingHandshakeState {
             session_id,
             probe_ephemeral,
             0,
+            PeerSessionGeneration::for_test(1),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_reserved_if_current_with_generation(
         &mut self,
         peer_id: String,
@@ -303,14 +312,18 @@ impl PendingHandshakeState {
         session_id: Option<String>,
         probe_ephemeral: Option<DhKeyPair>,
         network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
     ) -> Option<u64> {
         if self.starting_ids.get(&peer_id).copied() != Some(owner)
             || self.starting_network_generations.get(&peer_id) != Some(&network_generation)
+            || self.starting_peer_session_generations.get(&peer_id)
+                != Some(&peer_session_generation)
         {
             return None;
         }
         self.starting.remove(&peer_id);
         self.starting_network_generations.remove(&peer_id);
+        self.starting_peer_session_generations.remove(&peer_id);
         self.starting_ids.remove(&peer_id);
         let cancellation = self.starting_cancellations.remove(&peer_id);
         Some(self.insert_with_generation(
@@ -320,6 +333,7 @@ impl PendingHandshakeState {
             probe_ephemeral,
             cancellation,
             network_generation,
+            peer_session_generation,
         ))
     }
 
@@ -350,9 +364,11 @@ impl PendingHandshakeState {
             probe_ephemeral,
             cancellation,
             0,
+            PeerSessionGeneration::for_test(1),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_with_generation(
         &mut self,
         peer_id: String,
@@ -361,6 +377,7 @@ impl PendingHandshakeState {
         probe_ephemeral: Option<DhKeyPair>,
         cancellation: Option<tokio::sync::watch::Sender<bool>>,
         network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
     ) -> u64 {
         // Defend against a direct replacement: wake the old owner before
         // replacing its slot so a late slow POST cannot outlive the new
@@ -378,6 +395,8 @@ impl PendingHandshakeState {
         }
         self.pending_network_generations
             .insert(peer_id.clone(), network_generation);
+        self.pending_peer_session_generations
+            .insert(peer_id.clone(), peer_session_generation);
         if let Some(probe_ephemeral) = probe_ephemeral {
             self.pending_probe_ephemeral
                 .insert(peer_id.clone(), probe_ephemeral);
@@ -398,6 +417,7 @@ impl PendingHandshakeState {
         self.pending_ids.remove(peer_id);
         self.pending_session_ids.remove(peer_id);
         self.pending_network_generations.remove(peer_id);
+        self.pending_peer_session_generations.remove(peer_id);
         self.pending_probe_ephemeral.remove(peer_id);
         self.pending.remove(peer_id)
     }
@@ -410,6 +430,10 @@ impl PendingHandshakeState {
         self.pending_network_generations.get(peer_id).copied()
     }
 
+    fn peer_session_generation(&self, peer_id: &str) -> Option<PeerSessionGeneration> {
+        self.pending_peer_session_generations.get(peer_id).copied()
+    }
+
     /// Remove a pending initiator that belongs to an older local network
     /// incarnation and return its Probe token so the connection-level binding
     /// can be removed before a replacement is staged.
@@ -417,11 +441,16 @@ impl PendingHandshakeState {
         &mut self,
         peer_id: &str,
         network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
     ) -> Option<String> {
         let is_stale = self
             .pending_network_generations
             .get(peer_id)
-            .is_some_and(|pending_generation| *pending_generation != network_generation);
+            .is_some_and(|pending_generation| *pending_generation != network_generation)
+            || self
+                .pending_peer_session_generations
+                .get(peer_id)
+                .is_some_and(|pending_generation| *pending_generation != peer_session_generation);
         if !is_stale {
             return None;
         }
@@ -441,9 +470,15 @@ impl PendingHandshakeState {
         self.responder_cache
             .retain(|(cached_peer, _), _| cached_peer != peer_id);
         if let Some(worker) = self.responder_workers.remove(peer_id) {
+            if let Some(queued) = worker.queued.as_ref() {
+                queued.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+            }
             worker.cancellation.send_replace(true);
         }
         if let Some(worker) = self.peer_reflexive_workers.remove(peer_id) {
+            if let Some(queued) = worker.queued.as_ref() {
+                queued.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+            }
             worker.cancellation.send_replace(true);
         }
     }
@@ -455,9 +490,15 @@ impl PendingHandshakeState {
         self.responder_cache
             .retain(|(cached_peer, _), _| cached_peer != peer_id);
         if let Some(worker) = self.responder_workers.remove(peer_id) {
+            if let Some(queued) = worker.queued.as_ref() {
+                queued.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+            }
             worker.cancellation.send_replace(true);
         }
         if let Some(worker) = self.peer_reflexive_workers.remove(peer_id) {
+            if let Some(queued) = worker.queued.as_ref() {
+                queued.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+            }
             worker.cancellation.send_replace(true);
         }
     }
@@ -471,6 +512,9 @@ impl PendingHandshakeState {
         self.responder_cache
             .retain(|(cached_peer, _), _| cached_peer != peer_id);
         if let Some(worker) = self.peer_reflexive_workers.remove(peer_id) {
+            if let Some(queued) = worker.queued.as_ref() {
+                queued.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+            }
             worker.cancellation.send_replace(true);
         }
     }
@@ -586,9 +630,12 @@ impl PendingHandshakeState {
                 // later retransmit erase the sole queued turn for a different
                 // (typically replacement) identity. Same-queued-identity and
                 // third-identity arrivals remain newest-wins below.
+                offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
                 return None;
             }
-            worker.queued = Some(offer);
+            if let Some(replaced) = worker.queued.replace(offer) {
+                replaced.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+            }
             return None;
         }
 
@@ -667,7 +714,9 @@ impl PendingHandshakeState {
         work: PendingPeerReflexive,
     ) -> Option<(PeerReflexiveWorkReservation, PendingPeerReflexive)> {
         if let Some(worker) = self.peer_reflexive_workers.get_mut(&work.from_node_id) {
-            worker.queued = Some(work);
+            if let Some(replaced) = worker.queued.replace(work) {
+                replaced.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+            }
             return None;
         }
 

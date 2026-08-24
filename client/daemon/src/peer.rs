@@ -168,10 +168,17 @@ pub(crate) enum ProbeKeyRole {
 /// This is deliberately separate from network and candidate generations: a
 /// peer can leave and rejoin under the same node ID, rotate its public key, go
 /// offline and come back, or restart while reusing otherwise identical
-/// candidates. Authenticated UDP work snapshots this value together with the
+/// candidates.  Authenticated UDP work snapshots this value together with the
 /// key that verified the packet and must re-check it before adopting evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PeerSessionGeneration(u64);
+
+impl PeerSessionGeneration {
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerMembershipEntry {
@@ -187,7 +194,7 @@ struct PeerMembershipState {
 
 impl PeerMembershipState {
     /// Publish a fully initialized peer, rotating its lifecycle identity when
-    /// requested. Exhaustion fails closed instead of reusing a generation.
+    /// requested.  Exhaustion fails closed instead of reusing a generation.
     fn publish(&mut self, node_id: &str, online: bool, rotate: bool) -> bool {
         if !rotate {
             if let Some(entry) = self.peers.get_mut(node_id) {
@@ -243,7 +250,7 @@ pub(crate) struct ProbeKeyCandidate {
     pub(crate) session_id: Option<String>,
 }
 
-/// Deterministic one-shot pause after Probe-v2 MAC verification. Production
+/// Deterministic one-shot pause after Probe-v2 MAC verification.  Production
 /// builds contain neither the field nor the branch; UDP tests use this to put
 /// a lifecycle transition exactly between verification and adoption.
 #[cfg(test)]

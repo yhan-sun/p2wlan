@@ -28,6 +28,7 @@ async fn run_critical_control_loop(
     mut auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+    health: Option<Arc<crate::tasks::HealthState>>,
 ) {
     let answer_permits = Arc::new(Semaphore::new(CRITICAL_ANSWER_MAX_INFLIGHT));
     let offer_permits = Arc::new(Semaphore::new(CRITICAL_OFFER_MAX_INFLIGHT));
@@ -73,6 +74,7 @@ async fn run_critical_control_loop(
                             event_tx.clone(),
                             ctrl_permits.clone(),
                             relay_selection.clone(),
+                            health.clone(),
                         ));
                     }
                     CriticalControlCommand::Shutdown => {
@@ -279,10 +281,11 @@ async fn run_candidate_offer_worker(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let result = match http.current() {
             Err(error) => CandidateOfferAttempt::Completed(Err(error)),
-            Ok(_) if remaining.is_zero() => CandidateOfferAttempt::Completed(Err(
-                DaemonError::ControlPlane(
-                "candidate offer deadline exceeded; delivery status is unknown".into(),
-            ))),
+            Ok(_) if remaining.is_zero() => {
+                CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                    "candidate offer deadline exceeded; delivery status is unknown".into(),
+                )))
+            }
             Ok(current_http) => loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -512,6 +515,7 @@ async fn run_critical_endpoint_command(
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     permits: Arc<Semaphore>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
+    health: Option<Arc<crate::tasks::HealthState>>,
 ) {
     let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
         return;
@@ -556,6 +560,9 @@ async fn run_critical_endpoint_command(
     };
     match &result {
         Ok(()) => {
+            if let Some(health) = health.as_ref() {
+                health.mark_device_lease_success().await;
+            }
             debug!(
                 "Updated endpoint for {} through handshake control lane: {} ({})",
                 auth.self_node_id, endpoint, nat_type
@@ -563,6 +570,13 @@ async fn run_critical_endpoint_command(
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
         Err(error) => {
+            if let Some(health) = health.as_ref() {
+                // Endpoint PATCH is the online lease operation. Preserve API
+                // reachability independently: a later successful GET may
+                // still prove the control API reachable, but it cannot repair
+                // this failed device lease.
+                health.set_device_lease_healthy(false);
+            }
             let _ = event_tx.send(ControlEvent::ServerError {
                 code: 2000,
                 message: error.to_string(),

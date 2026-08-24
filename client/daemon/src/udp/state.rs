@@ -32,13 +32,11 @@ type NatMaintainerKey = (String, SocketAddr, usize);
 type NatMaintainerState = Arc<Mutex<HashMap<NatMaintainerKey, NatMaintainerLease>>>;
 /// Dedicated per-(peer, local socket) NAT maintainer probe budget, isolated
 /// from the recovery-epoch traversal credit and the shared outbound budgets.
-pub(super) type NatMaintainerBudgetState =
-    Arc<Mutex<HashMap<(String, usize), VecDeque<Instant>>>>;
+pub(super) type NatMaintainerBudgetState = Arc<Mutex<HashMap<(String, usize), VecDeque<Instant>>>>;
 /// Process-wide low-priority relay-backoff heartbeat budget. It is separate
 /// from the recovery epoch, but still accounts for every actual socket/target
 /// send globally.
-pub(super) type RelayBackoffHeartbeatBudgetState =
-    Arc<GlobalRelayBackoffHeartbeatBudget>;
+pub(super) type RelayBackoffHeartbeatBudgetState = Arc<GlobalRelayBackoffHeartbeatBudget>;
 /// One owner lease for a relay-backoff heartbeat worker. The sender is kept in
 /// a synchronous registry so lifecycle hooks can cancel without awaiting while
 /// holding a peer-manager lock.
@@ -90,8 +88,7 @@ impl RelayBackoffHeartbeatRegistry {
 
 /// Registry for relay-backoff heartbeat tasks: at most one send-capable
 /// worker per peer, with a quit handshake before replacement.
-pub(super) type RelayBackoffHeartbeatState =
-    Arc<std::sync::Mutex<RelayBackoffHeartbeatRegistry>>;
+pub(super) type RelayBackoffHeartbeatState = Arc<std::sync::Mutex<RelayBackoffHeartbeatRegistry>>;
 
 fn remove_heartbeat_lease_if_owned(
     leases: &mut HashMap<String, RelayBackoffHeartbeatLease>,
@@ -221,11 +218,7 @@ impl DirectValidationRegistry {
     /// relay has had time to remain the stable active path.  Extending an
     /// existing same-generation deadline is safe; a different generation
     /// replaces it because no old-generation cooldown may affect a rejoin.
-    pub(crate) async fn suppress_slow_relay_validation(
-        &self,
-        peer_id: &str,
-        generation: u64,
-    ) {
+    pub(crate) async fn suppress_slow_relay_validation(&self, peer_id: &str, generation: u64) {
         let deadline = Instant::now() + crate::peer::SLOW_DIRECT_RELAY_RETRY_COOLDOWN;
         let mut cooldowns = self.slow_relay_cooldowns.lock().await;
         match cooldowns.get_mut(peer_id) {
@@ -253,7 +246,10 @@ impl DirectValidationRegistry {
         let mut cooldowns = self.slow_relay_cooldowns.lock().await;
         match cooldowns.get(peer_id).copied() {
             Some((stored_generation, deadline))
-                if stored_generation == generation && deadline > now => true,
+                if stored_generation == generation && deadline > now =>
+            {
+                true
+            }
             Some(_) => {
                 cooldowns.remove(peer_id);
                 false
@@ -307,7 +303,12 @@ impl DirectValidationRegistry {
                 expectation_cancelled = expectations.remove(peer_id).is_some();
             }
         }
-        let cooldown_cancelled = self.slow_relay_cooldowns.lock().await.remove(peer_id).is_some();
+        let cooldown_cancelled = self
+            .slow_relay_cooldowns
+            .lock()
+            .await
+            .remove(peer_id)
+            .is_some();
         debug!(target: "p2pnet_daemon::direct_validation",
             event = "direct_validation_registry_peer_cancelled",
             peer_id = %peer_id,
@@ -350,20 +351,24 @@ impl DirectValidationRegistry {
         let mut expectations = self.expectations.lock().await;
         let mut cancelled_expectation_count = 0usize;
         expectations.retain(|peer_id, expectation| {
-            let keep = !cancelled_peers.contains(peer_id) && expectation.generation == current_generation;
+            let keep =
+                !cancelled_peers.contains(peer_id) && expectation.generation == current_generation;
             if !keep {
                 cancelled_expectation_count = cancelled_expectation_count.saturating_add(1);
             }
             keep
         });
         let mut cancelled_cooldown_count = 0usize;
-        self.slow_relay_cooldowns.lock().await.retain(|_, (generation, _)| {
-            let keep = *generation == current_generation;
-            if !keep {
-                cancelled_cooldown_count = cancelled_cooldown_count.saturating_add(1);
-            }
-            keep
-        });
+        self.slow_relay_cooldowns
+            .lock()
+            .await
+            .retain(|_, (generation, _)| {
+                let keep = *generation == current_generation;
+                if !keep {
+                    cancelled_cooldown_count = cancelled_cooldown_count.saturating_add(1);
+                }
+                keep
+            });
         debug!(target: "p2pnet_daemon::direct_validation",
             event = "direct_validation_registry_generation_cancelled",
             generation = current_generation,
@@ -854,6 +859,9 @@ impl DynamicPunchSocket {
 /// Why a dynamic punch socket could not be attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DynamicSocketAttachError {
+    /// The owning punch/network generation was cancelled or superseded before
+    /// the attach transaction acquired the network-epoch gate.
+    Superseded,
     /// The dynamic socket cap is full and no entry could be evicted safely
     /// (the same peer's predecessor and Direct peers are never evicted).
     CapacityRejected,
@@ -1056,9 +1064,13 @@ pub(crate) fn estimate_remote_scatter_punch_deadline(
         .iter()
         .map(|round| round.endpoints.len().saturating_mul(socket_count))
         .sum::<usize>();
-    let paced_send_time = OUTBOUND_CONNECTIVITY_PROBE_SPACING
-        .saturating_mul(planned_packets.min(MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION as usize) as u32);
-    let round_delays = schedule.iter().map(|round| round.delay_before).sum::<Duration>();
+    let paced_send_time = OUTBOUND_CONNECTIVITY_PROBE_SPACING.saturating_mul(
+        planned_packets.min(MAX_REMOTE_SCATTER_PUNCH_PROBES_PER_SESSION as usize) as u32,
+    );
+    let round_delays = schedule
+        .iter()
+        .map(|round| round.delay_before)
+        .sum::<Duration>();
     paced_send_time
         .saturating_add(round_delays)
         .saturating_add(ack_grace)
@@ -1346,8 +1358,7 @@ pub struct UdpProbeRxSnapshot {
 /// remain topology-free and aggregate; recovery timeout diagnostics must
 /// instead use this map so traffic for peer B or an older peer-A handshake
 /// cannot be presented as current peer-A ACK evidence.
-type PeerProbeRxDiagnostics =
-    Arc<Mutex<HashMap<(String, u64, Option<String>), PeerProbeRxEntry>>>;
+type PeerProbeRxDiagnostics = Arc<Mutex<HashMap<(String, u64, Option<String>), PeerProbeRxEntry>>>;
 
 struct PeerProbeRxEntry {
     snapshot: UdpProbeRxSnapshot,
@@ -1403,11 +1414,15 @@ fn legacy_ack_matches_pending(
     pending: &PendingProbe,
     source: SocketAddr,
     generation: u64,
+    remote_candidate_epoch: u64,
     socket_index: usize,
+    cleanup_epoch: u64,
     direct_commit_seq: u64,
 ) -> bool {
     pending.generation == generation
+        && pending.remote_candidate_epoch == remote_candidate_epoch
         && pending.socket_index == socket_index
+        && pending.cleanup_epoch == cleanup_epoch
         && pending.direct_commit_seq == direct_commit_seq
         && pending.accepts_legacy_ack
         && (pending.endpoint == source

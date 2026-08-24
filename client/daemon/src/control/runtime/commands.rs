@@ -67,12 +67,19 @@ match cmd {
                                     advertised_nat_type = nat_type;
                                     debug!("Updated endpoint for {self_node_id}: {advertised_endpoint} ({advertised_nat_type})");
                                     if let Some(health) = health.as_ref() {
-                                        health.mark_control_success().await;
+                                        health.mark_device_lease_success().await;
                                     }
                                     let _ = event_tx.send(ControlEvent::ControlHealthy);
                                 }
                                 Err(err) => {
                                     let err_str = err.to_string();
+                                    if let Some(health) = health.as_ref() {
+                                        // Endpoint PATCH is the server-side
+                                        // online lease heartbeat. A failed
+                                        // PATCH must remain visible even if a
+                                        // later roster/signal GET succeeds.
+                                        health.set_device_lease_healthy(false);
+                                    }
                                     let _ = event_tx.send(ControlEvent::ServerError { code: 2000, message: err_str.clone() });
                                     if is_permanent_auth_error(&err_str) {
                                         break;

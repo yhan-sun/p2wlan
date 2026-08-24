@@ -275,14 +275,17 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             let since = query_param(query, "since")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
-            let events = context
+            let expected_process_id =
+                query_param(query, "process_id").and_then(|v| v.parse::<u32>().ok());
+            let poll = context
                 .status_events
-                .wait_or_poll(since, Duration::from_secs(25))
+                .wait_or_poll_for_process(
+                    since,
+                    expected_process_id,
+                    Duration::from_secs(25),
+                )
                 .await;
-            let body = serde_json::to_string_pretty(&EventsResponse::new(
-                context.status_events.current_seq(),
-                events,
-            ))?;
+            let body = serde_json::to_string_pretty(&EventsResponse::from_poll(poll))?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
         ("GET", "/peers") => {

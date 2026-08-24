@@ -93,6 +93,127 @@ void _registerDashboardTests() {
     expect(find.text('Check issues'), findsNothing);
   });
 
+  testWidgets('Home distinguishes API reachability from online lease health', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final raw = jsonDecode(jsonEncode(base.raw)) as Map<String, dynamic>;
+    final health = raw['health'] as Map<String, dynamic>;
+    health
+      ..['status'] = 'degraded'
+      ..['control_connected'] = false
+      ..['control_api_reachable'] = true
+      ..['device_lease_healthy'] = false
+      ..['last_device_lease_success_secs_ago'] = 12;
+    raw['ready_phase'] = 'connecting_control';
+    final snapshot = DiagnosticsSnapshot.fromJson(raw);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(find.text('Degraded'), findsOneWidget);
+    expect(find.text('Online lease refresh failed'), findsOneWidget);
+    expect(
+      find.text(
+        "This device's server-side online lease could not be refreshed; peers may now see it as offline.",
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Control server'), findsOneWidget);
+  });
+
+  testWidgets('Home never counts an offline peer with a stale active path', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stale = _peerJson(
+      nodeId: 'offline-stale-direct',
+      deviceName: 'offline-stale-direct',
+      virtualIp: '10.20.0.99',
+      online: false,
+      state: 'direct',
+      activePath: 'direct',
+      relayConfirmedEndpoint: null,
+      direct: {'latency_ms': 1},
+      relay: _emptyPathHealth(),
+    );
+    final snapshot = _snapshotWithPeers(base, [stale]);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(_heroCount(tester, 'dashboard-count-online'), '0');
+    expect(_heroCount(tester, 'dashboard-count-direct'), '0');
+    expect(_heroCount(tester, 'dashboard-count-relay'), '0');
+    expect(find.text('offline-stale-direct'), findsNothing);
+  });
+
+  testWidgets('Home counts an online peer without a verified path as probing', (
+    tester,
+  ) async {
+    final base = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final pending = _peerJson(
+      nodeId: 'online-no-path',
+      deviceName: 'online-no-path',
+      virtualIp: '10.20.0.98',
+      online: true,
+      state: 'idle',
+      activePath: null,
+      relayConfirmedEndpoint: null,
+      direct: _emptyPathHealth(),
+      relay: _emptyPathHealth(),
+    );
+    final snapshot = _snapshotWithPeers(base, [pending]);
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await tester.pumpWidget(
+      _TestApp(
+        child: DashboardPage(
+          settingsStore: stores.settingsStore,
+          statusStore: stores.statusStore,
+        ),
+      ),
+    );
+
+    expect(_heroCount(tester, 'dashboard-count-online'), '1');
+    expect(_heroCount(tester, 'dashboard-count-direct'), '0');
+    expect(_heroCount(tester, 'dashboard-count-relay'), '0');
+    expect(find.text('online-no-path'), findsOneWidget);
+    expect(find.text('probing'), findsOneWidget);
+  });
+
   testWidgets('Home keeps technical noise off the default page', (
     tester,
   ) async {
@@ -795,7 +916,7 @@ List<Map<String, dynamic>> _fourPeerFixtures() {
     activePath: 'relay',
     relayConfirmedEndpoint: '203.0.113.10:18081',
     relayConfirmedGeneration: 5,
-    remoteRelayLatencyMs: 43,
+    remoteRelayLatencyMs: 91,
     direct: _emptyPathHealth(),
     relay: {
       'last_success_age_ms': 300,
@@ -803,9 +924,9 @@ List<Map<String, dynamic>> _fourPeerFixtures() {
       'consecutive_failures': 0,
       'last_error': null,
       'last_error_code': null,
-      // Relay daemons may publish the usable RTT as
-      // remote_relay_latency_ms while this local path-health sample is empty.
-      'latency_ms': null,
+      // Only this daemon's timed peer RTT is displayable. The remote daemon's
+      // peer-to-relay RTT above intentionally differs and must be ignored.
+      'latency_ms': 43,
       'rtt_ewma_ms': null,
     },
     currentPathSelection: {

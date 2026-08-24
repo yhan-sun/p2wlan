@@ -55,10 +55,10 @@ impl TrayApp {
             .set_text(format!("状态：{}", self.last_state.status_label));
         self.menu.network.set_text(match self.last_state.online {
             Some(count) => format!(
-                "虚拟 IP：{} · 在线设备：{count} · 延迟：{latency} · 速度：{speed}",
+                "虚拟 IP：{} · 在线设备：{count} · 本端平均 RTT：{latency} · 速度：{speed}",
                 self.last_state.virtual_ip,
             ),
-            None => format!("虚拟 IP：— · 在线设备：— · 延迟：{latency} · 速度：{speed}"),
+            None => format!("虚拟 IP：— · 在线设备：— · 本端平均 RTT：{latency} · 速度：{speed}"),
         });
         self.menu.stop_daemon.set_enabled(self.last_state.running);
         self.menu
@@ -68,7 +68,7 @@ impl TrayApp {
         let title = tray_performance_title(&self.last_state);
         let tooltip = if self.last_state.running {
             format!(
-                "{} · 延迟：{latency} · 速度：{speed}",
+                "{} · 本端平均 RTT：{latency} · 速度：{speed}",
                 self.last_state.tooltip
             )
         } else {

@@ -71,6 +71,7 @@
       "node_id": "peer-direct-001",
       "device_name": "direct-laptop",
       "virtual_ip": "10.20.0.11",
+      "online": true,
       "endpoint": "198.51.100.21:61111",
       "nat_type": "endpoint_independent",
       "state": "direct",
@@ -121,6 +122,7 @@
       "node_id": "peer-relay-002",
       "device_name": "relay-nas",
       "virtual_ip": "10.20.0.12",
+      "online": true,
       "endpoint": null,
       "nat_type": "symmetric",
       "state": "relay",
@@ -189,6 +191,9 @@
     ],
     "control_connected": true,
     "last_control_success_secs_ago": 2,
+    "control_api_reachable": true,
+    "device_lease_healthy": true,
+    "last_device_lease_success_secs_ago": 1,
     "reauth_required": false
   }
 }
