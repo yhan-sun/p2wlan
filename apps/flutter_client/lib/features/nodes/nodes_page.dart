@@ -173,9 +173,10 @@ class _NodesPageState extends State<NodesPage> {
                 widget.capabilities ?? PlatformCapabilities.current();
             final remoteOnly = !capabilities.canActAsLocalVpnNode;
             final snapshot = widget.statusStore.snapshot;
-            final allPeers = _dedupeAndSortPeers(
-              snapshot?.peers ?? const <PeerSnapshot>[],
-            ).where((peer) => !_hiddenPeerIds.contains(peer.nodeId)).toList();
+            final allPeers = widget.statusStore
+                .stablePeerOrder(snapshot?.peers ?? const <PeerSnapshot>[])
+                .where((peer) => !_hiddenPeerIds.contains(peer.nodeId))
+                .toList();
             final query = _searchController.text;
             final visiblePeers = _applySort(
               _applySearch(allPeers, query),

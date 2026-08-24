@@ -452,7 +452,8 @@ class DesktopTrayController with TrayListener, WindowListener {
     AppStrings strings,
     DiagnosticsSnapshot? snapshot,
   ) {
-    final peers = (snapshot?.peers ?? const <PeerSnapshot>[])
+    final peers = statusStore
+        .stablePeerOrder(snapshot?.peers ?? const <PeerSnapshot>[])
         .where((peer) => peer.online)
         .toList(growable: false);
     if (peers.isEmpty) {

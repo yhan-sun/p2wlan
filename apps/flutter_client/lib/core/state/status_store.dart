@@ -116,6 +116,11 @@ class StatusStore extends ChangeNotifier {
   DateTime? _speedTestStartedAt;
   var _peerTrafficSamples = <String, _PeerTrafficSample>{};
   var _peerTransferRatesBytesPerSecond = <String, int>{};
+  // Keep catalog order separate from the live peer snapshot. The daemon may
+  // return peers in a different order as paths, latency, or last-seen values
+  // change; those are presentation fields and must not make rows jump.
+  final _peerOrder = <String, int>{};
+  var _nextPeerOrder = 0;
   late String _lastDiagnosticsUrl;
 
   DiagnosticsSnapshot? get snapshot => _snapshot;
@@ -150,6 +155,39 @@ class StatusStore extends ChangeNotifier {
   /// absent until two successful status samples are available.
   Map<String, int> get peerTransferRatesBytesPerSecond =>
       Map.unmodifiable(_peerTransferRatesBytesPerSecond);
+
+  /// Returns peers in first-seen order and appends newly discovered peers.
+  ///
+  /// The returned list is a fresh list and is safe for a view to filter or
+  /// sort explicitly. Repeated status/metrics refreshes only replace the
+  /// [PeerSnapshot] values, so a path or latency change cannot reorder the
+  /// default device list. The catalog intentionally survives a temporary
+  /// snapshot outage and a peer disappearing/reappearing during this app run.
+  List<PeerSnapshot> stablePeerOrder(Iterable<PeerSnapshot> peers) {
+    final byKey = <String, PeerSnapshot>{};
+    for (final peer in peers) {
+      final key = _peerOrderKey(peer);
+      _peerOrder.putIfAbsent(key, () => _nextPeerOrder++);
+      // Keep the newest snapshot value if a mixed-version response contains
+      // duplicate entries for the same virtual IP/node.
+      byKey[key] = peer;
+    }
+    final ordered = byKey.values.toList();
+    ordered.sort(
+      (left, right) => _peerOrder[_peerOrderKey(left)]!.compareTo(
+        _peerOrder[_peerOrderKey(right)]!,
+      ),
+    );
+    return ordered;
+  }
+
+  static String _peerOrderKey(PeerSnapshot peer) {
+    final nodeId = peer.nodeId.trim();
+    if (nodeId.isNotEmpty) return 'node:$nodeId';
+    final virtualIp = peer.virtualIp.trim();
+    if (virtualIp.isNotEmpty) return 'ip:$virtualIp';
+    return 'name:${peer.displayName}';
+  }
 
   void startPolling() {
     setAutoRefresh(enabled: true, refreshImmediately: true);

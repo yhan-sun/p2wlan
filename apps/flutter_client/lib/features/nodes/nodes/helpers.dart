@@ -1,44 +1,5 @@
 part of '../nodes_page.dart';
 
-List<PeerSnapshot> _dedupeAndSortPeers(List<PeerSnapshot> peers) {
-  final byKey = <String, PeerSnapshot>{};
-  for (final peer in peers) {
-    final key = _peerDedupeKey(peer);
-    final known = byKey[key];
-    if (known == null || _comparePeers(peer, known) < 0) {
-      byKey[key] = peer;
-    }
-  }
-  final sorted = byKey.values.toList(growable: false);
-  sorted.sort(_comparePeers);
-  return sorted;
-}
-
-String _peerDedupeKey(PeerSnapshot peer) {
-  final ip = peer.virtualIp.trim();
-  if (ip.isNotEmpty) return 'ip:$ip';
-  return 'node:${peer.nodeId}';
-}
-
-int _comparePeers(PeerSnapshot left, PeerSnapshot right) {
-  final rank = _peerSortRank(left).compareTo(_peerSortRank(right));
-  if (rank != 0) return rank;
-  final recent = right.sortTimestampMs.compareTo(left.sortTimestampMs);
-  if (recent != 0) return recent;
-  return left.displayName.compareTo(right.displayName);
-}
-
-/// Recommended order: needs attention, online direct, online relay,
-/// connecting/probing, offline — the same ranking the network home preview
-/// uses. No group headers in the list; the rank is the structure.
-int _peerSortRank(PeerSnapshot peer) {
-  if (_peerIsOffline(peer)) return 3;
-  if (_peerNeedsAttention(peer)) return 0;
-  if (peer.path == 'direct') return 1;
-  if (peer.path == 'relay') return 2;
-  return 3;
-}
-
 bool _peerNeedsAttention(PeerSnapshot peer) {
   if (_peerIsOffline(peer)) return false;
   if (peer.lastError != null) return true;
@@ -141,7 +102,10 @@ List<PeerSnapshot> _applySort(List<PeerSnapshot> peers, _NodeSort sort) {
   final sorted = [...peers];
   switch (sort) {
     case _NodeSort.recommended:
-      sorted.sort(_comparePeers);
+      // The input is already the StatusStore's first-seen order. Keeping this
+      // branch a no-op is what prevents live path/latency updates from moving
+      // rows. Name and latency remain explicit, user-selected sorts.
+      break;
     case _NodeSort.name:
       sorted.sort(_compareByName);
     case _NodeSort.latency:
