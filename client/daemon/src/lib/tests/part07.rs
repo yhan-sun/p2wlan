@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,7 @@ const HARD_HARD_B: &str = "peer-b";
 /// sequence. A fresh test allocation gets a disjoint block so the E2E tests
 /// remain safe when the workspace runs tests concurrently.
 static HARD_HARD_NEXT_PORT: AtomicU16 = AtomicU16::new(30_000);
+static HARD_HARD_NEXT_SIGNAL_SEQ: AtomicU64 = AtomicU64::new(1);
 static HARD_HARD_E2E_SERIAL: Semaphore = Semaphore::const_new(1);
 
 #[derive(Clone, Copy)]
@@ -696,9 +697,7 @@ fn install_signal_forwarder(
             {
                 hook(&signal);
             }
-            log.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(signal.clone());
+            let logged_signal = signal.clone();
             let _ = event_tx.send(ControlEvent::PeerOffer {
                 from_node_id: signal.from_node_id,
                 candidates: signal.candidates,
@@ -712,6 +711,13 @@ fn install_signal_forwarder(
                 punch_at_server_ms: None,
                 sender_public_key: Some(signal.sender_public_key),
             });
+            // Publish the observable test copy only after the corresponding
+            // control event is in the receiver queue. A waiter that sees this
+            // signal can therefore enqueue a replay without overtaking the
+            // original response.
+            log.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(logged_signal);
         }),
     );
 }
@@ -1168,24 +1174,40 @@ async fn inject_candidate_offer(
     signal: &TestControlSignal,
     candidate_generation: u64,
     session_id: Option<String>,
-) {
+) -> crate::control::SignalDeliveryReceipt {
+    let signal_seq = HARD_HARD_NEXT_SIGNAL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let receipt = crate::control::SignalDeliveryReceipt::pending();
     harness
         .control_a
         .event_sender()
-        .send(ControlEvent::PeerOffer {
-            from_node_id: signal.from_node_id.clone(),
-            candidates: signal.candidates.clone(),
-            session_id,
-            probe_ephemeral_public_key: None,
-            candidate_sources: signal.candidate_sources.clone(),
-            candidate_generation,
-            candidates_expires_at_ms: signal.candidates_expires_at_ms,
-            handshake_init: signal.handshake_init.clone(),
-            punch_at_ms: None,
-            punch_at_server_ms: None,
-            sender_public_key: Some(signal.sender_public_key.clone()),
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: format!("hard-hard-test-signal-{signal_seq}"),
+            signal_seq: Some(signal_seq),
+            event: Box::new(ControlEvent::PeerOffer {
+                from_node_id: signal.from_node_id.clone(),
+                candidates: signal.candidates.clone(),
+                session_id,
+                probe_ephemeral_public_key: None,
+                candidate_sources: signal.candidate_sources.clone(),
+                candidate_generation,
+                candidates_expires_at_ms: signal.candidates_expires_at_ms,
+                handshake_init: signal.handshake_init.clone(),
+                punch_at_ms: None,
+                punch_at_server_ms: None,
+                sender_public_key: Some(signal.sender_public_key.clone()),
+            }),
+            receipt: receipt.clone(),
         })
         .expect("test control ingress must accept candidate event");
+    receipt
+}
+
+async fn wait_for_injected_offer_disposition(
+    receipt: crate::control::SignalDeliveryReceipt,
+) -> crate::control::SignalApplyOutcome {
+    timeout(Duration::from_secs(12), receipt.wait())
+        .await
+        .expect("candidate offer must reach a state-machine disposition")
 }
 
 async fn wait_for_failed_attempt_cleanup(harness: &TwoPeerHarness) {
@@ -2887,28 +2909,65 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     let original_a = harness.udp_a.dynamic_socket_count().await;
     let original_b = harness.udp_b.dynamic_socket_count().await;
 
+    assert_eq!(harness.udp_a.dynamic_socket_count().await, original_a);
+    assert_eq!(harness.udp_b.dynamic_socket_count().await, original_b);
+
+    // A duplicate full offer can wait behind the active responder transaction.
+    // Move the shared test clock to its punch boundary, then wait for both
+    // durable deliveries to reach a terminal state before installing the next
+    // candidate generation. This prevents an old queued offer from racing the
+    // direct test mutation below while preserving the real responder ordering.
+    harness.link.set_drop_a_to_b(true);
+    harness.link.set_drop_b_to_a(true);
+    set_hard_hard_test_now_ms(Some(
+        response
+            .punch_at_ms
+            .expect("response must carry punch_at_ms"),
+    ));
+    let duplicate_one = inject_candidate_offer(
+        &harness,
+        &response,
+        response.candidate_generation,
+        response.session_id.clone(),
+    )
+    .await;
+    assert_eq!(
+        wait_for_injected_offer_disposition(duplicate_one).await,
+        crate::control::SignalApplyOutcome::Applied,
+        "the first duplicate must drain through the existing responder lane"
+    );
+    let epoch_after_first_duplicate = harness
+        .peers_a
+        .current_remote_candidate_epoch(HARD_HARD_B)
+        .await
+        .unwrap();
+    let duplicate_two = inject_candidate_offer(
+        &harness,
+        &response,
+        response.candidate_generation,
+        response.session_id.clone(),
+    )
+    .await;
+    assert_eq!(
+        wait_for_injected_offer_disposition(duplicate_two).await,
+        crate::control::SignalApplyOutcome::Applied,
+        "the second duplicate must drain through the existing responder lane"
+    );
+    assert_eq!(
+        harness
+            .peers_a
+            .current_remote_candidate_epoch(HARD_HARD_B)
+            .await,
+        Some(epoch_after_first_duplicate),
+        "an exact duplicate must not advance the remote candidate epoch"
+    );
+    wait_for_failed_attempt_cleanup(&harness).await;
+
     let epoch_before_new = harness
         .peers_a
         .current_remote_candidate_epoch(HARD_HARD_B)
         .await
         .unwrap();
-    inject_candidate_offer(
-        &harness,
-        &response,
-        response.candidate_generation,
-        response.session_id.clone(),
-    )
-    .await;
-    inject_candidate_offer(
-        &harness,
-        &response,
-        response.candidate_generation,
-        response.session_id.clone(),
-    )
-    .await;
-    sleep(Duration::from_millis(100)).await;
-    assert_eq!(harness.udp_a.dynamic_socket_count().await, original_a);
-    assert_eq!(harness.udp_b.dynamic_socket_count().await, original_b);
 
     let candidate = response
         .candidates
@@ -2941,20 +3000,22 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     assert_eq!(epoch_after_new, epoch_before_new.saturating_add(1));
     // Deliver the old response after the newer candidate epoch. The real
     // control ingress must reject it as stale instead of reviving S1.
-    inject_candidate_offer(
+    let stale_offer = inject_candidate_offer(
         &harness,
         &response,
         response.candidate_generation,
         response.session_id.clone(),
     )
     .await;
-    harness.link.set_drop_a_to_b(true);
-    harness.link.set_drop_b_to_a(true);
-    set_hard_hard_test_now_ms(Some(
-        response
-            .punch_at_ms
-            .expect("response must carry punch_at_ms"),
-    ));
+    let stale_outcome = wait_for_injected_offer_disposition(stale_offer).await;
+    assert!(
+        matches!(
+            stale_outcome,
+            crate::control::SignalApplyOutcome::Applied
+                | crate::control::SignalApplyOutcome::TerminalRejected
+        ),
+        "the stale offer must finish terminally, got {stale_outcome:?}"
+    );
     wait_for_failed_attempt_cleanup(&harness).await;
     assert!(!harness.peers_a.is_direct(HARD_HARD_B).await);
     assert_relay_remains_available(&harness).await;
