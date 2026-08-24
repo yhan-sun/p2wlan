@@ -6,7 +6,7 @@
 
 use clap::Parser;
 use p2pnet_daemon::config::ControlProxyMode;
-use p2pnet_daemon::{Config, Daemon, DaemonError};
+use p2pnet_daemon::{Config, Daemon, DaemonError, PathPolicy};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::{error, info, warn};

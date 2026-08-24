@@ -400,6 +400,13 @@ pub struct RelayConfig {
     /// Whether to prefer direct P2P over relay.
     #[serde(default = "default_true")]
     pub prefer_direct: bool,
+    /// Data-path selection policy. `auto` preserves the relay-first safety
+    /// behavior, `score` compares encrypted-confirmed paths, and
+    /// `direct-sticky` keeps a healthy encrypted-confirmed Direct path after
+    /// the startup relay-first gate until a hard liveness failure.
+    /// `relay-only` is the explicit Relay fallback.
+    #[serde(default)]
+    pub path_policy: PathPolicy,
     /// Bounded time the first business packet waits for a relay transport to
     /// become available before it is dropped with a stable diagnostic reason.
     ///
@@ -417,6 +424,50 @@ pub struct RelayConfig {
     /// Path to additional CA certificate bundle for self-hosted relays.
     #[serde(default)]
     pub ca_cert_path: Option<String>,
+}
+
+/// Policy used by the outbound data-path selector.
+///
+/// Direct candidates and UDP probe ACKs are never sufficient by themselves
+/// to authorize business traffic. Both `score` and `direct-sticky` still
+/// require the encrypted Direct validation transaction to complete first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathPolicy {
+    /// Relay-first safety gate plus the existing Direct quality fallback.
+    #[default]
+    Auto,
+    /// Select between encrypted-confirmed Direct and peer-confirmed Relay by
+    /// their explainable health scores, with hysteresis.
+    Score,
+    /// Keep encrypted-confirmed Direct selected after the startup relay-first
+    /// gate until a hard liveness failure.
+    DirectSticky,
+    /// Disable Direct data-path promotion and use Relay only.
+    RelayOnly,
+}
+
+impl PathPolicy {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Score => "score",
+            Self::DirectSticky => "direct-sticky",
+            Self::RelayOnly => "relay-only",
+        }
+    }
+}
+
+impl RelayConfig {
+    /// Resolve the effective policy while preserving the meaning of the
+    /// legacy `prefer_direct=false` field in old configuration files.
+    pub fn effective_path_policy(&self, prefer_direct_override: bool) -> PathPolicy {
+        if !prefer_direct_override || !self.prefer_direct {
+            PathPolicy::RelayOnly
+        } else {
+            self.path_policy
+        }
+    }
 }
 
 fn default_true() -> bool {

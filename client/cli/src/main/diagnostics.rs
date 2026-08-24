@@ -90,6 +90,10 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
         }
     );
     println!(
+        "Path policy：{}",
+        config.relay.effective_path_policy(true).as_label()
+    );
+    println!(
         "STUN config：{}",
         stun_config_summary(&config.network.stun_servers)
     );

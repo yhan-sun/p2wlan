@@ -60,7 +60,7 @@ pub mod traversal_history;
 pub mod udp;
 
 // Re-export key types
-pub use config::Config;
+pub use config::{Config, PathPolicy};
 pub use error::{DaemonError, Result};
 
 use crate::udp::estimate_remote_scatter_punch_deadline;

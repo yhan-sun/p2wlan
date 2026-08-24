@@ -133,6 +133,7 @@ impl Config {
                 preferred_regions: Vec::new(),
                 selection_timeout_ms: default_relay_selection_timeout(),
                 prefer_direct: true,
+                path_policy: PathPolicy::default(),
                 relay_startup_timeout_ms: default_relay_timeout(),
                 allow_insecure_plaintext: false,
                 ca_cert_path: None,

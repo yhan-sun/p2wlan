@@ -310,7 +310,7 @@ async fn fresh_candidate_signal_replaces_stale_registry_endpoint() {
 }
 
 #[tokio::test]
-async fn remote_candidate_refresh_invalidates_old_direct_pair_and_ack() {
+async fn remote_candidate_refresh_retains_confirmed_direct_when_endpoint_is_omitted() {
     let manager = PeerManager::new(test_config());
     let old_endpoint: SocketAddr = "203.0.113.10:41000".parse().unwrap();
     let fresh_endpoint: SocketAddr = "203.0.113.10:42000".parse().unwrap();
@@ -356,10 +356,11 @@ async fn remote_candidate_refresh_invalidates_old_direct_pair_and_ack() {
         CandidateSetApplyResult::Applied
     );
 
-    // A remote candidate handover must fence both the selected pair and any
-    // delayed ACK from the old candidate set.  The old endpoint may remain in
-    // diagnostics/history, but it must not remain an active Direct target.
-    assert_ne!(
+    // A volatile candidate refresh must not tear down an already encrypted-
+    // confirmed Direct path merely because the selected peer-reflexive or
+    // signaled endpoint is omitted from the newest set. The consent monitor
+    // remains responsible for detecting a genuinely dead mapping.
+    assert_eq!(
         manager.direct_endpoint_for_send("peer1").await,
         Some(old_endpoint)
     );
@@ -369,11 +370,11 @@ async fn remote_candidate_refresh_invalidates_old_direct_pair_and_ack() {
             .await
             .expect("peer must remain present")
             .state,
-        ConnectionState::FallbackToRelay,
-        "remote handover must retain relay fallback while Direct is invalidated"
+        ConnectionState::Direct,
+        "candidate refresh must retain the confirmed Direct state"
     );
     assert!(
-        !manager
+        manager
             .record_direct_success_for_generation(
                 "peer1",
                 Some(old_endpoint),
@@ -387,25 +388,26 @@ async fn remote_candidate_refresh_invalidates_old_direct_pair_and_ack() {
         .iter()
         .find(|pair| pair.remote_endpoint == old_endpoint)
         .expect("old pair should remain available for diagnostics");
-    assert_ne!(old_pair.state, CandidatePairState::Selected);
-    assert_ne!(conn.endpoint, Some(old_endpoint));
-    assert_eq!(conn.signaled_endpoint, None);
+    assert_eq!(old_pair.state, CandidatePairState::Selected);
+    assert_eq!(conn.endpoint, Some(old_endpoint));
+    assert_eq!(conn.signaled_endpoint, Some(old_endpoint));
     assert!(conn.candidates.contains(&fresh_endpoint.to_string()));
+    assert!(conn.candidates.contains(&old_endpoint.to_string()));
     let diagnostics = manager
         .diagnostics_with_path_selection(true, false, Duration::from_secs(5), None)
         .await
         .into_iter()
         .find(|diagnostics| diagnostics.node_id == "peer1")
         .expect("peer diagnostics must remain available after handover");
-    assert_ne!(
+    assert_eq!(
         diagnostics.active_path,
         Some(NetworkPath::Direct),
-        "diagnostics must not expose the retired Direct path"
+        "diagnostics must retain the confirmed Direct path"
     );
     assert!(diagnostics
         .selected_pair
         .as_ref()
-        .is_none_or(|pair| pair.remote_endpoint != old_endpoint.to_string()));
+        .is_some_and(|pair| pair.remote_endpoint == old_endpoint.to_string()));
 }
 
 #[tokio::test]

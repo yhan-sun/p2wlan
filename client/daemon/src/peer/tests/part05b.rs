@@ -1,3 +1,5 @@
+use crate::config::PathPolicy;
+
 #[tokio::test]
 async fn very_slow_confirmed_direct_is_not_duplicated_to_relay() {
     let config = test_config();
@@ -36,6 +38,144 @@ async fn very_slow_confirmed_direct_is_not_duplicated_to_relay() {
         selected.direct_score.as_ref().unwrap().score
             < selected.relay_score.as_ref().unwrap().score
     );
+}
+
+#[tokio::test]
+async fn score_policy_selects_confirmed_direct_when_direct_score_wins() {
+    let mut config = test_config();
+    config.relay.path_policy = PathPolicy::Score;
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "198.51.100.71:51831".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    manager
+        .record_relay_success_with_latency(
+            "peer1",
+            "relay.test:443",
+            false,
+            Duration::from_millis(80),
+        )
+        .await;
+
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
+    assert_eq!(selected.reason_code, REASON_PATH_SCORE_DIRECT);
+    assert!(selected.direct_confirmed);
+    assert!(selected.direct_score.as_ref().unwrap().score > selected.relay_score.as_ref().unwrap().score);
+}
+
+#[tokio::test]
+async fn score_policy_selects_peer_confirmed_relay_when_direct_score_loses() {
+    let mut config = test_config();
+    config.relay.path_policy = PathPolicy::Score;
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "198.51.100.72:51831".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(700)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    manager
+        .record_relay_success_with_latency(
+            "peer1",
+            "relay.test:443",
+            false,
+            Duration::from_millis(8),
+        )
+        .await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        conn.direct_health.consecutive_failures = 3;
+        conn.direct_health.failure_count = 3;
+        conn.direct_health.rtt_ewma_ms = Some(650);
+        conn.direct_health.jitter_ms = Some(120);
+    }
+
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Relay));
+    assert_eq!(selected.reason_code, REASON_PATH_SCORE_RELAY);
+    assert!(!selected.direct_confirmed);
+    assert!(selected.relay_score.as_ref().unwrap().score > selected.direct_score.as_ref().unwrap().score);
+}
+
+#[tokio::test]
+async fn direct_sticky_keeps_confirmed_direct_until_hard_liveness_failure() {
+    let mut config = test_config();
+    config.relay.path_policy = PathPolicy::DirectSticky;
+    let manager = PeerManager::new(config);
+    let endpoint: SocketAddr = "198.51.100.73:51831".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(700)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+    manager
+        .record_relay_success_with_latency(
+            "peer1",
+            "relay.test:443",
+            false,
+            Duration::from_millis(8),
+        )
+        .await;
+    let generation = manager.current_network_generation().await;
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
+    {
+        let mut conns = manager.connections.write().await;
+        let conn = conns.get_mut("peer1").unwrap();
+        conn.direct_health.consecutive_failures = 3;
+        conn.direct_health.failure_count = 3;
+        conn.direct_health.rtt_ewma_ms = Some(650);
+        conn.direct_health.jitter_ms = Some(120);
+    }
+
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_STICKY);
+    assert!(selected.direct_confirmed);
+
+    // Sticky ignores quality degradation, not an authenticated hard
+    // liveness fence. Three consent failures must still demote the path.
+    {
+        let mut conns = manager.connections.write().await;
+        conns
+            .get_mut("peer1")
+            .unwrap()
+            .direct_health
+            .consecutive_failures = 0;
+    }
+    let before_timeout = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(before_timeout.state, ConnectionState::Direct);
+    assert!(before_timeout.online);
+    assert_eq!(before_timeout.direct_generation, generation);
+    assert_eq!(manager.current_network_generation().await, generation);
+    let session_generation = manager.peer_session_generation_sync("peer1").unwrap();
+    assert!(manager.peer_session_is_current_sync("peer1", session_generation));
+    for _ in 0..3 {
+        assert!(
+            manager
+                .record_direct_keepalive_timeout_for_generation("peer1", endpoint, generation)
+                .await
+        );
+    }
+    let fallback = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(fallback.path, Some(NetworkPath::Relay));
 }
 
 #[tokio::test]

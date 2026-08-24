@@ -191,8 +191,15 @@ impl PeerManager {
             Ok(connections) => connections
                 .values()
                 .map(|conn| {
-                    let current_selection =
-                        conn.select_path_for_data(generation, prefer_direct, relay_available);
+                    let policy = self
+                        .config
+                        .relay
+                        .effective_path_policy(prefer_direct);
+                    let current_selection = conn.select_path_for_data_with_policy(
+                        generation,
+                        policy,
+                        relay_available,
+                    );
                     let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
                         conn,
                         Some(&current_selection),
@@ -256,8 +263,15 @@ impl PeerManager {
             });
         let conns = self.connections.try_read().ok()?;
         let conn = conns.get(node_id)?;
-        let current_selection =
-            conn.select_path_for_data(generation, prefer_direct, relay_available);
+        let policy = self
+            .config
+            .relay
+            .effective_path_policy(prefer_direct);
+        let current_selection = conn.select_path_for_data_with_policy(
+            generation,
+            policy,
+            relay_available,
+        );
         let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
             conn,
             Some(&current_selection),

@@ -117,10 +117,32 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 .collect();
         }
         "relay-policy" => match value {
-            "auto" | "direct" => config.relay.prefer_direct = true,
-            "relay" => config.relay.prefer_direct = false,
+            "auto" | "direct" => {
+                config.relay.prefer_direct = true;
+                config.relay.path_policy = PathPolicy::Auto;
+            }
+            "relay" => {
+                config.relay.prefer_direct = false;
+                config.relay.path_policy = PathPolicy::RelayOnly;
+            }
             _ => return Err("relay-policy 只支持 auto、direct 或 relay".to_string()),
         },
+        "path-policy" => {
+            let normalized = value.trim().to_ascii_lowercase();
+            let policy = match normalized.as_str() {
+                "auto" => PathPolicy::Auto,
+                "score" => PathPolicy::Score,
+                "direct-sticky" | "direct_sticky" | "direct" => PathPolicy::DirectSticky,
+                "relay-only" | "relay_only" | "relay" => PathPolicy::RelayOnly,
+                _ => {
+                    return Err(
+                        "path-policy 只支持 auto、score、direct-sticky 或 relay-only".to_string(),
+                    )
+                }
+            };
+            config.relay.path_policy = policy;
+            config.relay.prefer_direct = policy != PathPolicy::RelayOnly;
+        }
         "relay-startup-timeout" | "direct-timeout" => {
             let timeout = parse_millis(value, "relay-startup-timeout")?;
             if !(100..=60000).contains(&timeout) {

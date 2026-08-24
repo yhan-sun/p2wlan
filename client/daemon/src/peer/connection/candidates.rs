@@ -34,6 +34,7 @@ impl PeerConnection {
     pub(super) fn retire_withdrawn_signaled_candidate_pairs(
         &mut self,
         incoming_signaled: &HashSet<String>,
+        retained_direct_endpoint: Option<SocketAddr>,
         reason: &str,
     ) -> usize {
         let peer_id = self.node_id.clone();
@@ -42,6 +43,7 @@ impl PeerConnection {
         self.candidate_pairs.retain_mut(|pair| {
             let withdrawn = pair.remote_candidate_epoch == remote_epoch
                 && !incoming_signaled.contains(&pair.remote_endpoint.to_string())
+                && Some(pair.remote_endpoint) != retained_direct_endpoint
                 && !matches!(
                     pair.source,
                     CandidatePairSource::Learned | CandidatePairSource::PeerReflexive

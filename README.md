@@ -133,6 +133,8 @@ P2WLAN 会直接展示当前使用的连接路径，方便快速定位网络问�
 
 直连候选来自本地地址、STUN 观测、公网手动配置、peer-reflexive 观测和少量受限预测。复杂 NAT 下，直连成功率取决于两端 NAT 映射与过滤行为；如果云服务器希望被公网 UDP 直连，请固定 UDP 监听端口，并同时在云安全组和操作系统防火墙中放行对应入站规则。
 
+路径选择默认使用 `auto`：只有完成加密确认的 Direct 才能进入数据面，候选刷新不会撤销已确认的 Direct。需要比较已确认 Direct 与 Relay 健康分数时，可设置 `p2wlan config set path-policy score`；测试“启动 relay-first 闸门通过后，只要 Direct 仍通过硬 liveness 就保持直连”时，可设置 `p2wlan config set path-policy direct-sticky`。`direct-sticky` 仍会在连续 Direct 保活失败后回退到 Relay。
+
 ## 架构
 
 ```mermaid

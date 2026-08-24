@@ -97,12 +97,19 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     }
     if cli.relay_only {
         config.relay.prefer_direct = false;
+        config.relay.path_policy = PathPolicy::RelayOnly;
     } else if cli.prefer_relay || cli.prefer_direct {
         // Relay-first is the normal data-plane state: keep business FIFO on
         // Relay until an encrypted Direct validation ACK promotes the path.
         // The old implementation interpreted --prefer-relay as relay-only,
         // which made successful Direct validation unable to switch traffic.
         config.relay.prefer_direct = true;
+        // The legacy flags enable Direct; if a persisted `relay-only` policy
+        // came from the new setting, restore the legacy default instead of
+        // silently leaving Direct disabled for this invocation.
+        if config.relay.path_policy == PathPolicy::RelayOnly {
+            config.relay.path_policy = PathPolicy::Auto;
+        }
     }
     if cli.fresh_mapping_harness_loopback {
         config.network.fresh_mapping_harness_loopback = true;
