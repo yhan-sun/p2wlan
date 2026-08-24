@@ -1291,25 +1291,57 @@ impl UdpTransport {
                 && current.generation == generation
                 && current.remote_candidate_epoch == remote_candidate_epoch
             {
-                // Newest-wins selects the target for the next request. An
-                // already-sent request keeps its exact expectation until it
-                // is ACKed, times out, or is cancelled by owner/generation
-                // teardown. Clearing it here would reject a valid ACK just
-                // because peer-reflexive discovery observed a newer address
-                // while the old request was still in flight.
+                let replace_target = self
+                    .peers
+                    .should_replace_direct_validation_target(
+                        peer_id,
+                        current.endpoint,
+                        endpoint,
+                    )
+                    .await;
+                let target_endpoint = if replace_target {
+                    endpoint
+                } else {
+                    current.endpoint
+                };
                 let updated = DirectValidationTarget {
-                    endpoint,
+                    endpoint: target_endpoint,
                     ..current
                 };
                 target_tx.send_replace(updated);
+                let target_class_upgraded = target_endpoint != current.endpoint
+                    && self
+                        .peers
+                        .is_direct_validation_target_on_link_upgrade(
+                            peer_id,
+                            current.endpoint,
+                            target_endpoint,
+                        )
+                        .await;
+                if target_class_upgraded {
+                    // A request sent to the lower-priority endpoint must not
+                    // be promoted after a LAN target takes over.  The worker
+                    // will observe the watch update and retry the preferred
+                    // target; owner-bound cleanup rejects the old ACK.
+                    let mut expectations = self.direct_validation.expectations.lock().await;
+                    if expectations
+                        .get(peer_id)
+                        .is_some_and(|expectation| expectation.owner_token == current.owner_token)
+                    {
+                        expectations.remove(peer_id);
+                    }
+                }
                 debug!(target: "p2pnet_daemon::direct_validation",
                     event = "direct_validation_observation_merged",
                     peer_id = %peer_id,
                     remote_endpoint = %endpoint,
                     previous_endpoint = %current.endpoint,
+                    selected_endpoint = %target_endpoint,
+                    target_replaced = target_endpoint != current.endpoint,
+                    target_class_upgraded,
                     generation,
                     remote_candidate_epoch,
-                    "merged newest direct-validation endpoint into existing worker"
+                    "merged direct-validation endpoint into existing worker"
                 );
                 return DirectValidationSessionStart::Merged;
             }

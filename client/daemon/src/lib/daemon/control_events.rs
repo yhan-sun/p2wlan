@@ -3028,6 +3028,20 @@ impl Daemon {
                                 FreshPunchDecision::None,
                             )
                         };
+                        if !handshake_init.is_empty() {
+                            // A successful authenticated offer is fresh
+                            // reachability evidence even when the candidate
+                            // list is byte-for-byte unchanged.  This is the
+                            // common rekey path for Android and must be able
+                            // to wake a frozen direct-recovery epoch before
+                            // the ordinary punch admission gate runs.
+                            self.peers
+                                .recovery_reopen_on_evidence(
+                                    &from_node_id,
+                                    "authenticated_peer_offer",
+                                )
+                                .await;
+                        }
                         let hard_hard_handling = self
                             .handle_hard_hard_fresh_offer(
                                 &from_node_id,
@@ -3228,6 +3242,21 @@ impl Daemon {
                                 sender_public_key.as_deref(),
                             )
                             .await;
+                        if !handshake_response.is_empty()
+                            && answer_signal_outcome == control::SignalApplyOutcome::Applied
+                        {
+                            // See the offer path above.  An encrypted answer
+                            // is authenticated liveness evidence and is the
+                            // normal signal emitted by a rekeying Android
+                            // peer; re-arm the bounded recovery window before
+                            // starting its synchronized punch.
+                            self.peers
+                                .recovery_reopen_on_evidence(
+                                    &from_node_id,
+                                    "authenticated_peer_answer",
+                                )
+                                .await;
+                        }
                         match fresh_punch {
                             FreshPunchDecision::Fresh(id, frozen_targets) => {
                                 self.start_hole_punch_at(

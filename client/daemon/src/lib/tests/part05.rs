@@ -1697,6 +1697,100 @@ async fn direct_validation_ingress_coalesces_to_the_newest_endpoint() {
 }
 
 #[tokio::test]
+async fn direct_validation_ingress_preserves_non_public_over_public_churn() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: String::new(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.1.10".parse().unwrap(),
+            24,
+        )])
+        .await;
+    let ingress = DirectValidationIngress::with_peer_manager(peers);
+    let public: SocketAddr = "198.51.100.24:44001".parse().unwrap();
+    let lan: SocketAddr = "192.168.1.24:44002".parse().unwrap();
+
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: public,
+    });
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: lan,
+    });
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: "198.51.100.25:44003".parse().unwrap(),
+    });
+
+    assert_eq!(
+        ingress.next().await.observed_endpoint,
+        lan,
+        "a LAN observation must survive a later public peer-reflexive observation"
+    );
+}
+
+#[tokio::test]
+async fn direct_validation_ingress_does_not_prefer_off_link_private_over_public() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: String::new(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.1.10".parse().unwrap(),
+            24,
+        )])
+        .await;
+    let ingress = DirectValidationIngress::with_peer_manager(peers);
+    let remote_private: SocketAddr = "192.168.50.20:44001".parse().unwrap();
+    let public: SocketAddr = "198.51.100.20:44002".parse().unwrap();
+
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: remote_private,
+    });
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: public,
+    });
+
+    assert_eq!(
+        ingress.next().await.observed_endpoint,
+        public,
+        "off-link private evidence must not suppress a usable public UDP candidate"
+    );
+}
+
+#[tokio::test]
 async fn direct_validation_ingress_skips_replaced_peer_and_preserves_fifo() {
     let ingress = DirectValidationIngress::new();
 

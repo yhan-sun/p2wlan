@@ -259,10 +259,10 @@ async fn run_udp_direct_instance(
     };
     let peer_reflexive_ingress = PeerReflexiveIngress::new();
     // Every source of direct-validation evidence feeds this bounded
-    // per-peer newest-wins ingress. The scheduler is the only place
+    // per-peer reachability-ranked ingress. The scheduler is the only place
     // that may spawn a validation worker; it grants at most one lease
     // per peer/generation and has its own hard global worker cap.
-    let validation_ingress = DirectValidationIngress::new();
+    let validation_ingress = DirectValidationIngress::with_peer_manager(peers.clone());
     let udp = udp
         .with_local_node_id(local_node_id.clone())
         .with_wireguard_transport(direct_validation_transport.clone())
@@ -270,7 +270,8 @@ async fn run_udp_direct_instance(
         .with_peer_reflexive_observer(peer_reflexive_ingress.clone());
     // Matched ACKs enter the same scheduler as peer-reflexive
     // observations. The ingress is synchronous/nonblocking for the
-    // UDP reader and retains each queued peer's newest endpoint.
+    // UDP reader and retains the highest-ranked queued endpoint, with newest
+    // observations winning within the same reachability class.
     let trigger_ingress = validation_ingress.clone();
     let trigger = std::sync::Arc::new(move |observation: PeerReflexiveObservation| {
         trigger_ingress.submit(observation);

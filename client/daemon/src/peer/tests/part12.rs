@@ -71,6 +71,12 @@ async fn hard_nat_side_probes_every_stable_public_mapping_in_initial_burst() {
         .direct_probe_target_set_for("peer1")
         .await
         .expect("stable pool should produce direct targets");
+    for endpoint in &advertised_pool {
+        assert!(
+            target_set.preferred_fast_candidates.contains(endpoint),
+            "the first fast window must cover every stable public mapping, including {endpoint}"
+        );
+    }
     assert!(
         target_set.birthday_plan.is_none(),
         "the asymmetric stable role never builds a birthday plan"
@@ -279,6 +285,63 @@ async fn authenticated_evidence_reopens_frozen_epoch_with_bounded_retry_credit()
         after.probe_credit_remaining,
         "a healthy epoch must not be refilled by evidence"
     );
+}
+
+#[tokio::test]
+async fn remote_candidate_handover_reopens_frozen_recovery_epoch() {
+    let manager = PeerManager::new(test_config());
+    let first: SocketAddr = "198.51.100.20:41000".parse().unwrap();
+    let replacement: SocketAddr = "198.51.100.20:41001".parse().unwrap();
+    manager
+        .add_peer(&flood_peer_112("peer-handover", "10.20.0.5", first))
+        .await;
+
+    let first_text = first.to_string();
+    manager
+        .add_candidates_with_sources(
+            "peer-handover",
+            std::slice::from_ref(&first_text),
+            &HashMap::from([(first_text.clone(), "signaled".to_string())]),
+        )
+        .await;
+    manager.recovery_epoch_admit("peer-handover").await;
+
+    // Consume the same bounded resources that produced the observed
+    // `epoch_budget_exhausted=true, sent=0` Air log episode.
+    while manager
+        .try_consume_recovery_probe_credit("peer-handover")
+        .await
+    {}
+    for _ in 0..RECOVERY_EPOCH_PLAN_BUILDS {
+        assert!(manager.try_consume_recovery_plan_build("peer-handover").await);
+    }
+    for _ in 0..RECOVERY_EPOCH_SESSIONS {
+        assert!(manager.try_consume_recovery_session("peer-handover").await);
+    }
+    manager
+        .mark_recovery_budget_exhausted("peer-handover", 1, 1, 0, 1, "test zero-send")
+        .await;
+    assert!(manager.recovery_budget_frozen("peer-handover").await);
+
+    let replacement_text = replacement.to_string();
+    manager
+        .add_candidates_with_sources(
+            "peer-handover",
+            std::slice::from_ref(&replacement_text),
+            &HashMap::from([(replacement_text.clone(), "signaled".to_string())]),
+        )
+        .await;
+
+    assert!(
+        !manager.recovery_budget_frozen("peer-handover").await,
+        "a real remote mapping handover must wake the frozen recovery epoch"
+    );
+    let report = manager
+        .recovery_epoch_work_budget_report("peer-handover")
+        .await
+        .expect("the existing recovery epoch must be retained");
+    assert_eq!(report.probe_credit_remaining, RECOVERY_EVIDENCE_RETRY_CREDIT);
+    assert_eq!(report.sessions_remaining, RECOVERY_EVIDENCE_REGRANT_SESSIONS);
 }
 
 #[tokio::test]

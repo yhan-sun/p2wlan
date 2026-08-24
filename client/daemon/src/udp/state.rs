@@ -419,9 +419,11 @@ impl DirectValidationRegistry {
 
 /// The mutable target owned by a direct-validation worker.
 ///
-/// A same-generation observation replaces `endpoint` (newest-wins).  A
-/// generation change or lifecycle cleanup sets `cancelled`, so an old worker
-/// cannot keep validating after its ownership was revoked.
+/// A same-generation observation updates `endpoint` using LAN-aware priority:
+/// an on-link endpoint wins over a public endpoint, while newer observations
+/// within the same reachability class still win.  A generation change or
+/// lifecycle cleanup sets `cancelled`, so an old worker cannot keep validating
+/// after its ownership was revoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectValidationTarget {
     pub(crate) endpoint: SocketAddr,

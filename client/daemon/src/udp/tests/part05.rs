@@ -256,6 +256,153 @@ async fn direct_validation_allows_on_link_upgrade_but_rejects_public_alternate()
 }
 
 #[tokio::test]
+async fn direct_validation_target_keeps_lan_over_public_churn() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.2", None))
+        .await;
+    peers
+        .add_peer(&peer("peer-c", "10.20.0.3", None))
+        .await;
+    peers
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.14".parse().unwrap(),
+            24,
+        )])
+        .await;
+
+    let public_endpoint: SocketAddr = "198.51.100.24:51820".parse().unwrap();
+    let lan_endpoint: SocketAddr = "192.168.2.24:51820".parse().unwrap();
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+
+    let lan_owner = match udp
+        .begin_or_merge_direct_validation("peer-b", lan_endpoint, 0)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("the first LAN observation must own the validation session"),
+    };
+    assert!(udp
+        .expect_direct_validation_ack_owned("peer-b", 0x5101, 0, lan_owner, lan_endpoint)
+        .await);
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-b", public_endpoint, 0)
+            .await,
+        DirectValidationSessionStart::Merged
+    ));
+    assert_eq!(
+        udp.direct_validation_target("peer-b")
+            .await
+            .unwrap()
+            .endpoint,
+        lan_endpoint,
+        "a later public observation must not displace an on-link target"
+    );
+    assert!(
+        udp.has_direct_validation_expectation("peer-b").await,
+        "same-class/public churn must not cancel an in-flight LAN expectation"
+    );
+    udp.finish_direct_validation_session("peer-b", lan_owner).await;
+
+    let public_owner = match udp
+        .begin_or_merge_direct_validation("peer-c", public_endpoint, 0)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("the first public observation must own the validation session"),
+    };
+    assert!(udp
+        .expect_direct_validation_ack_owned(
+            "peer-c",
+            0x5102,
+            0,
+            public_owner,
+            public_endpoint,
+        )
+        .await);
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-c", lan_endpoint, 0)
+            .await,
+        DirectValidationSessionStart::Merged
+    ));
+    assert_eq!(
+        udp.direct_validation_target("peer-c")
+            .await
+            .unwrap()
+            .endpoint,
+        lan_endpoint,
+        "an on-link observation must take over from a public target"
+    );
+    assert!(
+        !udp.has_direct_validation_expectation("peer-c").await,
+        "a public in-flight expectation must be revoked when LAN takes over"
+    );
+    udp.finish_direct_validation_session("peer-c", public_owner).await;
+}
+
+#[tokio::test]
+async fn direct_validation_target_prefers_public_over_off_link_private() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.2", None))
+        .await;
+    peers
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.1.10".parse().unwrap(),
+            24,
+        )])
+        .await;
+
+    let remote_private: SocketAddr = "192.168.50.20:51820".parse().unwrap();
+    let public_endpoint: SocketAddr = "198.51.100.20:51820".parse().unwrap();
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap();
+
+    let owner = match udp
+        .begin_or_merge_direct_validation("peer-b", remote_private, 0)
+        .await
+    {
+        DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("the first off-link private observation must own the session"),
+    };
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-b", public_endpoint, 0)
+            .await,
+        DirectValidationSessionStart::Merged
+    ));
+    assert_eq!(
+        udp.direct_validation_target("peer-b")
+            .await
+            .unwrap()
+            .endpoint,
+        public_endpoint,
+        "a usable public candidate must outrank an off-link private endpoint"
+    );
+
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("peer-b", remote_private, 0)
+            .await,
+        DirectValidationSessionStart::Merged
+    ));
+    assert_eq!(
+        udp.direct_validation_target("peer-b")
+            .await
+            .unwrap()
+            .endpoint,
+        public_endpoint,
+        "later off-link private churn must not displace the public hole-punch target"
+    );
+    udp.finish_direct_validation_session("peer-b", owner).await;
+}
+
+#[tokio::test]
 async fn remote_candidate_refresh_cancels_direct_validation_owner() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),

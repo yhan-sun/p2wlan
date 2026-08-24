@@ -20,17 +20,21 @@ fn new_direct_validation_worker_permits() -> Arc<tokio::sync::Semaphore> {
     ))
 }
 
-/// Synchronous, per-peer newest-wins ingress for direct validation.
+/// Synchronous, per-peer coalescing ingress for direct validation.
 ///
 /// UDP receive paths cannot await. Instead of a bounded `mpsc::try_send` that
 /// can discard the newest endpoint when full, this slot map retains the latest
-/// observation for every already-queued peer and wakes one authoritative
-/// scheduler. Distinct peers are bounded explicitly by
+/// observation by reachability priority: on-link LAN, public, then off-link
+/// private. That prevents a LAN target from being lost before the scheduler
+/// applies the connection's prefix-aware policy without allowing an off-link
+/// private address to suppress public Internet hole punching. Distinct peers
+/// are bounded explicitly by
 /// [`MAX_PENDING_DIRECT_VALIDATION_PEERS`].
 #[derive(Clone)]
 struct DirectValidationIngress {
     state: Arc<std::sync::Mutex<DirectValidationIngressState>>,
     notify: Arc<tokio::sync::Notify>,
+    peers: Option<Arc<PeerManager>>,
 }
 
 #[derive(Default)]
@@ -40,16 +44,42 @@ struct DirectValidationIngressState {
 }
 
 impl DirectValidationIngress {
+    #[cfg(test)]
     fn new() -> Self {
         Self {
             state: Arc::new(std::sync::Mutex::new(DirectValidationIngressState::default())),
             notify: Arc::new(tokio::sync::Notify::new()),
+            peers: None,
         }
     }
 
-    /// Store the latest endpoint without blocking the UDP reader. A new peer
-    /// is refused only when the bounded pending-peer set is full; an existing
-    /// peer always wins with its newest observation.
+    fn with_peer_manager(peers: Arc<PeerManager>) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(DirectValidationIngressState::default())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            peers: Some(peers),
+        }
+    }
+
+    fn target_priority(&self, peer_id: &str, endpoint: SocketAddr) -> u8 {
+        self.peers
+            .as_ref()
+            .and_then(|peers| {
+                peers.direct_validation_target_priority_sync(peer_id, endpoint)
+            })
+            .unwrap_or_else(|| {
+                // Focused ingress tests without a peer manager use the same
+                // public-vs-private fallback. In production, the manager
+                // supplies prefix-aware LAN evidence; if its lock is
+                // contended, public remains above unknown private.
+                u8::from(crate::peer::is_public_probe_endpoint(endpoint))
+            })
+    }
+
+    /// Store the preferred endpoint without blocking the UDP reader. A new
+    /// peer is refused only when the bounded pending-peer set is full. Within
+    /// one reachability class the newest observation wins; higher-ranked
+    /// reachability evidence replaces lower-ranked evidence.
     fn submit(&self, observation: PeerReflexiveObservation) {
         let peer_id = observation.peer_id.clone();
         let inserted = {
@@ -57,9 +87,12 @@ impl DirectValidationIngress {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.latest.contains_key(&peer_id)
-                || state.latest.len() < MAX_PENDING_DIRECT_VALIDATION_PEERS
-            {
+            let should_replace = state.latest.get(&peer_id).is_some_and(|current| {
+                self.target_priority(&peer_id, observation.observed_endpoint)
+                    >= self.target_priority(&peer_id, current.observed_endpoint)
+            });
+            let can_insert = state.latest.len() < MAX_PENDING_DIRECT_VALIDATION_PEERS;
+            if should_replace || (!state.latest.contains_key(&peer_id) && can_insert) {
                 let is_new_peer = state.latest.insert(peer_id.clone(), observation).is_none();
                 if is_new_peer {
                     state.order.push_back(peer_id.clone());
@@ -79,7 +112,7 @@ impl DirectValidationIngress {
             debug!(
                 peer_id = %peer_id,
                 max_pending_peers = MAX_PENDING_DIRECT_VALIDATION_PEERS,
-                "dropping direct-validation observation for a new peer because the coalesced ingress is full"
+                "dropping lower-priority direct-validation observation or a new peer because the coalesced ingress is full"
             );
         }
     }
@@ -1092,15 +1125,35 @@ async fn run_direct_encrypted_validation_session(
                         stop_worker = true;
                         break;
                     }
-                    // A newer observation only changes the target for the
-                    // next bounded attempt. This request was already sent to
-                    // `endpoint`, so its ACK remains valid evidence when it
-                    // arrives within the same owner/generation/request lease.
-                    // Do not abort the wait merely because candidate
-                    // discovery learned a fresher endpoint: doing so turns
-                    // normal peer-reflexive churn into validation starvation
-                    // and can make a healthy ACK arrive after its expectation
-                    // was incorrectly withdrawn.
+                    if current.endpoint != endpoint {
+                        // The target changed class while this request was in
+                        // flight (normally public -> LAN).  Withdraw the old
+                        // expectation before the ACK can promote the wrong
+                        // path, then let the outer bounded loop retry the
+                        // policy-preferred endpoint.  Same-class churn keeps
+                        // the old expectation valid until its normal timeout.
+                        udp.clear_direct_validation_expectation_if_owned(&peer_id, owner_token)
+                            .await;
+                        record_validation_event(
+                            &peers,
+                            &peer_id,
+                            generation,
+                            owner_token,
+                            "direct_validation_target_changed",
+                            Some(current.endpoint),
+                            Some(sent),
+                            format!(
+                                "validation target changed from {endpoint} to {}; retrying the policy-preferred endpoint",
+                                current.endpoint
+                            ),
+                        )
+                        .await;
+                        break;
+                    }
+                    // A same-class newer observation only changes the target
+                    // for the next bounded attempt. This request was already
+                    // sent to `endpoint`, so its ACK remains valid evidence
+                    // within the same owner/generation/request lease.
                     let remaining = DIRECT_VALIDATION_ACK_WAIT
                         .saturating_sub(ack_wait_started.elapsed());
                     let _ = wait_for_validation_update(

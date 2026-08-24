@@ -266,6 +266,80 @@ impl PeerManager {
             })
     }
 
+    /// Rank a Direct-validation endpoint by reachability evidence.  A
+    /// directly-connected LAN endpoint is strongest, a public endpoint is
+    /// next for Internet hole punching, and an RFC1918/ULA endpoint that is
+    /// not on one of our local prefixes is weakest.  Address class alone must
+    /// never make an off-link private endpoint outrank a usable public one.
+    fn direct_validation_target_priority(
+        connection: &PeerConnection,
+        endpoint: SocketAddr,
+    ) -> u8 {
+        if connection.is_on_link_host_candidate(endpoint) {
+            2
+        } else if crate::peer::is_public_probe_endpoint(endpoint) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Decide whether a same-generation Direct-validation observation should
+    /// replace the worker's current target.  The priority order is LAN,
+    /// public, then off-link private; within one class, retain the historical
+    /// newest-observation behavior.
+    pub(crate) async fn should_replace_direct_validation_target(
+        &self,
+        node_id: &str,
+        current_endpoint: SocketAddr,
+        candidate_endpoint: SocketAddr,
+    ) -> bool {
+        if current_endpoint == candidate_endpoint {
+            return true;
+        }
+        let connections = self.connections.read().await;
+        let Some(connection) = connections.get(node_id) else {
+            // The admission lifecycle gate already rejects a missing peer.
+            // Preserve newest-wins if the peer disappears between that gate
+            // and this merge rather than pinning a stale target forever.
+            return true;
+        };
+        Self::direct_validation_target_priority(connection, candidate_endpoint)
+            >= Self::direct_validation_target_priority(connection, current_endpoint)
+    }
+
+    /// Whether replacing a validation target is an upgrade from a public or
+    /// otherwise non-on-link endpoint to a directly-connected LAN endpoint.
+    /// Only this class change invalidates an in-flight ACK expectation; newer
+    /// endpoints within the same class retain the existing ACK semantics.
+    pub(crate) async fn is_direct_validation_target_on_link_upgrade(
+        &self,
+        node_id: &str,
+        current_endpoint: SocketAddr,
+        candidate_endpoint: SocketAddr,
+    ) -> bool {
+        let connections = self.connections.read().await;
+        let Some(connection) = connections.get(node_id) else {
+            return false;
+        };
+        Self::direct_validation_target_priority(connection, current_endpoint) < 2
+            && Self::direct_validation_target_priority(connection, candidate_endpoint) == 2
+    }
+
+    /// Synchronous priority lookup for the non-awaiting UDP validation
+    /// ingress.  A contended/missing peer returns `None`; callers then use a
+    /// conservative public-vs-private fallback rather than treating every
+    /// private address as LAN.
+    pub(crate) fn direct_validation_target_priority_sync(
+        &self,
+        node_id: &str,
+        endpoint: SocketAddr,
+    ) -> Option<u8> {
+        let connections = self.connections.try_read().ok()?;
+        let connection = connections.get(node_id)?;
+        Some(Self::direct_validation_target_priority(connection, endpoint))
+    }
+
     /// Lock-free/try-lock counterpart used by the synchronous UDP ingress
     /// gate.  A Direct peer's ordinary matched ACKs must be dropped before
     /// they wake the scheduler; only an on-link alternate may pass through to
