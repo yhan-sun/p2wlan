@@ -52,7 +52,7 @@ class DesktopTrayController with TrayListener, WindowListener {
   Future<void>? _menuUpdateInFlight;
   String? _lastTrayIconAsset;
   String? _lastDesktopTitle;
-  String? _lastDockBadge;
+  bool _macosDockBadgeCleared = false;
   Future<DaemonCommandResult>? _stopDaemonFuture;
   Timer? _windowsLeftClickDedupeTimer;
   var _windowsLeftClickHandled = false;
@@ -254,9 +254,9 @@ class DesktopTrayController with TrayListener, WindowListener {
 
   Future<void> _updateDesktopWindowIndicators(String title) async {
     final shouldUpdateTitle = _lastDesktopTitle != title;
-    final badge = desktopVisibleBadgeForTesting();
-    final shouldUpdateBadge = Platform.isMacOS && _lastDockBadge != badge;
-    if (!shouldUpdateTitle && !shouldUpdateBadge) return;
+    final shouldClearMacosDockBadge =
+        Platform.isMacOS && !_macosDockBadgeCleared;
+    if (!shouldUpdateTitle && !shouldClearMacosDockBadge) return;
 
     try {
       await DesktopWindowOperations.run(() async {
@@ -264,14 +264,18 @@ class DesktopTrayController with TrayListener, WindowListener {
           await windowManager.setTitle(title);
           _lastDesktopTitle = title;
         }
-        if (!shouldUpdateBadge) return;
-        await windowManager.setBadgeLabel(badge.isEmpty ? null : badge);
-        _lastDockBadge = badge;
+        if (shouldClearMacosDockBadge) {
+          // Do not show live metrics as a red macOS Dock badge. Calling this
+          // once also clears a badge written by an older client version.
+          await windowManager.setBadgeLabel();
+          _macosDockBadgeCleared = true;
+        }
       });
     } catch (error) {
       if (shouldUpdateTitle) {
         debugPrint('Failed to update P2WLAN taskbar title: $error');
-      } else {
+      }
+      if (shouldClearMacosDockBadge) {
         debugPrint('Failed to update P2WLAN Dock badge: $error');
       }
     }
@@ -326,10 +330,9 @@ class DesktopTrayController with TrayListener, WindowListener {
           disabled: busy || statusStore.refreshActivityVisible,
           onClick: (_) => unawaited(statusStore.refresh()),
         ),
-        MenuItem.submenu(
-          label: strings.devices,
-          submenu: Menu(items: _deviceItems(strings, snapshot)),
-        ),
+        MenuItem.separator(),
+        MenuItem(label: strings.devices, disabled: true),
+        ..._deviceItems(strings, snapshot),
         MenuItem.separator(),
         MenuItem(
           label: strings.openLogs,
@@ -397,20 +400,6 @@ class DesktopTrayController with TrayListener, WindowListener {
     return '$p2wlanAppName · ${formatLatency(_averageLatency(snapshot))} · ${formatTransferRate(_aggregateSpeed(snapshot))}';
   }
 
-  @visibleForTesting
-  String dockBadgeForTesting() {
-    final snapshot = _metricsSnapshot;
-    if (snapshot == null) return '';
-    final latency = _averageLatency(snapshot);
-    final speed = _aggregateSpeed(snapshot);
-    if (latency == null && speed == null) return '';
-    final latencyLabel = latency == null ? '—' : '${latency}ms';
-    final speedLabel = speed == null
-        ? '—'
-        : formatTransferRate(speed).replaceAll(' ', '');
-    return '$latencyLabel/$speedLabel';
-  }
-
   String _networkLabel(AppStrings strings, DiagnosticsSnapshot? snapshot) {
     final virtualIp = snapshot?.virtualIp.trim();
     final peerCount = snapshot?.stats.totalPeers ?? 0;
@@ -454,7 +443,7 @@ class DesktopTrayController with TrayListener, WindowListener {
   ) {
     final peers = statusStore
         .stablePeerOrder(snapshot?.peers ?? const <PeerSnapshot>[])
-        .where((peer) => peer.online)
+        .where((peer) => peer.online && peer.path != 'offline')
         .toList(growable: false);
     if (peers.isEmpty) {
       return [MenuItem(label: strings.noOnlineDevices, disabled: true)];
