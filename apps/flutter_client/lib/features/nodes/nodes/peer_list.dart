@@ -150,10 +150,9 @@ class _RowContent extends StatelessWidget {
   }
 }
 
-/// Phone layout for a peer row. The identity owns the first line so long
-/// device names are not squeezed into the narrow gap left by three metrics.
-/// Metrics form a compact right-aligned cluster underneath instead of having
-/// desktop-sized empty columns between speed and RTT.
+/// Phone layout for a peer row. Keep the complete interaction on one compact
+/// line: identity, transfer rate, RTT, path, and the detail affordance. The
+/// identity truncates gracefully instead of growing the row to two lines.
 class _CompactRowContent extends StatelessWidget {
   const _CompactRowContent({
     required this.peer,
@@ -170,56 +169,33 @@ class _CompactRowContent extends StatelessWidget {
     final theme = Theme.of(context);
     final statusLabel = _rowPathLabel(strings, peer);
     final statusColor = _rowStatusColor(context, peer);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _PeerLeading(peer: peer, strings: strings),
-            const SizedBox(width: AppTokens.space10),
-            Expanded(
-              child: _PeerPrimaryText(
-                peer: peer,
-                strings: strings,
-                maxNameLines: 2,
-              ),
-            ),
-            const SizedBox(width: AppTokens.space8),
-            Icon(
-              Icons.chevron_right_rounded,
-              size: 20,
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ],
+        _PeerLeading(peer: peer, strings: strings),
+        const SizedBox(width: AppTokens.space8),
+        Expanded(
+          child: _PeerPrimaryText(peer: peer, strings: strings),
         ),
-        Padding(
-          padding: const EdgeInsets.only(left: 42, top: AppTokens.space4),
-          child: Align(
-            alignment: Alignment.centerRight,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _PeerMetricText(
-                  value: formatTransferRate(speedBytesPerSecond),
-                  width: 54,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-                const SizedBox(width: 6),
-                _PeerMetricText(
-                  value: formatLatency(peer.latencyMs),
-                  width: 44,
-                  color: theme.colorScheme.onSurfaceVariant,
-                ),
-                const SizedBox(width: 6),
-                _PeerMetricText(
-                  value: statusLabel,
-                  width: 54,
-                  color: statusColor,
-                ),
-              ],
-            ),
-          ),
+        const SizedBox(width: AppTokens.space4),
+        _PeerMetricText(
+          value: formatTransferRate(speedBytesPerSecond),
+          width: 36,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+        const SizedBox(width: 2),
+        _PeerMetricText(
+          value: formatLatency(peer.latencyMs),
+          width: 36,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+        const SizedBox(width: 2),
+        _PeerMetricText(value: statusLabel, width: 46, color: statusColor),
+        const SizedBox(width: 2),
+        Icon(
+          Icons.chevron_right_rounded,
+          size: 20,
+          color: theme.colorScheme.onSurfaceVariant,
         ),
       ],
     );
@@ -248,7 +224,7 @@ class _PeerMetricText extends StatelessWidget {
         textAlign: TextAlign.end,
         style: TextStyle(
           color: color,
-          fontSize: 11,
+          fontSize: width < 50 ? 10 : 11,
           fontWeight: FontWeight.w600,
           height: 1.2,
           fontFeatures: AppTokens.tabularFontFeatures,
@@ -312,62 +288,62 @@ class _PeerLeading extends StatelessWidget {
 }
 
 class _PeerPrimaryText extends StatelessWidget {
-  const _PeerPrimaryText({
-    required this.peer,
-    required this.strings,
-    this.maxNameLines = 1,
-  });
+  const _PeerPrimaryText({required this.peer, required this.strings});
 
   final PeerSnapshot peer;
   final AppStrings strings;
-  final int maxNameLines;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final error = peer.lastError?.trim();
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        Row(
-          children: [
-            Flexible(
-              child: Text(
-                dash(peer.displayName),
-                maxLines: maxNameLines,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontSize: 13.5,
-                  fontWeight: FontWeight.w700,
-                  color: theme.colorScheme.onSurface,
-                ),
-              ),
+        Flexible(
+          child: Text(
+            dash(peer.displayName),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 13.5,
+              fontWeight: FontWeight.w700,
+              color: theme.colorScheme.onSurface,
             ),
-            if (error != null && error.isNotEmpty) ...[
-              const SizedBox(width: AppTokens.space6),
-              Tooltip(
-                message: error,
-                child: Icon(
-                  Icons.warning_amber_rounded,
-                  size: 15,
-                  color: P2WlanColors.of(context).probing,
-                ),
-              ),
-            ],
-          ],
-        ),
-        const SizedBox(height: 3),
-        Text(
-          dash(peer.virtualIp),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            fontSize: 12,
-            fontWeight: FontWeight.w600,
-            color: theme.colorScheme.onSurfaceVariant,
-            fontFeatures: AppTokens.tabularFontFeatures,
           ),
         ),
+        Text(
+          ' · ',
+          maxLines: 1,
+          style: TextStyle(
+            fontSize: 11,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        Flexible(
+          child: Text(
+            dash(peer.virtualIp),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: theme.colorScheme.onSurfaceVariant,
+              fontFeatures: AppTokens.tabularFontFeatures,
+            ),
+          ),
+        ),
+        if (error != null && error.isNotEmpty) ...[
+          const SizedBox(width: AppTokens.space6),
+          Tooltip(
+            message: error,
+            child: Icon(
+              Icons.warning_amber_rounded,
+              size: 15,
+              color: P2WlanColors.of(context).probing,
+            ),
+          ),
+        ],
       ],
     );
   }

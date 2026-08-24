@@ -119,6 +119,10 @@ void _registerNodesTests() {
     expect(find.text('direct-laptop'), findsOneWidget);
     expect(find.text('10.20.0.11'), findsOneWidget);
     expect(find.byKey(const Key('nodes-search-field')), findsOneWidget);
+    expect(
+      tester.getSize(find.byKey(const Key('node-row-peer-direct-001'))).height,
+      lessThan(64),
+    );
     // No inspector on mobile, no overflow menu on mobile rows.
     expect(find.byKey(const Key('nodes-detail-pane')), findsNothing);
     expect(find.byTooltip('Device actions'), findsNothing);

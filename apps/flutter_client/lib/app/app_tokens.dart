@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 /// Design tokens for P2WLAN Flutter Client UI/UX.
@@ -140,4 +141,15 @@ abstract final class AppTokens {
     'Arial',
     'sans-serif',
   ];
+
+  /// Use the native UI family for Latin text on each desktop/mobile platform
+  /// and let the ordered fallback list fill in CJK glyphs. In particular,
+  /// Windows must not inherit the renderer's generic fallback family: that
+  /// produces visibly mismatched weights and awkward Chinese glyph metrics.
+  static String get primaryFontFamily => switch (defaultTargetPlatform) {
+    TargetPlatform.windows => 'Segoe UI',
+    TargetPlatform.macOS || TargetPlatform.iOS => 'SF Pro Text',
+    TargetPlatform.android || TargetPlatform.fuchsia => 'Roboto',
+    TargetPlatform.linux => 'Noto Sans',
+  };
 }

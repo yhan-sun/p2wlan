@@ -83,33 +83,39 @@ class _LocalNodePanel extends StatelessWidget {
                   ),
                   const SizedBox(width: AppTokens.space10),
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                    child: Row(
                       children: [
-                        Text(
-                          dash(deviceName),
-                          // Keep long hostnames readable on phones; the
-                          // status/edit affordances already consume the
-                          // trailing space in this row.
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 13.5,
-                            fontWeight: FontWeight.w700,
-                            color: theme.colorScheme.onSurface,
-                            height: 1.2,
+                        Flexible(
+                          child: Text(
+                            dash(deviceName),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                              color: theme.colorScheme.onSurface,
+                            ),
                           ),
                         ),
-                        const SizedBox(height: 2),
                         Text(
-                          dash(virtualIp),
+                          ' · ',
                           maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
+                            fontSize: 11,
                             color: theme.colorScheme.onSurfaceVariant,
-                            fontFeatures: AppTokens.tabularFontFeatures,
+                          ),
+                        ),
+                        Flexible(
+                          child: Text(
+                            dash(virtualIp),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: theme.colorScheme.onSurfaceVariant,
+                              fontFeatures: AppTokens.tabularFontFeatures,
+                            ),
                           ),
                         ),
                       ],

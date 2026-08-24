@@ -104,50 +104,8 @@ class _NetworkHero extends StatelessWidget {
         };
 
     final header = LayoutBuilder(
-      builder: (context, constraints) {
+      builder: (context, _) {
         final colors = P2WlanColors.of(context);
-        final compactStop = constraints.maxWidth < 460;
-        final stop = compactStop
-            ? IconButton(
-                key: const Key('dashboard-stop-button'),
-                tooltip: strings.stopP2wlan,
-                onPressed: daemonBusy ? null : onStopDaemon,
-                style: IconButton.styleFrom(
-                  foregroundColor: colors.dangerText,
-                  backgroundColor: colors.dangerSurface,
-                  side: BorderSide(color: colors.dangerBorder),
-                  minimumSize: const Size(40, 40),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                  ),
-                ),
-                icon: daemonBusy
-                    ? _ButtonSpinner(color: colors.dangerText)
-                    : const Icon(Icons.stop_rounded, size: 18),
-              )
-            : OutlinedButton.icon(
-                key: const Key('dashboard-stop-button'),
-                onPressed: daemonBusy ? null : onStopDaemon,
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: colors.dangerText,
-                  backgroundColor: colors.dangerSurface,
-                  side: BorderSide(color: colors.dangerBorder),
-                  minimumSize: const Size(0, 40),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 10,
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-                  ),
-                ),
-                icon: daemonBusy
-                    ? _ButtonSpinner(color: colors.dangerText)
-                    : const Icon(Icons.stop_rounded, size: 17),
-                label: Text(
-                  daemonBusy ? strings.daemonWorking : strings.stopP2wlan,
-                ),
-              );
         return Row(
           children: [
             Container(
@@ -177,7 +135,6 @@ class _NetworkHero extends StatelessWidget {
                 ),
               ),
             ),
-            if (showStop) ...[const SizedBox(width: AppTokens.space8), stop],
             const SizedBox(width: AppTokens.space8),
             StatusBadge(
               label: _networkStatusLabel(
@@ -201,13 +158,18 @@ class _NetworkHero extends StatelessWidget {
         if (hasSnapshot) ...[
           LayoutBuilder(
             builder: (context, constraints) {
-              final virtualIp = _VirtualIpBlock(virtualIp: snapshot!.virtualIp);
+              final virtualIp = _VirtualIpBlock(
+                virtualIp: snapshot!.virtualIp,
+                showStop: showStop,
+                daemonBusy: daemonBusy,
+                onStopDaemon: onStopDaemon,
+              );
 
               // On desktop the two pieces of primary information share one
               // baseline. Narrow windows keep the same order but stack them
               // so neither the IP nor the counts becomes cramped.
               if (status != _NetworkStatus.stale &&
-                  constraints.maxWidth >= 560) {
+                  constraints.maxWidth >= 720) {
                 return Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
@@ -347,9 +309,17 @@ class _HeroSurface extends StatelessWidget {
 
 /// Virtual IP with tap-to-copy (tooltip + lightweight snackbar).
 class _VirtualIpBlock extends StatelessWidget {
-  const _VirtualIpBlock({required this.virtualIp});
+  const _VirtualIpBlock({
+    required this.virtualIp,
+    this.showStop = false,
+    this.daemonBusy = false,
+    this.onStopDaemon,
+  });
 
   final String virtualIp;
+  final bool showStop;
+  final bool daemonBusy;
+  final Future<void> Function()? onStopDaemon;
 
   @override
   Widget build(BuildContext context) {
@@ -370,41 +340,54 @@ class _VirtualIpBlock extends StatelessWidget {
           ),
         ),
         const SizedBox(height: AppTokens.space4),
-        Tooltip(
-          message: strings.copyVirtualIp,
-          child: InkWell(
-            key: const Key('home-virtual-ip'),
-            onTap: () => _copy(context, strings),
-            borderRadius: BorderRadius.circular(AppTokens.radiusSm),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Flexible(
-                    child: Text(
-                      dash(virtualIp),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: theme.colorScheme.onSurface,
-                        fontSize: 28,
-                        fontWeight: FontWeight.w700,
-                        height: 1.1,
-                        fontFeatures: AppTokens.tabularFontFeatures,
-                      ),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Expanded(
+              child: Tooltip(
+                message: strings.copyVirtualIp,
+                child: InkWell(
+                  key: const Key('home-virtual-ip'),
+                  onTap: () => _copy(context, strings),
+                  borderRadius: BorderRadius.circular(AppTokens.radiusSm),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            dash(virtualIp),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: theme.colorScheme.onSurface,
+                              fontSize: 28,
+                              fontWeight: FontWeight.w700,
+                              height: 1.1,
+                              fontFeatures: AppTokens.tabularFontFeatures,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: AppTokens.space8),
+                        Icon(
+                          Icons.copy_rounded,
+                          size: 15,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(width: AppTokens.space8),
-                  Icon(
-                    Icons.copy_rounded,
-                    size: 15,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ],
+                ),
               ),
             ),
-          ),
+            if (showStop && onStopDaemon != null) ...[
+              const SizedBox(width: AppTokens.space8),
+              _StopDaemonButton(
+                daemonBusy: daemonBusy,
+                onStopDaemon: onStopDaemon!,
+              ),
+            ],
+          ],
         ),
       ],
     );
@@ -416,6 +399,45 @@ class _VirtualIpBlock extends StatelessWidget {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(SnackBar(content: Text(strings.copied)));
+  }
+}
+
+/// Full-label stop action kept next to the Virtual IP. It intentionally stays
+/// a text button on phones: the destructive action must remain discoverable
+/// and must not collapse into an unlabeled icon at compact widths.
+class _StopDaemonButton extends StatelessWidget {
+  const _StopDaemonButton({
+    required this.daemonBusy,
+    required this.onStopDaemon,
+  });
+
+  final bool daemonBusy;
+  final Future<void> Function() onStopDaemon;
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = AppStringsScope.of(context);
+    final colors = P2WlanColors.of(context);
+    return OutlinedButton.icon(
+      key: const Key('dashboard-stop-button'),
+      onPressed: daemonBusy ? null : onStopDaemon,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: colors.dangerText,
+        backgroundColor: colors.dangerSurface,
+        side: BorderSide(color: colors.dangerBorder),
+        minimumSize: const Size(0, 40),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+        visualDensity: VisualDensity.compact,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+        ),
+        textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+      ),
+      icon: daemonBusy
+          ? _ButtonSpinner(color: colors.dangerText)
+          : const Icon(Icons.stop_rounded, size: 17),
+      label: Text(daemonBusy ? strings.daemonWorking : strings.stopP2wlan),
+    );
   }
 }
 
