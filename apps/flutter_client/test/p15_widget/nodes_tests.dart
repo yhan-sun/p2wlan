@@ -491,6 +491,7 @@ void _registerNodesTests() {
     // brief. This catches height/width regressions without changing mobile
     // coverage, which intentionally stays on the original dialog branch.
     for (final size in const [
+      Size(800, 600),
       Size(1024, 768),
       Size(1280, 800),
       Size(1440, 900),

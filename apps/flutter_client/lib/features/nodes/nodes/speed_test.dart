@@ -398,7 +398,11 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
     final eligible = _canRunSpeedTest(widget.peer);
     final size = MediaQuery.sizeOf(context);
     final maxWidth = math.min(900.0, math.max(0.0, size.width - 32));
-    final chartHeight = maxWidth < 820 ? 214.0 : 248.0;
+    final maxDialogHeight = math.min(720.0, math.max(0.0, size.height - 48));
+    final chartHeight = _desktopChartHeight(
+      maxWidth: maxWidth,
+      maxDialogHeight: maxDialogHeight,
+    );
     final pathLabel = _rowPathLabel(strings, widget.peer);
     final pathValue = _connectionLabel(strings, widget.peer);
     final pathColor = _rowStatusColor(context, widget.peer);
@@ -412,166 +416,181 @@ class _SpeedTestDialogState extends State<_SpeedTestDialog> {
       child: ConstrainedBox(
         constraints: BoxConstraints(
           maxWidth: maxWidth,
-          maxHeight: math.min(720.0, math.max(0.0, size.height - 48)),
+          maxHeight: maxDialogHeight,
         ),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(24, 20, 24, 18),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          strings.speedTestTitle,
-                          style: TextStyle(
-                            color: colorScheme.onSurface,
-                            fontSize: 21,
-                            fontWeight: FontWeight.w700,
-                            height: 1.1,
+        child: SingleChildScrollView(
+          primary: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 20, 24, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            strings.speedTestTitle,
+                            style: TextStyle(
+                              color: colorScheme.onSurface,
+                              fontSize: 21,
+                              fontWeight: FontWeight.w700,
+                              height: 1.1,
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 5),
-                        Text(
-                          strings.speedTestPeer(widget.peer.displayName),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: colorScheme.onSurfaceVariant,
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
+                          const SizedBox(height: 5),
+                          Text(
+                            strings.speedTestPeer(widget.peer.displayName),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: colorScheme.onSurfaceVariant,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w500,
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: AppTokens.space12),
-                  _DesktopPathBadge(label: pathLabel, color: pathColor),
-                  const SizedBox(width: AppTokens.space4),
-                  IconButton(
-                    tooltip: strings.close,
-                    onPressed: () => Navigator.of(context).pop(),
-                    padding: EdgeInsets.zero,
-                    visualDensity: VisualDensity.compact,
-                    icon: Icon(
-                      Icons.close_rounded,
-                      size: 24,
-                      color: colorScheme.onSurfaceVariant,
+                    const SizedBox(width: AppTokens.space12),
+                    _DesktopPathBadge(label: pathLabel, color: pathColor),
+                    const SizedBox(width: AppTokens.space4),
+                    IconButton(
+                      tooltip: strings.close,
+                      onPressed: () => Navigator.of(context).pop(),
+                      padding: EdgeInsets.zero,
+                      visualDensity: VisualDensity.compact,
+                      icon: Icon(
+                        Icons.close_rounded,
+                        size: 24,
+                        color: colorScheme.onSurfaceVariant,
+                      ),
                     ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 14),
-              _DesktopSpeedLinkInfo(
-                peer: widget.peer,
-                path: pathValue,
-                pathColor: pathColor,
-                strings: strings,
-              ),
-              const SizedBox(height: 12),
-              AnimatedBuilder(
-                animation: _desktopTelemetry,
-                builder: (context, _) => _DesktopSpeedRateCards(
-                  downloadMbps: _desktopTelemetry.currentDownloadMbps,
-                  uploadMbps: _desktopTelemetry.currentUploadMbps,
-                  strings: strings,
-                  downloadColor: colorScheme.primary,
-                  uploadColor: colors.direct,
+                  ],
                 ),
-              ),
-              const SizedBox(height: 12),
-              RepaintBoundary(
-                child: AnimatedBuilder(
+                const SizedBox(height: 14),
+                _DesktopSpeedLinkInfo(
+                  peer: widget.peer,
+                  path: pathValue,
+                  pathColor: pathColor,
+                  strings: strings,
+                ),
+                const SizedBox(height: 12),
+                AnimatedBuilder(
                   animation: _desktopTelemetry,
-                  builder: (context, _) => _DesktopSpeedTestChart(
-                    samples: _desktopTelemetry.samples,
-                    maxSpeed: _desktopTelemetry.chartMaxMbps,
-                    duration: _testDuration,
-                    height: chartHeight,
+                  builder: (context, _) => _DesktopSpeedRateCards(
+                    downloadMbps: _desktopTelemetry.currentDownloadMbps,
+                    uploadMbps: _desktopTelemetry.currentUploadMbps,
+                    strings: strings,
                     downloadColor: colorScheme.primary,
                     uploadColor: colors.direct,
-                    axisColor: colorScheme.onSurfaceVariant,
-                    gridColor: colorScheme.outlineVariant,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                RepaintBoundary(
+                  child: AnimatedBuilder(
+                    animation: _desktopTelemetry,
+                    builder: (context, _) => _DesktopSpeedTestChart(
+                      samples: _desktopTelemetry.samples,
+                      maxSpeed: _desktopTelemetry.chartMaxMbps,
+                      duration: _testDuration,
+                      height: chartHeight,
+                      downloadColor: colorScheme.primary,
+                      uploadColor: colors.direct,
+                      axisColor: colorScheme.onSurfaceVariant,
+                      gridColor: colorScheme.outlineVariant,
+                      strings: strings,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                AnimatedBuilder(
+                  animation: _desktopTelemetry,
+                  builder: (context, _) => _DesktopSpeedSummary(
+                    telemetry: _desktopTelemetry,
+                    result: result,
+                    fallbackRttMs: widget.peer.latencyMs,
                     strings: strings,
+                    downloadColor: colorScheme.primary,
+                    uploadColor: colors.direct,
                   ),
                 ),
-              ),
-              const SizedBox(height: 12),
-              AnimatedBuilder(
-                animation: _desktopTelemetry,
-                builder: (context, _) => _DesktopSpeedSummary(
-                  telemetry: _desktopTelemetry,
-                  result: result,
-                  fallbackRttMs: widget.peer.latencyMs,
-                  strings: strings,
-                  downloadColor: colorScheme.primary,
-                  uploadColor: colors.direct,
-                ),
-              ),
-              if (_runningElsewhere) ...[
-                const SizedBox(height: 10),
-                _DesktopSpeedNotice(
-                  icon: Icons.hourglass_top_rounded,
-                  message: strings.speedTestRunningOn(
-                    widget.statusStore.speedTestPeerVirtualIp ?? '',
-                  ),
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ] else if (error != null && error.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                _DesktopSpeedNotice(
-                  icon: Icons.error_outline_rounded,
-                  message: strings.speedTestFailed(error),
-                  color: colorScheme.error,
-                ),
-              ] else if (!eligible) ...[
-                const SizedBox(height: 10),
-                _DesktopSpeedNotice(
-                  icon: Icons.info_outline_rounded,
-                  message: strings.speedTestUnavailable,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ],
-              const SizedBox(height: 14),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  OutlinedButton(
-                    onPressed: () => Navigator.of(context).pop(),
-                    child: Text(strings.close),
-                  ),
-                  const SizedBox(width: AppTokens.space8),
-                  FilledButton.icon(
-                    key: const Key('node-speedtest-start'),
-                    onPressed: eligible && !widget.statusStore.speedTestRunning
-                        ? _run
-                        : null,
-                    icon: Icon(
-                      _runningForPeer
-                          ? Icons.hourglass_top_rounded
-                          : Icons.speed_rounded,
-                      size: 18,
+                if (_runningElsewhere) ...[
+                  const SizedBox(height: 10),
+                  _DesktopSpeedNotice(
+                    icon: Icons.hourglass_top_rounded,
+                    message: strings.speedTestRunningOn(
+                      widget.statusStore.speedTestPeerVirtualIp ?? '',
                     ),
-                    label: Text(
-                      _runningForPeer || _runningElsewhere
-                          ? strings.speedTesting
-                          : result != null || error != null
-                          ? strings.retrySpeedTest
-                          : strings.startSpeedTest,
-                    ),
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ] else if (error != null && error.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  _DesktopSpeedNotice(
+                    icon: Icons.error_outline_rounded,
+                    message: strings.speedTestFailed(error),
+                    color: colorScheme.error,
+                  ),
+                ] else if (!eligible) ...[
+                  const SizedBox(height: 10),
+                  _DesktopSpeedNotice(
+                    icon: Icons.info_outline_rounded,
+                    message: strings.speedTestUnavailable,
+                    color: colorScheme.onSurfaceVariant,
                   ),
                 ],
-              ),
-            ],
+                const SizedBox(height: 14),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    OutlinedButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: Text(strings.close),
+                    ),
+                    const SizedBox(width: AppTokens.space8),
+                    FilledButton.icon(
+                      key: const Key('node-speedtest-start'),
+                      onPressed:
+                          eligible && !widget.statusStore.speedTestRunning
+                          ? _run
+                          : null,
+                      icon: Icon(
+                        _runningForPeer
+                            ? Icons.hourglass_top_rounded
+                            : Icons.speed_rounded,
+                        size: 18,
+                      ),
+                      label: Text(
+                        _runningForPeer || _runningElsewhere
+                            ? strings.speedTesting
+                            : result != null || error != null
+                            ? strings.retrySpeedTest
+                            : strings.startSpeedTest,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),
     );
+  }
+
+  static double _desktopChartHeight({
+    required double maxWidth,
+    required double maxDialogHeight,
+  }) {
+    final preferred = maxWidth < 820 ? 214.0 : 248.0;
+    if (maxDialogHeight >= 640) return preferred;
+    // The default macOS window can be close to 800×600. Keep the graph
+    // readable there while reserving enough room for the summary and actions.
+    return math.max(128.0, math.min(preferred, maxDialogHeight - 462));
   }
 }
 
