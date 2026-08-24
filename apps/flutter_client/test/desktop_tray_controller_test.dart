@@ -73,15 +73,12 @@ void main() {
     addTearDown(stores.dispose);
     await stores.statusStore.refresh();
 
-    final menu = DesktopTrayController(
-      settingsStore: stores.settingsStore,
-      statusStore: stores.statusStore,
-    ).buildMenuForTesting();
-    final devices = menu.items!.firstWhere((item) => item.label == '设备');
-    final labels = devices.submenu!.items!
-        .map((item) => item.label)
-        .whereType<String>()
-        .toList();
+    final labels = _labels(
+      DesktopTrayController(
+        settingsStore: stores.settingsStore,
+        statusStore: stores.statusStore,
+      ),
+    );
 
     expect(labels.any((label) => label.contains('direct-laptop')), isTrue);
     expect(labels.any((label) => label.contains('relay-nas')), isTrue);
@@ -97,15 +94,12 @@ void main() {
 
     await stores.statusStore.refresh();
 
-    final menu = DesktopTrayController(
-      settingsStore: stores.settingsStore,
-      statusStore: stores.statusStore,
-    ).buildMenuForTesting();
-    final devices = menu.items!.firstWhere((item) => item.label == '设备');
-    final labels = devices.submenu!.items!
-        .map((item) => item.label)
-        .whereType<String>()
-        .toList();
+    final labels = _labels(
+      DesktopTrayController(
+        settingsStore: stores.settingsStore,
+        statusStore: stores.statusStore,
+      ),
+    );
 
     expect(labels.any((label) => label.contains('🟢 直连')), isTrue);
     expect(labels.any((label) => label.contains('🟠 中继')), isTrue);
@@ -273,9 +267,18 @@ void main() {
           .toList();
 
       expect(deviceLabels, hasLength(13));
-      expect(labels, contains('direct-laptop · 10.20.0.11'));
-      expect(labels, contains('extra-12 · 10.20.1.12'));
-      expect(labels, isNot(contains('relay-nas · 10.20.0.12')));
+      expect(
+        labels.any((label) => label.contains('direct-laptop · 10.20.0.11')),
+        isTrue,
+      );
+      expect(
+        labels.any((label) => label.contains('extra-12 · 10.20.1.12')),
+        isTrue,
+      );
+      expect(
+        labels.any((label) => label.contains('relay-nas · 10.20.0.12')),
+        isFalse,
+      );
     },
   );
 

@@ -126,6 +126,20 @@ class DesktopWindowStatusController {
     return '$p2wlanAppName · ${formatLatency(_averageLatency(snapshot))} · ${formatTransferRate(_aggregateSpeed(snapshot))}';
   }
 
+  @visibleForTesting
+  String dockBadgeForTesting() {
+    final snapshot = _metricsSnapshot;
+    if (snapshot == null) return '';
+    final latency = _averageLatency(snapshot);
+    final speed = _aggregateSpeed(snapshot);
+    if (latency == null && speed == null) return '';
+    final latencyLabel = latency == null ? '—' : '${latency}ms';
+    final speedLabel = speed == null
+        ? '—'
+        : formatTransferRate(speed).replaceAll(' ', '');
+    return '$latencyLabel/$speedLabel';
+  }
+
   DiagnosticsSnapshot? get _metricsSnapshot {
     if (!statusStore.daemonReachable || statusStore.snapshotStale) return null;
     return statusStore.snapshot;

@@ -400,6 +400,20 @@ class DesktopTrayController with TrayListener, WindowListener {
     return '$p2wlanAppName · ${formatLatency(_averageLatency(snapshot))} · ${formatTransferRate(_aggregateSpeed(snapshot))}';
   }
 
+  @visibleForTesting
+  String dockBadgeForTesting() {
+    final snapshot = _metricsSnapshot;
+    if (snapshot == null) return '';
+    final latency = _averageLatency(snapshot);
+    final speed = _aggregateSpeed(snapshot);
+    if (latency == null && speed == null) return '';
+    final latencyLabel = latency == null ? '—' : '${latency}ms';
+    final speedLabel = speed == null
+        ? '—'
+        : formatTransferRate(speed).replaceAll(' ', '');
+    return '$latencyLabel/$speedLabel';
+  }
+
   String _networkLabel(AppStrings strings, DiagnosticsSnapshot? snapshot) {
     final virtualIp = snapshot?.virtualIp.trim();
     final peerCount = snapshot?.stats.totalPeers ?? 0;
