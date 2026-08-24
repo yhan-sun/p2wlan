@@ -494,3 +494,25 @@ fn validates_and_sets_safe_config_values() {
     assert!(set_config_value(&mut config, "diagnostics", "0.0.0.0:39277").is_err());
     assert!(set_config_value(&mut config, "auth-token", "secret").is_err());
 }
+
+#[test]
+fn path_policy_updates_direct_selection_mode() {
+    let mut config = Config::generate_default(DEFAULT_CONTROL_SERVER, DEFAULT_NETWORK).unwrap();
+
+    set_config_value(&mut config, "path-policy", "score").unwrap();
+    assert_eq!(config.relay.path_policy, PathPolicy::Score);
+    assert!(config.relay.prefer_direct);
+
+    set_config_value(&mut config, "path-policy", "direct-sticky").unwrap();
+    assert_eq!(config.relay.path_policy, PathPolicy::DirectSticky);
+    assert!(config.relay.prefer_direct);
+
+    set_config_value(&mut config, "path-policy", "relay-only").unwrap();
+    assert_eq!(config.relay.path_policy, PathPolicy::RelayOnly);
+    assert!(!config.relay.prefer_direct);
+
+    // The legacy relay-policy switch remains a compatibility alias.
+    set_config_value(&mut config, "relay-policy", "auto").unwrap();
+    assert_eq!(config.relay.path_policy, PathPolicy::Auto);
+    assert!(config.relay.prefer_direct);
+}

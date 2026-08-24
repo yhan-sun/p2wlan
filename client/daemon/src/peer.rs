@@ -395,6 +395,15 @@ pub const REASON_DIRECT_TRIAL_EXPIRED: &str = "direct_trial_expired";
 pub const REASON_HANDSHAKE_TIMEOUT: &str = "handshake_timeout";
 /// Path selector chose a confirmed Direct UDP pair.
 pub const REASON_PATH_DIRECT_CONFIRMED: &str = "path_direct_confirmed";
+/// Path selector kept an encrypted-confirmed Direct pair under the
+/// `direct-sticky` policy.
+pub const REASON_PATH_DIRECT_STICKY: &str = "path_direct_sticky";
+/// Path selector selected Direct because the configured score policy ranked
+/// it at least as well as the confirmed Relay path.
+pub const REASON_PATH_SCORE_DIRECT: &str = "path_score_direct";
+/// Path selector selected Relay because the configured score policy ranked it
+/// materially better than the encrypted-confirmed Direct path.
+pub const REASON_PATH_SCORE_RELAY: &str = "path_score_relay";
 /// Path selector chose a recent Direct trial while Relay stays available.
 pub const REASON_PATH_DIRECT_TRIAL: &str = "path_direct_trial";
 /// Path selector chose Direct because Relay is unavailable.

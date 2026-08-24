@@ -652,19 +652,29 @@ impl Daemon {
         }
 
         // All state required to replay/validate the response is now staged.
-        // The answer must never wait for a live STUN refresh or the ordinary
-        // candidate/endpoint lane: use the cached candidate snapshot. If the
-        // relay transport is already available, an empty snapshot is valid and
-        // lets the encrypted session/relay probe complete before Direct
-        // candidates arrive. Candidate refresh remains a background upgrade.
+        // The answer never starts a new live STUN gather. It may wait briefly
+        // for the already-running startup gather to replace the provisional
+        // host-only snapshot; if relay is available, an empty snapshot still
+        // lets the encrypted session/relay probe complete immediately.
         let (candidates, candidate_sources) = {
-            let snapshot = self.cached_local_candidate_set().await;
+            let initial_snapshot = self.initial_candidate_set_if_ready().await;
             let mut relay_available = self.relay_available_tx.subscribe();
             let relay_is_available = *relay_available.borrow();
-            if let Some(snapshot) =
-                relay_first_candidate_shortcut(snapshot.0, snapshot.1, relay_is_available)
-            {
-                snapshot
+            if let Some(initial_snapshot) = initial_snapshot {
+                if let Some(snapshot) = relay_first_candidate_shortcut(
+                    initial_snapshot.0,
+                    initial_snapshot.1,
+                    relay_is_available,
+                ) {
+                    snapshot
+                } else {
+                    self.wait_for_local_candidate_set().await
+                }
+            } else if relay_is_available {
+                // The host-only bootstrap snapshot is intentionally not used
+                // for a new answer when relay is already usable. The full
+                // startup candidate publication will follow independently.
+                (Vec::new(), HashMap::new())
             } else {
                 match cancellation.as_deref_mut() {
                     Some(cancellation) => {
@@ -674,10 +684,10 @@ impl Daemon {
                                 if changed.is_ok() && *relay_available.borrow() {
                                     (Vec::new(), HashMap::new())
                                 } else {
-                                    self.wait_for_local_candidate_set().await
+                                    self.wait_for_initial_candidate_set().await
                                 }
                             }
-                            candidates = self.wait_for_local_candidate_set() => candidates,
+                            candidates = self.wait_for_initial_candidate_set() => candidates,
                             changed = cancellation.changed() => {
                                 let _ = changed;
                                 return Ok(());
@@ -691,10 +701,10 @@ impl Daemon {
                                 if changed.is_ok() && *relay_available.borrow() {
                                     (Vec::new(), HashMap::new())
                                 } else {
-                                    self.wait_for_local_candidate_set().await
+                                    self.wait_for_initial_candidate_set().await
                                 }
                             }
-                            candidates = self.wait_for_local_candidate_set() => candidates,
+                            candidates = self.wait_for_initial_candidate_set() => candidates,
                         }
                     }
                 }

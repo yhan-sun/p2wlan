@@ -32,6 +32,25 @@ async fn run_direct_probe_loop(
             continue;
         }
 
+        // A host-only bootstrap snapshot is intentionally published before
+        // the first STUN gather finishes. Do not spend the background retry
+        // budget on that provisional endpoint; the initial candidate
+        // publication will wake Direct probing once the full snapshot is
+        // committed. A missing snapshot is retained as the legacy/manual-mode
+        // behavior for tests and direct-only configurations that seed the
+        // mirror locks themselves.
+        if candidate_snapshot
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.initial_gather_complete)
+        {
+            debug!(
+                "Initial UDP candidate snapshot is provisional; delaying background Direct probe cycle"
+            );
+            continue;
+        }
+
         for target in peers.direct_probe_targets_due(retry_after).await {
             let peer_id = target.peer_id;
             let candidates = target.candidates;

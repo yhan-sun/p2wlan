@@ -46,8 +46,15 @@ impl PeerManager {
         match conns.get_mut(node_id) {
             Some(conn) => {
                 conn.expire_stale_trial_nominations(generation, local_endpoint);
-                let mut selection =
-                    conn.select_path_for_data(generation, prefer_direct, relay_available);
+                let policy = self
+                    .config
+                    .relay
+                    .effective_path_policy(prefer_direct);
+                let mut selection = conn.select_path_for_data_with_policy(
+                    generation,
+                    policy,
+                    relay_available,
+                );
                 if selection.path == Some(NetworkPath::Relay) {
                     selection.relay_server = conn.relay_server.clone();
                 }

@@ -209,24 +209,26 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // a healthy Direct peer's rekey never re-triggers traversal churn.
             let refreshed = {
                 let _lease_guard = candidate_refresh_lock.lock().await;
-                let leased = candidate_snapshot
-                    .read()
-                    .await
+                let snapshot_state = candidate_snapshot.read().await.clone();
+                let leased = snapshot_state.as_ref().and_then(|snapshot| {
+                    (snapshot.initial_gather_complete && !snapshot.candidates.is_empty()).then(
+                        || (snapshot.candidates.clone(), snapshot.candidate_sources.clone()),
+                    )
+                });
+                let startup_snapshot_is_provisional = snapshot_state
                     .as_ref()
-                    .and_then(|snapshot| {
-                        (!snapshot.candidates.is_empty()).then(|| {
-                            (
-                                snapshot.candidates.clone(),
-                                snapshot.candidate_sources.clone(),
-                            )
-                        })
-                    });
+                    .is_some_and(|snapshot| !snapshot.initial_gather_complete);
                 drop(_lease_guard);
                 if let Some(leased) = leased {
                     debug!(
                         "Handshake maintenance reuses the cached candidate snapshot; no live STUN gather"
                     );
                     Some(leased)
+                } else if startup_snapshot_is_provisional {
+                    debug!(
+                        "Handshake maintenance waits for the full startup candidate snapshot before retrying the initiator"
+                    );
+                    Some(wait_for_initial_candidate_set_from_store(&candidate_snapshot).await)
                 } else {
                     refresh_candidate_cache_for_maintenance_signal(
                         &peers,

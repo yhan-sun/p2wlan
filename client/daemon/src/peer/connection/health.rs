@@ -521,7 +521,9 @@ impl PeerConnection {
     }
 
     /// Keep an encrypted-confirmed Direct transport across a newer candidate
-    /// freshness revision that still advertises the selected endpoint.
+    /// freshness revision, even when a volatile signal omits the selected
+    /// endpoint. The authenticated path remains stronger evidence than the
+    /// latest candidate list; consent/keepalive is the liveness fence.
     ///
     /// This is the remote-side make-before-break counterpart to local candidate
     /// refresh retention.  It intentionally leaves the remote epoch, selected

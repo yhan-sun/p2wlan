@@ -146,6 +146,9 @@ fn reason_label(code: &str) -> &'static str {
 fn path_reason_label(code: &str) -> &'static str {
     match code {
         "path_direct_confirmed" => "Direct UDP pair 已确认",
+        "path_direct_sticky" => "Direct 已确认并按 sticky 策略保持",
+        "path_score_direct" => "按分数选择 Direct",
+        "path_score_relay" => "按分数选择 Relay",
         "path_direct_trial" => "Direct 最近成功，处于试探窗口",
         "path_relay_unavailable" => "Relay 不可用，尝试 Direct",
         "path_direct_disabled" => "策略禁用 Direct",

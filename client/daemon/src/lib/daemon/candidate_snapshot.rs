@@ -24,6 +24,17 @@ pub(crate) struct CandidateSnapshotLease {
     pub(crate) network_identity: Vec<String>,
     pub(crate) version: u64,
     pub(crate) hash: u64,
+    /// Whether the first full startup gather has committed this snapshot.
+    ///
+    /// The UDP supervisor publishes host candidates immediately after bind so
+    /// LAN traffic and relay setup do not wait behind STUN. Those candidates
+    /// are useful, but they are only a provisional bootstrap set: advertising
+    /// them in the first peer offer can race the public/predicted candidates
+    /// that are committed a few milliseconds later. Signal paths that are
+    /// establishing a brand-new session use this bit as a readiness fence;
+    /// ordinary refreshes and candidate trickle may continue to use the
+    /// provisional snapshot.
+    pub(crate) initial_gather_complete: bool,
     gathered_at: Instant,
 }
 
@@ -71,6 +82,7 @@ impl Daemon {
                 .as_ref()
                 .map_or(1, |current| current.version.saturating_add(1)),
             hash: 0,
+            initial_gather_complete: true,
             gathered_at: Instant::now(),
         };
         lease.hash = candidate_set_hash(&lease.candidates, &lease.candidate_sources);
@@ -90,6 +102,27 @@ impl Daemon {
             candidates,
             candidate_sources,
             network_identity,
+        )
+        .await;
+    }
+
+    /// Test helper for exercising the host-only bootstrap window. Production
+    /// callers should use the normal committed-snapshot method or the
+    /// explicit provisional helper in the UDP startup path.
+    #[cfg(test)]
+    async fn publish_candidate_snapshot_with_readiness(
+        &self,
+        candidates: Vec<String>,
+        candidate_sources: HashMap<String, String>,
+        network_identity: Vec<String>,
+        initial_gather_complete: bool,
+    ) {
+        publish_candidate_snapshot_to_store_with_readiness(
+            &self.candidate_snapshot,
+            candidates,
+            candidate_sources,
+            network_identity,
+            initial_gather_complete,
         )
         .await;
     }
@@ -126,6 +159,25 @@ async fn publish_candidate_snapshot_to_store(
     candidate_sources: HashMap<String, String>,
     network_identity: Vec<String>,
 ) {
+    publish_candidate_snapshot_to_store_with_readiness(
+        store,
+        candidates,
+        candidate_sources,
+        network_identity,
+        true,
+    )
+    .await;
+}
+
+/// Commit a candidate snapshot and explicitly record whether it represents
+/// the first full startup gather or only the host-candidate bootstrap.
+async fn publish_candidate_snapshot_to_store_with_readiness(
+    store: &Arc<RwLock<Option<CandidateSnapshotLease>>>,
+    candidates: Vec<String>,
+    candidate_sources: HashMap<String, String>,
+    network_identity: Vec<String>,
+    initial_gather_complete: bool,
+) {
     let mut current = store.write().await;
     let version = current
         .as_ref()
@@ -137,6 +189,45 @@ async fn publish_candidate_snapshot_to_store(
         network_identity,
         version,
         hash,
+        initial_gather_complete,
         gathered_at: Instant::now(),
     });
+}
+
+/// Wait briefly for the first full startup snapshot without requiring a
+/// `Daemon` receiver. The handshake event path and maintenance worker both
+/// use this fence, so every initiator producer observes the same bounded
+/// readiness policy.
+async fn wait_for_initial_candidate_set_from_store(
+    store: &Arc<RwLock<Option<CandidateSnapshotLease>>>,
+) -> (Vec<String>, HashMap<String, String>) {
+    let timeout = Duration::from_millis(INITIAL_CANDIDATE_READY_TIMEOUT_MS);
+    let step = Duration::from_millis(25);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(snapshot) = store.read().await.clone() {
+            if snapshot.initial_gather_complete {
+                return (snapshot.candidates, snapshot.candidate_sources);
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let fallback = store
+                .read()
+                .await
+                .as_ref()
+                .map(|snapshot| (snapshot.candidates.clone(), snapshot.candidate_sources.clone()))
+                .unwrap_or_default();
+            warn!(
+                "Proceeding with the provisional UDP candidate snapshot after the initial readiness budget elapsed ({} ms, candidates={})",
+                timeout.as_millis(),
+                fallback.0.len(),
+            );
+            return fallback;
+        }
+
+        sleep(step.min(deadline.saturating_duration_since(now))).await;
+    }
 }

@@ -72,6 +72,67 @@ async fn concurrent_initiators_share_one_candidate_snapshot_refresh() {
     );
 }
 
+/// Host candidates are intentionally visible before the first STUN gather,
+/// but a new offer must wait for the committed full snapshot when it is about
+/// to arrive. This reproduces the startup ordering that previously sent a
+/// one-candidate offer a few milliseconds before the public/predicted set.
+#[tokio::test]
+async fn initial_handshake_candidate_gate_skips_provisional_host_snapshot() {
+    let daemon = Arc::new(Daemon::new(
+        Config::generate_default("http://ctrl.test", "net1").unwrap(),
+    ));
+    let provisional = vec!["192.168.1.20:40000".to_string()];
+    let provisional_sources = HashMap::from([(
+        provisional[0].clone(),
+        "host".to_string(),
+    )]);
+    daemon
+        .publish_candidate_snapshot_with_readiness(
+            provisional,
+            provisional_sources,
+            vec!["host:192.168.1.20".to_string()],
+            false,
+        )
+        .await;
+    assert!(
+        daemon.initial_candidate_set_if_ready().await.is_none(),
+        "a non-empty host bootstrap must not satisfy initial offer readiness"
+    );
+
+    let complete = vec![
+        "203.0.113.10:45393".to_string(),
+        "203.0.113.10:45394".to_string(),
+    ];
+    let complete_sources = HashMap::from([
+        (complete[0].clone(), "stun_observed".to_string()),
+        (complete[1].clone(), "predicted".to_string()),
+    ]);
+    let publisher = daemon.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(10)).await;
+        publisher
+            .publish_candidate_snapshot_with_readiness(
+                complete,
+                complete_sources,
+                vec!["public:203.0.113.10".to_string()],
+                true,
+            )
+            .await;
+    });
+
+    let (received, sources) = timeout(
+        Duration::from_millis(300),
+        daemon.wait_for_initial_candidate_set(),
+    )
+    .await
+    .expect("the full startup snapshot should win before the readiness budget");
+    assert_eq!(received.len(), 2);
+    assert_eq!(
+        sources.get(&received[0]).map(String::as_str),
+        Some("stun_observed")
+    );
+}
+
 /// A Direct peer's rekey reuses the cached candidate snapshot: rekey must
 /// never re-trigger a live STUN gather (no traversal churn on a confirmed
 /// path).

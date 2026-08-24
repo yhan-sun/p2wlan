@@ -210,17 +210,18 @@ impl PeerManager {
         let incoming_signaled = valid_candidates.iter().cloned().collect::<HashSet<_>>();
         let remote_candidate_set_changed = conn.signaled_candidates != incoming_signaled;
         // Make-before-break for an encrypted-confirmed Direct path: a revised
-        // set that still advertises the selected endpoint is continuity of the
-        // same live remote transport.  Alternate candidates may be added or
-        // withdrawn without tearing down that proven path.  If the selected
-        // endpoint disappears (or there is no Direct proof), the change is a
-        // real handover and retains the strict epoch/cancellation fence.
+        // set is continuity of the same live remote transport even when the
+        // selected endpoint is peer-reflexive, predicted, or simply omitted
+        // from a volatile refresh.  The authenticated Direct path is stronger
+        // evidence than the latest signaled candidate list; consent/keepalive
+        // failure remains the hard liveness fence that can demote it.  Without
+        // Direct proof, a changed set is still a real handover and retains the
+        // strict epoch/cancellation fence.
         let retained_direct_endpoint = remote_candidate_set_changed
             .then(|| {
                 (conn.state == ConnectionState::Direct)
                     .then(|| conn.selected_direct_endpoint_for_consent(generation))
                     .flatten()
-                    .filter(|endpoint| incoming_signaled.contains(&endpoint.to_string()))
             })
             .flatten();
         let remote_transport_handover =
@@ -237,11 +238,16 @@ impl PeerManager {
         let old_signaled_endpoint = conn.signaled_endpoint;
         let previous_signaled = std::mem::take(&mut conn.signaled_candidates);
         for candidate in previous_signaled {
+            let retained_direct_candidate = retained_direct_endpoint.is_some_and(|endpoint| {
+                candidate
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|candidate_endpoint| candidate_endpoint == endpoint)
+            });
             let learned = matches!(
                 conn.candidate_sources.get(&candidate),
                 Some(CandidatePairSource::Learned | CandidatePairSource::PeerReflexive)
             );
-            if !learned {
+            if !learned && !retained_direct_candidate {
                 conn.candidates.retain(|existing| existing != &candidate);
                 conn.candidate_sources.remove(&candidate);
             }
@@ -254,6 +260,7 @@ impl PeerManager {
             if !valid_candidates
                 .iter()
                 .any(|candidate| candidate == &endpoint.to_string())
+                && Some(endpoint) != retained_direct_endpoint
             {
                 conn.signaled_endpoint = None;
                 let endpoint = endpoint.to_string();
@@ -262,6 +269,20 @@ impl PeerManager {
                     conn.candidate_sources.remove(&endpoint);
                 }
             }
+        }
+
+        // Keep the active, encrypted-confirmed endpoint in the candidate
+        // registry even if the latest volatile signal omitted it. The normal
+        // endpoint/epoch fences still apply, while the Direct consent monitor
+        // decides whether the old mapping is actually dead.
+        if let Some(endpoint) = retained_direct_endpoint {
+            let endpoint_text = endpoint.to_string();
+            if !conn.candidates.contains(&endpoint_text) {
+                conn.candidates.push(endpoint_text.clone());
+            }
+            conn.candidate_sources
+                .entry(endpoint_text)
+                .or_insert(CandidatePairSource::PeerReflexive);
         }
 
         for (rank, c) in valid_candidates.iter().enumerate() {
@@ -291,6 +312,7 @@ impl PeerManager {
         if let Some(endpoint) = retained_direct_endpoint {
             let retired_pairs = conn.retire_withdrawn_signaled_candidate_pairs(
                 &incoming_signaled,
+                retained_direct_endpoint,
                 "candidate revision withdrew an alternate endpoint while retaining the encrypted-confirmed Direct transport",
             );
             conn.mark_remote_candidate_revision_with_direct_continuity(

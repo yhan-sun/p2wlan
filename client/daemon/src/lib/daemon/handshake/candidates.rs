@@ -18,17 +18,6 @@ impl Daemon {
             .unwrap_or_else(|| (Vec::new(), HashMap::new()))
     }
 
-    /// Snapshot the cached candidate set WITHOUT taking the refresh lock.
-    ///
-    /// Used by the responder answer path: a live STUN refresh must never delay
-    /// the answer. The lease is the one committed candidate/source tuple.
-    async fn cached_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
-        if let Some(leased) = self.leased_candidate_set().await {
-            return leased;
-        }
-        (Vec::new(), HashMap::new())
-    }
-
     async fn wait_for_local_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
         let mut waited = Duration::ZERO;
         let step = Duration::from_millis(50);
@@ -49,6 +38,29 @@ impl Daemon {
             sleep(step).await;
             waited += step;
         }
+    }
+
+    /// Return the first full startup snapshot when it is already committed.
+    ///
+    /// The UDP startup path intentionally publishes host candidates before
+    /// STUN completes. A non-empty lease therefore does not, by itself, mean
+    /// that the candidate set is ready for the first peer offer.
+    async fn initial_candidate_set_if_ready(
+        &self,
+    ) -> Option<(Vec<String>, HashMap<String, String>)> {
+        let snapshot = self.cached_candidate_snapshot().await?;
+        snapshot
+            .initial_gather_complete
+            .then_some((snapshot.candidates, snapshot.candidate_sources))
+    }
+
+    /// Wait briefly for the first full STUN/prediction snapshot, then fall
+    /// back to the newest committed set if discovery is unavailable. This is
+    /// deliberately separate from `wait_for_local_candidate_set`: responders
+    /// and candidate-only publication may use the provisional host snapshot,
+    /// while a brand-new offer benefits from the complete startup window.
+    async fn wait_for_initial_candidate_set(&self) -> (Vec<String>, HashMap<String, String>) {
+        wait_for_initial_candidate_set_from_store(&self.candidate_snapshot).await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -141,8 +153,16 @@ impl Daemon {
         // Publication reuses the snapshot lease: a fresh lease means the
         // current committed set is already live — no re-gather, no endpoint
         // re-publish (the gather path already published it).
-        let (candidates, candidate_sources) = if let Some(leased) = self.fresh_candidate_set().await
+        let (candidates, candidate_sources) = if self
+            .cached_candidate_snapshot()
+            .await
+            .is_some_and(|snapshot| !snapshot.initial_gather_complete)
         {
+            debug!(
+                "Waiting for the full startup candidate snapshot before publishing {reason} candidates to {node_id}"
+            );
+            wait_for_initial_candidate_set_from_store(&self.candidate_snapshot).await
+        } else if let Some(leased) = self.fresh_candidate_set().await {
             leased
         } else if let Some(refreshed) = self
             .refresh_local_candidates_for_imminent_signal(&udp, reason)
@@ -488,6 +508,34 @@ impl Daemon {
                 )
                 .await;
             debug!("Local UDP candidates are not ready; delaying hole punch for {node_id}");
+            return;
+        }
+
+        // The UDP supervisor publishes a provisional host-only snapshot as
+        // soon as the socket binds. Do not start a synchronized punch from
+        // that snapshot: the corresponding first offer may still be waiting
+        // for the public/predicted candidates that the startup gather commits
+        // a moment later. Relay-first signaling can establish the encrypted
+        // session immediately; the initial candidate publication will start
+        // the Direct punch once this readiness fence is open.
+        if self
+            .cached_candidate_snapshot()
+            .await
+            .is_some_and(|snapshot| !snapshot.initial_gather_complete)
+        {
+            self.peers
+                .record_direct_event(
+                    node_id,
+                    "punch_delayed_initial_candidates_not_ready",
+                    None,
+                    None,
+                    None,
+                    "delayed synchronized UDP punch until the first full candidate snapshot was committed",
+                )
+                .await;
+            debug!(
+                "Initial UDP candidate snapshot is provisional; delaying hole punch for {node_id}"
+            );
             return;
         }
 

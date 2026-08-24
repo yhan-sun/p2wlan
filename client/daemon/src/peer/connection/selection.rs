@@ -353,16 +353,16 @@ impl PeerConnection {
         true
     }
 
-    fn select_path_for_data(
+    pub(super) fn select_path_for_data_with_policy(
         &self,
         local_generation: u64,
-        prefer_direct: bool,
+        policy: crate::config::PathPolicy,
         relay_available: bool,
     ) -> PathSelection {
         let direct_endpoint = self.direct_endpoint_for_send(local_generation);
         let relay_score = self.relay_path_score(relay_available);
 
-        if !prefer_direct {
+        if policy == crate::config::PathPolicy::RelayOnly {
             return if relay_available {
                 PathSelection::relay(
                     REASON_PATH_DIRECT_DISABLED,
@@ -420,7 +420,12 @@ impl PeerConnection {
             confirmed_direct,
             trial_direct,
         );
-        let retain_private_direct = selected_pair.is_some_and(should_retain_private_direct_pair);
+        // `auto` keeps the existing LAN/private-direct safety preference.
+        // An explicit `score` policy opts into score-based selection even for
+        // a private endpoint; `direct-sticky` returns earlier and never
+        // reaches this quality fallback.
+        let retain_private_direct = policy != crate::config::PathPolicy::Score
+            && selected_pair.is_some_and(should_retain_private_direct_pair);
         // An encrypted-confirmed pair whose endpoint is on one of our physical
         // interface prefixes is already the strongest available path.  The
         // relay-first business gate is a safety net for off-link traversal;
@@ -461,15 +466,35 @@ impl PeerConnection {
                     )
                 })
             {
-                return PathSelection::relay(
-                    REASON_PATH_DIRECT_SLOW_RELAY_RETAINED,
+                if policy != crate::config::PathPolicy::DirectSticky {
+                    return PathSelection::relay(
+                        REASON_PATH_DIRECT_SLOW_RELAY_RETAINED,
+                        format!(
+                            "probe-only Direct evidence is quarantined for {}ms after a slow ACK",
+                            SLOW_DIRECT_RELAY_RETRY_COOLDOWN.as_millis()
+                        ),
+                    )
+                    .with_scores(direct_score, relay_score);
+                }
+            }
+
+            // `direct-sticky` deliberately ignores score and historical
+            // latency/failure penalties after encrypted Direct promotion. A
+            // hard consent/keepalive failure still changes the connection
+            // state before the selector is called, so this cannot force a
+            // dead socket to remain active.
+            if policy == crate::config::PathPolicy::DirectSticky {
+                return PathSelection::direct(
+                    endpoint,
+                    REASON_PATH_DIRECT_STICKY,
                     format!(
-                        "probe-only Direct evidence is quarantined for {}ms after a slow ACK",
-                        SLOW_DIRECT_RELAY_RETRY_COOLDOWN.as_millis()
+                        "encrypted Direct is sticky; keeping endpoint {endpoint} until hard liveness failure"
                     ),
+                    true,
                 )
                 .with_scores(direct_score, relay_score);
             }
+
             // An encrypted Direct validation is the admission proof for this
             // generation.  Probe failures accumulated before that proof are
             // historical telemetry, not evidence that the newly validated
@@ -479,7 +504,8 @@ impl PeerConnection {
             // be immediately undone by the score's historical failure term.
             let direct_has_current_failure = self.direct_health.consecutive_failures > 0;
             if let (Some(direct_score), Some(relay_score)) = (&direct_score, &relay_score) {
-                if direct_has_current_failure
+                let score_policy = policy == crate::config::PathPolicy::Score;
+                if (score_policy || direct_has_current_failure)
                     && !retain_private_direct
                     && direct_score.score < DIRECT_CONFIRMED_MIN_SCORE
                     && direct_score.score <= relay_score.score
@@ -487,9 +513,14 @@ impl PeerConnection {
                     if !self.relay_peer_confirmed_for_generation(local_generation) {
                         return PathSelection::direct(
                             endpoint,
-                            REASON_PATH_DIRECT_DEGRADED,
+                            if score_policy {
+                                REASON_PATH_SCORE_DIRECT
+                            } else {
+                                REASON_PATH_DIRECT_DEGRADED
+                            },
                             format!(
-                                "confirmed direct score {} is poor, but relay is not peer-confirmed; retaining Direct",
+                                "{} direct score {} is poor, but relay is not peer-confirmed; retaining Direct",
+                                if score_policy { "score policy:" } else { "confirmed" },
                                 direct_score.score
                             ),
                             true,
@@ -497,34 +528,50 @@ impl PeerConnection {
                         .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                     }
                     return PathSelection::relay(
-                        REASON_PATH_DIRECT_DEGRADED,
+                        if score_policy {
+                            REASON_PATH_SCORE_RELAY
+                        } else {
+                            REASON_PATH_DIRECT_DEGRADED
+                        },
                         format!(
-                            "confirmed direct score {} is below quality floor {} and relay score {}",
+                            "{} direct score {} is below quality floor {} and relay score {}",
+                            if score_policy { "score policy:" } else { "confirmed" },
                             direct_score.score, DIRECT_CONFIRMED_MIN_SCORE, relay_score.score
                         ),
                     )
                     .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                 }
-                if direct_has_current_failure
+                if (score_policy || direct_has_current_failure)
                     && !retain_private_direct
                     && direct_score.score + DIRECT_TO_RELAY_HYSTERESIS_MARGIN < relay_score.score
                 {
                     if !self.relay_peer_confirmed_for_generation(local_generation) {
                         return PathSelection::direct(
                             endpoint,
-                            REASON_PATH_DIRECT_DEGRADED,
+                            if score_policy {
+                                REASON_PATH_SCORE_DIRECT
+                            } else {
+                                REASON_PATH_DIRECT_DEGRADED
+                            },
                             format!(
-                                "direct score {} is below relay score {}, but relay is not peer-confirmed; retaining Direct",
-                                direct_score.score, relay_score.score
+                                "{} direct score {} is below relay score {}, but relay is not peer-confirmed; retaining Direct",
+                                if score_policy { "score policy:" } else { "confirmed" },
+                                direct_score.score,
+                                relay_score.score
                             ),
                             true,
                         )
                         .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
                     }
                     return PathSelection::relay(
-                        REASON_PATH_DIRECT_DEGRADED,
+                        if score_policy {
+                            REASON_PATH_SCORE_RELAY
+                        } else {
+                            REASON_PATH_DIRECT_DEGRADED
+                        },
                         format!(
-                            "direct score {} is below relay score {} after hysteresis",
+                            "{} direct score {} is below relay score {} after hysteresis",
+                            if score_policy { "score policy:" } else { "confirmed" },
                             direct_score.score, relay_score.score
                         ),
                     )
@@ -533,10 +580,20 @@ impl PeerConnection {
             }
             return PathSelection::direct(
                 endpoint,
-                REASON_PATH_DIRECT_CONFIRMED,
+                if policy == crate::config::PathPolicy::Score {
+                    REASON_PATH_SCORE_DIRECT
+                } else {
+                    REASON_PATH_DIRECT_CONFIRMED
+                },
                 direct_score
                     .as_ref()
-                    .map(|score| format!("direct UDP pair is confirmed; score={}", score.score))
+                    .map(|score| {
+                        if policy == crate::config::PathPolicy::Score {
+                            format!("score policy selected encrypted Direct; score={}", score.score)
+                        } else {
+                            format!("direct UDP pair is confirmed; score={}", score.score)
+                        }
+                    })
                     .unwrap_or_else(|| "direct UDP pair is confirmed".to_string()),
                 true,
             )

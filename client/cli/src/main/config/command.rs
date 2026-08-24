@@ -79,6 +79,10 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
                 }
             );
             println!(
+                "path-policy = {}",
+                config.relay.effective_path_policy(true).as_label()
+            );
+            println!(
                 "relay-startup-timeout = {}ms",
                 config.relay.relay_startup_timeout_ms
             );

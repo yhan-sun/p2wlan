@@ -100,6 +100,7 @@ use super::*;
         apply_cli_overrides(&mut config, &cli);
 
         assert!(config.relay.prefer_direct);
+        assert_eq!(config.relay.path_policy, PathPolicy::Auto);
 
         let mut relay_only_config = Config::generate_default("http://127.0.0.1", "default").unwrap();
         let mut relay_only_cli = test_cli(None, None);
@@ -108,6 +109,15 @@ use super::*;
         apply_cli_overrides(&mut relay_only_config, &relay_only_cli);
 
         assert!(!relay_only_config.relay.prefer_direct);
+        assert_eq!(relay_only_config.relay.path_policy, PathPolicy::RelayOnly);
+
+        let mut sticky_config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+        sticky_config.relay.path_policy = PathPolicy::RelayOnly;
+        let mut direct_cli = test_cli(None, None);
+        direct_cli.prefer_direct = true;
+        apply_cli_overrides(&mut sticky_config, &direct_cli);
+        assert!(sticky_config.relay.prefer_direct);
+        assert_eq!(sticky_config.relay.path_policy, PathPolicy::Auto);
     }
 
     #[test]
