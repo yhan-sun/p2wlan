@@ -266,6 +266,50 @@ impl PeerManager {
             })
     }
 
+    /// Decide whether a same-generation Direct-validation observation should
+    /// replace the worker's current target.  Directly-connected endpoints are
+    /// a stronger path choice than public peer-reflexive endpoints, so public
+    /// churn must not displace a LAN target.  Within the same reachability
+    /// class, retain the historical newest-observation behavior.
+    pub(crate) async fn should_replace_direct_validation_target(
+        &self,
+        node_id: &str,
+        current_endpoint: SocketAddr,
+        candidate_endpoint: SocketAddr,
+    ) -> bool {
+        if current_endpoint == candidate_endpoint {
+            return true;
+        }
+        let connections = self.connections.read().await;
+        let Some(connection) = connections.get(node_id) else {
+            // The admission lifecycle gate already rejects a missing peer.
+            // Preserve newest-wins if the peer disappears between that gate
+            // and this merge rather than pinning a stale target forever.
+            return true;
+        };
+        let current_on_link = connection.is_on_link_host_candidate(current_endpoint);
+        let candidate_on_link = connection.is_on_link_host_candidate(candidate_endpoint);
+        candidate_on_link || !current_on_link
+    }
+
+    /// Whether replacing a validation target is an upgrade from a public or
+    /// otherwise non-on-link endpoint to a directly-connected LAN endpoint.
+    /// Only this class change invalidates an in-flight ACK expectation; newer
+    /// endpoints within the same class retain the existing ACK semantics.
+    pub(crate) async fn is_direct_validation_target_on_link_upgrade(
+        &self,
+        node_id: &str,
+        current_endpoint: SocketAddr,
+        candidate_endpoint: SocketAddr,
+    ) -> bool {
+        let connections = self.connections.read().await;
+        let Some(connection) = connections.get(node_id) else {
+            return false;
+        };
+        !connection.is_on_link_host_candidate(current_endpoint)
+            && connection.is_on_link_host_candidate(candidate_endpoint)
+    }
+
     /// Lock-free/try-lock counterpart used by the synchronous UDP ingress
     /// gate.  A Direct peer's ordinary matched ACKs must be dropped before
     /// they wake the scheduler; only an on-link alternate may pass through to

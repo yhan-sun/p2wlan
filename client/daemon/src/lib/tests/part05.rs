@@ -1697,6 +1697,32 @@ async fn direct_validation_ingress_coalesces_to_the_newest_endpoint() {
 }
 
 #[tokio::test]
+async fn direct_validation_ingress_preserves_non_public_over_public_churn() {
+    let ingress = DirectValidationIngress::new();
+    let public: SocketAddr = "198.51.100.24:44001".parse().unwrap();
+    let lan: SocketAddr = "192.168.2.24:44002".parse().unwrap();
+
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: public,
+    });
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: lan,
+    });
+    ingress.submit(PeerReflexiveObservation {
+        peer_id: "node-b".to_string(),
+        observed_endpoint: "198.51.100.25:44003".parse().unwrap(),
+    });
+
+    assert_eq!(
+        ingress.next().await.observed_endpoint,
+        lan,
+        "a LAN observation must survive a later public peer-reflexive observation"
+    );
+}
+
+#[tokio::test]
 async fn direct_validation_ingress_skips_replaced_peer_and_preserves_fifo() {
     let ingress = DirectValidationIngress::new();
 
