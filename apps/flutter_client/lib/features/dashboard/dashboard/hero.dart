@@ -499,19 +499,11 @@ class _HomeMetrics extends StatelessWidget {
     final natType = natProfile?.traversalType;
     final natValue = natProfile == null
         ? '—'
-        : natType == NatTraversalType.unknown
-        // A stable endpoint-independent mapping is already a meaningful
-        // result. Filtering sub-type probing is best-effort because many
-        // public STUN servers do not implement RFC 5780 CHANGE-REQUEST.
-        ? strings.natBehaviorLabel(natProfile!.mappingBehavior)
         : strings.natTraversalTypeCompactLabel(natType!);
     final natTooltip = natProfile == null
         ? strings.natDetectionUnavailable
         : natType == NatTraversalType.unknown
-        ? strings.natPartialClassificationTooltip(
-            natProfile!.mappingBehavior,
-            natProfile!.filteringBehavior,
-          )
+        ? strings.natTypeDetectionInProgressDetail
         : strings.natTraversalTypeLabel(natType!);
     return Container(
       padding: const EdgeInsets.symmetric(

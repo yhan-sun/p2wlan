@@ -216,6 +216,10 @@ class AppStrings {
   String get natDetectionUnavailableDetail => isZh
       ? '启动并刷新后，P2WLAN 会通过 STUN 观测自动判断本机 NAT 类型。'
       : 'Start and refresh P2WLAN to classify this network from STUN observations.';
+  String get natTypeDetectionInProgress => isZh ? '检测中' : 'Detecting';
+  String get natTypeDetectionInProgressDetail => isZh
+      ? '正在探测过滤规则，完成后显示全锥形、受限锥形、端口受限锥形或对称型。'
+      : 'Filtering behavior is being probed. The result will be Full Cone, Restricted Cone, Port-Restricted Cone, or Symmetric.';
   String get natPublicEndpoint => isZh ? '公网端点' : 'Public endpoint';
   String get natMappingBehavior => isZh ? '映射行为' : 'Mapping';
   String get natFilteringBehavior => isZh ? '过滤行为' : 'Filtering';
@@ -1041,11 +1045,12 @@ class AppStrings {
 
   String natTraversalTypeLabel(NatTraversalType type) {
     return switch (type) {
-      NatTraversalType.fullCone => isZh ? '全锥形 NAT（FullCone）' : 'FullCone NAT',
+      NatTraversalType.fullCone =>
+        isZh ? '全锥形 NAT（Full Cone）' : 'Full Cone NAT',
       NatTraversalType.restrictedCone =>
         isZh ? '受限锥形 NAT（Restricted Cone）' : 'Restricted Cone NAT',
       NatTraversalType.portRestrictedCone =>
-        isZh ? '端口受限锥形 NAT（Port Restricted Cone）' : 'Port Restricted Cone NAT',
+        isZh ? '端口受限锥形 NAT（Port-Restricted Cone）' : 'Port-Restricted Cone NAT',
       NatTraversalType.symmetric =>
         isZh ? '对称型 NAT（Symmetric）' : 'Symmetric NAT',
       NatTraversalType.openInternet => isZh ? '公网直连' : 'Open Internet',
@@ -1059,13 +1064,14 @@ class AppStrings {
   /// the metric tooltip), while this version stays readable on phones.
   String natTraversalTypeCompactLabel(NatTraversalType type) {
     return switch (type) {
-      NatTraversalType.fullCone => isZh ? '全锥形' : 'Full cone',
-      NatTraversalType.restrictedCone => isZh ? '受限锥形' : 'Restricted',
-      NatTraversalType.portRestrictedCone => isZh ? '端口受限' : 'Port restricted',
+      NatTraversalType.fullCone => isZh ? '全锥形' : 'Full Cone',
+      NatTraversalType.restrictedCone => isZh ? '受限锥形' : 'Restricted Cone',
+      NatTraversalType.portRestrictedCone =>
+        isZh ? '端口受限锥形' : 'Port-Restricted Cone',
       NatTraversalType.symmetric => isZh ? '对称型' : 'Symmetric',
       NatTraversalType.openInternet => isZh ? '公网直连' : 'Open',
       NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',
-      NatTraversalType.unknown => isZh ? '未确认' : 'Unknown',
+      NatTraversalType.unknown => natTypeDetectionInProgress,
     };
   }
 
@@ -1151,21 +1157,12 @@ class AppStrings {
     };
   }
 
-  /// Explains why a complete cone subtype is not shown yet while preserving
-  /// the mapping evidence that is already useful to the user.
-  String natPartialClassificationTooltip(String mapping, String filtering) {
-    final mappingLabel = natBehaviorLabel(mapping);
-    final filteringLabel = natBehaviorLabel(filtering);
-    return isZh
-        ? '已确认映射：$mappingLabel；过滤行为：$filteringLabel，等待更多探测。'
-        : 'Mapping: $mappingLabel; filtering: $filteringLabel. Waiting for more probes.';
-  }
-
   String natTraversalShortLabel(NatTraversalType type) {
     return switch (type) {
-      NatTraversalType.fullCone => isZh ? '全锥形' : 'FullCone',
-      NatTraversalType.restrictedCone => isZh ? '受限锥形' : 'Restricted',
-      NatTraversalType.portRestrictedCone => isZh ? '端口受限' : 'Port restricted',
+      NatTraversalType.fullCone => isZh ? '全锥形' : 'Full Cone',
+      NatTraversalType.restrictedCone => isZh ? '受限锥形' : 'Restricted Cone',
+      NatTraversalType.portRestrictedCone =>
+        isZh ? '端口受限锥形' : 'Port-Restricted Cone',
       NatTraversalType.symmetric => isZh ? '对称型' : 'Symmetric',
       NatTraversalType.openInternet => isZh ? '公网' : 'Open',
       NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',

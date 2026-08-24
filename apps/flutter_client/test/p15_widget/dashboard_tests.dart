@@ -150,7 +150,7 @@ void _registerDashboardTests() {
     expect(_heroCount(tester, 'dashboard-count-online'), '2');
     expect(_heroCount(tester, 'dashboard-count-direct'), '1');
     expect(_heroCount(tester, 'dashboard-count-relay'), '1');
-    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted');
+    expect(_heroCount(tester, 'dashboard-nat-type'), 'Restricted Cone');
 
     // Device preview section is titled "Devices" and contains connected peers.
     expect(find.text('Devices'), findsOneWidget);
@@ -174,7 +174,7 @@ void _registerDashboardTests() {
     expect(find.text('Check issues'), findsNothing);
   });
 
-  testWidgets('Home keeps mapping evidence while NAT subtype is pending', (
+  testWidgets('Home shows a detection state while NAT subtype is pending', (
     tester,
   ) async {
     final base = (await tester.runAsync(_loadFixtureSnapshot))!;
@@ -203,8 +203,8 @@ void _registerDashboardTests() {
       ),
     );
 
-    expect(_heroCount(tester, 'dashboard-nat-type'), 'Endpoint independent');
-    expect(find.text('Unknown'), findsNothing);
+    expect(_heroCount(tester, 'dashboard-nat-type'), 'Detecting');
+    expect(find.text('Endpoint independent'), findsNothing);
   });
 
   testWidgets('Home distinguishes API reachability from online lease health', (

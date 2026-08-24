@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/app_strings.dart';
+import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 
 void main() {
   group('supported languages', () {
@@ -38,17 +39,41 @@ void main() {
       expect(en.troubleshooting, 'Troubleshooting');
     });
 
-    test('partial NAT classification keeps mapping evidence visible', () {
+    test('pending NAT classification uses a clear detection state', () {
       final zh = AppStrings.fromCode('zh-Hans');
       final en = AppStrings.fromCode('en');
-      expect(zh.natBehaviorLabel('endpoint_independent'), '端点无关');
+      expect(zh.natTypeDetectionInProgress, '检测中');
+      expect(zh.natTypeDetectionInProgressDetail, contains('全锥形'));
+      expect(en.natTypeDetectionInProgress, 'Detecting');
+      expect(en.natTypeDetectionInProgressDetail, contains('Full Cone'));
+      expect(zh.natTraversalTypeCompactLabel(NatTraversalType.fullCone), '全锥形');
       expect(
-        zh.natPartialClassificationTooltip('endpoint_independent', 'unknown'),
-        '已确认映射：端点无关；过滤行为：未知，等待更多探测。',
+        zh.natTraversalTypeCompactLabel(NatTraversalType.restrictedCone),
+        '受限锥形',
       );
       expect(
-        en.natPartialClassificationTooltip('endpoint_independent', 'unknown'),
-        'Mapping: Endpoint independent; filtering: Unknown. Waiting for more probes.',
+        zh.natTraversalTypeCompactLabel(NatTraversalType.portRestrictedCone),
+        '端口受限锥形',
+      );
+      expect(
+        zh.natTraversalTypeCompactLabel(NatTraversalType.symmetric),
+        '对称型',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.fullCone),
+        'Full Cone',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.restrictedCone),
+        'Restricted Cone',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.portRestrictedCone),
+        'Port-Restricted Cone',
+      );
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.symmetric),
+        'Symmetric',
       );
     });
   });
