@@ -91,6 +91,7 @@ class DashboardPage extends StatelessWidget {
           healthError: statusStore.lastHealthError,
           error: statusStore.lastError,
           snapshot: snapshot,
+          startupCatalogSettling: statusStore.startupCatalogSettling,
         );
         final manualCommand = settingsStore.settings.authToken.trim().isEmpty
             ? statusStore.lastDaemonManualCommand

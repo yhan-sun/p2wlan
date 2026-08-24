@@ -320,6 +320,31 @@ void main() {
     },
   );
 
+  test('startup catalog settling has an explicit transient state', () async {
+    final fixture = await _loadFixture();
+    final health = Completer<void>();
+    final api = _SwitchingDiagnosticsApi(snapshot: fixture, oldHealth: health);
+    final stores = await _makeStores(
+      api,
+      startupCatalogRefreshInterval: Duration.zero,
+      startupCatalogRefreshTimeout: const Duration(milliseconds: 1),
+    );
+    addTearDown(stores.dispose);
+    await stores.settingsStore.updateSettings(
+      stores.settingsStore.settings.copyWith(authToken: 'managed-token'),
+    );
+
+    final settling = stores.statusStore.refreshUntilPeerCatalogSettled(
+      silent: true,
+    );
+    await api.oldHealthStarted.future;
+    expect(stores.statusStore.startupCatalogSettling, isTrue);
+
+    health.complete();
+    await settling.timeout(const Duration(seconds: 1));
+    expect(stores.statusStore.startupCatalogSettling, isFalse);
+  });
+
   test('event revision triggers an immediate full snapshot refresh', () async {
     final fixture = await _loadFixture();
     final first = _snapshotCopy(

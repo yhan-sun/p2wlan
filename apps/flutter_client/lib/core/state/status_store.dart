@@ -93,6 +93,7 @@ class StatusStore extends ChangeNotifier {
   var _appInForeground = true;
   var _snapshotStale = false;
   var _statusSnapshotTimedOut = false;
+  var _startupCatalogSettleDepth = 0;
   var _refreshPending = false;
   var _refreshGeneration = 0;
   Future<void>? _refreshFuture;
@@ -143,6 +144,12 @@ class StatusStore extends ChangeNotifier {
   bool get appInForeground => _appInForeground;
   bool get snapshotStale => _snapshotStale;
   bool get statusSnapshotTimedOut => _statusSnapshotTimedOut;
+
+  /// True while the initial catalog is converging after app/daemon startup.
+  /// The Home page uses this to keep a transient status-auth race out of the
+  /// user-facing issue banner; the underlying error remains available to
+  /// diagnostics once settling finishes.
+  bool get startupCatalogSettling => _startupCatalogSettleDepth > 0;
   String? get lastError => _lastError;
   String? get lastHealthError => _lastHealthError;
   String? get lastStatusError => _lastStatusError;
@@ -711,42 +718,63 @@ class StatusStore extends ChangeNotifier {
     bool skipInitialRefresh = false,
     bool silent = false,
   }) async {
-    if (!skipInitialRefresh) {
-      await refresh(silent: silent);
+    // A daemon can answer public /health before its per-process diagnostics
+    // token is visible to the client. Keep the initial status-auth race out
+    // of Home while the same background refresh loop retries it. Do not mask
+    // errors during ordinary refreshes once a snapshot has been established.
+    final maskStartupErrors = _snapshot == null;
+    if (maskStartupErrors) _beginStartupCatalogSettling();
+    try {
+      if (!skipInitialRefresh) {
+        await refresh(silent: silent);
+      }
+      if (!_shouldSettlePeerCatalog()) return;
+
+      final deadline = DateTime.now().add(startupCatalogRefreshTimeout);
+      var refreshCount = 1;
+      var stableCatalogCount = 0;
+      var previousSignature = _peerCatalogSignature(_snapshot);
+      while (refreshCount < _startupCatalogMaxRefreshes &&
+          DateTime.now().isBefore(deadline)) {
+        if (startupCatalogRefreshInterval > Duration.zero) {
+          await Future<void>.delayed(startupCatalogRefreshInterval);
+        } else {
+          await Future<void>.delayed(Duration.zero);
+        }
+
+        await refresh(silent: silent);
+        refreshCount += 1;
+
+        final currentSnapshot = _snapshot;
+        final currentSignature = _peerCatalogSignature(currentSnapshot);
+        if (currentSignature == previousSignature) {
+          stableCatalogCount += 1;
+        } else {
+          stableCatalogCount = 0;
+        }
+        previousSignature = currentSignature;
+
+        if (!_shouldSettlePeerCatalog()) break;
+        if (currentSnapshot?.health.controlConnected == true &&
+            refreshCount >= _startupCatalogMinRefreshes &&
+            stableCatalogCount >= 1) {
+          break;
+        }
+      }
+    } finally {
+      if (maskStartupErrors) _endStartupCatalogSettling();
     }
-    if (!_shouldSettlePeerCatalog()) return;
+  }
 
-    final deadline = DateTime.now().add(startupCatalogRefreshTimeout);
-    var refreshCount = 1;
-    var stableCatalogCount = 0;
-    var previousSignature = _peerCatalogSignature(_snapshot);
-    while (refreshCount < _startupCatalogMaxRefreshes &&
-        DateTime.now().isBefore(deadline)) {
-      if (startupCatalogRefreshInterval > Duration.zero) {
-        await Future<void>.delayed(startupCatalogRefreshInterval);
-      } else {
-        await Future<void>.delayed(Duration.zero);
-      }
+  void _beginStartupCatalogSettling() {
+    _startupCatalogSettleDepth += 1;
+    if (_startupCatalogSettleDepth == 1) notifyListeners();
+  }
 
-      await refresh(silent: silent);
-      refreshCount += 1;
-
-      final currentSnapshot = _snapshot;
-      final currentSignature = _peerCatalogSignature(currentSnapshot);
-      if (currentSignature == previousSignature) {
-        stableCatalogCount += 1;
-      } else {
-        stableCatalogCount = 0;
-      }
-      previousSignature = currentSignature;
-
-      if (!_shouldSettlePeerCatalog()) break;
-      if (currentSnapshot?.health.controlConnected == true &&
-          refreshCount >= _startupCatalogMinRefreshes &&
-          stableCatalogCount >= 1) {
-        break;
-      }
-    }
+  void _endStartupCatalogSettling() {
+    if (_startupCatalogSettleDepth == 0) return;
+    _startupCatalogSettleDepth -= 1;
+    if (_startupCatalogSettleDepth == 0) notifyListeners();
   }
 
   Future<DaemonCommandResult> startDaemon() async {
