@@ -477,13 +477,16 @@ class _HomeMetrics extends StatelessWidget {
   Widget build(BuildContext context) {
     final strings = AppStringsScope.of(context);
     final colors = P2WlanColors.of(context);
-    final natType = natProfile?.traversalType;
+    final exactNatType = natProfile?.traversalType;
+    final natType = natProfile?.displayTraversalType;
     final natValue = natProfile == null
         ? '—'
         : strings.natTraversalTypeCompactLabel(natType!);
     final natTooltip = natProfile == null
         ? strings.natDetectionUnavailable
-        : natType == NatTraversalType.unknown
+        : natProfile!.displayTypeIsConservativeFallback
+        ? strings.natTypeConservativeFallbackDetail
+        : exactNatType == NatTraversalType.unknown
         ? strings.natTypeDetectionInProgressDetail
         : strings.natTraversalTypeLabel(natType!);
     return Container(

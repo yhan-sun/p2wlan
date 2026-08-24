@@ -220,6 +220,9 @@ class AppStrings {
   String get natTypeDetectionInProgressDetail => isZh
       ? '正在探测过滤规则，完成后显示全锥形、受限锥形、端口受限锥形或对称型。'
       : 'Filtering behavior is being probed. The result will be Full Cone, Restricted Cone, Port-Restricted Cone, or Symmetric.';
+  String get natTypeConservativeFallbackDetail => isZh
+      ? '公网映射已确认稳定；当前 STUN 服务不支持过滤探测，暂按最保守的端口受限锥形显示。'
+      : 'The public mapping is stable, but this STUN service does not expose filtering probes; Port-Restricted Cone is shown as the conservative fallback.';
   String get natPublicEndpoint => isZh ? '公网端点' : 'Public endpoint';
   String get natMappingBehavior => isZh ? '映射行为' : 'Mapping';
   String get natFilteringBehavior => isZh ? '过滤行为' : 'Filtering';
@@ -1071,7 +1074,7 @@ class AppStrings {
       NatTraversalType.symmetric => isZh ? '对称型' : 'Symmetric',
       NatTraversalType.openInternet => isZh ? '公网直连' : 'Open',
       NatTraversalType.udpBlocked => isZh ? 'UDP 受阻' : 'UDP blocked',
-      NatTraversalType.unknown => natTypeDetectionInProgress,
+      NatTraversalType.unknown => isZh ? '未确认' : 'Unconfirmed',
     };
   }
 

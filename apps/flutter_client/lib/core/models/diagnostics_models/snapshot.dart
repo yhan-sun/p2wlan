@@ -202,6 +202,32 @@ class NatProfileSnapshot {
     };
   }
 
+  /// The type that should be rendered in compact user-facing surfaces.
+  ///
+  /// A stable endpoint-independent mapping is enough to prove that the NAT
+  /// is a cone NAT, but the exact filtering subtype requires an RFC 5780
+  /// CHANGE-REQUEST-capable STUN server. Most public STUN services ignore
+  /// that attribute, so the daemon correctly leaves filtering as `unknown`.
+  /// The classic STUN fallback is Port-Restricted Cone, the most conservative
+  /// usable subtype for a user-facing summary. Keep [traversalType] exact for
+  /// diagnostics and use this getter only for the compact UI.
+  NatTraversalType get displayTraversalType {
+    final mapping = mappingBehavior.toLowerCase();
+    final filtering = filteringBehavior.toLowerCase();
+    if (traversalType == NatTraversalType.unknown &&
+        mapping == 'endpoint_independent' &&
+        filtering == 'unknown') {
+      return NatTraversalType.portRestrictedCone;
+    }
+    return traversalType;
+  }
+
+  /// Whether [displayTraversalType] is a conservative fallback rather than
+  /// a subtype proved by an active filtering probe.
+  bool get displayTypeIsConservativeFallback =>
+      traversalType == NatTraversalType.unknown &&
+      displayTraversalType == NatTraversalType.portRestrictedCone;
+
   double get probabilityTotal {
     return typeProbabilities.fold<double>(
       0,

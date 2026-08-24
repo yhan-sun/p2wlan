@@ -46,6 +46,11 @@ void main() {
       expect(zh.natTypeDetectionInProgressDetail, contains('全锥形'));
       expect(en.natTypeDetectionInProgress, 'Detecting');
       expect(en.natTypeDetectionInProgressDetail, contains('Full Cone'));
+      expect(zh.natTypeConservativeFallbackDetail, contains('端口受限锥形'));
+      expect(
+        en.natTypeConservativeFallbackDetail,
+        contains('Port-Restricted Cone'),
+      );
       expect(zh.natTraversalTypeCompactLabel(NatTraversalType.fullCone), '全锥形');
       expect(
         zh.natTraversalTypeCompactLabel(NatTraversalType.restrictedCone),
@@ -74,6 +79,11 @@ void main() {
       expect(
         en.natTraversalTypeCompactLabel(NatTraversalType.symmetric),
         'Symmetric',
+      );
+      expect(zh.natTraversalTypeCompactLabel(NatTraversalType.unknown), '未确认');
+      expect(
+        en.natTraversalTypeCompactLabel(NatTraversalType.unknown),
+        'Unconfirmed',
       );
     });
   });
