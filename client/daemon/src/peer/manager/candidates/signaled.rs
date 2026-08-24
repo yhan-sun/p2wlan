@@ -74,6 +74,7 @@ impl PeerManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn add_candidates_with_metadata_for_identity_with_hard_hard_retire(
         &self,
         node_id: &str,
