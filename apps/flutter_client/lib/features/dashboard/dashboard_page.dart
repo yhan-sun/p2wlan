@@ -75,7 +75,9 @@ class DashboardPage extends StatelessWidget {
             statusStore.lastFetchedAt == null && statusStore.refreshing;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);
-        final overviewPeers = _topOverviewPeers(peers);
+        final overviewPeers = _topOverviewPeers(
+          statusStore.stablePeerOrder(peers),
+        );
         final peerTransferRates = statusStore.snapshotStale
             ? const <String, int>{}
             : statusStore.peerTransferRatesBytesPerSecond;

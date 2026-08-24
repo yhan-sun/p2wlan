@@ -29,6 +29,43 @@ void main() {
     );
   });
 
+  test(
+    'stable peer order keeps first-seen rows and appends new peers',
+    () async {
+      final fixture = await _loadFixture();
+      final stores = await _makeStores(DiagnosticsApi());
+      addTearDown(stores.dispose);
+
+      final initial = stores.statusStore.stablePeerOrder(fixture.peers);
+      final reordered = stores.statusStore.stablePeerOrder(
+        fixture.peers.reversed,
+      );
+
+      expect(
+        reordered.map((peer) => peer.nodeId),
+        initial.map((peer) => peer.nodeId),
+      );
+
+      final raw = jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+      final peers = [
+        for (final item in raw['peers'] as List<dynamic>)
+          Map<String, dynamic>.from(item as Map),
+      ];
+      peers.add(
+        Map<String, dynamic>.from(peers.first)
+          ..['node_id'] = 'node-appended'
+          ..['device_name'] = 'appended-device'
+          ..['virtual_ip'] = '10.20.0.250',
+      );
+      final withNewPeer = DiagnosticsSnapshot.fromJson(raw..['peers'] = peers);
+      final extended = stores.statusStore.stablePeerOrder(
+        withNewPeer.peers.reversed,
+      );
+
+      expect(extended.last.nodeId, 'node-appended');
+    },
+  );
+
   test('automatic refresh stays silent while work is in flight', () async {
     final fixture = await _loadFixture();
     final health = Completer<void>();

@@ -414,7 +414,8 @@ class AppStrings {
       ? '搜索设备名称、虚拟 IP 或 Node ID'
       : 'Search device name, virtual IP, or Node ID';
   String get filterAll => isZh ? '全部' : 'All';
-  String get sortRecommended => isZh ? '默认排序' : 'Default';
+  String get sortByJoinOrder => isZh ? '加入顺序' : 'Join order';
+  String get sortRecommended => sortByJoinOrder;
   String get sortByName => isZh ? '名称' : 'Name';
   String get sortByLatency => isZh ? '本端 RTT' : 'Local RTT';
   String deviceCountSummary(int total, int online) => isZh
@@ -872,8 +873,8 @@ class AppStrings {
   String get directTypeLan => isZh ? '局域网直连' : 'LAN direct';
   String get directTypeOverlay => isZh ? 'Overlay 直连' : 'Overlay direct';
   String get removeDeviceOfflineHint => isZh
-      ? '如果只是临时离线，不需要移除；离线设备已自动排在列表底部。'
-      : 'If it is only temporarily offline, leave it. Offline devices already sort to the bottom.';
+      ? '如果只是临时离线，不需要移除；设备位置会保持加入顺序。'
+      : 'If it is only temporarily offline, leave it. Device positions stay in join order.';
 
   // --- Settings ---
   String get controlServerHelper => isZh

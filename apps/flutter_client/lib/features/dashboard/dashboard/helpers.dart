@@ -106,38 +106,19 @@ _PeerCounts _countPeers(List<PeerSnapshot> peers) {
   );
 }
 
-/// Most relevant connected peers for the home overview: attention first, then
-/// relay and direct. Offline devices belong in the Devices section, not this
-/// compact Home preview. The result is capped to keep the page quiet.
+/// Connected peers for the home overview in the shared first-seen order.
+/// Offline devices belong in the Devices section, not this compact Home
+/// preview. The result is capped to keep the page quiet without allowing a
+/// live path/latency update to reshuffle the visible rows.
 List<PeerSnapshot> _topOverviewPeers(
   List<PeerSnapshot> peers, {
   int limit = 5,
 }) {
-  final sorted =
-      peers.where((peer) => peer.online && peer.path != 'offline').toList()
-        ..sort(_compareDashboardPeers);
-  if (sorted.length <= limit) return sorted;
-  return sorted.sublist(0, limit);
-}
-
-int _compareDashboardPeers(PeerSnapshot left, PeerSnapshot right) {
-  final rank = _dashboardPeerRank(left).compareTo(_dashboardPeerRank(right));
-  if (rank != 0) return rank;
-  final recent = right.sortTimestampMs.compareTo(left.sortTimestampMs);
-  if (recent != 0) return recent;
-  return left.displayName.compareTo(right.displayName);
-}
-
-int _dashboardPeerRank(PeerSnapshot peer) {
-  if (!peer.online || peer.path == 'offline') return 4;
-  if (peer.lastError != null ||
-      peer.path == 'probing' ||
-      peer.path == 'direct_trial') {
-    return 0;
-  }
-  if (peer.path == 'relay') return 1;
-  if (peer.path == 'direct') return 2;
-  return 3;
+  final visible = peers
+      .where((peer) => peer.online && peer.path != 'offline')
+      .toList(growable: false);
+  if (visible.length <= limit) return visible;
+  return visible.sublist(0, limit);
 }
 
 String _peerStatusLabel(AppStrings strings, PeerSnapshot peer) {
