@@ -356,6 +356,15 @@ impl PeerManager {
         }
         drop(connections);
         if remote_transport_handover {
+            // A changed authenticated candidate set is real transport
+            // evidence, not ordinary freshness churn.  If the previous
+            // recovery window was frozen after exhausting its scatter
+            // credit, give this new mapping a bounded retry window before
+            // cancelling the old validation owner.  The recovery ledger
+            // caps these re-opens per epoch, so repeated NAT churn cannot
+            // turn candidate refreshes into an unbounded punch storm.
+            self.recovery_reopen_on_evidence(node_id, "remote_candidate_handover")
+                .await;
             self.cancel_direct_validation_for_remote_candidate_change(node_id)
                 .await;
             if retire_hard_hard {

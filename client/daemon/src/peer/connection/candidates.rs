@@ -164,6 +164,12 @@ impl PeerConnection {
             .iter()
             .copied()
             .filter(|endpoint| is_public_probe_endpoint(*endpoint))
+            // `candidates` can also contain synthesized neighborhood or
+            // birthday targets.  Only an endpoint present in the accepted
+            // candidate-source table is an advertised/observed mapping; the
+            // fallback source classifier must not turn an arbitrary probe
+            // target into an authoritative public pool member.
+            .filter(|endpoint| self.candidate_sources.contains_key(&endpoint.to_string()))
             .filter(|endpoint| {
                 matches!(
                     self.candidate_source_for_endpoint(*endpoint),
@@ -174,7 +180,12 @@ impl PeerConnection {
                         | CandidatePairSource::NatPmp
                 )
             })
-            .take(1)
+            // A hard-NAT peer needs the complete bounded stable mapping pool
+            // in its first fast window.  Selecting only the top-ranked port
+            // makes a stale socket-pool mapping look authoritative and forces
+            // recovery to wait for a later background sweep.  The stable-role
+            // gate and PREFERRED_FAST_CANDIDATE_CAP keep this bounded.
+            .take(ASYMMETRIC_STABLE_MAX_PUBLIC_ENDPOINTS)
             .collect::<Vec<_>>();
         // A directly-connected interface is a stronger latency signal than a
         // public candidate's provenance.  Keep the LAN fast lane first so a
