@@ -105,9 +105,11 @@ class ReleaseIdentityTests(unittest.TestCase):
         self.assertIn("manifest build_id mismatch", result.stdout + result.stderr)
 
     def test_dirty_release_input_fails_closed(self):
+        value = dict(self.info)
+        value["dirty"] = True
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "build-info.json"
-            path.write_text(json.dumps(self.info), encoding="utf-8")
+            path.write_text(json.dumps(value), encoding="utf-8")
             result = self.run_gate(path, "--release")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("dirty", result.stdout + result.stderr)
