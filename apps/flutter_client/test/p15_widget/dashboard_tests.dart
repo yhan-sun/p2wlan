@@ -651,12 +651,28 @@ void _registerDashboardTests() {
 
     await tester.tap(find.byKey(const Key('home-device-row-peer-direct-001')));
     await tester.pumpAndSettle();
+    // Home hands the selected peer to the real Devices page. The list owns
+    // the detail surface, so actions such as speed test are identical from
+    // either entry point.
+    expect(find.byType(NodesPage), findsOneWidget);
     expect(find.byType(Dialog), findsOneWidget);
-    expect(find.byType(NodesPage), findsNothing);
+    expect(
+      find.byKey(const Key('node-detail-speedtest-peer-direct-001')),
+      findsOneWidget,
+    );
     expect(find.text('24 ms'), findsWidgets);
     await tester.tap(find.byKey(const Key('nodes-detail-close')));
     await tester.pumpAndSettle();
 
+    // The unified detail flow leaves the shell on Devices; return Home before
+    // checking the separate "View all" navigation affordance.
+    await tester.tap(
+      find.descendant(
+        of: find.byType(DesktopSidebar),
+        matching: find.text('Home'),
+      ),
+    );
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('home-view-all-devices')));
     await tester.pumpAndSettle();
 

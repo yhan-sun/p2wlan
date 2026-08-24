@@ -300,7 +300,7 @@ class _DetailHeader extends StatelessWidget {
               borderRadius: BorderRadius.circular(AppTokens.radiusMd),
             ),
             child: Icon(
-              Icons.computer_rounded,
+              peerDeviceIcon(peer),
               size: 24,
               color: theme.colorScheme.primary,
             ),

@@ -17,6 +17,7 @@ import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/layout/app_breakpoints.dart';
 import '../../shared/widgets/app_back_button.dart';
+import '../../shared/widgets/device_type_icon.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
@@ -40,6 +41,8 @@ class NodesPage extends StatefulWidget {
     this.showHeader = true,
     this.controlApi,
     this.capabilities,
+    this.initialPeerId,
+    this.onInitialPeerOpened,
   });
 
   final SettingsStore settingsStore;
@@ -55,6 +58,12 @@ class NodesPage extends StatefulWidget {
   /// fabricated offline local node.
   final PlatformCapabilities? capabilities;
 
+  /// Optional peer requested by another shell surface (Home). The page opens
+  /// it through the exact same list interaction after the Devices page has
+  /// mounted, so detail actions never diverge by entry point.
+  final String? initialPeerId;
+  final VoidCallback? onInitialPeerOpened;
+
   @override
   State<NodesPage> createState() => _NodesPageState();
 }
@@ -68,6 +77,8 @@ class _NodesPageState extends State<NodesPage> {
   var _sort = _NodeSort.recommended;
   String? _copiedKey;
   String? _busyPeerId;
+  String? _openedInitialPeerId;
+  var _initialPeerOpenScheduled = false;
 
   @override
   void initState() {
@@ -82,6 +93,10 @@ class _NodesPageState extends State<NodesPage> {
     if (oldWidget.statusStore != widget.statusStore) {
       oldWidget.statusStore.removeListener(_pruneHiddenPeers);
       widget.statusStore.addListener(_pruneHiddenPeers);
+    }
+    if (oldWidget.initialPeerId != widget.initialPeerId) {
+      _openedInitialPeerId = null;
+      _scheduleInitialPeerOpen();
     }
   }
 
@@ -108,8 +123,37 @@ class _NodesPageState extends State<NodesPage> {
     _searchFocusNode.requestFocus();
   }
 
+  void _scheduleInitialPeerOpen() {
+    final requestedId = widget.initialPeerId?.trim();
+    if (requestedId == null ||
+        requestedId.isEmpty ||
+        requestedId == _openedInitialPeerId ||
+        _initialPeerOpenScheduled) {
+      return;
+    }
+    _initialPeerOpenScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initialPeerOpenScheduled = false;
+      if (!mounted || widget.initialPeerId?.trim() != requestedId) return;
+      final peers =
+          widget.statusStore.snapshot?.peers ?? const <PeerSnapshot>[];
+      PeerSnapshot? requestedPeer;
+      for (final peer in peers) {
+        if (peer.nodeId == requestedId) {
+          requestedPeer = peer;
+          break;
+        }
+      }
+      if (requestedPeer == null) return;
+      _openedInitialPeerId = requestedId;
+      _openPeer(requestedPeer);
+      widget.onInitialPeerOpened?.call();
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    _scheduleInitialPeerOpen();
     return CallbackShortcuts(
       bindings: {
         const SingleActivator(LogicalKeyboardKey.keyF, control: true):
@@ -604,37 +648,3 @@ class _NodesPageState extends State<NodesPage> {
 }
 
 AppStrings stringsOf(BuildContext context) => AppStringsScope.of(context);
-
-/// Opens the same read-only device detail surface used by the Home preview.
-/// Keeping this entry point next to the detail widgets avoids navigating to
-/// the Devices section just to inspect one peer.
-Future<void> showPeerDetailsSurface(
-  BuildContext context,
-  PeerSnapshot peer, {
-  StatusStore? statusStore,
-  PlatformCapabilities? capabilities,
-}) async {
-  final strings = stringsOf(context);
-  final resolvedCapabilities = capabilities ?? PlatformCapabilities.current();
-  if (!resolvedCapabilities.canUseSystemTray) {
-    await Navigator.of(context, rootNavigator: true).push(
-      MaterialPageRoute<void>(
-        settings: RouteSettings(name: '/devices/${peer.nodeId}'),
-        builder: (_) => _MobilePeerDetails(
-          peer: peer,
-          strings: strings,
-          statusStore: statusStore,
-        ),
-      ),
-    );
-    return;
-  }
-  await showDialog<void>(
-    context: context,
-    builder: (_) => _PeerDetailsDialog(
-      peer: peer,
-      strings: strings,
-      statusStore: statusStore,
-    ),
-  );
-}

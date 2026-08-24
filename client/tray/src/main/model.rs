@@ -108,6 +108,9 @@ enum MenuAction {
 struct TrayDevice {
     name: String,
     virtual_ip: String,
+    /// Verified path used for the compact tray legend. `probing` is retained
+    /// for online roster entries that have not completed path confirmation.
+    path: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

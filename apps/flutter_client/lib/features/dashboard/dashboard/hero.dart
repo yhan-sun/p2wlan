@@ -94,41 +94,102 @@ class _NetworkHero extends StatelessWidget {
     final theme = Theme.of(context);
     final hasSnapshot = snapshot != null;
 
-    final header = Row(
-      children: [
-        Container(
-          width: 36,
-          height: 36,
-          decoration: BoxDecoration(
-            color: P2WlanColors.of(context).selectedSurface,
-            borderRadius: BorderRadius.circular(AppTokens.radiusMd),
-          ),
-          child: Icon(
-            Icons.hub_rounded,
-            size: 19,
-            color: theme.colorScheme.primary,
-          ),
-        ),
-        const SizedBox(width: AppTokens.space12),
-        Expanded(
-          child: Text(
-            strings.homeNetworkTitle,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: theme.colorScheme.onSurface,
-              fontSize: 15,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0,
+    final showStop =
+        canControlLocalDaemon &&
+        switch (status) {
+          _NetworkStatus.healthy ||
+          _NetworkStatus.degraded ||
+          _NetworkStatus.stale => true,
+          _ => false,
+        };
+
+    final header = LayoutBuilder(
+      builder: (context, constraints) {
+        final colors = P2WlanColors.of(context);
+        final compactStop = constraints.maxWidth < 460;
+        final stop = compactStop
+            ? IconButton(
+                key: const Key('dashboard-stop-button'),
+                tooltip: strings.stopP2wlan,
+                onPressed: daemonBusy ? null : onStopDaemon,
+                style: IconButton.styleFrom(
+                  foregroundColor: colors.dangerText,
+                  backgroundColor: colors.dangerSurface,
+                  side: BorderSide(color: colors.dangerBorder),
+                  minimumSize: const Size(40, 40),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                  ),
+                ),
+                icon: daemonBusy
+                    ? _ButtonSpinner(color: colors.dangerText)
+                    : const Icon(Icons.stop_rounded, size: 18),
+              )
+            : OutlinedButton.icon(
+                key: const Key('dashboard-stop-button'),
+                onPressed: daemonBusy ? null : onStopDaemon,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: colors.dangerText,
+                  backgroundColor: colors.dangerSurface,
+                  side: BorderSide(color: colors.dangerBorder),
+                  minimumSize: const Size(0, 40),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+                  ),
+                ),
+                icon: daemonBusy
+                    ? _ButtonSpinner(color: colors.dangerText)
+                    : const Icon(Icons.stop_rounded, size: 17),
+                label: Text(
+                  daemonBusy ? strings.daemonWorking : strings.stopP2wlan,
+                ),
+              );
+        return Row(
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: colors.selectedSurface,
+                borderRadius: BorderRadius.circular(AppTokens.radiusMd),
+              ),
+              child: Icon(
+                Icons.hub_rounded,
+                size: 19,
+                color: theme.colorScheme.primary,
+              ),
             ),
-          ),
-        ),
-        const SizedBox(width: AppTokens.space12),
-        StatusBadge(
-          label: _networkStatusLabel(strings, status, canControlLocalDaemon),
-          tone: _networkStatusTone(status),
-        ),
-      ],
+            const SizedBox(width: AppTokens.space12),
+            Expanded(
+              child: Text(
+                strings.homeNetworkTitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: theme.colorScheme.onSurface,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0,
+                ),
+              ),
+            ),
+            if (showStop) ...[const SizedBox(width: AppTokens.space8), stop],
+            const SizedBox(width: AppTokens.space8),
+            StatusBadge(
+              label: _networkStatusLabel(
+                strings,
+                status,
+                canControlLocalDaemon,
+              ),
+              tone: _networkStatusTone(status),
+            ),
+          ],
+        );
+      },
     );
 
     final showStartGuide =
@@ -207,12 +268,10 @@ class _NetworkHero extends StatelessWidget {
       initialProbePending: initialProbePending,
       canControlLocalDaemon: canControlLocalDaemon,
       onStartDaemon: () => _handleStart(context),
-      onStopDaemon: onStopDaemon,
     );
 
     final showActions =
-        canControlLocalDaemon &&
-        (status == _NetworkStatus.stopped || hasSnapshot);
+        canControlLocalDaemon && status == _NetworkStatus.stopped;
 
     return _HeroSurface(
       child: Column(
@@ -222,13 +281,8 @@ class _NetworkHero extends StatelessWidget {
           const SizedBox(height: AppTokens.space16),
           infoBlock,
           if (showActions) ...[
-            if (hasSnapshot) ...[
-              const SizedBox(height: AppTokens.space14),
-              Align(alignment: Alignment.centerRight, child: actions),
-            ] else ...[
-              const SizedBox(height: AppTokens.space16),
-              actions,
-            ],
+            const SizedBox(height: AppTokens.space16),
+            actions,
           ],
         ],
       ),

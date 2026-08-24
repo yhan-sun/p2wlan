@@ -30,7 +30,10 @@ class _GeneralSection extends StatelessWidget {
           label: strings.language,
           subtitle: strings.languageHelper,
           trailing: AppSelect<String>(
-            expanded: MediaQuery.sizeOf(context).width < 520,
+            // The preference row keeps this control on the right on normal
+            // phones; expand only on very narrow handsets where the row has
+            // to stack to remain readable.
+            expanded: MediaQuery.sizeOf(context).width < 340,
             key: const ValueKey('settings-language-select'),
             menuTitle: strings.language,
             value: AppLanguage.fromCode(languageCode).code,
@@ -48,7 +51,7 @@ class _GeneralSection extends StatelessWidget {
           label: strings.themeMode,
           subtitle: strings.themeModeHelper,
           trailing: AppSelect<String>(
-            expanded: MediaQuery.sizeOf(context).width < 520,
+            expanded: MediaQuery.sizeOf(context).width < 340,
             key: const ValueKey('settings-theme-select'),
             menuTitle: strings.themeMode,
             value: AppThemeMode.fromCode(themeCode).code,

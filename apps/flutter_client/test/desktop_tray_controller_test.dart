@@ -88,6 +88,29 @@ void main() {
     expect(labels.any((label) => label.contains('offline-device')), isFalse);
   });
 
+  test('desktop tray device submenu marks direct and relay paths', () async {
+    final snapshot = await _loadFixtureSnapshot();
+    final stores = await _makeStores(
+      api: _FakeDiagnosticsApi(snapshot: snapshot),
+    );
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+
+    final menu = DesktopTrayController(
+      settingsStore: stores.settingsStore,
+      statusStore: stores.statusStore,
+    ).buildMenuForTesting();
+    final devices = menu.items!.firstWhere((item) => item.label == '设备');
+    final labels = devices.submenu!.items!
+        .map((item) => item.label)
+        .whereType<String>()
+        .toList();
+
+    expect(labels.any((label) => label.contains('🟢 直连')), isTrue);
+    expect(labels.any((label) => label.contains('🟠 中继')), isTrue);
+  });
+
   test(
     'desktop tray icon exposes offline state without opening the menu',
     () async {

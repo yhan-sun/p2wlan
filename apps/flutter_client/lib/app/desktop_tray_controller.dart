@@ -459,19 +459,23 @@ class DesktopTrayController with TrayListener, WindowListener {
       return [MenuItem(label: strings.noOnlineDevices, disabled: true)];
     }
     return [
-      for (final peer in peers.take(12))
+      for (final peer in peers)
         MenuItem(
-          label: _peerLabel(peer),
+          label: _peerLabel(strings, peer),
           onClick: (_) => unawaited(_copyPeerIp(peer.virtualIp)),
         ),
-      if (peers.length > 12)
-        MenuItem(label: '+${peers.length - 12}', disabled: true),
     ];
   }
 
-  String _peerLabel(PeerSnapshot peer) {
+  String _peerLabel(AppStrings strings, PeerSnapshot peer) {
     final ip = peer.virtualIp.trim().isEmpty ? '—' : peer.virtualIp.trim();
-    return '${peer.displayName} · $ip';
+    final path = peer.path;
+    final marker = switch (path) {
+      'direct' => '🟢',
+      'relay' => '🟠',
+      _ => '🟡',
+    };
+    return '$marker ${strings.pathLabel(path)} · ${peer.displayName} · $ip';
   }
 
   Future<void> _showWindow() async {

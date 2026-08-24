@@ -162,7 +162,7 @@ void main() {
   });
 
   test(
-    'peer latency prefers ewma and relay selection exposes pong latency',
+    'peer latency prefers the latest verified sample and relay selection exposes pong latency',
     () {
       final peer = PeerSnapshot.fromJson({
         'node_id': 'direct-peer',
@@ -183,7 +183,7 @@ void main() {
         'selected_rtt_ewma_ms': 25,
       });
 
-      expect(peer.latencyMs, 31);
+      expect(peer.latencyMs, 48);
       expect(peer.appVersion, '0.1.68');
       expect(relaySelection.latencyMs, 25);
     },

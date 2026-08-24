@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import '../layout/app_breakpoints.dart';
@@ -384,6 +385,7 @@ class _AppSelectSheet<T> extends StatelessWidget {
     final theme = Theme.of(context);
     final colors = P2WlanColors.of(context);
     final media = MediaQuery.of(context);
+    final strings = AppStringsScope.of(context);
     return Container(
       key: const Key('app-select-mobile-sheet'),
       constraints: BoxConstraints(maxHeight: media.size.height * 0.72),
@@ -433,13 +435,19 @@ class _AppSelectSheet<T> extends StatelessWidget {
                       ),
                     ),
                   ),
-                  IconButton(
+                  TextButton(
                     key: const Key('app-select-sheet-close'),
-                    tooltip: MaterialLocalizations.of(
-                      context,
-                    ).closeButtonTooltip,
                     onPressed: () => Navigator.of(context).pop(),
-                    icon: const Icon(Icons.close_rounded),
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(AppTokens.minTouchTarget, 44),
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      foregroundColor: theme.colorScheme.primary,
+                      textStyle: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    child: Text(strings.cancel),
                   ),
                 ],
               ),
@@ -450,11 +458,11 @@ class _AppSelectSheet<T> extends StatelessWidget {
           Flexible(
             child: ListView.separated(
               shrinkWrap: true,
-              padding: const EdgeInsets.fromLTRB(
+              padding: EdgeInsets.fromLTRB(
                 AppTokens.space12,
                 AppTokens.space8,
                 AppTokens.space12,
-                AppTokens.space16,
+                AppTokens.space12 + media.padding.bottom,
               ),
               itemCount: options.length,
               separatorBuilder: (_, _) =>
@@ -488,11 +496,13 @@ class _AppSelectSheet<T> extends StatelessWidget {
                         Navigator.of(context).pop(option.value);
                       },
                       child: ConstrainedBox(
-                        constraints: const BoxConstraints(minHeight: 54),
+                        constraints: const BoxConstraints(
+                          minHeight: AppTokens.minTouchTarget,
+                        ),
                         child: Padding(
                           padding: const EdgeInsets.symmetric(
                             horizontal: AppTokens.space14,
-                            vertical: AppTokens.space10,
+                            vertical: AppTokens.space8,
                           ),
                           child: Row(
                             children: [

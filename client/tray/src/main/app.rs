@@ -170,6 +170,12 @@ impl TrayApp {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn tray_performance_title(_state: &DaemonState) -> String {
+    String::new()
+}
+
+#[cfg(not(target_os = "macos"))]
 fn tray_performance_title(state: &DaemonState) -> String {
     if !state.running {
         return "P2WLAN".to_string();

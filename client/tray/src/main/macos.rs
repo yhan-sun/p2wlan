@@ -26,7 +26,7 @@ mod tests {
                     "online": true,
                     "active_path": "direct",
                     "state": "direct",
-                    "direct": {"latency_ms": 24}
+                    "direct": {"latency_ms": 24, "rtt_ewma_ms": 99}
                 },
                 {
                     "online": true,
@@ -86,6 +86,15 @@ mod tests {
         let menu = tray_device_menu(&status);
         assert_eq!(menu.total, 1);
         assert_eq!(menu.devices[0].name, "Online");
+        assert_eq!(menu.devices[0].path, "probing");
+    }
+
+    #[test]
+    fn tray_device_labels_keep_direct_and_relay_legible() {
+        assert_eq!(tray_device_marker("direct"), "🟢");
+        assert_eq!(tray_device_path_label("direct"), "直连");
+        assert_eq!(tray_device_marker("relay"), "🟠");
+        assert_eq!(tray_device_path_label("relay"), "中继");
     }
 
     #[test]

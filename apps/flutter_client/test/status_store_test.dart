@@ -23,6 +23,10 @@ void main() {
       StatusStore.defaultRouteVerificationInterval,
       const Duration(seconds: 10),
     );
+    expect(
+      StatusStore.defaultMetricsUpdateInterval,
+      const Duration(seconds: 1),
+    );
   });
 
   test('automatic refresh stays silent while work is in flight', () async {

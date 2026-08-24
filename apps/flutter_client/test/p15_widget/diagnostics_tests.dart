@@ -794,6 +794,45 @@ void _registerDiagnosticsTests() {
       },
     );
   }
+
+  testWidgets('diagnostics route actions stack for narrow large text', (
+    tester,
+  ) async {
+    final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+    final stores = (await tester.runAsync(
+      () => _makeStores(
+        api: _FakeDiagnosticsApi(health: true, snapshot: snapshot),
+      ),
+    ))!;
+    addTearDown(stores.dispose);
+
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await stores.statusStore.refresh();
+
+    await tester.pumpWidget(
+      _TestApp(
+        child: MediaQuery(
+          data: const MediaQueryData(
+            size: Size(390, 844),
+            textScaler: TextScaler.linear(1.5),
+          ),
+          child: DiagnosticsPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+            capabilities: PlatformCapabilities.fromPlatform('macos'),
+            permissionCheck: _noopPermissionCheck,
+            logPreviewLoader: _noopLogPreviewLoader,
+          ),
+        ),
+      ),
+    );
+
+    await _expandAdvanced(tester);
+    expect(find.text('Check routes'), findsOneWidget);
+    expect(find.text('Repair routes'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 }
 
 Future<void> _expandAdvanced(WidgetTester tester) async {

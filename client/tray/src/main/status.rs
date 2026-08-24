@@ -104,12 +104,15 @@ fn verified_online_connection_count(status: &serde_json::Value) -> Option<u64> {
 fn verified_peer_latency_ms(peer: &serde_json::Value) -> Option<u64> {
     let path_key = verified_active_path_key(peer)?;
 
+    // Prefer the most recent verified sample so the tray follows the same
+    // value rendered by Flutter. Older daemons may omit it, so retain the
+    // smoothed RTT as a compatibility fallback.
     peer.get(path_key)
-        .and_then(|path| path.get("rtt_ewma_ms"))
+        .and_then(|path| path.get("latency_ms"))
         .and_then(serde_json::Value::as_u64)
         .or_else(|| {
             peer.get(path_key)
-                .and_then(|path| path.get("latency_ms"))
+                .and_then(|path| path.get("rtt_ewma_ms"))
                 .and_then(serde_json::Value::as_u64)
         })
 }
@@ -196,6 +199,9 @@ fn tray_device_menu(status: &serde_json::Value) -> TrayDeviceMenu {
             Some(TrayDevice {
                 name: display_device_name(device_name, node_id),
                 virtual_ip: virtual_ip.to_string(),
+                path: verified_active_path_key(peer)
+                    .unwrap_or("probing")
+                    .to_string(),
             })
         })
         .collect::<Vec<_>>();
@@ -209,7 +215,6 @@ fn tray_device_menu(status: &serde_json::Value) -> TrayDeviceMenu {
     devices.dedup_by(|left, right| left.virtual_ip == right.virtual_ip);
 
     let total = devices.len();
-    devices.truncate(MAX_TRAY_DEVICES);
     TrayDeviceMenu { devices, total }
 }
 
@@ -250,22 +255,33 @@ fn rebuild_device_menu(submenu: &Submenu, device_menu: &TrayDeviceMenu) {
     for device in &device_menu.devices {
         let item = MenuItem::with_id(
             format!("{COPY_PEER_IP_PREFIX}{}", device.virtual_ip),
-            format!("{} · {}", device.name, device.virtual_ip),
+            format!(
+                "{} {} · {} · {}",
+                tray_device_marker(&device.path),
+                tray_device_path_label(&device.path),
+                device.name,
+                device.virtual_ip
+            ),
             true,
             None,
         );
         let _ = submenu.append(&item);
     }
+}
 
-    if device_menu.total > device_menu.devices.len() {
-        let remaining = device_menu.total - device_menu.devices.len();
-        let overflow = MenuItem::with_id(
-            "more-devices",
-            format!("另有 {remaining} 台设备，请在控制台查看"),
-            false,
-            None,
-        );
-        let _ = submenu.append(&overflow);
+fn tray_device_marker(path: &str) -> &'static str {
+    match path {
+        "direct" => "🟢",
+        "relay" => "🟠",
+        _ => "🟡",
+    }
+}
+
+fn tray_device_path_label(path: &str) -> &'static str {
+    match path {
+        "direct" => "直连",
+        "relay" => "中继",
+        _ => "探测中",
     }
 }
 

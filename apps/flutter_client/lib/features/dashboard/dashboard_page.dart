@@ -13,6 +13,7 @@ import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
+import '../../shared/widgets/device_type_icon.dart';
 
 part 'dashboard/actions.dart';
 part 'dashboard/components.dart';
@@ -48,7 +49,8 @@ class DashboardPage extends StatelessWidget {
   /// Opens the Devices section (supplied by the shell).
   final VoidCallback? onOpenDevices;
 
-  /// Opens one device's detail surface directly from the Home preview.
+  /// Requests the Devices section to open one peer through its canonical
+  /// list/detail flow.
   final ValueChanged<PeerSnapshot>? onOpenPeer;
 
   /// Opens Troubleshooting for a reported issue (supplied by the shell).

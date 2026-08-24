@@ -131,21 +131,22 @@ class _DeviceRow extends StatelessWidget {
           constraints: const BoxConstraints(minHeight: 44),
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 6),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                Stack(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final colors = P2WlanColors.of(context);
+                final leading = Stack(
                   clipBehavior: Clip.none,
                   children: [
                     Container(
                       width: 32,
                       height: 32,
                       decoration: BoxDecoration(
-                        color: P2WlanColors.of(context).selectedSurface,
+                        color: colors.selectedSurface,
                         borderRadius: BorderRadius.circular(AppTokens.radiusSm),
                       ),
                       child: Icon(
-                        Icons.devices_rounded,
+                        key: Key('home-device-icon-${peer.nodeId}'),
+                        peerDeviceIcon(peer),
                         size: 17,
                         color: theme.colorScheme.primary,
                       ),
@@ -162,7 +163,7 @@ class _DeviceRow extends StatelessWidget {
                             color: statusColor,
                             shape: BoxShape.circle,
                             border: Border.all(
-                              color: P2WlanColors.of(context).surface,
+                              color: colors.surface,
                               width: 1.5,
                             ),
                           ),
@@ -170,70 +171,113 @@ class _DeviceRow extends StatelessWidget {
                       ),
                     ),
                   ],
-                ),
-                const SizedBox(width: AppTokens.space10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        peer.displayName,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: theme.colorScheme.onSurface,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          height: 1.25,
-                        ),
+                );
+                final identity = Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      peer.displayName,
+                      maxLines: constraints.maxWidth < 520 ? 2 : 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurface,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        height: 1.25,
                       ),
-                      Text(
-                        dash(peer.virtualIp),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: theme.colorScheme.onSurfaceVariant,
-                          fontSize: 11.5,
-                          height: 1.2,
-                          fontFeatures: AppTokens.tabularFontFeatures,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: AppTokens.space12),
-                SizedBox(
-                  width: 186,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      _HomeMetricText(
-                        value: formatTransferRate(speedBytesPerSecond),
-                        width: 58,
+                    ),
+                    Text(
+                      dash(peer.virtualIp),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
                         color: theme.colorScheme.onSurfaceVariant,
+                        fontSize: 11.5,
+                        height: 1.2,
+                        fontFeatures: AppTokens.tabularFontFeatures,
                       ),
-                      const SizedBox(width: 8),
-                      _HomeMetricText(
-                        value: formatLatency(peer.latencyMs),
-                        width: 50,
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                      const SizedBox(width: 8),
-                      _HomeMetricText(
-                        value: statusLabel,
-                        width: 58,
-                        color: statusColor,
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: AppTokens.space8),
-                Icon(
+                    ),
+                  ],
+                );
+                final chevron = Icon(
                   Icons.chevron_right_rounded,
                   size: 19,
                   color: theme.colorScheme.onSurfaceVariant,
-                ),
-              ],
+                );
+                final metrics = Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _HomeMetricText(
+                      value: formatTransferRate(speedBytesPerSecond),
+                      width: constraints.maxWidth < 520 ? 54 : 58,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 6),
+                    _HomeMetricText(
+                      value: formatLatency(peer.latencyMs),
+                      width: constraints.maxWidth < 520 ? 44 : 50,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 6),
+                    _HomeMetricText(
+                      value: statusLabel,
+                      width: constraints.maxWidth < 520 ? 54 : 58,
+                      color: statusColor,
+                    ),
+                  ],
+                );
+
+                if (constraints.maxWidth < 520) {
+                  // A phone cannot fit a readable name beside three fixed
+                  // metrics. Keep the identity on the first line and move the
+                  // compact metric cluster below it; this also removes the
+                  // unusually large speed/RTT gaps seen on narrow screens.
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          leading,
+                          const SizedBox(width: AppTokens.space10),
+                          Expanded(child: identity),
+                          const SizedBox(width: AppTokens.space8),
+                          chevron,
+                        ],
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(
+                          left: 42,
+                          top: AppTokens.space4,
+                        ),
+                        child: Align(
+                          alignment: Alignment.centerRight,
+                          child: metrics,
+                        ),
+                      ),
+                    ],
+                  );
+                }
+
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    leading,
+                    const SizedBox(width: AppTokens.space10),
+                    Expanded(child: identity),
+                    const SizedBox(width: AppTokens.space12),
+                    SizedBox(
+                      width: 186,
+                      child: Align(
+                        alignment: Alignment.centerRight,
+                        child: metrics,
+                      ),
+                    ),
+                    const SizedBox(width: AppTokens.space8),
+                    chevron,
+                  ],
+                );
+              },
             ),
           ),
         ),
