@@ -465,16 +465,21 @@ class P2wlanVpnService : VpnService() {
     }
 
     private fun physicalNetworkKind(): String {
-        val manager = getSystemService(ConnectivityManager::class.java) ?: return "unknown"
-        var hasCellular = false
-        for (network in manager.allNetworks) {
-            val capabilities = manager.getNetworkCapabilities(network) ?: continue
-            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "wifi"
-            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-                hasCellular = true
+        return try {
+            val manager = getSystemService(ConnectivityManager::class.java) ?: return "unknown"
+            var hasCellular = false
+            for (network in manager.allNetworks) {
+                val capabilities = manager.getNetworkCapabilities(network) ?: continue
+                if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "wifi"
+                if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                    hasCellular = true
+                }
             }
+            if (hasCellular) "cellular" else "unknown"
+        } catch (error: SecurityException) {
+            Log.w(TAG, "Unable to inspect the physical network for Wi-Fi latency mode", error)
+            "unknown"
         }
-        return if (hasCellular) "cellular" else "unknown"
     }
 
     private fun compactLogReason(value: String): String {
