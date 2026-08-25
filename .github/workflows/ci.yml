@@ -37,7 +37,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          hard_hard_tests="$(cargo test -p p2wlan-daemon --lib hard_hard_ -- --list | sed -n 's/: test$//p')"
+          cargo test -p p2wlan-daemon --lib --no-run
+          hard_hard_binary="$(find target/debug/deps -maxdepth 1 -type f -name 'p2pnet_daemon-*' -perm -111 -print0 | xargs -0 ls -t | head -n 1)"
+          if [ -z "$hard_hard_binary" ]; then
+            echo "Hard↔Hard test binary was not built" >&2
+            exit 1
+          fi
+          hard_hard_tests="$("$hard_hard_binary" hard_hard_ --list | sed -n 's/: test$//p')"
           test_count="$(printf '%s\n' "$hard_hard_tests" | sed '/^$/d' | wc -l | tr -d ' ')"
           if [ "$test_count" -eq 0 ]; then
             echo "No Hard↔Hard tests discovered" >&2
@@ -45,7 +51,7 @@ jobs:
           fi
           while IFS= read -r test_name; do
             [ -n "$test_name" ] || continue
-            cargo test -p p2wlan-daemon --lib "$test_name" -- --exact --test-threads=1
+            "$hard_hard_binary" "$test_name" --exact --test-threads=1
           done <<< "$hard_hard_tests"
       - name: Linux route gate tests
         run: "cargo test -p p2wlan-daemon --lib route::tests::"
@@ -97,14 +103,21 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $hardHardTests = @(cargo test -p p2wlan-daemon --lib hard_hard_ -- --list |
+          cargo test -p p2wlan-daemon --lib --no-run
+          $hardHardBinary = Get-ChildItem -Path 'target/debug/deps' -Filter 'p2pnet_daemon-*.exe' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if ($null -eq $hardHardBinary) {
+            throw 'Hard↔Hard test binary was not built'
+          }
+          $hardHardTests = @(& $hardHardBinary.FullName hard_hard_ --list |
             Where-Object { $_ -match ': test$' } |
             ForEach-Object { $_ -replace ': test$', '' })
           if ($hardHardTests.Count -eq 0) {
             throw 'No Hard↔Hard tests discovered'
           }
           foreach ($testName in $hardHardTests) {
-            cargo test -p p2wlan-daemon --lib $testName -- --exact --test-threads=1
+            & $hardHardBinary.FullName $testName --exact --test-threads=1
             if ($LASTEXITCODE -ne 0) {
               exit $LASTEXITCODE
             }
