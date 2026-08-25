@@ -467,6 +467,16 @@ async fn network_generation_invalidates_direct_and_ignores_stale_results() {
         manager.get_connection("peer1").await.unwrap().state,
         ConnectionState::FallbackToRelay
     );
+    assert!(
+        !manager
+            .record_direct_success_for_generation("peer1", Some(old_endpoint), 0)
+            .await,
+        "an encrypted Direct ACK from the retired network generation must not promote Direct"
+    );
+    assert_eq!(
+        manager.get_connection("peer1").await.unwrap().state,
+        ConnectionState::FallbackToRelay
+    );
 
     assert!(
         manager

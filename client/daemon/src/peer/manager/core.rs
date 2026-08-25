@@ -84,7 +84,8 @@ impl PeerManager {
     /// Install or remove the relay-first topology gate after control has
     /// resolved the current relay catalog. The gate is armed for every live
     /// peer under the same network-epoch lock used by Direct/relay commits,
-    /// so a Direct ACK racing relay startup cannot win by arriving first.
+    /// so relay-first remains the safe startup path until an authoritative
+    /// Direct ACK commits a current Selected pair.
     pub(crate) async fn configure_relay_first(&self, required: bool) {
         self.relay_first_required
             .store(required, std::sync::atomic::Ordering::Release);

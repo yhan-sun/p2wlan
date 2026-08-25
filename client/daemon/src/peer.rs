@@ -418,17 +418,14 @@ pub const REASON_PATH_DIRECT_NOT_CONFIRMED: &str = "path_direct_not_confirmed";
 pub const REASON_PATH_DIRECT_DEGRADED: &str = "path_direct_degraded";
 /// An encrypted Direct validation succeeded, but its measured RTT exceeded
 /// the relay-retention quality floor while the same-generation relay was
-/// already peer-confirmed.  The proof is retained as a candidate observation;
-/// it must not become the active business path.
+/// already peer-confirmed. The proof remains authoritative, while the
+/// existing quality fallback keeps Relay active.
 pub const REASON_PATH_DIRECT_SLOW_RELAY_RETAINED: &str = "path_direct_slow_relay_retained";
-/// Direct has encrypted proof, but relay transport is ready and its
-/// same-generation peer ACK is still pending.  Business data must wait here;
-/// a Direct candidate/ACK cannot bypass relay-first admission.
+/// Reserved startup-gate reason for a path that has not yet received an
+/// authoritative current-generation Direct confirmation.
 pub const REASON_PATH_RELAY_FIRST_PENDING: &str = "path_relay_first_pending";
-/// Direct is already encrypted-confirmed, but the first real business packet
-/// is deliberately reserved for the newly confirmed Relay path.  This keeps
-/// relay-first an observable data-plane property instead of merely a control
-/// plane ordering promise.
+/// Reserved relay-first business-gate reason for pre-authoritative/trial
+/// selection. A current authoritative Direct pair bypasses this marker.
 pub const REASON_PATH_RELAY_FIRST_BUSINESS: &str = "path_relay_first_business";
 /// Relay was confirmed, but the bidirectional first-business evidence did not
 /// arrive before the bounded relay-first grace.  Direct remains eligible only
@@ -436,8 +433,9 @@ pub const REASON_PATH_RELAY_FIRST_BUSINESS: &str = "path_relay_first_business";
 /// observable fallback, never a relay confirmation.
 pub const REASON_PATH_DIRECT_AFTER_RELAY_BUSINESS_DEADLINE: &str =
     "path_direct_after_relay_business_deadline";
-/// A Direct business packet arrived before the bidirectional relay-first
-/// evidence was complete; it may be delivered, but it cannot win first usable.
+/// A Direct business packet arrived before an authoritative current Direct
+/// commit and before the bidirectional relay-first evidence was complete; it
+/// may be delivered, but it cannot win first usable.
 pub const REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS: &str = "first_direct_before_relay_business";
 /// Direct became first usable after the bounded relay-business gate expired.
 /// This is deliberately distinct from a relay-first result in acceptance

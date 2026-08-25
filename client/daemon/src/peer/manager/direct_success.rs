@@ -189,8 +189,14 @@ impl PeerManager {
             let was_direct = conn.state == ConnectionState::Direct;
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
-            let relay_first_required = self.relay_first_required();
-            if relay_first_required && conn.relay_first.gate_generation != Some(generation) {
+            // This ACK commit can happen before the live per-peer relay slot
+            // is published.  Keep the topology-level relay expectation for
+            // the selector snapshot intentionally: the selector argument is
+            // a fallback-availability signal here, not proof that relay has
+            // delivered business traffic.  Dataplane callers pass the live
+            // relay availability separately.
+            let relay_expected = self.relay_first_required();
+            if relay_expected && conn.relay_first.gate_generation != Some(generation) {
                 // Direct validation can complete before the relay supervisor
                 // publishes its transport. Arm the gate here as well as at
                 // catalog/peer admission so an inbound peer cannot use this
@@ -258,15 +264,15 @@ impl PeerManager {
             }
             conn.transition(ConnectionState::Direct);
             // Keep the persisted selector in lock-step with the Direct
-            // promotion.  A selector snapshot taken before this ACK may
-            // still say Relay, but it can never be written after this commit
-            // without observing the newer connection state.
+            // promotion.  The current encrypted-confirmed Direct pair wins
+            // past relay-first business gating; only an explicit current
+            // quality/path failure may retain Relay as fallback.
             if let Some(endpoint) = selected_endpoint {
                 let policy = self.config.relay.effective_path_policy(true);
                 let mut direct_selection = conn.select_path_for_data_with_policy(
                     generation,
                     policy,
-                    relay_first_required,
+                    relay_expected,
                 );
                 if direct_selection.path == Some(NetworkPath::Direct) {
                     direct_selection.path = Some(NetworkPath::Direct);

@@ -776,28 +776,28 @@ impl PeerManager {
                         // has been proven.
                         (conn.record_first_usable(path, generation), None, None)
                     } else if path == NetworkPath::Direct
+                        && !conn.has_current_authoritative_direct(generation)
                         && (conn.relay_confirmed_generation == Some(generation)
                             && conn.relay_confirmed_endpoint.is_some())
                         && conn.relay_first.business_gate_completed_generation != Some(generation)
                         && conn.relay_first.business_exchange_generation != Some(generation)
                     {
-                        // A confirmed relay remains the business safety path
-                        // until both same-generation relay business
-                        // directions have been observed.  Direct validation
-                        // is deliberately background-only here; a timer must
-                        // never convert missing relay ingress into a false
-                        // Direct first-usable result.
+                        // Before an authoritative Direct commit, a confirmed
+                        // relay remains the business safety path until both
+                        // same-generation relay business directions have been
+                        // observed.  The authoritative Direct case is handled
+                        // above by the current Selected-pair check.
                         (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
                     } else if path == NetworkPath::Direct
+                        && !conn.has_current_authoritative_direct(generation)
                         && (conn.relay_ready_generation == Some(generation)
                             || conn.relay_first.gate_generation == Some(generation))
                         && conn.relay_confirmed_generation != Some(generation)
                     {
                         // If relay peer confirmation itself is still pending,
-                        // keep the bounded startup fallback: after the gate
-                        // expires, a separately encrypted-confirmed Direct
-                        // path may establish first usable because no relay
-                        // delivery proof exists for this generation.
+                        // keep the bounded startup fallback for an uncommitted
+                        // Direct trial.  A separately encrypted-confirmed
+                        // Direct path has already been admitted above.
                         let gate_expired = conn
                             .relay_ready_at
                             .or(conn.relay_first.gate_started_at)
@@ -1397,13 +1397,12 @@ impl PeerManager {
         targets
     }
 
-    /// Peers whose relay-first business gate is pending on the confirmed relay
-    /// while Direct is already encrypted-confirmed.  For these peers a synthetic
-    /// path-commit request closes the gate (one-way traffic has no natural
-    /// inbound business to release it — audit P0-4).  The predicate is exactly
-    /// the business-pending condition: relay confirmed for the current
-    /// generation, Direct confirmed, natural exchange not done, path-commit not
-    /// yet done, not quarantined.
+    /// Peers whose relay fallback business evidence is still pending on the
+    /// confirmed relay while Direct is already encrypted-confirmed. For these
+    /// peers a synthetic path-commit request can complete the standby evidence
+    /// (one-way traffic has no natural inbound business — audit P0-4). Direct
+    /// is already primary; the predicate is exactly the current-generation
+    /// relay/Direct state with neither natural exchange nor path-commit done.
     pub async fn path_commit_targets(&self) -> Vec<(String, String, u64)> {
         let generation = self.current_network_generation().await;
         let candidates: Vec<_> = self
@@ -1796,10 +1795,10 @@ impl PeerManager {
     ///
     /// Called when a matching forced-relay path-commit ACK arrives (a
     /// business-shaped authenticated packet round-tripped over the confirmed
-    /// relay).  This closes the relay-first business gate as an *alternative*
+    /// relay). This completes relay-first business evidence as an *alternative*
     /// to natural two-way business: it proves the same bidirectional relay-data
     /// invariant without depending on traffic that may never flow one way
-    /// (audit P0-4).  It does not itself make Direct active — Direct promotion
+    /// (audit P0-4). It does not itself make Direct active — Direct promotion
     /// still requires its own generation-bound encrypted validation.
     ///
     /// Returns `true` when the marker was newly committed for this generation.

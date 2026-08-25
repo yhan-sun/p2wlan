@@ -2531,9 +2531,7 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
 }
 
 #[tokio::test]
-async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_before_slot() {
-    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
-    let relay_endpoint = server.addr.to_string();
+async fn test_network_outbound_promotes_direct_before_relay_slot_is_published() {
     let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = direct_sink.local_addr().unwrap();
 
@@ -2561,21 +2559,15 @@ async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_bef
             Some(Duration::from_millis(8)),
         )
         .await;
-    // This is the startup race from the real Air/Mini run: Direct can become
-    // encrypted-confirmed before the relay supervisor publishes its live
-    // transport slot.  Relay-first must still retain the raw business packet
-    // until the configured relay is available and peer-confirmed.
+    // This is the startup race from the real Mini/Android run: Direct can
+    // become encrypted-confirmed before the relay supervisor publishes its
+    // live transport slot. The authoritative ACK makes Direct primary; the
+    // relay-first state remains warm standby/fallback state.
     peers
         .record_direct_success("node-b", Some(direct_endpoint))
         .await;
 
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
-        .await
-        .unwrap();
-    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
-        .await
-        .unwrap();
-    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
         .await
         .unwrap();
 
@@ -2588,7 +2580,7 @@ async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_bef
 
     let udp_transport = Arc::new(RwLock::new(Some(udp)));
     let relay_transport = Arc::new(RwLock::new(None));
-    let (relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
     let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
     let worker = tokio::spawn(run_network_outbound(
         outbound_rx,
@@ -2623,50 +2615,24 @@ async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_bef
         .await
         .unwrap();
 
-    tokio::time::timeout(Duration::from_millis(150), rx_b.recv())
-        .await
-        .expect_err("relay should not receive before relay transport is published");
-    let mut direct_buf = [0u8; 64];
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            direct_sink.recv_from(&mut direct_buf)
-        )
-        .await
-        .is_err(),
-        "a configured relay must block Direct business handoff during startup"
-    );
-
-    *relay_transport.write().await = Some(relay_a);
-    let generation = peers.current_network_generation().await;
-    peers
-        .mark_relay_transport_ready("node-b", &relay_endpoint, generation)
-        .await;
-    assert!(
-        peers
-            .confirm_relay_peer("node-b", &relay_endpoint, generation)
-            .await
-    );
-    let _ = relay_available_tx.send(true);
-
-    let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+    let mut direct_buf = [0u8; 256];
+    let (received_len, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        direct_sink.recv_from(&mut direct_buf),
+    )
         .await
         .unwrap()
         .unwrap();
-    if let RelayMessage::Data { from_node, data } = received {
-        assert_eq!(from_node, "node-a");
-        assert_eq!(
-            remote_session.decrypt_from_bytes(&data).unwrap(),
-            packet,
-            "the parked PLAINTEXT packet must be encrypted and flushed over the relay after confirmation"
-        );
-    } else {
-        panic!("Expected Data message, got {:?}", received);
-    }
+    assert_eq!(
+        remote_session
+            .decrypt_from_bytes(&direct_buf[..received_len])
+            .unwrap(),
+        packet,
+        "an authoritative Direct ACK must promote the first business packet before relay publish"
+    );
 
     worker.abort();
     forwarder.abort();
-    server.shutdown().await;
 }
 
 #[tokio::test]

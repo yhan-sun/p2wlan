@@ -1984,7 +1984,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::control::PeerInfo;
-    use crate::peer::REASON_PATH_RELAY_FIRST_PENDING;
+    use crate::peer::REASON_PATH_DIRECT_CONFIRMED;
 
     fn test_peer(node_id: &str, endpoint: SocketAddr) -> PeerInfo {
         PeerInfo {
@@ -2063,16 +2063,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_selector_honors_expected_relay_before_transport_publish() {
+    async fn send_selector_accepts_authoritative_direct_before_relay_transport_publish() {
         let manager =
             PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
         let endpoint: SocketAddr = "198.51.100.50:51850".parse().unwrap();
         manager.add_peer(&test_peer("peer-a", endpoint)).await;
         let generation = manager.current_network_generation().await;
 
-        // This is the exact window observed in the real Air round: relay is
-        // expected/configured, but its transport object has not been
-        // published yet; Direct has already completed encrypted validation.
+        // This is the exact startup race: relay is expected/configured, but
+        // its transport object has not been published yet; Direct has already
+        // completed encrypted validation.  The ACK is authoritative for the
+        // Direct data path, while the relay expectation remains standby state.
         assert!(
             !manager
                 .is_data_path_admitted_for_generation("peer-a", generation, true)
@@ -2096,9 +2097,9 @@ mod tests {
             is_business: true,
         };
         let selection = select_outbound_path(&packet, &manager, true, false, true, None).await;
-        assert_eq!(selection.path, None);
-        assert_eq!(selection.reason_code, REASON_PATH_RELAY_FIRST_PENDING);
-        assert!(!selection.direct_confirmed);
+        assert_eq!(selection.path, Some(NetworkPath::Direct));
+        assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+        assert!(selection.direct_confirmed);
     }
 
     #[tokio::test]
