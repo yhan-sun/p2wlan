@@ -516,6 +516,7 @@ async fn refresh_candidate_cache_for_maintenance_signal(
             local_addr,
             udp_advertise,
             &candidates,
+            &candidate_sources,
             include_host_candidate,
         )
     }) {

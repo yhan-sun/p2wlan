@@ -35,16 +35,13 @@ fn candidate_pair_source_from_label(label: &str) -> Option<CandidatePairSource> 
 }
 
 /// Best-effort compatibility classification for candidate sets from older
-/// clients that predate `candidate_sources` metadata.  A public socket is not
-/// proof that it was STUN-derived, but it is the safest first-round target for
-/// a cross-LAN punch; RFC1918/link-local addresses remain host candidates.
-fn infer_unlabeled_candidate_source(candidate: &str) -> CandidatePairSource {
-    candidate
-        .parse::<SocketAddr>()
-        .ok()
-        .filter(|endpoint| is_public_probe_endpoint(*endpoint))
-        .map(|_| CandidatePairSource::StunObserved)
-        .unwrap_or(CandidatePairSource::Host)
+/// clients that predate `candidate_sources` metadata. Missing provenance is
+/// explicitly kept as a generic signaled candidate. A public-looking socket
+/// is not proof that it was STUN-derived; assigning `StunObserved` here would
+/// silently recreate the same Host-vs-public bug this metadata is meant to
+/// prevent.
+fn infer_unlabeled_candidate_source(_candidate: &str) -> CandidatePairSource {
+    CandidatePairSource::Signaled
 }
 
 fn candidate_pair_probe_retry_remaining(pair: &CandidatePair) -> Option<Duration> {

@@ -2,6 +2,7 @@ pub(super) fn advertised_udp_endpoint(
     local_addr: SocketAddr,
     configured: Option<&str>,
     candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
     include_host_candidate: bool,
 ) -> Option<String> {
     if let Some(endpoint) = configured
@@ -11,29 +12,73 @@ pub(super) fn advertised_udp_endpoint(
         return Some(endpoint.to_string());
     }
 
-    // A public reflexive / port-mapped candidate is the peer's best primary
-    // target: it is reachable through both NATs, while a private host
-    // candidate is not.  Field evidence (v0.1.116 acceptance): advertising
-    // the private host endpoint FIRST made the Air side punch the
-    // unreachable private address (192.168.0.239:...) and two of ten cold
-    // start rounds timed out at ~102 s; the rounds where the public mapping
-    // won the ordering converged in ~3-6 s.
+    // A STUN/port-mapping candidate is a credible public primary target. A
+    // global-looking Host candidate is not: it may be a VPN/VNIC address
+    // whose literal scope says nothing about public reachability. Keep Host
+    // candidates available as fallbacks, but rank an ordinary private Host
+    // ahead of a global-looking unrelated Host. This preserves the LAN path
+    // in the multi-NIC case without turning a static address heuristic into a
+    // hard rejection.
     candidates
         .iter()
         .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
-        .find(|candidate| is_public_udp_candidate(*candidate))
-        .map(|candidate| candidate.to_string())
+        .enumerate()
+        .min_by_key(|(index, candidate)| {
+            (
+                advertised_candidate_rank(
+                    *candidate,
+                    candidate_sources
+                        .get(&candidate.to_string())
+                        .map(String::as_str),
+                ),
+                *index,
+            )
+        })
+        .filter(|(_, candidate)| {
+            !candidate.ip().is_unspecified() && !candidate.ip().is_loopback()
+        })
+        .map(|(_, candidate)| candidate.to_string())
         .or_else(|| {
             candidates
                 .iter()
                 .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
-                .find(|candidate| !candidate.ip().is_unspecified() && !candidate.ip().is_loopback())
+                .find(|candidate| {
+                    !candidate.ip().is_unspecified() && !candidate.ip().is_loopback()
+                })
                 .map(|candidate| candidate.to_string())
         })
         .or_else(|| {
             (include_host_candidate && !local_addr.ip().is_unspecified())
                 .then(|| local_addr.to_string())
         })
+}
+
+fn advertised_candidate_rank(endpoint: SocketAddr, source: Option<&str>) -> u8 {
+    let public = is_public_udp_candidate(endpoint);
+    match source {
+        Some("manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping")
+            if public => 0,
+        Some("stun_observed") if public => 1,
+        Some("host") if !public => 2,
+        Some("host") => 3,
+        Some("signaled") if public => 4,
+        None if public => 4,
+        Some("signaled") | None => 5,
+        Some("peer_reflexive" | "learned" | "predicted" | "birthday" | "relay") => 6,
+        Some(_) if public => 5,
+        Some(_) => 6,
+    }
+}
+
+fn is_verified_public_source(source: Option<&str>) -> bool {
+    matches!(
+        source,
+        Some("manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping" | "stun_observed")
+    )
+}
+
+fn is_verified_public_candidate(endpoint: SocketAddr, source: Option<&str>) -> bool {
+    is_public_udp_candidate(endpoint) && is_verified_public_source(source)
 }
 
 pub(super) fn control_udp_endpoint_from_candidates(
@@ -73,13 +118,14 @@ fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
         {
             1
         }
-        Some("host")
-            if endpoint
-                .parse::<SocketAddr>()
-                .is_ok_and(is_public_udp_candidate) =>
-        {
-            2
-        }
+        // Host provenance never becomes public proof merely because the
+        // address is outside RFC1918. It remains a usable last-resort Host
+        // candidate, but it must follow independently observed mappings.
+        Some("host") => endpoint
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|endpoint| if is_public_udp_candidate(endpoint) { 4 } else { 3 })
+            .unwrap_or(u8::MAX),
         Some("peer_reflexive" | "learned" | "predicted" | "birthday") => u8::MAX,
         Some("relay") => u8::MAX,
         Some(source) if crate::parse_fresh_prediction_source_label(source).is_some() => u8::MAX,
@@ -87,7 +133,7 @@ fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
             if endpoint.parse::<SocketAddr>().is_ok_and(|candidate| {
                 !candidate.ip().is_unspecified() && !candidate.ip().is_loopback()
             }) {
-                3
+                5
             } else {
                 u8::MAX
             }
@@ -476,10 +522,10 @@ fn signal_candidate_rank(endpoint: &str, source: Option<&str>) -> u8 {
         // in `truncate_signal_candidates` so it is never crowded out.
         Some("predicted") => 4,
         Some(source) if crate::parse_fresh_prediction_source_label(source).is_some() => 4,
-        Some("host") => match endpoint.parse::<SocketAddr>() {
-            Ok(endpoint) if is_public_udp_candidate(endpoint) => 5,
-            _ => 8,
-        },
+        // Host provenance remains Host regardless of address scope. A
+        // global-looking Host must not outrank independently observed public
+        // evidence merely because it is not RFC1918.
+        Some("host") => 8,
         Some("relay") => 9,
         Some(_) | None => {
             if endpoint
@@ -500,6 +546,7 @@ fn candidate_source_label(source: CandidateSource) -> &'static str {
         CandidateSource::StunObserved => "stun_observed",
         CandidateSource::Predicted => "predicted",
         CandidateSource::PeerReflexive => "peer_reflexive",
+        CandidateSource::PortMapped => "port_mapping",
         CandidateSource::Manual => "manual",
         CandidateSource::Relay => "relay",
     }
@@ -596,11 +643,8 @@ pub(super) fn has_real_public_candidate(
         if !is_public_udp_candidate(endpoint) {
             return false;
         }
-        let source = candidate_sources
-            .get(endpoint_text)
-            .map(String::as_str);
-        !matches!(source, Some("peer_reflexive" | "learned" | "predicted"))
-            && source.is_none_or(|source| crate::parse_fresh_prediction_source_label(source).is_none())
+        let source = candidate_sources.get(endpoint_text).map(String::as_str);
+        is_verified_public_candidate(endpoint, source)
     })
 }
 
@@ -925,15 +969,24 @@ pub(super) fn stable_network_candidate_signature(
             .map(String::as_str)
             .unwrap_or("signaled");
         match endpoint.parse::<SocketAddr>() {
-            Ok(addr) if is_public_udp_candidate(addr) => {
-                // Port churn and candidate-source promotion do not mean the
-                // host changed networks. Peer-reflexive/learned endpoints are
-                // observations about a remote path and must not become this
-                // daemon's local public identity.
-                if !matches!(source, "peer_reflexive" | "learned") {
+            Ok(addr) if is_public_udp_candidate(addr) => match source {
+                // Only independently observed/mapped evidence is a public
+                // identity. A global-looking Host is still a physical Host
+                // identity, not proof of a public NAT mapping.
+                "stun_observed" | "manual" | "upnp" | "pcp" | "nat_pmp"
+                | "nat-pmp" | "port_mapping" => {
                     signature.push(format!("public-ip:{}", addr.ip()));
                 }
-            }
+                "host" => signature.push(format!("physical-host-ip:{}", addr.ip())),
+                // Prediction is not current reachability proof, but its IP is
+                // derived from an earlier local public observation and still
+                // belongs to the stable network-identity fingerprint.
+                "predicted" => signature.push(format!("public-ip:{}", addr.ip())),
+                // Peer-reflexive/learned endpoints describe a remote path,
+                // not this daemon's local network identity.
+                "peer_reflexive" | "learned" => {}
+                _ => signature.push(format!("physical-host-ip:{}", addr.ip())),
+            },
             Ok(addr) => match source {
                 "host" => {
                     signature.push(format!("physical-host-ip:{}", addr.ip()));

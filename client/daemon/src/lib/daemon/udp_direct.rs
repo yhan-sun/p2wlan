@@ -444,6 +444,7 @@ async fn run_udp_direct_instance(
                     addr,
                     udp_advertise.as_deref(),
                     &candidate_endpoints,
+                    &candidate_sources,
                     peers.gather_host_candidates().await,
                 ) {
                     // The advertised endpoint is the peer's PRIMARY punch

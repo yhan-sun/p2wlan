@@ -827,7 +827,7 @@ impl PeerManager {
     /// mark pairs as probing only once the UDP layer confirms a packet left.
     pub async fn record_direct_probe_sent(&self, node_id: &str, endpoint: SocketAddr) -> bool {
         let generation = self.current_network_generation().await;
-        self.emit_timeline_first(
+        let first_probe = self.emit_timeline_first(
             node_id,
             generation,
             "first_direct_probe_sent",
@@ -835,6 +835,37 @@ impl PeerManager {
             None,
             Some(format!("peer={node_id} endpoint={endpoint} generation={generation}")),
         );
+        if first_probe {
+            // Route inspection is intentionally first-probe-only: it is
+            // valuable for diagnosing Windows multi-NIC selection, but doing
+            // an interface enumeration for every punch would turn a
+            // diagnostic into a source of probe latency.
+            let route = tokio::task::spawn_blocking(move || {
+                p2pnet_netbind::resolve_route(endpoint.ip())
+            })
+            .await
+            .ok()
+            .flatten();
+            let source = self
+                .connections
+                .read()
+                .await
+                .get(node_id)
+                .map(|connection| connection.candidate_source_for_endpoint(endpoint));
+            self.emit_timeline_debug(
+                "direct_probe_route",
+                Some("direct"),
+                None,
+                Some(format!(
+                    "peer={node_id} destination={endpoint} candidate_source={source:?} route_interface={:?} interface_index={:?} preferred_source={:?} next_hop={:?} metric={:?}",
+                    route.as_ref().and_then(|route| route.interface_name.as_deref()),
+                    route.as_ref().and_then(|route| route.interface_index),
+                    route.as_ref().and_then(|route| route.preferred_source),
+                    route.as_ref().and_then(|route| route.next_hop),
+                    route.as_ref().and_then(|route| route.metric),
+                )),
+            );
+        }
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;

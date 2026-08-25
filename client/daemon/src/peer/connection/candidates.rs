@@ -138,6 +138,53 @@ impl PeerConnection {
             .unwrap_or(CandidatePairSource::Signaled)
     }
 
+    /// Rank a candidate by destination-specific route relevance.
+    ///
+    /// Address scope is not enough on a multi-NIC host: a global-looking Host
+    /// may belong to an unrelated VNIC, while a private Host can be the exact
+    /// on-link destination. The route lookup is only a tie-breaker for
+    /// off-link Host candidates; authenticated reachability and on-link prefix
+    /// evidence remain stronger and are never revoked by this static hint.
+    fn candidate_route_relevance_rank(
+        &self,
+        pair: &CandidatePair,
+        route_relevance_cache: &mut HashMap<IpAddr, u8>,
+    ) -> u8 {
+        if pair.source == CandidatePairSource::Host {
+            if self.is_on_link_host_candidate(pair.remote_endpoint) {
+                return 0;
+            }
+            if is_overlay_endpoint(pair.remote_endpoint) {
+                return 4;
+            }
+            let destination = pair.remote_endpoint.ip();
+            let structurally_non_routable = destination.is_loopback()
+                || destination.is_unspecified()
+                || destination.is_multicast();
+            if structurally_non_routable {
+                return 3;
+            }
+            return *route_relevance_cache.entry(destination).or_insert_with(|| {
+                if p2pnet_netbind::resolve_route(destination).is_some() {
+                    2
+                } else {
+                    3
+                }
+            });
+        }
+
+        match pair.source {
+            CandidatePairSource::PeerReflexive | CandidatePairSource::Learned => 0,
+            CandidatePairSource::StunObserved
+            | CandidatePairSource::Upnp
+            | CandidatePairSource::Pcp
+            | CandidatePairSource::NatPmp
+            | CandidatePairSource::Signaled => 1,
+            CandidatePairSource::Host => 2,
+            CandidatePairSource::Predicted | CandidatePairSource::Birthday => 3,
+        }
+    }
+
     /// Return the candidate endpoints whose provenance is strong enough to
     /// receive the larger bounded fast-probe prefix.  The caller still owns
     /// the full candidate FIFO; this is only a latency hint for authenticated
@@ -668,6 +715,7 @@ impl PeerConnection {
                     && candidate_pair_probe_allowed_at(pair, mode, now)
             })
             .collect::<Vec<_>>();
+        let mut route_relevance_cache = HashMap::new();
         pairs.sort_by(|a, b| {
             outbound_probe_priority_rank(a)
                 .cmp(&outbound_probe_priority_rank(b))
@@ -708,6 +756,10 @@ impl PeerConnection {
                 })
                 .then_with(|| {
                     speculative_probe_rotation_rank(a).cmp(&speculative_probe_rotation_rank(b))
+                })
+                .then_with(|| {
+                    self.candidate_route_relevance_rank(a, &mut route_relevance_cache)
+                        .cmp(&self.candidate_route_relevance_rank(b, &mut route_relevance_cache))
                 })
                 .then_with(|| {
                     endpoint_probe_rank(a.remote_endpoint)

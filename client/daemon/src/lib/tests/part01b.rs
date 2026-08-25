@@ -2,7 +2,13 @@
 fn test_advertised_udp_endpoint_uses_configured_value() {
     let local = "0.0.0.0:51820".parse().unwrap();
     assert_eq!(
-        advertised_udp_endpoint(local, Some("203.0.113.10:51820"), &[], false),
+        advertised_udp_endpoint(
+            local,
+            Some("203.0.113.10:51820"),
+            &[],
+            &HashMap::new(),
+            false,
+        ),
         Some("203.0.113.10:51820".to_string())
     );
 }
@@ -18,6 +24,7 @@ fn test_advertised_udp_endpoint_uses_public_candidate_for_unspecified_bind() {
                 "192.168.1.10:51820".to_string(),
                 "8.8.8.8:43000".to_string()
             ],
+            &HashMap::new(),
             false,
         ),
         Some("8.8.8.8:43000".to_string())
@@ -28,7 +35,7 @@ fn test_advertised_udp_endpoint_uses_public_candidate_for_unspecified_bind() {
 fn test_advertised_udp_endpoint_uses_specific_bind_address() {
     let local = "127.0.0.1:51820".parse().unwrap();
     assert_eq!(
-        advertised_udp_endpoint(local, None, &[], true),
+        advertised_udp_endpoint(local, None, &[], &HashMap::new(), true),
         Some("127.0.0.1:51820".to_string())
     );
 }
@@ -36,7 +43,10 @@ fn test_advertised_udp_endpoint_uses_specific_bind_address() {
 #[test]
 fn advertised_udp_endpoint_omits_specific_bind_when_host_candidates_are_disabled() {
     let local = "127.0.0.1:51820".parse().unwrap();
-    assert_eq!(advertised_udp_endpoint(local, None, &[], false), None);
+    assert_eq!(
+        advertised_udp_endpoint(local, None, &[], &HashMap::new(), false),
+        None
+    );
 }
 
 #[test]
@@ -51,17 +61,69 @@ fn advertised_udp_endpoint_prefers_public_candidate_over_private_host() {
         "192.168.0.239:60482".to_string(),
         "220.165.178.32:7361".to_string(),
     ];
+    let sources = HashMap::from([
+        (candidates[0].clone(), "host".to_string()),
+        (candidates[1].clone(), "stun_observed".to_string()),
+    ]);
     assert_eq!(
-        advertised_udp_endpoint(local, None, &candidates, true),
+        advertised_udp_endpoint(local, None, &candidates, &sources, true),
         Some("220.165.178.32:7361".to_string()),
         "the public reflexive mapping must be the advertised endpoint"
     );
     // Without any public candidate, the private host address remains the
     // fallback (LAN-only deployments).
     assert_eq!(
-        advertised_udp_endpoint(local, None, &["192.168.0.239:60482".to_string()], true),
+        advertised_udp_endpoint(
+            local,
+            None,
+            &["192.168.0.239:60482".to_string()],
+            &HashMap::from([(
+                "192.168.0.239:60482".to_string(),
+                "host".to_string(),
+            )]),
+            true,
+        ),
         Some("192.168.0.239:60482".to_string())
     );
+}
+
+#[test]
+fn advertised_endpoint_does_not_treat_global_host_as_public_proof() {
+    let local: SocketAddr = "0.0.0.0:58079".parse().unwrap();
+    let candidates = vec![
+        "20.0.3.148:58079".to_string(),
+        "10.23.176.16:58079".to_string(),
+    ];
+    let sources = HashMap::from([
+        (candidates[0].clone(), "host".to_string()),
+        (candidates[1].clone(), "host".to_string()),
+    ]);
+
+    assert_eq!(
+        advertised_udp_endpoint(local, None, &candidates, &sources, true),
+        Some("10.23.176.16:58079".to_string())
+    );
+}
+
+#[test]
+fn control_endpoint_keeps_private_host_ahead_of_unverified_global_host() {
+    let candidates = vec![
+        "20.0.3.148:58079".to_string(),
+        "10.23.176.16:58079".to_string(),
+    ];
+    let sources = HashMap::from([
+        (candidates[0].clone(), "host".to_string()),
+        (candidates[1].clone(), "host".to_string()),
+    ]);
+
+    assert_eq!(
+        control_udp_endpoint_from_candidates(&candidates, &sources).as_deref(),
+        Some("10.23.176.16:58079")
+    );
+    assert!(!crate::candidate_refresh::has_real_public_candidate(
+        &candidates,
+        &sources
+    ));
 }
 
 #[test]
@@ -407,11 +469,11 @@ fn signal_payload_json_keeps_stun_candidates_under_both_proxy_modes() {
     // mode, and the selected control endpoint stays the STUN-observed one.
     use std::collections::HashMap;
     let candidates = vec![
-        "203.0.113.10:41000".to_string(), // STUN-observed public endpoint
+        "8.8.8.8:41000".to_string(), // STUN-observed public endpoint
         "192.168.1.10:51820".to_string(), // host candidate
     ];
     let sources = HashMap::from([
-        ("203.0.113.10:41000".to_string(), "stun_observed".to_string()),
+        ("8.8.8.8:41000".to_string(), "stun_observed".to_string()),
         ("192.168.1.10:51820".to_string(), "host".to_string()),
     ]);
     // The prepared signal body carries the EXACT STUN candidate list in JSON.
@@ -437,7 +499,7 @@ fn signal_payload_json_keeps_stun_candidates_under_both_proxy_modes() {
         .collect();
     assert_eq!(json_candidates, candidates, "candidate JSON must be the STUN-derived list verbatim");
     assert_eq!(
-        payload["candidate_sources"]["203.0.113.10:41000"],
+        payload["candidate_sources"]["8.8.8.8:41000"],
         "stun_observed",
         "the STUN source label must survive into the JSON"
     );
@@ -448,7 +510,7 @@ fn signal_payload_json_keeps_stun_candidates_under_both_proxy_modes() {
     ] {
         assert_eq!(
             control_udp_endpoint_from_candidates(&candidates, &sources).as_deref(),
-            Some("203.0.113.10:41000"),
+            Some("8.8.8.8:41000"),
             "proxy mode {mode:?} must never replace the STUN candidate with a proxy egress"
         );
     }

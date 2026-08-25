@@ -311,6 +311,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 local_addr,
                 udp_advertise.as_deref(),
                 &candidates,
+                &candidate_sources,
                 include_host_candidate,
             )
         });

@@ -156,6 +156,8 @@ impl From<&SocketAddr> for Endpoint {
 pub enum CandidateType {
     /// Local network address (e.g. 192.168.1.100).
     Host,
+    /// Endpoint opened by an explicit gateway mapping (UPnP/PCP/NAT-PMP).
+    PortMapped,
     /// Server-reflexive address (from STUN).
     ServerReflexive,
     /// Peer-reflexive address (discovered during ICE).
@@ -180,10 +182,82 @@ pub enum CandidateSource {
     Predicted,
     /// Candidate was discovered from authenticated peer-reflexive traffic.
     PeerReflexive,
+    /// Candidate came from an explicit gateway port mapping (UPnP/PCP/NAT-PMP).
+    PortMapped,
     /// Candidate was manually configured or explicitly advertised.
     Manual,
     /// Candidate came from a relay transport.
     Relay,
+}
+
+/// Address classification kept separate from [`CandidateSource`].
+///
+/// A global-looking address is still only a `Host` candidate until an
+/// independent observation (STUN, an explicit mapping, or authenticated
+/// traffic) supplies public-reachability evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AddressScope {
+    Unspecified,
+    Loopback,
+    Multicast,
+    LinkLocal,
+    Private,
+    Shared,
+    Global,
+    Other,
+}
+
+/// Classify an address without changing its candidate provenance.
+pub fn classify_address_scope(address: IpAddr) -> AddressScope {
+    match address {
+        IpAddr::V4(ip) => {
+            if ip.is_unspecified() {
+                AddressScope::Unspecified
+            } else if ip.is_loopback() {
+                AddressScope::Loopback
+            } else if ip.is_multicast() || ip.is_broadcast() {
+                AddressScope::Multicast
+            } else if ip.is_link_local() {
+                AddressScope::LinkLocal
+            } else if ip.is_private() {
+                AddressScope::Private
+            } else if is_shared_ipv4(ip) {
+                AddressScope::Shared
+            } else if is_documentation_ipv4(ip) {
+                AddressScope::Other
+            } else {
+                AddressScope::Global
+            }
+        }
+        IpAddr::V6(ip) => {
+            let first_segment = ip.segments()[0];
+            if ip.is_unspecified() {
+                AddressScope::Unspecified
+            } else if ip.is_loopback() {
+                AddressScope::Loopback
+            } else if ip.is_multicast() {
+                AddressScope::Multicast
+            } else if (first_segment & 0xffc0) == 0xfe80 {
+                AddressScope::LinkLocal
+            } else if (first_segment & 0xfe00) == 0xfc00 {
+                AddressScope::Private
+            } else {
+                AddressScope::Global
+            }
+        }
+    }
+}
+
+fn is_shared_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn is_documentation_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
 /// An ICE candidate address.
@@ -207,6 +281,16 @@ impl IceCandidate {
             endpoint: Endpoint::new(ip, port),
             priority: 100,
             source: CandidateSource::Host,
+        }
+    }
+
+    /// Create an explicitly port-mapped candidate.
+    pub fn port_mapped(ip: &str, port: u16) -> Self {
+        Self {
+            candidate_type: CandidateType::PortMapped,
+            endpoint: Endpoint::new(ip, port),
+            priority: 95,
+            source: CandidateSource::PortMapped,
         }
     }
 
@@ -264,7 +348,10 @@ impl NatDiscoveryResult {
 
     /// Add a candidate.
     pub fn add_candidate(&mut self, candidate: IceCandidate) {
-        if candidate.candidate_type == CandidateType::ServerReflexive {
+        if matches!(
+            candidate.candidate_type,
+            CandidateType::ServerReflexive | CandidateType::PortMapped
+        ) {
             self.public_endpoint = Some(candidate.endpoint.clone());
         }
         self.candidates.push(candidate);

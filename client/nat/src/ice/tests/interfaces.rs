@@ -1,11 +1,16 @@
+use crate::{classify_address_scope, AddressScope, CandidateSource};
+
 #[test]
 fn test_priority_ordering() {
     let host_pri = compute_priority(CandidateType::Host);
     let srflx_pri = compute_priority(CandidateType::ServerReflexive);
     let prflx_pri = compute_priority(CandidateType::PeerReflexive);
+    let mapped_pri = compute_priority(CandidateType::PortMapped);
     let relay_pri = compute_priority(CandidateType::Relay);
 
     assert!(host_pri > prflx_pri);
+    assert!(host_pri > mapped_pri);
+    assert!(mapped_pri > prflx_pri);
     assert!(prflx_pri > srflx_pri);
     assert!(srflx_pri > relay_pri);
 
@@ -19,6 +24,24 @@ fn test_priority_ordering() {
         srflx_pri,
         (1 << 24) * PREF_SERVER_REFLEXIVE + (1 << 8) * LOCAL_PREF + (256 - COMPONENT_ID)
     );
+}
+
+#[test]
+fn global_looking_host_keeps_host_provenance() {
+    let address = "20.0.3.148".parse().unwrap();
+    assert_eq!(classify_address_scope(address), AddressScope::Global);
+    let candidate = IceCandidate::host("20.0.3.148", 58079);
+    assert_eq!(candidate.source, CandidateSource::Host);
+    assert_ne!(candidate.source, CandidateSource::StunObserved);
+}
+
+#[test]
+fn port_mapping_is_distinct_from_host_and_stun_provenance() {
+    let candidate = IceCandidate::port_mapped("203.0.113.10", 58079);
+    assert_eq!(candidate.candidate_type, CandidateType::PortMapped);
+    assert_eq!(candidate.source, CandidateSource::PortMapped);
+    assert_ne!(candidate.source, CandidateSource::Host);
+    assert_ne!(candidate.source, CandidateSource::StunObserved);
 }
 
 #[test]

@@ -34,6 +34,7 @@ use crate::{CandidateType, IceCandidate};
 
 /// Type preference values (RFC 5245 Section 4.1.2.1).
 const PREF_HOST: u32 = 126;
+const PREF_PORT_MAPPED: u32 = 120;
 const PREF_PEER_REFLEXIVE: u32 = 110;
 const PREF_SERVER_REFLEXIVE: u32 = 100;
 const PREF_RELAY: u32 = 0;

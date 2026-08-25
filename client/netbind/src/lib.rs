@@ -16,6 +16,117 @@ use std::sync::{Mutex, OnceLock};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
+/// The kernel route selected for one concrete destination.
+///
+/// This is deliberately a read-only, destination-scoped result. Callers may
+/// use it to rank a candidate or emit diagnostics, but it must not be used to
+/// permanently bind the daemon's single Direct socket to one interface: a
+/// later peer can legitimately use another LAN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteResolution {
+    /// Destination used for the lookup.
+    pub destination: IpAddr,
+    /// Interface index when the platform exposes it through the interface
+    /// enumeration API.
+    pub interface_index: Option<u32>,
+    /// Platform interface alias associated with the preferred source address.
+    pub interface_name: Option<String>,
+    /// Source address the kernel would use for this destination.
+    pub preferred_source: Option<IpAddr>,
+    /// Next hop when the platform/API exposes it. The socket-probe fallback
+    /// intentionally leaves this unknown.
+    pub next_hop: Option<IpAddr>,
+    /// Route metric when the platform/API exposes it.
+    pub metric: Option<u32>,
+}
+
+/// Resolve the route for one destination without sending a packet.
+///
+/// A UDP `connect` only asks the kernel to select a route and source address;
+/// it does not perform a network handshake. This gives Windows the same
+/// destination-aware source selection used by `send_to`, without invoking
+/// PowerShell or parsing mutable command output. Interface metadata is then
+/// matched to the selected source address. Native interface indices are
+/// returned where the platform API permits it.
+pub fn resolve_route(destination: IpAddr) -> Option<RouteResolution> {
+    let bind_addr = if destination.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0u16; 8], 0))
+    };
+    let destination_addr = SocketAddr::new(destination, 9);
+    let socket = std::net::UdpSocket::bind(bind_addr).ok()?;
+    socket.connect(destination_addr).ok()?;
+    let preferred_source = socket.local_addr().ok()?.ip();
+    if preferred_source.is_unspecified() {
+        return None;
+    }
+
+    let (interface_name, interface_index) = interface_metadata_for_address(preferred_source)
+        .map(|(name, index)| (Some(name), index))
+        .unwrap_or((None, None));
+    Some(RouteResolution {
+        destination,
+        interface_index,
+        interface_name,
+        preferred_source: Some(preferred_source),
+        next_hop: None,
+        metric: None,
+    })
+}
+
+fn interface_metadata_for_address(address: IpAddr) -> Option<(String, Option<u32>)> {
+    let interfaces = if_addrs::get_if_addrs().ok()?;
+    interfaces.into_iter().find_map(|interface| {
+        let interface_address = match interface.addr {
+            if_addrs::IfAddr::V4(value) => IpAddr::V4(value.ip),
+            if_addrs::IfAddr::V6(value) => IpAddr::V6(value.ip),
+        };
+        if interface_address != address {
+            return None;
+        }
+        let name = interface.name;
+        let index = interface.index.or_else(|| interface_index_for_name(&name));
+        Some((name, index))
+    })
+}
+
+#[cfg(unix)]
+fn interface_index_for_name(name: &str) -> Option<u32> {
+    use std::ffi::CString;
+
+    let name = CString::new(name).ok()?;
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (index != 0).then_some(index)
+}
+
+#[cfg(windows)]
+fn interface_index_for_name(name: &str) -> Option<u32> {
+    use std::mem::MaybeUninit;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex,
+    };
+
+    let wide = name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut luid = MaybeUninit::zeroed();
+    let result = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), luid.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let luid = unsafe { luid.assume_init() };
+    let mut index = 0u32;
+    let result = unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) };
+    (result == 0).then_some(index)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn interface_index_for_name(_name: &str) -> Option<u32> {
+    None
+}
+
 #[cfg(target_os = "android")]
 pub type AndroidSocketProtector = fn(RawFd) -> io::Result<()>;
 
@@ -241,6 +352,19 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn route_resolution_is_destination_scoped_and_does_not_send() {
+        let route = resolve_route(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .expect("loopback route should be available");
+        assert_eq!(route.destination, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            route.preferred_source,
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert!(route.next_hop.is_none());
+        assert!(route.metric.is_none());
     }
 
     #[cfg(target_os = "macos")]

@@ -309,3 +309,41 @@ async fn host_candidate_is_not_starved_by_predicted_fast_window() {
         "an on-link candidate must lead the latency-sensitive prefix"
     );
 }
+
+#[test]
+fn destination_route_relevance_prefers_on_link_host_over_global_and_overlay_hosts() {
+    let mut conn = PeerConnection::new("peer-route", "10.20.0.2");
+    conn.set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+        "10.23.176.87".parse().unwrap(),
+        24,
+    )]);
+
+    let candidates = [
+        ("20.0.3.148:58079", CandidatePairSource::Host),
+        ("100.127.99.28:58079", CandidatePairSource::Host),
+        ("10.23.176.16:58079", CandidatePairSource::Host),
+    ];
+    conn.candidates = candidates
+        .iter()
+        .map(|(endpoint, _)| (*endpoint).to_string())
+        .collect();
+    conn.candidate_sources = candidates
+        .iter()
+        .map(|(endpoint, source)| ((*endpoint).to_string(), *source))
+        .collect();
+    for (endpoint, source) in candidates {
+        conn.ensure_candidate_pair_with_source(endpoint.parse().unwrap(), 0, source);
+    }
+
+    let (ordered, _) = conn.candidate_probe_endpoints(
+        0,
+        &TraversalHistory::default(),
+        None,
+        ProbeTargetMode::Synchronized,
+        None,
+    );
+
+    assert_eq!(ordered.first().copied(), Some("10.23.176.16:58079".parse().unwrap()));
+    assert!(ordered.contains(&"20.0.3.148:58079".parse().unwrap()));
+    assert!(ordered.contains(&"100.127.99.28:58079".parse().unwrap()));
+}

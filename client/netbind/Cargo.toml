@@ -8,6 +8,7 @@ description = "Cross-platform physical-interface socket binding for P2WLAN"
 [dependencies]
 tokio = { workspace = true }
 socket2 = { workspace = true }
+if-addrs = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

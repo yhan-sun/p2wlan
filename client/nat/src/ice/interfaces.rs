@@ -8,6 +8,7 @@
 pub fn compute_priority(candidate_type: CandidateType) -> u32 {
     let type_pref = match candidate_type {
         CandidateType::Host => PREF_HOST,
+        CandidateType::PortMapped => PREF_PORT_MAPPED,
         CandidateType::PeerReflexive => PREF_PEER_REFLEXIVE,
         CandidateType::ServerReflexive => PREF_SERVER_REFLEXIVE,
         CandidateType::Relay => PREF_RELAY,

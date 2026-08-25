@@ -345,6 +345,7 @@ impl Daemon {
                 local_addr,
                 self.config.network.udp_advertise.as_deref(),
                 &candidates,
+                &candidate_sources,
                 include_host_candidate,
             )
         }) {
