@@ -1,0 +1,228 @@
+name: Package Test Builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/hard-hard-birthday-validation
+    paths:
+      - ".github/workflows/package-test.yml"
+      - "apps/flutter_client/**"
+      - "client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/build_android_native.sh"
+      - "scripts/release/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64:
+    name: macOS arm64 test DMG
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          architecture: arm64
+          cache: true
+
+      - name: Set up Rust arm64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Enable macOS desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-macos-desktop
+
+      - name: Flutter dependencies
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore Flutter-managed source files
+        run: bash scripts/release/hermetic_build.sh restore --macos
+
+      - name: Build Flutter macOS app
+        working-directory: apps/flutter_client
+        run: flutter build macos --release --split-debug-info build/symbols/macos-arm64
+
+      - name: Restore Flutter-managed source files after build
+        run: bash scripts/release/hermetic_build.sh restore --macos
+
+      - name: Build arm64 daemon
+        run: cargo build -p p2wlan-daemon --release --target aarch64-apple-darwin
+
+      - name: Assemble and verify macOS DMG
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          src="apps/flutter_client/build/macos/Build/Products/Release/P2WLAN.app"
+          daemon="target/aarch64-apple-darwin/release/p2wlan-daemon"
+          work="$RUNNER_TEMP/p2wlan-macos-arm64"
+          app="$work/P2WLAN.app"
+          dmg="$RUNNER_TEMP/p2wlan-flutter-macos-arm64.dmg"
+
+          test -d "$src"
+          test -x "$daemon"
+          rm -rf "$work" "$dmg"
+          mkdir -p "$work"
+          ditto "$src" "$app"
+          install -m 0755 "$daemon" "$app/Contents/Resources/p2wlan-daemon"
+
+          echo "Flutter executable architecture:"
+          file "$app/Contents/MacOS/P2WLAN"
+          echo "Daemon architecture:"
+          file "$app/Contents/Resources/p2wlan-daemon"
+          lipo -info "$app/Contents/MacOS/P2WLAN" | grep -Eq 'arm64|Apple silicon'
+          lipo -info "$app/Contents/Resources/p2wlan-daemon" | grep -Eq 'arm64|Apple silicon'
+
+          python3 scripts/release/verify_release_identity.py \
+            --release \
+            --daemon "$app/Contents/Resources/p2wlan-daemon" \
+            --app-info "$app/Contents/Info.plist" \
+            --expected-commit "$EXPECTED_COMMIT"
+
+          # Ad-hoc signing is sufficient for a local test DMG. It is not a
+          # notarized distribution build and may require Finder/Open Anyway.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          ln -s /Applications "$work/Applications"
+          hdiutil create \
+            -volname "P2WLAN Test" \
+            -srcfolder "$work" \
+            -ov \
+            -format UDZO \
+            "$dmg" >/dev/null
+
+          mkdir -p dist-test
+          cp "$dmg" dist-test/p2wlan-macos-arm64-test.dmg
+          shasum -a 256 dist-test/p2wlan-macos-arm64-test.dmg \
+            > dist-test/p2wlan-macos-arm64-test.dmg.sha256
+
+      - name: Upload macOS test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-macos-arm64-test
+          path: dist-test/
+          if-no-files-found: error
+          retention-days: 14
+
+  android-arm64:
+    name: Android arm64 test APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Set up Rust Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Configure Android NDK for Rust bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -n "$ndk_root"
+          test -d "$ndk_root"
+          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+
+      - name: Flutter dependencies
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore Flutter-managed source files
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Configure Android release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_BASE64:?Missing repository secret ANDROID_KEYSTORE_BASE64}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Missing repository secret ANDROID_KEYSTORE_PASSWORD}"
+          : "${ANDROID_KEY_ALIAS:?Missing repository secret ANDROID_KEY_ALIAS}"
+          : "${ANDROID_KEY_PASSWORD:?Missing repository secret ANDROID_KEY_PASSWORD}"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode \
+            > apps/flutter_client/android/app/release-keystore.jks
+          chmod 600 apps/flutter_client/android/app/release-keystore.jks
+          cat > apps/flutter_client/android/key.properties <<EOF
+          storeFile=app/release-keystore.jks
+          storePassword=${ANDROID_KEYSTORE_PASSWORD}
+          keyAlias=${ANDROID_KEY_ALIAS}
+          keyPassword=${ANDROID_KEY_PASSWORD}
+          EOF
+          chmod 600 apps/flutter_client/android/key.properties
+
+      - name: Build arm64 signed APK
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_ANDROID_ABIS: arm64-v8a
+        run: |
+          flutter build apk \
+            --release \
+            --target-platform android-arm64 \
+            --split-per-abi \
+            --split-debug-info build/symbols/android-arm64
+
+      - name: Restore Flutter-managed source files after build
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Verify and stage arm64 signed APK
+        working-directory: apps/flutter_client
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          test -f "$apk"
+          actual_abis="$(unzip -Z1 "$apk" \
+            | sed -n 's#^lib/\([^/]*\)/.*#\1#p' \
+            | sort -u \
+            | paste -sd, -)"
+          if [[ "$actual_abis" != "arm64-v8a" ]]; then
+            echo "Expected only arm64-v8a in $apk, found: ${actual_abis:-none}" >&2
+            exit 1
+          fi
+          mkdir -p ../../dist-test
+          cp "$apk" ../../dist-test/p2wlan-android-arm64-release.apk
+          sha256sum ../../dist-test/p2wlan-android-arm64-release.apk \
+            > ../../dist-test/p2wlan-android-arm64-release.apk.sha256
+
+      - name: Upload Android signed test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-android-arm64-signed-test
+          path: dist-test/
+          if-no-files-found: error
+          retention-days: 14
