@@ -821,6 +821,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: Some(old_generation),
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes,
             })
             .await
@@ -1765,6 +1768,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes,
             })
             .await
@@ -1893,6 +1899,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes,
             })
             .await
@@ -1990,6 +1999,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: Some(0),
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes,
             })
             .await
@@ -2118,6 +2130,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: Some(1),
                 network_generation: Some(0),
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: remote_session.encrypt_to_bytes(&direct_packet).unwrap(),
             })
             .await
@@ -2151,6 +2166,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: Some(0),
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: remote_session.encrypt_to_bytes(&relay_packet).unwrap(),
             })
             .await
@@ -2232,6 +2250,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes,
             })
             .await
@@ -2303,6 +2324,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes,
             })
             .await
@@ -2397,6 +2421,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: vec![0xAB; 64],
             })
             .await
@@ -2432,6 +2459,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes,
             })
             .await
@@ -2532,6 +2562,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: Some(1),
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: remote_session.encrypt_to_bytes(&packet).unwrap(),
             })
             .await
@@ -2627,6 +2660,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: Some(2),
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: remote_session.encrypt_to_bytes(&packet).unwrap(),
             })
             .await
@@ -2749,6 +2785,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: Some(1),
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: remote_session.encrypt_to_bytes(&ack_packet).unwrap(),
             })
             .await
@@ -3302,6 +3341,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: remote_session.encrypt_to_bytes(&ack_packet).unwrap(),
             })
             .await
@@ -3443,6 +3485,9 @@ mod tests {
                 direct_socket: None,
                 udp_transport_owner: None,
                 network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
                 wire_bytes: remote_session.encrypt_to_bytes(&old_ack_packet).unwrap(),
             })
             .await

@@ -142,6 +142,26 @@ where
                             warn!("Inbound data plane channel closed; continuing outbound-only");
                             break;
                         };
+                        let profiler = global_dataplane_profiler();
+                        let mut packet = packet;
+                        if let Some(trace) = packet.trace.as_mut() {
+                            trace.inbound_queue_dequeued = Some(std::time::Instant::now());
+                            profiler.record_value(
+                                trace.sampled,
+                                "rx_dataplane_inbound_queue_depth",
+                                inbound_rx.len() as u64,
+                            );
+                            if let Some(enqueued) = trace.inbound_queue_send_started {
+                                profiler.record(
+                                    trace.sampled,
+                                    "rx_dataplane_inbound_queue_wait_us",
+                                    trace
+                                        .inbound_queue_dequeued
+                                        .expect("inbound dequeue timestamp was just set")
+                                        .duration_since(enqueued),
+                                );
+                            }
+                        }
                         self.write_inbound(packet).await?;
                     }
                 }
@@ -190,9 +210,11 @@ where
     ) -> Result<()> {
         let profiler = global_dataplane_profiler();
         let sampled = profiler.sample_next_packet();
+        // The read future can legitimately wait for the next packet. Keep that
+        // idle wait diagnostic-only; TX latency starts at the completed packet.
         profiler.record(
             sampled,
-            "tun_read_us",
+            "tun_read_idle_wait_us",
             tun_read_completed.duration_since(tun_read_started),
         );
         let parsed = match IpPacket::new(packet) {
@@ -242,7 +264,13 @@ where
             return Ok(());
         }
 
-        let routed = OutboundPacket {
+        let route_ready = std::time::Instant::now();
+        profiler.record(
+            sampled,
+            "tx_tun_to_route_ready_us",
+            route_ready.duration_since(tun_read_completed),
+        );
+        let mut routed = OutboundPacket {
             peer_id: peer_id.clone(),
             dst_ip: dst_ip.clone(),
             packet: routed_packet,
@@ -250,17 +278,39 @@ where
                 sampled,
                 tun_read_started,
                 tun_read_completed,
-                route_ready: Some(std::time::Instant::now()),
+                route_ready: Some(route_ready),
+                dataplane_queue_send_started: None,
+                transport_queue_dequeued: None,
+                transport_queue_send_started: None,
+                network_queue_dequeued: None,
             }),
         };
 
         let queue_started = std::time::Instant::now();
+        if let Some(trace) = routed.trace.as_mut() {
+            trace.dataplane_queue_send_started = Some(queue_started);
+        }
+        profiler.record_value(
+            sampled,
+            "tx_outbound_queue_depth",
+            self.outbound_tx
+                .max_capacity()
+                .saturating_sub(self.outbound_tx.capacity()) as u64,
+        );
         self.outbound_tx
             .send(routed)
             .await
             .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()))?;
         let queue_wait = queue_started.elapsed();
+        profiler.record(sampled, "tx_outbound_queue_wait_us", queue_wait);
+        // Preserve the Phase 4 name for existing log consumers while the new
+        // name makes the measured boundary explicit.
         profiler.record(sampled, "udp_send_queue_us", queue_wait);
+        profiler.record(
+            sampled,
+            "tx_route_to_queue_send_us",
+            queue_started.duration_since(tun_read_completed),
+        );
         profiler.record(
             sampled,
             "tun_read_to_route_us",
@@ -289,6 +339,7 @@ where
 
     async fn write_inbound(&mut self, packet: InboundPacket) -> Result<()> {
         let trace = packet.trace.clone();
+        let validation_started = std::time::Instant::now();
         let parsed = match IpPacket::new(&packet.packet) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -363,11 +414,20 @@ where
             return Ok(());
         }
 
+        let tun_write_started = std::time::Instant::now();
+        if let Some(trace) = trace.as_ref() {
+            global_dataplane_profiler().record(
+                trace.sampled,
+                "rx_dataplane_validation_us",
+                tun_write_started.duration_since(validation_started),
+            );
+        }
         let written = self
             .tun
             .write(&inbound_packet)
             .await
             .map_err(|e| DaemonError::Network(format!("TUN write failed: {e}")))?;
+        let tun_write_completed = std::time::Instant::now();
 
         if written != inbound_packet.len() {
             return Err(DaemonError::Network(format!(
@@ -380,13 +440,56 @@ where
 
         if let Some(trace) = trace {
             let profiler = global_dataplane_profiler();
-            let receive_to_tun = trace.transport_dequeued.elapsed();
+            let rx_start = trace.udp_received.unwrap_or(trace.transport_dequeued);
+            let receive_to_tun = tun_write_completed.duration_since(rx_start);
+            let tun_write = tun_write_completed.duration_since(tun_write_started);
+            profiler.record(trace.sampled, "rx_tun_write_us", tun_write);
+            profiler.record(
+                trace.sampled,
+                "rx_decrypt_queue_to_tun_us",
+                tun_write_completed.duration_since(trace.transport_dequeued),
+            );
+            profiler.record(
+                trace.sampled,
+                "rx_decrypt_to_tun_write_us",
+                tun_write_started.duration_since(trace.decrypt_completed),
+            );
             profiler.record(
                 trace.sampled,
                 "decrypt_to_tun_write_us",
-                trace.decrypt_completed.elapsed(),
+                tun_write_started.duration_since(trace.decrypt_completed),
             );
             profiler.record(trace.sampled, "total_userspace_rx_us", receive_to_tun);
+            profiler.record(
+                trace.sampled,
+                if trace.udp_received.is_some() {
+                    "rx_udp_total_userspace_us"
+                } else {
+                    "rx_relay_total_userspace_us"
+                },
+                receive_to_tun,
+            );
+            profiler.record_tail_event(
+                "rx",
+                &packet.peer_id,
+                "inbound",
+                receive_to_tun,
+                DataplaneTailMetrics {
+                    queue_wait_us: trace
+                        .inbound_queue_send_started
+                        .zip(trace.inbound_queue_dequeued)
+                        .map(|(start, end)| end.duration_since(start).as_micros() as u64)
+                        .unwrap_or_default(),
+                    crypto_us: trace
+                        .decrypt_completed
+                        .duration_since(trace.decrypt_started)
+                        .as_micros() as u64,
+                    tun_write_us: tun_write.as_micros() as u64,
+                    ..DataplaneTailMetrics::default()
+                },
+                profiler.candidate_gather_active(),
+                self.peers.current_network_generation_sync(),
+            );
             if receive_to_tun >= DATAPLANE_STALL_THRESHOLD {
                 tracing::debug!(
                     event = "dataplane_stall",

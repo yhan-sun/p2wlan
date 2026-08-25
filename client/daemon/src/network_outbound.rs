@@ -44,7 +44,7 @@ use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, warn};
 
 use crate::connection_timeline::ConnectionTimeline;
-use crate::dataplane::{global_dataplane_profiler, OutboundPacket};
+use crate::dataplane::{global_dataplane_profiler, DataplaneTailMetrics, OutboundPacket};
 use crate::peer::{
     ActivePathSnapshot, NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED,
     REASON_PATH_UNAVAILABLE,
@@ -400,6 +400,8 @@ async fn try_lan_direct_fast_path(
 ) -> FastPathAttempt {
     let peer_id = packet.peer_id.as_str();
     let profiler = global_dataplane_profiler();
+    let fast_path_lookup_started = Instant::now();
+    let mut udp_socket_lookup_us = 0u64;
     let mut entry = fast_paths.get(peer_id).cloned();
 
     if let Some(cached) = entry.as_ref() {
@@ -440,17 +442,57 @@ async fn try_lan_direct_fast_path(
             }
             return FastPathAttempt::Fallback(packet);
         };
-        let Some(session_instance) = transport
+        let session_status_started = Instant::now();
+        let session_instance = transport
             .session_status(peer_id)
             .await
-            .active_session_instance
-        else {
+            .active_session_instance;
+        if let Some(trace) = packet.trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "tx_fast_path_session_status_us",
+                session_status_started.elapsed(),
+            );
+        }
+        let Some(session_instance) = session_instance else {
             return FastPathAttempt::Fallback(packet);
         };
-        let Some(udp) = udp_transport.read().await.clone() else {
+        let udp_read_started = Instant::now();
+        let udp_guard = udp_transport.read().await;
+        let udp_read_acquired = Instant::now();
+        let udp = udp_guard.clone();
+        let udp_read_hold = udp_read_acquired.elapsed();
+        drop(udp_guard);
+        if let Some(trace) = packet.trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "tx_udp_transport_rwlock_wait_us",
+                udp_read_acquired.duration_since(udp_read_started),
+            );
+            profiler.record(
+                trace.sampled,
+                "tx_udp_transport_rwlock_hold_us",
+                udp_read_hold,
+            );
+        }
+        let Some(udp) = udp else {
             return FastPathAttempt::Fallback(packet);
         };
-        let Some((socket_index, _)) = udp.socket_for_peer(Some(peer_id)).await else {
+        let socket_lookup_started = Instant::now();
+        let socket = udp.socket_for_peer(Some(peer_id)).await;
+        let socket_lookup_completed = Instant::now();
+        let cache_socket_lookup_us = socket_lookup_completed
+            .duration_since(socket_lookup_started)
+            .as_micros() as u64;
+        udp_socket_lookup_us = udp_socket_lookup_us.saturating_add(cache_socket_lookup_us);
+        if let Some(trace) = packet.trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "udp_socket_lookup_us",
+                Duration::from_micros(cache_socket_lookup_us),
+            );
+        }
+        let Some((socket_index, _)) = socket else {
             return FastPathAttempt::Fallback(packet);
         };
         entry = Some(DirectFastPathEntry {
@@ -473,18 +515,48 @@ async fn try_lan_direct_fast_path(
     let Some(entry) = entry else {
         return FastPathAttempt::Fallback(packet);
     };
+    if let Some(trace) = packet.trace.as_ref() {
+        profiler.record(
+            trace.sampled,
+            "tx_fast_path_lookup_us",
+            fast_path_lookup_started.elapsed(),
+        );
+    }
     let packet_bytes = packet.packet.len();
     let sampled_trace = packet.trace.clone();
     let overlay_identity = overlay_packet_identity(&packet.packet);
     let encrypt_started = Instant::now();
+    let mut epoch_gate_wait_us = 0u64;
+    let mut epoch_gate_hold_us = 0u64;
+    let emit_guard_wait_started = Instant::now();
     let emit_guard = transport.acquire_outbound_emit_guard(peer_id).await;
+    let emit_guard_acquired = Instant::now();
+    if let Some(trace) = sampled_trace.as_ref() {
+        profiler.record(
+            trace.sampled,
+            "tx_emit_guard_wait_us",
+            emit_guard_acquired.duration_since(emit_guard_wait_started),
+        );
+    }
 
     // Keep the lock order identical to the existing business path:
     // per-peer emit -> network epoch -> socket state/session. The UDP write is
     // intentionally outside the epoch gate.
-    let (udp, socket, encrypted) = {
+    let (udp, socket, encrypted, session_lock_wait_us, crypto_us) = {
         let epoch_gate = peers.network_epoch_gate();
+        let epoch_gate_wait_started = Instant::now();
         let _epoch_guard = epoch_gate.lock().await;
+        let epoch_gate_acquired = Instant::now();
+        if let Some(trace) = sampled_trace.as_ref() {
+            epoch_gate_wait_us = epoch_gate_acquired
+                .duration_since(epoch_gate_wait_started)
+                .as_micros() as u64;
+            profiler.record(
+                trace.sampled,
+                "tx_epoch_gate_wait_us",
+                Duration::from_micros(epoch_gate_wait_us),
+            );
+        }
         if !peers.active_direct_path_snapshot_is_current_sync(peer_id, entry.path) {
             drop(emit_guard);
             profiler.record_fast_path_invalidation();
@@ -492,7 +564,25 @@ async fn try_lan_direct_fast_path(
             return FastPathAttempt::Fallback(packet);
         }
 
-        let Some(udp) = udp_transport.read().await.clone() else {
+        let udp_read_started = Instant::now();
+        let udp_guard = udp_transport.read().await;
+        let udp_read_acquired = Instant::now();
+        let udp = udp_guard.clone();
+        let udp_read_hold = udp_read_acquired.elapsed();
+        drop(udp_guard);
+        if let Some(trace) = sampled_trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "tx_udp_transport_rwlock_wait_us",
+                udp_read_acquired.duration_since(udp_read_started),
+            );
+            profiler.record(
+                trace.sampled,
+                "tx_udp_transport_rwlock_hold_us",
+                udp_read_hold,
+            );
+        }
+        let Some(udp) = udp else {
             drop(emit_guard);
             profiler.record_fast_path_invalidation();
             fast_paths.remove(peer_id);
@@ -506,21 +596,38 @@ async fn try_lan_direct_fast_path(
             fast_paths.remove(peer_id);
             return FastPathAttempt::Fallback(packet);
         }
-        let Some(socket) = udp
+        let socket_lookup_started = Instant::now();
+        let socket = udp
             .socket_for_inbound_peer_index(peer_id, entry.socket_index)
-            .await
-        else {
+            .await;
+        let socket_lookup_completed = Instant::now();
+        let socket_lookup_us = socket_lookup_completed
+            .duration_since(socket_lookup_started)
+            .as_micros() as u64;
+        udp_socket_lookup_us = udp_socket_lookup_us.saturating_add(socket_lookup_us);
+        if let Some(trace) = sampled_trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "udp_socket_lookup_us",
+                Duration::from_micros(socket_lookup_us),
+            );
+        }
+        let Some(socket) = socket else {
             drop(emit_guard);
             profiler.record_fast_path_invalidation();
             fast_paths.remove(peer_id);
             return FastPathAttempt::Fallback(packet);
         };
 
-        let encrypted = match transport
+        let (encrypted, session_lock_wait_us, crypto_us) = match transport
             .encrypt_outbound_with_emit_guard_for_session(packet, entry.session_instance)
             .await
         {
-            SessionBoundEncryption::Encrypted(encrypted) => encrypted,
+            SessionBoundEncryption::Encrypted {
+                packet: encrypted,
+                session_lock_wait_us,
+                crypto_us,
+            } => (encrypted, session_lock_wait_us, crypto_us),
             SessionBoundEncryption::Unavailable(packet) => {
                 drop(emit_guard);
                 profiler.record_fast_path_invalidation();
@@ -538,7 +645,15 @@ async fn try_lan_direct_fast_path(
                 };
             }
         };
-        (udp, socket, encrypted)
+        if let Some(trace) = sampled_trace.as_ref() {
+            epoch_gate_hold_us = epoch_gate_acquired.elapsed().as_micros() as u64;
+            profiler.record(
+                trace.sampled,
+                "tx_epoch_gate_hold_us",
+                Duration::from_micros(epoch_gate_hold_us),
+            );
+        }
+        (udp, socket, encrypted, session_lock_wait_us, crypto_us)
     };
 
     let peer_id = encrypted.peer_id.as_str();
@@ -559,6 +674,11 @@ async fn try_lan_direct_fast_path(
         profiler.record(
             trace.sampled,
             "encrypt_us",
+            encrypt_completed.duration_since(encrypt_started),
+        );
+        profiler.record(
+            trace.sampled,
+            "tx_fast_path_encrypt_us",
             encrypt_completed.duration_since(encrypt_started),
         );
     }
@@ -588,6 +708,24 @@ async fn try_lan_direct_fast_path(
     )
     .await;
     let transport_handoff_completed = Instant::now();
+    let udp_send_call_us = transport_handoff_completed
+        .duration_since(transport_handoff_started)
+        .as_micros() as u64;
+    let emit_guard_hold_us = transport_handoff_completed
+        .duration_since(emit_guard_acquired)
+        .as_micros() as u64;
+    if let Some(trace) = sampled_trace.as_ref() {
+        profiler.record(
+            trace.sampled,
+            "udp_send_call_us",
+            Duration::from_micros(udp_send_call_us),
+        );
+        profiler.record(
+            trace.sampled,
+            "tx_emit_guard_hold_us",
+            Duration::from_micros(emit_guard_hold_us),
+        );
+    }
     if let Some(trace) = sampled_trace.as_ref() {
         let total_userspace_tx =
             transport_handoff_completed.duration_since(trace.tun_read_completed);
@@ -597,6 +735,45 @@ async fn try_lan_direct_fast_path(
             transport_handoff_started.duration_since(encrypt_completed),
         );
         profiler.record(trace.sampled, "total_userspace_tx_us", total_userspace_tx);
+        profiler.record(
+            trace.sampled,
+            "tx_fast_path_total_userspace_us",
+            total_userspace_tx,
+        );
+        let queue_wait_us = trace
+            .dataplane_queue_send_started
+            .zip(trace.transport_queue_dequeued)
+            .map(|(start, end)| end.duration_since(start).as_micros() as u64)
+            .unwrap_or_default()
+            .saturating_add(
+                trace
+                    .transport_queue_send_started
+                    .zip(trace.network_queue_dequeued)
+                    .map(|(start, end)| end.duration_since(start).as_micros() as u64)
+                    .unwrap_or_default(),
+            );
+        profiler.record_tail_event(
+            "tx",
+            peer_id,
+            "lan_direct",
+            total_userspace_tx,
+            DataplaneTailMetrics {
+                queue_wait_us,
+                emit_guard_wait_us: emit_guard_acquired
+                    .duration_since(emit_guard_wait_started)
+                    .as_micros() as u64,
+                emit_guard_hold_us,
+                epoch_gate_wait_us,
+                epoch_gate_hold_us,
+                session_lock_wait_us,
+                crypto_us,
+                udp_socket_lookup_us,
+                udp_send_call_us,
+                ..DataplaneTailMetrics::default()
+            },
+            profiler.candidate_gather_active(),
+            entry.path.generation,
+        );
         if total_userspace_tx >= crate::dataplane::DATAPLANE_STALL_THRESHOLD {
             debug!(
                 event = "dataplane_stall",
@@ -710,7 +887,24 @@ pub(super) async fn run_network_outbound(
     loop {
         tokio::select! {
             packet = outbound_rx.recv() => {
-                let Some(packet) = packet else { break; };
+                let Some(mut packet) = packet else { break; };
+                let profiler = global_dataplane_profiler();
+                let network_dequeued = Instant::now();
+                if let Some(trace) = packet.trace.as_mut() {
+                    trace.network_queue_dequeued = Some(network_dequeued);
+                    profiler.record_value(
+                        trace.sampled,
+                        "tx_network_outbound_queue_depth",
+                        outbound_rx.len() as u64,
+                    );
+                    if let Some(enqueued) = trace.transport_queue_send_started {
+                        profiler.record(
+                            trace.sampled,
+                            "tx_network_outbound_queue_wait_us",
+                            network_dequeued.duration_since(enqueued),
+                        );
+                    }
+                }
                 let peer_id = packet.peer_id.clone();
                 let can_try_fast_path = prefer_direct
                     && peers.is_direct_sync(&peer_id)
@@ -1143,6 +1337,7 @@ async fn encrypt_then_send(
 ) -> EncryptSendOutcome {
     let retry_packet = packet.clone();
     let profiler = global_dataplane_profiler();
+    let sampled_trace = retry_packet.trace.clone();
     let encrypt_started = Instant::now();
     // Acquire the per-peer counter-ordering guard BEFORE the global epoch
     // gate.  Inbound relay ACK/business evidence uses the same order
@@ -1155,7 +1350,15 @@ async fn encrypt_then_send(
     // validation.
     let emit_lock_started = Instant::now();
     let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
+    let emit_guard_acquired = Instant::now();
     let emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64;
+    if let Some(trace) = sampled_trace.as_ref() {
+        profiler.record(
+            trace.sampled,
+            "tx_emit_guard_wait_us",
+            emit_guard_acquired.duration_since(emit_lock_started),
+        );
+    }
     debug!(
         event = "outbound_business_emit_lock_acquired",
         peer_id = %packet.peer_id,
@@ -1165,7 +1368,16 @@ async fn encrypt_then_send(
     );
     let encrypted_and_guard = {
         let epoch_gate = peers.network_epoch_gate();
+        let epoch_gate_wait_started = Instant::now();
         let _epoch_guard = epoch_gate.lock().await;
+        let epoch_gate_acquired = Instant::now();
+        if let Some(trace) = sampled_trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "tx_epoch_gate_wait_us",
+                epoch_gate_acquired.duration_since(epoch_gate_wait_started),
+            );
+        }
         let current_generation = peers.current_network_generation_sync();
         if current_generation != expected_generation {
             debug!(
@@ -1184,7 +1396,7 @@ async fn encrypt_then_send(
                 ),
             };
         }
-        match transport.encrypt_outbound_with_emit_guard(packet).await {
+        let result = match transport.encrypt_outbound_with_emit_guard(packet).await {
             Ok(Some(value)) => value,
             Ok(None) => {
                 debug!(
@@ -1217,7 +1429,15 @@ async fn encrypt_then_send(
                     reason: err.to_string(),
                 };
             }
+        };
+        if let Some(trace) = sampled_trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "tx_epoch_gate_hold_us",
+                epoch_gate_acquired.elapsed(),
+            );
         }
+        result
     };
     let encrypted = encrypted_and_guard;
     let encrypt_completed = Instant::now();
@@ -1239,6 +1459,11 @@ async fn encrypt_then_send(
             "encrypt_us",
             encrypt_completed.duration_since(encrypt_started),
         );
+        profiler.record(
+            trace.sampled,
+            "tx_slow_path_encrypt_us",
+            encrypt_completed.duration_since(encrypt_started),
+        );
     }
     let transport_handoff_started = Instant::now();
     let outcome = send_encrypted_packet_bounded(
@@ -1248,6 +1473,7 @@ async fn encrypt_then_send(
         udp_transport,
         relay_transport,
         relay_expected,
+        sampled_trace.as_ref().map(|trace| trace.sampled),
     )
     .await;
     let transport_handoff_completed = Instant::now();
@@ -1260,6 +1486,41 @@ async fn encrypt_then_send(
             transport_handoff_started.duration_since(encrypt_completed),
         );
         profiler.record(trace.sampled, "total_userspace_tx_us", total_userspace_tx);
+        profiler.record(
+            trace.sampled,
+            "tx_slow_path_total_userspace_us",
+            total_userspace_tx,
+        );
+        let queue_wait_us = trace
+            .dataplane_queue_send_started
+            .zip(trace.transport_queue_dequeued)
+            .map(|(start, end)| end.duration_since(start).as_micros() as u64)
+            .unwrap_or_default()
+            .saturating_add(
+                trace
+                    .transport_queue_send_started
+                    .zip(trace.network_queue_dequeued)
+                    .map(|(start, end)| end.duration_since(start).as_micros() as u64)
+                    .unwrap_or_default(),
+            );
+        profiler.record_tail_event(
+            "tx",
+            &retry_packet.peer_id,
+            "slow_path",
+            total_userspace_tx,
+            DataplaneTailMetrics {
+                queue_wait_us,
+                emit_guard_wait_us: emit_guard_acquired
+                    .duration_since(emit_lock_started)
+                    .as_micros() as u64,
+                emit_guard_hold_us: transport_handoff_completed
+                    .duration_since(emit_guard_acquired)
+                    .as_micros() as u64,
+                ..DataplaneTailMetrics::default()
+            },
+            profiler.candidate_gather_active(),
+            expected_generation,
+        );
         if total_userspace_tx >= crate::dataplane::DATAPLANE_STALL_THRESHOLD {
             debug!(
                 event = "dataplane_stall",
@@ -1985,13 +2246,32 @@ async fn send_encrypted_packet_bounded(
     udp_transport: &RwLock<Option<UdpTransport>>,
     relay_transport: &RwLock<Option<RelayTransport>>,
     relay_expected: bool,
+    sampled: Option<bool>,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
     // The same snapshot is passed into the send operation, so a supervisor
     // replacement cannot make the timeout abort one relay while the packet is
     // actually blocked on another. The replacement remains available for the
     // next plaintext retry.
-    let relay_for_send = relay_transport.read().await.clone();
+    let profiler = global_dataplane_profiler();
+    let relay_read_started = Instant::now();
+    let relay_guard = relay_transport.read().await;
+    let relay_read_acquired = Instant::now();
+    let relay_for_send = relay_guard.clone();
+    let relay_read_hold = relay_read_acquired.elapsed();
+    drop(relay_guard);
+    if let Some(sampled) = sampled {
+        profiler.record(
+            sampled,
+            "tx_relay_transport_rwlock_wait_us",
+            relay_read_acquired.duration_since(relay_read_started),
+        );
+        profiler.record(
+            sampled,
+            "tx_relay_transport_rwlock_hold_us",
+            relay_read_hold,
+        );
+    }
     let relay_at_start = relay_for_send.clone();
     let relay_send_started = AtomicBool::new(false);
     match timeout(
@@ -2004,6 +2284,7 @@ async fn send_encrypted_packet_bounded(
             relay_for_send,
             &relay_send_started,
             relay_expected,
+            sampled,
         ),
     )
     .await
@@ -2051,6 +2332,7 @@ fn outbound_send_timeout_failure_for_path(reason: &'static str) -> SendOutcome {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_encrypted_packet_once(
     packet: &EncryptedPeerPacket,
     peers: &PeerManager,
@@ -2059,20 +2341,44 @@ async fn send_encrypted_packet_once(
     relay: Option<RelayTransport>,
     relay_send_started: &AtomicBool,
     relay_expected: bool,
+    sampled: Option<bool>,
 ) -> SendOutcome {
+    let profiler = global_dataplane_profiler();
     // Take one path/generation snapshot atomically, then release the global
     // epoch gate before any transport write.  A later revoke/advance may make
     // this particular handoff uncertain, but the packet is never retried as
     // ciphertext; the per-peer emit guard still preserves counter order.
     let (generation, relay_peer_confirmed, udp, udp_local_endpoint, selection) = {
         let epoch_gate = peers.network_epoch_gate();
+        let epoch_gate_wait_started = Instant::now();
         let _epoch_guard = epoch_gate.lock().await;
+        let epoch_gate_acquired = Instant::now();
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_epoch_gate_wait_us",
+                epoch_gate_acquired.duration_since(epoch_gate_wait_started),
+            );
+        }
         let generation = peers.current_network_generation_sync();
         let relay_peer_confirmed = peers
             .is_relay_peer_confirmed_for_generation(&packet.peer_id, generation)
             .await;
         let relay_available = relay.is_some();
-        let udp = udp_transport.read().await.clone();
+        let udp_read_started = Instant::now();
+        let udp_guard = udp_transport.read().await;
+        let udp_read_acquired = Instant::now();
+        let udp = udp_guard.clone();
+        let udp_read_hold = udp_read_acquired.elapsed();
+        drop(udp_guard);
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_udp_transport_rwlock_wait_us",
+                udp_read_acquired.duration_since(udp_read_started),
+            );
+            profiler.record(sampled, "tx_udp_transport_rwlock_hold_us", udp_read_hold);
+        }
         let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
         let selection = select_outbound_path(
             packet,
@@ -2083,6 +2389,13 @@ async fn send_encrypted_packet_once(
             udp_local_endpoint,
         )
         .await;
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_epoch_gate_hold_us",
+                epoch_gate_acquired.elapsed(),
+            );
+        }
         debug!(
             event = "outbound_transport_handoff_started",
             peer_id = %packet.peer_id,
@@ -2106,7 +2419,9 @@ async fn send_encrypted_packet_once(
     };
 
     if selection.direct_confirmed {
-        match send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint).await {
+        match send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint, sampled)
+            .await
+        {
             DirectSendOutcome::HandoffAccepted => return SendOutcome::Sent,
             DirectSendOutcome::DeliveryUncertain { err } => {
                 // The Direct counter may have reached the kernel. Never send
@@ -2128,6 +2443,7 @@ async fn send_encrypted_packet_once(
                             peers,
                             generation,
                             relay_send_started,
+                            sampled,
                         )
                         .await;
                     }
@@ -2145,7 +2461,15 @@ async fn send_encrypted_packet_once(
     // connection or writer completion is not enough to admit a counter.
     if relay_peer_confirmed {
         if let Some(relay) = relay {
-            return send_via_relay(&relay, packet, peers, generation, relay_send_started).await;
+            return send_via_relay(
+                &relay,
+                packet,
+                peers,
+                generation,
+                relay_send_started,
+                sampled,
+            )
+            .await;
         }
         return SendOutcome::Retryable(RetryableSendFailure::NoSelectedPath {
             reason: "relay peer was confirmed but relay transport is unavailable".to_string(),
@@ -2170,6 +2494,7 @@ async fn send_via_relay(
     peers: &PeerManager,
     generation: u64,
     relay_send_started: &AtomicBool,
+    sampled: Option<bool>,
 ) -> SendOutcome {
     relay_send_started.store(true, Ordering::Release);
     debug!(
@@ -2185,7 +2510,13 @@ async fn send_via_relay(
         wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
         "encrypted packet handed to the relay client command boundary"
     );
-    match relay.send_packet(packet).await {
+    let relay_send_call_started = Instant::now();
+    let send_result = relay.send_packet(packet).await;
+    let relay_send_call_us = relay_send_call_started.elapsed();
+    if let Some(sampled) = sampled {
+        global_dataplane_profiler().record(sampled, "relay_send_call_us", relay_send_call_us);
+    }
+    match send_result {
         Ok(()) => {
             let first_business = packet.is_business
                 && peers
@@ -2302,6 +2633,7 @@ async fn send_direct_if_selected(
     udp: Option<UdpTransport>,
     selection: &PathSelection,
     udp_local_endpoint: Option<SocketAddr>,
+    sampled: Option<bool>,
 ) -> DirectSendOutcome {
     // A candidate probe or nomination is not an encrypted data-plane proof.
     // Business packets must never use a Direct trial: sending the same
@@ -2328,7 +2660,16 @@ async fn send_direct_if_selected(
                 wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
                 "encrypted packet handed to the Direct UDP socket"
             );
-            match udp.send_packet_to(packet, endpoint).await {
+            let udp_send_started = Instant::now();
+            let send_result = udp.send_packet_to(packet, endpoint).await;
+            if let Some(sampled) = sampled {
+                global_dataplane_profiler().record(
+                    sampled,
+                    "udp_send_path_lookup_and_call_us",
+                    udp_send_started.elapsed(),
+                );
+            }
+            match send_result {
                 Ok(_) => {
                     debug!(
                         event = "direct_data_handoff_accepted",

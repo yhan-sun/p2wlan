@@ -293,6 +293,7 @@ impl UdpTransport {
                     )));
                 }
             };
+            let udp_received = Instant::now();
 
             if n == 0 {
                 continue;
@@ -1438,6 +1439,16 @@ impl UdpTransport {
             })
             .await;
 
+            let profiler = global_dataplane_profiler();
+            let profile_sampled = profiler.sample_next_packet();
+            let transport_queue_send_started = Instant::now();
+            profiler.record_value(
+                profile_sampled,
+                "rx_transport_inbound_queue_depth_before_send",
+                inbound_tx
+                    .max_capacity()
+                    .saturating_sub(inbound_tx.capacity()) as u64,
+            );
             inbound_tx
                 .send(ReceivedEncryptedPacket {
                     source: Some(source),
@@ -1455,6 +1466,9 @@ impl UdpTransport {
                     // as evidence for the replacement socket.
                     udp_transport_owner: Some(self.inbound_publication_owner()),
                     network_generation: Some(self.peers.current_network_generation_sync()),
+                    profile_sampled,
+                    udp_received: Some(udp_received),
+                    transport_queue_send_started: Some(transport_queue_send_started),
                     wire_bytes: data.to_vec(),
                 })
                 .await

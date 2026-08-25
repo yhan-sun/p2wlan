@@ -472,6 +472,16 @@ impl RelayTransport {
                     }
                 }
                 RelayMessage::Data { from_node, data } => {
+                    let profiler = global_dataplane_profiler();
+                    let profile_sampled = profiler.sample_next_packet();
+                    let transport_queue_send_started = Instant::now();
+                    profiler.record_value(
+                        profile_sampled,
+                        "rx_transport_inbound_queue_depth_before_send",
+                        inbound_tx
+                            .max_capacity()
+                            .saturating_sub(inbound_tx.capacity()) as u64,
+                    );
                     debug!(
                         event = "relay_inbound_frame_accepted",
                         peer_id = %from_node,
@@ -492,6 +502,9 @@ impl RelayTransport {
                             direct_socket: None,
                             udp_transport_owner: None,
                             network_generation: Some(self.peers.current_network_generation_sync()),
+                            profile_sampled,
+                            udp_received: None,
+                            transport_queue_send_started: Some(transport_queue_send_started),
                             wire_bytes: data,
                         })
                         .await
