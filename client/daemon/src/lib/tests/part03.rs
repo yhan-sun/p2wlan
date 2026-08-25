@@ -926,6 +926,7 @@ async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() 
     let encrypted = daemon
         .transport
         .encrypt_outbound(OutboundPacket {
+                trace: None,
             peer_id: peer_id.to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: packet.clone(),
@@ -2379,6 +2380,7 @@ async fn test_network_outbound_uses_relay_when_udp_unavailable() {
     );
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: packet.clone(),
@@ -2486,6 +2488,7 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
     );
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: packet.clone(),
@@ -2612,6 +2615,7 @@ async fn test_network_outbound_waits_for_relay_even_when_direct_is_confirmed_bef
     );
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: packet.clone(),
@@ -2995,6 +2999,7 @@ async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_deliver
     let payload = vec![1, 2, 3];
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -3101,6 +3106,7 @@ async fn test_network_outbound_direct_only_degrades_immediately_with_stable_reas
 
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -3206,6 +3212,7 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
     // node-b's first packet parks (bounded wait, not a blocking loop).
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -3232,6 +3239,7 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
     );
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-c".to_string(),
             dst_ip: "10.20.0.3".to_string(),
             packet: packet.clone(),
@@ -3312,6 +3320,7 @@ async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() 
     for seq in 0..3u8 {
         dataplane_tx
             .send(OutboundPacket {
+                trace: None,
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -3432,6 +3441,7 @@ async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_neve
     );
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: packet.clone(),
@@ -3537,6 +3547,7 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
     );
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: packet.clone(),
@@ -3858,6 +3869,7 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
     // The first business packet parks PLAINTEXT (peer not usable yet).
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -3891,6 +3903,7 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
     let probe_sent = transport
         .encrypt_and_emit_outbound(
             OutboundPacket {
+                trace: None,
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: probe_packet,
@@ -4038,6 +4051,7 @@ async fn run_burst_confirmation_replay_test(count: usize) {
     for seq in 0..count as u16 {
         dataplane_tx
             .send(OutboundPacket {
+                trace: None,
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -4072,6 +4086,7 @@ async fn run_burst_confirmation_replay_test(count: usize) {
     let probe_sent = transport
         .encrypt_and_emit_outbound(
             OutboundPacket {
+                trace: None,
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: probe_packet.clone(),
@@ -4231,6 +4246,7 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
             transport
                 .encrypt_and_emit_outbound(
                     OutboundPacket {
+                trace: None,
                         peer_id: "node-b".to_string(),
                         dst_ip: "10.20.0.2".to_string(),
                         packet: Ipv4Packet::build_icmp_echo_request(
@@ -4259,6 +4275,7 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
     for seq in 0..20u16 {
         dataplane_tx
             .send(OutboundPacket {
+                trace: None,
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -4280,6 +4297,7 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
     for seq in 0..20u16 {
         dataplane_tx
             .send(OutboundPacket {
+                trace: None,
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -4385,6 +4403,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
     for seq in 0..total as u16 {
         dataplane_tx
             .send(OutboundPacket {
+                trace: None,
                 peer_id: "node-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -4546,6 +4565,7 @@ async fn test_network_outbound_worker_shutdown_counts_parked_packets() {
 
     dataplane_tx
         .send(OutboundPacket {
+                trace: None,
             peer_id: "node-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(

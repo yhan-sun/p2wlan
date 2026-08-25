@@ -154,6 +154,7 @@ mod tests {
 
         outbound_tx
             .send(OutboundPacket {
+                trace: None,
                 peer_id: "peer-b".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: packet.clone(),
@@ -187,6 +188,7 @@ mod tests {
         let ingress_lock = transport.outbound_ingress_lock("peer-missing").await;
         let _ingress_guard = ingress_lock.lock().await;
         let packet = OutboundPacket {
+                trace: None,
             peer_id: "peer-missing".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -227,6 +229,7 @@ mod tests {
         let generation = peers.advance_network_generation("session_queue_test").await;
 
         let packet = OutboundPacket {
+                trace: None,
             peer_id: "peer-a".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: vec![1, 2, 3, 4],
@@ -255,6 +258,7 @@ mod tests {
 
         let dropped = transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "missing-peer".to_string(),
                 dst_ip: "10.20.0.9".to_string(),
                 packet: vec![0x45, 0x00, 0x00, 0x14],
@@ -285,6 +289,7 @@ mod tests {
             async move {
                 transport
                     .encrypt_or_queue_outbound(OutboundPacket {
+                trace: None,
                         peer_id: "peer-a".to_string(),
                         dst_ip: "10.20.0.1".to_string(),
                         packet,
@@ -326,6 +331,7 @@ mod tests {
         for sequence in 0..96u16 {
             assert!(transport
                 .encrypt_or_queue_outbound(OutboundPacket {
+                trace: None,
                     peer_id: "peer-a".to_string(),
                     dst_ip: "10.20.0.1".to_string(),
                     packet: Ipv4Packet::build_icmp_echo_request(
@@ -347,6 +353,7 @@ mod tests {
             async move { transport.run_outbound(dataplane_rx).await }
         });
         let live_packet = OutboundPacket {
+                trace: None,
             peer_id: "peer-a".to_string(),
             dst_ip: "10.20.0.1".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -385,6 +392,7 @@ mod tests {
         let mut counters = Vec::new();
         for raw in received {
             let packet = OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -424,6 +432,7 @@ mod tests {
         for sequence in 0..96u16 {
             assert!(transport
                 .encrypt_or_queue_outbound(OutboundPacket {
+                trace: None,
                     peer_id: "peer-a".to_string(),
                     dst_ip: "10.20.0.1".to_string(),
                     packet: Ipv4Packet::build_icmp_echo_request(
@@ -440,6 +449,7 @@ mod tests {
         }
 
         let filler = OutboundPacket {
+                trace: None,
             peer_id: "filler".to_string(),
             dst_ip: "10.20.0.254".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -487,6 +497,7 @@ mod tests {
         }
 
         let live_packet = OutboundPacket {
+                trace: None,
             peer_id: "peer-a".to_string(),
             dst_ip: "10.20.0.1".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -534,6 +545,7 @@ mod tests {
 
         let dropped = transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: vec![0x45, 0x00, 0x00, 0x14],
@@ -586,6 +598,7 @@ mod tests {
 
         let (encrypted, emit_guard) = transport
             .encrypt_outbound_with_guard(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -869,6 +882,7 @@ mod tests {
         );
         let encrypted = transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: old_outbound.clone(),
@@ -920,6 +934,7 @@ mod tests {
         );
         let encrypted = transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: new_outbound.clone(),
@@ -962,6 +977,7 @@ mod tests {
         assert!(status.has_pending_responder);
         assert!(transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: vec![0x45, 0x00, 0x00, 0x14],
@@ -1304,6 +1320,7 @@ mod tests {
         );
         let encrypted = transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: packet.clone(),
@@ -1376,6 +1393,7 @@ mod tests {
         );
         let encrypted = transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: outbound.clone(),
@@ -1406,6 +1424,7 @@ mod tests {
         );
         let (encrypted_first, guard) = transport
             .encrypt_outbound_with_guard(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: first.clone(),
@@ -1433,6 +1452,7 @@ mod tests {
                 transport
                     .encrypt_and_emit_outbound(
                         OutboundPacket {
+                trace: None,
                             peer_id: "peer-a".to_string(),
                             dst_ip: "10.20.0.1".to_string(),
                             packet: second,
@@ -1488,6 +1508,7 @@ mod tests {
         let emitted = transport
             .encrypt_and_emit_outbound_with_lock_timeout(
                 OutboundPacket {
+                trace: None,
                     peer_id: "peer-a".to_string(),
                     dst_ip: "10.20.0.1".to_string(),
                     packet: vec![0],
@@ -1516,6 +1537,7 @@ mod tests {
         transport.add_session("peer-a", local).await;
         let (encrypted, guard) = transport
             .encrypt_outbound_with_guard(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -1581,6 +1603,7 @@ mod tests {
                 transport
                     .encrypt_and_emit_outbound(
                         OutboundPacket {
+                trace: None,
                             peer_id: "peer-a".to_string(),
                             dst_ip: "10.20.0.1".to_string(),
                             packet: Ipv4Packet::build_icmp_echo_request(
@@ -1613,6 +1636,7 @@ mod tests {
                     transport
                         .encrypt_and_emit_outbound(
                             OutboundPacket {
+                trace: None,
                                 peer_id: "peer-a".to_string(),
                                 dst_ip: "10.20.0.1".to_string(),
                                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -1779,6 +1803,7 @@ mod tests {
         );
         let encrypted = transport
             .encrypt_outbound(OutboundPacket {
+                trace: None,
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.1".to_string(),
                 packet: packet.clone(),

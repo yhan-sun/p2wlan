@@ -21,6 +21,41 @@ pub(super) struct UdpCandidateRefreshContext {
     pub(super) boot_epoch_ms: u64,
 }
 
+/// The reason that woke the candidate-refresh scheduler.
+///
+/// These reasons are intentionally kept separate: a volatile publication is
+/// a control-plane flush of an already gathered snapshot, while a periodic
+/// wake is the only event allowed to start a full STUN/gateway gather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RefreshWakeReason {
+    Periodic,
+    VolatileDeadline,
+}
+
+impl RefreshWakeReason {
+    fn permits_full_gather(self) -> bool {
+        matches!(self, Self::Periodic)
+    }
+}
+
+/// Mirror the ordering used by the biased Tokio `select!` below.  Keeping the
+/// decision pure makes the simultaneous-ready behavior deterministic in unit
+/// tests: a periodic tick is never lost when it is ready at the same time as a
+/// volatile deadline.
+#[cfg(test)]
+fn refresh_wake_reason(
+    periodic_ready: bool,
+    volatile_deadline_ready: bool,
+) -> Option<RefreshWakeReason> {
+    if periodic_ready {
+        Some(RefreshWakeReason::Periodic)
+    } else if volatile_deadline_ready {
+        Some(RefreshWakeReason::VolatileDeadline)
+    } else {
+        None
+    }
+}
+
 /// Volatile candidate churn (source-only or short-lived port changes on the
 /// same public IP) is coalesced newest-wins and published at most once per
 /// short, fixed debounce window.  This is deliberately sub-second: a NAT
@@ -153,6 +188,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
     } else {
         CANDIDATE_REFRESH_INTERVAL
     });
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     if initial_refresh_needs_fast_retry {
         // The startup gather intentionally has a short budget.  If it only
         // produced a host candidate (or only an observer-specific mapping on
@@ -179,14 +215,20 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         // gather tick or the fixed debounce deadline, whichever comes first.
         // The latter is what prevents a changed NAT mapping from sitting in
         // the committed snapshot while the peer keeps using an old endpoint.
-        if let Some(deadline) = volatile_coalescer.pending_deadline() {
+        let wake_reason = if let Some(deadline) = volatile_coalescer.pending_deadline() {
             tokio::select! {
-                _ = ticker.tick() => {}
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                // Prefer a periodic refresh when both futures are ready. The
+                // volatile publication is flushed below before the periodic
+                // gather, so neither event is lost and only the periodic
+                // branch may start STUN/gateway discovery.
+                biased;
+                _ = ticker.tick() => RefreshWakeReason::Periodic,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => RefreshWakeReason::VolatileDeadline,
             }
         } else {
             ticker.tick().await;
-        }
+            RefreshWakeReason::Periodic
+        };
 
         // Flush a coalesced volatile publication whose debounce window
         // elapsed.  The pending set is the newest committed candidate set;
@@ -217,9 +259,12 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 )
                 .await;
                 volatile_coalescer.record_published(hash);
-                info!(
-                    "Published coalesced volatile UDP candidate refresh (hash={hash}, candidates={})",
-                    pending.candidates.len()
+                debug!(
+                    target: "p2wlan_daemon::candidate_refresh",
+                    event = "candidate_volatile_publish_completed",
+                    hash,
+                    candidate_count = pending.candidates.len(),
+                    "Published coalesced volatile UDP candidate refresh"
                 );
             } else {
                 debug!(
@@ -228,9 +273,30 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             }
         }
 
+        // A volatile deadline only flushes the already committed newest
+        // candidate set. It must return to the scheduler here: falling
+        // through into the gather below turns every debounce expiry into a
+        // full STUN refresh and recreates the observed refresh storm. If a
+        // periodic tick was simultaneously ready, `biased` selected it above
+        // and this branch deliberately falls through to the legitimate gather.
+        if !wake_reason.permits_full_gather() {
+            debug!(
+                target: "p2wlan_daemon::candidate_refresh",
+                event = "candidate_volatile_publish_completed",
+                wake_reason = ?wake_reason,
+                "volatile candidate publication completed without a full gather"
+            );
+            continue;
+        }
+
         let gather_started = Instant::now();
         debug!(
             target: "p2wlan_daemon::candidate_refresh",
+            event = "candidate_gather_started",
+            wake_reason = ?wake_reason,
+            network_generation = peers.current_network_generation_sync(),
+            stun_query_count = stun_servers.len(),
+            pool_socket_count = udp.socket_count(),
             "UDP candidate refresh started"
         );
 
@@ -265,10 +331,13 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             );
             (discovered, discovered_sources)
         };
+        let profiler = crate::dataplane::global_dataplane_profiler();
+        profiler.set_candidate_gather_active(true);
         let (report_result, (mapped_candidates, mapped_sources)) = tokio::join!(
             udp.gather_candidate_report_live_parallel_full(stun_servers.clone(), stun_timeout),
             mapping_future,
         );
+        profiler.set_candidate_gather_active(false);
         let gather_elapsed_ms = gather_started.elapsed().as_millis() as u64;
         let refresh_lock_wait_started = Instant::now();
         let refresh_guard = candidate_refresh_lock.lock().await;
@@ -279,8 +348,13 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             Err(err) => {
                 warn!(
                     target: "p2wlan_daemon::candidate_refresh",
+                    event = "candidate_gather_completed",
+                    wake_reason = ?wake_reason,
                     refresh_lock_wait_ms,
                     gather_elapsed_ms,
+                    stun_query_count = stun_servers.len(),
+                    pool_socket_count = udp.socket_count(),
+                    candidate_count = 0,
                     "Periodic UDP candidate refresh failed: {err}"
                 );
                 continue;
@@ -289,8 +363,12 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
         debug!(
             target: "p2wlan_daemon::candidate_refresh",
+            event = "candidate_gather_completed",
+            wake_reason = ?wake_reason,
             refresh_lock_wait_ms,
             gather_elapsed_ms,
+            stun_query_count = report.nat_profile.observations.len(),
+            pool_socket_count = udp.socket_count(),
             candidate_count = candidates.len(),
             "UDP candidate refresh gather completed"
         );
@@ -375,6 +453,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 CANDIDATE_REFRESH_INTERVAL
             };
             ticker = interval(interval_ms);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the new interval's immediate tick; the next periodic
             // refresh happens one full cadence later.
             ticker.tick().await;

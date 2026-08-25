@@ -1250,6 +1250,7 @@ pub(super) async fn run_relay_peer_validation_loop(
                             peer_id: send_peer_id.clone(),
                             dst_ip: send_peer_virtual_ip,
                             packet,
+                            trace: None,
                         },
                         move |encrypted| async move {
                             let Some(peer_session_generation) = send_peers
@@ -1562,6 +1563,7 @@ pub(super) async fn run_relay_peer_probe_loop(
                             peer_id: send_peer_id.clone(),
                             dst_ip: send_peer_virtual_ip,
                             packet,
+                            trace: None,
                         },
                         move |encrypted| async move {
                             send_relay
@@ -1812,6 +1814,7 @@ pub(super) async fn run_relay_peer_probe_loop(
                                 peer_id: send_peer_id.clone(),
                                 dst_ip: send_peer_virtual_ip,
                                 packet,
+                                trace: None,
                             },
                             move |encrypted| async move {
                                 send_relay
@@ -1937,6 +1940,7 @@ pub(super) async fn send_relay_validation_packet(
                 peer_id: validation.peer_id.to_string(),
                 dst_ip: validation.peer_virtual_ip.to_string(),
                 packet,
+                trace: None,
             },
             |encrypted| async move { relay.send_packet(&encrypted).await },
         )

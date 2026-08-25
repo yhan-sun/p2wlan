@@ -21,6 +21,7 @@ use crate::peer::PeerManager;
 include!("dataplane/core.rs");
 include!("dataplane/normalization.rs");
 include!("dataplane/logging.rs");
+include!("dataplane/profiling.rs");
 
 #[cfg(test)]
 mod tests {
