@@ -517,6 +517,19 @@ pub struct EncryptedPeerPacket {
     pub is_business: bool,
 }
 
+/// Result of an encryption attempt that is bound to one cached session
+/// instance.  Returning the plaintext on a stale-session miss avoids a
+/// per-packet clone on the successful LAN fast path while preserving the
+/// existing slow-path FIFO fallback.
+pub(crate) enum SessionBoundEncryption {
+    Encrypted(EncryptedPeerPacket),
+    Unavailable(OutboundPacket),
+    Failed {
+        packet: OutboundPacket,
+        error: DaemonError,
+    },
+}
+
 /// An encrypted WireGuard packet received from UDP or relay transport.
 #[derive(Debug, Clone)]
 pub struct ReceivedEncryptedPacket {
@@ -1808,6 +1821,58 @@ impl WireGuardTransport {
         // emit teardown order.  Returning None lets the actor re-park the
         // plaintext without allocating a WireGuard counter.
         self.encrypt_outbound_inner(packet, false, true).await
+    }
+
+    /// Encrypt a business packet only if the cached active session instance
+    /// is still installed.  The caller owns the per-peer emit guard and the
+    /// network-epoch gate, so this method takes only the short sessions lock;
+    /// it never performs network I/O while either ordering guard is held.
+    pub(crate) async fn encrypt_outbound_with_emit_guard_for_session(
+        &self,
+        packet: OutboundPacket,
+        expected_session_instance: u64,
+    ) -> SessionBoundEncryption {
+        let mut sessions = self.sessions.lock().await;
+        let now = Instant::now();
+        let Some(peer_sessions) = sessions.get_mut(&packet.peer_id) else {
+            return SessionBoundEncryption::Unavailable(packet);
+        };
+        peer_sessions.prepare_active(now);
+        let Some(active) = peer_sessions.active.as_mut() else {
+            return SessionBoundEncryption::Unavailable(packet);
+        };
+        if active.session_instance != expected_session_instance || active.session.is_expired() {
+            return SessionBoundEncryption::Unavailable(packet);
+        }
+
+        let session_instance = active.session_instance;
+        let wire_bytes = match active.session.encrypt_to_bytes(&packet.packet) {
+            Ok(wire_bytes) => wire_bytes,
+            Err(error) => {
+                return SessionBoundEncryption::Failed {
+                    packet,
+                    error: DaemonError::Peer(format!("WireGuard encrypt failed: {error}")),
+                };
+            }
+        };
+        debug!(
+            event = "wireguard_outbound_counter_allocated",
+            peer_id = %packet.peer_id,
+            session_instance,
+            counter = ?wire_counter(&wire_bytes),
+            bytes = wire_bytes.len(),
+            is_business = true,
+            wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
+            "WireGuard counter allocated under the LAN Direct fast-path ordering lock"
+        );
+        let encrypted = EncryptedPeerPacket {
+            peer_id: packet.peer_id,
+            dst_ip: packet.dst_ip,
+            wire_bytes,
+            is_business: true,
+        };
+        drop(sessions);
+        SessionBoundEncryption::Encrypted(encrypted)
     }
 
     async fn outbound_emit_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {

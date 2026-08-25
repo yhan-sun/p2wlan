@@ -49,6 +49,22 @@ pub enum NetworkPath {
     Relay,
 }
 
+/// Immutable, generation-bound state for the LAN Direct data-plane fast path.
+///
+/// The snapshot deliberately contains only path state owned by `PeerManager`.
+/// The outbound worker extends it with the exact WireGuard session instance and
+/// UDP publication/socket identity before sending.  Keeping those domains
+/// separate avoids making the peer manager own a transport handle while still
+/// requiring every domain to match before a WireGuard counter is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivePathSnapshot {
+    pub(crate) path: NetworkPath,
+    pub(crate) generation: u64,
+    pub(crate) direct_commit_seq: u64,
+    pub(crate) peer_session_generation: PeerSessionGeneration,
+    pub(crate) endpoint: SocketAddr,
+}
+
 /// Diagnostic classification for the currently selected or best direct path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -46,10 +46,11 @@ use tracing::{debug, warn};
 use crate::connection_timeline::ConnectionTimeline;
 use crate::dataplane::{global_dataplane_profiler, OutboundPacket};
 use crate::peer::{
-    NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED, REASON_PATH_UNAVAILABLE,
+    ActivePathSnapshot, NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED,
+    REASON_PATH_UNAVAILABLE,
 };
 use crate::relay::RelayTransport;
-use crate::transport::{EncryptedPeerPacket, WireGuardTransport};
+use crate::transport::{EncryptedPeerPacket, SessionBoundEncryption, WireGuardTransport};
 use crate::udp::UdpTransport;
 
 const OUTBOUND_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -152,6 +153,51 @@ enum DirectSendOutcome {
     HandoffAccepted,
     /// The result cannot be safely replayed through another path.
     DeliveryUncertain { err: String },
+}
+
+/// Sender-owned extension of [`ActivePathSnapshot`]. The peer manager owns
+/// path/generation state; the outbound worker owns the exact session and UDP
+/// publication/socket identity used for the handoff.
+#[derive(Debug, Clone)]
+struct DirectFastPathEntry {
+    path: ActivePathSnapshot,
+    session_instance: u64,
+    udp_transport_instance_id: u64,
+    publication_owner: u64,
+    socket_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FastPathEligibilityToken {
+    generation: u64,
+    direct_commit_seq: u64,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+}
+
+impl FastPathEligibilityToken {
+    fn is_current(&self, peers: &PeerManager, peer_id: &str) -> bool {
+        peers.current_network_generation_sync() == self.generation
+            && peers.peer_session_is_current_sync(peer_id, self.peer_session_generation)
+            && peers.direct_commit_seq_sync(peer_id) == Some(self.direct_commit_seq)
+    }
+}
+
+enum FastPathAttempt {
+    Sent,
+    Fallback(OutboundPacket),
+    Terminal {
+        packet: OutboundPacket,
+        generation: u64,
+        reason_code: &'static str,
+        reason: String,
+    },
+    TerminalBytes {
+        peer_id: String,
+        generation: u64,
+        bytes: usize,
+        reason_code: &'static str,
+        reason: String,
+    },
 }
 
 impl RetryableSendFailure {
@@ -339,6 +385,289 @@ fn raw_packet_summary(packet: &[u8]) -> String {
     summary
 }
 
+/// Try the specialized LAN Direct sender. The caller has already established
+/// that this peer has no older pending FIFO or in-flight flush task, so a
+/// successful fast send cannot overtake an earlier plaintext packet.
+#[allow(clippy::too_many_arguments)]
+async fn try_lan_direct_fast_path(
+    packet: OutboundPacket,
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    prefer_direct: bool,
+    udp_transport: &RwLock<Option<UdpTransport>>,
+    fast_paths: &mut HashMap<String, DirectFastPathEntry>,
+    ineligible: &mut HashMap<String, FastPathEligibilityToken>,
+) -> FastPathAttempt {
+    let peer_id = packet.peer_id.as_str();
+    let profiler = global_dataplane_profiler();
+    let mut entry = fast_paths.get(peer_id).cloned();
+
+    if let Some(cached) = entry.as_ref() {
+        if !peers.active_direct_path_snapshot_is_current_sync(peer_id, cached.path) {
+            fast_paths.remove(peer_id);
+            profiler.record_fast_path_invalidation();
+            entry = None;
+        }
+    }
+
+    if entry.is_none() {
+        profiler.record_fast_path_miss();
+        if ineligible
+            .get(peer_id)
+            .is_some_and(|token| token.is_current(peers, peer_id))
+        {
+            return FastPathAttempt::Fallback(packet);
+        }
+        ineligible.remove(peer_id);
+
+        let generation = peers.current_network_generation_sync();
+        let Some(path) = peers
+            .active_direct_path_snapshot(peer_id, generation, prefer_direct)
+            .await
+        else {
+            if let (Some(direct_commit_seq), Some(peer_session_generation)) = (
+                peers.direct_commit_seq_sync(peer_id),
+                peers.peer_session_generation_sync(peer_id),
+            ) {
+                ineligible.insert(
+                    peer_id.to_owned(),
+                    FastPathEligibilityToken {
+                        generation,
+                        direct_commit_seq,
+                        peer_session_generation,
+                    },
+                );
+            }
+            return FastPathAttempt::Fallback(packet);
+        };
+        let Some(session_instance) = transport
+            .session_status(peer_id)
+            .await
+            .active_session_instance
+        else {
+            return FastPathAttempt::Fallback(packet);
+        };
+        let Some(udp) = udp_transport.read().await.clone() else {
+            return FastPathAttempt::Fallback(packet);
+        };
+        let Some((socket_index, _)) = udp.socket_for_peer(Some(peer_id)).await else {
+            return FastPathAttempt::Fallback(packet);
+        };
+        entry = Some(DirectFastPathEntry {
+            path,
+            session_instance,
+            udp_transport_instance_id: udp.transport_instance_id(),
+            publication_owner: udp.inbound_publication_owner(),
+            socket_index,
+        });
+        fast_paths.insert(
+            peer_id.to_string(),
+            entry
+                .as_ref()
+                .expect("fast-path entry was just built")
+                .clone(),
+        );
+        ineligible.remove(peer_id);
+    }
+
+    let Some(entry) = entry else {
+        return FastPathAttempt::Fallback(packet);
+    };
+    let packet_bytes = packet.packet.len();
+    let sampled_trace = packet.trace.clone();
+    let overlay_identity = overlay_packet_identity(&packet.packet);
+    let encrypt_started = Instant::now();
+    let emit_guard = transport.acquire_outbound_emit_guard(peer_id).await;
+
+    // Keep the lock order identical to the existing business path:
+    // per-peer emit -> network epoch -> socket state/session. The UDP write is
+    // intentionally outside the epoch gate.
+    let (udp, socket, encrypted) = {
+        let epoch_gate = peers.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if !peers.active_direct_path_snapshot_is_current_sync(peer_id, entry.path) {
+            drop(emit_guard);
+            profiler.record_fast_path_invalidation();
+            fast_paths.remove(peer_id);
+            return FastPathAttempt::Fallback(packet);
+        }
+
+        let Some(udp) = udp_transport.read().await.clone() else {
+            drop(emit_guard);
+            profiler.record_fast_path_invalidation();
+            fast_paths.remove(peer_id);
+            return FastPathAttempt::Fallback(packet);
+        };
+        if udp.transport_instance_id() != entry.udp_transport_instance_id
+            || udp.inbound_publication_owner() != entry.publication_owner
+        {
+            drop(emit_guard);
+            profiler.record_fast_path_invalidation();
+            fast_paths.remove(peer_id);
+            return FastPathAttempt::Fallback(packet);
+        }
+        let Some(socket) = udp
+            .socket_for_inbound_peer_index(peer_id, entry.socket_index)
+            .await
+        else {
+            drop(emit_guard);
+            profiler.record_fast_path_invalidation();
+            fast_paths.remove(peer_id);
+            return FastPathAttempt::Fallback(packet);
+        };
+
+        let encrypted = match transport
+            .encrypt_outbound_with_emit_guard_for_session(packet, entry.session_instance)
+            .await
+        {
+            SessionBoundEncryption::Encrypted(encrypted) => encrypted,
+            SessionBoundEncryption::Unavailable(packet) => {
+                drop(emit_guard);
+                profiler.record_fast_path_invalidation();
+                fast_paths.remove(packet.peer_id.as_str());
+                return FastPathAttempt::Fallback(packet);
+            }
+            SessionBoundEncryption::Failed { packet, error } => {
+                drop(emit_guard);
+                fast_paths.remove(packet.peer_id.as_str());
+                return FastPathAttempt::Terminal {
+                    packet,
+                    generation: entry.path.generation,
+                    reason_code: REASON_OUTBOUND_ENCRYPT_FAILED,
+                    reason: error.to_string(),
+                };
+            }
+        };
+        (udp, socket, encrypted)
+    };
+
+    let peer_id = encrypted.peer_id.as_str();
+    let encrypt_completed = Instant::now();
+    if let Some(trace) = sampled_trace.as_ref() {
+        profiler.record(
+            trace.sampled,
+            "tun_read_to_encrypt_us",
+            encrypt_started.duration_since(trace.tun_read_completed),
+        );
+        if let Some(route_ready) = trace.route_ready {
+            profiler.record(
+                trace.sampled,
+                "route_to_encrypt_us",
+                encrypt_started.duration_since(route_ready),
+            );
+        }
+        profiler.record(
+            trace.sampled,
+            "encrypt_us",
+            encrypt_completed.duration_since(encrypt_started),
+        );
+    }
+
+    let transport_handoff_started = Instant::now();
+    let local_endpoint = udp.local_addr().ok();
+    debug!(
+        event = "lan_direct_fast_path_send_started",
+        peer_id = %peer_id,
+        generation = entry.path.generation,
+        remote_endpoint = %entry.path.endpoint,
+        local_endpoint = ?local_endpoint,
+        socket_index = entry.socket_index,
+        udp_transport_instance_id = entry.udp_transport_instance_id,
+        session_instance = entry.session_instance,
+        counter = ?crate::transport::wire_counter(&encrypted.wire_bytes),
+        "encrypted packet entered the LAN Direct fast path"
+    );
+    let send_result = timeout(
+        OUTBOUND_SEND_TIMEOUT,
+        udp.send_encrypted_packet_on_socket(
+            &socket,
+            entry.socket_index,
+            &encrypted,
+            entry.path.endpoint,
+        ),
+    )
+    .await;
+    let transport_handoff_completed = Instant::now();
+    if let Some(trace) = sampled_trace.as_ref() {
+        let total_userspace_tx =
+            transport_handoff_completed.duration_since(trace.tun_read_completed);
+        profiler.record(
+            trace.sampled,
+            "encrypt_to_send_us",
+            transport_handoff_started.duration_since(encrypt_completed),
+        );
+        profiler.record(trace.sampled, "total_userspace_tx_us", total_userspace_tx);
+        if total_userspace_tx >= crate::dataplane::DATAPLANE_STALL_THRESHOLD {
+            debug!(
+                event = "dataplane_stall",
+                peer_id = %peer_id,
+                active_path = "direct",
+                tun_to_send_us = total_userspace_tx.as_micros() as u64,
+                receive_to_tun_us = 0u64,
+                candidate_gather_active = profiler.candidate_gather_active(),
+                network_generation = entry.path.generation,
+                "LAN Direct fast-path packet exceeded the diagnostic stall threshold"
+            );
+        }
+    }
+
+    let outcome = match send_result {
+        Ok(Ok(_)) => {
+            profiler.record_fast_path_hit();
+            FastPathAttempt::Sent
+        }
+        Ok(Err(error)) => {
+            let reason = format!("LAN Direct UDP send result uncertain: {error}");
+            peers
+                .record_direct_failure_with_code_and_local_endpoint(
+                    peer_id,
+                    REASON_DIRECT_SEND_FAILED,
+                    reason.clone(),
+                    local_endpoint,
+                )
+                .await;
+            fast_paths.remove(peer_id);
+            FastPathAttempt::TerminalBytes {
+                peer_id: encrypted.peer_id.clone(),
+                generation: entry.path.generation,
+                bytes: packet_bytes,
+                reason_code: REASON_DIRECT_DELIVERY_UNCERTAIN,
+                reason,
+            }
+        }
+        Err(_) => {
+            fast_paths.remove(peer_id);
+            FastPathAttempt::TerminalBytes {
+                peer_id: encrypted.peer_id.clone(),
+                generation: entry.path.generation,
+                bytes: packet_bytes,
+                reason_code: REASON_DIRECT_DELIVERY_UNCERTAIN,
+                reason: "LAN Direct UDP send timed out; delivery is uncertain".to_string(),
+            }
+        }
+    };
+    if let Some((nonce, sequence, direction)) = overlay_identity {
+        let outcome_label = match &outcome {
+            FastPathAttempt::Sent => "sent",
+            FastPathAttempt::Fallback(_) => "fallback",
+            FastPathAttempt::Terminal { .. } | FastPathAttempt::TerminalBytes { .. } => "terminal",
+        };
+        debug!(
+            event = "outbound_overlay_transport_result",
+            peer_id = %peer_id,
+            nonce = format_args!("{nonce:#x}"),
+            sequence,
+            direction,
+            wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&encrypted.wire_bytes)),
+            counter = ?crate::transport::wire_counter(&encrypted.wire_bytes),
+            outcome = outcome_label,
+            "encrypted overlay packet reached the LAN Direct fast-path outcome"
+        );
+    }
+    drop(emit_guard);
+    outcome
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_network_outbound(
     mut outbound_rx: mpsc::Receiver<OutboundPacket>,
@@ -365,6 +694,12 @@ pub(super) async fn run_network_outbound(
     // second FIFO for the same peer.
     let mut flush_tasks = JoinSet::new();
     let mut flushing_peers = HashSet::new();
+    // The cache is owned by this actor so a fast send can never run beside an
+    // older per-peer flush. Negative eligibility tokens keep Public Direct,
+    // Relay-only and otherwise ineligible peers on the existing path without
+    // repeating a connection-map read for every packet.
+    let mut fast_paths: HashMap<String, DirectFastPathEntry> = HashMap::new();
+    let mut fast_path_ineligible: HashMap<String, FastPathEligibilityToken> = HashMap::new();
     // `relay_available` is a live transport snapshot, while this flag says
     // that the configured topology requires a relay-first admission window.
     // Keeping them separate closes the startup race where Direct was admitted
@@ -376,22 +711,83 @@ pub(super) async fn run_network_outbound(
         tokio::select! {
             packet = outbound_rx.recv() => {
                 let Some(packet) = packet else { break; };
-                handle_ingress(
-                    packet,
-                    &transport,
-                    &peers,
-                    &mut pending,
-                    prefer_direct,
-                    &udp_transport,
-                    &relay_transport,
-                    relay_startup_wait,
-                    relay_expected,
-                    &mut probe_kick,
-                    &relay_probe_kick_tx,
-                    &timeline,
-                    &mut flush_tasks,
-                    &mut flushing_peers,
-                ).await;
+                let peer_id = packet.peer_id.clone();
+                let can_try_fast_path = prefer_direct
+                    && peers.is_direct_sync(&peer_id)
+                    && !pending.contains_key(&peer_id)
+                    && !flushing_peers.contains(&peer_id);
+                if can_try_fast_path {
+                    match try_lan_direct_fast_path(
+                        packet,
+                        &transport,
+                        &peers,
+                        prefer_direct,
+                        &udp_transport,
+                        &mut fast_paths,
+                        &mut fast_path_ineligible,
+                    ).await {
+                        FastPathAttempt::Sent => continue,
+                        FastPathAttempt::Fallback(packet) => {
+                            handle_ingress(
+                                packet,
+                                &transport,
+                                &peers,
+                                &mut pending,
+                                prefer_direct,
+                                &udp_transport,
+                                &relay_transport,
+                                relay_startup_wait,
+                                relay_expected,
+                                &mut probe_kick,
+                                &relay_probe_kick_tx,
+                                &timeline,
+                                &mut flush_tasks,
+                                &mut flushing_peers,
+                            ).await;
+                        }
+                        FastPathAttempt::Terminal { packet, generation, reason_code, reason } => {
+                            record_terminal_drop(
+                                &transport,
+                                &peers,
+                                &peer_id,
+                                generation,
+                                packet,
+                                reason_code,
+                                reason,
+                                &timeline,
+                            ).await;
+                        }
+                        FastPathAttempt::TerminalBytes { peer_id, generation, bytes, reason_code, reason } => {
+                            record_terminal_drop_bytes(
+                                &transport,
+                                &peers,
+                                &peer_id,
+                                generation,
+                                bytes,
+                                reason_code,
+                                reason,
+                                &timeline,
+                            ).await;
+                        }
+                    }
+                } else {
+                    handle_ingress(
+                        packet,
+                        &transport,
+                        &peers,
+                        &mut pending,
+                        prefer_direct,
+                        &udp_transport,
+                        &relay_transport,
+                        relay_startup_wait,
+                        relay_expected,
+                        &mut probe_kick,
+                        &relay_probe_kick_tx,
+                        &timeline,
+                        &mut flush_tasks,
+                        &mut flushing_peers,
+                    ).await;
+                }
             }
             _ = direct_notify.notified() => {
                 start_ready_peer_flushes(
@@ -1304,6 +1700,30 @@ async fn record_terminal_drop(
     timeline: &ConnectionTimeline,
 ) {
     let bytes = packet.packet.len();
+    record_terminal_drop_bytes(
+        transport,
+        peers,
+        peer_id,
+        packet_generation,
+        bytes,
+        reason_code,
+        reason,
+        timeline,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_terminal_drop_bytes(
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    peer_id: &str,
+    packet_generation: u64,
+    bytes: usize,
+    reason_code: &'static str,
+    reason: String,
+    timeline: &ConnectionTimeline,
+) {
     transport.record_outbound_drop(reason_code, 1, bytes).await;
     record_loss_event(
         peers,
@@ -1985,6 +2405,24 @@ mod tests {
     use crate::config::Config;
     use crate::control::PeerInfo;
     use crate::peer::REASON_PATH_RELAY_FIRST_PENDING;
+    use p2pnet_crypto::NodeIdentity;
+    use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
+
+    fn establish_sessions() -> (TransportSession, TransportSession) {
+        let node_a = NodeIdentity::generate();
+        let node_b = NodeIdentity::generate();
+        let mut initiator = HandshakeInitiator::new(node_a, node_b.public_key(), None);
+        let mut responder = HandshakeResponder::new(node_b, None);
+        let initiation = initiator.create_initiation().unwrap();
+        let (response, node_b_keys) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
+        let node_a_keys = initiator.consume_response(&response).unwrap();
+        (
+            TransportSession::new(node_a_keys),
+            TransportSession::new(node_b_keys),
+        )
+    }
 
     fn test_peer(node_id: &str, endpoint: SocketAddr) -> PeerInfo {
         PeerInfo {
@@ -2137,6 +2575,186 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn lan_direct_snapshot_is_generation_and_commit_bound() {
+        let manager =
+            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let endpoint: SocketAddr = "192.168.2.11:51850".parse().unwrap();
+        let local: SocketAddr = "192.168.2.10:51820".parse().unwrap();
+        manager.add_peer(&test_peer("peer-lan", endpoint)).await;
+        manager
+            .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+                "192.168.2.10".parse().unwrap(),
+                24,
+            )])
+            .await;
+        manager
+            .add_candidates_with_sources(
+                "peer-lan",
+                &[endpoint.to_string()],
+                &std::collections::HashMap::from([(endpoint.to_string(), "host".to_string())]),
+            )
+            .await;
+        manager
+            .record_direct_probe_success_with_latency_and_local_endpoint(
+                "peer-lan",
+                endpoint,
+                Some(Duration::from_millis(2)),
+                Some(local),
+            )
+            .await;
+        manager
+            .record_direct_success_with_local_endpoint("peer-lan", Some(endpoint), Some(local))
+            .await;
+
+        let generation = manager.current_network_generation_sync();
+        let snapshot = manager
+            .active_direct_path_snapshot("peer-lan", generation, true)
+            .await
+            .expect("healthy on-link Direct should publish a fast-path snapshot");
+        assert_eq!(snapshot.path, NetworkPath::Direct);
+        assert_eq!(snapshot.endpoint, endpoint);
+        assert!(manager.active_direct_path_snapshot_is_current_sync("peer-lan", snapshot));
+
+        manager
+            .advance_network_generation("fast-path-generation-fence")
+            .await;
+        assert!(!manager.active_direct_path_snapshot_is_current_sync("peer-lan", snapshot));
+    }
+
+    #[tokio::test]
+    async fn public_direct_does_not_enter_lan_fast_path() {
+        let manager =
+            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let endpoint: SocketAddr = "198.51.100.50:51850".parse().unwrap();
+        manager.add_peer(&test_peer("peer-public", endpoint)).await;
+        manager
+            .record_direct_probe_success_with_latency(
+                "peer-public",
+                endpoint,
+                Some(Duration::from_millis(8)),
+            )
+            .await;
+        manager
+            .record_direct_success("peer-public", Some(endpoint))
+            .await;
+
+        let generation = manager.current_network_generation_sync();
+        assert!(
+            manager
+                .active_direct_path_snapshot("peer-public", generation, true)
+                .await
+                .is_none(),
+            "Public Direct remains on the existing selector path"
+        );
+    }
+
+    #[tokio::test]
+    async fn lan_direct_fast_path_sends_with_cached_session_and_socket() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = receiver.local_addr().unwrap();
+        let local_network = p2pnet_nat::LocalNetwork::new("127.0.0.1".parse().unwrap(), 8);
+        peers.add_peer(&test_peer("peer-fast", endpoint)).await;
+        peers
+            .set_local_interface_networks(vec![local_network])
+            .await;
+        peers
+            .add_candidates_with_sources(
+                "peer-fast",
+                &[endpoint.to_string()],
+                &std::collections::HashMap::from([(endpoint.to_string(), "host".to_string())]),
+            )
+            .await;
+        let local_transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let local_endpoint = local_transport.local_addr().unwrap();
+        peers
+            .record_direct_probe_success_with_latency_and_local_endpoint(
+                "peer-fast",
+                endpoint,
+                Some(Duration::from_millis(1)),
+                Some(local_endpoint),
+            )
+            .await;
+        peers
+            .record_direct_success_with_local_endpoint(
+                "peer-fast",
+                Some(endpoint),
+                Some(local_endpoint),
+            )
+            .await;
+
+        let (transport, _outbound_rx) = WireGuardTransport::new();
+        let (local_session, _remote_session) = establish_sessions();
+        transport.add_session("peer-fast", local_session).await;
+        let udp_transport = RwLock::new(Some(local_transport));
+        let mut fast_paths = HashMap::new();
+        let mut ineligible = HashMap::new();
+        let counters_before = global_dataplane_profiler().fast_path_counters();
+        let attempt = try_lan_direct_fast_path(
+            OutboundPacket {
+                peer_id: "peer-fast".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: vec![0x45, 0, 0, 20],
+                trace: None,
+            },
+            &transport,
+            &peers,
+            true,
+            &udp_transport,
+            &mut fast_paths,
+            &mut ineligible,
+        )
+        .await;
+        assert!(matches!(attempt, FastPathAttempt::Sent));
+        assert_eq!(fast_paths.len(), 1);
+        let counters_after_send = global_dataplane_profiler().fast_path_counters();
+        assert!(counters_after_send.hits > counters_before.hits);
+        assert!(counters_after_send.misses > counters_before.misses);
+
+        let mut received = [0u8; 2048];
+        let (received_len, source) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut received))
+                .await
+                .expect("LAN Direct fast path must hand the ciphertext to the exact socket")
+                .unwrap();
+        assert!(received_len > 0);
+        assert_eq!(source.ip(), local_endpoint.ip());
+
+        let (replacement_session, _replacement_remote) = establish_sessions();
+        transport
+            .replace_session("peer-fast", replacement_session)
+            .await;
+        let stale_session_attempt = try_lan_direct_fast_path(
+            OutboundPacket {
+                peer_id: "peer-fast".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: vec![0x45, 0, 0, 20],
+                trace: None,
+            },
+            &transport,
+            &peers,
+            true,
+            &udp_transport,
+            &mut fast_paths,
+            &mut ineligible,
+        )
+        .await;
+        assert!(matches!(
+            stale_session_attempt,
+            FastPathAttempt::Fallback(_)
+        ));
+        assert!(fast_paths.is_empty());
+        assert!(
+            global_dataplane_profiler().fast_path_counters().invalidated
+                > counters_after_send.invalidated
+        );
     }
 
     #[tokio::test]

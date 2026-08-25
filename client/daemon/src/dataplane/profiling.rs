@@ -29,6 +29,17 @@ pub(crate) struct DataplaneRxTrace {
     pub(crate) decrypt_completed: Instant,
 }
 
+/// Cheap process-local counters for the specialized LAN Direct sender. These
+/// are atomic on purpose: the fast path must not take the profiler histogram
+/// mutex or add an allocation to every packet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FastPathCounters {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) invalidated: u64,
+}
+
 #[derive(Default)]
 struct StageSamples {
     values: Vec<u64>,
@@ -46,6 +57,9 @@ struct DataplaneProfilerState {
 pub(crate) struct DataplaneProfiler {
     packet_counter: AtomicU64,
     candidate_gather_active: std::sync::atomic::AtomicBool,
+    fast_path_hits: AtomicU64,
+    fast_path_misses: AtomicU64,
+    fast_path_invalidated: AtomicU64,
     state: Mutex<DataplaneProfilerState>,
 }
 
@@ -54,6 +68,9 @@ impl DataplaneProfiler {
         Self {
             packet_counter: AtomicU64::new(0),
             candidate_gather_active: std::sync::atomic::AtomicBool::new(false),
+            fast_path_hits: AtomicU64::new(0),
+            fast_path_misses: AtomicU64::new(0),
+            fast_path_invalidated: AtomicU64::new(0),
             state: Mutex::new(DataplaneProfilerState::default()),
         }
     }
@@ -70,6 +87,27 @@ impl DataplaneProfiler {
 
     pub(crate) fn candidate_gather_active(&self) -> bool {
         self.candidate_gather_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_fast_path_hit(&self) {
+        self.fast_path_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fast_path_miss(&self) {
+        self.fast_path_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fast_path_invalidation(&self) {
+        self.fast_path_invalidated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn fast_path_counters(&self) -> FastPathCounters {
+        FastPathCounters {
+            hits: self.fast_path_hits.load(Ordering::Relaxed),
+            misses: self.fast_path_misses.load(Ordering::Relaxed),
+            invalidated: self.fast_path_invalidated.load(Ordering::Relaxed),
+        }
     }
 
     pub(crate) fn record(&self, sampled: bool, stage: &'static str, duration: Duration) {
@@ -119,4 +157,27 @@ fn percentile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
 pub(crate) fn global_dataplane_profiler() -> &'static DataplaneProfiler {
     static PROFILER: OnceLock<DataplaneProfiler> = OnceLock::new();
     PROFILER.get_or_init(DataplaneProfiler::new)
+}
+
+#[cfg(test)]
+mod profiling_tests {
+    use super::*;
+
+    #[test]
+    fn fast_path_counters_are_independent_of_histogram_sampling() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record_fast_path_hit();
+        profiler.record_fast_path_hit();
+        profiler.record_fast_path_miss();
+        profiler.record_fast_path_invalidation();
+
+        assert_eq!(
+            profiler.fast_path_counters(),
+            FastPathCounters {
+                hits: 2,
+                misses: 1,
+                invalidated: 1,
+            }
+        );
+    }
 }
