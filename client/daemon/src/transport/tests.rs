@@ -112,6 +112,26 @@ mod tests {
         assert_eq!(wire_counter(&[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]), None);
     }
 
+    #[test]
+    fn session_unavailable_reasons_have_stable_diagnostic_labels() {
+        assert_eq!(
+            SessionUnavailableReason::PeerSessionsMissing.as_str(),
+            "peer_sessions_missing"
+        );
+        assert_eq!(
+            SessionUnavailableReason::ActiveMissing.as_str(),
+            "active_missing"
+        );
+        assert_eq!(
+            SessionUnavailableReason::SessionInstanceMismatch.as_str(),
+            "session_instance_mismatch"
+        );
+        assert_eq!(
+            SessionUnavailableReason::SessionExpired.as_str(),
+            "session_expired"
+        );
+    }
+
     fn establish_sessions() -> (TransportSession, TransportSession) {
         let node_a = NodeIdentity::generate();
         let node_b = NodeIdentity::generate();

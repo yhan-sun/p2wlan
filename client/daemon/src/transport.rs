@@ -517,8 +517,31 @@ pub struct EncryptedPeerPacket {
     pub is_business: bool,
 }
 
+/// Why a FastPath session-bound encryption attempt could not use its cached
+/// session. These reasons are intentionally narrower than a generic
+/// "unavailable" result so lifecycle churn can be correlated with Android
+/// daemon restarts and remote-incarnation cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionUnavailableReason {
+    PeerSessionsMissing,
+    ActiveMissing,
+    SessionInstanceMismatch,
+    SessionExpired,
+}
+
+impl SessionUnavailableReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerSessionsMissing => "peer_sessions_missing",
+            Self::ActiveMissing => "active_missing",
+            Self::SessionInstanceMismatch => "session_instance_mismatch",
+            Self::SessionExpired => "session_expired",
+        }
+    }
+}
+
 /// Result of an encryption attempt that is bound to one cached session
-/// instance.  Returning the plaintext on a stale-session miss avoids a
+/// instance. Returning the plaintext on a stale-session miss avoids a
 /// per-packet clone on the successful LAN fast path while preserving the
 /// existing slow-path FIFO fallback.
 pub(crate) enum SessionBoundEncryption {
@@ -527,7 +550,10 @@ pub(crate) enum SessionBoundEncryption {
         session_lock_wait_us: u64,
         crypto_us: u64,
     },
-    Unavailable(OutboundPacket),
+    Unavailable {
+        packet: OutboundPacket,
+        reason: SessionUnavailableReason,
+    },
     Failed {
         packet: OutboundPacket,
         error: DaemonError,
@@ -1660,8 +1686,13 @@ impl WireGuardTransport {
         }
     }
 
-    /// Remove a peer session.
-    pub async fn remove_session(&self, peer_id: &str) {
+    /// Remove a peer session with a structured lifecycle cause.
+    pub async fn remove_session_with_reason(
+        &self,
+        peer_id: &str,
+        reason: &'static str,
+        caller: &'static str,
+    ) {
         // A session flush may already have removed its queue and be forwarding
         // raw packets. Wait for that per-peer ingress turn before clearing the
         // session/backlog, so a live packet cannot be inserted behind a
@@ -1684,9 +1715,11 @@ impl WireGuardTransport {
                 .map(|item| item.packet.packet.len())
                 .sum::<usize>()
         });
-        debug!(
+        info!(
             event = "wireguard_session_removed",
             peer_id = %peer_id,
+            reason,
+            caller,
             removed_session,
             removed_queue_packets,
             removed_queue_bytes,
@@ -1713,6 +1746,14 @@ impl WireGuardTransport {
         }
         self.promoted_responder_tokens.lock().await.remove(peer_id);
         self.remove_idle_outbound_emit_lock(peer_id).await;
+    }
+
+    /// Compatibility wrapper for tests and legacy callers. Production
+    /// lifecycle boundaries should use `remove_session_with_reason` so a
+    /// session disappearance can be correlated with the caller that caused it.
+    pub async fn remove_session(&self, peer_id: &str) {
+        self.remove_session_with_reason(peer_id, "unspecified", "legacy_callsite")
+            .await;
     }
 
     /// Return whether a peer has an encrypting session.
@@ -1865,14 +1906,29 @@ impl WireGuardTransport {
         }
         let now = Instant::now();
         let Some(peer_sessions) = sessions.get_mut(&packet.peer_id) else {
-            return SessionBoundEncryption::Unavailable(packet);
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::PeerSessionsMissing,
+            };
         };
         peer_sessions.prepare_active(now);
         let Some(active) = peer_sessions.active.as_mut() else {
-            return SessionBoundEncryption::Unavailable(packet);
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::ActiveMissing,
+            };
         };
-        if active.session_instance != expected_session_instance || active.session.is_expired() {
-            return SessionBoundEncryption::Unavailable(packet);
+        if active.session_instance != expected_session_instance {
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::SessionInstanceMismatch,
+            };
+        }
+        if active.session.is_expired() {
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::SessionExpired,
+            };
         }
 
         let session_instance = active.session_instance;

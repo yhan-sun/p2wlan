@@ -80,6 +80,10 @@ android {
     }
 }
 
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+}
+
 val buildP2wlanNative by tasks.registering(Exec::class) {
     inputs.property("P2WLAN_ANDROID_ABIS", System.getenv("P2WLAN_ANDROID_ABIS") ?: "all")
     inputs.files(

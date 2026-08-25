@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.util.Log
 import org.json.JSONObject
 import java.io.File
@@ -32,6 +33,8 @@ class P2wlanVpnService : VpnService() {
         private const val RESTART_INITIAL_DELAY_MS = 1_000L
         private const val RESTART_MAX_DELAY_MS = 60_000L
         private const val MAX_AUTOMATIC_RESTARTS = 8
+        private const val HEALTHY_RUNTIME_RESET_DELAY_MS = 30_000L
+        private const val NATIVE_MONITOR_INTERVAL_MS = 250L
         const val ACTION_START = "com.example.p2wlan_flutter_client.action.START"
         const val ACTION_STOP = "com.example.p2wlan_flutter_client.action.STOP"
         const val EXTRA_REQUEST_JSON = "request_json"
@@ -56,6 +59,10 @@ class P2wlanVpnService : VpnService() {
     @Volatile
     private var monitorGeneration = 0L
     private var monitorThread: Thread? = null
+    @Volatile
+    private var nativeReadyObserved = false
+    private var nativeStartedAtElapsedMs = 0L
+    private var healthyBudgetResetRunnable: Runnable? = null
     private var lastRequestJson: String? = null
     private var restartRunnable: Runnable? = null
     private var restartAttempts = 0
@@ -69,6 +76,12 @@ class P2wlanVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        // A user-initiated START is an explicit request to try again after a
+        // previous bounded crash budget. Android service recreation has a
+        // null action and must retain the existing budget.
+        if (intent?.action == ACTION_START) {
+            restartAttempts = 0
+        }
         explicitStop = false
         val requestJson = intent?.getStringExtra(EXTRA_REQUEST_JSON)
             ?.takeIf { it.isNotBlank() }
@@ -139,8 +152,13 @@ class P2wlanVpnService : VpnService() {
             if (!nativeError.isNullOrBlank()) {
                 throw IllegalStateException(nativeError)
             }
+            nativeStartedAtElapsedMs = SystemClock.elapsedRealtime()
+            nativeReadyObserved = false
             serviceRunning = true
-            restartAttempts = 0
+            Log.i(
+                TAG,
+                "event=android_daemon_started restart_attempt=$restartAttempts",
+            )
             startNativeMonitor()
             Log.i(TAG, "P2WLAN Android VPN started")
         } catch (error: Throwable) {
@@ -151,7 +169,7 @@ class P2wlanVpnService : VpnService() {
             vpnInterface?.close()
             vpnInterface = null
             serviceRunning = false
-            if (!explicitStop && scheduleAutomaticRestart(requestJson)) {
+            if (!explicitStop && scheduleAutomaticRestart(requestJson, message)) {
                 return
             }
             stopForeground(true)
@@ -166,6 +184,8 @@ class P2wlanVpnService : VpnService() {
         cancelAutomaticRestart()
         clearPersistedStartRequest()
         serviceRunning = false
+        nativeReadyObserved = false
+        nativeStartedAtElapsedMs = 0L
         stopMonitor()
         try {
             if (P2wlanNative.isRunning()) {
@@ -187,6 +207,8 @@ class P2wlanVpnService : VpnService() {
 
     override fun onDestroy() {
         serviceRunning = false
+        nativeReadyObserved = false
+        nativeStartedAtElapsedMs = 0L
         cancelAutomaticRestart()
         stopMonitor()
         if (P2wlanNative.isRunning()) {
@@ -210,7 +232,31 @@ class P2wlanVpnService : VpnService() {
         val thread = Thread({
             try {
                 while (serviceRunning && P2wlanNative.isRunning()) {
-                    Thread.sleep(250)
+                    if (!nativeReadyObserved && P2wlanNative.isReady()) {
+                        nativeReadyObserved = true
+                        val readyAtElapsedMs = SystemClock.elapsedRealtime()
+                        mainHandler.post {
+                            if (
+                                !serviceRunning ||
+                                generation != monitorGeneration ||
+                                !P2wlanNative.isRunning() ||
+                                !P2wlanNative.isReady()
+                            ) {
+                                return@post
+                            }
+                            val startupRuntimeMs =
+                                readyAtElapsedMs - nativeStartedAtElapsedMs
+                            Log.i(
+                                TAG,
+                                "event=android_daemon_ready " +
+                                    "restart_attempt=$restartAttempts " +
+                                    "startup_runtime_ms=$startupRuntimeMs " +
+                                    "healthy_reset_delay_ms=$HEALTHY_RUNTIME_RESET_DELAY_MS",
+                            )
+                            scheduleHealthyBudgetReset(generation)
+                        }
+                    }
+                    Thread.sleep(NATIVE_MONITOR_INTERVAL_MS)
                 }
             } catch (_: InterruptedException) {
                 return@Thread
@@ -219,13 +265,26 @@ class P2wlanVpnService : VpnService() {
 
             val error = P2wlanNative.lastError()
                 ?: "Android VPN 本地 daemon 已退出，请查看诊断日志。"
+            val runtimeMs = (SystemClock.elapsedRealtime() - nativeStartedAtElapsedMs)
+                .coerceAtLeast(0L)
             mainHandler.post {
                 if (!serviceRunning || generation != monitorGeneration) return@post
+                cancelHealthyBudgetReset()
                 serviceError = error
                 serviceRunning = false
-                Log.e(TAG, error)
+                Log.e(
+                    TAG,
+                    "event=android_daemon_exited " +
+                        "restart_attempt=$restartAttempts " +
+                        "runtime_ms=$runtimeMs " +
+                        "exit_reason=${compactLogReason(error)}",
+                )
                 val requestJson = lastRequestJson
-                if (!explicitStop && requestJson != null && scheduleAutomaticRestart(requestJson)) {
+                if (
+                    !explicitStop &&
+                    requestJson != null &&
+                    scheduleAutomaticRestart(requestJson, error)
+                ) {
                     return@post
                 }
                 stopForeground(true)
@@ -240,6 +299,46 @@ class P2wlanVpnService : VpnService() {
         monitorGeneration += 1
         monitorThread?.interrupt()
         monitorThread = null
+        cancelHealthyBudgetReset()
+    }
+
+    /**
+     * Reset the crash budget only after the native daemon has reported ready
+     * and remained alive for the full health window. A successful nativeStart
+     * means only that the runtime handle was installed; it is not a healthy
+     * daemon boot.
+     */
+    private fun scheduleHealthyBudgetReset(generation: Long) {
+        cancelHealthyBudgetReset()
+        val reset = Runnable {
+            healthyBudgetResetRunnable = null
+            if (
+                !serviceRunning ||
+                generation != monitorGeneration ||
+                !nativeReadyObserved ||
+                !P2wlanNative.isRunning() ||
+                !P2wlanNative.isReady()
+            ) {
+                return@Runnable
+            }
+            val stableRuntimeMs =
+                (SystemClock.elapsedRealtime() - nativeStartedAtElapsedMs).coerceAtLeast(0L)
+            val previousAttempt = restartAttempts
+            restartAttempts = 0
+            Log.i(
+                TAG,
+                "event=android_daemon_healthy " +
+                    "previous_restart_attempt=$previousAttempt " +
+                    "stable_runtime_ms=$stableRuntimeMs",
+            )
+        }
+        healthyBudgetResetRunnable = reset
+        mainHandler.postDelayed(reset, HEALTHY_RUNTIME_RESET_DELAY_MS)
+    }
+
+    private fun cancelHealthyBudgetReset() {
+        healthyBudgetResetRunnable?.let(mainHandler::removeCallbacks)
+        healthyBudgetResetRunnable = null
     }
 
     /**
@@ -248,18 +347,21 @@ class P2wlanVpnService : VpnService() {
      * TUN and registration, while a persistent bad token does not create a
      * tight foreground-service restart loop.
      */
-    private fun scheduleAutomaticRestart(requestJson: String): Boolean {
+    private fun scheduleAutomaticRestart(requestJson: String, exitReason: String): Boolean {
         if (explicitStop || restartRunnable != null) return true
-        if (restartAttempts >= MAX_AUTOMATIC_RESTARTS) {
+        val schedule = nextAutomaticRestartSchedule(
+            currentAttempt = restartAttempts,
+            maxAttempts = MAX_AUTOMATIC_RESTARTS,
+            initialDelayMs = RESTART_INITIAL_DELAY_MS,
+            maxDelayMs = RESTART_MAX_DELAY_MS,
+        ) ?: run {
             serviceError = "Android VPN 自动重启次数已达上限，请重新点击启动。"
             Log.e(TAG, serviceError ?: "Android VPN automatic restart limit reached")
             return false
         }
 
-        restartAttempts += 1
-        val exponent = (restartAttempts - 1).coerceIn(0, 6)
-        val delayMs = (RESTART_INITIAL_DELAY_MS * (1L shl exponent))
-            .coerceAtMost(RESTART_MAX_DELAY_MS)
+        restartAttempts = schedule.attempt
+        val delayMs = schedule.delayMs
         val restart = Runnable {
             restartRunnable = null
             if (explicitStop || isRunning()) return@Runnable
@@ -268,8 +370,10 @@ class P2wlanVpnService : VpnService() {
         restartRunnable = restart
         Log.w(
             TAG,
-            "Android VPN/native daemon exited; retrying in ${delayMs}ms " +
-                "(attempt $restartAttempts/$MAX_AUTOMATIC_RESTARTS)",
+            "event=android_restart_scheduled " +
+                "retry_delay_ms=$delayMs " +
+                "restart_attempt=$restartAttempts/$MAX_AUTOMATIC_RESTARTS " +
+                "exit_reason=${compactLogReason(exitReason)}",
         )
         mainHandler.postDelayed(restart, delayMs)
         return true
@@ -292,6 +396,10 @@ class P2wlanVpnService : VpnService() {
 
     private fun clearPersistedStartRequest() {
         statePreferences().edit().remove(STATE_START_REQUEST).apply()
+    }
+
+    private fun compactLogReason(value: String): String {
+        return value.replace('\n', ' ').replace('\r', ' ').take(240)
     }
 
     private fun enrichRequest(request: JSONObject): JSONObject {

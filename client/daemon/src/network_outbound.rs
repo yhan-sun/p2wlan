@@ -628,7 +628,14 @@ async fn try_lan_direct_fast_path(
                 session_lock_wait_us,
                 crypto_us,
             } => (encrypted, session_lock_wait_us, crypto_us),
-            SessionBoundEncryption::Unavailable(packet) => {
+            SessionBoundEncryption::Unavailable { packet, reason } => {
+                debug!(
+                    event = "wireguard_session_unavailable",
+                    peer_id = %packet.peer_id,
+                    reason = reason.as_str(),
+                    expected_session_instance = entry.session_instance,
+                    "LAN Direct FastPath cache could not bind the packet to its expected session"
+                );
                 drop(emit_guard);
                 profiler.record_fast_path_invalidation();
                 fast_paths.remove(packet.peer_id.as_str());
@@ -2745,7 +2752,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::control::PeerInfo;
-    use crate::peer::REASON_PATH_RELAY_FIRST_PENDING;
     use crate::peer::REASON_PATH_DIRECT_CONFIRMED;
     use p2pnet_crypto::NodeIdentity;
     use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
