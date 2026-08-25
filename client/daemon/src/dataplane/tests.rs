@@ -98,6 +98,7 @@ use std::net::Ipv4Addr;
                         packet,
                         session_instance: None,
                         from_previous_session: false,
+                        trace: None,
                     })
                     .await
                     .expect("inbound channel closed");
@@ -184,6 +185,7 @@ use std::net::Ipv4Addr;
                 packet: packet.clone(),
                 session_instance: None,
                 from_previous_session: false,
+                trace: None,
             })
             .await
             .unwrap();
@@ -225,6 +227,7 @@ use std::net::Ipv4Addr;
                 packet,
                 session_instance: None,
                 from_previous_session: false,
+                trace: None,
             })
             .await
             .unwrap();
@@ -266,6 +269,7 @@ use std::net::Ipv4Addr;
                 packet,
                 session_instance: None,
                 from_previous_session: false,
+                trace: None,
             })
             .await
             .unwrap();
@@ -312,6 +316,7 @@ use std::net::Ipv4Addr;
                 packet,
                 session_instance: None,
                 from_previous_session: false,
+                trace: None,
             })
             .await
             .unwrap();
@@ -427,6 +432,7 @@ use std::net::Ipv4Addr;
                 packet,
                 session_instance: None,
                 from_previous_session: false,
+                trace: None,
             })
             .await
             .unwrap();

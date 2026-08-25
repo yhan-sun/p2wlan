@@ -347,6 +347,7 @@ impl Daemon {
                         sequence as u16,
                         REKEY_CONFIRMATION_PAYLOAD,
                     ),
+                    trace: None,
                 };
 
                 if let (Some(udp), Some(endpoint)) = (udp, direct_endpoint) {

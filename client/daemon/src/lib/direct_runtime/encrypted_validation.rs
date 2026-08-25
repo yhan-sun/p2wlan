@@ -1026,6 +1026,7 @@ async fn run_direct_encrypted_validation_session(
                     peer_id: peer_id.clone(),
                     dst_ip: connection.virtual_ip.clone(),
                     packet,
+                    trace: None,
                 },
                 crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
                 move |encrypted| async move {

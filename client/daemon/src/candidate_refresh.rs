@@ -53,6 +53,107 @@ mod tests {
     }
 
     #[test]
+    fn refresh_c1_periodic_wake_starts_one_full_gather() {
+        let wake = refresh_wake_reason(true, false).expect("periodic wake");
+        assert_eq!(wake, RefreshWakeReason::Periodic);
+        assert!(wake.permits_full_gather());
+    }
+
+    #[test]
+    fn refresh_c2_volatile_deadline_publishes_without_full_gather() {
+        let wake = refresh_wake_reason(false, true).expect("volatile wake");
+        assert_eq!(wake, RefreshWakeReason::VolatileDeadline);
+        assert!(!wake.permits_full_gather());
+
+        let now = Instant::now();
+        let mut coalescer = VolatilePublishCoalescer::default();
+        assert_eq!(
+            coalescer.on_churn(1, now),
+            VolatileChurnAction::SchedulePublish
+        );
+        assert_eq!(
+            coalescer.take_due(now + Duration::from_millis(500)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn refresh_c3_continuous_volatile_changes_coalesce_to_one_publish() {
+        let now = Instant::now();
+        let mut coalescer = VolatilePublishCoalescer::default();
+        let mut scheduled = 0;
+        let mut coalesced = 0;
+        for (offset_ms, hash) in [10u64, 20, 30, 40, 50].into_iter().enumerate() {
+            let action = coalescer.on_churn(hash, now + Duration::from_millis(offset_ms as u64));
+            match action {
+                VolatileChurnAction::SchedulePublish => scheduled += 1,
+                VolatileChurnAction::CoalescedNewest => coalesced += 1,
+                VolatileChurnAction::SuppressIdentical => {}
+            }
+        }
+        assert_eq!(scheduled, 1);
+        assert_eq!(coalesced, 4);
+        assert_eq!(
+            coalescer.take_due(now + Duration::from_millis(510)),
+            Some(50)
+        );
+        assert_eq!(coalescer.take_due(now + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn refresh_c4_simultaneous_periodic_and_volatile_wake_keeps_periodic_gather() {
+        let wake = refresh_wake_reason(true, true).expect("simultaneous wake");
+        assert_eq!(wake, RefreshWakeReason::Periodic);
+        assert!(wake.permits_full_gather());
+    }
+
+    #[test]
+    fn refresh_c5_sixty_seconds_has_only_periodic_full_gathers() {
+        let start = Instant::now();
+        let volatile_changes = [1u64, 5, 16, 30, 45, 59];
+        let mut coalescer = VolatilePublishCoalescer::default();
+        let mut full_gathers = 0;
+        let mut volatile_publishes = 0;
+
+        // The production worker consumes the immediate interval tick during
+        // startup. This fake-clock run therefore models periodic gathers at
+        // 15, 30, 45, and 60 seconds, while volatile deadlines are serviced
+        // independently between them.
+        for second in 0..=60u64 {
+            let now = start + Duration::from_secs(second);
+            if volatile_changes.contains(&second) {
+                coalescer.on_churn(second, now);
+            }
+            let periodic_ready = second > 0 && second % 15 == 0;
+            let volatile_ready = coalescer.pending_due(now);
+            let Some(wake) = refresh_wake_reason(periodic_ready, volatile_ready) else {
+                continue;
+            };
+
+            if volatile_ready {
+                assert!(
+                    coalescer.take_due(now).is_some(),
+                    "a ready volatile deadline must be consumed"
+                );
+                volatile_publishes += 1;
+            }
+            if wake.permits_full_gather() {
+                full_gathers += 1;
+            }
+        }
+
+        assert_eq!(
+            full_gathers, 4,
+            "only the 15-second periodic cadence gathers"
+        );
+        assert_eq!(volatile_publishes, volatile_changes.len());
+        assert!(
+            full_gathers <= 5,
+            "60-second run must not become a gather storm"
+        );
+    }
+
+    #[test]
     fn canonical_candidate_set_hash_is_order_insensitive_but_sensitive_to_content() {
         let mut sources = HashMap::new();
         sources.insert("1.2.3.4:1000".to_string(), "stun_observed".to_string());

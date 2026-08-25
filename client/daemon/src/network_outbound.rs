@@ -44,7 +44,7 @@ use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, warn};
 
 use crate::connection_timeline::ConnectionTimeline;
-use crate::dataplane::OutboundPacket;
+use crate::dataplane::{global_dataplane_profiler, OutboundPacket};
 use crate::peer::{
     NetworkPath, PathSelection, PeerManager, REASON_DIRECT_SEND_FAILED, REASON_PATH_UNAVAILABLE,
 };
@@ -746,6 +746,8 @@ async fn encrypt_then_send(
     relay_expected: bool,
 ) -> EncryptSendOutcome {
     let retry_packet = packet.clone();
+    let profiler = global_dataplane_profiler();
+    let encrypt_started = Instant::now();
     // Acquire the per-peer counter-ordering guard BEFORE the global epoch
     // gate.  Inbound relay ACK/business evidence uses the same order
     // (`emit -> epoch`); taking these in the opposite order here would let an
@@ -822,6 +824,27 @@ async fn encrypt_then_send(
         }
     };
     let encrypted = encrypted_and_guard;
+    let encrypt_completed = Instant::now();
+    if let Some(trace) = retry_packet.trace.as_ref() {
+        profiler.record(
+            trace.sampled,
+            "tun_read_to_encrypt_us",
+            encrypt_started.duration_since(trace.tun_read_completed),
+        );
+        if let Some(route_ready) = trace.route_ready {
+            profiler.record(
+                trace.sampled,
+                "route_to_encrypt_us",
+                encrypt_started.duration_since(route_ready),
+            );
+        }
+        profiler.record(
+            trace.sampled,
+            "encrypt_us",
+            encrypt_completed.duration_since(encrypt_started),
+        );
+    }
+    let transport_handoff_started = Instant::now();
     let outcome = send_encrypted_packet_bounded(
         &encrypted,
         peers,
@@ -831,6 +854,29 @@ async fn encrypt_then_send(
         relay_expected,
     )
     .await;
+    let transport_handoff_completed = Instant::now();
+    if let Some(trace) = retry_packet.trace.as_ref() {
+        let total_userspace_tx =
+            transport_handoff_completed.duration_since(trace.tun_read_completed);
+        profiler.record(
+            trace.sampled,
+            "encrypt_to_send_us",
+            transport_handoff_started.duration_since(encrypt_completed),
+        );
+        profiler.record(trace.sampled, "total_userspace_tx_us", total_userspace_tx);
+        if total_userspace_tx >= crate::dataplane::DATAPLANE_STALL_THRESHOLD {
+            debug!(
+                event = "dataplane_stall",
+                peer_id = %retry_packet.peer_id,
+                active_path = if peers.is_direct_sync(&retry_packet.peer_id) { "direct" } else { "relay_or_unknown" },
+                tun_to_send_us = total_userspace_tx.as_micros() as u64,
+                receive_to_tun_us = 0u64,
+                candidate_gather_active = profiler.candidate_gather_active(),
+                network_generation = expected_generation,
+                "outbound encrypted dataplane packet exceeded the diagnostic stall threshold"
+            );
+        }
+    }
     if let Some((nonce, sequence, direction)) = overlay_packet_identity(&retry_packet.packet) {
         let outcome_label = match &outcome {
             SendOutcome::Sent => "sent",
@@ -2072,6 +2118,7 @@ mod tests {
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: vec![0x45, 0x00, 0x00, 0x14],
+                trace: None,
             },
             &transport,
             &manager,
@@ -2106,6 +2153,7 @@ mod tests {
             peer_id: "peer-a".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: vec![0x45, 0, 0, 20],
+            trace: None,
         }));
 
         let (_peer_id, remaining) = flush_one_peer(
@@ -2139,6 +2187,7 @@ mod tests {
                 peer_id: "peer-a".to_string(),
                 dst_ip: "10.20.0.2".to_string(),
                 packet: vec![sequence],
+                trace: None,
             }
         }
 
