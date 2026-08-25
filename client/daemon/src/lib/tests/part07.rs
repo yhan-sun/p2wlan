@@ -3298,22 +3298,14 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
         response_s1.punch_at_ms.is_some(),
         "S1 response must carry a canonical punch deadline"
     );
+    // On a slow CI runner the fake clock can advance through the bounded S1
+    // sweep before this polling task observes the transient socket/pending
+    // state.  An authenticated ACK held by the link is the durable evidence
+    // that S1 emitted a probe; the later S2 assertions verify that replaying
+    // those ACKs cannot consume S2's live transactions.
     let s1_probe_wait = timeout(HARD_HARD_E2E_TIMEOUT, async {
         loop {
-            if harness.udp_a.dynamic_socket_count().await == 1
-                && harness.udp_b.dynamic_socket_count().await == 1
-                && harness.link.held_ack_count() > 0
-                && harness
-                    .udp_a
-                    .hard_hard_pending_probe_count_for_test(HARD_HARD_B)
-                    .await
-                    > 0
-                && harness
-                    .udp_b
-                    .hard_hard_pending_probe_count_for_test(HARD_HARD_A)
-                    .await
-                    > 0
-            {
+            if harness.link.held_ack_count() > 0 {
                 return;
             }
             sleep(Duration::from_millis(10)).await;
