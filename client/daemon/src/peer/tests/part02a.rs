@@ -402,7 +402,6 @@ async fn remote_incarnation_change_resets_but_same_boot_candidate_refresh_does_n
     // wall clock. The flag/high-field layout is the wire compatibility
     // contract: incarnation is above the 21-bit per-boot counter.
     let old_generation = 0x4000_0000_0000_0000u64 | (1000u64 << 21) | 1;
-    let same_boot_refresh = 0x4000_0000_0000_0000u64 | (1000u64 << 21) | 2;
     let new_boot_generation = 0x4000_0000_0000_0000u64 | (1001u64 << 21) | 1;
     let replayed_old_boot_generation = 0x4000_0000_0000_0000u64 | (999u64 << 21) | 99;
     manager
@@ -420,28 +419,47 @@ async fn remote_incarnation_change_resets_but_same_boot_candidate_refresh_does_n
     manager
         .record_direct_success("peer-incarnation", Some(endpoint))
         .await;
-    assert!(
-        !manager
-            .reset_peer_session_if_remote_incarnation_changed(
-                "peer-incarnation",
-                same_boot_refresh,
-                "same_boot_candidate_refresh",
-            )
-            .await
-    );
-    assert_eq!(
-        manager
-            .get_connection("peer-incarnation")
-            .await
-            .unwrap()
-            .state,
-        ConnectionState::Direct
-    );
-    assert_eq!(
-        manager.peer_session_snapshot_for_test("peer-incarnation"),
-        Some(old_session),
-        "same remote incarnation candidate refresh must retain lifecycle"
-    );
+    for counter in 2..=101 {
+        let same_boot_refresh = 0x4000_0000_0000_0000u64 | (1000u64 << 21) | counter;
+        let refreshed_endpoint = format!("1.2.3.4:{}", 5000 + counter);
+        assert_eq!(
+            manager
+                .add_candidates_with_metadata(
+                    "peer-incarnation",
+                    &[refreshed_endpoint],
+                    &HashMap::new(),
+                    same_boot_refresh,
+                    None,
+                )
+                .await,
+            CandidateSetApplyResult::Applied,
+            "same-incarnation AddressOrPortDependent refresh {counter} must apply"
+        );
+        assert!(
+            !manager
+                .reset_peer_session_if_remote_incarnation_changed(
+                    "peer-incarnation",
+                    same_boot_refresh,
+                    "same_boot_candidate_refresh",
+                )
+                .await,
+            "same remote incarnation refresh {counter} must not reset the peer session"
+        );
+        assert_eq!(
+            manager
+                .get_connection("peer-incarnation")
+                .await
+                .unwrap()
+                .state,
+            ConnectionState::Direct,
+            "active Direct transport must survive refresh {counter}"
+        );
+        assert_eq!(
+            manager.peer_session_snapshot_for_test("peer-incarnation"),
+            Some(old_session),
+            "same-incarnation refresh {counter} must retain the authenticated peer lifecycle"
+        );
+    }
     assert!(
         !manager
             .reset_peer_session_if_remote_incarnation_changed(

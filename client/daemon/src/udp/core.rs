@@ -26,9 +26,16 @@ pub(crate) enum DirectValidationSendError {
 type RemoteIncarnationCleanupGateSlot =
     Arc<std::sync::Mutex<Option<(String, Arc<RemoteIncarnationCleanupGate>)>>>;
 
+static NEXT_UDP_TRANSPORT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
+    /// Process-local identity of this concrete UDP publication. Clones keep
+    /// the identity; a newly bound/replaced transport gets a new one, so a
+    /// cached fast-path socket index can never silently carry across a
+    /// publication replacement that reused the same index.
+    transport_instance_id: u64,
     /// The primary socket is used for STUN and remains the single-socket
     /// fallback. Additional sockets, when explicitly enabled, are only used
     /// for bounded symmetric-NAT traversal experiments.
@@ -171,6 +178,7 @@ impl UdpTransport {
             .await;
 
         Ok(Self {
+            transport_instance_id: NEXT_UDP_TRANSPORT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             socket: Arc::new(socket),
             sockets: Arc::new(Vec::new()),
             outbound_interface: outbound_interface.map(Arc::<str>::from),
@@ -224,6 +232,12 @@ impl UdpTransport {
     /// Interface currently enforced for public UDP egress, if any.
     pub fn outbound_interface(&self) -> Option<&str> {
         self.outbound_interface.as_deref()
+    }
+
+    /// Stable identity for this concrete UDP publication. It is diagnostic
+    /// and cache-fencing metadata only; it is never sent on the wire.
+    pub(crate) fn transport_instance_id(&self) -> u64 {
+        self.transport_instance_id
     }
 
     #[cfg(test)]
@@ -463,6 +477,33 @@ impl UdpTransport {
             .get_mut(socket_index)
         {
             update(diagnostics);
+        }
+    }
+
+    /// Best-effort diagnostics update for the encrypted business-packet path.
+    ///
+    /// The UDP receive loop must not wait for a diagnostics mutex before it
+    /// hands an authenticated-encrypted candidate to the bounded transport
+    /// queue. Probe/control packets may use the awaited helper above because
+    /// they are not on the normal data path; business packets use this helper
+    /// only after enqueue and silently skip a contended sample.
+    fn update_socket_diagnostics_try(
+        &self,
+        socket_index: usize,
+        update: impl FnOnce(&mut UdpSocketPoolMemberDiagnostics),
+    ) {
+        if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
+            if let Ok(mut diagnostics) = self.dynamic_socket_diagnostics.try_lock() {
+                if let Some(metrics) = diagnostics.get_mut(&socket_index) {
+                    update(metrics);
+                }
+            }
+            return;
+        }
+        if let Ok(mut diagnostics) = self.socket_pool_diagnostics.try_lock() {
+            if let Some(metrics) = diagnostics.get_mut(socket_index) {
+                update(metrics);
+            }
         }
     }
 

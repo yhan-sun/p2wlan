@@ -17,6 +17,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::control::ControlClient;
+use crate::dataplane::global_dataplane_profiler;
 use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};

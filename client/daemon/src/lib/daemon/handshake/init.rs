@@ -15,13 +15,14 @@ impl Daemon {
                     "Android VPN TUN fd was not supplied by VpnService".to_string(),
                 )
             })?;
-            let tun = TunDevice::from_raw_fd(fd, &config)
+            let tun = TunDevice::from_raw_fd_with_mode(fd, &config, self.android_tun_mode)
                 .map_err(|e| DaemonError::Network(format!("failed to attach Android VPN TUN: {e}")))?;
             info!(
-                "Android VPN TUN {} is attached at logical address {} MTU {}",
+                "Android VPN TUN {} is attached at logical address {} MTU {} mode={:?}",
                 tun.name(),
                 tun.address(),
-                tun.mtu()
+                tun.mtu(),
+                self.android_tun_mode,
             );
             Ok(Some(tun))
         }

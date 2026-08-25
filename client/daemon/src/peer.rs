@@ -493,9 +493,9 @@ use probe_budget::{
     is_priority_outbound_probe_pair, is_speculative_probe_source, outbound_probe_priority_rank,
 };
 pub use types::{
-    CandidatePair, CandidatePairSource, CandidatePairState, ConnectionState, DirectPathType,
-    DirectTraversalEvent, DirectValidationEventMetadata, NetworkPath, PathHealth, PathScore,
-    PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
+    ActivePathSnapshot, CandidatePair, CandidatePairSource, CandidatePairState, ConnectionState,
+    DirectPathType, DirectTraversalEvent, DirectValidationEventMetadata, NetworkPath, PathHealth,
+    PathScore, PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
 };
 
 include!("peer/connection/core.rs");

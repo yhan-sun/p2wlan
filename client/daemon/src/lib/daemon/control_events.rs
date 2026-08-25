@@ -265,7 +265,21 @@ impl Daemon {
                 } else {
                     punch_attempts.cancel(&peer_id);
                 }
-                transport.remove_session(&peer_id).await;
+                info!(
+                    event = "peer_restart_detected",
+                    peer_id = %peer_id,
+                    old_incarnation,
+                    new_incarnation = claimed_incarnation,
+                    caller = "control_events.remote_incarnation_responder",
+                    "remote daemon incarnation advanced; rotating the peer session"
+                );
+                transport
+                    .remove_session_with_reason(
+                        &peer_id,
+                        "remote_incarnation_changed",
+                        "control_events.remote_incarnation_responder",
+                    )
+                    .await;
                 let udp_slot = udp_transport.read().await;
                 let changed = if let Some(udp) = udp_slot.clone() {
                     // Keep the UDP adoption fence held from old-session cleanup
@@ -366,7 +380,21 @@ impl Daemon {
         } else {
             self.punch_attempts.cancel(peer_id);
         }
-        self.transport.remove_session(peer_id).await;
+        info!(
+            event = "peer_restart_detected",
+            peer_id = %peer_id,
+            old_incarnation,
+            new_incarnation = claimed_incarnation,
+            caller = "control_events.remote_incarnation",
+            "remote daemon incarnation advanced; rotating the peer session"
+        );
+        self.transport
+            .remove_session_with_reason(
+                peer_id,
+                "remote_incarnation_changed",
+                "control_events.remote_incarnation",
+            )
+            .await;
         let udp_slot = self.udp_transport.read().await;
         let changed = if let Some(udp) = udp_slot.clone() {
             udp.cleanup_peer_lifecycle_and_finish_remote_incarnation_reset(
@@ -2387,7 +2415,13 @@ impl Daemon {
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
-                            self.transport.remove_session(&peer_info.node_id).await;
+                            self.transport
+                                .remove_session_with_reason(
+                                    &peer_info.node_id,
+                                    "peer_offline",
+                                    "control_events.peer_updated_offline",
+                                )
+                                .await;
                             self.pending_handshakes
                                 .lock()
                                 .await
@@ -2434,7 +2468,13 @@ impl Daemon {
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
-                            self.transport.remove_session(&peer_info.node_id).await;
+                            self.transport
+                                .remove_session_with_reason(
+                                    &peer_info.node_id,
+                                    "public_key_changed",
+                                    "control_events.peer_updated_public_key",
+                                )
+                                .await;
                             self.pending_handshakes
                                 .lock()
                                 .await
@@ -2604,7 +2644,13 @@ impl Daemon {
                             // offer staging. It never holds the arbiter across the
                             // subsequent UDP lifecycle cleanup.
                             let _handshake_guard = self.handshake_arbiter.acquire(&node_id).await;
-                            self.transport.remove_session(&node_id).await;
+                            self.transport
+                                .remove_session_with_reason(
+                                    &node_id,
+                                    "peer_left",
+                                    "control_events.peer_left",
+                                )
+                                .await;
                             self.pending_handshakes.lock().await.clear_peer(&node_id);
                         }
                         // Keep the slot read guard through the selected cleanup.

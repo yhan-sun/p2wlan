@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
+use crate::dataplane::global_dataplane_profiler;
 use crate::error::{DaemonError, Result};
 use crate::peer::{is_public_probe_endpoint, PeerManager, ProbeKeyRole, REASON_DIRECT_SEND_FAILED};
 use crate::transport::{

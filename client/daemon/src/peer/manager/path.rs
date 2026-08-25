@@ -172,6 +172,87 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
+    /// Publish the cheap immutable state needed to enter the LAN Direct fast
+    /// path.  This is intentionally narrower than ordinary data-path
+    /// selection: only a selected, recently healthy, on-link Host pair is
+    /// eligible.  Public Direct and relay-first Direct continue through the
+    /// existing selector/admission path until a later phase proves they are
+    /// safe to specialize as well.
+    pub(crate) async fn active_direct_path_snapshot(
+        &self,
+        node_id: &str,
+        generation: u64,
+        prefer_direct: bool,
+    ) -> Option<ActivePathSnapshot> {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        self.active_direct_path_snapshot_in_epoch(node_id, generation, prefer_direct)
+            .await
+    }
+
+    /// Build the LAN Direct snapshot while the caller already owns the
+    /// network-epoch gate.  No network I/O or transport await is performed
+    /// while the gate is held; the only await is the short connection-map
+    /// read used to publish one coherent path state.
+    pub(crate) async fn active_direct_path_snapshot_in_epoch(
+        &self,
+        node_id: &str,
+        generation: u64,
+        prefer_direct: bool,
+    ) -> Option<ActivePathSnapshot> {
+        if generation != self.current_network_generation_sync()
+            || self.config.relay.effective_path_policy(prefer_direct)
+                == crate::config::PathPolicy::RelayOnly
+        {
+            return None;
+        }
+
+        let peer_session_generation = self.peer_session_generation_sync(node_id)?;
+        let connections = self.connections.read().await;
+        let connection = connections.get(node_id)?;
+        if !connection.online
+            || connection.state != ConnectionState::Direct
+            || connection.direct_generation != generation
+            || !connection.direct_is_healthy_confirmed()
+        {
+            return None;
+        }
+
+        // Use the already-selected pair, not the general candidate sorter.
+        // The sorter is exactly the per-packet work this snapshot removes.
+        let endpoint = connection.selected_direct_endpoint_for_consent(generation)?;
+        if !connection.is_on_link_host_candidate(endpoint) {
+            return None;
+        }
+
+        Some(ActivePathSnapshot {
+            path: NetworkPath::Direct,
+            generation,
+            direct_commit_seq: connection.direct_commit_seq,
+            peer_session_generation,
+            endpoint,
+        })
+    }
+
+    /// Short synchronous validation for a cached LAN Direct snapshot. Every
+    /// mirror consulted here is published under the same network-epoch
+    /// critical section as its authoritative state transition, so a successful
+    /// check cannot allocate a counter for an already-committed stale
+    /// generation, lifecycle or Direct commit. The mirrors use short
+    /// process-local mutexes; no async connection-map lock or network await is
+    /// taken on the steady-state path.
+    pub(crate) fn active_direct_path_snapshot_is_current_sync(
+        &self,
+        node_id: &str,
+        snapshot: ActivePathSnapshot,
+    ) -> bool {
+        snapshot.path == NetworkPath::Direct
+            && snapshot.generation == self.current_network_generation_sync()
+            && self.peer_session_is_current_sync(node_id, snapshot.peer_session_generation)
+            && self.is_direct_sync(node_id)
+            && self.direct_commit_seq_sync(node_id) == Some(snapshot.direct_commit_seq)
+    }
+
     /// Whether direct retry suppression has expired for diagnostics/probing.
     pub async fn direct_retry_due(&self, node_id: &str, retry_after: Duration) -> bool {
         let Some(conn) = self.connections.read().await.get(node_id).cloned() else {

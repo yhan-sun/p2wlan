@@ -32,6 +32,7 @@ use tokio::sync::watch;
 
 use p2pnet_daemon::config::{Config, ControlProxyMode};
 use p2pnet_daemon::Daemon;
+use p2pnet_tun::AndroidTunMode;
 
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_CONTROL_SERVER: &str = "http://47.109.40.237:18080";
@@ -73,6 +74,12 @@ struct AndroidStartRequest {
     log_path: String,
     #[serde(default)]
     diagnostics_auth_path: String,
+    #[serde(default = "default_android_tun_mode")]
+    android_tun_mode: String,
+}
+
+fn default_android_tun_mode() -> String {
+    "async_fd".to_string()
 }
 
 #[derive(Clone)]
@@ -461,6 +468,13 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
             return Err(error);
         }
     };
+    let tun_mode = match request.android_tun_mode.parse::<AndroidTunMode>() {
+        Ok(mode) => mode,
+        Err(error) => {
+            close_raw_fd(tun_fd);
+            return Err(error);
+        }
+    };
     let log_path = config
         .diagnostics
         .log_path
@@ -493,7 +507,7 @@ fn start_runtime(tun_fd: jint, request: AndroidStartRequest) -> Result<(), Strin
                 // before the first control request is sent.
                 let mut daemon = {
                     let _runtime_guard = runtime.enter();
-                    let mut daemon = Daemon::new_with_android_tun(config, tun_fd);
+                    let mut daemon = Daemon::new_with_android_tun_mode(config, tun_fd, tun_mode);
                     fd_owned_by_thread = false;
                     daemon.set_android_startup_ready(Arc::clone(&ready_for_thread));
                     let handle = RuntimeHandle {

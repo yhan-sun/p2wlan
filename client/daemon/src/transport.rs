@@ -517,6 +517,49 @@ pub struct EncryptedPeerPacket {
     pub is_business: bool,
 }
 
+/// Why a FastPath session-bound encryption attempt could not use its cached
+/// session. These reasons are intentionally narrower than a generic
+/// "unavailable" result so lifecycle churn can be correlated with Android
+/// daemon restarts and remote-incarnation cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionUnavailableReason {
+    PeerSessionsMissing,
+    ActiveMissing,
+    SessionInstanceMismatch,
+    SessionExpired,
+}
+
+impl SessionUnavailableReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerSessionsMissing => "peer_sessions_missing",
+            Self::ActiveMissing => "active_missing",
+            Self::SessionInstanceMismatch => "session_instance_mismatch",
+            Self::SessionExpired => "session_expired",
+        }
+    }
+}
+
+/// Result of an encryption attempt that is bound to one cached session
+/// instance. Returning the plaintext on a stale-session miss avoids a
+/// per-packet clone on the successful LAN fast path while preserving the
+/// existing slow-path FIFO fallback.
+pub(crate) enum SessionBoundEncryption {
+    Encrypted {
+        packet: EncryptedPeerPacket,
+        session_lock_wait_us: u64,
+        crypto_us: u64,
+    },
+    Unavailable {
+        packet: OutboundPacket,
+        reason: SessionUnavailableReason,
+    },
+    Failed {
+        packet: OutboundPacket,
+        error: DaemonError,
+    },
+}
+
 /// An encrypted WireGuard packet received from UDP or relay transport.
 #[derive(Debug, Clone)]
 pub struct ReceivedEncryptedPacket {
@@ -557,6 +600,18 @@ pub struct ReceivedEncryptedPacket {
     /// then mislabeled as evidence for the newer generation. Standalone unit
     /// callers may leave it unset for backwards-compatible transport tests.
     pub network_generation: Option<u64>,
+    /// Whether this envelope is part of the low-overhead dataplane sample.
+    /// UDP/relay readers stamp it once so the same sample follows both
+    /// encrypted-ingress queues and the final TUN write without incrementing
+    /// the global sampler at every boundary.
+    pub(crate) profile_sampled: bool,
+    /// Completed UDP/relay receive boundary. UDP sets this immediately after
+    /// the socket read; relay packets use the same field at frame receipt.
+    pub(crate) udp_received: Option<Instant>,
+    /// Timestamp immediately before this envelope enters the transport
+    /// decrypt queue. A send that waits for capacity is intentionally included
+    /// in the queue/scheduler measurement.
+    pub(crate) transport_queue_send_started: Option<Instant>,
     /// Serialized WireGuard transport message.
     pub wire_bytes: Vec<u8>,
 }
@@ -1631,8 +1686,13 @@ impl WireGuardTransport {
         }
     }
 
-    /// Remove a peer session.
-    pub async fn remove_session(&self, peer_id: &str) {
+    /// Remove a peer session with a structured lifecycle cause.
+    pub async fn remove_session_with_reason(
+        &self,
+        peer_id: &str,
+        reason: &'static str,
+        caller: &'static str,
+    ) {
         // A session flush may already have removed its queue and be forwarding
         // raw packets. Wait for that per-peer ingress turn before clearing the
         // session/backlog, so a live packet cannot be inserted behind a
@@ -1655,9 +1715,11 @@ impl WireGuardTransport {
                 .map(|item| item.packet.packet.len())
                 .sum::<usize>()
         });
-        debug!(
+        info!(
             event = "wireguard_session_removed",
             peer_id = %peer_id,
+            reason,
+            caller,
             removed_session,
             removed_queue_packets,
             removed_queue_bytes,
@@ -1684,6 +1746,14 @@ impl WireGuardTransport {
         }
         self.promoted_responder_tokens.lock().await.remove(peer_id);
         self.remove_idle_outbound_emit_lock(peer_id).await;
+    }
+
+    /// Compatibility wrapper for tests and legacy callers. Production
+    /// lifecycle boundaries should use `remove_session_with_reason` so a
+    /// session disappearance can be correlated with the caller that caused it.
+    pub async fn remove_session(&self, peer_id: &str) {
+        self.remove_session_with_reason(peer_id, "unspecified", "legacy_callsite")
+            .await;
     }
 
     /// Return whether a peer has an encrypting session.
@@ -1810,6 +1880,108 @@ impl WireGuardTransport {
         self.encrypt_outbound_inner(packet, false, true).await
     }
 
+    /// Encrypt a business packet only if the cached active session instance
+    /// is still installed.  The caller owns the per-peer emit guard and the
+    /// network-epoch gate, so this method takes only the short sessions lock;
+    /// it never performs network I/O while either ordering guard is held.
+    pub(crate) async fn encrypt_outbound_with_emit_guard_for_session(
+        &self,
+        packet: OutboundPacket,
+        expected_session_instance: u64,
+    ) -> SessionBoundEncryption {
+        let profiler = global_dataplane_profiler();
+        let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
+        let session_lock_started = Instant::now();
+        let mut sessions = self.sessions.lock().await;
+        let session_lock_acquired = Instant::now();
+        let session_lock_wait_us = session_lock_acquired
+            .duration_since(session_lock_started)
+            .as_micros() as u64;
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_session_lock_wait_us",
+                Duration::from_micros(session_lock_wait_us),
+            );
+        }
+        let now = Instant::now();
+        let Some(peer_sessions) = sessions.get_mut(&packet.peer_id) else {
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::PeerSessionsMissing,
+            };
+        };
+        peer_sessions.prepare_active(now);
+        let Some(active) = peer_sessions.active.as_mut() else {
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::ActiveMissing,
+            };
+        };
+        if active.session_instance != expected_session_instance {
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::SessionInstanceMismatch,
+            };
+        }
+        if active.session.is_expired() {
+            return SessionBoundEncryption::Unavailable {
+                packet,
+                reason: SessionUnavailableReason::SessionExpired,
+            };
+        }
+
+        let session_instance = active.session_instance;
+        let crypto_started = Instant::now();
+        let wire_bytes = match active.session.encrypt_to_bytes(&packet.packet) {
+            Ok(wire_bytes) => wire_bytes,
+            Err(error) => {
+                return SessionBoundEncryption::Failed {
+                    packet,
+                    error: DaemonError::Peer(format!("WireGuard encrypt failed: {error}")),
+                };
+            }
+        };
+        let crypto_us = crypto_started.elapsed().as_micros() as u64;
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_crypto_exec_us",
+                Duration::from_micros(crypto_us),
+            );
+        }
+        debug!(
+            event = "wireguard_outbound_counter_allocated",
+            peer_id = %packet.peer_id,
+            session_instance,
+            counter = ?wire_counter(&wire_bytes),
+            bytes = wire_bytes.len(),
+            is_business = true,
+            wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
+            "WireGuard counter allocated under the LAN Direct fast-path ordering lock"
+        );
+        let encrypted = EncryptedPeerPacket {
+            peer_id: packet.peer_id,
+            dst_ip: packet.dst_ip,
+            wire_bytes,
+            is_business: true,
+        };
+        let session_lock_hold_us = session_lock_acquired.elapsed().as_micros() as u64;
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_session_lock_hold_us",
+                Duration::from_micros(session_lock_hold_us),
+            );
+        }
+        drop(sessions);
+        SessionBoundEncryption::Encrypted {
+            packet: encrypted,
+            session_lock_wait_us,
+            crypto_us,
+        }
+    }
+
     async fn outbound_emit_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.outbound_emit_locks.lock().await;
         if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
@@ -1854,7 +2026,18 @@ impl WireGuardTransport {
         queue_if_unavailable: bool,
         is_business: bool,
     ) -> Result<Option<EncryptedPeerPacket>> {
+        let profiler = global_dataplane_profiler();
+        let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
+        let session_lock_started = Instant::now();
         let mut sessions = self.sessions.lock().await;
+        let session_lock_acquired = Instant::now();
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_session_lock_wait_us",
+                session_lock_acquired.duration_since(session_lock_started),
+            );
+        }
         let now = Instant::now();
         let Some(peer_sessions) = sessions.get_mut(&packet.peer_id) else {
             drop(sessions);
@@ -1901,10 +2084,18 @@ impl WireGuardTransport {
         }
 
         let session_instance = active.session_instance;
-        let wire_bytes = active
-            .session
-            .encrypt_to_bytes(&packet.packet)
-            .map_err(|e| DaemonError::Peer(format!("WireGuard encrypt failed: {e}")))?;
+        let crypto_started = Instant::now();
+        let wire_result = active.session.encrypt_to_bytes(&packet.packet);
+        let crypto_us = crypto_started.elapsed().as_micros() as u64;
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_crypto_exec_us",
+                Duration::from_micros(crypto_us),
+            );
+        }
+        let wire_bytes =
+            wire_result.map_err(|e| DaemonError::Peer(format!("WireGuard encrypt failed: {e}")))?;
         debug!(
             event = "wireguard_outbound_counter_allocated",
             peer_id = %packet.peer_id,
@@ -1915,6 +2106,13 @@ impl WireGuardTransport {
             wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
             "WireGuard counter allocated under the per-peer emit ordering lock"
         );
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_session_lock_hold_us",
+                session_lock_acquired.elapsed(),
+            );
+        }
         drop(sessions);
 
         Ok(Some(EncryptedPeerPacket {
@@ -2010,20 +2208,68 @@ impl WireGuardTransport {
     /// Forward a live raw TUN packet through the same per-peer ingress turn as
     /// session-ready backlog flushing. If a backlog exists, append behind it;
     /// otherwise hand the packet to the network-outbound worker immediately.
-    async fn forward_raw_outbound(&self, packet: OutboundPacket) -> Result<()> {
+    async fn forward_raw_outbound(&self, mut packet: OutboundPacket) -> Result<()> {
         let peer_id = packet.peer_id.clone();
+        let profiler = global_dataplane_profiler();
+        let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
+        let ingress_wait_started = Instant::now();
         let ingress_lock = self.outbound_ingress_lock(&peer_id).await;
         let _ingress_guard = ingress_lock.lock().await;
+        let ingress_guard_acquired = Instant::now();
+        if let Some(trace) = packet.trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "tx_outbound_ingress_lock_wait_us",
+                ingress_wait_started.elapsed(),
+            );
+        }
+        let pending_lock_started = Instant::now();
         let has_pending = self.pending_outbound.lock().await.contains_key(&peer_id);
+        if let Some(trace) = packet.trace.as_ref() {
+            profiler.record(
+                trace.sampled,
+                "tx_pending_queue_lock_wait_us",
+                pending_lock_started.elapsed(),
+            );
+        }
         if has_pending {
             self.queue_pending_outbound_locked(packet, "session backlog flush in progress")
                 .await;
+            if let Some(sampled) = sampled {
+                profiler.record(
+                    sampled,
+                    "tx_outbound_ingress_lock_hold_us",
+                    ingress_guard_acquired.elapsed(),
+                );
+            }
             return Ok(());
         }
-        self.outbound_tx
+        let queue_send_started = Instant::now();
+        if let Some(trace) = packet.trace.as_mut() {
+            trace.transport_queue_send_started = Some(queue_send_started);
+        }
+        if let Some(trace) = packet.trace.as_ref() {
+            profiler.record_value(
+                trace.sampled,
+                "tx_network_outbound_queue_depth_before_send",
+                self.outbound_tx
+                    .max_capacity()
+                    .saturating_sub(self.outbound_tx.capacity()) as u64,
+            );
+        }
+        let result = self
+            .outbound_tx
             .send(packet)
             .await
-            .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()))
+            .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()));
+        if let Some(sampled) = sampled {
+            profiler.record(
+                sampled,
+                "tx_outbound_ingress_lock_hold_us",
+                ingress_guard_acquired.elapsed(),
+            );
+        }
+        result
     }
 
     pub(crate) async fn flush_pending_outbound_for_peer(&self, peer_id: &str) {
@@ -2396,7 +2642,24 @@ impl WireGuardTransport {
         &self,
         mut outbound_rx: mpsc::Receiver<OutboundPacket>,
     ) -> Result<()> {
-        while let Some(packet) = outbound_rx.recv().await {
+        while let Some(mut packet) = outbound_rx.recv().await {
+            let profiler = global_dataplane_profiler();
+            let transport_dequeued = Instant::now();
+            if let Some(trace) = packet.trace.as_mut() {
+                trace.transport_queue_dequeued = Some(transport_dequeued);
+                profiler.record_value(
+                    trace.sampled,
+                    "tx_dataplane_queue_depth",
+                    outbound_rx.len() as u64,
+                );
+                if let Some(enqueued) = trace.dataplane_queue_send_started {
+                    profiler.record(
+                        trace.sampled,
+                        "tx_dataplane_queue_wait_us",
+                        transport_dequeued.duration_since(enqueued),
+                    );
+                }
+            }
             self.forward_raw_outbound(packet).await?;
         }
         Ok(())
@@ -2493,8 +2756,27 @@ impl WireGuardTransport {
     ) -> Result<()> {
         while let Some(packet) = encrypted_rx.recv().await {
             let profiler = global_dataplane_profiler();
-            let sampled = profiler.sample_next_packet();
+            let sampled = packet.profile_sampled;
             let transport_dequeued = Instant::now();
+            profiler.record_value(
+                sampled,
+                "rx_transport_inbound_queue_depth",
+                encrypted_rx.len() as u64,
+            );
+            if let Some(enqueued) = packet.transport_queue_send_started {
+                profiler.record(
+                    sampled,
+                    "rx_transport_queue_wait_us",
+                    transport_dequeued.duration_since(enqueued),
+                );
+            }
+            if let Some(udp_received) = packet.udp_received {
+                profiler.record(
+                    sampled,
+                    "rx_udp_receive_to_decrypt_us",
+                    Instant::now().duration_since(udp_received),
+                );
+            }
             let source = packet.source;
             let local_endpoint = packet.local_endpoint;
             let relay_endpoint = packet.relay_endpoint;
@@ -2524,6 +2806,11 @@ impl WireGuardTransport {
                     let decrypt_completed = Instant::now();
                     profiler.record(
                         sampled,
+                        "rx_decrypt_us",
+                        decrypt_completed.duration_since(decrypt_started),
+                    );
+                    profiler.record(
+                        sampled,
                         "transport_queue_to_decrypt_us",
                         decrypt_started.duration_since(transport_dequeued),
                     );
@@ -2534,8 +2821,13 @@ impl WireGuardTransport {
                     );
                     inbound.trace = Some(DataplaneRxTrace {
                         sampled,
+                        udp_received: packet.udp_received,
+                        transport_queue_send_started: packet.transport_queue_send_started,
                         transport_dequeued,
+                        decrypt_started,
                         decrypt_completed,
+                        inbound_queue_send_started: None,
+                        inbound_queue_dequeued: None,
                     });
                     debug!(
                         event = "wireguard_inbound_decrypt_succeeded",
@@ -3315,6 +3607,32 @@ impl WireGuardTransport {
                                 }
                             }
                         }
+                    }
+                    let validation_completed = Instant::now();
+                    // Decryption proves the packet belongs to a peer. This
+                    // separate stage covers only the post-decrypt generation,
+                    // session, path-evidence, and overlay-validation work
+                    // before the packet enters the TUN-facing queue.
+                    profiler.record(
+                        sampled,
+                        "rx_postdecrypt_evidence_us",
+                        validation_completed.duration_since(decrypt_completed),
+                    );
+                    profiler.record(
+                        sampled,
+                        "rx_generation_session_validation_us",
+                        validation_completed.duration_since(decrypt_completed),
+                    );
+                    if let Some(trace) = inbound.trace.as_mut() {
+                        trace.inbound_queue_send_started = Some(Instant::now());
+                        profiler.record_value(
+                            trace.sampled,
+                            "rx_dataplane_inbound_queue_depth_before_send",
+                            inbound_tx
+                                .max_capacity()
+                                .saturating_sub(inbound_tx.capacity())
+                                as u64,
+                        );
                     }
                     inbound_tx.send(inbound).await.map_err(|_| {
                         DaemonError::Network("inbound packet channel closed".to_string())
