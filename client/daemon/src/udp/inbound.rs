@@ -441,6 +441,7 @@ impl UdpTransport {
                 let received_local_generation = self.peers.current_network_generation().await;
                 match packet.kind {
                     PunchPacketKind::Punch => {
+                        let mut hard_hard_winner_promoted = false;
                         // Bind every effect of the authenticated packet to the
                         // exact peer lifecycle that owned the MAC key.  The
                         // lifecycle writers use the shared epoch gate while
@@ -531,7 +532,7 @@ impl UdpTransport {
                                 if let Some(token) =
                                     self.hard_hard_socket_token(socket_index).await
                                 {
-                                    let _ = self
+                                    hard_hard_winner_promoted = self
                                         .promote_hard_hard_winner_in_epoch(
                                             &epoch_guard,
                                             &identity.source_node_id,
@@ -690,6 +691,19 @@ impl UdpTransport {
                                 source,
                             )
                             .await;
+                            if hard_hard_winner_promoted {
+                                // The peer-reflexive worker also submits this
+                                // observation, but it is asynchronous.  A
+                                // newly selected Hard↔Hard winner must get a
+                                // validation ingress on the already-finalized
+                                // socket before the short rendezvous cleanup
+                                // can race that worker.
+                                self.trigger_encrypted_validation(
+                                    &identity.source_node_id,
+                                    source,
+                                )
+                                .await;
+                            }
                         } else {
                             debug!(
                                 "Received authenticated UDP punch from peer {} at {} without an ACK",

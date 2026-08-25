@@ -941,6 +941,12 @@ pub(crate) struct HardHardBirthdaySocket {
 /// Result of a bounded high-entropy rendezvous. Candidate endpoints are
 /// deterministic, token-scoped guesses; they are not an unbounded port scan.
 pub(crate) struct HardHardBirthdayResult {
+    /// The negotiated level requested by the recovery stage before the
+    /// process-wide dynamic-socket cap was applied.
+    pub(crate) requested_level: usize,
+    /// The source-socket count implied by `requested_level`.
+    pub(crate) requested_socket_count: usize,
+    /// The level actually sent after any bounded cap downgrade.
     pub(crate) level: usize,
     pub(crate) public_ip: IpAddr,
     pub(crate) public_port_samples: Vec<u16>,
@@ -948,6 +954,7 @@ pub(crate) struct HardHardBirthdayResult {
     pub(crate) candidate_endpoints: Vec<SocketAddr>,
     pub(crate) sockets: Vec<HardHardBirthdaySocket>,
     pub(crate) model_label: String,
+    pub(crate) model_confidence: u8,
 }
 
 /// Why a fresh-mapping generation was rejected and the legacy flow continued.

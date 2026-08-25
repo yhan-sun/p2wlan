@@ -1,7 +1,7 @@
 use p2pnet_nat::adaptive::{DirectionPattern, ReverseDetector, StepLearner};
 use p2pnet_nat::mapping::{
-    build_model_for_batch, infer_allocation_model, predict_ports_with_learning, AllocationModelKind,
-    MappingBatch, MappingObservation, ModelRejection, PortModel, PortModelKind,
+    build_model_for_batch, infer_allocation_model, predict_ports_with_learning, MappingBatch,
+    MappingObservation, ModelRejection, PortModel, PortModelKind,
 };
 
 const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
@@ -735,6 +735,19 @@ impl UdpTransport {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn dynamic_socket_phase_for_test(
+        &self,
+        socket_index: usize,
+    ) -> Option<DynamicSocketPhase> {
+        self.socket_state
+            .lock()
+            .await
+            .dynamic
+            .get(&socket_index)
+            .map(|entry| entry.phase)
+    }
+
     /// Detach a superseded generation's predecessor socket, unless the
     /// predecessor was re-pinned by authenticated traffic since the commit.
     ///
@@ -1181,16 +1194,13 @@ impl UdpTransport {
         if observers.len() < 3 {
             return Err(FreshMappingRejection::InsufficientSamples);
         }
-        let level = match level {
+        let requested_level = match level {
             0..=64 => 64,
             65..=128 => 128,
             _ => 256,
         };
-        let socket_count = match level {
-            64 => 2,
-            128 => 4,
-            _ => 8,
-        };
+        let requested_socket_count = hard_hard_birthday_socket_count(requested_level);
+        let mut level = requested_level;
         let network_generation = self.peers.current_network_generation_sync();
         let mut attached: Vec<(
             usize,
@@ -1198,8 +1208,9 @@ impl UdpTransport {
             ProvisionalSocketGuard,
             u64,
             SocketAddr,
-        )> = Vec::with_capacity(socket_count);
-        for _ in 0..socket_count {
+        )> = Vec::with_capacity(requested_socket_count);
+        let mut capacity_rejected = false;
+        for _ in 0..requested_socket_count {
             let punch_generation = self.peers.next_punch_generation(peer_id).await;
             let (socket_index, socket) = match self.bind_fresh_punch_socket().await {
                 Ok(bound) => bound,
@@ -1239,7 +1250,11 @@ impl UdpTransport {
                 .await
             {
                 Ok(guard) => guard,
-                Err(_) => {
+                Err(DynamicSocketAttachError::CapacityRejected) => {
+                    capacity_rejected = true;
+                    break;
+                }
+                Err(error) => {
                     for attached_socket in &attached {
                         self.detach_dynamic_socket_by_index(
                             attached_socket.0,
@@ -1247,32 +1262,60 @@ impl UdpTransport {
                         )
                         .await;
                     }
-                    return Err(FreshMappingRejection::CapacityRejected);
+                    return Err(match error {
+                        DynamicSocketAttachError::Superseded => FreshMappingRejection::Superseded,
+                        DynamicSocketAttachError::CapacityRejected => {
+                            FreshMappingRejection::CapacityRejected
+                        }
+                        DynamicSocketAttachError::NoInboundChannel
+                        | DynamicSocketAttachError::ReaderStartupFailed => {
+                            FreshMappingRejection::BindFailed
+                        }
+                    });
                 }
             };
-            let committed = guard
-                .commit_and_pin(
-                    self,
-                    peer_id,
-                    socket_index,
-                    network_generation,
-                    punch_generation,
-                )
-                .await
-                .committed;
-            if !committed || !self.tag_hard_hard_socket(peer_id, socket_index, session_token).await {
-                self.detach_dynamic_socket_by_index(socket_index, "hard_hard_birthday_commit_failed")
-                    .await;
+            attached.push((socket_index, socket, guard, punch_generation, local_endpoint));
+        }
+
+        if capacity_rejected {
+            let Some((actual_level, actual_socket_count)) =
+                hard_hard_birthday_capacity_plan(requested_level, attached.len())
+            else {
                 for attached_socket in &attached {
                     self.detach_dynamic_socket_by_index(
                         attached_socket.0,
-                        "hard_hard_birthday_commit_failed",
+                        "hard_hard_birthday_capacity_rejected",
                     )
                     .await;
                 }
-                return Err(FreshMappingRejection::Superseded);
+                return Err(FreshMappingRejection::CapacityRejected);
+            };
+            level = actual_level;
+            while attached.len() > actual_socket_count {
+                if let Some((socket_index, _, _, _, _)) = attached.pop() {
+                    self.detach_dynamic_socket_by_index(
+                        socket_index,
+                        "hard_hard_birthday_capacity_downgrade",
+                    )
+                    .await;
+                }
             }
-            attached.push((socket_index, socket, guard, punch_generation, local_endpoint));
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "hard_hard_birthday_degraded",
+                    None,
+                    Some(level),
+                    None,
+                    format!(
+                        "requested_level={} actual_level={} requested_socket_count={} actual_socket_count={} reason=socket_cap",
+                        requested_level,
+                        level,
+                        requested_socket_count,
+                        attached.len(),
+                    ),
+                )
+                .await;
         }
 
         let mut measurements = JoinSet::new();
@@ -1349,19 +1392,12 @@ impl UdpTransport {
         observed_ports.sort_unstable();
         observed_ports.dedup();
         let local_model = infer_allocation_model(&observations_by_socket[0]);
-        let model_label = match local_model.kind {
-            AllocationModelKind::HighEntropy => "high_entropy",
-            AllocationModelKind::SmallWindow { .. } => "small_window",
-            AllocationModelKind::FixedStep { .. } => "fixed_step",
-            AllocationModelKind::Stable => "stable",
-            AllocationModelKind::Unknown => "high_entropy",
-        }
-        .to_string();
+        let model_label = local_model.kind.label().to_string();
         let candidate_endpoints = hard_hard_birthday_candidates(
             public_ip,
             &observed_ports,
-            level,
-            session_token,
+                    level,
+                    session_token,
         );
         if candidate_endpoints.len() != level {
             for attached_socket in &attached {
@@ -1373,6 +1409,49 @@ impl UdpTransport {
             }
             return Err(FreshMappingRejection::UnpredictableSequence);
         }
+        // A birthday window has one affinity owner but several authenticated
+        // speculative receivers.  Pin only the first socket; committing each
+        // guard with commit_and_pin would overwrite the previous pin and make
+        // every earlier guard fail its finalize revalidation.  The remaining
+        // guards use the no-affinity speculative commit below and are still
+        // protected by the same generation/cancellation fences.
+        for (position, (socket_index, _, guard, punch_generation, _)) in
+            attached.iter().enumerate()
+        {
+            let committed = if position == 0 {
+                guard
+                    .commit_and_pin(
+                        self,
+                        peer_id,
+                        *socket_index,
+                        network_generation,
+                        *punch_generation,
+                    )
+                    .await
+                    .committed
+            } else {
+                guard
+                    .commit_speculative(
+                        self,
+                        peer_id,
+                        *socket_index,
+                        network_generation,
+                        *punch_generation,
+                    )
+                    .await
+                    .committed
+            };
+            if !committed || !self.tag_hard_hard_socket(peer_id, *socket_index, session_token).await {
+                for attached_socket in &attached {
+                    self.detach_dynamic_socket_by_index(
+                        attached_socket.0,
+                        "hard_hard_birthday_commit_failed",
+                    )
+                    .await;
+                }
+                return Err(FreshMappingRejection::Superseded);
+            }
+        }
         self.peers
             .record_direct_event(
                 peer_id,
@@ -1381,13 +1460,15 @@ impl UdpTransport {
                 Some(candidate_endpoints.len()),
                 None,
                 format!(
-                    "model={} confidence={} socket_count={} observation_count={} public_ip={} level={} public_port_samples={}",
+                    "model={} strategy=bounded_birthday confidence={} socket_count={} observation_count={} public_ip={} level={} requested_level={} requested_socket_count={} public_port_samples={}",
                     model_label,
                     local_model.confidence,
                     attached.len(),
                     all_observations.len(),
                     public_ip,
                     level,
+                    requested_level,
+                    requested_socket_count,
                     observed_ports.len(),
                 ),
             )
@@ -1401,9 +1482,11 @@ impl UdpTransport {
                     socket_local_endpoint,
                     guard,
                 }
-            })
-            .collect();
+        })
+        .collect();
         Ok(HardHardBirthdayResult {
+            requested_level,
+            requested_socket_count,
             level,
             public_ip,
             public_port_samples: observed_ports,
@@ -1411,6 +1494,7 @@ impl UdpTransport {
             candidate_endpoints,
             sockets,
             model_label,
+            model_confidence: local_model.confidence,
         })
     }
 
@@ -2182,11 +2266,7 @@ impl UdpTransport {
         if socket_indices.is_empty() || targets.is_empty() {
             return Ok(PunchSendReport::default());
         }
-        let mut assignments = vec![Vec::new(); socket_indices.len()];
-        let assignment_count = assignments.len();
-        for (index, target) in targets.into_iter().enumerate() {
-            assignments[index % assignment_count].push(target);
-        }
+        let mut assignments = hard_hard_birthday_assignments(socket_indices.len(), targets);
         let mut workers = JoinSet::new();
         for (socket_position, socket_index) in socket_indices.into_iter().enumerate() {
             let assigned = std::mem::take(&mut assignments[socket_position]);
@@ -2579,11 +2659,64 @@ fn hard_hard_birthday_candidates(
     candidates
 }
 
-/// Outcome of one atomic commit-and-pin phase transition.
+fn hard_hard_birthday_socket_count(level: usize) -> usize {
+    match level {
+        0..=64 => 2,
+        65..=128 => 4,
+        _ => 8,
+    }
+}
+
+fn hard_hard_birthday_capacity_plan(
+    requested_level: usize,
+    attached_socket_count: usize,
+) -> Option<(usize, usize)> {
+    let requested_level = match requested_level {
+        0..=64 => 64,
+        65..=128 => 128,
+        _ => 256,
+    };
+    let requested_socket_count = hard_hard_birthday_socket_count(requested_level);
+    let available_socket_count = if attached_socket_count >= 8 {
+        8
+    } else if attached_socket_count >= 4 {
+        4
+    } else if attached_socket_count >= 2 {
+        2
+    } else {
+        return None;
+    };
+    let actual_socket_count = available_socket_count.min(requested_socket_count);
+    let actual_level = match actual_socket_count {
+        2 => 64,
+        4 => 128,
+        8 => 256,
+        _ => return None,
+    };
+    Some((actual_level, actual_socket_count))
+}
+
+fn hard_hard_birthday_assignments(
+    socket_count: usize,
+    targets: Vec<SocketAddr>,
+) -> Vec<Vec<SocketAddr>> {
+    if socket_count == 0 {
+        return Vec::new();
+    }
+    let mut assignments = vec![Vec::new(); socket_count];
+    for (index, target) in targets.into_iter().enumerate() {
+        assignments[index % socket_count].push(target);
+    }
+    assignments
+}
+
+/// Outcome of one atomic commit phase transition.
 #[derive(Debug, Clone, Copy)]
 struct CommitOutcome {
     /// Whether the socket transitioned from Provisional to
-    /// CommittedPendingHandoff and was pinned as the peer's traffic socket.
+    /// CommittedPendingHandoff. A birthday speculative commit deliberately
+    /// leaves `installed` empty so it can remain a receiver without replacing
+    /// the window's single affinity pin.
     committed: bool,
     /// The affinity pin the commit replaced, captured under the same
     /// socket-state lock.  A cancelled generation must restore it so the
@@ -2591,9 +2724,15 @@ struct CommitOutcome {
     /// still equals THIS commit's pin (a newer commit owns the affinity
     /// after that and a blind restore would downgrade it).
     predecessor: Option<PeerSocketPin>,
-    /// The pin this commit installed.  Post-commit rollback compares the
-    /// live affinity against this pin before touching anything.
+    /// The pin this commit installed. Post-commit rollback compares the live
+    /// affinity against this pin before touching anything. `None` identifies
+    /// a birthday speculative receiver, whose rollback never changes peer
+    /// affinity.
     installed: Option<PeerSocketPin>,
+    /// The committed-generation high-water value that fences this guard's
+    /// handoff. Birthday speculative receivers share the first socket's
+    /// value; a later generation therefore invalidates every old guard.
+    generation_fence: u64,
     /// The entry's authenticated-evidence counter at commit time, snapshotted
     /// under the same lock.  The watcher's rollback promotes the socket to
     /// Finalized when the counter moved afterwards: fresh authenticated
@@ -2855,6 +2994,7 @@ impl ProvisionalSocketGuard {
             predecessor: None,
             installed: None,
             evidence_at_commit: 0,
+            generation_fence: 0,
         };
         let _epoch_gate = transport.network_epoch_gate.lock().await;
         let mut state = transport.socket_state.lock().await;
@@ -2921,6 +3061,7 @@ impl ProvisionalSocketGuard {
             predecessor,
             installed: Some(installed),
             evidence_at_commit,
+            generation_fence: punch_generation,
         };
         *self.outcome.lock().expect("guard outcome mutex") = Some(outcome);
         // Publish under the same lock the entry was flipped under: the
@@ -2935,6 +3076,77 @@ impl ProvisionalSocketGuard {
             .dynamic
             .get_mut(&socket_index)
             .expect("committed entry verified above")
+            .phase = DynamicSocketPhase::CommittedPendingHandoff;
+        outcome
+    }
+
+    /// Commit a birthday receiver without changing peer affinity.
+    ///
+    /// The first socket in a birthday window owns the affinity pin. Every
+    /// other socket still needs the committed phase (so its reader can admit
+    /// authenticated Probe v2 traffic and its watcher can survive the
+    /// rendezvous), but must not overwrite that pin. `installed = None` in
+    /// the outcome gives rollback/finalize the corresponding no-affinity
+    /// semantics.
+    async fn commit_speculative(
+        &self,
+        transport: &UdpTransport,
+        peer_id: &str,
+        socket_index: usize,
+        network_generation: u64,
+        punch_generation: u64,
+    ) -> CommitOutcome {
+        let refused = CommitOutcome {
+            committed: false,
+            predecessor: None,
+            installed: None,
+            evidence_at_commit: 0,
+            generation_fence: 0,
+        };
+        let _epoch_gate = transport.network_epoch_gate.lock().await;
+        let mut state = transport.socket_state.lock().await;
+        let Some(entry) = state.dynamic.get(&socket_index) else {
+            return refused;
+        };
+        let current_network_generation = transport.peers.current_network_generation_sync();
+        if entry.phase != DynamicSocketPhase::Provisional
+            || entry.peer_id != peer_id
+            || entry.network_generation != network_generation
+            || entry.network_generation != current_network_generation
+            || entry.punch_generation != punch_generation
+            || self.cancellation.is_cancelled()
+        {
+            return refused;
+        }
+        if state
+            .committed_punch_generations
+            .get(peer_id)
+            .is_some_and(|committed| *committed > punch_generation)
+        {
+            return refused;
+        }
+        let Some(generation_fence) = state.committed_punch_generations.get(peer_id).copied()
+        else {
+            return refused;
+        };
+        let evidence_at_commit = state
+            .dynamic
+            .get(&socket_index)
+            .map(|entry| entry.authenticated_evidence)
+            .unwrap_or(0);
+        let outcome = CommitOutcome {
+            committed: true,
+            predecessor: None,
+            installed: None,
+            evidence_at_commit,
+            generation_fence,
+        };
+        *self.outcome.lock().expect("guard outcome mutex") = Some(outcome);
+        let _ = self.commit_tx.send(Some(outcome));
+        state
+            .dynamic
+            .get_mut(&socket_index)
+            .expect("speculative entry verified above")
             .phase = DynamicSocketPhase::CommittedPendingHandoff;
         outcome
     }
@@ -3003,7 +3215,7 @@ impl ProvisionalSocketGuard {
                 return false;
             }
             if phase != DynamicSocketPhase::Finalized {
-                let (committed_punch_generation, current_network_generation, installed) = {
+                let (committed_punch_generation, current_network_generation, outcome) = {
                     let outcome = self.outcome.lock().expect("guard outcome mutex");
                     (
                         state
@@ -3012,21 +3224,36 @@ impl ProvisionalSocketGuard {
                             .copied()
                             .unwrap_or(0),
                         self.transport.peers.current_network_generation_sync(),
-                        outcome.and_then(|outcome| {
-                            if outcome.committed {
-                                outcome.installed
-                            } else {
-                                None
-                            }
-                        }),
+                        *outcome,
                     )
                 };
-                let revalidated = installed.is_some_and(|installed| {
-                    peer_id == self.peer_id
-                        && punch_generation == committed_punch_generation
-                        && network_generation == current_network_generation
-                        && state.affinity.get(&self.peer_id).copied() == Some(installed)
-                        && !self.cancellation.is_cancelled()
+                let revalidated = outcome.is_some_and(|outcome| {
+                    if !outcome.committed
+                        || peer_id != self.peer_id
+                        || network_generation != current_network_generation
+                        || committed_punch_generation != outcome.generation_fence
+                        || self.cancellation.is_cancelled()
+                    {
+                        return false;
+                    }
+                    match outcome.installed {
+                        Some(installed) => {
+                            punch_generation == committed_punch_generation
+                                && state.affinity.get(&self.peer_id).copied() == Some(installed)
+                        }
+                        None => {
+                            // Birthday speculative receivers share the first
+                            // socket's generation fence but intentionally do
+                            // not own the peer affinity pin.
+                            punch_generation != 0
+                                && state
+                                    .dynamic
+                                    .get(&self.socket_index)
+                                    .is_some_and(|entry| {
+                                        entry.phase == DynamicSocketPhase::CommittedPendingHandoff
+                                    })
+                        }
+                    }
                 });
                 if !revalidated {
                     debug!(
@@ -3104,6 +3331,34 @@ impl UdpTransport {
         socket_index: &usize,
         outcome: &CommitOutcome,
     ) -> Option<DynamicPunchSocket> {
+        if outcome.installed.is_none() {
+            let entry = state.dynamic.get(socket_index)?;
+            if entry.phase == DynamicSocketPhase::Finalized {
+                return None;
+            }
+            let has_post_commit_evidence = entry.authenticated_evidence
+                > outcome.evidence_at_commit;
+            if has_post_commit_evidence {
+                state
+                    .dynamic
+                    .get_mut(socket_index)
+                    .expect("speculative socket verified above")
+                    .phase = DynamicSocketPhase::Finalized;
+                return None;
+            }
+            let entry = state
+                .dynamic
+                .remove(socket_index)
+                .expect("speculative socket verified above");
+            if state
+                .affinity
+                .get(&entry.peer_id)
+                .is_some_and(|pin| pin.socket_index == *socket_index)
+            {
+                state.affinity.remove(&entry.peer_id);
+            }
+            return Some(entry);
+        }
         let installed = outcome.installed?;
         {
             let entry = state.dynamic.get(socket_index)?;
@@ -3207,7 +3462,11 @@ impl Drop for ProvisionalSocketGuard {
 
 #[cfg(test)]
 mod birthday_tests {
-    use super::hard_hard_birthday_candidates;
+    use super::{
+        hard_hard_birthday_assignments, hard_hard_birthday_candidates,
+        hard_hard_birthday_capacity_plan,
+    };
+    use p2pnet_nat::mapping::AllocationModelKind;
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -3229,5 +3488,39 @@ mod birthday_tests {
             assert_eq!(unique.len(), level);
             assert!(level < usize::from(u16::MAX));
         }
+    }
+
+    #[test]
+    fn birthday_diagnostics_keep_unknown_distinct_from_high_entropy() {
+        assert_eq!(AllocationModelKind::Unknown.label(), "unknown");
+        assert_eq!(AllocationModelKind::HighEntropy.label(), "high_entropy");
+        assert_ne!(
+            AllocationModelKind::Unknown.label(),
+            AllocationModelKind::HighEntropy.label()
+        );
+    }
+
+    #[test]
+    fn birthday_assignments_send_each_target_once_without_socket_cartesian_product() {
+        for (socket_count, level) in [(2, 64), (4, 128), (8, 256)] {
+            let targets = (1..=level)
+                .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port as u16))
+                .collect::<Vec<_>>();
+            let assignments = hard_hard_birthday_assignments(socket_count, targets.clone());
+            assert_eq!(assignments.len(), socket_count);
+            let flattened = assignments.into_iter().flatten().collect::<Vec<_>>();
+            assert_eq!(flattened.len(), level);
+            assert_eq!(flattened.iter().collect::<HashSet<_>>().len(), level);
+            assert!(flattened.iter().all(|target| targets.contains(target)));
+        }
+    }
+
+    #[test]
+    fn birthday_capacity_plan_preserves_cap_and_exposes_downgrade() {
+        assert_eq!(hard_hard_birthday_capacity_plan(64, 2), Some((64, 2)));
+        assert_eq!(hard_hard_birthday_capacity_plan(128, 3), Some((64, 2)));
+        assert_eq!(hard_hard_birthday_capacity_plan(256, 7), Some((128, 4)));
+        assert_eq!(hard_hard_birthday_capacity_plan(256, 8), Some((256, 8)));
+        assert_eq!(hard_hard_birthday_capacity_plan(256, 1), None);
     }
 }

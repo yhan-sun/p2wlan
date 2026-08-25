@@ -679,6 +679,29 @@ impl UdpTransport {
         self.dynamic_socket_index_for_peer(peer_id).await.is_some()
     }
 
+    /// Return every committed/finalized speculative socket for a peer. The
+    /// deterministic loopback NAT harness uses this to route one packet that
+    /// arrived at a shared fake public endpoint to a deterministic live
+    /// receiver; production sends still use the exact-index path and never
+    /// multiply their target count.
+    #[cfg(test)]
+    pub(crate) async fn dynamic_sockets_for_peer_for_test(
+        &self,
+        peer_id: &str,
+    ) -> Vec<(usize, Arc<UdpSocket>)> {
+        let state = self.socket_state.lock().await;
+        state
+            .dynamic
+            .iter()
+            .filter(|(_, entry)| {
+                entry.peer_id == peer_id
+                    && entry.phase.is_usable()
+                    && entry.network_generation == self.peers.current_network_generation_sync()
+            })
+            .map(|(index, entry)| (*index, entry.socket.clone()))
+            .collect()
+    }
+
     /// Adopt `socket_index` as the peer's traffic socket, backed by evidence
     /// whose epoch decides whether it may supersede the current pin.
     ///

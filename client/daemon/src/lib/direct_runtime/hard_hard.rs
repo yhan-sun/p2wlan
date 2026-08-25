@@ -1004,9 +1004,12 @@ fn hard_hard_measurement_summary(measurement: &HardHardLocalMeasurement) -> Stri
             result.predicted_ports.len(),
         ),
         HardHardLocalMeasurement::Birthday(result) => format!(
-            "mode=birthday model={} level={} public_ip={} public_port_samples={:?} socket_count={} sample_count={} target_count={}",
+            "mode=birthday model={} strategy=bounded_birthday confidence={} level={} requested_level={} requested_socket_count={} public_ip={} public_port_samples={:?} socket_count={} sample_count={} target_count={}",
             result.model_label,
+            result.model_confidence,
             result.level,
+            result.requested_level,
+            result.requested_socket_count,
             result.public_ip,
             result.public_port_samples,
             result.sockets.len(),
@@ -1035,8 +1038,10 @@ async fn finalize_hard_hard_measurement(measurement: &mut HardHardLocalMeasureme
     }
 }
 
-async fn hard_hard_birthday_level(peers: &PeerManager, peer_id: &str) -> usize {
-    let stage = peers.recovery_stage_for(peer_id).await;
+fn hard_hard_birthday_level_for_stage(
+    android_platform: bool,
+    stage: crate::peer::RecoveryStage,
+) -> usize {
     let desktop_level = match stage {
         crate::peer::RecoveryStage::Initial => 64,
         crate::peer::RecoveryStage::Predicted | crate::peer::RecoveryStage::ScatterSmall => 128,
@@ -1044,11 +1049,18 @@ async fn hard_hard_birthday_level(peers: &PeerManager, peer_id: &str) -> usize {
             256
         }
     };
-    if peers.is_android_platform() {
+    if android_platform {
         desktop_level.min(128)
     } else {
         desktop_level
     }
+}
+
+async fn hard_hard_birthday_level(peers: &PeerManager, peer_id: &str) -> usize {
+    hard_hard_birthday_level_for_stage(
+        peers.is_android_platform(),
+        peers.recovery_stage_for(peer_id).await,
+    )
 }
 
 async fn run_hard_hard_local_measurement(
@@ -1129,7 +1141,12 @@ fn hard_hard_measurement_payload(
                 sources.insert(endpoint.clone(), source.clone());
                 candidates.push(endpoint);
             }
-            (!candidates.is_empty()).then_some((candidates, sources, 72, result.model_label.clone()))
+            (!candidates.is_empty()).then_some((
+                candidates,
+                sources,
+                result.model_confidence,
+                result.model_label.clone(),
+            ))
         }
     }
 }
@@ -1245,6 +1262,45 @@ async fn hard_hard_exact_direct_socket_is_current_for_cleanup(
     identity: &crate::peer::HardHardFreshSocketIdentity,
 ) -> bool {
     peers.hard_hard_direct_pair_is_current(identity).await
+        && udp
+            .hard_hard_socket_identity_has_authenticated_evidence(identity)
+            .await
+}
+
+/// An authenticated Hard↔Hard winner may reach the encrypted validation
+/// worker just after the short rendezvous sweep expires.  Keep that exact
+/// socket alive until the normal bounded session cleanup gets a chance to see
+/// the Direct commit; a winner with no authenticated evidence is still
+/// cleaned immediately by the caller.
+async fn hard_hard_authenticated_winner_for_cleanup(
+    udp: &UdpTransport,
+    peers: &PeerManager,
+    peer_id: &str,
+    session_token: &str,
+) -> Option<crate::peer::HardHardFreshSocketIdentity> {
+    let winner = peers
+        .hard_hard_winner_for_token(peer_id, session_token)
+        .await?;
+    let identity = peers
+        .hard_hard_fresh_socket_for_token(peer_id, session_token)
+        .await?;
+    if identity.socket_index != winner
+        || !peers.hard_hard_session_identity_is_current(&identity).await
+        || !udp
+            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
+            .await
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+async fn hard_hard_authenticated_socket_for_cleanup(
+    udp: &UdpTransport,
+    peers: &PeerManager,
+    identity: &crate::peer::HardHardFreshSocketIdentity,
+) -> bool {
+    peers.hard_hard_session_identity_is_current(identity).await
         && udp
             .hard_hard_socket_identity_has_authenticated_evidence(identity)
             .await
@@ -2174,9 +2230,49 @@ pub(crate) async fn spawn_hard_hard_responder(
                 peers.hard_hard_remove_session(&peer_id, &session_id).await;
             }
         } else {
-            if !direct_on_fresh_socket {
+            let authenticated_winner =
+                hard_hard_authenticated_winner_for_cleanup(
+                    &cleanup_udp,
+                    &peers,
+                    &peer_id,
+                    &coordination.token,
+                )
+                .await;
+            let retained_socket = if authenticated_winner.is_some() {
+                authenticated_winner
+            } else if hard_hard_authenticated_socket_for_cleanup(
+                &cleanup_udp,
+                &peers,
+                &fresh_socket,
+            )
+            .await
+            {
+                Some(fresh_socket.clone())
+            } else {
+                direct_on_fresh_socket.then_some(fresh_socket.clone())
+            };
+            if let Some(retained_socket) = retained_socket {
+                // The encrypted validation worker owns the final Direct
+                // verdict.  The rendezvous task may finish first, so defer
+                // socket/session cleanup to the bounded expiry watcher.
+                spawn_hard_hard_expiry_cleanup(
+                    cleanup_udp.clone(),
+                    peers.clone(),
+                    peer_id.clone(),
+                    session_id.clone(),
+                    retained_socket,
+                    cancellation,
+                    hard_hard_now_ms()
+                        .saturating_add(HARD_HARD_SESSION_TTL.as_millis() as u64),
+                );
+            } else {
                 cleanup_udp
-                    .detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_sweep_failed")
+                    .detach_hard_hard_sockets_for_token(
+                        &peer_id,
+                        &coordination.token,
+                        None,
+                        "hard_hard_sweep_failed",
+                    )
                     .await;
                 if peers.is_direct(&peer_id).await {
                     peers
@@ -2187,14 +2283,14 @@ pub(crate) async fn spawn_hard_hard_responder(
                             None,
                             None,
                             format!(
-                                "peer became Direct on another socket after the sweep failed; detached Hard↔Hard socket index={} exact_socket=false",
+                                "peer became Direct on another socket after the sweep failed; detached all Hard↔Hard sockets; socket index={} exact_socket=false",
                                 fresh_socket.socket_index
                             ),
                         )
                         .await;
                 }
+                peers.hard_hard_remove_session(&peer_id, &session_id).await;
             }
-            peers.hard_hard_remove_session(&peer_id, &session_id).await;
         }
     });
     HardHardRemoteStart::Started
@@ -2384,9 +2480,45 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
                 .await;
         }
     } else {
-        if !direct_on_fresh_socket {
+        let authenticated_winner =
+            hard_hard_authenticated_winner_for_cleanup(
+                &cleanup_udp,
+                &peers,
+                &peer_id,
+                &record.session_token,
+            )
+            .await;
+        let retained_socket = if authenticated_winner.is_some() {
+            authenticated_winner
+        } else if hard_hard_authenticated_socket_for_cleanup(&cleanup_udp, &peers, &fresh_socket)
+            .await
+        {
+            Some(fresh_socket.clone())
+        } else {
+            direct_on_fresh_socket.then_some(fresh_socket.clone())
+        };
+        if let Some(retained_socket) = retained_socket {
+            // Give the encrypted validation worker the rest of the bounded
+            // Hard↔Hard lifetime to finish.  Expiry cleanup retains this
+            // exact socket only if Direct and authenticated evidence still
+            // agree; otherwise it detaches the whole session token.
+            spawn_hard_hard_expiry_cleanup(
+                cleanup_udp.clone(),
+                peers.clone(),
+                peer_id.clone(),
+                record.session_id.clone(),
+                retained_socket,
+                record.cancellation.clone(),
+                record.expires_at_ms,
+            );
+        } else {
             cleanup_udp
-                .detach_hard_hard_socket_if_identity(&fresh_socket, "hard_hard_sweep_failed")
+                .detach_hard_hard_sockets_for_token(
+                    &peer_id,
+                    &record.session_token,
+                    None,
+                    "hard_hard_sweep_failed",
+                )
                 .await;
             if peers.is_direct(&peer_id).await {
                 peers
@@ -2397,16 +2529,16 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
                         None,
                         None,
                         format!(
-                            "peer became Direct on another socket after the sweep failed; detached Hard↔Hard socket index={} exact_socket=false",
+                            "peer became Direct on another socket after the sweep failed; detached all Hard↔Hard sockets; socket index={} exact_socket=false",
                             fresh_socket.socket_index
                         ),
                     )
                     .await;
             }
+            peers
+                .hard_hard_remove_session(&record.peer_id, &record.session_id)
+                .await;
         }
-        peers
-            .hard_hard_remove_session(&record.peer_id, &record.session_id)
-            .await;
     }
     HardHardRemoteStart::Started
 }
@@ -2708,6 +2840,84 @@ fn spawn_hard_hard_expiry_cleanup(
 #[cfg(test)]
 mod hard_hard_tests {
     use super::*;
+
+    #[test]
+    fn birthday_level_caps_android_without_downgrading_desktop() {
+        use crate::peer::RecoveryStage;
+
+        assert_eq!(
+            hard_hard_birthday_level_for_stage(false, RecoveryStage::Initial),
+            64
+        );
+        assert_eq!(
+            hard_hard_birthday_level_for_stage(false, RecoveryStage::ScatterExtended),
+            256
+        );
+        assert_eq!(
+            hard_hard_birthday_level_for_stage(true, RecoveryStage::Initial),
+            64
+        );
+        assert_eq!(
+            hard_hard_birthday_level_for_stage(true, RecoveryStage::Predicted),
+            128
+        );
+        assert_eq!(
+            hard_hard_birthday_level_for_stage(true, RecoveryStage::ScatterExtended),
+            128
+        );
+        assert_eq!(
+            hard_hard_birthday_level_for_stage(true, RecoveryStage::RelayBackoff),
+            128
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn birthday_runtime_level_cap_tracks_platform_and_recovery_stage() {
+        use crate::peer::RecoveryStage;
+
+        for (platform, expected_level) in [("android", 128), ("linux", 256)] {
+            let identity = NodeIdentity::generate();
+            let mut config = Config::generate_default(
+                "https://hard-hard-runtime-cap.test",
+                &format!("hard-hard-runtime-cap-{platform}"),
+            )
+            .unwrap();
+            config.node.node_id = format!("hard-hard-runtime-cap-{platform}");
+            config.node.platform = platform.to_string();
+            let peers = PeerManager::new(config);
+            let peer_id = format!("peer-runtime-cap-{platform}");
+            peers
+                .add_peer(&crate::control::PeerInfo {
+                    node_id: peer_id.clone(),
+                    device_name: "runtime-cap".to_string(),
+                    app_version: "test".to_string(),
+                    public_key: hex::encode(identity.public_key()),
+                    endpoint: "198.51.100.20:41000".to_string(),
+                    nat_type:
+                        "p2v2:m=address_or_port_dependent;a=random;d=?;c=90;f=address_or_port_dependent;h=unknown;g=1"
+                            .to_string(),
+                    virtual_ip: "10.20.0.20".to_string(),
+                    online: true,
+                    last_seen: 1,
+                    relay_rtt_ms: None,
+                })
+                .await;
+            assert!(matches!(
+                peers.recovery_epoch_admit(&peer_id).await,
+                crate::peer::RecoveryAdmission::Accepted { .. }
+            ));
+            for _ in 0..3 {
+                peers
+                    .advance_recovery_stage_after_no_ack(&peer_id, "runtime cap test")
+                    .await;
+            }
+            assert_eq!(
+                peers.recovery_stage_for(&peer_id).await,
+                RecoveryStage::ScatterExtended
+            );
+            assert_eq!(hard_hard_birthday_level(&peers, &peer_id).await, expected_level);
+        }
+    }
 
     async fn exact_socket_proof_fixture() -> (
         Arc<PeerManager>,
