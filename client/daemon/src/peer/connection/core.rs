@@ -36,12 +36,13 @@ pub(crate) struct PendingRelayBusinessEvidence {
 
 /// The relay-first business gate state for one peer connection.
 ///
-/// This is the set of fields that decide whether Direct may win the data plane
-/// after a same-generation relay transport is ready and peer-confirmed.  Grouping
-/// them here (instead of flat on [`PeerConnection`]) keeps the legal/illegal
-/// state combinations locally contained: the gate is one atomic concept with a
-/// bounded set of milestones, not N independent booleans scattered across a
-/// 60-field struct.
+/// This is the set of fields that describe relay-first startup/fallback
+/// evidence after a same-generation relay transport is ready and
+/// peer-confirmed. Grouping them here (instead of flat on [`PeerConnection`])
+/// keeps the legal/illegal state combinations locally contained: the gate is
+/// one atomic concept with a bounded set of milestones, not N independent
+/// booleans scattered across a 60-field struct. An authoritative current
+/// Direct pair is primary and does not wait for these business markers.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RelayFirstBusinessState {
     /// Generation in which the first-business relay gate began waiting.  This
@@ -52,12 +53,10 @@ pub(crate) struct RelayFirstBusinessState {
     /// Monotonic start of the bounded first-business relay gate.
     pub gate_started_at: Option<Instant>,
     /// Generation for which at least one real business packet was accepted by
-    /// the confirmed relay writer.  Direct may be confirmed in the background,
-    /// but it cannot become the first data-plane path until both directions
-    /// have crossed the confirmed relay.  The receive marker is kept separately
-    /// because a peer can send its first packet over relay, promote Direct, and
-    /// then deliver the other direction's first packet directly before this
-    /// daemon has itself observed relay business.
+    /// the confirmed relay writer. This is relay fallback evidence; an
+    /// authoritative current Direct pair does not wait for both directions.
+    /// The receive marker is kept separately because a peer can send its first
+    /// packet over relay and later deliver the other direction directly.
     pub business_sent_generation: Option<u64>,
     /// Generation for which a normal decrypted business packet was received
     /// through the confirmed relay.  This closes the bidirectional relay-first
@@ -65,16 +64,15 @@ pub(crate) struct RelayFirstBusinessState {
     /// the other direction.
     pub business_received_generation: Option<u64>,
     /// Generation for which a relay business packet was sent locally and a
-    /// normal relay business packet was received.  Writer completion is not a
-    /// peer-delivery proof; this two-direction marker is the minimum local
-    /// evidence that both directions crossed the confirmed relay before a
-    /// Direct data-plane promotion may win.  The two component markers may
+    /// normal relay business packet was received. Writer completion is not a
+    /// peer-delivery proof; this two-direction marker records that both
+    /// directions crossed the confirmed relay. The two component markers may
     /// arrive in either order.
     pub business_exchange_generation: Option<u64>,
     /// Generation for which a synthetic path-commit probe round-tripped over
     /// the confirmed relay, proving bidirectional relay data without natural
-    /// traffic (audit P0-4).  An alternative to `..._exchange_generation` for
-    /// closing the relay-first business gate; it does not itself activate
+    /// traffic (audit P0-4). An alternative to `..._exchange_generation` for
+    /// completing relay fallback evidence; it does not itself activate
     /// Direct.
     pub business_pathcommit_generation: Option<u64>,
     /// Generation in which the relay-first business gate completed at least
@@ -215,7 +213,7 @@ pub struct PeerConnection {
     /// the endpoint.  A reconnect/renewal can reuse the same endpoint, so an
     /// endpoint string alone cannot identify the connection that was proven.
     pub relay_confirmed_connection_id: Option<u64>,
-    /// Relay-first business gate state (when Direct may win the data plane).
+    /// Relay-first startup/fallback business evidence state.
     pub(crate) relay_first: RelayFirstBusinessState,
     /// Monotonic relay-confirm sequence.  Bumped (and mirrored in the peer
     /// manager, notified to outbound waiters) every time the peer's relay

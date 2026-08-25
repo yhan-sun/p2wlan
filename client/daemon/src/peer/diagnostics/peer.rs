@@ -70,9 +70,9 @@ pub struct PeerDiagnostics {
     /// Local relay transport incarnation that carried the ready milestone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_ready_connection_id: Option<u64>,
-    /// Generation in which the relay-first admission gate began, plus its
-    /// daemon-local age. This is useful for diagnosing a Direct ACK that is
-    /// valid but intentionally not yet allowed to carry business traffic.
+    /// Generation in which the relay-first standby gate began, plus its
+    /// daemon-local age. This is useful for diagnosing relay fallback state
+    /// around a Direct ACK that may already be authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_first_gate_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,9 +81,9 @@ pub struct PeerDiagnostics {
     pub relay_first_confirmation_pending: bool,
     #[serde(default)]
     pub relay_first_business_pending: bool,
-    /// The two same-generation relay-first business-direction gates.  Direct
-    /// may be confirmed in the background, but it is not active until both
-    /// have been observed.
+    /// The two same-generation relay-first business-direction markers. Direct
+    /// remains primary after an authoritative commit; these describe relay
+    /// fallback readiness and historical startup evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_first_business_sent_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,31 +178,26 @@ impl PeerDiagnostics {
                 .relay_confirmed_endpoint
                 .as_deref()
                 .is_some_and(|endpoint| !endpoint.is_empty());
-        // A Direct ACK is retained as background evidence, but while this
-        // generation's relay transport is ready and the two-direction relay
-        // business gate is incomplete, Direct is not the active business
-        // path.  Keeping this distinction in `/status` prevents a UI from
-        // rendering a Direct probe as a usable connection or latency sample.
+        // These relay-first fields remain useful fallback-proof diagnostics.
+        // They do not override a current encrypted-confirmed Selected Direct
+        // pair: after that commit Direct is the active path and Relay is only
+        // the warm standby.
         let relay_first_pending = !on_link_direct_snapshot
             && conn.relay_first_confirmation_pending(local_generation, relay_available);
         let relay_first_business_pending =
             !on_link_direct_snapshot && conn.relay_first_business_pending(local_generation, relay_available);
-        let confirmed_direct_active =
-            confirmed_direct_snapshot && !relay_first_pending && !relay_first_business_pending;
+        let confirmed_direct_active = confirmed_direct_snapshot;
         let mut active_path = match current_selection {
             Some(selection) => match selection.path {
                 Some(NetworkPath::Direct)
                     if selection.direct_confirmed
-                        && !relay_first_pending
-                        && !relay_first_business_pending
+                        && confirmed_direct_snapshot
                         && selection
                             .direct_endpoint
                             .is_some_and(|endpoint| !conn.is_overlay_direct_endpoint(endpoint)) =>
                     Some(NetworkPath::Direct),
                 Some(NetworkPath::Direct)
-                    if relay_peer_confirmed
-                        && !relay_first_pending =>
-                {
+                    if relay_peer_confirmed && !selection.direct_confirmed => {
                     Some(NetworkPath::Relay)
                 }
                 Some(NetworkPath::Relay) if relay_peer_confirmed => {
@@ -231,8 +226,6 @@ impl PeerDiagnostics {
         }
         let selected_pair = conn.selected_candidate_pair_for_diagnostics(local_generation);
         if active_path.is_none()
-            && !relay_first_pending
-            && !relay_first_business_pending
             && conn.state == ConnectionState::Direct
             && selected_pair.is_some_and(|pair| !conn.is_overlay_candidate_pair(pair))
             && conn.direct_health.consecutive_failures == 0

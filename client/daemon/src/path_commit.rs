@@ -1,15 +1,13 @@
 //! Synthetic path-commit protocol: prove a path can carry business in BOTH
 //! directions without depending on *natural* traffic actually flowing.
 //!
-//! The relay-first business gate (`PeerConnection::relay_first_business_*`)
-//! requires both local business directions to have crossed the confirmed relay
-//! before Direct may win the data plane.  That protects the WireGuard
-//! counter-commit invariant (the first plaintext commits on a path proven for
-//! both directions, so it cannot be committed on relay then re-committed on
-//! direct).  But for one-directional traffic — telemetry, video push, unidirectional
-//! UDP, heartbeat-only — the natural *receive* direction never happens, so the
-//! gate holds forever and the peer is stranded on relay despite a confirmed,
-//! encrypted Direct path (audit P0-4).
+//! The relay-first business markers (`PeerConnection::relay_first_business_*`)
+//! record whether the confirmed relay has carried both local business
+//! directions. They remain useful for relay fallback diagnostics and for
+//! unvalidated/trial startup, but an authoritative current-generation Direct
+//! pair is already the primary data path. For one-directional traffic —
+//! telemetry, video push, unidirectional UDP, heartbeat-only — the synthetic
+//! proof still supplies relay standby evidence when desired (audit P0-4).
 //!
 //! A path-commit probe solves this the way the relay path-probe
 //! (`relay_probe.rs`) confirms the relay: a request is sent FORCED over the
@@ -18,7 +16,7 @@
 //! WireGuard datagram) and proves BOTH directions over the same transport, it is
 //! an *alternative* proof of the same invariant the natural exchange establishes.
 //! Receiving a path-commit ACK may therefore close the relay-first business
-//! gate; it must never, by itself, make Direct the active path — Direct
+//! markers; it must never, by itself, make Direct the active path — Direct
 //! promotion still requires its own generation-bound encrypted validation.
 //!
 //! Framing mirrors `relay_probe.rs`: an ICMP echo-request (type 8) carrying the

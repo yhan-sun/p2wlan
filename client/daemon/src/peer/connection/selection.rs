@@ -97,6 +97,23 @@ impl PeerConnection {
             .map(|pair| pair.remote_endpoint)
     }
 
+    /// Whether this snapshot contains the current encrypted-confirmed Direct
+    /// pair.  Probe reachability is intentionally not enough: the pair must
+    /// be Selected for the current local generation and remote candidate
+    /// epoch, and the connection must have committed Direct for that same
+    /// generation.
+    pub(crate) fn has_current_authoritative_direct(&self, local_generation: u64) -> bool {
+        self.state == ConnectionState::Direct
+            && self.direct_generation == local_generation
+            && self.candidate_pairs.iter().any(|pair| {
+                pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
+                    && pair.state == CandidatePairState::Selected
+                    && pair.selected_at.is_some()
+                    && !self.is_overlay_candidate_pair(pair)
+            })
+    }
+
     pub(crate) fn should_upgrade_direct_to_on_link(
         &self,
         local_generation: u64,
@@ -343,13 +360,12 @@ impl PeerConnection {
         {
             return false;
         }
-        // A confirmed relay is the safety path for this generation.  Do not
-        // let a wall-clock grace window turn a missing business ingress into
-        // a Direct promotion: that would make the first real TUN packet
-        // depend on scheduling rather than on the relay-first invariant.
-        // The relay transport itself has already been proven by the encrypted
-        // probe ACK; the only remaining gate is that both local business
-        // directions have crossed this same confirmed relay.
+        // A confirmed relay is the safety path before Direct validation.  Do
+        // not let a wall-clock grace window turn missing business ingress into
+        // a Direct promotion: that would make an unvalidated Direct trial
+        // depend on scheduling rather than on the relay-first invariant.  A
+        // current encrypted-confirmed Direct pair is handled as authoritative
+        // by the selector before this fallback-proof marker is consulted.
         true
     }
 
@@ -426,38 +442,12 @@ impl PeerConnection {
         // reaches this quality fallback.
         let retain_private_direct = policy != crate::config::PathPolicy::Score
             && selected_pair.is_some_and(should_retain_private_direct_pair);
-        // An encrypted-confirmed pair whose endpoint is on one of our physical
-        // interface prefixes is already the strongest available path.  The
-        // relay-first business gate is a safety net for off-link traversal;
-        // applying it to a proven LAN pair needlessly sends local traffic via
-        // the relay and can overwrite a successful 4 ms direct path.
-        let on_link_direct = selected_pair
-            .is_some_and(|pair| self.is_on_link_host_candidate(pair.remote_endpoint));
-
         if confirmed_direct {
-            // Direct validation is deliberately allowed to run in parallel,
-            // but it is not allowed to win the first business packet while a
-            // relay transport is already ready for this peer and its matching
-            // encrypted relay ACK is still pending.  Returning unavailable
-            // (rather than Direct or an unconfirmed Relay) makes the outbound
-            // FIFO retain the plaintext packet and keeps its WireGuard counter
-            // from being committed on the wrong path.
-            if !on_link_direct
-                && self.relay_first_confirmation_pending(local_generation, relay_available)
-            {
-                return PathSelection::unavailable(
-                    REASON_PATH_RELAY_FIRST_PENDING,
-                    "Direct is encrypted-confirmed, but same-generation relay peer ACK is pending",
-                )
-                .with_scores(direct_score, relay_score);
-            }
-            if !on_link_direct && self.relay_first_business_pending(local_generation, relay_available) {
-                return PathSelection::relay(
-                    REASON_PATH_RELAY_FIRST_BUSINESS,
-                    "same-generation relay peer is confirmed; both relay business directions are required before off-link Direct",
-                )
-                .with_scores(direct_score, relay_score);
-            }
+            // The current-generation encrypted Request -> ACK and Selected
+            // pair are the Direct admission proof.  Relay-first remains the
+            // startup/fallback path while Direct is only a probe or trial;
+            // once this branch is reached, neither relay confirmation nor the
+            // two-direction relay business marker may override Direct.
             if self.relay_peer_confirmed_for_generation(local_generation)
                 && selected_pair.is_some_and(|pair| {
                     pair.slow_validation_is_recent_at(

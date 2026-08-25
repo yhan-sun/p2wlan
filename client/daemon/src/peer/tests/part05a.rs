@@ -40,7 +40,7 @@ async fn path_selector_prefers_relay_until_direct_is_confirmed() {
 }
 
 #[tokio::test]
-async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
+async fn authoritative_direct_confirmation_bypasses_ready_relay_business_gate() {
     let config = test_config();
     let manager = PeerManager::new(config);
     let endpoint: SocketAddr = "198.51.100.41:51831".parse().unwrap();
@@ -58,30 +58,27 @@ async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(8)))
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
+    assert!(manager
+        .confirm_relay_peer("peer1", relay_endpoint, generation)
+        .await);
 
-    let pending = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(pending.path, None);
-    assert_eq!(pending.reason_code, REASON_PATH_RELAY_FIRST_PENDING);
-    assert!(!manager
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert!(selected.direct_confirmed);
+    assert!(manager
         .is_data_path_admitted_for_generation("peer1", generation, true)
         .await);
     let diagnostics = manager
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
         .await;
-    assert_eq!(diagnostics[0].active_path, None);
+    assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
 
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
-    let first = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(first.path, Some(NetworkPath::Relay));
-    assert_eq!(first.reason_code, REASON_PATH_RELAY_FIRST_BUSINESS);
     assert!(manager
         .mark_relay_first_business_sent_for_generation("peer1", generation)
         .await);
-    let still_relay = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(still_relay.path, Some(NetworkPath::Relay));
-    assert_eq!(still_relay.reason_code, REASON_PATH_RELAY_FIRST_BUSINESS);
+    let still_direct = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(still_direct.path, Some(NetworkPath::Direct));
     assert!(manager
         .mark_relay_first_business_received_for_generation(
             "peer1",
@@ -89,11 +86,14 @@ async fn direct_confirmation_cannot_bypass_ready_relay_ack() {
             generation,
         )
         .await);
-    let admitted = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(admitted.path, Some(NetworkPath::Direct));
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    let after_business = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(after_business.path, Some(NetworkPath::Direct));
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.state, ConnectionState::Direct);
+    assert_eq!(
+        connection.last_path_selection.as_ref().unwrap().path,
+        Some(NetworkPath::Direct)
+    );
 }
 
 #[tokio::test]
@@ -267,15 +267,11 @@ async fn relay_ticket_renewal_does_not_rearm_completed_relay_first_gate() {
 }
 
 #[tokio::test]
-async fn one_way_business_does_not_permanently_block_direct_when_pathcommit_proves_relay() {
-    // P0-4 (audit): one-directional traffic (telemetry, video push, heartbeat
-    // only) never produces a natural *received* business direction, so the
-    // old relay-first business gate stranded the peer on relay forever despite
-    // a confirmed, encrypted Direct path.  A synthetic path-commit proof — a
-    // business-shaped authenticated packet round-tripped over the confirmed
-    // relay — closes the gate as an alternative, restoring liveness while
-    // preserving the counter-commit invariant (the relay was proven for both
-    // directions before Direct may win).
+async fn authoritative_direct_does_not_wait_for_one_way_relay_business() {
+    // One-directional traffic must not strand a peer on Relay after the
+    // current-generation encrypted Direct ACK has selected its pair.  Relay
+    // business markers remain useful warm-standby evidence, but are no longer
+    // an admission gate for an already authoritative Direct path.
     let config = test_config();
     let manager = PeerManager::new(config);
     let endpoint: SocketAddr = "198.51.100.61:51831".parse().unwrap();
@@ -302,15 +298,12 @@ async fn one_way_business_does_not_permanently_block_direct_when_pathcommit_prov
     assert!(manager
         .mark_relay_first_business_sent_for_generation("peer1", generation)
         .await);
-    // ...but the peer sends nothing back, so the *received* direction never
-    // happens.  Without a path-commit proof the gate must still hold relay.
-    let stuck = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(stuck.path, Some(NetworkPath::Relay));
-    assert_eq!(stuck.reason_code, REASON_PATH_RELAY_FIRST_BUSINESS);
+    // ...but the peer sends nothing back. Direct is already authoritative.
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
 
-    // A path-commit probe round-trips over the confirmed relay and proves the
-    // missing direction.  The gate now releases to Direct even though no
-    // natural inbound business ever arrived.
+    // A later path-commit remains accepted as relay standby evidence and is
+    // idempotent with respect to the already-selected Direct path.
     assert!(manager
         .mark_relay_first_business_pathcommit_for_generation("peer1", generation, relay_endpoint)
         .await);
@@ -322,10 +315,9 @@ async fn one_way_business_does_not_permanently_block_direct_when_pathcommit_prov
 }
 
 #[tokio::test]
-async fn pathcommit_proof_does_not_relie_on_natural_business_and_resets_on_generation() {
-    // A path-commit marker committed for a stale generation must not release the
-    // gate for the current generation, and a generation change must clear it —
-    // so an old proof can never promote Direct for a new allocator epoch.
+async fn stale_pathcommit_does_not_override_authoritative_direct() {
+    // A path-commit marker for a stale generation must not mutate the current
+    // relay standby state or change an already authoritative Direct path.
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.62:51831".parse().unwrap();
     let relay_endpoint = "tcp://relay.test:18083";
@@ -349,7 +341,7 @@ async fn pathcommit_proof_does_not_relie_on_natural_business_and_resets_on_gener
         .mark_relay_first_business_pathcommit_for_generation("peer1", generation + 1, relay_endpoint)
         .await);
     let still = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(still.path, Some(NetworkPath::Relay));
+    assert_eq!(still.path, Some(NetworkPath::Direct));
 }
 
 #[tokio::test]
@@ -570,7 +562,7 @@ async fn relay_receive_before_local_send_completes_after_local_send() {
 }
 
 #[tokio::test]
-async fn confirmed_relay_without_business_receive_keeps_direct_background_only() {
+async fn authoritative_direct_business_can_be_first_usable_before_relay_receive() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.46:51831".parse().unwrap();
     let relay_endpoint = "tcp://relay.test:18081";
@@ -597,13 +589,13 @@ async fn confirmed_relay_without_business_receive_keeps_direct_background_only()
         connection.relay_confirmed_at = Some(expired_at);
     }
     let selection = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(selection.reason_code, REASON_PATH_RELAY_FIRST_BUSINESS);
-    assert_eq!(selection.path, Some(NetworkPath::Relay));
-    assert!(!manager
+    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert_eq!(selection.path, Some(NetworkPath::Direct));
+    assert!(manager
         .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
         .await);
     let connection = manager.get_connection("peer1").await.unwrap();
-    assert_eq!(connection.first_usable_path, None);
+    assert_eq!(connection.first_usable_path, Some(NetworkPath::Direct));
 }
 
 #[tokio::test]
@@ -812,7 +804,7 @@ async fn direct_confirmation_is_bounded_fallback_when_relay_probe_does_not_ack()
 }
 
 #[tokio::test]
-async fn direct_ack_cannot_win_before_per_peer_relay_ready_is_published() {
+async fn authoritative_direct_ack_wins_before_per_peer_relay_ready_is_published() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.43:51831".parse().unwrap();
 
@@ -824,17 +816,17 @@ async fn direct_ack_cannot_win_before_per_peer_relay_ready_is_published() {
     manager.record_direct_success("peer1", Some(endpoint)).await;
 
     // A shared relay transport exists, but this peer has not published its
-    // relay-ready milestone yet. Admission arms the bounded gate before the
-    // selector is consulted, so Direct cannot consume a counter here.
-    assert!(!manager
+    // relay-ready milestone yet. The encrypted Direct ACK is stronger than
+    // the startup gate and may consume a counter immediately.
+    assert!(manager
         .is_data_path_admitted_for_generation("peer1", generation, true)
         .await);
-    let pending = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(pending.path, None);
-    assert_eq!(pending.reason_code, REASON_PATH_RELAY_FIRST_PENDING);
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
 
-    // If the per-peer relay setup never publishes ready/ACK, the gate still
-    // has a hard deadline and a real Direct ACK becomes the safe fallback.
+    // The startup gate marker remains available for relay recovery, but does
+    // not demote the current Direct selection.
     {
         let mut connections = manager.connections.write().await;
         connections
@@ -849,13 +841,12 @@ async fn direct_ack_cannot_win_before_per_peer_relay_ready_is_published() {
     assert!(manager
         .is_data_path_admitted_for_generation("peer1", generation, true)
         .await);
-    let fallback = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(fallback.path, Some(NetworkPath::Direct));
-    assert_eq!(fallback.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    let after_expiry = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(after_expiry.path, Some(NetworkPath::Direct));
 }
 
 #[tokio::test]
-async fn relay_catalog_gate_blocks_direct_ack_before_any_business_ingress() {
+async fn relay_catalog_gate_does_not_override_authoritative_direct_ack() {
     let manager = PeerManager::new(test_config());
     manager.configure_relay_first(true).await;
     let endpoint: SocketAddr = "198.51.100.64:51864".parse().unwrap();
@@ -867,13 +858,12 @@ async fn relay_catalog_gate_blocks_direct_ack_before_any_business_ingress() {
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
 
-    // The Direct ACK is real background evidence, but no outbound business
-    // packet may consume a WireGuard counter until relay confirmation and the
-    // first relay business exchange have both completed.
-    let pending = manager.select_path_for_data("peer1", true, true).await;
-    assert_eq!(pending.path, None);
-    assert_eq!(pending.reason_code, REASON_PATH_RELAY_FIRST_PENDING);
-    assert!(!manager
+    // The catalog gate still arms relay standby state, but an exact encrypted
+    // Direct ACK is authoritative for the current generation.
+    let selected = manager.select_path_for_data("peer1", true, true).await;
+    assert_eq!(selected.path, Some(NetworkPath::Direct));
+    assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert!(manager
         .is_data_path_admitted_for_generation("peer1", generation, true)
         .await);
 
@@ -1684,6 +1674,12 @@ async fn direct_promotion_updates_selection_atomically() {
     manager.record_direct_success("peer1", Some(public)).await;
     let conn = manager.get_connection("peer1").await.unwrap();
     let selection = conn.last_path_selection.expect("promotion selector snapshot");
+    assert_eq!(conn.state, ConnectionState::Direct);
+    assert!(conn.candidate_pairs.iter().any(|pair| {
+        pair.local_generation == conn.direct_generation
+            && pair.state == CandidatePairState::Selected
+            && pair.selected_at.is_some()
+    }));
     assert_eq!(selection.path, Some(NetworkPath::Direct));
     assert!(selection.direct_confirmed);
     assert_eq!(selection.direct_endpoint, Some(public));

@@ -235,9 +235,10 @@ impl Daemon {
         // task below and can publish/upgrade after relay is serving.
         let relay_candidates = relay_candidates_from_sources(&relay_catalog, &relay_servers);
         let relay_candidates_present = !relay_candidates.is_empty();
-        // Arm the per-peer relay-first gate before either direct validation or
-        // the relay supervisor can publish a transport. A Direct ACK that
-        // arrives during relay startup is background evidence only.
+        // Arm the per-peer relay-first standby state before either Direct
+        // validation or the relay supervisor can publish a transport. An
+        // authoritative Direct ACK that arrives during relay startup still
+        // promotes Direct; the relay state remains available for fallback.
         self.peers
             .configure_relay_first(relay_candidates_present)
             .await;

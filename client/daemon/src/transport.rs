@@ -4538,7 +4538,7 @@ impl WireGuardTransport {
     ///
     /// Mirrors [`Self::handle_relay_probe_packet`]: a request is answered
     /// idempotently over the same relay, and an ack is verified against the
-    /// outstanding expectation before it commits the relay-first business gate
+    /// outstanding expectation before it commits relay-first business evidence
     /// for one-directional traffic.  A relay renewal rejects this reader the
     /// same way, so a stale transport can neither answer nor consume.
     async fn handle_path_commit_packet(
