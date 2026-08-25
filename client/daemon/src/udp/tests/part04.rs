@@ -145,6 +145,30 @@ impl SimulatedNat {
                                         drop(next);
                                         mappings.insert((client_src, peer_public), port);
                                     }
+                                    // Windows can reject an otherwise unused
+                                    // fixed loopback port with WSAEACCES when
+                                    // the port belongs to an OS-excluded
+                                    // range. Preserve the NAT's linear public
+                                    // port model whenever possible, but use a
+                                    // kernel-selected port for this mapping so
+                                    // the fixture remains portable.
+                                    Err(error)
+                                        if error.kind() == std::io::ErrorKind::PermissionDenied =>
+                                    {
+                                        let fallback = UdpSocket::bind(SocketAddr::new(nat_ip, 0))
+                                            .await
+                                            .unwrap_or_else(|fallback_error| {
+                                                panic!(
+                                                    "bind public forwarder fallback: {fallback_error}"
+                                                )
+                                            });
+                                        port = fallback
+                                            .local_addr()
+                                            .expect("public forwarder fallback must have an address")
+                                            .port();
+                                        mappings.insert((client_src, peer_public), port);
+                                        break Arc::new(fallback);
+                                    }
                                     Err(error) => panic!("bind public forwarder: {error}"),
                                 }
                             };
