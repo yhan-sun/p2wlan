@@ -17,7 +17,9 @@ use p2pnet_wireguard::{MessageTransport, TransportSession};
 use tokio::sync::{mpsc, watch, Mutex, OwnedMutexGuard, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::dataplane::{InboundPacket, OutboundPacket};
+use crate::dataplane::{
+    global_dataplane_profiler, DataplaneRxTrace, InboundPacket, OutboundPacket,
+};
 use crate::error::{DaemonError, Result};
 use crate::peer::{PeerManager, PeerSessionGeneration};
 use crate::relay::RelayTransport;
@@ -2184,6 +2186,7 @@ impl WireGuardTransport {
                 packet,
                 session_instance: Some(session_instance),
                 from_previous_session: false,
+                trace: None,
             }));
         }
 
@@ -2276,6 +2279,7 @@ impl WireGuardTransport {
                 packet,
                 session_instance: Some(session_instance),
                 from_previous_session: false,
+                trace: None,
             }));
         }
 
@@ -2293,6 +2297,7 @@ impl WireGuardTransport {
                         packet,
                         session_instance: Some(previous.slot.session_instance),
                         from_previous_session: true,
+                        trace: None,
                     }));
                 }
                 Err(error) => {
@@ -2487,6 +2492,9 @@ impl WireGuardTransport {
         evidence: Option<InboundEvidenceFeed>,
     ) -> Result<()> {
         while let Some(packet) = encrypted_rx.recv().await {
+            let profiler = global_dataplane_profiler();
+            let sampled = profiler.sample_next_packet();
+            let transport_dequeued = Instant::now();
             let source = packet.source;
             let local_endpoint = packet.local_endpoint;
             let relay_endpoint = packet.relay_endpoint;
@@ -2510,8 +2518,25 @@ impl WireGuardTransport {
                 network_generation = ?packet_network_generation,
                 "encrypted datagram reached the daemon transport decrypt boundary"
             );
+            let decrypt_started = Instant::now();
             match self.decrypt_inbound(&packet.wire_bytes).await {
-                Ok(Some(inbound)) => {
+                Ok(Some(mut inbound)) => {
+                    let decrypt_completed = Instant::now();
+                    profiler.record(
+                        sampled,
+                        "transport_queue_to_decrypt_us",
+                        decrypt_started.duration_since(transport_dequeued),
+                    );
+                    profiler.record(
+                        sampled,
+                        "decrypt_us",
+                        decrypt_completed.duration_since(decrypt_started),
+                    );
+                    inbound.trace = Some(DataplaneRxTrace {
+                        sampled,
+                        transport_dequeued,
+                        decrypt_completed,
+                    });
                     debug!(
                         event = "wireguard_inbound_decrypt_succeeded",
                         peer_id = %inbound.peer_id,
@@ -3538,6 +3563,7 @@ impl WireGuardTransport {
                             peer_id: peer_id_owned.clone(),
                             dst_ip: ip.src_addr().to_string(),
                             packet: ack_packet,
+                            trace: None,
                         },
                         DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
                         move |encrypted| async move {
@@ -4200,6 +4226,7 @@ impl WireGuardTransport {
                             peer_id: peer_id.to_string(),
                             dst_ip: ip.src_addr().to_string(),
                             packet: ack_packet,
+                            trace: None,
                         },
                         move |encrypted| async move {
                             relay_send.send_packet(&encrypted).await.map(|_| ())
@@ -4338,6 +4365,7 @@ impl WireGuardTransport {
                             peer_id: peer_id.to_string(),
                             dst_ip: ip.src_addr().to_string(),
                             packet: ack_packet,
+                            trace: None,
                         },
                         move |encrypted| async move {
                             relay_send.send_packet(&encrypted).await.map(|_| ())

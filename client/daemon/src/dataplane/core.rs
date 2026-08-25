@@ -7,6 +7,9 @@ pub struct OutboundPacket {
     pub dst_ip: String,
     /// Raw IP packet bytes read from TUN.
     pub packet: Vec<u8>,
+    /// Low-frequency userspace latency context. It is never used for routing
+    /// or path selection and is absent for synthetic/control packets.
+    pub(crate) trace: Option<DataplaneTxTrace>,
 }
 
 /// A raw IP packet decrypted from a peer and ready to write into TUN.
@@ -26,6 +29,9 @@ pub struct InboundPacket {
     /// the bounded WireGuard overlap window, but they are never path or
     /// first-usable evidence for the current session.
     pub from_previous_session: bool,
+    /// Low-frequency userspace latency context, attached only by the live
+    /// decrypt worker before the packet is written to TUN.
+    pub(crate) trace: Option<DataplaneRxTrace>,
 }
 
 /// Reads packets from a virtual interface and routes them by destination IP.
@@ -118,12 +124,17 @@ where
             loop {
                 tokio::select! {
                     result = self.read_packet(&mut buf) => {
-                        let packet = result?;
+                        let (packet, tun_read_started, tun_read_completed) = result?;
                         if !packet.is_empty() {
                             // The TUN read has completed.  Route outside the
                             // select future so a competing inbound packet
                             // cannot cancel after bytes were consumed.
-                            self.route_outbound_packet(&packet).await?;
+                            self.route_outbound_packet(
+                                &packet,
+                                tun_read_started,
+                                tun_read_completed,
+                            )
+                            .await?;
                         }
                     }
                     inbound = inbound_rx.recv() => {
@@ -143,30 +154,47 @@ where
     }
 
     async fn read_and_route_once(&mut self, buf: &mut [u8]) -> Result<()> {
-        let packet = self.read_packet(buf).await?;
+        let (packet, tun_read_started, tun_read_completed) = self.read_packet(buf).await?;
         if packet.is_empty() {
             return Ok(());
         }
-        self.route_outbound_packet(&packet).await
+        self.route_outbound_packet(&packet, tun_read_started, tun_read_completed)
+            .await
     }
 
     /// Read exactly one TUN packet without doing any further asynchronous
     /// work.  `run` deliberately completes this future before entering the
     /// peer-resolution/routing phase: cancelling a future after it has
     /// consumed a packet from a TUN implementation is a silent packet loss.
-    async fn read_packet(&mut self, buf: &mut [u8]) -> Result<Vec<u8>> {
+    async fn read_packet(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<(Vec<u8>, std::time::Instant, std::time::Instant)> {
+        let started = std::time::Instant::now();
         let n = self
             .tun
             .read(buf)
             .await
             .map_err(|e| DaemonError::Network(format!("TUN read failed: {e}")))?;
-        Ok(buf[..n].to_vec())
+        Ok((buf[..n].to_vec(), started, std::time::Instant::now()))
     }
 
     /// Route a packet that has already been removed from the TUN read queue.
     /// This method may await peer state and ACL locks, but it is never placed
     /// directly in the `select!` that owns the TUN read operation.
-    async fn route_outbound_packet(&mut self, packet: &[u8]) -> Result<()> {
+    async fn route_outbound_packet(
+        &mut self,
+        packet: &[u8],
+        tun_read_started: std::time::Instant,
+        tun_read_completed: std::time::Instant,
+    ) -> Result<()> {
+        let profiler = global_dataplane_profiler();
+        let sampled = profiler.sample_next_packet();
+        profiler.record(
+            sampled,
+            "tun_read_us",
+            tun_read_completed.duration_since(tun_read_started),
+        );
         let parsed = match IpPacket::new(packet) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -218,12 +246,41 @@ where
             peer_id: peer_id.clone(),
             dst_ip: dst_ip.clone(),
             packet: routed_packet,
+            trace: Some(DataplaneTxTrace {
+                sampled,
+                tun_read_started,
+                tun_read_completed,
+                route_ready: Some(std::time::Instant::now()),
+            }),
         };
 
+        let queue_started = std::time::Instant::now();
         self.outbound_tx
             .send(routed)
             .await
             .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()))?;
+        let queue_wait = queue_started.elapsed();
+        profiler.record(sampled, "udp_send_queue_us", queue_wait);
+        profiler.record(
+            sampled,
+            "tun_read_to_route_us",
+            queue_started.duration_since(tun_read_completed),
+        );
+        if queue_wait >= DATAPLANE_STALL_THRESHOLD {
+            tracing::debug!(
+                event = "dataplane_stall",
+                peer_id = %peer_id,
+                active_path = if self.peers.is_direct_sync(&peer_id) { "direct" } else { "relay_or_unknown" },
+                tun_to_send_us = queue_started
+                    .duration_since(tun_read_started)
+                    .as_micros() as u64,
+                receive_to_tun_us = 0u64,
+                candidate_gather_active = profiler.candidate_gather_active(),
+                network_generation = self.peers.current_network_generation_sync(),
+                queue_wait_us = queue_wait.as_micros() as u64,
+                "outbound dataplane packet waited beyond the diagnostic stall threshold"
+            );
+        }
         self.peers.record_sent(&peer_id, total_len as u64).await;
 
         debug!("Routed {total_len} byte {protocol} packet to {peer_id} ({dst_ip})");
@@ -231,6 +288,7 @@ where
     }
 
     async fn write_inbound(&mut self, packet: InboundPacket) -> Result<()> {
+        let trace = packet.trace.clone();
         let parsed = match IpPacket::new(&packet.packet) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -318,6 +376,29 @@ where
                 written,
                 inbound_packet.len()
             )));
+        }
+
+        if let Some(trace) = trace {
+            let profiler = global_dataplane_profiler();
+            let receive_to_tun = trace.transport_dequeued.elapsed();
+            profiler.record(
+                trace.sampled,
+                "decrypt_to_tun_write_us",
+                trace.decrypt_completed.elapsed(),
+            );
+            profiler.record(trace.sampled, "total_userspace_rx_us", receive_to_tun);
+            if receive_to_tun >= DATAPLANE_STALL_THRESHOLD {
+                tracing::debug!(
+                    event = "dataplane_stall",
+                    peer_id = %packet.peer_id,
+                    active_path = if self.peers.is_direct_sync(&packet.peer_id) { "direct" } else { "relay_or_unknown" },
+                    tun_to_send_us = 0u64,
+                    receive_to_tun_us = receive_to_tun.as_micros() as u64,
+                    candidate_gather_active = profiler.candidate_gather_active(),
+                    network_generation = self.peers.current_network_generation_sync(),
+                    "inbound dataplane packet exceeded the diagnostic stall threshold"
+                );
+            }
         }
 
         self.peers
