@@ -11,6 +11,10 @@ const MAX_PROFILE_SAMPLES: usize = 512;
 const PROFILE_REPORT_EVERY: u64 = 8;
 const PROFILE_SUMMARY_INTERVAL: Duration = Duration::from_secs(30);
 const TAIL_EVENT_RATE_LIMIT: Duration = Duration::from_millis(100);
+#[allow(dead_code)]
+const TUN_TURNAROUND_MAX_PENDING: usize = 128;
+#[allow(dead_code)]
+const TUN_TURNAROUND_TTL: Duration = Duration::from_secs(2);
 /// A sampled dataplane packet above this threshold is a warning candidate.
 pub(crate) const DATAPLANE_TAIL_WARNING_THRESHOLD: Duration = Duration::from_millis(2);
 /// A sampled dataplane packet above this threshold is a severe tail event.
@@ -19,6 +23,97 @@ pub(crate) const DATAPLANE_TAIL_SEVERE_THRESHOLD: Duration = Duration::from_mill
 /// far above normal sub-millisecond stage work. It emits an event only when a
 /// real packet crosses the threshold; it is not a correctness timeout.
 pub(crate) const DATAPLANE_STALL_THRESHOLD: Duration = Duration::from_millis(25);
+
+/// The small amount of correlation state used to measure Android's kernel
+/// echo turnaround after a packet has been written to the TUN. It deliberately
+/// stores only ICMP echo id/sequence and monotonic timestamps: no payload,
+/// packet copy, or routing state is retained.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IcmpEchoKey {
+    identifier: u16,
+    sequence: u16,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingTunEcho {
+    key: IcmpEchoKey,
+    written_at: Instant,
+}
+
+#[allow(dead_code)]
+pub(crate) struct TunTurnaroundCorrelator {
+    pending: Mutex<VecDeque<PendingTunEcho>>,
+}
+
+impl Default for TunTurnaroundCorrelator {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::with_capacity(TUN_TURNAROUND_MAX_PENDING)),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl TunTurnaroundCorrelator {
+    fn icmp_echo_key(packet: &[u8], expected_type: u8) -> Option<IcmpEchoKey> {
+        let parsed = p2pnet_tun::Ipv4Packet::new(packet).ok()?;
+        if parsed.protocol() != p2pnet_tun::Protocol::Icmp || parsed.is_fragment() {
+            return None;
+        }
+        let payload = parsed.payload();
+        if payload.len() < 8 || payload[0] != expected_type || payload[1] != 0 {
+            return None;
+        }
+        Some(IcmpEchoKey {
+            identifier: u16::from_be_bytes([payload[4], payload[5]]),
+            sequence: u16::from_be_bytes([payload[6], payload[7]]),
+        })
+    }
+
+    fn prune_expired(pending: &mut VecDeque<PendingTunEcho>, now: Instant) {
+        while pending.front().is_some_and(|sample| {
+            now.saturating_duration_since(sample.written_at) > TUN_TURNAROUND_TTL
+        }) {
+            pending.pop_front();
+        }
+    }
+
+    /// Remember a sampled echo request immediately after it is written to the
+    /// Android TUN. This is intentionally a no-op for unsampled packets.
+    pub(crate) fn record_request(&self, packet: &[u8], written_at: Instant, sampled: bool) {
+        if !sampled {
+            return;
+        }
+        let Some(key) = Self::icmp_echo_key(packet, 8) else {
+            return;
+        };
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_expired(&mut pending, written_at);
+        if pending.len() >= TUN_TURNAROUND_MAX_PENDING {
+            pending.pop_front();
+        }
+        pending.push_back(PendingTunEcho { key, written_at });
+    }
+
+    /// Match a kernel-generated echo reply against a recent sampled request.
+    /// Returns only the monotonic elapsed time for the diagnostic histogram.
+    pub(crate) fn observe_reply(&self, packet: &[u8], read_at: Instant) -> Option<Duration> {
+        let key = Self::icmp_echo_key(packet, 0)?;
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::prune_expired(&mut pending, read_at);
+        let index = pending.iter().rposition(|sample| sample.key == key)?;
+        let sample = pending.remove(index)?;
+        Some(read_at.saturating_duration_since(sample.written_at))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DataplaneTxTrace {
@@ -372,6 +467,10 @@ pub(crate) fn global_dataplane_profiler() -> &'static DataplaneProfiler {
 
 #[cfg(test)]
 mod profiling_tests {
+    use std::net::Ipv4Addr;
+
+    use p2pnet_tun::Ipv4Packet;
+
     use super::*;
 
     fn stage_values(profiler: &DataplaneProfiler, stage: &'static str) -> Vec<u64> {
@@ -768,5 +867,88 @@ mod profiling_tests {
         let values = [10, 20, 30, 40, 50];
         assert!(percentile(&values, 99, 100) >= percentile(&values, 95, 100));
         assert!(percentile(&values, 95, 100) >= percentile(&values, 50, 100));
+    }
+
+    #[test]
+    fn android_tun_turnaround_uses_only_icmp_echo_id_and_sequence() {
+        let correlator = TunTurnaroundCorrelator::default();
+        let request = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            0x1234,
+            7,
+            b"payload-is-not-retained",
+        );
+        let mut reply = request.clone();
+        reply[20] = 0; // ICMP Echo Reply; the checksum is not correlation state.
+        let written_at = Instant::now();
+
+        correlator.record_request(&request, written_at, true);
+        assert_eq!(
+            correlator.observe_reply(&reply, written_at + Duration::from_millis(7)),
+            Some(Duration::from_millis(7))
+        );
+        assert!(correlator
+            .observe_reply(&reply, written_at + Duration::from_millis(8))
+            .is_none());
+    }
+
+    #[test]
+    fn android_tun_turnaround_is_bounded_and_expires() {
+        let correlator = TunTurnaroundCorrelator::default();
+        let start = Instant::now();
+        for sequence in 0..=TUN_TURNAROUND_MAX_PENDING as u16 {
+            let request = Ipv4Packet::build_icmp_echo_request(
+                Ipv4Addr::new(10, 20, 0, 2),
+                Ipv4Addr::new(10, 20, 0, 1),
+                0x4321,
+                sequence,
+                &[],
+            );
+            correlator.record_request(
+                &request,
+                start + Duration::from_micros(sequence as u64),
+                true,
+            );
+        }
+
+        let first_request = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            0x4321,
+            0,
+            &[],
+        );
+        let mut first_reply = first_request.clone();
+        first_reply[20] = 0;
+        assert!(correlator
+            .observe_reply(&first_reply, start + Duration::from_millis(1))
+            .is_none());
+
+        let retained_request = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            0x4321,
+            1,
+            &[],
+        );
+        let mut retained_reply = retained_request.clone();
+        retained_reply[20] = 0;
+        assert!(correlator
+            .observe_reply(&retained_reply, start + Duration::from_millis(1))
+            .is_some());
+
+        let expired_request = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            0x4321,
+            129,
+            &[],
+        );
+        let mut expired_reply = expired_request.clone();
+        expired_reply[20] = 0;
+        assert!(correlator
+            .observe_reply(&expired_reply, start + Duration::from_secs(3))
+            .is_none());
     }
 }

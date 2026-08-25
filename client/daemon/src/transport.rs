@@ -3609,6 +3609,15 @@ impl WireGuardTransport {
                         }
                     }
                     let validation_completed = Instant::now();
+                    // Decryption proves the packet belongs to a peer. This
+                    // separate stage covers only the post-decrypt generation,
+                    // session, path-evidence, and overlay-validation work
+                    // before the packet enters the TUN-facing queue.
+                    profiler.record(
+                        sampled,
+                        "rx_postdecrypt_evidence_us",
+                        validation_completed.duration_since(decrypt_completed),
+                    );
                     profiler.record(
                         sampled,
                         "rx_generation_session_validation_us",

@@ -6,6 +6,17 @@ part of '../daemon_controller.dart';
 /// TUN permission and foreground lifecycle; the existing DiagnosticsApi still
 /// remains the readiness/status contract for the UI.
 const _androidVpnChannel = MethodChannel('p2wlan/android_vpn');
+// Build-time experiment switches keep the default APK on the existing
+// AsyncFd/no-Wi-Fi-lock path while allowing GitHub Actions/device A/B builds
+// to select the alternate implementation without adding UI state.
+const _androidTunMode = String.fromEnvironment(
+  'P2WLAN_ANDROID_TUN_MODE',
+  defaultValue: 'async_fd',
+);
+const _androidWifiLowLatency = bool.fromEnvironment(
+  'P2WLAN_ANDROID_WIFI_LOW_LATENCY',
+  defaultValue: false,
+);
 
 extension DaemonControllerAndroidVpn on DaemonController {
   Future<DaemonCommandResult> _startAndroidVpn(AppSettings settings) async {
@@ -91,6 +102,8 @@ extension DaemonControllerAndroidVpn on DaemonController {
       'relay_servers': settings.relayServers,
       'socket_pool': settings.socketPool,
       'diagnostics_bind': _androidDiagnosticsBind(settings.diagnosticsUrl),
+      'android_tun_mode': _androidTunMode,
+      'android_wifi_low_latency': _androidWifiLowLatency,
     });
   }
 

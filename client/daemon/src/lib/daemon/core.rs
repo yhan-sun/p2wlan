@@ -96,6 +96,9 @@ pub struct Daemon {
     /// Android's VpnService establishes the TUN before the Rust daemon starts.
     #[cfg(target_os = "android")]
     android_tun_fd: Option<std::os::fd::RawFd>,
+    /// Android TUN I/O experiment selected by the VpnService request.
+    #[cfg(target_os = "android")]
+    android_tun_mode: AndroidTunMode,
     /// Set by the Android JNI bridge once the daemon has completed control
     /// registration, attached the supplied TUN, and started its core tasks.
     /// The JNI launch acknowledgement must not be confused with this state:
@@ -239,6 +242,8 @@ impl Daemon {
             #[cfg(target_os = "android")]
             android_tun_fd: None,
             #[cfg(target_os = "android")]
+            android_tun_mode: AndroidTunMode::AsyncFd,
+            #[cfg(target_os = "android")]
             android_startup_ready: None,
         }
     }
@@ -246,8 +251,21 @@ impl Daemon {
     /// Construct a daemon around the fd owned by Android's VpnService.
     #[cfg(target_os = "android")]
     pub fn new_with_android_tun(config: Config, tun_fd: std::os::fd::RawFd) -> Self {
+        Self::new_with_android_tun_mode(config, tun_fd, AndroidTunMode::AsyncFd)
+    }
+
+    /// Construct a daemon around an Android VpnService fd and an explicit TUN
+    /// experiment mode. The default constructor above remains the stable
+    /// AsyncFd behavior for all existing callers.
+    #[cfg(target_os = "android")]
+    pub fn new_with_android_tun_mode(
+        config: Config,
+        tun_fd: std::os::fd::RawFd,
+        mode: AndroidTunMode,
+    ) -> Self {
         let mut daemon = Self::new(config);
         daemon.android_tun_fd = Some(tun_fd);
+        daemon.android_tun_mode = mode;
         daemon
     }
 

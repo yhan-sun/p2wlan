@@ -319,21 +319,25 @@ impl UdpTransport {
                 continue;
             }
 
-            self.update_socket_diagnostics(socket_index, |metrics| {
-                metrics.datagrams_received = metrics.datagrams_received.saturating_add(1)
-            })
-            .await;
+            let authenticated_probe = is_authenticated_punch_candidate(data);
+            let legacy_punch = decode_punch_packet(data);
 
-            let known_peer_ip = self.peers.has_known_public_candidate_ip(source.ip()).await;
-            if known_peer_ip {
+            if authenticated_probe {
+                // Probe diagnostics and candidate/public-IP inspection are
+                // deliberately confined to the probe path. Neither is
+                // allowed to delay a normal encrypted business datagram.
                 self.update_socket_diagnostics(socket_index, |metrics| {
-                    metrics.known_peer_ip_datagrams_received =
-                        metrics.known_peer_ip_datagrams_received.saturating_add(1)
+                    metrics.datagrams_received = metrics.datagrams_received.saturating_add(1)
                 })
                 .await;
-            }
-
-            if is_authenticated_punch_candidate(data) {
+                let known_peer_ip = self.peers.has_known_public_candidate_ip(source.ip()).await;
+                if known_peer_ip {
+                    self.update_socket_diagnostics(socket_index, |metrics| {
+                        metrics.known_peer_ip_datagrams_received =
+                            metrics.known_peer_ip_datagrams_received.saturating_add(1)
+                    })
+                    .await;
+                }
                 self.update_socket_diagnostics(socket_index, |metrics| {
                     metrics.authenticated_probe_packets_received = metrics
                         .authenticated_probe_packets_received
@@ -1061,7 +1065,11 @@ impl UdpTransport {
                 continue;
             }
 
-            if let Some(packet) = decode_punch_packet(data) {
+            if let Some(packet) = legacy_punch {
+                self.update_socket_diagnostics(socket_index, |metrics| {
+                    metrics.datagrams_received = metrics.datagrams_received.saturating_add(1)
+                })
+                .await;
                 match packet.kind {
                     PunchPacketKind::Punch => {
                         let ack = build_punch_ack(packet.nonce).to_vec();
@@ -1425,30 +1433,16 @@ impl UdpTransport {
                 continue;
             }
 
-            // Raw encrypted UDP is NOT fresh affinity evidence: the socket is
-            // only adopted for the peer after WireGuard decryption proves the
-            // datagram really belongs to it (see `run_inbound_with_peers`).
-            // Endpoint learning may still run here, but it only records the
-            // observed source, never the sending socket.
-            if let Some(peer_id) = self.peers.learn_endpoint_from_addr(source).await {
-                trace!("Learned encrypted UDP source {source} for peer {peer_id}");
-            }
-
-            self.update_socket_diagnostics(socket_index, |metrics| {
-                metrics.encrypted_packets_received += 1
-            })
-            .await;
-
+            // Raw encrypted UDP is NOT fresh affinity evidence. It is handed
+            // to the transport queue without candidate scans, PeerManager
+            // locks, or awaited diagnostics. Endpoint learning occurs only
+            // after WireGuard authentication in run_inbound_with_peers.
             let profiler = global_dataplane_profiler();
             let profile_sampled = profiler.sample_next_packet();
             let transport_queue_send_started = Instant::now();
-            profiler.record_value(
-                profile_sampled,
-                "rx_transport_inbound_queue_depth_before_send",
-                inbound_tx
-                    .max_capacity()
-                    .saturating_sub(inbound_tx.capacity()) as u64,
-            );
+            let queue_depth_before_send = inbound_tx
+                .max_capacity()
+                .saturating_sub(inbound_tx.capacity()) as u64;
             inbound_tx
                 .send(ReceivedEncryptedPacket {
                     source: Some(source),
@@ -1475,6 +1469,24 @@ impl UdpTransport {
                 .map_err(|_| {
                     DaemonError::Network("received encrypted packet channel closed".to_string())
                 })?;
+
+            // All diagnostic work is sampled and happens after the packet is
+            // in the bounded transport queue. A contended metrics lock can
+            // therefore never add receive-side queueing latency.
+            profiler.record(
+                profile_sampled,
+                "rx_udp_prequeue_us",
+                transport_queue_send_started.duration_since(udp_received),
+            );
+            profiler.record_value(
+                profile_sampled,
+                "rx_transport_inbound_queue_depth_before_send",
+                queue_depth_before_send,
+            );
+            self.update_socket_diagnostics_try(socket_index, |metrics| {
+                metrics.datagrams_received = metrics.datagrams_received.saturating_add(1);
+                metrics.encrypted_packets_received = metrics.encrypted_packets_received.saturating_add(1);
+            });
 
             debug!("Received {n} encrypted UDP bytes from {source}");
         }

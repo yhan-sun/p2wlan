@@ -43,6 +43,8 @@ pub struct DataPlane<T> {
     acl: Option<Arc<RwLock<AclEngine>>>,
     local_node_id: Option<String>,
     overlay_v4: Option<Ipv4Cidr>,
+    #[cfg(target_os = "android")]
+    tun_turnaround: TunTurnaroundCorrelator,
 }
 
 impl<T> DataPlane<T>
@@ -61,6 +63,8 @@ where
                 acl: None,
                 local_node_id: None,
                 overlay_v4: None,
+                #[cfg(target_os = "android")]
+                tun_turnaround: TunTurnaroundCorrelator::default(),
             },
             outbound_rx,
         )
@@ -89,6 +93,8 @@ where
                 acl: None,
                 local_node_id: None,
                 overlay_v4: None,
+                #[cfg(target_os = "android")]
+                tun_turnaround: TunTurnaroundCorrelator::default(),
             },
             outbound_rx,
             inbound_tx,
@@ -152,13 +158,21 @@ where
                                 inbound_rx.len() as u64,
                             );
                             if let Some(enqueued) = trace.inbound_queue_send_started {
+                                let queue_wait = trace
+                                    .inbound_queue_dequeued
+                                    .expect("inbound dequeue timestamp was just set")
+                                    .duration_since(enqueued);
+                                profiler.record(
+                                    trace.sampled,
+                                    "rx_inbound_queue_wait_us",
+                                    queue_wait,
+                                );
+                                // Preserve the Phase 4 diagnostic name for
+                                // existing log consumers.
                                 profiler.record(
                                     trace.sampled,
                                     "rx_dataplane_inbound_queue_wait_us",
-                                    trace
-                                        .inbound_queue_dequeued
-                                        .expect("inbound dequeue timestamp was just set")
-                                        .duration_since(enqueued),
+                                    queue_wait,
                                 );
                             }
                         }
@@ -210,6 +224,13 @@ where
     ) -> Result<()> {
         let profiler = global_dataplane_profiler();
         let sampled = profiler.sample_next_packet();
+        #[cfg(target_os = "android")]
+        if let Some(turnaround) = self
+            .tun_turnaround
+            .observe_reply(packet, tun_read_completed)
+        {
+            profiler.record(true, "android_tun_kernel_turnaround_us", turnaround);
+        }
         // The read future can legitimately wait for the next packet. Keep that
         // idle wait diagnostic-only; TX latency starts at the completed packet.
         profiler.record(
@@ -436,6 +457,12 @@ where
                 written,
                 inbound_packet.len()
             )));
+        }
+
+        #[cfg(target_os = "android")]
+        if let Some(trace) = trace.as_ref() {
+            self.tun_turnaround
+                .record_request(&inbound_packet, tun_write_completed, trace.sampled);
         }
 
         if let Some(trace) = trace {

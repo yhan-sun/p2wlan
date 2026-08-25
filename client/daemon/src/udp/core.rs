@@ -480,6 +480,33 @@ impl UdpTransport {
         }
     }
 
+    /// Best-effort diagnostics update for the encrypted business-packet path.
+    ///
+    /// The UDP receive loop must not wait for a diagnostics mutex before it
+    /// hands an authenticated-encrypted candidate to the bounded transport
+    /// queue. Probe/control packets may use the awaited helper above because
+    /// they are not on the normal data path; business packets use this helper
+    /// only after enqueue and silently skip a contended sample.
+    fn update_socket_diagnostics_try(
+        &self,
+        socket_index: usize,
+        update: impl FnOnce(&mut UdpSocketPoolMemberDiagnostics),
+    ) {
+        if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
+            if let Ok(mut diagnostics) = self.dynamic_socket_diagnostics.try_lock() {
+                if let Some(metrics) = diagnostics.get_mut(&socket_index) {
+                    update(metrics);
+                }
+            }
+            return;
+        }
+        if let Ok(mut diagnostics) = self.socket_pool_diagnostics.try_lock() {
+            if let Some(metrics) = diagnostics.get_mut(socket_index) {
+                update(metrics);
+            }
+        }
+    }
+
     fn punch_socket_count(&self) -> usize {
         if self.socket_pool_active() {
             self.socket_count()

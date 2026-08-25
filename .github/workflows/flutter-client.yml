@@ -41,6 +41,20 @@ on:
       - "contracts/**"
       - ".github/workflows/**"
   workflow_dispatch:
+    inputs:
+      android_tun_mode:
+        description: "Android TUN mode for the APK experiment"
+        required: true
+        type: choice
+        options:
+          - async_fd
+          - dedicated_blocking
+        default: async_fd
+      android_wifi_low_latency:
+        description: "Request Android Wi-Fi full-low-latency lock"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -135,10 +149,18 @@ jobs:
       - name: Build arm64 release APK
         env:
           P2WLAN_ANDROID_ABIS: arm64-v8a
+          P2WLAN_ANDROID_TUN_MODE: ${{ inputs.android_tun_mode || 'async_fd' }}
+          P2WLAN_ANDROID_WIFI_LOW_LATENCY: ${{ inputs.android_wifi_low_latency || 'false' }}
           # Fork PRs do not receive repository secrets. They may still build
           # a test APK, but only push/workflow-dispatch builds are distributable.
           P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: ${{ github.event_name == 'pull_request' && '1' || '0' }}
-        run: flutter build apk --release --target-platform android-arm64 --split-per-abi
+        run: >
+          flutter build apk
+          --release
+          --target-platform android-arm64
+          --split-per-abi
+          --dart-define=P2WLAN_ANDROID_TUN_MODE=$P2WLAN_ANDROID_TUN_MODE
+          --dart-define=P2WLAN_ANDROID_WIFI_LOW_LATENCY=$P2WLAN_ANDROID_WIFI_LOW_LATENCY
 
       - name: Verify APK contains only arm64-v8a
         shell: bash

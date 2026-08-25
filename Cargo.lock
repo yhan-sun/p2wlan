@@ -2151,6 +2151,7 @@ dependencies = [
  "hex",
  "jni",
  "p2pnet-netbind",
+ "p2pnet-tun",
  "p2wlan-daemon",
  "rand 0.8.7",
  "serde",

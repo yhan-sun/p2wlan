@@ -5,7 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -55,6 +58,7 @@ class P2wlanVpnService : VpnService() {
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var wifiLatencyLock: WifiManager.WifiLock? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile
     private var monitorGeneration = 0L
@@ -123,6 +127,7 @@ class P2wlanVpnService : VpnService() {
             }
 
             val request = JSONObject(requestJson)
+            val experiment = AndroidExperimentConfig.from(request)
             val overlay = parseCidr(request.optString("overlay_cidr", "10.20.0.0/16"))
             val address = validIpv4(request.optString("virtual_ip"))
                 ?: "10.20.0.1"
@@ -131,7 +136,7 @@ class P2wlanVpnService : VpnService() {
             val builder = Builder()
                 .setSession("P2WLAN")
                 .setMtu(mtu)
-                .setBlocking(false)
+                .setBlocking(experiment.tunMode == AndroidTunMode.DEDICATED_BLOCKING)
                 // Only the overlay is captured. Public control/relay endpoints
                 // never match this route and therefore stay on Wi-Fi/mobile.
                 .addAddress(address, overlay.second)
@@ -141,6 +146,7 @@ class P2wlanVpnService : VpnService() {
                 ?: throw IllegalStateException("VpnService.Builder.establish() returned null")
             detachedFd = established.detachFd()
             vpnInterface = null
+            configureWifiLatencyMode(experiment.wifiLowLatencyRequested)
 
             val enrichedRequest = enrichRequest(request)
             val nativeError = P2wlanNative.start(this, detachedFd, enrichedRequest.toString())
@@ -157,7 +163,10 @@ class P2wlanVpnService : VpnService() {
             serviceRunning = true
             Log.i(
                 TAG,
-                "event=android_daemon_started restart_attempt=$restartAttempts",
+                "event=android_daemon_started " +
+                    "restart_attempt=$restartAttempts " +
+                    "android_tun_mode=${experiment.tunMode.wireValue} " +
+                    "android_wifi_low_latency=${experiment.wifiLowLatencyRequested}",
             )
             startNativeMonitor()
             Log.i(TAG, "P2WLAN Android VPN started")
@@ -166,6 +175,7 @@ class P2wlanVpnService : VpnService() {
             serviceError = message
             Log.e(TAG, message, error)
             if (detachedFd >= 0) closeDetachedFd(detachedFd)
+            releaseWifiLatencyMode()
             vpnInterface?.close()
             vpnInterface = null
             serviceRunning = false
@@ -194,6 +204,7 @@ class P2wlanVpnService : VpnService() {
         } catch (error: Throwable) {
             Log.w(TAG, "Failed to request Rust daemon shutdown", error)
         }
+        releaseWifiLatencyMode()
         vpnInterface?.close()
         vpnInterface = null
         stopForeground(true)
@@ -214,6 +225,7 @@ class P2wlanVpnService : VpnService() {
         if (P2wlanNative.isRunning()) {
             P2wlanNative.stop()
         }
+        releaseWifiLatencyMode()
         vpnInterface?.close()
         vpnInterface = null
         super.onDestroy()
@@ -272,6 +284,7 @@ class P2wlanVpnService : VpnService() {
                 cancelHealthyBudgetReset()
                 serviceError = error
                 serviceRunning = false
+                releaseWifiLatencyMode()
                 Log.e(
                     TAG,
                     "event=android_daemon_exited " +
@@ -396,6 +409,72 @@ class P2wlanVpnService : VpnService() {
 
     private fun clearPersistedStartRequest() {
         statePreferences().edit().remove(STATE_START_REQUEST).apply()
+    }
+
+    private fun configureWifiLatencyMode(requested: Boolean) {
+        // A prior failed/restarted start must not retain a lock across TUN
+        // generations. The new request below is the only owner of the lock.
+        releaseWifiLatencyMode()
+        val network = physicalNetworkKind()
+        var held = false
+        if (AndroidWifiLatencyPolicy.shouldAcquire(Build.VERSION.SDK_INT, network, requested)) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val manager = getSystemService(WifiManager::class.java)
+                    val lock = manager?.createWifiLock(
+                        WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+                        "P2WLAN:android-low-latency",
+                    )
+                    if (lock != null) {
+                        lock.setReferenceCounted(false)
+                        lock.acquire()
+                        if (lock.isHeld) {
+                            wifiLatencyLock = lock
+                            held = true
+                        }
+                    }
+                }
+            } catch (error: Throwable) {
+                Log.w(TAG, "Failed to acquire Android Wi-Fi low-latency lock", error)
+            }
+        }
+        Log.i(
+            TAG,
+            "event=android_wifi_latency_mode requested=$requested held=$held network=$network",
+        )
+    }
+
+    private fun releaseWifiLatencyMode() {
+        val lock = wifiLatencyLock ?: return
+        val wasHeld = try {
+            lock.isHeld
+        } catch (_: Throwable) {
+            false
+        }
+        try {
+            if (wasHeld) lock.release()
+        } catch (error: Throwable) {
+            Log.w(TAG, "Failed to release Android Wi-Fi low-latency lock", error)
+        } finally {
+            wifiLatencyLock = null
+        }
+        Log.i(
+            TAG,
+            "event=android_wifi_latency_mode requested=true held=false network=${physicalNetworkKind()}",
+        )
+    }
+
+    private fun physicalNetworkKind(): String {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return "unknown"
+        var hasCellular = false
+        for (network in manager.allNetworks) {
+            val capabilities = manager.getNetworkCapabilities(network) ?: continue
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "wifi"
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                hasCellular = true
+            }
+        }
+        return if (hasCellular) "cellular" else "unknown"
     }
 
     private fun compactLogReason(value: String): String {
