@@ -26,6 +26,7 @@
 //! - When the sequence is not consistent enough, the linear model is rejected
 //!   (`Unpredictable`) instead of forcing a prediction.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -50,6 +51,278 @@ pub struct MappingObservation {
     pub responded_at_ms: u64,
     /// Local UDP socket endpoint used for the measurement.
     pub local_endpoint: SocketAddr,
+}
+
+/// Coarse allocation behavior inferred from several independent observations.
+///
+/// This is intentionally separate from [`PortModelKind`]. `PortModelKind` is
+/// the predictor used when a sequence is already good enough to walk; this
+/// model is the admission/evidence view used to decide whether a hard NAT is
+/// predictable, bounded-scatter, or high entropy. In particular, two
+/// different ports are not enough to call an allocator random.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocationModelKind {
+    Stable,
+    FixedStep { step: i16 },
+    SmallWindow { direction: i8, width: u16 },
+    HighEntropy,
+    Unknown,
+}
+
+impl AllocationModelKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::FixedStep { .. } => "fixed_step",
+            Self::SmallWindow { .. } => "small_window",
+            Self::HighEntropy => "high_entropy",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Allocation evidence kept for diagnostics and planner admission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllocationModel {
+    pub kind: AllocationModelKind,
+    pub confidence: u8,
+    pub median_delta: Option<i16>,
+    pub variance: Option<f32>,
+    pub entropy: Option<f32>,
+    pub parity_stable: Option<bool>,
+    pub monotonicity: Option<f32>,
+    pub repeatability: Option<f32>,
+    pub public_ip_stable: Option<bool>,
+    pub destination_diversity: Option<f32>,
+    pub timing_jitter_ms: Option<f32>,
+    pub sample_count: usize,
+}
+
+/// Infer allocation behavior from the complete observer record, not just a
+/// pair of ports. Destination, socket identity and timestamps are validated so
+/// mixed-socket or duplicate observations cannot manufacture a model.
+pub fn infer_allocation_model(observations: &[MappingObservation]) -> AllocationModel {
+    let mut samples = observations
+        .iter()
+        .filter(|observation| {
+            observation.responded_at_ms > 0 && observation.responded_at_ms >= observation.sent_at_ms
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by_key(|observation| observation.sequence);
+    let sample_count = samples.len();
+    let public_ip_stable = samples.first().map(|first| {
+        samples
+            .iter()
+            .all(|sample| sample.observed.ip() == first.observed.ip())
+    });
+    let destination_diversity = (sample_count > 0).then(|| {
+        samples
+            .iter()
+            .map(|sample| sample.observer)
+            .collect::<HashSet<_>>()
+            .len() as f32
+            / sample_count as f32
+    });
+    let unknown = |kind| AllocationModel {
+        kind,
+        confidence: 0,
+        median_delta: None,
+        variance: None,
+        entropy: None,
+        parity_stable: None,
+        monotonicity: None,
+        repeatability: None,
+        public_ip_stable,
+        destination_diversity,
+        timing_jitter_ms: None,
+        sample_count,
+    };
+    if sample_count < 3
+        || samples
+            .windows(2)
+            .any(|window| window[1].sequence <= window[0].sequence)
+        || samples
+            .iter()
+            .any(|sample| sample.local_endpoint != samples[0].local_endpoint)
+        || samples.windows(2).any(|window| {
+            window[1].sent_at_ms < window[0].sent_at_ms
+                || window[1].responded_at_ms < window[0].responded_at_ms
+        })
+        || public_ip_stable != Some(true)
+    {
+        return unknown(AllocationModelKind::Unknown);
+    }
+
+    let ports = samples
+        .iter()
+        .map(|sample| sample.observed.port())
+        .collect::<Vec<_>>();
+    let deltas = ports
+        .windows(2)
+        .map(|window| modular_difference(window[0], window[1]))
+        .collect::<Vec<_>>();
+    let non_zero = deltas.iter().filter(|delta| **delta != 0).count();
+    let positive = deltas.iter().filter(|delta| **delta > 0).count();
+    let negative = deltas.iter().filter(|delta| **delta < 0).count();
+    let monotonicity = (positive.max(negative) as f32) / deltas.len() as f32;
+    let median_delta = (!deltas.is_empty()).then(|| median(&deltas));
+    let mean =
+        deltas.iter().map(|delta| f32::from(*delta)).sum::<f32>() / deltas.len().max(1) as f32;
+    let variance = (!deltas.is_empty()).then(|| {
+        deltas
+            .iter()
+            .map(|delta| {
+                let distance = f32::from(*delta) - mean;
+                distance * distance
+            })
+            .sum::<f32>()
+            / deltas.len() as f32
+    });
+    let mut delta_frequencies = HashMap::<i16, usize>::new();
+    for delta in &deltas {
+        *delta_frequencies.entry(*delta).or_default() += 1;
+    }
+    let entropy = if delta_frequencies.len() <= 1 {
+        Some(0.0)
+    } else {
+        let denominator = (delta_frequencies.len() as f32).ln();
+        Some(
+            delta_frequencies
+                .values()
+                .map(|count| {
+                    let probability = *count as f32 / deltas.len() as f32;
+                    -probability * probability.ln()
+                })
+                .sum::<f32>()
+                / denominator,
+        )
+    };
+    let timing_jitter_ms = (sample_count > 1).then(|| {
+        let delays = samples
+            .iter()
+            .map(|sample| (sample.responded_at_ms - sample.sent_at_ms) as f32)
+            .collect::<Vec<_>>();
+        let mean = delays.iter().sum::<f32>() / delays.len() as f32;
+        (delays
+            .iter()
+            .map(|delay| {
+                let distance = *delay - mean;
+                distance * distance
+            })
+            .sum::<f32>()
+            / delays.len() as f32)
+            .sqrt()
+    });
+    let parity_stable = (non_zero > 0).then(|| {
+        let parity = deltas[0].unsigned_abs() % 2;
+        deltas
+            .iter()
+            .filter(|delta| **delta != 0)
+            .all(|delta| delta.unsigned_abs() % 2 == parity)
+    });
+    let repeatability = Some(
+        deltas
+            .iter()
+            .filter(|delta| deltas.iter().filter(|other| *other == *delta).count() > 1)
+            .count() as f32
+            / deltas.len().max(1) as f32,
+    );
+
+    if deltas.iter().all(|delta| *delta == 0) {
+        return AllocationModel {
+            kind: AllocationModelKind::Stable,
+            confidence: 98,
+            median_delta,
+            variance,
+            entropy,
+            parity_stable,
+            monotonicity: Some(1.0),
+            repeatability,
+            public_ip_stable,
+            destination_diversity,
+            timing_jitter_ms,
+            sample_count,
+        };
+    }
+
+    if deltas.iter().all(|delta| *delta == deltas[0]) && deltas[0] != 0 {
+        return AllocationModel {
+            kind: AllocationModelKind::FixedStep { step: deltas[0] },
+            confidence: 96,
+            median_delta,
+            variance,
+            entropy,
+            parity_stable,
+            monotonicity: Some(monotonicity),
+            repeatability,
+            public_ip_stable,
+            destination_diversity,
+            timing_jitter_ms,
+            sample_count,
+        };
+    }
+
+    let same_direction = positive == deltas.len() || negative == deltas.len();
+    let min_delta = deltas.iter().copied().min().unwrap_or_default();
+    let max_delta = deltas.iter().copied().max().unwrap_or_default();
+    let width = max_delta.saturating_sub(min_delta).unsigned_abs();
+    if same_direction && width <= 8 {
+        return AllocationModel {
+            kind: AllocationModelKind::SmallWindow {
+                direction: if positive == deltas.len() { 1 } else { -1 },
+                width,
+            },
+            confidence: 78u8.saturating_sub(width.min(8) as u8 * 4),
+            median_delta,
+            variance,
+            entropy,
+            parity_stable,
+            monotonicity: Some(monotonicity),
+            repeatability,
+            public_ip_stable,
+            destination_diversity,
+            timing_jitter_ms,
+            sample_count,
+        };
+    }
+
+    let distinct_ports = ports.iter().copied().collect::<HashSet<_>>().len();
+    if distinct_ports >= sample_count.saturating_sub(1)
+        && (monotonicity < 0.75
+            || variance.is_some_and(|value| value > 64.0)
+            || entropy.is_some_and(|value| value >= 0.75))
+    {
+        return AllocationModel {
+            kind: AllocationModelKind::HighEntropy,
+            confidence: 72,
+            median_delta,
+            variance,
+            entropy,
+            parity_stable,
+            monotonicity: Some(monotonicity),
+            repeatability,
+            public_ip_stable,
+            destination_diversity,
+            timing_jitter_ms,
+            sample_count,
+        };
+    }
+
+    AllocationModel {
+        kind: AllocationModelKind::Unknown,
+        confidence: 20,
+        median_delta,
+        variance,
+        entropy,
+        parity_stable,
+        monotonicity: Some(monotonicity),
+        repeatability,
+        public_ip_stable,
+        destination_diversity,
+        timing_jitter_ms,
+        sample_count,
+    }
 }
 
 impl MappingObservation {
@@ -963,6 +1236,48 @@ mod tests {
         assert_eq!(modular_difference(1, 65535), -2);
         assert_eq!(modular_difference(1000, 1005), 5);
         assert_eq!(modular_difference(45390, 45391), 1);
+    }
+
+    fn model_observations(ports: &[u16]) -> Vec<MappingObservation> {
+        ports
+            .iter()
+            .enumerate()
+            .map(|(sequence, port)| MappingObservation {
+                sequence: sequence as u16,
+                observer: SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                    3478 + sequence as u16,
+                ),
+                observed: SocketAddr::new(ip(), *port),
+                sent_at_ms: 1_000 + sequence as u64 * 10,
+                responded_at_ms: 1_005 + sequence as u64 * 10,
+                local_endpoint: ("0.0.0.0:58980").parse().unwrap(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn allocation_model_requires_three_ordered_samples() {
+        let observations = model_observations(&[40_000, 40_004]);
+        let model = infer_allocation_model(&observations);
+        assert_eq!(model.kind, AllocationModelKind::Unknown);
+        assert_eq!(model.sample_count, 2);
+    }
+
+    #[test]
+    fn allocation_model_distinguishes_fixed_small_window_and_entropy() {
+        assert!(matches!(
+            infer_allocation_model(&model_observations(&[40_000, 40_004, 40_008, 40_012])).kind,
+            AllocationModelKind::FixedStep { step: 4 }
+        ));
+        assert!(matches!(
+            infer_allocation_model(&model_observations(&[40_000, 40_003, 40_005, 40_007])).kind,
+            AllocationModelKind::SmallWindow { direction: 1, .. }
+        ));
+        let random =
+            infer_allocation_model(&model_observations(&[40_000, 1_000, 50_000, 2_000, 45_000]));
+        assert_eq!(random.kind, AllocationModelKind::HighEntropy);
+        assert!(random.entropy.is_some_and(|entropy| entropy > 0.75));
     }
 
     #[test]

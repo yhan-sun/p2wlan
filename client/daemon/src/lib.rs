@@ -145,8 +145,9 @@ use transport::{
     WireGuardTransport,
 };
 use udp::{
-    FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, PeerReflexiveIngress,
-    PeerReflexiveObservation, PunchSendReport, UdpTransport,
+    FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, HardHardBirthdayResult,
+    PeerReflexiveIngress, PeerReflexiveObservation, ProvisionalSocketGuard, PunchSendReport,
+    UdpTransport,
 };
 
 include!("lib/pending_handshake.rs");

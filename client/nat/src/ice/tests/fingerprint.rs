@@ -7,9 +7,9 @@
 // `use super::*;`, so all `ice` items are in scope — no re-import here.
 
 /// Build a fully-controlled `NatProfile` for label/parse tests.  Allocation is
-/// driven by `udp_blocked` / `prediction_candidate` / `port_delta` /
-/// `likely_symmetric` exactly as in `control_label`, so callers pin those to
-/// steer `a=`.  `MappingLifetime` is deliberately left at `Unknown`: it is NOT
+/// driven by `udp_blocked` / observer evidence exactly as in `control_label`,
+/// so callers pin those to steer `a=`. `MappingLifetime` is deliberately left
+/// at `Unknown`: it is NOT
 /// serialized into the control label, so it cannot affect length or round-trip
 /// (this is a non-goal for R1, kept constant here to avoid a false axis).
 #[allow(clippy::too_many_arguments)]
@@ -23,9 +23,35 @@ fn fingerprint_profile(
     likely_symmetric: Option<bool>,
     confidence: u8,
 ) -> NatProfile {
+    let observations = if mapping == MappingBehavior::AddressOrPortDependent
+        && prediction_candidate
+    {
+        vec![
+            StunObservation {
+                server: "stun-a.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:40001".to_string()),
+                rtt_ms: Some(10),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-b.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:40008".to_string()),
+                rtt_ms: Some(11),
+                error: None,
+            },
+            StunObservation {
+                server: "stun-c.example:3478".to_string(),
+                mapped_address: Some("203.0.113.10:40015".to_string()),
+                rtt_ms: Some(12),
+                error: None,
+            },
+        ]
+    } else {
+        Vec::new()
+    };
     NatProfile {
         local_addr: "192.168.1.2:5000".to_string(),
-        observations: Vec::new(),
+        observations,
         udp_blocked,
         public_endpoint: None,
         public_ip_stable: None,
@@ -236,17 +262,19 @@ fn test_profile_generation_is_additive_and_bounded() {
 fn expected_allocation(p: &NatProfile) -> NatAllocation {
     if p.udp_blocked {
         NatAllocation::Blocked
-    } else if p.prediction_candidate && p.port_delta.is_some() {
-        NatAllocation::Linear
     } else if matches!(
         p.mapping_behavior,
         MappingBehavior::OpenInternet | MappingBehavior::EndpointIndependent
     ) {
         NatAllocation::Stable
-    } else if p.likely_symmetric == Some(true) {
-        NatAllocation::Random
     } else {
-        NatAllocation::Unknown
+        match p.allocation_model_hint() {
+            crate::mapping::AllocationModelKind::FixedStep { .. }
+            | crate::mapping::AllocationModelKind::SmallWindow { .. } => NatAllocation::Linear,
+            crate::mapping::AllocationModelKind::HighEntropy => NatAllocation::Random,
+            crate::mapping::AllocationModelKind::Stable => NatAllocation::Stable,
+            crate::mapping::AllocationModelKind::Unknown => NatAllocation::Unknown,
+        }
     }
 }
 

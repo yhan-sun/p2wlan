@@ -1583,6 +1583,8 @@ async fn hard_hard_responder_without_stun_worker_falls_back_to_admitted_fresh_pu
         remote_profile_generation: plan.local_profile_generation,
         local_prediction_confidence: 90,
         remote_prediction_confidence: 0,
+        local_prediction_model: "fixed_step".to_string(),
+        remote_prediction_model: "unknown".to_string(),
         remote_network_generation: 0,
     };
     let punch_at_ms = hard_hard_now_for_test().saturating_add(3_500);
@@ -1750,6 +1752,15 @@ async fn hard_hard_initiator_deferred_claim_refunds_exact_fresh_quota() {
         1,
         "an initiator which never acquired the punch owner must refund its exact reservation"
     );
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(HARD_HARD_B)
+            .await
+            .expect("the recovery epoch must remain active")
+            .hard_hard_generations_remaining,
+        1,
+        "the dedicated Hard↔Hard fresh-generation lane must not be consumed by a deferred claim"
+    );
     assert!(!existing.is_cancelled());
 }
 
@@ -1837,6 +1848,8 @@ async fn hard_hard_response_network_generation_fence_precedes_punch_preemption()
             remote_profile_generation: plan.local_profile_generation,
             local_prediction_confidence: 90,
             remote_prediction_confidence: 95,
+            local_prediction_model: "fixed_step".to_string(),
+            remote_prediction_model: "fixed_step".to_string(),
             // Deliberately invalid: this must fence before a priority-2 claim
             // can cancel the ordinary priority-1 owner.
             remote_network_generation: plan.local_network_generation.saturating_add(1),

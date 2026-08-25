@@ -36,10 +36,10 @@ pub use ice::{
     StunObservation,
 };
 pub use mapping::{
-    build_model, build_model_for_batch, model_is_fresh, modular_add, modular_difference,
-    predict_ports, predict_ports_for_elapsed, predict_ports_with_learning, MappingBatch,
-    MappingObservation, ModelRejection, PortModel, PortModelKind, PredictionCandidate,
-    PredictionReason, MAX_PREDICTED_PORTS,
+    build_model, build_model_for_batch, infer_allocation_model, model_is_fresh, modular_add,
+    modular_difference, predict_ports, predict_ports_for_elapsed, predict_ports_with_learning,
+    AllocationModel, AllocationModelKind, MappingBatch, MappingObservation, ModelRejection,
+    PortModel, PortModelKind, PredictionCandidate, PredictionReason, MAX_PREDICTED_PORTS,
 };
 pub use punch::{
     build_authenticated_punch_ack, build_authenticated_punch_packet,
