@@ -66,6 +66,18 @@ pub(crate) struct DataplaneTailMetrics {
     pub(crate) tun_write_us: u64,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TailEventRecord {
+    direction: &'static str,
+    peer_id: String,
+    path: &'static str,
+    total_us: u64,
+    metrics: DataplaneTailMetrics,
+    candidate_gather_active: bool,
+    network_generation: u64,
+}
+
 /// Cheap process-local counters for the specialized LAN Direct sender. These
 /// are atomic on purpose: the fast path must not take the profiler histogram
 /// mutex or add an allocation to every packet.
@@ -102,6 +114,8 @@ pub(crate) struct DataplaneProfiler {
     last_tail_event_us: AtomicU64,
     last_summary_us: AtomicU64,
     state: Mutex<DataplaneProfilerState>,
+    #[cfg(test)]
+    tail_event_records: Mutex<Vec<TailEventRecord>>,
 }
 
 impl DataplaneProfiler {
@@ -117,6 +131,8 @@ impl DataplaneProfiler {
             last_tail_event_us: AtomicU64::new(0),
             last_summary_us: AtomicU64::new(0),
             state: Mutex::new(DataplaneProfilerState::default()),
+            #[cfg(test)]
+            tail_event_records: Mutex::new(Vec::new()),
         }
     }
 
@@ -227,6 +243,20 @@ impl DataplaneProfiler {
             return;
         }
 
+        #[cfg(test)]
+        self.tail_event_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(TailEventRecord {
+                direction,
+                peer_id: peer_id.to_owned(),
+                path,
+                total_us: duration_us(total),
+                metrics,
+                candidate_gather_active,
+                network_generation,
+            });
+
         let severity = if total >= DATAPLANE_TAIL_SEVERE_THRESHOLD {
             "severe"
         } else {
@@ -259,6 +289,14 @@ impl DataplaneProfiler {
     #[cfg(test)]
     pub(crate) fn tail_event_count(&self) -> u64 {
         self.tail_events.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn tail_event_records(&self) -> Vec<TailEventRecord> {
+        self.tail_event_records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn maybe_report_summary(&self) {
@@ -335,6 +373,315 @@ pub(crate) fn global_dataplane_profiler() -> &'static DataplaneProfiler {
 #[cfg(test)]
 mod profiling_tests {
     use super::*;
+
+    fn stage_values(profiler: &DataplaneProfiler, stage: &'static str) -> Vec<u64> {
+        profiler
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stages
+            .get(stage)
+            .map(|samples| samples.values.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_tail(
+        profiler: &DataplaneProfiler,
+        peer_id: &str,
+        candidate_gather_active: bool,
+        network_generation: u64,
+        metrics: DataplaneTailMetrics,
+    ) {
+        profiler.record_tail_event(
+            "tx",
+            peer_id,
+            "lan_direct",
+            Duration::from_millis(6),
+            metrics,
+            candidate_gather_active,
+            network_generation,
+        );
+    }
+
+    fn allow_next_tail_event(profiler: &DataplaneProfiler) {
+        profiler.last_tail_event_us.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn p1_queue_histogram_records_enqueue_to_dequeue_wait() {
+        let profiler = DataplaneProfiler::new();
+        let enqueue = Instant::now();
+        let dequeue = enqueue + Duration::from_micros(42);
+        profiler.record(
+            true,
+            "tx_outbound_queue_wait_us",
+            dequeue.saturating_duration_since(enqueue),
+        );
+
+        assert_eq!(stage_values(&profiler, "tx_outbound_queue_wait_us"), vec![42]);
+    }
+
+    #[test]
+    fn p2_fast_and_slow_path_histograms_are_separate() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record_fast_path_hit();
+        profiler.record(true, "tx_fast_path_lookup_us", Duration::from_micros(3));
+        profiler.record(true, "tx_slow_path_total_userspace_us", Duration::from_micros(9));
+
+        assert_eq!(profiler.fast_path_counters().hits, 1);
+        assert_eq!(stage_values(&profiler, "tx_fast_path_lookup_us"), vec![3]);
+        assert_eq!(
+            stage_values(&profiler, "tx_slow_path_total_userspace_us"),
+            vec![9]
+        );
+        assert!(stage_values(&profiler, "tx_fast_path_lookup_us")
+            .iter()
+            .all(|value| *value != 9));
+    }
+
+    #[test]
+    fn p3_emit_guard_wait_and_hold_are_distinct() {
+        let profiler = DataplaneProfiler::new();
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            1,
+            DataplaneTailMetrics {
+                emit_guard_wait_us: 12,
+                emit_guard_hold_us: 34,
+                ..DataplaneTailMetrics::default()
+            },
+        );
+
+        let event = &profiler.tail_event_records()[0];
+        assert_eq!(event.metrics.emit_guard_wait_us, 12);
+        assert_eq!(event.metrics.emit_guard_hold_us, 34);
+    }
+
+    #[test]
+    fn p4_epoch_gate_wait_and_hold_are_distinct() {
+        let profiler = DataplaneProfiler::new();
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            7,
+            DataplaneTailMetrics {
+                epoch_gate_wait_us: 23,
+                epoch_gate_hold_us: 45,
+                ..DataplaneTailMetrics::default()
+            },
+        );
+
+        let event = &profiler.tail_event_records()[0];
+        assert_eq!(event.metrics.epoch_gate_wait_us, 23);
+        assert_eq!(event.metrics.epoch_gate_hold_us, 45);
+        assert_eq!(event.network_generation, 7);
+    }
+
+    #[test]
+    fn p5_session_wait_and_crypto_exec_are_separate() {
+        let profiler = DataplaneProfiler::new();
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            1,
+            DataplaneTailMetrics {
+                session_lock_wait_us: 17,
+                crypto_us: 61,
+                ..DataplaneTailMetrics::default()
+            },
+        );
+
+        let event = &profiler.tail_event_records()[0];
+        assert_eq!(event.metrics.session_lock_wait_us, 17);
+        assert_eq!(event.metrics.crypto_us, 61);
+        assert_ne!(event.metrics.session_lock_wait_us, event.metrics.crypto_us);
+    }
+
+    #[test]
+    fn p6_udp_socket_lookup_and_send_are_separate() {
+        let profiler = DataplaneProfiler::new();
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            1,
+            DataplaneTailMetrics {
+                udp_socket_lookup_us: 29,
+                udp_send_call_us: 47,
+                ..DataplaneTailMetrics::default()
+            },
+        );
+
+        let event = &profiler.tail_event_records()[0];
+        assert_eq!(event.metrics.udp_socket_lookup_us, 29);
+        assert_eq!(event.metrics.udp_send_call_us, 47);
+    }
+
+    #[test]
+    fn p7_rx_queue_histogram_records_enqueue_to_dequeue_wait() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record(true, "rx_decrypt_queue_wait_us", Duration::from_micros(31));
+        profiler.record(true, "rx_dataplane_inbound_queue_wait_us", Duration::from_micros(53));
+
+        assert_eq!(stage_values(&profiler, "rx_decrypt_queue_wait_us"), vec![31]);
+        assert_eq!(
+            stage_values(&profiler, "rx_dataplane_inbound_queue_wait_us"),
+            vec![53]
+        );
+    }
+
+    #[test]
+    fn p8_tun_write_metric_is_recorded_without_being_folded_into_queue_wait() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record(true, "rx_tun_write_us", Duration::from_micros(71));
+        profiler.record(true, "rx_dataplane_inbound_queue_wait_us", Duration::from_micros(19));
+
+        assert_eq!(stage_values(&profiler, "rx_tun_write_us"), vec![71]);
+        assert_eq!(
+            stage_values(&profiler, "rx_dataplane_inbound_queue_wait_us"),
+            vec![19]
+        );
+    }
+
+    #[test]
+    fn p9_tail_event_threshold_only_counts_packets_at_or_above_warning() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record_tail_event(
+            "tx",
+            "peer-a",
+            "lan_direct",
+            DATAPLANE_TAIL_WARNING_THRESHOLD.saturating_sub(Duration::from_nanos(1)),
+            DataplaneTailMetrics::default(),
+            false,
+            1,
+        );
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            1,
+            DataplaneTailMetrics::default(),
+        );
+
+        assert_eq!(profiler.tail_event_count(), 1);
+        assert_eq!(profiler.tail_event_records().len(), 1);
+    }
+
+    #[test]
+    fn p10_tail_event_logging_is_rate_limited_but_counted() {
+        let profiler = DataplaneProfiler::new();
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            1,
+            DataplaneTailMetrics::default(),
+        );
+        profiler.last_tail_event_us.store(
+            profiler.started_at.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        record_tail(
+            &profiler,
+            "peer-b",
+            false,
+            1,
+            DataplaneTailMetrics::default(),
+        );
+
+        assert_eq!(profiler.tail_event_count(), 2);
+        assert_eq!(profiler.tail_event_records().len(), 1);
+    }
+
+    #[test]
+    fn p11_sampling_does_not_disable_fast_path_counters() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record(false, "tx_fast_path_lookup_us", Duration::from_micros(3));
+        profiler.record_fast_path_hit();
+
+        assert_eq!(profiler.fast_path_counters().hits, 1);
+        assert!(stage_values(&profiler, "tx_fast_path_lookup_us").is_empty());
+    }
+
+    #[test]
+    fn p12_tail_context_keeps_network_generations_separate() {
+        let profiler = DataplaneProfiler::new();
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            11,
+            DataplaneTailMetrics::default(),
+        );
+        allow_next_tail_event(&profiler);
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            12,
+            DataplaneTailMetrics::default(),
+        );
+
+        let records = profiler.tail_event_records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].network_generation, 11);
+        assert_eq!(records[1].network_generation, 12);
+    }
+
+    #[test]
+    fn p13_tail_context_keeps_multiple_peers_separate() {
+        let profiler = DataplaneProfiler::new();
+        record_tail(
+            &profiler,
+            "peer-a",
+            false,
+            1,
+            DataplaneTailMetrics::default(),
+        );
+        allow_next_tail_event(&profiler);
+        record_tail(
+            &profiler,
+            "peer-b",
+            false,
+            1,
+            DataplaneTailMetrics::default(),
+        );
+
+        let records = profiler.tail_event_records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].peer_id, "peer-a");
+        assert_eq!(records[1].peer_id, "peer-b");
+    }
+
+    #[test]
+    fn p14_candidate_refresh_context_is_observed_without_mutating_gather_state() {
+        let profiler = DataplaneProfiler::new();
+        profiler.set_candidate_gather_active(true);
+        assert!(profiler.candidate_gather_active());
+        record_tail(
+            &profiler,
+            "peer-a",
+            profiler.candidate_gather_active(),
+            1,
+            DataplaneTailMetrics::default(),
+        );
+
+        assert!(profiler.candidate_gather_active());
+        assert!(profiler.tail_event_records()[0].candidate_gather_active);
+    }
+
+    #[test]
+    fn p15_unsampled_metrics_are_a_noop_for_business_counters_and_histograms() {
+        let profiler = DataplaneProfiler::new();
+        profiler.record(false, "tx_total_userspace_us", Duration::from_micros(99));
+
+        assert_eq!(profiler.fast_path_counters(), FastPathCounters::default());
+        assert!(profiler.state.lock().unwrap().stages.is_empty());
+    }
 
     #[test]
     fn fast_path_counters_are_independent_of_histogram_sampling() {
