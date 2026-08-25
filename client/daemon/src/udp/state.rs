@@ -725,6 +725,10 @@ pub(crate) struct DynamicPunchSocket {
     pub(crate) peer_id: String,
     pub(crate) network_generation: u64,
     pub(crate) punch_generation: u64,
+    /// Local-only Hard↔Hard session token. It never crosses the wire; it
+    /// binds an authenticated packet received on this socket to the exact
+    /// bounded rendezvous that owns the socket.
+    pub(crate) hard_hard_session_token: Option<String>,
     pub(crate) created_at: Instant,
     /// Monotonic counter of AUTHENTICATED post-attach evidence observed on
     /// this socket: a matched Probe-v2 ACK, an accepted authenticated punch,
@@ -922,6 +926,35 @@ pub(crate) struct FreshMappingResult {
     /// First and last authenticated punch send timestamps (monotonic ms).
     pub(crate) first_punch_sent_at_ms: u64,
     pub(crate) last_punch_sent_at_ms: u64,
+}
+
+/// One committed speculative mapping used by the bounded Hard↔Hard birthday
+/// lane. The guard is retained by the runtime task until a winner is selected
+/// or the session is cancelled.
+pub(crate) struct HardHardBirthdaySocket {
+    pub(crate) punch_generation: u64,
+    pub(crate) socket_index: usize,
+    pub(crate) socket_local_endpoint: SocketAddr,
+    pub(crate) guard: ProvisionalSocketGuard,
+}
+
+/// Result of a bounded high-entropy rendezvous. Candidate endpoints are
+/// deterministic, token-scoped guesses; they are not an unbounded port scan.
+pub(crate) struct HardHardBirthdayResult {
+    /// The negotiated level requested by the recovery stage before the
+    /// process-wide dynamic-socket cap was applied.
+    pub(crate) requested_level: usize,
+    /// The source-socket count implied by `requested_level`.
+    pub(crate) requested_socket_count: usize,
+    /// The level actually sent after any bounded cap downgrade.
+    pub(crate) level: usize,
+    pub(crate) public_ip: IpAddr,
+    pub(crate) public_port_samples: Vec<u16>,
+    pub(crate) observation_count: usize,
+    pub(crate) candidate_endpoints: Vec<SocketAddr>,
+    pub(crate) sockets: Vec<HardHardBirthdaySocket>,
+    pub(crate) model_label: String,
+    pub(crate) model_confidence: u8,
 }
 
 /// Why a fresh-mapping generation was rejected and the legacy flow continued.

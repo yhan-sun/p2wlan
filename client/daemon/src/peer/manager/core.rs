@@ -7,6 +7,14 @@ impl PeerManager {
         self.config.network.predicted_candidates_enabled
     }
 
+    /// Return the platform hint used only for bounded Hard↔Hard resource
+    /// sizing.  Keep the configuration private; callers should not inspect
+    /// the manager's full runtime configuration just to choose an Android
+    /// socket/probe cap.
+    pub(crate) fn is_android_platform(&self) -> bool {
+        self.config.node.platform.eq_ignore_ascii_case("android")
+    }
+
     /// Create a new peer manager.
     pub fn new(config: Config) -> Self {
         let history_path = traversal_history_path(&config);
@@ -38,6 +46,7 @@ impl PeerManager {
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
             hard_hard_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hard_hard_winners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_snapshots: Arc::new(std::sync::Mutex::new(HashMap::new())),

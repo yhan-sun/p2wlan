@@ -133,6 +133,9 @@ pub struct RecoveryEpochDiagnostics {
     pub probe_credit_remaining: u32,
     /// Remaining fresh-mapping generations (fresh sockets) for the epoch.
     pub fresh_generation_quota_remaining: u32,
+    /// Remaining dedicated Hard↔Hard fresh-mapping generations for the epoch.
+    #[serde(default)]
+    pub hard_hard_generation_quota_remaining: u32,
     /// Remaining HTTP publishes for the epoch.
     pub http_quota_remaining: u32,
     /// Scatter windows sent this epoch.

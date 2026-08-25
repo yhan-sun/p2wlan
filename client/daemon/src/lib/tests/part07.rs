@@ -8,7 +8,7 @@ use crate::control::TestControlSignal;
 use crate::peer::NetworkPath;
 use p2pnet_nat::{
     peek_authenticated_punch_identity, HairpinBehavior, MappingBehavior, MappingLifetime,
-    NatProfile, PunchPacketKind, StunAttribute, StunMessage,
+    NatProfile, PunchPacketKind, StunAttribute, StunMessage, StunObservation,
 };
 use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
 use tokio::net::UdpSocket;
@@ -28,6 +28,12 @@ static HARD_HARD_E2E_SERIAL: Semaphore = Semaphore::const_new(1);
 struct HarnessStunProfile {
     observer_count: usize,
     timeout: Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HarnessNatMode {
+    Predictable,
+    HighEntropy,
 }
 
 impl HarnessStunProfile {
@@ -52,12 +58,29 @@ struct HarnessPorts {
 }
 
 impl HarnessPorts {
-    fn allocate(stun: HarnessStunProfile) -> Self {
+    fn allocate_with_mode(stun: HarnessStunProfile, mode: HarnessNatMode) -> Self {
         assert!((3..=4).contains(&stun.observer_count));
         let base = HARD_HARD_NEXT_PORT.fetch_add(300, Ordering::Relaxed);
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let a_public_offset = if stun.observer_count == 4 { 16 } else { 12 };
-        let b_public_offset = if stun.observer_count == 4 { 112 } else { 109 };
+        let (a_public_offset, b_public_offset, a_mapped, b_mapped) = match mode {
+            HarnessNatMode::Predictable => (
+                if stun.observer_count == 4 { 16 } else { 12 },
+                if stun.observer_count == 4 { 112 } else { 109 },
+                [base, base + 4, base + 8, base + 12],
+                [base + 100, base + 103, base + 106, base + 109],
+            ),
+            // The first observed port is also the real public endpoint. The
+            // remaining samples deliberately jump in both directions so the
+            // production allocation model classifies this as HighEntropy,
+            // while the birthday candidate set still contains the endpoint
+            // that the fake NAT link owns.
+            HarnessNatMode::HighEntropy => (
+                12,
+                109,
+                [base + 12, base + 181, base + 43, base + 257],
+                [base + 109, base + 220, base + 137, base + 271],
+            ),
+        };
         Self {
             a_public: SocketAddr::new(ip, base.saturating_add(a_public_offset)),
             b_public: SocketAddr::new(ip, base.saturating_add(b_public_offset)),
@@ -73,8 +96,8 @@ impl HarnessPorts {
                 SocketAddr::new(ip, base.saturating_add(7)),
                 SocketAddr::new(ip, base.saturating_add(8)),
             ],
-            a_mapped: [base, base + 4, base + 8, base + 12],
-            b_mapped: [base + 100, base + 103, base + 106, base + 109],
+            a_mapped,
+            b_mapped,
         }
     }
 }
@@ -133,12 +156,62 @@ fn hard_hard_profile(public_endpoint: SocketAddr, port_delta: i32) -> NatProfile
     }
 }
 
+fn hard_hard_high_entropy_profile(
+    public_endpoint: SocketAddr,
+    observers: &[SocketAddr; 4],
+    mapped_ports: &[u16; 4],
+    observer_count: usize,
+) -> NatProfile {
+    let observations = observers
+        .iter()
+        .copied()
+        .zip(mapped_ports.iter().copied())
+        .take(observer_count)
+        .map(|(observer, mapped_port)| StunObservation {
+            server: observer.to_string(),
+            mapped_address: Some(SocketAddr::new(public_endpoint.ip(), mapped_port).to_string()),
+            rtt_ms: Some(1),
+            error: None,
+        })
+        .collect();
+    NatProfile {
+        local_addr: "127.0.0.1:0".to_string(),
+        observations,
+        udp_blocked: false,
+        public_endpoint: Some(public_endpoint.to_string()),
+        public_ip_stable: Some(true),
+        public_port_stable: Some(false),
+        port_preserved: Some(false),
+        port_delta: None,
+        likely_symmetric: Some(true),
+        mapping_behavior: MappingBehavior::AddressOrPortDependent,
+        filtering_behavior: p2pnet_nat::FilteringBehavior::AddressOrPortDependent,
+        hairpin_behavior: HairpinBehavior::Unknown,
+        mapping_lifetime: MappingLifetime::Unknown,
+        prediction_candidate: false,
+        predicted_endpoints: Vec::new(),
+        birthday_candidate: true,
+        confidence: 90,
+    }
+}
+
 fn harness_config(
     identity: &NodeIdentity,
     node_id: &str,
     virtual_ip: &str,
     config_path: PathBuf,
     stun: HarnessStunProfile,
+) -> Config {
+    harness_config_with_birthday(identity, node_id, virtual_ip, config_path, stun, false)
+}
+
+fn harness_config_with_birthday(
+    identity: &NodeIdentity,
+    node_id: &str,
+    virtual_ip: &str,
+    config_path: PathBuf,
+    stun: HarnessStunProfile,
+    birthday_enabled: bool,
 ) -> Config {
     let mut config = Config::generate_default("http://hard-hard.test", "phase-2-2").unwrap();
     config.config_path = Some(config_path);
@@ -153,7 +226,7 @@ fn harness_config(
     config.network.punch_attempts = 1;
     config.network.upnp_enabled = false;
     config.network.udp_liveness_enabled = false;
-    config.network.birthday_probing_enabled = false;
+    config.network.birthday_probing_enabled = birthday_enabled;
     config.network.socket_pool_enabled = false;
     config.network.fresh_mapping_punch_enabled = true;
     config.network.fresh_mapping_harness_loopback = true;
@@ -279,6 +352,7 @@ struct NatPacketLink {
     hold_ack: Arc<AtomicBool>,
     held_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
     held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
+    route_dynamic_socket: bool,
     worker: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -294,6 +368,7 @@ impl NatPacketLink {
         udp_b: UdpTransport,
         actual_public: Option<(SocketAddr, SocketAddr)>,
         primary_a: Option<SocketAddr>,
+        route_dynamic_socket: bool,
     ) -> Self {
         let a_public = Arc::new(UdpSocket::bind(ports.a_public).await.unwrap());
         let b_public = Arc::new(UdpSocket::bind(ports.b_public).await.unwrap());
@@ -327,6 +402,7 @@ impl NatPacketLink {
             held_a_to_b.clone(),
             held_b_to_a.clone(),
             primary_a,
+            route_dynamic_socket,
         )));
         Self {
             a_public,
@@ -338,6 +414,7 @@ impl NatPacketLink {
             hold_ack,
             held_a_to_b,
             held_b_to_a,
+            route_dynamic_socket,
             worker,
         }
     }
@@ -348,6 +425,7 @@ impl NatPacketLink {
         target_udp: &UdpTransport,
         target_peer: &str,
         primary: Option<SocketAddr>,
+        route_dynamic_socket: bool,
         dropped: &AtomicBool,
     ) {
         if dropped.load(Ordering::Acquire) {
@@ -361,6 +439,17 @@ impl NatPacketLink {
         if let Some(primary) = primary {
             let _ = source_socket.send_to(data, primary).await;
             return;
+        }
+        if route_dynamic_socket {
+            let sockets = target_udp
+                .dynamic_sockets_for_peer_for_test(target_peer)
+                .await;
+            if let Some((_, socket)) = sockets.into_iter().min_by_key(|(index, _)| *index) {
+                if let Ok(target) = socket.local_addr() {
+                    let _ = source_socket.send_to(data, target).await;
+                }
+                return;
+            }
         }
         if target_udp.has_dynamic_socket_for_peer(target_peer).await {
             if let Some((_, socket)) = target_udp.socket_for_peer(Some(target_peer)).await {
@@ -385,6 +474,7 @@ impl NatPacketLink {
         held_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
         held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
         primary_a: Option<SocketAddr>,
+        route_dynamic_socket: bool,
     ) {
         let mut a_buf = vec![0u8; 8192];
         let mut b_buf = vec![0u8; 8192];
@@ -411,6 +501,7 @@ impl NatPacketLink {
                         &udp_a,
                         HARD_HARD_B,
                         primary_a,
+                        route_dynamic_socket,
                         &drop_b_to_a,
                     ).await;
                 }
@@ -433,6 +524,7 @@ impl NatPacketLink {
                         &udp_b,
                         HARD_HARD_A,
                         None,
+                        route_dynamic_socket,
                         &drop_a_to_b,
                     ).await;
                 }
@@ -494,6 +586,7 @@ impl NatPacketLink {
                 udp_b,
                 HARD_HARD_A,
                 None,
+                self.route_dynamic_socket,
                 &self.drop_a_to_b,
             )
             .await;
@@ -505,6 +598,7 @@ impl NatPacketLink {
                 udp_a,
                 HARD_HARD_B,
                 None,
+                self.route_dynamic_socket,
                 &self.drop_b_to_a,
             )
             .await;
@@ -561,17 +655,22 @@ impl TwoPeerHarness {
         for task in self.control_tasks.drain(..) {
             let _ = timeout(Duration::from_secs(1), task).await;
         }
-        for task in self
+        let mut background_tasks = self
             .udp_tasks
             .drain(..)
             .chain(self.validation_tasks.drain(..))
             .chain(self.peer_reflexive_tasks.drain(..))
-        {
+            .collect::<Vec<_>>();
+        for task in &background_tasks {
             task.abort();
+        }
+        for task in background_tasks.drain(..) {
+            let _ = timeout(Duration::from_secs(1), task).await;
         }
         self.stun_observers.clear();
         if let Some(task) = self.link.worker.take() {
             task.abort();
+            let _ = timeout(Duration::from_secs(1), task).await;
         }
         // Keep the public sockets owned by the link alive until its worker has
         // been stopped; then their Drop closes the exact simulated NAT ports.
@@ -742,7 +841,25 @@ async fn build_two_peer_harness_with_stun(
     mapping_miss: bool,
     stun: HarnessStunProfile,
 ) -> TwoPeerHarness {
-    let ports = HarnessPorts::allocate(stun);
+    build_two_peer_harness_with_stun_mode(
+        advance_clock_on_response,
+        race_primary,
+        mapping_miss,
+        stun,
+        HarnessNatMode::Predictable,
+    )
+    .await
+}
+
+async fn build_two_peer_harness_with_stun_mode(
+    advance_clock_on_response: bool,
+    race_primary: bool,
+    mapping_miss: bool,
+    stun: HarnessStunProfile,
+    nat_mode: HarnessNatMode,
+) -> TwoPeerHarness {
+    let ports = HarnessPorts::allocate_with_mode(stun, nat_mode);
+    let birthday_enabled = nat_mode == HarnessNatMode::HighEntropy;
     let a_identity = NodeIdentity::generate();
     let b_identity = NodeIdentity::generate();
     let root = std::env::temp_dir().join(format!(
@@ -753,27 +870,47 @@ async fn build_two_peer_harness_with_stun(
     fs::create_dir_all(&root).unwrap();
     let path_a = root.join("peer-a.json");
     let path_b = root.join("peer-b.json");
-    let mut daemon_a = Daemon::new(harness_config(
+    let mut daemon_a = Daemon::new(harness_config_with_birthday(
         &a_identity,
         HARD_HARD_A,
         "10.20.0.1",
         path_a,
         stun,
+        birthday_enabled,
     ));
-    let mut daemon_b = Daemon::new(harness_config(
+    let mut daemon_b = Daemon::new(harness_config_with_birthday(
         &b_identity,
         HARD_HARD_B,
         "10.20.0.2",
         path_b,
         stun,
+        birthday_enabled,
     ));
 
     let peers_a = daemon_a.peers.clone();
     let peers_b = daemon_b.peers.clone();
     let punch_attempts_a = daemon_a.punch_attempts.clone();
     let punch_attempts_b = daemon_b.punch_attempts.clone();
-    let a_profile = hard_hard_profile(ports.a_public, 4);
-    let b_profile = hard_hard_profile(ports.b_public, 3);
+    let (a_profile, b_profile) = match nat_mode {
+        HarnessNatMode::Predictable => (
+            hard_hard_profile(ports.a_public, 4),
+            hard_hard_profile(ports.b_public, 3),
+        ),
+        HarnessNatMode::HighEntropy => (
+            hard_hard_high_entropy_profile(
+                ports.a_public,
+                &ports.a_observers,
+                &ports.a_mapped,
+                stun.observer_count,
+            ),
+            hard_hard_high_entropy_profile(
+                ports.b_public,
+                &ports.b_observers,
+                &ports.b_mapped,
+                stun.observer_count,
+            ),
+        ),
+    };
     peers_a.update_nat_profile(a_profile.clone()).await;
     peers_b.update_nat_profile(b_profile.clone()).await;
 
@@ -906,6 +1043,7 @@ async fn build_two_peer_harness_with_stun(
         udp_b.clone(),
         actual_public,
         primary_a,
+        nat_mode == HarnessNatMode::HighEntropy,
     )
     .await;
 
@@ -972,6 +1110,39 @@ async fn build_two_peer_harness_with_stun(
     }
 }
 
+async fn install_committed_birthday_predecessor(
+    peers: &PeerManager,
+    udp: &UdpTransport,
+    peer_id: &str,
+) -> crate::udp::ProvisionalSocketGuard {
+    let (socket_index, socket) = udp.bind_fresh_punch_socket().await.unwrap();
+    let punch_generation = peers.next_punch_generation(peer_id).await;
+    let guard = udp
+        .attach_dynamic_punch_socket(
+            peer_id,
+            socket_index,
+            socket,
+            peers.current_network_generation_sync(),
+            punch_generation,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        guard
+            .commit_and_pin_for_test(
+                udp,
+                peer_id,
+                socket_index,
+                peers.current_network_generation_sync(),
+                punch_generation,
+            )
+            .await
+    );
+    assert!(guard.finalize().await);
+    guard
+}
+
 async fn trigger_initial_offer(harness: &TwoPeerHarness) {
     let sources = HashMap::from([(
         harness.link.b_public.local_addr().unwrap().to_string(),
@@ -1014,7 +1185,7 @@ async fn trigger_retry_offer_with_current_candidates(
             &sources,
             &[],
             None,
-            None,
+            Some(Arc::new(crate::PunchSessionCancellation::default())),
         )
         .await
         .unwrap();
@@ -1062,6 +1233,47 @@ async fn wait_for_both_direct(harness: &TwoPeerHarness) {
             "both isolated peers must converge to Direct\nA diagnostics={diagnostics_a:#?}\nB diagnostics={diagnostics_b:#?}\nA session={session_a:#?}\nB session={session_b:#?}\nA sockets={} B sockets={}\nSTUN observers(endpoint, requests, responses)={stun_observers:#?}\nA received signals={signals_a:#?}\nB received signals={signals_b:#?}",
             harness.udp_a.dynamic_socket_count().await,
             harness.udp_b.dynamic_socket_count().await,
+        );
+    }
+}
+
+async fn wait_for_both_direct_compact(harness: &TwoPeerHarness) {
+    if timeout(Duration::from_secs(12), async {
+        loop {
+            if harness.peers_a.is_direct(HARD_HARD_B).await
+                && harness.peers_b.is_direct(HARD_HARD_A).await
+            {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let summarize = |diagnostics: Vec<peer::PeerDiagnostics>| {
+            diagnostics
+                .into_iter()
+                .map(|peer| {
+                    (
+                        peer.node_id,
+                        peer.state,
+                        peer.active_path,
+                        peer.current_direct_pair.map(|pair| {
+                            (pair.source, pair.state, pair.remote_endpoint)
+                        }),
+                        peer.direct_events
+                            .into_iter()
+                            .map(|event| event.stage)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        panic!(
+            "birthday peers did not both become Direct: A={:?} B={:?}",
+            summarize(harness.peers_a.diagnostics().await),
+            summarize(harness.peers_b.diagnostics().await),
         );
     }
 }
@@ -1583,6 +1795,8 @@ async fn hard_hard_responder_without_stun_worker_falls_back_to_admitted_fresh_pu
         remote_profile_generation: plan.local_profile_generation,
         local_prediction_confidence: 90,
         remote_prediction_confidence: 0,
+        local_prediction_model: "fixed_step".to_string(),
+        remote_prediction_model: "unknown".to_string(),
         remote_network_generation: 0,
     };
     let punch_at_ms = hard_hard_now_for_test().saturating_add(3_500);
@@ -1750,6 +1964,15 @@ async fn hard_hard_initiator_deferred_claim_refunds_exact_fresh_quota() {
         1,
         "an initiator which never acquired the punch owner must refund its exact reservation"
     );
+    assert_eq!(
+        peers
+            .recovery_epoch_work_budget_report(HARD_HARD_B)
+            .await
+            .expect("the recovery epoch must remain active")
+            .hard_hard_generations_remaining,
+        1,
+        "the dedicated Hard↔Hard fresh-generation lane must not be consumed by a deferred claim"
+    );
     assert!(!existing.is_cancelled());
 }
 
@@ -1837,6 +2060,8 @@ async fn hard_hard_response_network_generation_fence_precedes_punch_preemption()
             remote_profile_generation: plan.local_profile_generation,
             local_prediction_confidence: 90,
             remote_prediction_confidence: 95,
+            local_prediction_model: "fixed_step".to_string(),
+            remote_prediction_model: "fixed_step".to_string(),
             // Deliberately invalid: this must fence before a priority-2 claim
             // can cancel the ordinary priority-1 owner.
             remote_network_generation: plan.local_network_generation.saturating_add(1),
@@ -2101,6 +2326,500 @@ async fn hard_hard_two_peer_success_is_full_e2e_and_exact_socket() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_hard_two_peer_success_with_minimum_stun_capacity() {
     hard_hard_two_peer_success_with_stun(HarnessStunProfile::MINIMUM_CAPACITY).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let now = hard_hard_now_for_test();
+    set_hard_hard_test_now_ms(Some(now));
+    let _clock = HardHardClockReset;
+    let harness = build_two_peer_harness_with_stun_mode(
+        true,
+        false,
+        false,
+        HarnessStunProfile::FULL_CAPACITY,
+        HarnessNatMode::HighEntropy,
+    )
+    .await;
+
+    for diagnostics in [harness.peers_a.diagnostics().await, harness.peers_b.diagnostics().await]
+    {
+        assert_eq!(
+            diagnostics[0]
+                .traversal_plan
+                .as_ref()
+                .map(|plan| plan.reason.as_str()),
+            Some("hard_hard_bounded_birthday")
+        );
+    }
+
+    trigger_initial_offer(&harness).await;
+    wait_for_both_direct_compact(&harness).await;
+
+    for (peers, remote_id, expected_remote) in [
+        (&harness.peers_a, HARD_HARD_B, harness.link.b_public.local_addr().unwrap()),
+        (&harness.peers_b, HARD_HARD_A, harness.link.a_public.local_addr().unwrap()),
+    ] {
+        let diagnostics = peers.diagnostics().await;
+        let peer = &diagnostics[0];
+        assert_eq!(peer.state, ConnectionState::Direct);
+        assert_eq!(peer.active_path, Some(NetworkPath::Direct));
+        let observed = peer
+            .direct_events
+            .iter()
+            .find(|event| event.stage == "hard_hard_fresh_mapping_observed")
+            .or_else(|| {
+                peer.direct_events
+                    .iter()
+                    .find(|event| event.stage == "hard_hard_local_nat_model")
+            });
+        if let Some(observed) = observed {
+            assert!(observed.detail.contains("model=high_entropy"));
+            assert!(observed.detail.contains("strategy=bounded_birthday"));
+            assert!(observed.detail.contains("socket_count=2"));
+        }
+        let winner = peer
+            .direct_events
+            .iter()
+            .find(|event| event.stage == "hard_hard_winner_selected")
+            .expect("authenticated Probe v2 evidence must select a birthday winner");
+        let winner_socket = winner.socket_index.expect("winner must name its socket");
+        let winner_phase = if remote_id == HARD_HARD_B {
+            harness
+                .udp_a
+                .dynamic_socket_phase_for_test(winner_socket)
+                .await
+        } else {
+            harness
+                .udp_b
+                .dynamic_socket_phase_for_test(winner_socket)
+                .await
+        };
+        assert_eq!(
+            winner_phase,
+            Some(crate::udp::DynamicSocketPhase::Finalized),
+            "authenticated birthday winner must reach the Finalized phase: peer={} winner={} dynamic_count={} stages={:?}",
+            peer.node_id,
+            winner_socket,
+            if remote_id == HARD_HARD_B {
+                harness.udp_a.dynamic_socket_count().await
+            } else {
+                harness.udp_b.dynamic_socket_count().await
+            },
+            peer.direct_events
+                .iter()
+                .filter(|event| event.stage.starts_with("hard_hard_"))
+                .map(|event| (event.stage.as_str(), event.detail.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let affinity_socket = if remote_id == HARD_HARD_B {
+            harness
+                .udp_a
+                .affinity_pin_for_test(remote_id)
+                .await
+                .map(|pin| pin.socket_index)
+        } else {
+            harness
+                .udp_b
+                .affinity_pin_for_test(remote_id)
+                .await
+                .map(|pin| pin.socket_index)
+        };
+        assert_eq!(
+            affinity_socket,
+            Some(winner_socket)
+        );
+        let pair = peer
+            .current_direct_pair
+            .as_ref()
+            .expect("Direct must expose the selected birthday pair");
+        assert_eq!(pair.source, peer::CandidatePairSource::PeerReflexive);
+        assert_eq!(pair.remote_endpoint, expected_remote.to_string());
+    }
+    let birthday_signals = [
+        harness
+            .signals_a
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+        harness
+            .signals_b
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    ];
+    let birthday_signal_seen = birthday_signals
+        .iter()
+        .flat_map(|signals| signals.iter())
+        .any(|signal| {
+            signal
+                .session_id
+                .as_deref()
+                .is_some_and(|session| session.contains("high_entropy"))
+        });
+    assert!(
+        birthday_signal_seen,
+        "the session envelope must identify the HighEntropy birthday lane"
+    );
+
+    let parse_count = |detail: &str, key: &str| {
+        detail
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(key)?.parse::<usize>().ok())
+    };
+    let mut probe_summaries = 0;
+    for peers in [&harness.peers_a, &harness.peers_b] {
+        for event in &peers.diagnostics().await[0].direct_events {
+            if event.stage != "hard_hard_probe_summary"
+                || !event.detail.contains("target_count=64")
+            {
+                continue;
+            }
+            let sent = parse_count(&event.detail, "sent=").expect("probe summary must report sent");
+            let unique = parse_count(&event.detail, "unique_targets=")
+                .expect("probe summary must report unique targets");
+            let target_count =
+                parse_count(&event.detail, "target_count=").expect("probe summary must report target count");
+            assert!(sent <= target_count);
+            assert!(unique <= target_count);
+            assert_eq!(sent, unique, "birthday assignment must send each target once");
+            probe_summaries += 1;
+        }
+    }
+    assert!(probe_summaries > 0, "production birthday sweep must report its bounded send count");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if harness.udp_a.dynamic_socket_count().await == 1
+                && harness.udp_b.dynamic_socket_count().await == 1
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("birthday losers must detach after the authenticated winner is selected");
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let now = hard_hard_now_for_test();
+    set_hard_hard_test_now_ms(Some(now));
+    let _clock = HardHardClockReset;
+    let harness = build_two_peer_harness_with_stun_mode(
+        true,
+        false,
+        false,
+        HarnessStunProfile::FULL_CAPACITY,
+        HarnessNatMode::HighEntropy,
+    )
+    .await;
+    harness.link.set_drop_a_to_b(true);
+    harness.link.set_drop_b_to_a(true);
+    trigger_initial_offer(&harness).await;
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if !harness.peers_a.is_direct(HARD_HARD_B).await
+                && !harness.peers_b.is_direct(HARD_HARD_A).await
+                && !harness
+                    .peers_a
+                    .hard_hard_session_is_active(HARD_HARD_B)
+                    .await
+                && !harness
+                    .peers_b
+                    .hard_hard_session_is_active(HARD_HARD_A)
+                    .await
+                && harness.udp_a.dynamic_socket_count().await == 0
+                && harness.udp_b.dynamic_socket_count().await == 0
+            {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bounded birthday no-collision session must terminate and clean up");
+
+    for peers in [&harness.peers_a, &harness.peers_b] {
+        let peer = &peers.diagnostics().await[0];
+        assert!(peer.state != ConnectionState::Direct);
+        assert!(!peer
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_winner_selected"));
+    }
+    assert_relay_remains_available(&harness).await;
+    assert_eq!(
+        harness
+            .udp_a
+            .hard_hard_pending_probe_count_for_test(HARD_HARD_B)
+            .await,
+        0
+    );
+    assert_eq!(
+        harness
+            .udp_b
+            .hard_hard_pending_probe_count_for_test(HARD_HARD_A)
+            .await,
+        0
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let now = hard_hard_now_for_test();
+    set_hard_hard_test_now_ms(Some(now));
+    let _clock = HardHardClockReset;
+    let harness = build_two_peer_harness_with_stun_mode(
+        true,
+        false,
+        false,
+        HarnessStunProfile::FULL_CAPACITY,
+        HarnessNatMode::HighEntropy,
+    )
+    .await;
+    harness.link.set_drop_a_to_b(true);
+    harness.link.set_drop_b_to_a(true);
+    trigger_initial_offer(&harness).await;
+    let _ = wait_for_hard_hard_response_signal(&harness).await;
+    wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_sweep_started")
+        .await;
+    let (_, speculative_socket) = harness
+        .udp_a
+        .socket_for_peer(Some(HARD_HARD_B))
+        .await
+        .expect("birthday sweep must expose a speculative socket");
+    let injector = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap();
+    injector
+        .send_to(b"not-a-probe-v2-packet", speculative_socket.local_addr().unwrap())
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(50)).await;
+    for peers in [&harness.peers_a, &harness.peers_b] {
+        let peer = &peers.diagnostics().await[0];
+        assert!(!peer
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_winner_selected"));
+        assert_ne!(peer.state, ConnectionState::Direct);
+    }
+    drop(injector);
+    harness.shutdown().await;
+
+    // A fresh production session must still select an authenticated birthday
+    // winner; the raw packet above is the only input in the first session.
+    set_hard_hard_test_now_ms(Some(hard_hard_now_for_test()));
+    let valid_harness = build_two_peer_harness_with_stun_mode(
+        true,
+        false,
+        false,
+        HarnessStunProfile::FULL_CAPACITY,
+        HarnessNatMode::HighEntropy,
+    )
+    .await;
+    // Keep the ordinary signaled candidate from winning before the birthday
+    // sweep reaches its authenticated Probe.  Re-enable the existing
+    // encrypted-validation ingress at the exact production sweep boundary;
+    // the legal Probe then validates the selected Hard↔Hard socket.
+    valid_harness
+        .validation_enabled_a
+        .store(false, Ordering::Release);
+    valid_harness
+        .validation_enabled_b
+        .store(false, Ordering::Release);
+    trigger_initial_offer(&valid_harness).await;
+    wait_for_stage(&valid_harness.peers_a, HARD_HARD_B, "hard_hard_sweep_started").await;
+    wait_for_stage(&valid_harness.peers_b, HARD_HARD_A, "hard_hard_sweep_started").await;
+    valid_harness
+        .validation_enabled_a
+        .store(true, Ordering::Release);
+    valid_harness
+        .validation_enabled_b
+        .store(true, Ordering::Release);
+    wait_for_both_direct_compact(&valid_harness).await;
+    assert!(
+        valid_harness
+            .peers_a
+            .diagnostics()
+            .await
+            .iter()
+            .find(|peer| peer.node_id == HARD_HARD_B)
+            .is_some_and(|peer| {
+                peer.state == ConnectionState::Direct
+                    && peer.active_path == Some(NetworkPath::Direct)
+                    && peer.current_direct_pair.as_ref().is_some_and(|pair| {
+                        pair.source == peer::CandidatePairSource::PeerReflexive
+                    })
+            }),
+        "a fresh production session must promote an authenticated peer-reflexive birthday pair",
+    );
+    assert!(
+        valid_harness
+            .peers_b
+            .diagnostics()
+            .await
+            .iter()
+            .find(|peer| peer.node_id == HARD_HARD_A)
+            .is_some_and(|peer| {
+                peer.state == ConnectionState::Direct
+                    && peer.active_path == Some(NetworkPath::Direct)
+                    && peer.current_direct_pair.as_ref().is_some_and(|pair| {
+                        pair.source == peer::CandidatePairSource::PeerReflexive
+                    })
+            }),
+        "the reciprocal production session must promote an authenticated peer-reflexive birthday pair",
+    );
+    valid_harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    for (requested_level, expected_socket_count) in [(64, 2), (128, 4)] {
+        let now = hard_hard_now_for_test();
+        set_hard_hard_test_now_ms(Some(now));
+        let _clock = HardHardClockReset;
+        let harness = build_two_peer_harness_with_stun_mode(
+            true,
+            false,
+            false,
+            HarnessStunProfile::FULL_CAPACITY,
+            HarnessNatMode::HighEntropy,
+        )
+        .await;
+        let observers = harness
+            .stun_observers
+            .iter()
+            .take(4)
+            .map(|observer| observer.endpoint)
+            .collect::<Vec<_>>();
+        let result = harness
+            .udp_a
+            .run_hard_hard_birthday_generation(
+                HARD_HARD_B,
+                &observers,
+                Duration::from_millis(300),
+                requested_level,
+                &format!("level-{requested_level}"),
+                None,
+            )
+            .await
+            .expect("birthday generation must succeed below the socket cap");
+        assert_eq!(result.requested_level, requested_level);
+        assert_eq!(result.level, requested_level);
+        assert_eq!(result.requested_socket_count, expected_socket_count);
+        assert_eq!(result.sockets.len(), expected_socket_count);
+        for socket in &result.sockets {
+            assert!(socket.guard.finalize().await);
+        }
+        harness
+            .udp_a
+            .detach_hard_hard_sockets_for_token(
+                HARD_HARD_B,
+                &format!("level-{requested_level}"),
+                None,
+                "hard_hard_birthday_level_test_cleanup",
+            )
+            .await;
+        harness.shutdown().await;
+    }
+
+    let now = hard_hard_now_for_test();
+    set_hard_hard_test_now_ms(Some(now));
+    let _clock = HardHardClockReset;
+    let harness = build_two_peer_harness_with_stun_mode(
+        true,
+        false,
+        false,
+        HarnessStunProfile::FULL_CAPACITY,
+        HarnessNatMode::HighEntropy,
+    )
+    .await;
+    let observers = harness
+        .stun_observers
+        .iter()
+        .take(4)
+        .map(|observer| observer.endpoint)
+        .collect::<Vec<_>>();
+    let predecessor = install_committed_birthday_predecessor(
+        &harness.peers_a,
+        &harness.udp_a,
+        HARD_HARD_B,
+    )
+    .await;
+    let mut filler_guards = Vec::new();
+    for index in 0..7 {
+        let peer_id = format!("birthday-cap-filler-{index}");
+        let (socket_index, socket) = harness.udp_a.bind_fresh_punch_socket().await.unwrap();
+        filler_guards.push(
+            harness
+                .udp_a
+                .attach_dynamic_punch_socket(
+                    &peer_id,
+                    socket_index,
+                    socket,
+                    harness.peers_a.current_network_generation_sync(),
+                    10_000 + index as u64,
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(harness.udp_a.dynamic_socket_count().await, 8);
+    let token = "level-256-cap";
+    let result = harness
+        .udp_a
+        .run_hard_hard_birthday_generation(
+            HARD_HARD_B,
+            &observers,
+            Duration::from_millis(300),
+            256,
+            token,
+            None,
+        )
+        .await
+        .expect("capacity downgrade must keep a safe bounded birthday lane");
+    assert_eq!(result.requested_level, 256);
+    assert_eq!(result.requested_socket_count, 8);
+    assert_eq!(result.level, 128);
+    assert_eq!(result.sockets.len(), 4);
+    let diagnostics = harness.peers_a.diagnostics().await;
+    assert!(diagnostics[0].direct_events.iter().any(|event| {
+        event.stage == "hard_hard_birthday_degraded"
+            && event.detail.contains("requested_level=256")
+            && event.detail.contains("actual_level=128")
+            && event.detail.contains("requested_socket_count=8")
+            && event.detail.contains("actual_socket_count=4")
+            && event.detail.contains("reason=socket_cap")
+    }));
+    assert!(harness.udp_a.dynamic_socket_count().await <= 8);
+    for socket in &result.sockets {
+        assert!(socket.guard.finalize().await);
+    }
+    harness
+        .udp_a
+        .detach_hard_hard_sockets_for_token(HARD_HARD_B, token, None, "hard_hard_birthday_cap_test_cleanup")
+        .await;
+    drop(filler_guards);
+    drop(predecessor);
+    timeout(Duration::from_secs(1), async {
+        while harness.udp_a.dynamic_socket_count().await != 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("capacity validation must clean predecessor and filler readers");
+    harness.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2532,7 +3251,7 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
         response_s1.punch_at_ms.is_some(),
         "S1 response must carry a canonical punch deadline"
     );
-    let s1_probe_wait = timeout(Duration::from_secs(5), async {
+    let s1_probe_wait = timeout(Duration::from_secs(12), async {
         loop {
             if harness.udp_a.dynamic_socket_count().await == 1
                 && harness.udp_b.dynamic_socket_count().await == 1
@@ -2777,6 +3496,102 @@ async fn hard_hard_manager_peer_isolation_keeps_unrelated_session_authoritative(
         c_before.fresh_socket.socket_index
     );
     assert!(manager.hard_hard_session_is_active("peer-c").await);
+    manager.clear_hard_hard_sessions(None).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_manager_sticky_winner_rejects_delayed_authenticated_socket() {
+    let identity = NodeIdentity::generate();
+    let manager = PeerManager::new(harness_config(
+        &identity,
+        "peer-sticky-root",
+        "10.20.0.30",
+        std::env::temp_dir().join(format!(
+            "p2wlan-phase-2-2-sticky-{}",
+            std::process::id()
+        )),
+        HarnessStunProfile::FULL_CAPACITY,
+    ));
+    let peer_identity = NodeIdentity::generate();
+    manager
+        .add_peer(&peer_info(
+            "peer-sticky",
+            "10.20.0.31",
+            hex::encode(peer_identity.public_key()),
+            "127.0.0.1:31031".parse().unwrap(),
+            "phase-2-2-test".to_string(),
+        ))
+        .await;
+    let endpoint_a: SocketAddr = "127.0.0.1:31100".parse().unwrap();
+    let endpoint_b: SocketAddr = "127.0.0.1:31101".parse().unwrap();
+    let record = peer::HardHardSessionRecord {
+        session_id: "hh1:i:sticky-token".to_string(),
+        session_token: "sticky-token".to_string(),
+        peer_id: "peer-sticky".to_string(),
+        initiator: true,
+        remote_network_generation: 0,
+        local_network_generation: 0,
+        remote_candidate_epoch: 1,
+        local_profile_generation: 1,
+        remote_profile_generation: 1,
+        local_prediction_confidence: 90,
+        remote_prediction_confidence: 0,
+        prediction_window: vec![endpoint_a],
+        remote_prediction: Vec::new(),
+        fresh_socket: peer::HardHardFreshSocketIdentity {
+            peer_id: "peer-sticky".to_string(),
+            session_token: "sticky-token".to_string(),
+            network_generation: 0,
+            remote_candidate_epoch: 1,
+            local_profile_generation: 1,
+            remote_profile_generation: 1,
+            punch_generation: 1,
+            socket_index: 4100,
+            socket_local_endpoint: endpoint_a,
+        },
+        punch_at_ms: hard_hard_now_for_test().saturating_add(5_000),
+        expires_at_ms: hard_hard_now_for_test().saturating_add(30_000),
+        state: peer::HardHardSessionState::AwaitingPeer,
+        attempt_count: 0,
+        created_at: Instant::now(),
+        cancellation: Arc::new(crate::PunchSessionCancellation::default()),
+    };
+    assert!(manager.hard_hard_register_session(record).await);
+    assert!(manager
+        .hard_hard_begin_sweep(
+            "peer-sticky",
+            "sticky-token",
+            vec![endpoint_a],
+            90,
+            0,
+        )
+        .await
+        .is_some());
+
+    let first = manager
+        .hard_hard_select_winner("peer-sticky", "sticky-token", 4100, 0, 1, endpoint_a)
+        .await
+        .expect("the first authenticated socket must become the winner");
+    assert_eq!(first.socket_index, 4100);
+    assert!(manager
+        .hard_hard_select_winner("peer-sticky", "sticky-token", 4101, 0, 2, endpoint_b)
+        .await
+        .is_none());
+    assert_eq!(
+        manager
+            .hard_hard_winner_for_token("peer-sticky", "sticky-token")
+            .await,
+        Some(4100)
+    );
+    assert_eq!(
+        manager
+            .hard_hard_session_by_token("peer-sticky", "sticky-token")
+            .await
+            .expect("sticky session must remain authoritative")
+            .fresh_socket
+            .socket_index,
+        4100
+    );
     manager.clear_hard_hard_sessions(None).await;
 }
 

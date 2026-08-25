@@ -30,6 +30,7 @@ use tracing::{debug, info};
 
 use crate::client::StunClient;
 use crate::error::Result;
+use crate::mapping::{infer_allocation_model, AllocationModelKind, MappingObservation};
 use crate::{CandidateType, IceCandidate};
 
 /// Type preference values (RFC 5245 Section 4.1.2.1).
@@ -234,17 +235,28 @@ impl NatProfile {
         };
         let allocation = if self.udp_blocked {
             "blocked"
-        } else if self.prediction_candidate && self.port_delta.is_some() {
-            "linear"
         } else if matches!(
             self.mapping_behavior,
             MappingBehavior::OpenInternet | MappingBehavior::EndpointIndependent
         ) {
             "stable"
-        } else if self.likely_symmetric == Some(true) {
-            "random"
+        } else if self.prediction_candidate
+            && self.port_delta.is_some()
+            && !self.predicted_endpoints.is_empty()
+        {
+            // This is an already materialized model/window from a previous
+            // complete measurement or a trusted remote hint. It is not a
+            // random classification derived from two differing ports.
+            "linear"
         } else {
-            "unknown"
+            match self.allocation_model_hint() {
+                AllocationModelKind::FixedStep { .. } | AllocationModelKind::SmallWindow { .. } => {
+                    "linear"
+                }
+                AllocationModelKind::HighEntropy => "random",
+                AllocationModelKind::Stable => "stable",
+                AllocationModelKind::Unknown => "unknown",
+            }
         };
         let delta = self
             .port_delta
@@ -278,6 +290,36 @@ impl NatProfile {
             "p2v2:m={mapping};a={allocation};d={delta};c={};f={filtering};h={hairpin}",
             self.confidence
         )
+    }
+
+    /// Reconstruct the allocation evidence from the observer records. A
+    /// profile with only two different ports is deliberately `unknown`: the
+    /// direction, repeatability and entropy of the allocator are not
+    /// identifiable from one delta.
+    fn allocation_model_hint(&self) -> AllocationModelKind {
+        let observations =
+            self.observations
+                .iter()
+                .enumerate()
+                .filter_map(|(sequence, observation)| {
+                    let observed = observation.mapped_address.as_deref()?.parse().ok()?;
+                    let observer = observation
+                        .server
+                        .parse()
+                        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+                    Some(MappingObservation {
+                        sequence: sequence as u16,
+                        observer,
+                        observed,
+                        sent_at_ms: sequence as u64,
+                        responded_at_ms: sequence as u64 + 1,
+                        local_endpoint: self.local_addr.parse().unwrap_or_else(|_| {
+                            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                        }),
+                    })
+                })
+                .collect::<Vec<_>>();
+        infer_allocation_model(&observations).kind
     }
 
     /// Add the local evidence generation to the compact control-plane hint.

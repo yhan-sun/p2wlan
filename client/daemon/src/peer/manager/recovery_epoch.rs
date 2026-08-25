@@ -72,6 +72,12 @@ pub(crate) const RECOVERY_EPOCH_CANDIDATE_ITERATIONS: u64 = 30_000;
 /// allocates one dedicated dynamic socket, so this also caps fresh sockets.
 pub(crate) const RECOVERY_EPOCH_FRESH_GENERATIONS: u32 = 1;
 
+/// A Hard↔Hard rendezvous owns a separate fresh-socket reservation. Ordinary
+/// recovery must not be able to consume the only experiment that can produce
+/// the synchronized local mapping, and a failed Hard↔Hard claim must refund
+/// only its own reservation.
+pub(crate) const RECOVERY_EPOCH_HARD_HARD_GENERATIONS: u32 = 1;
+
 /// HTTP publishes (fresh-prediction advertisements) allowed per recovery
 /// epoch.
 pub(crate) const RECOVERY_EPOCH_HTTP_PUBLISHES: u32 = 8;
@@ -206,6 +212,7 @@ pub(crate) struct RecoveryEpochIdentity {
     epoch: u64,
     network_generation: u64,
     allocation_id: u64,
+    hard_hard: bool,
 }
 
 /// One reserved fresh-mapping generation from an exact recovery epoch.
@@ -248,10 +255,17 @@ impl FreshGenerationReservation {
             && state.network_generation == expected.network_generation
             && state.allocation_id == expected.allocation_id
         {
-            state.epoch_fresh_generation_quota_remaining = state
-                .epoch_fresh_generation_quota_remaining
-                .saturating_add(1)
-                .min(RECOVERY_EPOCH_FRESH_GENERATIONS);
+            if expected.hard_hard {
+                state.epoch_hard_hard_generation_quota_remaining = state
+                    .epoch_hard_hard_generation_quota_remaining
+                    .saturating_add(1)
+                    .min(RECOVERY_EPOCH_HARD_HARD_GENERATIONS);
+            } else {
+                state.epoch_fresh_generation_quota_remaining = state
+                    .epoch_fresh_generation_quota_remaining
+                    .saturating_add(1)
+                    .min(RECOVERY_EPOCH_FRESH_GENERATIONS);
+            }
         }
     }
 }
@@ -325,6 +339,8 @@ pub(crate) struct RecoveryEpochState {
     pub epoch_candidate_iterations_remaining: u64,
     /// Remaining fresh-mapping generations (and fresh sockets) for this epoch.
     pub epoch_fresh_generation_quota_remaining: u32,
+    /// Reserved fresh-mapping generations for the Hard↔Hard rendezvous lane.
+    pub epoch_hard_hard_generation_quota_remaining: u32,
     /// Remaining HTTP publishes (fresh-prediction advertisements).
     pub epoch_http_quota_remaining: u32,
     /// Complete scatter windows sent this epoch.
@@ -388,6 +404,7 @@ impl RecoveryEpochState {
             epoch_sessions_remaining: RECOVERY_EPOCH_SESSIONS,
             epoch_candidate_iterations_remaining: RECOVERY_EPOCH_CANDIDATE_ITERATIONS,
             epoch_fresh_generation_quota_remaining: RECOVERY_EPOCH_FRESH_GENERATIONS,
+            epoch_hard_hard_generation_quota_remaining: RECOVERY_EPOCH_HARD_HARD_GENERATIONS,
             epoch_http_quota_remaining: RECOVERY_EPOCH_HTTP_PUBLISHES,
             epoch_scatter_windows_sent: 0,
             ack_feedback_seen: false,
@@ -799,6 +816,7 @@ impl PeerManager {
                 epoch: state.epoch,
                 network_generation: state.network_generation,
                 allocation_id: state.allocation_id,
+                hard_hard: false,
             },
             resolved: false,
         })
@@ -807,6 +825,7 @@ impl PeerManager {
     /// Reserve a retry from the same concrete epoch allocation as an earlier
     /// refunded reservation.  This is stronger than comparing the numeric
     /// epoch, which can be reused after Direct ends the old state.
+    #[allow(dead_code)]
     pub(crate) async fn try_begin_fresh_generation_for_identity(
         &self,
         peer_id: &str,
@@ -822,6 +841,60 @@ impl PeerManager {
             return None;
         }
         state.epoch_fresh_generation_quota_remaining -= 1;
+        Some(FreshGenerationReservation {
+            recovery_epochs: self.recovery_epochs.clone(),
+            peer_id: peer_id.to_string(),
+            identity: expected,
+            resolved: false,
+        })
+    }
+
+    /// Reserve the dedicated Hard↔Hard fresh-mapping lane for one exact
+    /// recovery epoch. This quota is independent from ordinary fresh mapping.
+    pub(crate) async fn try_begin_hard_hard_generation_for_epoch(
+        &self,
+        peer_id: &str,
+        expected_epoch: u64,
+    ) -> Option<FreshGenerationReservation> {
+        let mut epochs = self.recovery_epochs.write().await;
+        let state = epochs.get_mut(peer_id)?;
+        if state.epoch != expected_epoch
+            || state.epoch_hard_hard_generation_quota_remaining == 0
+        {
+            return None;
+        }
+        state.epoch_hard_hard_generation_quota_remaining -= 1;
+        Some(FreshGenerationReservation {
+            recovery_epochs: self.recovery_epochs.clone(),
+            peer_id: peer_id.to_string(),
+            identity: RecoveryEpochIdentity {
+                epoch: state.epoch,
+                network_generation: state.network_generation,
+                allocation_id: state.allocation_id,
+                hard_hard: true,
+            },
+            resolved: false,
+        })
+    }
+
+    /// Retry the same dedicated Hard↔Hard reservation after a protected punch
+    /// owner deferral.
+    pub(crate) async fn try_begin_hard_hard_generation_for_identity(
+        &self,
+        peer_id: &str,
+        expected: RecoveryEpochIdentity,
+    ) -> Option<FreshGenerationReservation> {
+        let mut epochs = self.recovery_epochs.write().await;
+        let state = epochs.get_mut(peer_id)?;
+        if !expected.hard_hard
+            || state.epoch != expected.epoch
+            || state.network_generation != expected.network_generation
+            || state.allocation_id != expected.allocation_id
+            || state.epoch_hard_hard_generation_quota_remaining == 0
+        {
+            return None;
+        }
+        state.epoch_hard_hard_generation_quota_remaining -= 1;
         Some(FreshGenerationReservation {
             recovery_epochs: self.recovery_epochs.clone(),
             peer_id: peer_id.to_string(),
@@ -1179,6 +1252,8 @@ impl PeerManager {
                 sessions_remaining: state.epoch_sessions_remaining,
                 candidate_iterations_remaining: state.epoch_candidate_iterations_remaining,
                 fresh_generations_remaining: state.epoch_fresh_generation_quota_remaining,
+                hard_hard_generations_remaining: state
+                    .epoch_hard_hard_generation_quota_remaining,
                 http_remaining: state.epoch_http_quota_remaining,
                 budget_exhausted: state.budget_exhausted,
                 zero_send_streak: state.zero_send_streak,
@@ -1399,6 +1474,7 @@ pub(crate) struct RecoveryEpochWorkBudgetSnapshot {
     pub sessions_remaining: u32,
     pub candidate_iterations_remaining: u64,
     pub fresh_generations_remaining: u32,
+    pub hard_hard_generations_remaining: u32,
     pub http_remaining: u32,
     pub budget_exhausted: bool,
     pub zero_send_streak: u32,

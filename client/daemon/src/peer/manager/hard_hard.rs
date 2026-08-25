@@ -5,7 +5,7 @@
 // fence that lets the direct-runtime rendezvous reject an older response.
 
 const MAX_HARD_HARD_SESSIONS: usize = 16;
-const MAX_HARD_HARD_PREDICTION_TARGETS: usize = 96;
+const MAX_HARD_HARD_PREDICTION_TARGETS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HardHardResponseAdmission {
@@ -130,12 +130,45 @@ impl PeerManager {
         )
     }
 
+    /// Return whether the authorized Hard↔Hard plan needs the bounded
+    /// high-entropy lane. The profile/candidate generations are re-read by
+    /// the normal plan fence, so this boolean is never used without the same
+    /// identity snapshot.
+    pub(crate) async fn hard_hard_plan_uses_birthday(&self, peer_id: &str) -> Option<bool> {
+        let local_profile_generation = self.current_local_profile_generation_sync();
+        let local_profile = self.local_nat_profile.read().await.clone()?;
+        let local = NatCapabilities::from_profile(&local_profile)
+            .with_profile_generation(local_profile_generation);
+        let conn = self.connections.read().await.get(peer_id)?.clone();
+        let remote_profile = conn.remote_nat_profile.as_ref()?;
+        if !conn.online
+            || conn.state == ConnectionState::Direct
+            || !conn.remote_nat_profile_is_fresh()
+            || !conn.remote_nat_profile_matches_candidate_epoch()
+        {
+            return None;
+        }
+        let remote = remote_profile
+            .capabilities
+            .clone()
+            .with_profile_generation(remote_profile.generation?);
+        if !local.is_hard_nat() || !remote.is_hard_nat() {
+            return None;
+        }
+        let bounded = self.config.network.birthday_probing_enabled
+            && (local.birthday_candidate || remote.birthday_candidate);
+        Some(bounded
+            && !(local.hard_allocation_is_predictable()
+                && remote.hard_allocation_is_predictable()))
+    }
+
     pub(crate) async fn hard_hard_register_session(
         &self,
         record: HardHardSessionRecord,
     ) -> bool {
         let now = unix_time_millis();
         let mut cancelled = Vec::new();
+        let mut expired_winners = Vec::new();
         let mut duplicate_result = None;
         let mut sessions = self.hard_hard_sessions.lock().await;
         let expired_keys = sessions
@@ -145,10 +178,12 @@ impl PeerManager {
             .collect::<Vec<_>>();
         for key in expired_keys {
             if let Some(existing) = sessions.remove(&key) {
+                expired_winners.push((existing.peer_id.clone(), existing.session_token.clone()));
                 cancelled.push(existing.cancellation);
             }
         }
         let key = (record.peer_id.clone(), record.session_id.clone());
+        let winner_key = (record.peer_id.clone(), record.session_token.clone());
         if let Some(existing) = sessions.get(&key) {
             duplicate_result = Some(existing.initiator == record.initiator
                 && existing.local_network_generation == record.local_network_generation
@@ -183,6 +218,15 @@ impl PeerManager {
             sessions.insert(key, record);
         }
         drop(sessions);
+        if duplicate_result.is_none() || !expired_winners.is_empty() {
+            let mut winners = self.hard_hard_winners.lock().await;
+            if duplicate_result.is_none() {
+                winners.remove(&winner_key);
+            }
+            for key in expired_winners {
+                winners.remove(&key);
+            }
+        }
         for cancellation in cancelled {
             cancellation.cancel_for_hard_hard_cleanup();
         }
@@ -250,6 +294,74 @@ impl PeerManager {
             .iter()
             .find(|((owner, _), record)| owner == peer_id && record.session_token == token)
             .map(|(_, record)| record.clone())
+    }
+
+    /// Promote one authenticated speculative socket to the session winner.
+    ///
+    /// The UDP layer has already authenticated the Probe v2 packet and checked
+    /// the socket's local token tag. This manager-side fence makes the first
+    /// valid peer-reflexive observation sticky: a delayed packet from another
+    /// candidate can add evidence, but cannot replace the selected socket.
+    pub(crate) async fn hard_hard_select_winner(
+        &self,
+        peer_id: &str,
+        token: &str,
+        socket_index: usize,
+        network_generation: u64,
+        punch_generation: u64,
+        socket_local_endpoint: SocketAddr,
+    ) -> Option<HardHardFreshSocketIdentity> {
+        let now = unix_time_millis();
+        let key = (peer_id.to_string(), token.to_string());
+        let mut sessions = self.hard_hard_sessions.lock().await;
+        let record = sessions.values_mut().find(|record| {
+            record.peer_id == peer_id
+                && record.session_token == token
+                && record.expires_at_ms >= now
+                && record.local_network_generation == network_generation
+                && (record.state == HardHardSessionState::Sweeping
+                    || (!record.initiator && record.state == HardHardSessionState::AwaitingPeer))
+        })?;
+        let mut winners = self.hard_hard_winners.lock().await;
+        if let Some(existing) = winners.get(&key) {
+            if *existing != socket_index {
+                return None;
+            }
+        } else {
+            winners.insert(key, socket_index);
+        }
+        record.fresh_socket.socket_index = socket_index;
+        record.fresh_socket.punch_generation = punch_generation.max(1);
+        record.fresh_socket.socket_local_endpoint = socket_local_endpoint;
+        Some(record.fresh_socket.clone())
+    }
+
+    /// Read the current socket identity after a peer-reflexive winner may have
+    /// replaced the initially measured socket.
+    pub(crate) async fn hard_hard_fresh_socket_for_token(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> Option<HardHardFreshSocketIdentity> {
+        self.hard_hard_session_by_token(peer_id, token)
+            .await
+            .map(|record| record.fresh_socket)
+    }
+
+    /// Return whether this bounded session has already selected a winner.
+    /// Dynamic-socket workers use the sticky ledger as their cancellation
+    /// fence so a peer-reflexive packet stops the remaining scatter workers
+    /// before they emit another candidate.
+    pub(crate) async fn hard_hard_winner_for_token(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> Option<usize> {
+        self.hard_hard_winners
+            .lock()
+            .await
+            .get(&(peer_id.to_string(), token.to_string()))
+            .copied()
     }
 
     /// Admit the one expected reciprocal response after the remote candidate
@@ -484,13 +596,23 @@ impl PeerManager {
     }
 
     pub(crate) async fn hard_hard_remove_session(&self, peer_id: &str, session_id: &str) {
-        if let Some(record) = self
+        let removed_token = if let Some(record) = self
             .hard_hard_sessions
             .lock()
             .await
             .remove(&(peer_id.to_string(), session_id.to_string()))
         {
+            let token = record.session_token.clone();
             record.cancellation.cancel_for_hard_hard_cleanup();
+            Some(token)
+        } else {
+            None
+        };
+        if let Some(token) = removed_token {
+            self.hard_hard_winners
+                .lock()
+                .await
+                .remove(&(peer_id.to_string(), token));
         }
     }
 
@@ -504,6 +626,10 @@ impl PeerManager {
                 .collect::<Vec<_>>(),
             None => sessions.keys().cloned().collect::<Vec<_>>(),
         };
+        let removed_tokens = cancelled
+            .iter()
+            .filter_map(|key| sessions.get(key).map(|record| (key.0.clone(), record.session_token.clone())))
+            .collect::<Vec<_>>();
         let mut cancellations = Vec::with_capacity(cancelled.len());
         for key in cancelled {
             if let Some(record) = sessions.remove(&key) {
@@ -511,6 +637,14 @@ impl PeerManager {
             }
         }
         drop(sessions);
+        let mut winners = self.hard_hard_winners.lock().await;
+        for key in removed_tokens {
+            winners.remove(&key);
+        }
+        if let Some(peer_id) = peer_id {
+            winners.retain(|(owner, _), _| owner != peer_id);
+        }
+        drop(winners);
         for cancellation in cancellations {
             cancellation.cancel_for_hard_hard_cleanup();
         }

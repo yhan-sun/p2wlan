@@ -16,7 +16,9 @@ use crate::ice::{
     FilteringBehavior, HairpinBehavior, LocalNetwork, MappingBehavior, NatAllocation,
     NatFingerprintHint, NatProfile,
 };
-use crate::mapping::{ModelRejection, PortModelKind};
+use crate::mapping::{
+    infer_allocation_model, AllocationModelKind, MappingObservation, ModelRejection, PortModelKind,
+};
 
 /// The network type is an operational hint, never NAT truth.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,20 +214,51 @@ fn allocation_model_from_profile(profile: &NatProfile) -> Option<PortModelKind> 
     ) {
         return Some(PortModelKind::Stable);
     }
-    if profile.prediction_candidate {
-        if let Some(delta) = profile.port_delta {
-            let step = delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
-            return Some(PortModelKind::FixedStep { step });
+    let local_endpoint = profile
+        .local_addr
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("valid fallback endpoint"));
+    let observations = profile
+        .observations
+        .iter()
+        .enumerate()
+        .filter_map(|(sequence, observation)| {
+            let observed = observation.mapped_address.as_deref()?.parse().ok()?;
+            let observer = observation
+                .server
+                .parse()
+                .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("valid fallback observer"));
+            Some(MappingObservation {
+                sequence: sequence as u16,
+                observer,
+                observed,
+                sent_at_ms: sequence as u64,
+                responded_at_ms: sequence as u64 + 1,
+                local_endpoint,
+            })
+        })
+        .collect::<Vec<_>>();
+    match infer_allocation_model(&observations).kind {
+        AllocationModelKind::Stable => Some(PortModelKind::Stable),
+        AllocationModelKind::FixedStep { step } => Some(PortModelKind::FixedStep { step }),
+        AllocationModelKind::SmallWindow { direction, .. } => {
+            Some(PortModelKind::MonotonicWindow { direction })
         }
+        AllocationModelKind::HighEntropy => Some(PortModelKind::Unpredictable {
+            reason: ModelRejection::NarrowRandom,
+        }),
+        AllocationModelKind::Unknown
+            if (observations.is_empty() || observations.len() >= 3)
+                && profile.prediction_candidate
+                && profile.port_delta.is_some()
+                && !profile.predicted_endpoints.is_empty() =>
+        {
+            profile.port_delta.map(|delta| PortModelKind::FixedStep {
+                step: delta.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            })
+        }
+        AllocationModelKind::Unknown => None,
     }
-    if profile.mapping_behavior == MappingBehavior::AddressOrPortDependent
-        && profile.likely_symmetric == Some(true)
-    {
-        return Some(PortModelKind::Unpredictable {
-            reason: ModelRejection::NoConsistentStep,
-        });
-    }
-    None
 }
 
 fn allocation_model_from_hint(hint: &NatFingerprintHint) -> Option<PortModelKind> {
@@ -376,6 +409,7 @@ pub enum TraversalReason {
     HardPredictableLocalStableRemote,
     StableLocalHardPredictableRemote,
     BothPredictableHardNat,
+    HardHardBoundedBirthday,
     MixedHardNatBoundedSpeculation,
     BothUnpredictableHardNat,
     HardNatWithoutBoundedEvidence,
@@ -394,6 +428,7 @@ impl TraversalReason {
             Self::HardPredictableLocalStableRemote => "local_predictable_hard_remote_stable",
             Self::StableLocalHardPredictableRemote => "local_stable_remote_predictable_hard",
             Self::BothPredictableHardNat => "both_predictable_hard_nat",
+            Self::HardHardBoundedBirthday => "hard_hard_bounded_birthday",
             Self::MixedHardNatBoundedSpeculation => "mixed_hard_nat_bounded_speculation",
             Self::BothUnpredictableHardNat => "both_unpredictable_hard_nat",
             Self::HardNatWithoutBoundedEvidence => "hard_nat_without_bounded_evidence",
@@ -604,12 +639,12 @@ pub fn plan_traversal(
     }
 
     if local_hard && remote_hard {
-        if !local_predictable && !remote_predictable {
+        if local_predictable && remote_predictable {
             return plan(
-                TraversalStrategy::RelayWithBackgroundReclaim,
-                TraversalCapability::RelayPreferred,
-                vec![TraversalStrategy::RelayWithBackgroundReclaim],
-                TraversalReason::BothUnpredictableHardNat,
+                TraversalStrategy::HardHardSynchronizedCandidate,
+                TraversalCapability::DirectSpeculative,
+                vec![TraversalStrategy::HardHardSynchronizedCandidate],
+                TraversalReason::BothPredictableHardNat,
                 context,
                 true,
             );
@@ -618,10 +653,20 @@ pub fn plan_traversal(
             && (local.birthday_candidate || remote_for_decision.birthday_candidate);
         if bounded {
             return plan(
-                TraversalStrategy::BirthdaySpeculative,
+                TraversalStrategy::HardHardSynchronizedCandidate,
                 TraversalCapability::DirectSpeculative,
-                vec![TraversalStrategy::BirthdaySpeculative],
-                TraversalReason::MixedHardNatBoundedSpeculation,
+                vec![TraversalStrategy::HardHardSynchronizedCandidate],
+                TraversalReason::HardHardBoundedBirthday,
+                context,
+                true,
+            );
+        }
+        if !local_predictable && !remote_predictable {
+            return plan(
+                TraversalStrategy::RelayWithBackgroundReclaim,
+                TraversalCapability::RelayPreferred,
+                vec![TraversalStrategy::RelayWithBackgroundReclaim],
+                TraversalReason::BothUnpredictableHardNat,
                 context,
                 true,
             );
@@ -837,20 +882,27 @@ mod tests {
     }
 
     #[test]
-    fn random_hard_pair_is_relay_preferred_or_bounded_speculative() {
+    fn random_hard_pair_uses_bounded_hard_hard_rendezvous() {
         let plan = plan_traversal(&random_hard(), &random_hard(), &TraversalContext::default());
-        assert_eq!(plan.strategy, TraversalStrategy::RelayWithBackgroundReclaim);
-        assert_eq!(plan.capability, TraversalCapability::RelayPreferred);
+        assert_eq!(
+            plan.strategy,
+            TraversalStrategy::HardHardSynchronizedCandidate
+        );
+        assert_eq!(plan.reason_code, TraversalReason::HardHardBoundedBirthday);
+        assert_eq!(plan.capability, TraversalCapability::DirectSpeculative);
     }
 
     #[test]
-    fn mixed_random_and_predictable_hard_is_bounded_speculation() {
+    fn mixed_random_and_predictable_hard_uses_same_hard_hard_rendezvous() {
         let plan = plan_traversal(
             &random_hard(),
             &predictable_hard(None),
             &TraversalContext::default(),
         );
-        assert_eq!(plan.strategy, TraversalStrategy::BirthdaySpeculative);
+        assert_eq!(
+            plan.strategy,
+            TraversalStrategy::HardHardSynchronizedCandidate
+        );
         assert_eq!(plan.fallback, TraversalFallback::Relay);
     }
 
@@ -944,12 +996,26 @@ mod tests {
     fn profile_conversion_keeps_apdm_and_allocation_separate() {
         let profile = NatProfile {
             local_addr: "192.168.1.2:5000".to_string(),
-            observations: vec![StunObservation {
-                server: "stun.example:3478".to_string(),
-                mapped_address: Some("203.0.113.10:40001".to_string()),
-                rtt_ms: Some(10),
-                error: None,
-            }],
+            observations: vec![
+                StunObservation {
+                    server: "stun-a.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40001".to_string()),
+                    rtt_ms: Some(10),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-b.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40005".to_string()),
+                    rtt_ms: Some(11),
+                    error: None,
+                },
+                StunObservation {
+                    server: "stun-c.example:3478".to_string(),
+                    mapped_address: Some("203.0.113.10:40009".to_string()),
+                    rtt_ms: Some(12),
+                    error: None,
+                },
+            ],
             udp_blocked: false,
             public_endpoint: Some("203.0.113.10:40001".to_string()),
             public_ip_stable: Some(true),

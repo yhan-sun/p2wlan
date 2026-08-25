@@ -317,6 +317,8 @@ impl PeerManager {
                     epoch_age_ms: duration_millis(now.saturating_duration_since(state.epoch_started_at)),
                     probe_credit_remaining: state.epoch_probe_credit_remaining,
                     fresh_generation_quota_remaining: state.epoch_fresh_generation_quota_remaining,
+                    hard_hard_generation_quota_remaining: state
+                        .epoch_hard_hard_generation_quota_remaining,
                     http_quota_remaining: state.epoch_http_quota_remaining,
                     scatter_windows_sent: state.epoch_scatter_windows_sent,
                     ack_feedback_seen: state.ack_feedback_seen,

@@ -287,6 +287,11 @@ pub struct PeerManager {
     /// measured.  Entries are short-lived and bounded; they are not a path
     /// selector or a Direct authority.
     hard_hard_sessions: Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
+    /// First authenticated socket selected by a bounded Hard↔Hard session.
+    /// Kept outside the wire/session record so old test fixtures and the
+    /// compact envelope remain compatible while a late packet cannot replace
+    /// the winner with another speculative socket.
+    hard_hard_winners: Arc<tokio::sync::Mutex<HashMap<(String, String), usize>>>,
     /// Time-limited prediction-error fingerprint per peer.
     fresh_mapping_history:
         Arc<std::sync::Mutex<HashMap<String, VecDeque<FreshMappingPredictionResult>>>>,
