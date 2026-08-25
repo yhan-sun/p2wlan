@@ -2765,26 +2765,53 @@ async fn hard_hard_wait_and_sweep(
                 peers
                     .record_direct_event(
                         &peer_id,
+                        "hard_hard_sweep_failed",
+                        targets.first().copied(),
+                        Some(targets.len()),
+                        None,
+                        format!(
+                            "origin={origin} exact-socket sweep failed before confirmation: {error}"
+                        ),
+                    )
+                    .await;
+                peers
+                    .record_direct_event(
+                        &peer_id,
                         "hard_hard_failed",
-                    targets.first().copied(),
-                    Some(targets.len()),
-                    None,
-                    format!("origin={origin} exact-socket sweep error: {error}"),
-                )
-                .await;
+                        targets.first().copied(),
+                        Some(targets.len()),
+                        None,
+                        format!("origin={origin} exact-socket sweep error: {error}"),
+                    )
+                    .await;
             false
         }
         (PunchSessionOutcome::DeadlineExceeded, _) => {
                 peers
                     .record_direct_event(
                         &peer_id,
+                        "hard_hard_sweep_failed",
+                        targets.first().copied(),
+                        Some(targets.len()),
+                        None,
+                        format!(
+                            "origin={origin} exact-socket sweep deadline elapsed before authenticated Direct confirmation"
+                        ),
+                    )
+                    .await;
+                peers
+                    .record_direct_event(
+                        &peer_id,
                         "hard_hard_failed",
-                    targets.first().copied(),
-                    Some(targets.len()),
-                    None,
-                    format!("origin={origin} stage=sweep reason=deadline budget_ms={}", HARD_HARD_SWEEP_DEADLINE.as_millis()),
-                )
-                .await;
+                        targets.first().copied(),
+                        Some(targets.len()),
+                        None,
+                        format!(
+                            "origin={origin} stage=sweep reason=deadline budget_ms={}",
+                            HARD_HARD_SWEEP_DEADLINE.as_millis()
+                        ),
+                    )
+                    .await;
             false
         }
         (PunchSessionOutcome::Cancelled, _) => false,

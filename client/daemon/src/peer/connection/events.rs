@@ -336,11 +336,11 @@ impl PeerConnection {
     /// Push one direct-traversal event into the bounded ring.
     ///
     /// The strict acceptance lifecycle (owned validation request -> ACK ->
-    /// promoted -> path) is the authoritative proof of a real Direct
-    /// promotion, so those evidence stages are protected from eviction: a
-    /// post-promotion burst of ordinary traversal events (scan completions,
-    /// inbound probes, maintainer stops) must never push the validation
-    /// chain out of the ring before the harness snapshot captures it
+    /// promoted -> path) and the bounded Hard↔Hard lifecycle markers are
+    /// authoritative traversal evidence, so those stages are protected from
+    /// eviction: a post-promotion burst of ordinary traversal events (scan
+    /// completions, inbound probes, maintainer stops) must never push the
+    /// evidence chain out of the ring before the harness snapshot captures it
     /// (field evidence: the v0.1.116 acceptance rounds that converged in
     /// ~1 s produced enough post-promotion events to evict
     /// `direct_validation_request_sent`, so the strict parser could not
@@ -360,7 +360,7 @@ impl PeerConnection {
             if evicted >= excess {
                 return true;
             }
-            if is_validation_evidence_stage(&candidate.stage) {
+            if is_protected_direct_event_stage(&candidate.stage) {
                 true
             } else {
                 evicted += 1;
@@ -374,10 +374,10 @@ impl PeerConnection {
     }
 }
 
-/// Direct-validation lifecycle stages that the strict acceptance parser
-/// requires as one owned chain.  These events are never evicted from the
-/// bounded event ring by ordinary traversal noise.
-fn is_validation_evidence_stage(stage: &str) -> bool {
+/// Direct-validation and bounded Hard↔Hard lifecycle stages that acceptance
+/// diagnostics need as one evidence chain. These events are never evicted
+/// from the bounded event ring by ordinary traversal noise.
+fn is_protected_direct_event_stage(stage: &str) -> bool {
     matches!(
         stage,
         "direct_validation_request_sent"
@@ -387,6 +387,12 @@ fn is_validation_evidence_stage(stage: &str) -> bool {
             | "direct_validation_emit_lock_timeout"
             | "direct_validation_promoted"
             | "direct_path_promoted"
+            | "hard_hard_sweep_started"
+            | "hard_hard_direct_validation_started"
+            | "hard_hard_probe_summary"
+            | "hard_hard_sweep_completed"
+            | "hard_hard_sweep_failed"
+            | "hard_hard_failed"
     )
 }
 

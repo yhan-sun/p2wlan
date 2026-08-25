@@ -31,8 +31,22 @@ jobs:
         run: cargo fmt --all --check
       - name: Rust Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Rust Tests
-        run: cargo test --workspace --all-targets
+      - name: Rust Tests (general suite)
+        run: cargo test --workspace --all-targets -- --test-threads=1 --skip hard_hard_
+      - name: Rust Tests (Hard↔Hard isolated suite)
+        shell: bash
+        run: |
+          set -euo pipefail
+          hard_hard_tests="$(cargo test -p p2wlan-daemon --lib hard_hard_ -- --list | sed -n 's/: test$//p')"
+          test_count="$(printf '%s\n' "$hard_hard_tests" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [ "$test_count" -eq 0 ]; then
+            echo "No Hard↔Hard tests discovered" >&2
+            exit 1
+          fi
+          while IFS= read -r test_name; do
+            [ -n "$test_name" ] || continue
+            cargo test -p p2wlan-daemon --lib "$test_name" -- --exact --test-threads=1
+          done <<< "$hard_hard_tests"
       - name: Linux route gate tests
         run: "cargo test -p p2wlan-daemon --lib route::tests::"
       - name: Rust Linux Target Cross-Compile Check
@@ -77,8 +91,24 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Rust Fmt Check (Windows)
         run: cargo fmt --all -- --check
-      - name: Rust Tests (Windows)
-        run: cargo test --workspace
+      - name: Rust Tests (Windows, general suite)
+        run: cargo test --workspace -- --test-threads=1 --skip hard_hard_
+      - name: Rust Tests (Windows, Hard↔Hard isolated suite)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hardHardTests = @(cargo test -p p2wlan-daemon --lib hard_hard_ -- --list |
+            Where-Object { $_ -match ': test$' } |
+            ForEach-Object { $_ -replace ': test$', '' })
+          if ($hardHardTests.Count -eq 0) {
+            throw 'No Hard↔Hard tests discovered'
+          }
+          foreach ($testName in $hardHardTests) {
+            cargo test -p p2wlan-daemon --lib $testName -- --exact --test-threads=1
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
 
   go:
     name: Go Check

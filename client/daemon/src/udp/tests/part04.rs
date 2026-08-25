@@ -37,6 +37,9 @@ struct SimulatedNat {
     peer_public: SocketAddr,
     /// The peer's private socket endpoint (127.0.0.1:Z).
     peer_private: SocketAddr,
+    /// Keep the private endpoint reserved until the peer listener takes it.
+    /// Releasing it in `start` made later binds race with unrelated UDP tests.
+    peer_private_socket: Option<UdpSocket>,
     /// First public port this instance allocated.
     base_port: u16,
     /// (client socket, destination) -> public port.
@@ -80,6 +83,7 @@ impl SimulatedNat {
             observers,
             peer_public,
             peer_private,
+            peer_private_socket: Some(peer_private_socket),
             base_port,
             mappings: Arc::new(Mutex::new(HashMap::new())),
             mapping_sources: Arc::new(Mutex::new(HashMap::new())),
@@ -245,6 +249,12 @@ impl SimulatedNat {
         }
 
         nat
+    }
+
+    fn take_peer_private_socket(&mut self) -> UdpSocket {
+        self.peer_private_socket
+            .take()
+            .expect("the simulated NAT private socket must be taken once")
     }
 
     /// The public port the NAT assigned for the client's punch mapping.
@@ -455,7 +465,7 @@ async fn run_generation_roundtrip(
 ) {
     let local_identity = NodeIdentity::generate();
     let peer_identity = NodeIdentity::generate();
-    let nat = SimulatedNat::start(step, consume_before_punch).await;
+    let mut nat = SimulatedNat::start(step, consume_before_punch).await;
 
     let peers = Arc::new(PeerManager::new(config_for_identity(
         &local_identity,
@@ -492,7 +502,7 @@ async fn run_generation_roundtrip(
         ))
         .await;
 
-    let peer_socket = UdpSocket::bind(nat.peer_private).await.unwrap();
+    let peer_socket = nat.take_peer_private_socket();
     let seen = spawn_peer_listener(Arc::new(peer_socket), b_peers, "peer-b", "peer-a").await;
 
     let outcome = transport
@@ -632,10 +642,10 @@ async fn fresh_mapping_generation_predicts_step1_and_ack_returns_on_same_socket(
 
 #[tokio::test]
 async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
-    let (peers, transport, nat) = generation_env().await;
+    let (peers, transport, mut nat) = generation_env().await;
     let key = peers.probe_key_for_peer("peer-b").await.unwrap();
     let generation = peers.current_network_generation().await;
-    let peer_socket = Arc::new(UdpSocket::bind(nat.peer_private).await.unwrap());
+    let peer_socket = Arc::new(nat.take_peer_private_socket());
     let listener_socket = peer_socket.clone();
     let listener = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -1768,7 +1778,7 @@ async fn fresh_mapping_zero_attempts_returns_no_probes_sent_and_keeps_predecesso
 async fn fresh_mapping_cancelled_mid_punch_is_superseded_and_keeps_predecessor() {
     let local_identity = NodeIdentity::generate();
     let peer_identity = NodeIdentity::generate();
-    let nat = SimulatedNat::start(1, false).await;
+    let mut nat = SimulatedNat::start(1, false).await;
     let peers = Arc::new(PeerManager::new(config_for_identity(
         &local_identity,
         "peer-a",
@@ -1819,7 +1829,7 @@ async fn fresh_mapping_cancelled_mid_punch_is_superseded_and_keeps_predecessor()
             None,
         ))
         .await;
-    let peer_socket = UdpSocket::bind(nat.peer_private).await.unwrap();
+    let peer_socket = nat.take_peer_private_socket();
     let seen = spawn_peer_listener(Arc::new(peer_socket), b_peers, "peer-b", "peer-a").await;
 
     let cancellation = Arc::new(crate::PunchSessionCancellation::default());
