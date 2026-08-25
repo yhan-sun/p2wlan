@@ -149,12 +149,7 @@ impl PeerManager {
                 if !conn.online || conn.state == ConnectionState::Closed {
                     return false;
                 }
-                let on_link_direct = conn.state == ConnectionState::Direct
-                    && conn.direct_generation == generation
-                    && conn
-                        .endpoint
-                        .is_some_and(|endpoint| conn.is_on_link_host_candidate(endpoint));
-                if on_link_direct {
+                if conn.is_on_link_direct_for_generation(generation) {
                     return true;
                 }
                 let relay_confirmed = relay_available

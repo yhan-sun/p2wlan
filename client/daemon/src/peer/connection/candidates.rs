@@ -229,6 +229,19 @@ impl PeerConnection {
                 || self.candidate_source_for_endpoint(endpoint) == CandidatePairSource::Host)
     }
 
+    /// Whether the currently committed Direct path is a validated physical
+    /// LAN path for this network generation.  Keep this predicate shared by
+    /// data-path admission and first-business evidence: a selector may label
+    /// a path LAN while a later lifecycle gate still accidentally applies the
+    /// off-link relay-first contract.
+    pub(crate) fn is_on_link_direct_for_generation(&self, local_generation: u64) -> bool {
+        self.state == ConnectionState::Direct
+            && self.direct_generation == local_generation
+            && self
+                .endpoint
+                .is_some_and(|endpoint| self.is_on_link_host_candidate(endpoint))
+    }
+
     pub(super) fn learned_candidate_source(
         &self,
         endpoint: SocketAddr,

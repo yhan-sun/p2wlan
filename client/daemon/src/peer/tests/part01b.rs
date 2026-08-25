@@ -313,6 +313,53 @@ async fn off_link_private_host_is_not_reported_as_lan_or_fast_lane() {
 }
 
 #[tokio::test]
+async fn off_link_private_candidate_does_not_suppress_public_udp_candidate() {
+    let manager = PeerManager::new(test_config());
+    let private_endpoint: SocketAddr = "192.168.50.20:56250".parse().unwrap();
+    let public_endpoint: SocketAddr = "198.51.100.20:56250".parse().unwrap();
+
+    manager.add_peer(&test_peer("peer1", private_endpoint)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.1.10".parse().unwrap(),
+            24,
+        )])
+        .await;
+    let candidates = [private_endpoint.to_string(), public_endpoint.to_string()];
+    let sources = HashMap::from([
+        (private_endpoint.to_string(), "host".to_string()),
+        (public_endpoint.to_string(), "peer_reflexive".to_string()),
+    ]);
+    manager
+        .add_candidates_with_sources("peer1", &candidates, &sources)
+        .await;
+
+    assert!(manager
+        .should_replace_direct_validation_target("peer1", private_endpoint, public_endpoint)
+        .await);
+    assert!(!manager
+        .should_replace_direct_validation_target("peer1", public_endpoint, private_endpoint)
+        .await);
+
+    // A usable public peer-reflexive endpoint remains eligible for and able
+    // to win Direct validation; the off-link RFC1918 address is not allowed
+    // to monopolize the candidate window merely because it is private.
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            public_endpoint,
+            Some(Duration::from_millis(32)),
+        )
+        .await;
+    manager
+        .record_direct_success("peer1", Some(public_endpoint))
+        .await;
+
+    assert!(manager.is_direct("peer1").await);
+    assert_eq!(manager.direct_endpoint_for_send("peer1").await, Some(public_endpoint));
+}
+
+#[tokio::test]
 async fn diagnostics_classifies_relay_without_reporting_direct() {
     let manager = PeerManager::new(test_config());
     let remote: SocketAddr = "8.8.4.4:40000".parse().unwrap();

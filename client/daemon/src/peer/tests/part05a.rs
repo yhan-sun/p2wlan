@@ -135,6 +135,43 @@ async fn on_link_direct_bypasses_relay_first_gate() {
 }
 
 #[tokio::test]
+async fn on_link_direct_business_can_be_first_usable_without_relay_business() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "192.168.2.8:51831".parse().unwrap();
+    let relay_endpoint = "tcp://relay.test:18081";
+
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
+    manager
+        .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
+            "192.168.2.16".parse().unwrap(),
+            24,
+        )])
+        .await;
+    let generation = manager.current_network_generation().await;
+    manager
+        .mark_relay_transport_ready("peer1", relay_endpoint, generation)
+        .await;
+    assert!(manager
+        .confirm_relay_peer("peer1", relay_endpoint, generation)
+        .await);
+    manager
+        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(4)))
+        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
+
+    assert!(manager
+        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+        .await);
+    assert!(!manager
+        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+        .await);
+
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.first_usable_generation, Some(generation));
+    assert_eq!(connection.first_usable_path, Some(NetworkPath::Direct));
+}
+
+#[tokio::test]
 async fn relay_ticket_renewal_does_not_rearm_completed_relay_first_gate() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "198.51.100.62:51831".parse().unwrap();

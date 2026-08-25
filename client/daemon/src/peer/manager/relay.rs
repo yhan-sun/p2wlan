@@ -693,6 +693,19 @@ impl PeerManager {
         path: NetworkPath,
         ingress_label: &str,
     ) -> bool {
+        // Normal business traffic continues after the first milestone.  Do
+        // not make every later packet queue behind the global network-epoch
+        // mutex and a connection write lock just to rediscover that the
+        // generation was already recorded.  This is only a read-side fast
+        // path; a racing generation advance is harmless because the method
+        // does not mutate state before the guarded commit below.
+        if generation == self.current_network_generation_sync()
+            && self.connections.read().await.get(node_id).is_some_and(|conn| {
+                conn.first_usable_generation == Some(generation) && conn.first_usable_at.is_some()
+            })
+        {
+            return false;
+        }
         // Linearize the generation check and the connection-state write with
         // Air/network generation advance.  Without this gate, an inbound
         // packet could observe generation N, then advance_network_generation
@@ -754,6 +767,14 @@ impl PeerManager {
                         // completion, or an unconfirmed peer cannot satisfy
                         // the relay-first contract.
                         (false, Some(REASON_FIRST_RELAY_BEFORE_CONFIRMATION), None)
+                    } else if conn.is_on_link_direct_for_generation(generation) {
+                        // A validated Host candidate inside one of our local
+                        // interface prefixes is already a physical LAN proof.
+                        // It must not wait for the off-link relay-first
+                        // business exchange, which exists to protect public
+                        // UDP hole punching from winning before relay delivery
+                        // has been proven.
+                        (conn.record_first_usable(path, generation), None, None)
                     } else if path == NetworkPath::Direct
                         && (conn.relay_confirmed_generation == Some(generation)
                             && conn.relay_confirmed_endpoint.is_some())
