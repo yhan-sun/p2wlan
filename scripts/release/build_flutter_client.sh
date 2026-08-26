@@ -15,6 +15,9 @@ fi
 
 DEFINES=()
 while IFS= read -r define; do
+  # Python on Windows may write CRLF to stdout; normalize the record before
+  # validating fields so the same wrapper works under Git Bash and POSIX bash.
+  define="${define%$'\r'}"
   DEFINES+=("$define")
 done <<< "$identity_output"
 

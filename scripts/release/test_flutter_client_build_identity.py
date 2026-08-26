@@ -681,6 +681,60 @@ exit 0
         self.assertFalse(marker.exists())
         self.assertEqual(before, after)
 
+    def test_wrapper_normalizes_windows_crlf_helper_output(self):
+        temp_dir = tempfile.TemporaryDirectory(prefix="p2wlan-wrapper-crlf-")
+        self.addCleanup(temp_dir.cleanup)
+        fake_bin = Path(temp_dir.name) / "bin"
+        fake_bin.mkdir()
+        marker = Path(temp_dir.name) / "flutter-called"
+        expected = parse_defines(
+            subprocess.check_output(
+                ["python3", str(SCRIPT), "apk", "--release"], cwd=ROOT, text=True
+            )
+        )
+        write_executable(
+            fake_bin / "python3",
+            """#!/bin/sh
+set -eu
+printf '%s\\r\\n' "--dart-define=P2WLAN_CLIENT_APP_VERSION=0.1.0"
+printf '%s\\r\\n' "--dart-define=P2WLAN_CLIENT_GIT_COMMIT=$P2WLAN_TEST_COMMIT"
+printf '%s\\r\\n' "--dart-define=P2WLAN_CLIENT_BUILD_ID=$P2WLAN_TEST_BUILD_ID"
+printf '%s\\r\\n' "--dart-define=P2WLAN_CLIENT_DIRTY=$P2WLAN_TEST_DIRTY"
+printf '%s\\r\\n' "--dart-define=P2WLAN_CLIENT_DIFF_HASH=$P2WLAN_TEST_DIFF_HASH"
+printf '%s\\r\\n' '--dart-define=P2WLAN_CLIENT_PROFILE=release'
+""",
+        )
+        write_executable(
+            fake_bin / "flutter",
+            """#!/bin/sh
+set -eu
+touch "$P2WLAN_TEST_FLUTTER_MARKER"
+snapshot="$ORG_GRADLE_PROJECT_p2wlanSourceIdentityFile"
+test -f "$snapshot"
+test "$(sed -n 's/^P2WLAN_SOURCE_GIT_COMMIT=//p' "$snapshot")" = "$P2WLAN_TEST_COMMIT"
+""",
+        )
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        env["P2WLAN_TEST_FLUTTER_MARKER"] = str(marker)
+        env["P2WLAN_TEST_COMMIT"] = expected["P2WLAN_CLIENT_GIT_COMMIT"]
+        env["P2WLAN_TEST_BUILD_ID"] = expected["P2WLAN_CLIENT_BUILD_ID"]
+        env["P2WLAN_TEST_DIRTY"] = expected["P2WLAN_CLIENT_DIRTY"]
+        env["P2WLAN_TEST_DIFF_HASH"] = expected["P2WLAN_CLIENT_DIFF_HASH"]
+        fixed_existed = FIXED_SOURCE_IDENTITY_FILE.exists()
+        with preserve_file(FIXED_SOURCE_IDENTITY_FILE):
+            result = subprocess.run(
+                ["bash", str(BUILD_WRAPPER), "apk", "--release"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(marker.exists())
+            if not fixed_existed:
+                self.assertFalse(FIXED_SOURCE_IDENTITY_FILE.exists())
+
     def test_direct_gradle_ignores_stale_fixed_snapshot(self):
         temp_dir = tempfile.TemporaryDirectory(prefix="p2wlan-gradle-stale-")
         self.addCleanup(temp_dir.cleanup)
