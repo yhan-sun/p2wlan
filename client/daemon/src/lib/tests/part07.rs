@@ -2530,26 +2530,38 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
             .split_whitespace()
             .find_map(|field| field.strip_prefix(key)?.parse::<usize>().ok())
     };
-    let mut probe_summaries = 0;
+    let mut birthday_summaries = 0;
     for peers in [&harness.peers_a, &harness.peers_b] {
         for event in &peers.diagnostics().await[0].direct_events {
-            if event.stage != "hard_hard_probe_summary"
-                || !event.detail.contains("target_count=64")
+            if event.stage != "hard_hard_birthday_sweep_summary"
+                || !event.detail.contains("requested_level=64")
             {
                 continue;
             }
-            let sent = parse_count(&event.detail, "sent=").expect("probe summary must report sent");
-            let unique = parse_count(&event.detail, "unique_targets=")
-                .expect("probe summary must report unique targets");
-            let target_count =
-                parse_count(&event.detail, "target_count=").expect("probe summary must report target count");
-            assert!(sent <= target_count);
-            assert!(unique <= target_count);
-            assert_eq!(sent, unique, "birthday assignment must send each target once");
-            probe_summaries += 1;
+            let sent = parse_count(&event.detail, "packets_sent=")
+                .expect("birthday summary must report sent packets");
+            let unique = parse_count(&event.detail, "unique_target_endpoints=")
+                .expect("birthday summary must report unique target endpoints");
+            let effective_target_count = parse_count(&event.detail, "effective_target_count=")
+                .expect("birthday summary must report effective target count");
+            let packets_planned = parse_count(&event.detail, "packets_planned=")
+                .expect("birthday summary must report planned packets");
+            let waves_planned = parse_count(&event.detail, "waves_planned=")
+                .expect("birthday summary must report planned waves");
+            assert_eq!(waves_planned, 2);
+            assert_eq!(packets_planned, effective_target_count * 2);
+            assert!(sent <= packets_planned);
+            assert!(unique <= effective_target_count);
+            assert!(event.detail.contains("first_send_at_ms="));
+            assert!(event.detail.contains("last_send_at_ms="));
+            assert!(event.detail.contains("stop_reason="));
+            birthday_summaries += 1;
         }
     }
-    assert!(probe_summaries > 0, "production birthday sweep must report its bounded send count");
+    assert!(
+        birthday_summaries > 0,
+        "production birthday sweep must report its bounded send count"
+    );
 
     timeout(Duration::from_secs(1), async {
         loop {

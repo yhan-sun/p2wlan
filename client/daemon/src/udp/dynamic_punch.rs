@@ -9,6 +9,8 @@ const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
 /// immediately.  Bound the handshake so a broken runtime/task cannot leave a
 /// fresh-mapping generation waiting forever before its first STUN request.
 const DYNAMIC_READER_READY_TIMEOUT: Duration = Duration::from_secs(1);
+const HARD_HARD_BIRTHDAY_WAVE_INTERVAL: Duration = Duration::from_millis(20);
+const HARD_HARD_BIRTHDAY_WAVES: usize = 2;
 
 /// Adaptive-prediction learner state for one network generation, scoped by
 /// destination so a stride learned toward STUN observers is not blindly applied
@@ -2251,66 +2253,256 @@ impl UdpTransport {
     }
 
     /// Fan a bounded Hard↔Hard birthday window across the committed candidate
-    /// sockets. Each target is sent once from exactly one socket, so the
-    /// physical datagram count is the negotiated 64/128/256 level rather than
-    /// a socket-count Cartesian product.
+    /// sockets in up to two deterministic waves. Each wave sends every target
+    /// from exactly one socket; the second wave rotates the socket assignment
+    /// so a target is retried from a different source port without creating a
+    /// socket-count Cartesian product.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn punch_hard_hard_birthday_candidates(
         &self,
         peer_id: &str,
         socket_indices: Vec<usize>,
         targets: Vec<SocketAddr>,
+        requested_level: usize,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
         profile_fence: (u64, u64),
         session_token: &str,
     ) -> Result<PunchSendReport> {
-        if socket_indices.is_empty() || targets.is_empty() {
-            return Ok(PunchSendReport::default());
-        }
-        let mut assignments = hard_hard_birthday_assignments(socket_indices.len(), targets);
-        let mut workers = JoinSet::new();
-        for (socket_position, socket_index) in socket_indices.into_iter().enumerate() {
-            let assigned = std::mem::take(&mut assignments[socket_position]);
-            if assigned.is_empty() {
+        let mut effective_targets = Vec::with_capacity(targets.len().min(crate::MAX_SIGNAL_CANDIDATES));
+        for target in targets {
+            if target.port() == 0 || effective_targets.contains(&target) {
                 continue;
             }
-            let transport = self.clone();
-            let peer_id = peer_id.to_string();
-            let session_token = session_token.to_string();
-            workers.spawn(async move {
-                transport
-                    .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
-                        &peer_id,
-                        socket_index,
-                        assigned,
-                        Duration::from_millis(20),
-                        1,
-                        Some(profile_fence),
-                        Some(&session_token),
+            effective_targets.push(target);
+            if effective_targets.len() == crate::MAX_SIGNAL_CANDIDATES {
+                break;
+            }
+        }
+        let mut effective_socket_indices = Vec::with_capacity(socket_indices.len());
+        for socket_index in socket_indices {
+            if !effective_socket_indices.contains(&socket_index) {
+                effective_socket_indices.push(socket_index);
+            }
+        }
+
+        let waves_planned = hard_hard_birthday_wave_count(effective_socket_indices.len());
+        let mut birthday = BirthdaySweepReport {
+            requested_level,
+            effective_target_count: effective_targets.len(),
+            waves_planned,
+            packets_planned: hard_hard_birthday_packets_planned(
+                effective_socket_indices.len(),
+                effective_targets.len(),
+            ),
+            ..BirthdaySweepReport::default()
+        };
+        let mut aggregate = PunchSendReport::default();
+        if effective_targets.is_empty() {
+            birthday.stop_reason = Some("empty_targets".to_string());
+            aggregate.birthday = Some(birthday);
+            return Ok(aggregate);
+        }
+        if effective_socket_indices.is_empty() {
+            birthday.stop_reason = Some("socket_unavailable".to_string());
+            aggregate.birthday = Some(birthday);
+            return Ok(aggregate);
+        }
+
+        // Keep the first-wave launch timing identical to the existing
+        // one-shot path. Each worker still resolves its exact socket
+        // fail-closed immediately before it can send; a fully detached set is
+        // reported as `socket_unavailable` after that wave.
+        birthday.socket_count = effective_socket_indices.len();
+        if birthday.socket_count == 1 {
+            birthday.degraded_reason = Some("single_socket".to_string());
+        }
+        birthday.waves_planned = hard_hard_birthday_wave_count(effective_socket_indices.len());
+        birthday.packets_planned = hard_hard_birthday_packets_planned(
+            birthday.socket_count,
+            birthday.effective_target_count,
+        );
+
+        let network_generation_at_start = self.peers.current_network_generation_sync();
+        let remote_candidate_epoch_at_start = self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or_default();
+        let direct_commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
+        for wave in 0..birthday.waves_planned {
+            if wave > 0 {
+                sleep(HARD_HARD_BIRTHDAY_WAVE_INTERVAL).await;
+            }
+            if wave > 0 {
+                if let Some(reason) = self
+                    .hard_hard_birthday_stop_reason(
+                        peer_id,
+                        session_token,
+                        profile_fence,
+                        peer_session_generation,
+                        network_generation_at_start,
+                        remote_candidate_epoch_at_start,
+                        direct_commit_seq_at_start,
                     )
                     .await
-            });
+                {
+                    birthday.stop_reason = Some(reason.to_string());
+                    break;
+                }
+            }
+
+            birthday.waves_started = birthday.waves_started.saturating_add(1);
+            let mut assignments = hard_hard_birthday_wave_assignments(
+                effective_socket_indices.len(),
+                effective_targets.clone(),
+                wave,
+            );
+            let mut workers = JoinSet::new();
+            for (socket_position, socket_index) in
+                effective_socket_indices.iter().copied().enumerate()
+            {
+                let assigned = std::mem::take(&mut assignments[socket_position]);
+                if assigned.is_empty() {
+                    continue;
+                }
+                let transport = self.clone();
+                let peer_id = peer_id.to_string();
+                let session_token = session_token.to_string();
+                workers.spawn(async move {
+                    transport
+                        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
+                            &peer_id,
+                            socket_index,
+                            assigned,
+                            HARD_HARD_BIRTHDAY_WAVE_INTERVAL,
+                            1,
+                            Some(profile_fence),
+                            Some(&session_token),
+                        )
+                        .await
+                });
+            }
+
+            let mut wave_report = PunchSendReport::default();
+            let mut worker_failed = false;
+            while let Some(joined) = workers.join_next().await {
+                let Ok(result) = joined else {
+                    worker_failed = true;
+                    continue;
+                };
+                let report = result?;
+                merge_punch_send_reports(&mut wave_report, report);
+            }
+            if worker_failed {
+                birthday.stop_reason = Some("send_error".to_string());
+                break;
+            }
+            birthday.waves_completed = birthday.waves_completed.saturating_add(1);
+            merge_punch_send_reports(&mut aggregate, wave_report.clone());
+            if let Some(reason) = self
+                .hard_hard_birthday_stop_reason(
+                    peer_id,
+                    session_token,
+                    profile_fence,
+                    peer_session_generation,
+                    network_generation_at_start,
+                    remote_candidate_epoch_at_start,
+                    direct_commit_seq_at_start,
+                )
+                .await
+            {
+                birthday.stop_reason = Some(reason.to_string());
+                break;
+            }
+            if wave_report.epoch_budget_exhausted {
+                birthday.stop_reason = Some("epoch_budget_exhausted".to_string());
+                break;
+            }
+            if wave_report.candidate_iteration_capped {
+                birthday.stop_reason = Some("candidate_iteration_capped".to_string());
+                break;
+            }
+            if wave_report.packets_sent == 0 && wave_report.budget_skipped > 0 {
+                birthday.stop_reason = Some("budget_exhausted".to_string());
+                break;
+            }
+            if wave_report.packets_sent == 0 && wave_report.budget_skipped == 0 {
+                birthday.stop_reason = Some("socket_unavailable".to_string());
+                break;
+            }
         }
-        let mut aggregate = PunchSendReport::default();
-        while let Some(joined) = workers.join_next().await {
-            let Ok(result) = joined else {
-                continue;
-            };
-            let report = result?;
-            aggregate.packets_sent = aggregate.packets_sent.saturating_add(report.packets_sent);
-            aggregate.unique_target_endpoints = aggregate
-                .unique_target_endpoints
-                .saturating_add(report.unique_target_endpoints);
-            aggregate.budget_skipped = aggregate.budget_skipped.saturating_add(report.budget_skipped);
-            aggregate.epoch_budget_exhausted |= report.epoch_budget_exhausted;
-            aggregate.candidate_iteration_capped |= report.candidate_iteration_capped;
-            aggregate.first_send_at_ms = match (aggregate.first_send_at_ms, report.first_send_at_ms) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                (None, right) => right,
-                (left, None) => left,
-            };
-            aggregate.per_socket_sent.extend(report.per_socket_sent);
+
+        if birthday.stop_reason.is_none() {
+            birthday.stop_reason = Some("completed".to_string());
         }
+        aggregate.unique_target_endpoints =
+            u32::try_from(aggregate.sent_target_endpoints.len()).unwrap_or(u32::MAX);
+        aggregate.birthday = Some(birthday);
         Ok(aggregate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hard_hard_birthday_stop_reason(
+        &self,
+        peer_id: &str,
+        session_token: &str,
+        profile_fence: (u64, u64),
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        network_generation: u64,
+        remote_candidate_epoch: u64,
+        direct_commit_seq: Option<u64>,
+    ) -> Option<&'static str> {
+        if self
+            .peers
+            .hard_hard_winner_for_token(peer_id, session_token)
+            .await
+            .is_some()
+        {
+            return Some("winner_selected");
+        }
+        if self.peers.is_direct_sync(peer_id) {
+            return Some("direct_confirmed");
+        }
+        if self.peers.current_network_generation_sync() != network_generation {
+            return Some("network_generation_changed");
+        }
+        if !self
+            .peers
+            .peer_session_is_current_sync(peer_id, peer_session_generation)
+        {
+            return Some("peer_session_changed");
+        }
+        if self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or_default()
+            != remote_candidate_epoch
+        {
+            return Some("candidate_epoch_changed");
+        }
+        let profile_current = self
+            .peers
+            .hard_hard_plan_for_peer(peer_id)
+            .await
+            .is_some_and(|plan| {
+                plan.local_profile_generation == profile_fence.0
+                    && plan.remote_profile_generation == profile_fence.1
+            });
+        if !profile_current {
+            return Some("profile_generation_changed");
+        }
+        if !self
+            .peers
+            .hard_hard_session_token_is_current(peer_id, session_token)
+            .await
+        {
+            return Some("session_retired");
+        }
+        if self.peers.direct_commit_seq_sync(peer_id) != direct_commit_seq {
+            return Some("direct_commit_seq_changed");
+        }
+        None
     }
 
     /// Exact-index sweep with an optional Hard↔Hard profile-generation fence.
@@ -2386,6 +2578,7 @@ impl UdpTransport {
         let mut last_budget_reason = None;
         let mut sent_endpoints = HashSet::new();
         let mut first_send_at_ms = None;
+        let mut last_send_at_ms: Option<u64> = None;
         let mut per_socket_sent = 0u32;
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         let network_generation_at_start = self.peers.current_network_generation_sync();
@@ -2525,6 +2718,10 @@ impl UdpTransport {
                         packets_sent = packets_sent.saturating_add(1);
                         if let Some(sent_at_ms) = sent.first_send_at_ms {
                             first_send_at_ms.get_or_insert(sent_at_ms);
+                            last_send_at_ms = Some(
+                                last_send_at_ms
+                                    .map_or(sent_at_ms, |last| last.max(sent_at_ms)),
+                            );
                         }
                         per_socket_sent =
                             per_socket_sent.saturating_add(u32::from(sent.datagrams_sent));
@@ -2573,6 +2770,9 @@ impl UdpTransport {
             budget_skipped,
             epoch_budget_exhausted: false,
             candidate_iteration_capped: false,
+            sent_target_endpoints: sent_endpoints.into_iter().collect(),
+            last_send_at_ms,
+            ..PunchSendReport::default()
         })
     }
 }
@@ -2696,16 +2896,63 @@ fn hard_hard_birthday_capacity_plan(
     Some((actual_level, actual_socket_count))
 }
 
-fn hard_hard_birthday_assignments(
+fn merge_punch_send_reports(destination: &mut PunchSendReport, source: PunchSendReport) {
+    destination.packets_sent = destination.packets_sent.saturating_add(source.packets_sent);
+    destination.budget_skipped = destination.budget_skipped.saturating_add(source.budget_skipped);
+    destination.epoch_budget_exhausted |= source.epoch_budget_exhausted;
+    destination.candidate_iteration_capped |= source.candidate_iteration_capped;
+    destination.first_send_at_ms = match (destination.first_send_at_ms, source.first_send_at_ms) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (None, right) => right,
+        (left, None) => left,
+    };
+    destination.last_send_at_ms = match (destination.last_send_at_ms, source.last_send_at_ms) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (None, right) => right,
+        (left, None) => left,
+    };
+    for endpoint in source.sent_target_endpoints {
+        if !destination.sent_target_endpoints.contains(&endpoint) {
+            destination.sent_target_endpoints.push(endpoint);
+        }
+    }
+    for (socket_index, sent) in source.per_socket_sent {
+        if let Some((_, existing)) = destination
+            .per_socket_sent
+            .iter_mut()
+            .find(|(index, _)| *index == socket_index)
+        {
+            *existing = existing.saturating_add(sent);
+        } else {
+            destination.per_socket_sent.push((socket_index, sent));
+        }
+    }
+}
+
+fn hard_hard_birthday_wave_count(socket_count: usize) -> usize {
+    match socket_count {
+        0 => 0,
+        1 => 1,
+        _ => HARD_HARD_BIRTHDAY_WAVES,
+    }
+}
+
+fn hard_hard_birthday_packets_planned(socket_count: usize, target_count: usize) -> usize {
+    target_count.saturating_mul(hard_hard_birthday_wave_count(socket_count))
+}
+
+fn hard_hard_birthday_wave_assignments(
     socket_count: usize,
     targets: Vec<SocketAddr>,
+    wave: usize,
 ) -> Vec<Vec<SocketAddr>> {
     if socket_count == 0 {
         return Vec::new();
     }
     let mut assignments = vec![Vec::new(); socket_count];
+    let socket_offset = wave % socket_count;
     for (index, target) in targets.into_iter().enumerate() {
-        assignments[index % socket_count].push(target);
+        assignments[(index + socket_offset) % socket_count].push(target);
     }
     assignments
 }
@@ -3463,11 +3710,12 @@ impl Drop for ProvisionalSocketGuard {
 #[cfg(test)]
 mod birthday_tests {
     use super::{
-        hard_hard_birthday_assignments, hard_hard_birthday_candidates,
-        hard_hard_birthday_capacity_plan,
+        hard_hard_birthday_candidates, hard_hard_birthday_capacity_plan,
+        hard_hard_birthday_packets_planned, hard_hard_birthday_wave_assignments,
+        hard_hard_birthday_wave_count,
     };
     use p2pnet_nat::mapping::AllocationModelKind;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
@@ -3501,18 +3749,41 @@ mod birthday_tests {
     }
 
     #[test]
-    fn birthday_assignments_send_each_target_once_without_socket_cartesian_product() {
+    fn birthday_two_waves_rotate_targets_without_socket_cartesian_product() {
         for (socket_count, level) in [(2, 64), (4, 128), (8, 256)] {
             let targets = (1..=level)
                 .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port as u16))
                 .collect::<Vec<_>>();
-            let assignments = hard_hard_birthday_assignments(socket_count, targets.clone());
-            assert_eq!(assignments.len(), socket_count);
-            let flattened = assignments.into_iter().flatten().collect::<Vec<_>>();
-            assert_eq!(flattened.len(), level);
-            assert_eq!(flattened.iter().collect::<HashSet<_>>().len(), level);
-            assert!(flattened.iter().all(|target| targets.contains(target)));
+            assert_eq!(hard_hard_birthday_wave_count(socket_count), 2);
+            let first = hard_hard_birthday_wave_assignments(socket_count, targets.clone(), 0);
+            let second = hard_hard_birthday_wave_assignments(socket_count, targets.clone(), 1);
+            assert_eq!(first.len(), socket_count);
+            assert_eq!(second.len(), socket_count);
+            for assignments in [&first, &second] {
+                let flattened = assignments.iter().flatten().copied().collect::<Vec<_>>();
+                assert_eq!(flattened.len(), level);
+                assert_eq!(flattened.iter().collect::<HashSet<_>>().len(), level);
+                assert!(flattened.iter().all(|target| targets.contains(target)));
+            }
+            let first_socket = first
+                .iter()
+                .enumerate()
+                .flat_map(|(socket, assigned)| assigned.iter().map(move |target| (*target, socket)))
+                .collect::<HashMap<_, _>>();
+            let second_socket = second
+                .iter()
+                .enumerate()
+                .flat_map(|(socket, assigned)| assigned.iter().map(move |target| (*target, socket)))
+                .collect::<HashMap<_, _>>();
+            assert!(targets
+                .iter()
+                .all(|target| first_socket[target] != second_socket[target]));
         }
+        assert_eq!(hard_hard_birthday_wave_count(1), 1);
+        assert_eq!(hard_hard_birthday_wave_count(0), 0);
+        assert_eq!(hard_hard_birthday_packets_planned(2, 64), 128);
+        assert_eq!(hard_hard_birthday_packets_planned(4, 96), 192);
+        assert_eq!(hard_hard_birthday_packets_planned(1, 96), 96);
     }
 
     #[test]

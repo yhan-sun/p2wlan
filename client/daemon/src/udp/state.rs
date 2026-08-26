@@ -1351,6 +1351,19 @@ impl PunchSocketPolicy {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BirthdaySweepReport {
+    pub requested_level: usize,
+    pub effective_target_count: usize,
+    pub socket_count: usize,
+    pub degraded_reason: Option<String>,
+    pub waves_planned: usize,
+    pub waves_started: usize,
+    pub waves_completed: usize,
+    pub packets_planned: usize,
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PunchSendReport {
     pub packets_sent: u32,
     pub unique_target_endpoints: u32,
@@ -1375,6 +1388,15 @@ pub(crate) struct PunchSendReport {
     /// The session stopped enumerating candidates because the epoch's hard
     /// candidate-iteration budget was reached.
     pub candidate_iteration_capped: bool,
+    /// Exact endpoints that accepted at least one logical probe. This is an
+    /// internal aggregation aid for multi-wave Hard↔Hard diagnostics; callers
+    /// must use `unique_target_endpoints` for the bounded count.
+    pub sent_target_endpoints: Vec<SocketAddr>,
+    /// Wall-clock UNIX milliseconds captured after the last successful
+    /// kernel UDP send in this punch session.
+    pub last_send_at_ms: Option<u64>,
+    /// Present only for the bounded Hard↔Hard Birthday scheduler.
+    pub birthday: Option<BirthdaySweepReport>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

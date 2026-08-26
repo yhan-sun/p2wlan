@@ -2170,6 +2170,7 @@ pub(crate) async fn spawn_hard_hard_responder(
         } else {
             false
         };
+        record_hard_hard_candidate_contract(&peers, &peer_id, candidate_contract, sent).await;
         if !sent
             || cancellation.is_cancelled()
             || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
@@ -2248,6 +2249,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             birthday_socket_indices,
             coordination.token.clone(),
             remote_prediction,
+            hard_hard_measurement_target_limit(&measurement),
             punch_at_ms,
             current_plan.local_network_generation,
             (
@@ -2507,6 +2509,10 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         (!birthday_socket_indices.is_empty()).then_some(birthday_socket_indices),
         record.session_token.clone(),
         remote_prediction,
+        record
+            .prediction_window
+            .len()
+            .min(HARD_HARD_MAX_BIRTHDAY_TARGETS),
         punch_at_ms,
         record.local_network_generation,
         (
@@ -2625,12 +2631,16 @@ async fn hard_hard_wait_and_sweep(
     birthday_socket_indices: Option<Vec<usize>>,
     session_token: String,
     targets: Vec<SocketAddr>,
+    requested_level: usize,
     punch_at_ms: u64,
     network_generation: u64,
     profile_generations: (u64, u64),
     origin: &'static str,
 ) -> bool {
     let socket_index = fresh_socket.socket_index;
+    let birthday_waves_planned = birthday_socket_indices.as_ref().map_or(1, |indices| {
+        if indices.len() > 1 { 2 } else { 1 }
+    });
     let delay = punch_at_ms.saturating_sub(hard_hard_now_ms());
     if delay > 0 {
         tokio::select! {
@@ -2657,10 +2667,12 @@ async fn hard_hard_wait_and_sweep(
             Some(targets.len()),
             None,
             format!(
-                "origin={origin} socket_count={} target_count={} attempt={} punch_at_ms={} local_clock_ms={} sweep_deadline_ms={}",
+                "origin={origin} mode={} socket_count={} target_count={} attempt={} waves_planned={} punch_at_ms={} local_clock_ms={} sweep_deadline_ms={}",
+                if birthday_socket_indices.is_some() { "birthday" } else { "predictable" },
                 birthday_socket_indices.as_ref().map_or(1, Vec::len),
                 targets.len(),
                 if birthday_socket_indices.is_some() { 1 } else { HARD_HARD_SWEEP_ATTEMPTS },
+                birthday_waves_planned,
                 punch_at_ms,
                 hard_hard_now_ms(),
                 HARD_HARD_SWEEP_DEADLINE.as_millis(),
@@ -2683,6 +2695,8 @@ async fn hard_hard_wait_and_sweep(
                 &peer_id,
                 socket_indices,
                 targets.clone(),
+                requested_level,
+                peer_session_generation,
                 profile_generations,
                 &session_token,
             )
@@ -2745,8 +2759,35 @@ async fn hard_hard_wait_and_sweep(
                     &confirmation_identity,
                     direct_commit_seq,
                 )
-                .await
+                    .await
             };
+            let mut per_socket_counts = report.per_socket_sent.clone();
+            per_socket_counts.sort_by_key(|(socket_index, _)| *socket_index);
+            let per_socket_sent = per_socket_counts
+                .iter()
+                .map(|(socket_index, sent)| format!("{socket_index}:{sent}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let birthday_detail = report.birthday.as_ref().map(|birthday| {
+                format!(
+                    "requested_level={} effective_target_count={} socket_count={} degraded_reason={} waves_planned={} waves_started={} waves_completed={} packets_planned={} packets_sent={} unique_target_endpoints={} budget_skipped={} per_socket_sent={} first_send_at_ms={:?} last_send_at_ms={:?} stop_reason={}",
+                    birthday.requested_level,
+                    birthday.effective_target_count,
+                    birthday.socket_count,
+                    birthday.degraded_reason.as_deref().unwrap_or("none"),
+                    birthday.waves_planned,
+                    birthday.waves_started,
+                    birthday.waves_completed,
+                    birthday.packets_planned,
+                    report.packets_sent,
+                    report.unique_target_endpoints,
+                    report.budget_skipped,
+                    per_socket_sent,
+                    report.first_send_at_ms,
+                    report.last_send_at_ms,
+                    birthday.stop_reason.as_deref().unwrap_or("unknown"),
+                )
+            });
             peers
                 .record_direct_event_for_generation_with_socket(
                     &peer_id,
@@ -2757,18 +2798,46 @@ async fn hard_hard_wait_and_sweep(
                     Some(report.unique_target_endpoints as usize),
                     Some(report.packets_sent),
                     format!(
-                        "origin={origin} sent={} received={} matched_ack={} authenticated_rx={} target_count={} unique_targets={} budget_skipped={} first_send_at_ms={:?}",
+                        "origin={origin} mode={} sent={} received={} matched_ack={} authenticated_rx={} authenticated_ack_unmatched={} target_count={} unique_targets={} budget_skipped={} first_send_at_ms={:?} last_send_at_ms={:?} per_socket_sent={}{}",
+                        if birthday_detail.is_some() { "birthday" } else { "predictable" },
                         report.packets_sent,
                         probe_rx_delta.known_peer_ip_datagrams_received,
                         probe_rx_delta.probe_acks_received,
                         probe_rx_delta.authenticated_probe_packets_received,
+                        probe_rx_delta.authenticated_probe_acks_unmatched,
                         targets.len(),
                         report.unique_target_endpoints,
                         report.budget_skipped,
                         report.first_send_at_ms,
+                        report.last_send_at_ms,
+                        per_socket_sent,
+                        birthday_detail
+                            .as_deref()
+                            .map(|detail| format!(" {detail}"))
+                            .unwrap_or_default(),
                     ),
                 )
                 .await;
+            if let Some(detail) = birthday_detail.as_deref() {
+                peers
+                    .record_direct_event_for_generation_with_socket(
+                        &peer_id,
+                        network_generation,
+                        "hard_hard_birthday_sweep_summary",
+                        targets.first().copied(),
+                        Some(socket_index),
+                        Some(report.unique_target_endpoints as usize),
+                        Some(report.packets_sent),
+                        format!(
+                            "origin={origin} mode=birthday {detail} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} matched_probe_ack_rx_delta={} authenticated_probe_ack_unmatched_delta={}",
+                            probe_rx_delta.known_peer_ip_datagrams_received,
+                            probe_rx_delta.authenticated_probe_packets_received,
+                            probe_rx_delta.probe_acks_received,
+                            probe_rx_delta.authenticated_probe_acks_unmatched,
+                        ),
+                    )
+                    .await;
+            }
             if direct_confirmed {
                 peers
                     .record_direct_event(
@@ -2866,7 +2935,11 @@ async fn hard_hard_wait_and_sweep(
                         Some(targets.len()),
                         None,
                         format!(
-                            "origin={origin} exact-socket sweep deadline elapsed before authenticated Direct confirmation"
+                            "origin={origin} mode={} requested_level={} effective_target_count={} waves_planned={} stop_reason=deadline exact-socket sweep deadline elapsed before authenticated Direct confirmation",
+                            if birthday_socket_indices.is_some() { "birthday" } else { "predictable" },
+                            requested_level,
+                            targets.len(),
+                            birthday_waves_planned,
                         ),
                     )
                     .await;
@@ -2878,14 +2951,60 @@ async fn hard_hard_wait_and_sweep(
                         Some(targets.len()),
                         None,
                         format!(
-                            "origin={origin} stage=sweep reason=deadline budget_ms={}",
-                            HARD_HARD_SWEEP_DEADLINE.as_millis()
+                            "origin={origin} mode={} stage=sweep reason=deadline requested_level={} effective_target_count={} budget_ms={}",
+                            if birthday_socket_indices.is_some() { "birthday" } else { "predictable" },
+                            requested_level,
+                            targets.len(),
+                            HARD_HARD_SWEEP_DEADLINE.as_millis(),
                         ),
                     )
                     .await;
             false
         }
-        (PunchSessionOutcome::Cancelled, _) => false,
+        (PunchSessionOutcome::Cancelled, _) => {
+            let cancellation_reason = session
+                .cancellation_reason()
+                .map(PunchCancellationReason::label)
+                .unwrap_or("unknown");
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "hard_hard_sweep_failed",
+                    targets.first().copied(),
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} mode={} requested_level={} effective_target_count={} waves_planned={} stop_reason=session_cancelled cancellation_reason={cancellation_reason}",
+                        if birthday_socket_indices.is_some() {
+                            "birthday"
+                        } else {
+                            "predictable"
+                        },
+                        requested_level,
+                        targets.len(),
+                        birthday_waves_planned,
+                    ),
+                )
+                .await;
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "hard_hard_failed",
+                    targets.first().copied(),
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} mode={} stage=sweep reason=session_cancelled cancellation_reason={cancellation_reason}",
+                        if birthday_socket_indices.is_some() {
+                            "birthday"
+                        } else {
+                            "predictable"
+                        },
+                    ),
+                )
+                .await;
+            false
+        }
         _ => false,
     }
 }
