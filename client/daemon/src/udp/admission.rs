@@ -696,6 +696,7 @@ impl UdpTransport {
             purpose,
             hard_hard_session_token,
             false,
+            None,
         )
         .await
         .map_err(|failure| failure.error)
@@ -712,6 +713,7 @@ impl UdpTransport {
         purpose: PendingProbePurpose,
         hard_hard_session_token: Option<&str>,
         require_exact_dynamic_owner: bool,
+        live_recorder: Option<BirthdayLiveRecorder>,
     ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
         let remote_candidate_epoch = match peer_id {
             Some(peer_id) => self
@@ -951,14 +953,35 @@ impl UdpTransport {
             send_lease
         };
 
-        if let Err(error) = self.send_probe_datagram(&socket, &bytes, peer_addr).await {
-            self.pending_probes.lock().await.remove(&nonce);
-            self.clear_hard_hard_pending_probe_token(nonce).await;
-            return Err(ProbeSendFailure::with_physical_send_error(DaemonError::Network(
-                format!("UDP probe send to {peer_addr} failed: {error}"),
-            )));
-        }
-        let first_send_at_ms = Some(monotonic_millis());
+        let first_send_at_ms = match self.send_probe_datagram(&socket, &bytes, peer_addr).await {
+            Ok(_) => {
+                let sent_at_ms = monotonic_millis();
+                // This is the physical send commit point.  It must precede
+                // the test gate, diagnostics update, lease cleanup, and every
+                // other follow-up await so a cancelled worker cannot lose a
+                // datagram that the kernel already accepted.
+                if let Some(recorder) = live_recorder.as_ref() {
+                    recorder.record_primary_success(socket_index, peer_addr, sent_at_ms);
+                }
+                #[cfg(test)]
+                wait_for_probe_post_send_gate_for_test().await;
+                Some(sent_at_ms)
+            }
+            Err(error) => {
+                // The primary send failed, but the physical error must still
+                // survive a cancellation racing the pending-probe cleanup.
+                if let Some(recorder) = live_recorder.as_ref() {
+                    recorder.record_primary_error();
+                }
+                #[cfg(test)]
+                wait_for_probe_post_send_gate_for_test().await;
+                self.pending_probes.lock().await.remove(&nonce);
+                self.clear_hard_hard_pending_probe_token(nonce).await;
+                return Err(ProbeSendFailure::with_physical_send_error(DaemonError::Network(
+                    format!("UDP probe send to {peer_addr} failed: {error}"),
+                )));
+            }
+        };
         // The send completed: release the in-flight send lease.  The pending
         // entry itself keeps the detach waiting until the ACK arrives or the
         // bounded drain timeout expires.
@@ -984,6 +1007,9 @@ impl UdpTransport {
             {
                 Ok(_) => {
                     datagrams_sent = datagrams_sent.saturating_add(1);
+                    if let Some(recorder) = live_recorder.as_ref() {
+                        recorder.record_compatibility_success(socket_index, monotonic_millis());
+                    }
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.probes_sent += 1
                     })
@@ -1013,6 +1039,9 @@ impl UdpTransport {
                 }
                 Err(err) => {
                     physical_send_errors = physical_send_errors.saturating_add(1);
+                    if let Some(recorder) = live_recorder.as_ref() {
+                        recorder.record_compatibility_error();
+                    }
                     debug!(
                         "Failed to send compatibility legacy UDP punch probe to peer {} at {}: {}",
                         peer_id.unwrap_or("unknown"),

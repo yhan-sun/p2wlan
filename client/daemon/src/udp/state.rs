@@ -180,6 +180,66 @@ pub(crate) async fn wait_for_birthday_worker_completion_gate_for_test() {
     }
 }
 
+/// Deterministic seam immediately after the production main `send_to` returns
+/// and after its session-local live recorder commit, but before the first
+/// post-send diagnostics/cleanup await.  The guard restores the hook and
+/// releases a parked sender when a test exits through an assertion failure.
+#[cfg(test)]
+pub(crate) struct ProbePostSendGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct ProbePostSendGateGuard {
+    gate: Arc<ProbePostSendGate>,
+}
+
+#[cfg(test)]
+static PROBE_POST_SEND_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<Arc<ProbePostSendGate>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+impl Drop for ProbePostSendGateGuard {
+    fn drop(&mut self) {
+        *PROBE_POST_SEND_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.gate.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_probe_post_send_gate_for_test() -> (
+    Arc<ProbePostSendGate>,
+    ProbePostSendGateGuard,
+) {
+    let gate = Arc::new(ProbePostSendGate {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    *PROBE_POST_SEND_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
+    (
+        gate.clone(),
+        ProbePostSendGateGuard { gate },
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn wait_for_probe_post_send_gate_for_test() {
+    let gate = PROBE_POST_SEND_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(gate) = gate {
+        gate.reached.notify_waiters();
+        gate.release.notified().await;
+    }
+}
+
 /// Deterministic one-shot seam after UDP lifecycle cleanup but before the
 /// remote-incarnation reset is published. The transaction still owns the
 /// peer adoption lock while parked here.
@@ -1562,6 +1622,116 @@ pub(crate) struct LiveBirthdayProgress {
     pub per_socket_sent: BTreeMap<usize, u32>,
     pub first_send_at_ms: Option<u64>,
     pub last_send_at_ms: Option<u64>,
+}
+
+/// Synchronous session-local telemetry for a bounded Birthday sweep.
+///
+/// Admission owns the physical `send_to` boundary, so this recorder is called
+/// immediately after each send future resolves and before diagnostics,
+/// pending-probe cleanup, or any other follow-up await.  It contains no
+/// connection-manager state and never awaits while holding its short-lived
+/// standard mutex.
+#[derive(Clone)]
+pub(crate) struct BirthdayLiveRecorder {
+    progress: Arc<StdMutex<LiveBirthdayProgress>>,
+}
+
+impl BirthdayLiveRecorder {
+    pub(crate) fn new(progress: Arc<StdMutex<LiveBirthdayProgress>>) -> Self {
+        Self { progress }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut LiveBirthdayProgress)) {
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut progress);
+    }
+
+    fn record_success_timestamp(progress: &mut LiveBirthdayProgress, sent_at_ms: u64) {
+        progress.first_send_at_ms = Some(
+            progress
+                .first_send_at_ms
+                .map_or(sent_at_ms, |first| first.min(sent_at_ms)),
+        );
+        progress.last_send_at_ms = Some(
+            progress
+                .last_send_at_ms
+                .map_or(sent_at_ms, |last| last.max(sent_at_ms)),
+        );
+    }
+
+    /// Commit the authenticated/main datagram. This is the one logical Probe
+    /// contribution and the first physical datagram contribution.
+    pub(crate) fn record_primary_success(
+        &self,
+        socket_index: usize,
+        target: SocketAddr,
+        sent_at_ms: u64,
+    ) {
+        self.update(|progress| {
+            progress.counters.logical_probes_sent = progress
+                .counters
+                .logical_probes_sent
+                .saturating_add(1);
+            progress.counters.physical_datagrams_sent = progress
+                .counters
+                .physical_datagrams_sent
+                .saturating_add(1);
+            progress.sent_target_endpoints.insert(target);
+            let sent = progress.per_socket_sent.entry(socket_index).or_default();
+            *sent = sent.saturating_add(1);
+            Self::record_success_timestamp(progress, sent_at_ms);
+        });
+    }
+
+    /// Commit a compatibility datagram. It is physical-only: the logical
+    /// Probe and unique target were already committed with the main packet.
+    pub(crate) fn record_compatibility_success(
+        &self,
+        socket_index: usize,
+        sent_at_ms: u64,
+    ) {
+        self.update(|progress| {
+            progress.counters.physical_datagrams_sent = progress
+                .counters
+                .physical_datagrams_sent
+                .saturating_add(1);
+            let sent = progress.per_socket_sent.entry(socket_index).or_default();
+            *sent = sent.saturating_add(1);
+            Self::record_success_timestamp(progress, sent_at_ms);
+        });
+    }
+
+    /// Commit a failed main physical send before pending-probe cleanup.
+    pub(crate) fn record_primary_error(&self) {
+        self.update(|progress| {
+            progress.counters.logical_probe_send_failures = progress
+                .counters
+                .logical_probe_send_failures
+                .saturating_add(1);
+            progress.counters.physical_send_errors = progress
+                .counters
+                .physical_send_errors
+                .saturating_add(1);
+        });
+    }
+
+    /// Commit a failed compatibility copy as a partial physical error. The
+    /// logical Probe remains successful because its main datagram succeeded.
+    pub(crate) fn record_compatibility_error(&self) {
+        self.update(|progress| {
+            progress.counters.physical_send_errors = progress
+                .counters
+                .physical_send_errors
+                .saturating_add(1);
+            progress.counters.partial_physical_send_errors = progress
+                .counters
+                .partial_physical_send_errors
+                .saturating_add(1);
+        });
+    }
 }
 
 #[derive(Debug, Clone)]

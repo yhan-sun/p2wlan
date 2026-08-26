@@ -3900,6 +3900,25 @@ mod hard_hard_tests {
         }
     }
 
+    async fn wait_for_birthday_post_send_gate(
+        gate: &Arc<crate::udp::ProbePostSendGate>,
+    ) {
+        // Register the waiter before starting the production task: the hook
+        // uses notify_waiters, so an already-reached gate must not be lost.
+        let reached = gate.reached.notified();
+        let mut watchdog = tokio::spawn(async {
+            for _ in 0..128 {
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::select! {
+            _ = reached => {
+                watchdog.abort();
+            }
+            _ = &mut watchdog => panic!("production Birthday send did not reach the post-send gate"),
+        }
+    }
+
     fn assert_live_birthday_terminal_summary(
         events: &[crate::peer::DirectTraversalEventDiagnostics],
         stop_reason: &str,
@@ -3924,6 +3943,42 @@ mod hard_hard_tests {
         }
         assert!(
             summary.detail.contains(&format!("stop_reason={stop_reason}")),
+            "terminal summary has an unexpected stop reason: {}",
+            summary.detail
+        );
+    }
+
+    fn assert_post_send_race_summary(
+        events: &[crate::peer::DirectTraversalEventDiagnostics],
+        stop_reason: &str,
+        require_physical_error: bool,
+    ) {
+        let summary = events
+            .iter()
+            .find(|event| event.stage == "hard_hard_birthday_sweep_summary")
+            .expect("post-send race must emit a durable Birthday summary");
+        let count = |key: &str| {
+            summary
+                .detail
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix(key)?.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("summary is missing {key}: {}", summary.detail))
+        };
+        if require_physical_error {
+            assert!(count("physical_send_errors=") >= 1);
+        } else {
+            assert!(count("physical_datagrams_sent=") >= 1);
+            assert!(count("logical_probes_sent=") >= 1);
+            assert!(count("unique_target_endpoints=") >= 1);
+            assert!(summary.detail.contains("per_socket_sent=") && !summary.detail.contains("per_socket_sent= "));
+            assert!(summary.detail.contains("first_send_at_ms=Some("));
+            assert!(summary.detail.contains("last_send_at_ms=Some("));
+        }
+        assert!(summary.detail.contains("waves_fully_completed=0"));
+        assert!(
+            summary
+                .detail
+                .contains(&format!("stop_reason={stop_reason}")),
             "terminal summary has an unexpected stop reason: {}",
             summary.detail
         );
@@ -4037,6 +4092,164 @@ mod hard_hard_tests {
             .any(|event| event.stage == "hard_hard_failed"));
         gate.release.notify_waiters();
         udp.detach_all_dynamic_punch_sockets("test_cancel_live_progress")
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_post_send_deadline_preserves_live_progress() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-post-send-deadline",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_post_send_gate(&gate).await;
+        tokio::time::advance(HARD_HARD_SWEEP_DEADLINE).await;
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_post_send_race_summary(&events, "deadline", false);
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_post_send_deadline").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_post_send_cancellation_preserves_live_progress() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let cancellation = session.cancellation_handle();
+        let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-post-send-cancel",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_post_send_gate(&gate).await;
+        cancellation.cancel_for_hard_hard_cleanup();
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_post_send_race_summary(&events, "session_cancelled", false);
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_post_send_cancellation")
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_primary_send_error_is_recorded_before_cleanup_cancel() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41004".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let cancellation = session.cancellation_handle();
+        let _send_failures = udp.set_probe_send_failures_for_test([1]);
+        let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-primary-error-cancel",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_post_send_gate(&gate).await;
+        cancellation.cancel_for_hard_hard_cleanup();
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_post_send_race_summary(&events, "session_cancelled", true);
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_primary_error_cancel")
             .await;
     }
 

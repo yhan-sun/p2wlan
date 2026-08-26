@@ -2868,11 +2868,13 @@ impl UdpTransport {
         let mut first_send_at_ms = None;
         let mut last_send_at_ms: Option<u64> = None;
         let mut per_socket_sent = 0u32;
+        let mut per_socket_sent_index = index;
         let targets_assigned = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
         let mut targets_examined = 0u32;
         let mut targets_attempted = 0u32;
         let mut target_processing_completed = true;
         let mut failure_kind = None;
+        let live_recorder = live.clone().map(BirthdayLiveRecorder::new);
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         let network_generation_at_start = self.peers.current_network_generation_sync();
         let remote_candidate_epoch_at_start = self
@@ -3066,6 +3068,7 @@ impl UdpTransport {
                         PendingProbePurpose::ConnectivityCheck,
                         hard_hard_session_token,
                         true,
+                        live_recorder.clone(),
                     )
                     .await
                 {
@@ -3074,8 +3077,7 @@ impl UdpTransport {
                         logical_probes_sent = logical_probes_sent.saturating_add(1);
                         let successful_datagrams = u32::from(sent.datagrams_sent);
                         let failed_datagrams = u32::from(sent.physical_send_errors);
-                        let actual_socket_index = sent.socket_index;
-                        let successful_send_at_ms = sent.first_send_at_ms;
+                        per_socket_sent_index = sent.socket_index;
                         physical_datagrams_sent =
                             physical_datagrams_sent.saturating_add(successful_datagrams);
                         physical_send_errors =
@@ -3084,40 +3086,6 @@ impl UdpTransport {
                             partial_physical_send_errors =
                                 partial_physical_send_errors.saturating_add(failed_datagrams);
                         }
-                        update_live_birthday_progress(&live, |progress| {
-                            let counters = &mut progress.counters;
-                            counters.logical_probes_sent =
-                                counters.logical_probes_sent.saturating_add(1);
-                            counters.physical_datagrams_sent = counters
-                                .physical_datagrams_sent
-                                .saturating_add(successful_datagrams);
-                            counters.physical_send_errors = counters
-                                .physical_send_errors
-                                .saturating_add(failed_datagrams);
-                            counters.partial_physical_send_errors = counters
-                                .partial_physical_send_errors
-                                .saturating_add(failed_datagrams);
-                            if successful_datagrams > 0 {
-                                progress.sent_target_endpoints.insert(candidate);
-                                let sent = progress
-                                    .per_socket_sent
-                                    .entry(actual_socket_index)
-                                    .or_default();
-                                *sent = sent.saturating_add(successful_datagrams);
-                                if let Some(sent_at_ms) = successful_send_at_ms {
-                                    progress.first_send_at_ms = Some(
-                                        progress
-                                            .first_send_at_ms
-                                            .map_or(sent_at_ms, |first| first.min(sent_at_ms)),
-                                    );
-                                    progress.last_send_at_ms = Some(
-                                        progress
-                                            .last_send_at_ms
-                                            .map_or(sent_at_ms, |last| last.max(sent_at_ms)),
-                                    );
-                                }
-                            }
-                        });
                         if let Some(sent_at_ms) = sent.first_send_at_ms {
                             first_send_at_ms.get_or_insert(sent_at_ms);
                             last_send_at_ms = Some(
@@ -3149,13 +3117,6 @@ impl UdpTransport {
                                 physical_send_errors.saturating_add(failed_datagrams);
                             logical_probe_send_failures =
                                 logical_probe_send_failures.saturating_add(1);
-                            update_live_birthday_counters(&live, |counters| {
-                                counters.logical_probe_send_failures =
-                                    counters.logical_probe_send_failures.saturating_add(1);
-                                counters.physical_send_errors = counters
-                                    .physical_send_errors
-                                    .saturating_add(failed_datagrams);
-                            });
                         } else {
                             probe_path_errors = probe_path_errors.saturating_add(1);
                             update_live_birthday_counters(&live, |counters| {
@@ -3208,7 +3169,7 @@ impl UdpTransport {
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
             first_send_at_ms,
             per_socket_sent: (per_socket_sent > 0)
-                .then_some(vec![(index, per_socket_sent)])
+                .then_some(vec![(per_socket_sent_index, per_socket_sent)])
                 .unwrap_or_default(),
             budget_skipped,
             epoch_budget_exhausted: false,

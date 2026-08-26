@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::peer::NetworkPath;
 use p2pnet_nat::{
@@ -904,6 +904,85 @@ async fn exact_dynamic_socket_partial_physical_failure_keeps_success_and_error_c
     assert_eq!(report.partial_physical_send_errors, 1);
     assert_eq!(report.per_socket_sent, vec![(socket_index, 1)]);
     assert_eq!(report.failure_kind, None);
+}
+
+#[tokio::test]
+async fn exact_dynamic_socket_live_recorder_counts_compatibility_success_once() {
+    let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
+    let live = Arc::new(StdMutex::new(crate::udp::LiveBirthdayProgress::default()));
+
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
+            "peer-b",
+            socket_index,
+            vec![nat.peer_public],
+            Duration::ZERO,
+            1,
+            None,
+            None,
+            Some(live.clone()),
+        )
+        .await
+        .unwrap();
+
+    let live = live.lock().unwrap();
+    assert_eq!(live.counters.logical_probes_sent, 1);
+    assert_eq!(live.counters.physical_datagrams_sent, 2);
+    assert_eq!(live.counters.physical_send_errors, 0);
+    assert_eq!(live.counters.partial_physical_send_errors, 0);
+    assert_eq!(live.sent_target_endpoints.len(), 1);
+    assert_eq!(live.per_socket_sent.get(&socket_index), Some(&2));
+    assert!(live.first_send_at_ms.is_some());
+    assert!(live.last_send_at_ms.is_some());
+    assert_eq!(
+        live.counters.physical_datagrams_sent,
+        live.per_socket_sent.values().sum::<u32>()
+    );
+    assert_eq!(report.logical_probes_sent, 1);
+    assert_eq!(report.physical_datagrams_sent, 2);
+    assert_eq!(report.per_socket_sent, vec![(socket_index, 2)]);
+}
+
+#[tokio::test]
+async fn exact_dynamic_socket_live_recorder_counts_compatibility_failure_as_partial() {
+    let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
+    // The authenticated primary is physical attempt 1; fail only the
+    // compatibility copy at attempt 2.
+    let _send_failures = transport.set_probe_send_failures_for_test([2]);
+    let live = Arc::new(StdMutex::new(crate::udp::LiveBirthdayProgress::default()));
+
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
+            "peer-b",
+            socket_index,
+            vec![nat.peer_public],
+            Duration::ZERO,
+            1,
+            None,
+            None,
+            Some(live.clone()),
+        )
+        .await
+        .unwrap();
+
+    let live = live.lock().unwrap();
+    assert_eq!(live.counters.logical_probes_sent, 1);
+    assert_eq!(live.counters.physical_datagrams_sent, 1);
+    assert_eq!(live.counters.physical_send_errors, 1);
+    assert_eq!(live.counters.partial_physical_send_errors, 1);
+    assert_eq!(live.sent_target_endpoints.len(), 1);
+    assert_eq!(live.per_socket_sent.get(&socket_index), Some(&1));
+    assert!(live.first_send_at_ms.is_some());
+    assert!(live.last_send_at_ms.is_some());
+    assert_eq!(
+        live.counters.physical_datagrams_sent,
+        live.per_socket_sent.values().sum::<u32>()
+    );
+    assert_eq!(report.logical_probes_sent, 1);
+    assert_eq!(report.physical_datagrams_sent, 1);
+    assert_eq!(report.physical_send_errors, 1);
+    assert_eq!(report.partial_physical_send_errors, 1);
+    assert_eq!(report.per_socket_sent, vec![(socket_index, 1)]);
 }
 
 #[tokio::test]
