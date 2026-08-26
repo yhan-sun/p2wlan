@@ -1,6 +1,8 @@
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.util.Properties
+import java.util.UUID
 
 plugins {
     id("com.android.application")
@@ -105,17 +107,21 @@ if (hasSourceIdentityFile != hasSourceIdentityNonce) {
 }
 
 val sourceIdentityFile = if (hasSourceIdentityFile) {
-    val path = sourceIdentityFileProperty.get()
-    if (path.isBlank()) {
+    val rawPath = sourceIdentityFileProperty.get()
+    if (rawPath.isBlank()) {
         throw GradleException("p2wlanSourceIdentityFile must not be blank")
     }
-    val candidate = rootProject.file(path)
-    if (!candidate.isAbsolute) {
+    // Check the caller's raw string before any Gradle path resolution.  Calling
+    // rootProject.file() first would turn a relative path into an absolute one
+    // and make this validation meaningless.
+    val rawFile = File(rawPath)
+    if (!rawFile.isAbsolute) {
         throw GradleException("p2wlanSourceIdentityFile must be an absolute path")
     }
+    val candidate = rawFile
     if (!Files.isRegularFile(candidate.toPath(), LinkOption.NOFOLLOW_LINKS)) {
         throw GradleException(
-            "p2wlanSourceIdentityFile must name a regular, non-symlink file: $path",
+            "p2wlanSourceIdentityFile must name a regular, non-symlink file: $rawPath",
         )
     }
     candidate
@@ -207,6 +213,8 @@ if (sourceIdentityFile != null) {
 }
 
 val buildP2wlanNative by tasks.registering(Exec::class) {
+    val directBuild = sourceIdentityFile == null
+
     inputs.property("P2WLAN_ANDROID_ABIS", System.getenv("P2WLAN_ANDROID_ABIS") ?: "all")
     inputs.property("p2wlanSourceIdentityFile", sourceIdentityFile?.absolutePath ?: "")
     inputs.property("p2wlanSourceIdentityNonce", sourceIdentityNonce ?: "")
@@ -223,6 +231,12 @@ val buildP2wlanNative by tasks.registering(Exec::class) {
         rootProject.file("../../../scripts/build_android_native.sh"),
     )
     outputs.dir(project.file("src/main/jniLibs"))
+    if (directBuild) {
+        // A direct build has no frozen identity input that Gradle can compare.
+        // It must execute so Cargo can inspect the current checkout every time.
+        outputs.upToDateWhen { false }
+        outputs.doNotCacheIf("direct native builds use live Git identity") { true }
+    }
     commandLine(
         "bash",
         rootProject.file("../../../scripts/build_android_native.sh").absolutePath,
@@ -235,6 +249,16 @@ val buildP2wlanNative by tasks.registering(Exec::class) {
             // build.  With no explicit snapshot, build.rs must inspect Git.
             environment.remove(key)
         }
+    }
+    if (directBuild) {
+        // Generate this at task execution time, not during configuration, so
+        // an existing daemon/configuration cache cannot freeze one refresh.
+        doFirst {
+            environment("P2WLAN_SOURCE_IDENTITY_REFRESH", UUID.randomUUID().toString())
+        }
+    } else {
+        // A shell-level refresh must never alter an explicitly frozen build.
+        environment.remove("P2WLAN_SOURCE_IDENTITY_REFRESH")
     }
 }
 

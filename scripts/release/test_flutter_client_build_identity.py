@@ -58,6 +58,47 @@ def init_git_repo(repo: Path) -> None:
     )
 
 
+def commit_git_changes(repo: Path, message: str) -> None:
+    subprocess.run(["git", "add", "--all"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", message], cwd=repo, check=True
+    )
+
+
+def make_direct_identity_repo() -> tuple[tempfile.TemporaryDirectory, Path]:
+    temp_dir = tempfile.TemporaryDirectory(prefix="p2wlan-direct-identity-")
+    repo = Path(temp_dir.name)
+    (repo / "client/daemon").mkdir(parents=True)
+    (repo / ".gitignore").write_text(
+        "target/\n.test-artifacts/\nfake-bin/\nndk/\n", encoding="utf-8"
+    )
+    (repo / "README.md").write_text("identity A\n", encoding="utf-8")
+    init_git_repo(repo)
+    return temp_dir, repo
+
+
+def make_cargo_refresh_repo() -> tuple[tempfile.TemporaryDirectory, Path]:
+    temp_dir = tempfile.TemporaryDirectory(prefix="p2wlan-cargo-refresh-")
+    repo = Path(temp_dir.name)
+    (repo / "client/daemon").mkdir(parents=True)
+    shutil.copy2(DAEMON_BUILD, repo / "client/daemon/build.rs")
+    (repo / "Cargo.toml").write_text(
+        "[package]\n"
+        "name = \"identity-refresh-fixture\"\n"
+        "version = \"0.1.0\"\n"
+        "edition = \"2021\"\n"
+        "build = \"client/daemon/build.rs\"\n"
+        "\n"
+        "[lib]\n"
+        "path = \"lib.rs\"\n",
+        encoding="utf-8",
+    )
+    (repo / "lib.rs").write_text("pub fn identity_fixture() {}\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("target/\n", encoding="utf-8")
+    init_git_repo(repo)
+    return temp_dir, repo
+
+
 def parse_defines(output: str) -> dict[str, str]:
     prefix = "--dart-define="
     values = {}
@@ -197,14 +238,22 @@ if [ -z "$source_build_id" ]; then source_build_id=UNSET; fi
 if [ -z "$source_dirty" ]; then source_dirty=UNSET; fi
 if [ -z "$source_diff_hash" ]; then source_diff_hash=UNSET; fi
 printf '%s\t%s\t%s\t%s\n' "$source_commit" "$source_build_id" "$source_dirty" "$source_diff_hash" >> "$FAKE_CARGO_LOG"
+refresh="$(printenv P2WLAN_SOURCE_IDENTITY_REFRESH 2>/dev/null || true)"
+if [ -z "$refresh" ]; then refresh=UNSET; fi
+refresh_log="$(printenv FAKE_REFRESH_LOG 2>/dev/null || true)"
+if [ -n "$refresh_log" ]; then printf '%s\n' "$refresh" >> "$refresh_log"; fi
 build_script="$(printenv FAKE_BUILD_SCRIPT 2>/dev/null || true)"
+native_identity="$source_commit"
 if [ -n "$build_script" ]; then
   mkdir -p "$FAKE_BUILD_OUT"
-  CARGO_MANIFEST_DIR="$FAKE_REPO/client/daemon" OUT_DIR="$FAKE_BUILD_OUT" \
+  build_manifest_repo="$(printenv FAKE_BUILD_MANIFEST_REPO 2>/dev/null || true)"
+  if [ -z "$build_manifest_repo" ]; then build_manifest_repo="$FAKE_REPO"; fi
+  CARGO_MANIFEST_DIR="$build_manifest_repo/client/daemon" OUT_DIR="$FAKE_BUILD_OUT" \
     "$build_script" > "$FAKE_BUILD_SCRIPT_OUTPUT"
+  native_identity="$(sed -n 's/^cargo:rustc-env=P2WLAN_GIT_COMMIT=//p' "$FAKE_BUILD_SCRIPT_OUTPUT" | tail -n 1)"
 fi
 mkdir -p "$FAKE_REPO/target/$target/release"
-printf '%s\n' fake-native > "$FAKE_REPO/target/$target/release/libp2wlan_android.so"
+printf 'fake-native identity=%s\n' "$native_identity" > "$FAKE_REPO/target/$target/release/libp2wlan_android.so"
 """,
     )
     write_executable(ndk_bin / "llvm-ar", "#!/bin/sh\nexit 0\n")
@@ -225,6 +274,7 @@ def make_fake_android_env(
     env["FAKE_REPO"] = str(repo)
     env["FAKE_CARGO_LOG"] = str(cargo_log)
     for name in SOURCE_ENV_KEYS + (
+        "P2WLAN_SOURCE_IDENTITY_REFRESH",
         "ORG_GRADLE_PROJECT_p2wlanSourceIdentityFile",
         "ORG_GRADLE_PROJECT_p2wlanSourceIdentityNonce",
     ):
@@ -233,9 +283,21 @@ def make_fake_android_env(
 
 
 def run_gradle_native(
-    env: dict[str, str], *, no_daemon: bool, task: str = ":app:buildP2wlanNative"
+    env: dict[str, str],
+    *,
+    no_daemon: bool,
+    task: str = ":app:buildP2wlanNative",
+    project_cache_dir: Path | None = None,
+    build_cache: bool = False,
+    configuration_cache: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     command = ["bash", "gradlew", task, "--console=plain"]
+    if project_cache_dir is not None:
+        command.extend(["--project-cache-dir", str(project_cache_dir)])
+    if build_cache:
+        command.append("--build-cache")
+    if configuration_cache:
+        command.append("--configuration-cache")
     command.append("--no-daemon" if no_daemon else "--daemon")
     return subprocess.run(
         command,
@@ -256,6 +318,45 @@ def read_fake_cargo_records(path: Path) -> list[tuple[str, str, str, str]]:
             raise AssertionError(f"malformed fake Cargo record: {line!r}")
         records.append(tuple(values))
     return records
+
+
+def parse_build_script_identity(output: str) -> dict[str, str]:
+    values = {}
+    for line in output.splitlines():
+        if line.startswith("cargo:rustc-env="):
+            key, value = line[len("cargo:rustc-env=") :].split("=", 1)
+            values[key] = value
+    return values
+
+
+def read_build_script_identity(path: Path) -> dict[str, str]:
+    return parse_build_script_identity(path.read_text(encoding="utf-8"))
+
+
+def gradle_task_line(output: str, task: str = ":app:buildP2wlanNative") -> str:
+    lines = [line for line in output.splitlines() if line.startswith(f"> Task {task}")]
+    if not lines:
+        raise AssertionError(f"Gradle did not report {task}:\n{output}")
+    return lines[-1]
+
+
+def make_direct_gradle_context(
+    temp_dir: tempfile.TemporaryDirectory, repo: Path, build_script_binary: Path
+) -> tuple[dict[str, str], Path, Path, Path, Path]:
+    artifact_dir = repo / ".test-artifacts"
+    artifact_dir.mkdir()
+    cargo_log = artifact_dir / "cargo.log"
+    refresh_log = artifact_dir / "refresh.log"
+    build_script_output = artifact_dir / "build-script-output.log"
+    build_out = artifact_dir / "build-out"
+    project_cache_dir = artifact_dir / "gradle-project-cache"
+    env = make_fake_android_env(temp_dir.name, ROOT, cargo_log)
+    env["FAKE_BUILD_MANIFEST_REPO"] = str(repo)
+    env["FAKE_BUILD_SCRIPT"] = str(build_script_binary)
+    env["FAKE_BUILD_OUT"] = str(build_out)
+    env["FAKE_BUILD_SCRIPT_OUTPUT"] = str(build_script_output)
+    env["FAKE_REFRESH_LOG"] = str(refresh_log)
+    return env, cargo_log, refresh_log, build_script_output, project_cache_dir
 
 
 def remove_generated_native_library() -> None:
@@ -284,6 +385,32 @@ def wait_for_file(
 
 
 class FlutterClientBuildIdentityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.build_script_tempdir = tempfile.TemporaryDirectory(
+            prefix="p2wlan-build-script-test-"
+        )
+        cls.build_script_binary = (
+            Path(cls.build_script_tempdir.name) / "daemon-build-script"
+        )
+        result = subprocess.run(
+            ["rustc", str(DAEMON_BUILD), "-o", str(cls.build_script_binary)],
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            cls.build_script_tempdir.cleanup()
+            raise RuntimeError(
+                "failed to compile build.rs for behavior tests:\n"
+                f"stdout={result.stdout}\nstderr={result.stderr}"
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build_script_tempdir.cleanup()
+        super().tearDownClass()
+
     def test_clean_temporary_checkout_has_exact_commit_identity(self):
         temp_dir, repo, script = make_identity_repo()
         self.addCleanup(temp_dir.cleanup)
@@ -420,11 +547,7 @@ class FlutterClientBuildIdentityTest(unittest.TestCase):
     def test_direct_native_build_uses_current_dirty_git_not_historical_snapshot(self):
         temp_dir, repo, gradle, untracked = make_native_safety_repo()
         self.addCleanup(temp_dir.cleanup)
-        build_script_binary = Path(temp_dir.name) / "daemon-build-script"
-        subprocess.run(
-            ["rustc", str(repo / "client/daemon/build.rs"), "-o", str(build_script_binary)],
-            check=True,
-        )
+        build_script_binary = self.build_script_binary
         cargo_log = Path(temp_dir.name) / "cargo.log"
         build_script_output = Path(temp_dir.name) / "build-script-output.log"
         fake_env = make_fake_android_env(temp_dir.name, repo, cargo_log)
@@ -464,6 +587,245 @@ class FlutterClientBuildIdentityTest(unittest.TestCase):
             values["P2WLAN_BUILD_ID"],
             rf"^{expected_commit[:12]}-dirty-[0-9a-f]{{12}}$",
         )
+
+    def test_direct_build_rebuilds_for_clean_and_dirty_identity_changes(self):
+        temp_dir, repo = make_direct_identity_repo()
+        self.addCleanup(temp_dir.cleanup)
+        env, cargo_log, refresh_log, build_script_output, project_cache_dir = (
+            make_direct_gradle_context(temp_dir, repo, self.build_script_binary)
+        )
+        identities = []
+        refreshes = []
+
+        def run_direct_build() -> dict[str, str]:
+            if identities:
+                self.assertTrue(
+                    GENERATED_NATIVE_LIBRARY.exists(),
+                    "direct rebuild must not delete the previous native output",
+                )
+                self.assertTrue(project_cache_dir.exists())
+            result = run_gradle_native(
+                env,
+                no_daemon=False,
+                project_cache_dir=project_cache_dir,
+                build_cache=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            task_line = gradle_task_line(result.stdout)
+            self.assertNotIn("UP-TO-DATE", task_line)
+            self.assertNotIn("FROM-CACHE", task_line)
+            self.assertTrue(
+                GENERATED_NATIVE_LIBRARY.exists(),
+                "the next invocation must start with the previous native output",
+            )
+            identity = read_build_script_identity(build_script_output)
+            self.assertIn(
+                f"identity={identity['P2WLAN_GIT_COMMIT']}",
+                GENERATED_NATIVE_LIBRARY.read_text(encoding="utf-8"),
+            )
+            identities.append(identity)
+            refreshes.append(refresh_log.read_text(encoding="utf-8").splitlines()[-1])
+            return identity
+
+        with preserve_file(GENERATED_NATIVE_LIBRARY):
+            remove_generated_native_library()
+
+            identity_a = run_direct_build()
+            commit_a = run_git(repo, "rev-parse", "HEAD")
+            self.assertEqual(identity_a["P2WLAN_GIT_COMMIT"], commit_a)
+            self.assertEqual(
+                identity_a["P2WLAN_DIRTY"],
+                "false",
+                run_git(repo, "status", "--porcelain=v1", "--untracked-files=all"),
+            )
+            self.assertEqual(identity_a["P2WLAN_DIFF_HASH"], "")
+
+            (repo / "README.md").write_text("identity B\n", encoding="utf-8")
+            commit_git_changes(repo, "identity B")
+            identity_b = run_direct_build()
+            commit_b = run_git(repo, "rev-parse", "HEAD")
+            self.assertNotEqual(commit_a, commit_b)
+            self.assertEqual(identity_b["P2WLAN_GIT_COMMIT"], commit_b)
+            self.assertEqual(identity_b["P2WLAN_DIRTY"], "false")
+            self.assertEqual(identity_b["P2WLAN_BUILD_ID"], commit_b[:12])
+
+            (repo / "README.md").write_text("tracked dirty\n", encoding="utf-8")
+            identity_tracked_dirty = run_direct_build()
+            self.assertEqual(identity_tracked_dirty["P2WLAN_GIT_COMMIT"], commit_b)
+            self.assertEqual(identity_tracked_dirty["P2WLAN_DIRTY"], "true")
+            tracked_diff_hash = identity_tracked_dirty["P2WLAN_DIFF_HASH"]
+            self.assertRegex(tracked_diff_hash, r"^[0-9a-f]{40}$")
+            self.assertEqual(
+                identity_tracked_dirty["P2WLAN_BUILD_ID"],
+                f"{commit_b[:12]}-dirty-{tracked_diff_hash[:12]}",
+            )
+
+            untracked = repo / "staging-input.txt"
+            untracked.write_text("untracked A\n", encoding="utf-8")
+            identity_untracked = run_direct_build()
+            self.assertEqual(identity_untracked["P2WLAN_DIRTY"], "true")
+            untracked_diff_hash = identity_untracked["P2WLAN_DIFF_HASH"]
+            self.assertRegex(untracked_diff_hash, r"^[0-9a-f]{40}$")
+            self.assertNotEqual(tracked_diff_hash, untracked_diff_hash)
+
+            untracked.write_text("untracked B\n", encoding="utf-8")
+            identity_untracked_changed = run_direct_build()
+            changed_diff_hash = identity_untracked_changed["P2WLAN_DIFF_HASH"]
+            self.assertRegex(changed_diff_hash, r"^[0-9a-f]{40}$")
+            self.assertNotEqual(untracked_diff_hash, changed_diff_hash)
+
+            commit_git_changes(repo, "identity clean again")
+            identity_clean_again = run_direct_build()
+            commit_c = run_git(repo, "rev-parse", "HEAD")
+            self.assertEqual(identity_clean_again["P2WLAN_GIT_COMMIT"], commit_c)
+            self.assertEqual(identity_clean_again["P2WLAN_DIRTY"], "false")
+            self.assertEqual(identity_clean_again["P2WLAN_DIFF_HASH"], "")
+            self.assertEqual(identity_clean_again["P2WLAN_BUILD_ID"], commit_c[:12])
+
+        self.assertEqual(len(read_fake_cargo_records(cargo_log)), 6)
+        self.assertEqual(len(identities), 6)
+        self.assertEqual(len(refreshes), 6)
+        self.assertTrue(all(value != "UNSET" for value in refreshes))
+        self.assertEqual(len(set(refreshes)), len(refreshes))
+
+    def test_same_direct_identity_still_refreshes_without_cache_reuse(self):
+        temp_dir, repo = make_direct_identity_repo()
+        self.addCleanup(temp_dir.cleanup)
+        env, cargo_log, refresh_log, build_script_output, project_cache_dir = (
+            make_direct_gradle_context(temp_dir, repo, self.build_script_binary)
+        )
+        with preserve_file(GENERATED_NATIVE_LIBRARY):
+            remove_generated_native_library()
+            first = run_gradle_native(
+                env,
+                no_daemon=False,
+                project_cache_dir=project_cache_dir,
+                build_cache=True,
+                configuration_cache=True,
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("UP-TO-DATE", gradle_task_line(first.stdout))
+            self.assertNotIn("FROM-CACHE", gradle_task_line(first.stdout))
+            self.assertTrue(GENERATED_NATIVE_LIBRARY.exists())
+            first_identity = read_build_script_identity(build_script_output)
+            self.assertIn(
+                f"identity={first_identity['P2WLAN_GIT_COMMIT']}",
+                GENERATED_NATIVE_LIBRARY.read_text(encoding="utf-8"),
+            )
+
+            self.assertTrue(
+                GENERATED_NATIVE_LIBRARY.exists(),
+                "the second direct invocation must retain the first native output",
+            )
+            second = run_gradle_native(
+                env,
+                no_daemon=False,
+                project_cache_dir=project_cache_dir,
+                build_cache=True,
+                configuration_cache=True,
+            )
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            task_line = gradle_task_line(second.stdout)
+            self.assertNotIn("UP-TO-DATE", task_line)
+            self.assertNotIn("FROM-CACHE", task_line)
+            second_identity = read_build_script_identity(build_script_output)
+            self.assertIn(
+                f"identity={second_identity['P2WLAN_GIT_COMMIT']}",
+                GENERATED_NATIVE_LIBRARY.read_text(encoding="utf-8"),
+            )
+
+        self.assertEqual(first_identity, second_identity)
+        self.assertEqual(len(read_fake_cargo_records(cargo_log)), 2)
+        refreshes = refresh_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(refreshes), 2)
+        self.assertNotEqual(refreshes[0], refreshes[1])
+        self.assertNotIn("UNSET", refreshes)
+
+    def test_cargo_refresh_env_forces_build_script_rerun(self):
+        temp_dir, repo = make_cargo_refresh_repo()
+        self.addCleanup(temp_dir.cleanup)
+        target_dir = repo / "target"
+        env = os.environ.copy()
+        env["CARGO_TERM_COLOR"] = "never"
+        env["P2WLAN_BUILD_EPOCH_MS"] = "0"
+        for name in SOURCE_ENV_KEYS:
+            env.pop(name, None)
+
+        def run_build_script(refresh: str | None) -> tuple[dict[str, str], str]:
+            invocation_env = env.copy()
+            invocation_env["CARGO_MANIFEST_DIR"] = str(repo / "client/daemon")
+            if refresh is None:
+                invocation_env.pop("P2WLAN_SOURCE_IDENTITY_REFRESH", None)
+            else:
+                invocation_env["P2WLAN_SOURCE_IDENTITY_REFRESH"] = refresh
+            result = subprocess.run(
+                [str(self.build_script_binary)],
+                cwd=repo,
+                env=invocation_env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return parse_build_script_identity(result.stdout), result.stdout
+
+        identity_without_refresh, output_without_refresh = run_build_script(None)
+        identity_with_empty_refresh, output_with_empty_refresh = run_build_script("")
+        identity_with_refresh_a, output_with_refresh_a = run_build_script("refresh-A")
+        identity_with_refresh_b, output_with_refresh_b = run_build_script("refresh-B")
+        for identity in (
+            identity_with_empty_refresh,
+            identity_with_refresh_a,
+            identity_with_refresh_b,
+        ):
+            self.assertEqual(identity, identity_without_refresh)
+        for output in (
+            output_without_refresh,
+            output_with_empty_refresh,
+            output_with_refresh_a,
+            output_with_refresh_b,
+        ):
+            self.assertNotIn("refresh-A", output)
+            self.assertNotIn("refresh-B", output)
+
+        def cargo_build(refresh: str) -> subprocess.CompletedProcess[str]:
+            invocation_env = env.copy()
+            invocation_env["P2WLAN_SOURCE_IDENTITY_REFRESH"] = refresh
+            return subprocess.run(
+                [
+                    "cargo",
+                    "build",
+                    "-vv",
+                    "--target-dir",
+                    str(target_dir),
+                ],
+                cwd=repo,
+                env=invocation_env,
+                text=True,
+                capture_output=True,
+            )
+
+        first = cargo_build("refresh-A")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        output_files = list((target_dir / "debug/build").glob("*/output"))
+        self.assertEqual(len(output_files), 1)
+        output_file = output_files[0]
+        first_output = output_file.read_text(encoding="utf-8")
+        first_mtime = output_file.stat().st_mtime_ns
+        time.sleep(0.05)
+
+        second = cargo_build("refresh-B")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        second_log = second.stdout + second.stderr
+        second_output = output_file.read_text(encoding="utf-8")
+        self.assertIn("P2WLAN_SOURCE_IDENTITY_REFRESH", second_log)
+        self.assertIn("build-script-build", second_log)
+        self.assertGreater(output_file.stat().st_mtime_ns, first_mtime)
+        self.assertEqual(
+            [line for line in first_output.splitlines() if "P2WLAN_BUILD_ID" in line],
+            [line for line in second_output.splitlines() if "P2WLAN_BUILD_ID" in line],
+        )
+        self.assertNotIn("refresh-A", second_output)
+        self.assertNotIn("refresh-B", second_output)
 
     def test_build_wrapper_freezes_unique_snapshot_for_flutter_and_cleans_it(self):
         expected = parse_defines(
@@ -788,11 +1150,24 @@ test "$(sed -n 's/^P2WLAN_SOURCE_GIT_COMMIT=//p' "$snapshot")" = "$P2WLAN_TEST_C
                 Path(temp_dir.name) / "does-not-exist.env"
             )
             nonexistent["ORG_GRADLE_PROJECT_p2wlanSourceIdentityNonce"] = nonce
+            relative_cases = []
+            for relative_path in (
+                "relative/source.env",
+                "./relative/source.env",
+                "target/source.env",
+            ):
+                relative_env = env.copy()
+                relative_env["ORG_GRADLE_PROJECT_p2wlanSourceIdentityFile"] = (
+                    relative_path
+                )
+                relative_env["ORG_GRADLE_PROJECT_p2wlanSourceIdentityNonce"] = nonce
+                relative_cases.append((f"relative path {relative_path}", relative_env))
             for case_name, case_env in (
                 ("missing nonce", missing_nonce),
                 ("missing path", missing_path),
                 ("nonce mismatch", mismatch),
                 ("missing file", nonexistent),
+                *relative_cases,
             ):
                 invalid = run_gradle_native(
                     case_env, no_daemon=True, task=":app:tasks"
@@ -803,50 +1178,84 @@ test "$(sed -n 's/^P2WLAN_SOURCE_GIT_COMMIT=//p' "$snapshot")" = "$P2WLAN_TEST_C
                     f"{case_name} unexpectedly succeeded:\n"
                     f"{invalid.stdout}\n{invalid.stderr}",
                 )
+                if case_name.startswith("relative path"):
+                    self.assertIn("must be an absolute path", invalid.stderr)
 
     def test_gradle_daemon_refreshes_identity_and_native_task_inputs(self):
         temp_dir = tempfile.TemporaryDirectory(prefix="p2wlan-gradle-daemon-")
         self.addCleanup(temp_dir.cleanup)
         cargo_log = Path(temp_dir.name) / "cargo.log"
+        refresh_log = Path(temp_dir.name) / "refresh.log"
         env = make_fake_android_env(temp_dir.name, ROOT, cargo_log)
+        env["FAKE_REFRESH_LOG"] = str(refresh_log)
         snapshot_a = Path(temp_dir.name) / "identity-a.env"
         snapshot_b = Path(temp_dir.name) / "identity-b.env"
         write_source_snapshot(snapshot_a, commit="a" * 40, nonce="a" * 32)
         write_source_snapshot(snapshot_b, commit="b" * 40, nonce="b" * 32)
         stale = ROOT / "target/p2wlan-source-identity.env"
+        project_cache_dir = Path(temp_dir.name) / "gradle-project-cache"
         with preserve_file(stale), preserve_file(GENERATED_NATIVE_LIBRARY):
             remove_generated_native_library()
-            for snapshot, nonce in (
-                (snapshot_a, "a" * 32),
-                (snapshot_b, "b" * 32),
-            ):
-                invocation_env = env.copy()
-                invocation_env["ORG_GRADLE_PROJECT_p2wlanSourceIdentityFile"] = str(
-                    snapshot
-                )
-                invocation_env["ORG_GRADLE_PROJECT_p2wlanSourceIdentityNonce"] = nonce
-                result = run_gradle_native(invocation_env, no_daemon=False)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            invocation_a = env.copy()
+            invocation_a["ORG_GRADLE_PROJECT_p2wlanSourceIdentityFile"] = str(
+                snapshot_a
+            )
+            invocation_a["ORG_GRADLE_PROJECT_p2wlanSourceIdentityNonce"] = "a" * 32
+            result_a = run_gradle_native(
+                invocation_a, no_daemon=False, project_cache_dir=project_cache_dir
+            )
+            self.assertEqual(result_a.returncode, 0, result_a.stdout + result_a.stderr)
+            self.assertTrue(GENERATED_NATIVE_LIBRARY.exists())
+            result_a_again = run_gradle_native(
+                invocation_a, no_daemon=False, project_cache_dir=project_cache_dir
+            )
+            self.assertEqual(
+                result_a_again.returncode,
+                0,
+                result_a_again.stdout + result_a_again.stderr,
+            )
+            self.assertIn("UP-TO-DATE", result_a_again.stdout)
+
+            invocation_b = env.copy()
+            invocation_b["ORG_GRADLE_PROJECT_p2wlanSourceIdentityFile"] = str(
+                snapshot_b
+            )
+            invocation_b["ORG_GRADLE_PROJECT_p2wlanSourceIdentityNonce"] = "b" * 32
+            result_b = run_gradle_native(
+                invocation_b, no_daemon=False, project_cache_dir=project_cache_dir
+            )
+            self.assertEqual(result_b.returncode, 0, result_b.stdout + result_b.stderr)
             write_source_snapshot(
                 stale,
                 commit="1" * 40,
                 nonce="1" * 32,
                 dirty="false",
             )
-            direct_result = run_gradle_native(env, no_daemon=False)
-            self.assertEqual(
-                direct_result.returncode,
-                0,
-                direct_result.stdout + direct_result.stderr,
+            direct_result = run_gradle_native(
+                env, no_daemon=False, project_cache_dir=project_cache_dir
             )
+            self.assertEqual(direct_result.returncode, 0, direct_result.stdout + direct_result.stderr)
+            self.assertNotIn("UP-TO-DATE", gradle_task_line(direct_result.stdout))
+            direct_again = run_gradle_native(
+                env, no_daemon=False, project_cache_dir=project_cache_dir
+            )
+            self.assertEqual(direct_again.returncode, 0, direct_again.stdout + direct_again.stderr)
+            self.assertNotIn("UP-TO-DATE", gradle_task_line(direct_again.stdout))
         self.assertEqual(
             read_fake_cargo_records(cargo_log),
             [
                 ("a" * 40, "a" * 12, "false", "UNSET"),
                 ("b" * 40, "b" * 12, "false", "UNSET"),
                 ("UNSET", "UNSET", "UNSET", "UNSET"),
+                ("UNSET", "UNSET", "UNSET", "UNSET"),
             ],
         )
+        refreshes = refresh_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(refreshes), 4)
+        self.assertEqual(refreshes[:2], ["UNSET", "UNSET"])
+        self.assertNotEqual(refreshes[2], "UNSET")
+        self.assertNotEqual(refreshes[3], "UNSET")
+        self.assertNotEqual(refreshes[2], refreshes[3])
 
     def test_daemon_source_identity_override_is_complete_and_fail_closed(self):
         temp_dir = tempfile.TemporaryDirectory(prefix="p2wlan-build-script-")
@@ -970,14 +1379,24 @@ test "$(sed -n 's/^P2WLAN_SOURCE_GIT_COMMIT=//p' "$snapshot")" = "$P2WLAN_TEST_C
         gradle = (ROOT / "apps/flutter_client/android/app/build.gradle.kts").read_text(
             encoding="utf-8"
         )
+        self.assertIn("val rawFile = File(rawPath)", gradle)
+        self.assertIn("outputs.upToDateWhen { false }", gradle)
+        self.assertIn("outputs.doNotCacheIf", gradle)
+        self.assertIn("P2WLAN_SOURCE_IDENTITY_REFRESH", gradle)
+        self.assertIn("UUID.randomUUID()", gradle)
         self.assertIn('providers.gradleProperty("p2wlanSourceIdentityFile")', gradle)
         self.assertIn('providers.gradleProperty("p2wlanSourceIdentityNonce")', gradle)
         self.assertIn('inputs.property("p2wlanSourceIdentityNonce"', gradle)
         self.assertNotIn("target/p2wlan-source-identity.env", gradle)
+        self.assertNotIn("val candidate = rootProject.file(path)", gradle)
         self.assertIn("environment(key, sourceIdentityValues.getValue(key))", gradle)
         native = ANDROID_NATIVE_BUILD.read_text(encoding="utf-8")
         self.assertNotIn("hermetic_build.sh restore", native)
         self.assertNotRegex(native, r"git (checkout|restore|reset|clean)")
+        build_rs = DAEMON_BUILD.read_text(encoding="utf-8")
+        self.assertIn(
+            'cargo:rerun-if-env-changed=P2WLAN_SOURCE_IDENTITY_REFRESH', build_rs
+        )
 
     def test_android_workflows_use_wrapper_without_bare_flutter_apk_build(self):
         for workflow_path in ANDROID_WORKFLOWS:

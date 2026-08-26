@@ -401,6 +401,7 @@ mod tests {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=P2WLAN_BUILD_EPOCH_MS");
+    println!("cargo:rerun-if-env-changed=P2WLAN_SOURCE_IDENTITY_REFRESH");
     for name in SOURCE_IDENTITY_ENV {
         println!("cargo:rerun-if-env-changed={name}");
     }
