@@ -158,6 +158,47 @@ fn signal_candidate_contract_deduplicates_and_caps_all_birthday_levels() {
 }
 
 #[test]
+fn shared_signal_candidate_cap_fixture_matches_daemon_constant() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/fixtures/signal_candidate_cap.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read shared cap fixture {path:?}: {error}"));
+    let fixture: serde_json::Value =
+        serde_json::from_str(&raw).expect("signal_candidate_cap.json must be valid JSON");
+    assert_eq!(
+        fixture["max_signal_candidates"].as_u64(),
+        Some(crate::MAX_SIGNAL_CANDIDATES as u64),
+        "Rust candidate cap must match the shared contract fixture"
+    );
+}
+
+#[test]
+fn high_priority_observed_and_fresh_candidates_survive_tail_cap() {
+    let observed = "8.8.8.8:41000".to_string();
+    let fresh = "1.1.1.1:42000".to_string();
+    let fresh_source = crate::fresh_prediction_source_label(FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation: 7,
+    });
+    let mut candidates = vec![observed.clone(), fresh.clone()];
+    candidates.extend((0..128).map(|index| format!("198.51.100.10:{}", 43000 + index)));
+    let mut sources = HashMap::new();
+    sources.insert(observed.clone(), "stun_observed".to_string());
+    sources.insert(fresh.clone(), fresh_source);
+    for candidate in candidates.iter().skip(2) {
+        sources.insert(candidate.clone(), "signaled".to_string());
+    }
+
+    let (effective, effective_sources, contract) =
+        crate::candidate_refresh::normalize_signal_candidates(&candidates, &sources);
+    assert_eq!(effective.len(), crate::MAX_SIGNAL_CANDIDATES);
+    assert!(effective.contains(&observed));
+    assert!(effective.contains(&fresh));
+    assert_eq!(effective_sources.len(), effective.len());
+    assert!(contract.capped);
+}
+
+#[test]
 fn signal_payload_boundary_never_emits_more_than_server_cap() {
     let candidates = (0..256usize)
         .map(|offset| format!("8.8.8.8:{}", 42_000 + offset))

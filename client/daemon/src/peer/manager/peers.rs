@@ -819,17 +819,28 @@ impl PeerManager {
         sent_probes: Option<u32>,
         detail: impl Into<String>,
     ) {
-        // Diagnostics must never become a back-pressure point for the control
-        // event loop.  A direct probe, candidate handover or relay renewal may
-        // briefly own the connection map while it commits state; waiting here
-        // would stop the loop from consuming ControlHealthy and new signals.
-        // The typed timeline event below remains authoritative when the map is
-        // contended, and the per-peer ring is best-effort for this diagnostic
-        // path.
+        // Ordinary diagnostics must never become a back-pressure point for the
+        // control event loop. A direct probe, candidate handover or relay
+        // renewal may briefly own the connection map while it commits state;
+        // the typed timeline event below remains authoritative when that map
+        // is contended. Hard↔Hard lifecycle markers are the exception: they
+        // are bounded acceptance evidence and use the durable branch below.
         let generation = self.current_network_generation_sync();
         let stage = stage.into();
         let detail = detail.into();
-        if let Ok(mut connections) = self.connections.try_write() {
+        if Self::direct_event_requires_durable_ring(&stage) {
+            let mut connections = self.connections.write().await;
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_direct_event(
+                    generation,
+                    stage.clone(),
+                    endpoint,
+                    candidate_count,
+                    sent_probes,
+                    detail.clone(),
+                );
+            }
+        } else if let Ok(mut connections) = self.connections.try_write() {
             if let Some(conn) = connections.get_mut(node_id) {
                 conn.record_direct_event(
                     generation,
@@ -869,7 +880,20 @@ impl PeerManager {
     ) {
         let stage = stage.into();
         let detail = detail.into();
-        if let Ok(mut connections) = self.connections.try_write() {
+        if Self::direct_event_requires_durable_ring(&stage) {
+            let mut connections = self.connections.write().await;
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_direct_event_with_socket(
+                    generation,
+                    stage.clone(),
+                    endpoint,
+                    socket_index,
+                    candidate_count,
+                    sent_probes,
+                    detail.clone(),
+                );
+            }
+        } else if let Ok(mut connections) = self.connections.try_write() {
             if let Some(conn) = connections.get_mut(node_id) {
                 conn.record_direct_event_with_socket(
                     generation,
@@ -892,6 +916,24 @@ impl PeerManager {
             sent_probes,
             &detail,
         );
+    }
+
+    /// Hard↔Hard terminal and lifecycle markers are acceptance evidence, not
+    /// best-effort trace noise.  Wait for the connection writer for these
+    /// bounded events so reciprocal validation cannot silently drop the final
+    /// summary/failure while high-volume ordinary diagnostics remain
+    /// non-blocking.
+    fn direct_event_requires_durable_ring(stage: &str) -> bool {
+        matches!(
+            stage,
+            "hard_hard_sweep_started"
+                | "hard_hard_direct_validation_started"
+                | "hard_hard_probe_summary"
+                | "hard_hard_birthday_sweep_summary"
+                | "hard_hard_sweep_completed"
+                | "hard_hard_sweep_failed"
+                | "hard_hard_failed"
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

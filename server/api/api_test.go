@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,6 +20,22 @@ import (
 	"github.com/yhan-sun/p2wlan/server/database"
 	"github.com/yhan-sun/p2wlan/server/signaling"
 )
+
+func TestSignalCandidateCapMatchesSharedFixture(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "contracts", "fixtures", "signal_candidate_cap.json"))
+	if err != nil {
+		t.Fatalf("read shared signal candidate cap fixture: %v", err)
+	}
+	var fixture struct {
+		MaxSignalCandidates int `json:"max_signal_candidates"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode shared signal candidate cap fixture: %v", err)
+	}
+	if fixture.MaxSignalCandidates != maxSignalCandidates {
+		t.Fatalf("candidate cap drifted: Go=%d fixture=%d", maxSignalCandidates, fixture.MaxSignalCandidates)
+	}
+}
 
 func TestCreateSignalWakesAuthenticatedWebSocketAndRemainsDurable(t *testing.T) {
 	db, err := database.New(filepath.Join(t.TempDir(), "control.db"))

@@ -190,6 +190,12 @@ impl PeerManager {
                 && existing.remote_candidate_epoch == record.remote_candidate_epoch
                 && existing.local_profile_generation == record.local_profile_generation
                 && existing.remote_profile_generation == record.remote_profile_generation
+                && existing.requested_birthday_level == record.requested_birthday_level
+                && existing.generated_candidate_count == record.generated_candidate_count
+                && existing.signaled_candidate_count == record.signaled_candidate_count
+                && existing.birthday == record.birthday
+                && existing.requested_socket_indices == record.requested_socket_indices
+                && existing.requested_socket_count == record.requested_socket_count
                 && existing.prediction_window == record.prediction_window);
         } else {
             // One live session per peer.  A newer fresh measurement supersedes

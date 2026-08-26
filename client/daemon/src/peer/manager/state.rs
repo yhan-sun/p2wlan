@@ -47,6 +47,19 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) remote_profile_generation: u64,
     pub(crate) local_prediction_confidence: u8,
     pub(crate) remote_prediction_confidence: u8,
+    /// Original Birthday level selected before candidate signaling is capped.
+    /// Zero denotes the predictable fresh-mapping lane, which has no Birthday
+    /// level.  This local ledger value is authoritative for the reciprocal
+    /// response path; it is never reconstructed from the signaled window.
+    pub(crate) requested_birthday_level: usize,
+    pub(crate) generated_candidate_count: usize,
+    pub(crate) signaled_candidate_count: usize,
+    pub(crate) birthday: bool,
+    /// Exact dynamic sockets created for this session.  A later scheduler
+    /// snapshot may find only a subset still attached/usable; it must never
+    /// replace a missing member with a pool socket.
+    pub(crate) requested_socket_indices: Vec<usize>,
+    pub(crate) requested_socket_count: usize,
     pub(crate) prediction_window: Vec<SocketAddr>,
     pub(crate) remote_prediction: Vec<SocketAddr>,
     pub(crate) fresh_socket: HardHardFreshSocketIdentity,

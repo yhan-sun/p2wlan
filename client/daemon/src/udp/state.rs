@@ -1353,14 +1353,47 @@ impl PunchSocketPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BirthdaySweepReport {
     pub requested_level: usize,
+    pub generated_candidate_count: usize,
+    pub signaled_candidate_count: usize,
     pub effective_target_count: usize,
+    pub requested_socket_count: usize,
+    pub attached_socket_count: usize,
+    pub usable_socket_count: usize,
+    pub unavailable_socket_count: usize,
+    /// Kept as a compatibility alias for existing diagnostics consumers; it
+    /// is always the exact usable socket count for this sweep.
     pub socket_count: usize,
     pub degraded_reason: Option<String>,
     pub waves_planned: usize,
     pub waves_started: usize,
+    pub waves_fully_completed: usize,
+    /// Compatibility alias retained for existing event parsers.  It has the
+    /// same value as `waves_fully_completed` and is never a worker-join count.
     pub waves_completed: usize,
     pub packets_planned: usize,
+    pub targets_assigned: usize,
+    pub targets_attempted: usize,
+    pub logical_probes_sent: usize,
+    pub physical_datagrams_sent: usize,
+    pub targets_budget_skipped: usize,
+    pub targets_cancelled: usize,
     pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BirthdaySweepProgress {
+    pub birthday: BirthdaySweepReport,
+    /// Partial logical/physical send counters published after every worker
+    /// wave.  This lets the caller emit a terminal summary when its deadline
+    /// or cancellation drops the scheduler future before it returns.
+    pub aggregate: PunchSendReport,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HardHardSocketSnapshot {
+    pub socket_index: usize,
+    pub attached: bool,
+    pub usable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1397,6 +1430,17 @@ pub(crate) struct PunchSendReport {
     pub last_send_at_ms: Option<u64>,
     /// Present only for the bounded Hard↔Hard Birthday scheduler.
     pub birthday: Option<BirthdaySweepReport>,
+    /// Number of exact targets assigned to this worker and how far the
+    /// worker progressed through them.  A worker that exits on a fence is not
+    /// complete even if its task joins successfully.
+    pub targets_assigned: u32,
+    pub targets_attempted: u32,
+    pub targets_cancelled: u32,
+    pub target_processing_completed: bool,
+    /// Set when the scheduler observed a normal worker error or JoinError.
+    /// The caller still receives the partial report so it can emit one final
+    /// summary before returning the Hard↔Hard sweep as failed.
+    pub worker_failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
