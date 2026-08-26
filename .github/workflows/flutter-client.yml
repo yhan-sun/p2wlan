@@ -160,10 +160,10 @@ jobs:
           expected_build_id="${expected_commit:0:12}"
           identity="$(python3 scripts/release/flutter_client_build_identity.py apk --release)"
           printf '%s\n' "$identity"
-          grep -F -- "--dart-define=P2WLAN_CLIENT_GIT_COMMIT=${expected_commit}" <<<"$identity"
-          grep -F -- "--dart-define=P2WLAN_CLIENT_BUILD_ID=${expected_build_id}" <<<"$identity"
-          grep -F -- "--dart-define=P2WLAN_CLIENT_DIRTY=false" <<<"$identity"
-          grep -F -- "--dart-define=P2WLAN_CLIENT_DIFF_HASH=" <<<"$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_GIT_COMMIT=${expected_commit}" <<<"$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_BUILD_ID=${expected_build_id}" <<<"$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_DIRTY=false" <<<"$identity"
+          grep -Fx -- "--dart-define=P2WLAN_CLIENT_DIFF_HASH=" <<<"$identity"
           if grep -Fq -- "-dirty-" <<<"$identity"; then
             echo "Flutter client identity unexpectedly contains a dirty build ID" >&2
             exit 1
