@@ -31,7 +31,7 @@
 
 pub mod acl;
 pub mod build_info;
-mod candidate_refresh;
+pub(crate) mod candidate_refresh;
 pub mod config;
 pub mod connection_timeline;
 pub mod control;
@@ -217,7 +217,7 @@ const CANDIDATE_REFRESH_NO_PUBLIC_RETRY_INTERVAL: Duration = Duration::from_secs
 /// Keep this large enough for a linear symmetric NAT to publish its observed
 /// STUN group plus the full predicted successor run. Air-like NATs can need
 /// the high-teens successor ports before a peer-reflexive path appears.
-const MAX_SIGNAL_CANDIDATES: usize = 96;
+pub(crate) const MAX_SIGNAL_CANDIDATES: usize = 96;
 /// Reserve a small part of the signaling budget for physical LAN host
 /// candidates. A hard-NAT prediction window can otherwise consume all 96
 /// entries and make same-LAN discovery impossible until a later refresh.

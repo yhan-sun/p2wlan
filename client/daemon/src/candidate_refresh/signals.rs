@@ -199,6 +199,89 @@ pub(super) fn candidate_endpoints_from_report(
     (endpoints, sources)
 }
 
+/// The one client-side contract for every signal candidate list.
+///
+/// The control server accepts at most `MAX_SIGNAL_CANDIDATES` entries. Keep
+/// the raw/model counts separate from the effective wire count so diagnostics
+/// can explain a bounded 128/256-port model without accidentally publishing
+/// an over-limit JSON body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SignalCandidateContract {
+    pub(crate) requested_candidate_count: usize,
+    pub(crate) generated_candidate_count: usize,
+    pub(crate) deduplicated_candidate_count: usize,
+    pub(crate) signaled_candidate_count: usize,
+    pub(crate) cap: usize,
+    pub(crate) capped: bool,
+    pub(crate) candidate_source_count: usize,
+    pub(crate) reason: &'static str,
+}
+
+/// Normalize a candidate list at the control-plane serialization boundary.
+///
+/// This preserves the existing candidate ranking and fresh
+/// prediction/LAN reservations in `truncate_signal_candidates`; the extra
+/// work here is stable de-duplication before applying the shared cap and exact
+/// alignment of the source map with the emitted candidates.
+pub(crate) fn normalize_signal_candidates(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+) -> (Vec<String>, HashMap<String, String>, SignalCandidateContract) {
+    normalize_signal_candidates_with_counts(
+        candidates,
+        candidate_sources,
+        candidates.len(),
+        candidates.len(),
+    )
+}
+
+/// Normalize a signal list while retaining caller-supplied model counts for
+/// diagnostics. The count arguments are metadata only; the returned vectors
+/// are always the authoritative wire payload.
+pub(crate) fn normalize_signal_candidates_with_counts(
+    candidates: &[String],
+    candidate_sources: &HashMap<String, String>,
+    requested_candidate_count: usize,
+    generated_candidate_count: usize,
+) -> (Vec<String>, HashMap<String, String>, SignalCandidateContract) {
+    let mut normalized_candidates = Vec::with_capacity(candidates.len());
+    let mut seen = HashSet::with_capacity(candidates.len());
+    for endpoint in candidates {
+        if seen.insert(endpoint.clone()) {
+            normalized_candidates.push(endpoint.clone());
+        }
+    }
+
+    let deduplicated_candidate_count = normalized_candidates.len();
+    let deduplicated = deduplicated_candidate_count != candidates.len();
+    let mut normalized_sources = HashMap::with_capacity(deduplicated_candidate_count);
+    for endpoint in &normalized_candidates {
+        if let Some(source) = candidate_sources.get(endpoint) {
+            normalized_sources.insert(endpoint.clone(), source.clone());
+        }
+    }
+
+    let capped = deduplicated_candidate_count > MAX_SIGNAL_CANDIDATES;
+    truncate_signal_candidates(&mut normalized_candidates, &mut normalized_sources);
+    let reason = match (deduplicated, capped) {
+        (true, true) => "deduplicated_and_capped",
+        (true, false) => "deduplicated",
+        (false, true) => "capped",
+        (false, false) => "within_cap",
+    };
+    let contract = SignalCandidateContract {
+        requested_candidate_count,
+        generated_candidate_count,
+        deduplicated_candidate_count,
+        signaled_candidate_count: normalized_candidates.len(),
+        cap: MAX_SIGNAL_CANDIDATES,
+        capped,
+        candidate_source_count: normalized_sources.len(),
+        reason,
+    };
+    (normalized_candidates, normalized_sources, contract)
+}
+
 pub(super) fn compact_volatile_public_signal_candidates(
     candidates: &mut Vec<String>,
     candidate_sources: &mut HashMap<String, String>,

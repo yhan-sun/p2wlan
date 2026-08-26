@@ -981,7 +981,13 @@ enum HardHardLocalMeasurement {
     Birthday(Box<HardHardBirthdayResult>),
 }
 
-type HardHardMeasurementPayload = (Vec<String>, HashMap<String, String>, u8, String);
+struct HardHardMeasurementPayload {
+    candidates: Vec<String>,
+    candidate_sources: HashMap<String, String>,
+    local_confidence: u8,
+    local_model: String,
+    candidate_contract: crate::candidate_refresh::SignalCandidateContract,
+}
 
 fn hard_hard_measurement_target_limit(measurement: &HardHardLocalMeasurement) -> usize {
     match measurement {
@@ -1115,12 +1121,23 @@ fn hard_hard_measurement_payload(
     match measurement {
         HardHardLocalMeasurement::Predictable { result, .. } => {
             let (candidates, sources) = hard_hard_prediction_payload(result, boot_epoch_ms)?;
-            Some((
+            let (candidates, sources, candidate_contract) =
+                crate::candidate_refresh::normalize_signal_candidates_with_counts(
+                    &candidates,
+                    &sources,
+                    result
+                        .predicted_ports
+                        .len()
+                        .min(HARD_HARD_MAX_PREDICTION_TARGETS),
+                    candidates.len(),
+                );
+            (!candidates.is_empty()).then_some(HardHardMeasurementPayload {
                 candidates,
-                sources,
-                result.model.confidence,
-                hard_hard_model_label(&result.model.kind).to_string(),
-            ))
+                candidate_sources: sources,
+                local_confidence: result.model.confidence,
+                local_model: hard_hard_model_label(&result.model.kind).to_string(),
+                candidate_contract,
+            })
         }
         HardHardLocalMeasurement::Birthday(result) => {
             let fresh_id = FreshPredictionId {
@@ -1141,14 +1158,51 @@ fn hard_hard_measurement_payload(
                 sources.insert(endpoint.clone(), source.clone());
                 candidates.push(endpoint);
             }
-            (!candidates.is_empty()).then_some((
+            let (candidates, sources, candidate_contract) =
+                crate::candidate_refresh::normalize_signal_candidates_with_counts(
+                    &candidates,
+                    &sources,
+                    result.requested_level,
+                    candidates.len(),
+                );
+            (!candidates.is_empty()).then_some(HardHardMeasurementPayload {
                 candidates,
-                sources,
-                result.model_confidence,
-                result.model_label.clone(),
-            ))
+                candidate_sources: sources,
+                local_confidence: result.model_confidence,
+                local_model: result.model_label.clone(),
+                candidate_contract,
+            })
         }
     }
+}
+
+async fn record_hard_hard_candidate_contract(
+    peers: &PeerManager,
+    peer_id: &str,
+    contract: crate::candidate_refresh::SignalCandidateContract,
+    signaling_accepted: bool,
+) {
+    peers
+        .record_direct_event(
+            peer_id,
+            "hard_hard_candidate_contract",
+            None,
+            Some(contract.signaled_candidate_count),
+            None,
+            format!(
+                "requested_candidate_count={} generated_candidate_count={} deduplicated_candidate_count={} signaled_candidate_count={} cap={} capped={} candidate_source_count={} reason={} signaling_result={}",
+                contract.requested_candidate_count,
+                contract.generated_candidate_count,
+                contract.deduplicated_candidate_count,
+                contract.signaled_candidate_count,
+                contract.cap,
+                contract.capped,
+                contract.candidate_source_count,
+                contract.reason,
+                if signaling_accepted { "accepted" } else { "failed" },
+            ),
+        )
+        .await;
 }
 
 fn hard_hard_measurement_primary_socket(
@@ -1549,8 +1603,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 .await;
             return;
         }
-        let Some((candidates, candidate_sources, local_confidence, local_model)) =
-            hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
+        let Some(HardHardMeasurementPayload {
+            candidates,
+            candidate_sources,
+            local_confidence,
+            local_model,
+            candidate_contract,
+        }) = hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
         else {
             peers
                 .record_direct_event(
@@ -1686,6 +1745,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         } else {
             false
         };
+        record_hard_hard_candidate_contract(
+            &peers,
+            &peer_id,
+            candidate_contract,
+            advertised,
+        )
+        .await;
         if !advertised
             || peers.is_direct(&peer_id).await
             || cancellation.is_cancelled()
@@ -1962,8 +2028,13 @@ pub(crate) async fn spawn_hard_hard_responder(
                 .await;
             return;
         }
-        let Some((candidates, candidate_sources, local_confidence, local_model)) =
-            hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
+        let Some(HardHardMeasurementPayload {
+            candidates,
+            candidate_sources,
+            local_confidence,
+            local_model,
+            candidate_contract,
+        }) = hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
         else {
             return;
         };
