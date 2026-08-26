@@ -1372,21 +1372,67 @@ pub(crate) struct BirthdaySweepReport {
     pub waves_completed: usize,
     pub packets_planned: usize,
     pub targets_assigned: usize,
+    pub targets_examined: usize,
     pub targets_attempted: usize,
+    pub logical_probes_attempted: usize,
     pub logical_probes_sent: usize,
     pub physical_datagrams_sent: usize,
+    pub physical_send_errors: usize,
     pub targets_budget_skipped: usize,
     pub targets_cancelled: usize,
     pub stop_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BirthdaySweepFailureKind {
+    Send,
+    WorkerJoin,
+}
+
+impl BirthdaySweepFailureKind {
+    pub(crate) const fn stop_reason(self) -> &'static str {
+        match self {
+            Self::Send => "send_error",
+            Self::WorkerJoin => "worker_failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveBirthdayCounters {
+    pub targets_assigned: u32,
+    pub targets_examined: u32,
+    pub targets_attempted: u32,
+    pub targets_cancelled: u32,
+    pub budget_skipped: u32,
+    pub logical_probes_attempted: u32,
+    pub logical_probes_sent: u32,
+    pub physical_datagrams_sent: u32,
+    pub physical_send_errors: u32,
+    pub workers_completed: u32,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct BirthdaySweepProgress {
     pub birthday: BirthdaySweepReport,
     /// Partial logical/physical send counters published after every worker
     /// wave.  This lets the caller emit a terminal summary when its deadline
     /// or cancellation drops the scheduler future before it returns.
     pub aggregate: PunchSendReport,
+    /// Session-scoped counters updated at each target/send event. This lock
+    /// is independent of the peer connection map and is never held across a
+    /// UDP send or another await.
+    pub live: Arc<StdMutex<LiveBirthdayCounters>>,
+}
+
+impl Default for BirthdaySweepProgress {
+    fn default() -> Self {
+        Self {
+            birthday: BirthdaySweepReport::default(),
+            aggregate: PunchSendReport::default(),
+            live: Arc::new(StdMutex::new(LiveBirthdayCounters::default())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1399,6 +1445,16 @@ pub(crate) struct HardHardSocketSnapshot {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PunchSendReport {
     pub packets_sent: u32,
+    /// Logical probes that passed admission and entered Probe construction or
+    /// the physical send path.
+    pub logical_probes_attempted: u32,
+    /// Logical probes with at least one successful physical datagram send.
+    pub logical_probes_sent: u32,
+    /// Successful physical UDP datagrams, including compatibility copies.
+    pub physical_datagrams_sent: u32,
+    /// Physical UDP sends that returned an error, including compatibility
+    /// copies after a successful primary send.
+    pub physical_send_errors: u32,
     pub unique_target_endpoints: u32,
     /// Wall-clock UNIX milliseconds captured immediately after the first
     /// successful kernel UDP send in this punch session.  `None` means the
@@ -1434,13 +1490,20 @@ pub(crate) struct PunchSendReport {
     /// worker progressed through them.  A worker that exits on a fence is not
     /// complete even if its task joins successfully.
     pub targets_assigned: u32,
+    /// Targets dequeued by this worker.
+    pub targets_examined: u32,
     pub targets_attempted: u32,
     pub targets_cancelled: u32,
     pub target_processing_completed: bool,
-    /// Set when the scheduler observed a normal worker error or JoinError.
+    /// Set when the scheduler observed a worker JoinError or panic. Normal
+    /// worker/business failures are carried by `failure_kind=Send` instead.
     /// The caller still receives the partial report so it can emit one final
     /// summary before returning the Hard↔Hard sweep as failed.
     pub worker_failed: bool,
+    /// Typed failure retained through scheduler aggregation. `Send` covers
+    /// ordinary worker/business errors and actual UDP send failures;
+    /// `WorkerJoin` covers a JoinError or panic.
+    pub failure_kind: Option<BirthdaySweepFailureKind>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

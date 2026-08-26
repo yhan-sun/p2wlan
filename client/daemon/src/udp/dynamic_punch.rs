@@ -2264,6 +2264,7 @@ impl UdpTransport {
             attempts,
             None,
             None,
+            None,
         )
         .await
     }
@@ -2340,6 +2341,11 @@ impl UdpTransport {
         session_token: &str,
         progress: Option<Arc<Mutex<BirthdaySweepProgress>>>,
     ) -> Result<PunchSendReport> {
+        let live = if let Some(progress) = progress.as_ref() {
+            Some(progress.lock().await.live.clone())
+        } else {
+            None
+        };
         let mut effective_targets = Vec::with_capacity(targets.len().min(crate::MAX_SIGNAL_CANDIDATES));
         for target in targets {
             if target.port() == 0 || effective_targets.contains(&target) {
@@ -2460,6 +2466,11 @@ impl UdpTransport {
             birthday.targets_assigned = birthday
                 .targets_assigned
                 .saturating_add(effective_targets.len());
+            update_live_birthday_counters(&live, |counters| {
+                counters.targets_assigned = counters
+                    .targets_assigned
+                    .saturating_add(u32::try_from(wave_assigned_count).unwrap_or(u32::MAX));
+            });
             let mut workers = JoinSet::new();
             for (socket_position, socket_index) in
                 effective_socket_indices.iter().copied().enumerate()
@@ -2471,10 +2482,11 @@ impl UdpTransport {
                 let transport = self.clone();
                 let peer_id = peer_id.to_string();
                 let session_token = session_token.to_string();
+                let live_counters = live.clone();
                 let assigned_count = assigned.len();
                 workers.spawn(async move {
                     let result = transport
-                        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
+                        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
                             &peer_id,
                             socket_index,
                             assigned,
@@ -2482,6 +2494,7 @@ impl UdpTransport {
                             1,
                             Some(profile_fence),
                             Some(&session_token),
+                            live_counters,
                         )
                         .await;
                     (assigned_count, result)
@@ -2492,14 +2505,15 @@ impl UdpTransport {
 
             let mut wave_report = PunchSendReport::default();
             let mut wave_fully_completed = true;
-            let mut ordinary_worker_failed = false;
-            let mut join_worker_failed = false;
+            let mut failure_kind = None;
             while let Some(joined) = workers.join_next().await {
+                update_live_birthday_counters(&live, |counters| {
+                    counters.workers_completed = counters.workers_completed.saturating_add(1);
+                });
                 record_birthday_worker_result(
                     &mut wave_report,
                     &mut wave_fully_completed,
-                    &mut ordinary_worker_failed,
-                    &mut join_worker_failed,
+                    &mut failure_kind,
                     joined,
                 );
             }
@@ -2513,14 +2527,16 @@ impl UdpTransport {
                     .unwrap_or(u32::MAX)
                     .saturating_sub(wave_report.targets_attempted),
             );
+            update_live_birthday_counters(&live, |counters| {
+                counters.targets_cancelled = counters
+                    .targets_cancelled
+                    .saturating_add(wave_report.targets_cancelled);
+            });
             merge_punch_send_reports(&mut aggregate, wave_report.clone());
-            if ordinary_worker_failed || join_worker_failed {
-                aggregate.worker_failed = true;
-                let stop_reason = if join_worker_failed {
-                    "worker_failed"
-                } else {
-                    "send_error"
-                };
+            if let Some(failure_kind) = failure_kind.or(wave_report.failure_kind) {
+                aggregate.failure_kind = Some(failure_kind);
+                aggregate.worker_failed |= failure_kind == BirthdaySweepFailureKind::WorkerJoin;
+                let stop_reason = failure_kind.stop_reason();
                 birthday.stop_reason = Some(stop_reason.to_string());
                 update_birthday_sweep_counters(&mut birthday, &aggregate);
                 publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
@@ -2706,6 +2722,31 @@ impl UdpTransport {
         profile_fence: Option<(u64, u64)>,
         hard_hard_session_token: Option<&str>,
     ) -> Result<PunchSendReport> {
+        self.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
+            peer_id,
+            socket_index,
+            candidates,
+            probe_interval,
+            attempts,
+            profile_fence,
+            hard_hard_session_token,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        profile_fence: Option<(u64, u64)>,
+        hard_hard_session_token: Option<&str>,
+        live: Option<Arc<StdMutex<LiveBirthdayCounters>>>,
+    ) -> Result<PunchSendReport> {
         let Some((index, socket, _lease)) = self
             .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
             .await
@@ -2725,6 +2766,7 @@ impl UdpTransport {
             attempts,
             profile_fence,
             hard_hard_session_token,
+            live,
         )
         .await
     }
@@ -2740,9 +2782,14 @@ impl UdpTransport {
         attempts: u32,
         profile_fence: Option<(u64, u64)>,
         hard_hard_session_token: Option<&str>,
+        live: Option<Arc<StdMutex<LiveBirthdayCounters>>>,
     ) -> Result<PunchSendReport> {
         let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
         let mut packets_sent = 0u32;
+        let mut logical_probes_attempted = 0u32;
+        let mut logical_probes_sent = 0u32;
+        let mut physical_datagrams_sent = 0u32;
+        let mut physical_send_errors = 0u32;
         let mut budget_skipped = 0u32;
         let mut last_budget_reason = None;
         let mut sent_endpoints = HashSet::new();
@@ -2750,8 +2797,10 @@ impl UdpTransport {
         let mut last_send_at_ms: Option<u64> = None;
         let mut per_socket_sent = 0u32;
         let targets_assigned = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+        let mut targets_examined = 0u32;
         let mut targets_attempted = 0u32;
         let mut target_processing_completed = true;
+        let mut failure_kind = None;
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         let network_generation_at_start = self.peers.current_network_generation_sync();
         let remote_candidate_epoch_at_start = self
@@ -2771,7 +2820,10 @@ impl UdpTransport {
                 sleep(round.delay_before).await;
             }
             for candidate in round.endpoints {
-                targets_attempted = targets_attempted.saturating_add(1);
+                targets_examined = targets_examined.saturating_add(1);
+                update_live_birthday_counters(&live, |counters| {
+                    counters.targets_examined = counters.targets_examined.saturating_add(1);
+                });
                 if let Some(token) = hard_hard_session_token {
                     if self
                         .peers
@@ -2852,6 +2904,14 @@ impl UdpTransport {
                     target_processing_completed = false;
                     break;
                 }
+                // All session, network, profile, winner, Direct and commit
+                // fences passed. A budget rejection below is still an
+                // attempted target: it entered this worker's admission path,
+                // but it is not a logical Probe construction/send attempt.
+                targets_attempted = targets_attempted.saturating_add(1);
+                update_live_birthday_counters(&live, |counters| {
+                    counters.targets_attempted = counters.targets_attempted.saturating_add(1);
+                });
                 if self
                     .peers
                     .direct_probe_endpoint_quarantined(
@@ -2863,6 +2923,9 @@ impl UdpTransport {
                 {
                     budget_skipped = budget_skipped.saturating_add(1);
                     last_budget_reason = Some("direct_slow_relay_retained");
+                    update_live_birthday_counters(&live, |counters| {
+                        counters.budget_skipped = counters.budget_skipped.saturating_add(1);
+                    });
                     trace!(
                         "Skipped dynamic-socket punch for peer {peer_id} candidate {candidate}: recent slow ACK quarantine"
                     );
@@ -2880,11 +2943,19 @@ impl UdpTransport {
                         // credit all apply to fresh-mapping punches.
                         budget_skipped = budget_skipped.saturating_add(1);
                         last_budget_reason = Some(outbound_probe_admission_reason(limited));
+                        update_live_birthday_counters(&live, |counters| {
+                            counters.budget_skipped = counters.budget_skipped.saturating_add(1);
+                        });
                         continue;
                     }
                 }
+                logical_probes_attempted = logical_probes_attempted.saturating_add(1);
+                update_live_birthday_counters(&live, |counters| {
+                    counters.logical_probes_attempted =
+                        counters.logical_probes_attempted.saturating_add(1);
+                });
                 match self
-                    .send_probe_on_socket_result_with_hard_hard_token(
+                    .send_probe_on_socket_result_with_hard_hard_token_classified(
                         index,
                         socket.clone(),
                         Some(peer_id),
@@ -2897,6 +2968,28 @@ impl UdpTransport {
                 {
                     Ok(sent) => {
                         packets_sent = packets_sent.saturating_add(1);
+                        logical_probes_sent = logical_probes_sent.saturating_add(1);
+                        let successful_datagrams = u32::from(sent.datagrams_sent);
+                        let failed_datagrams = u32::from(sent.physical_send_errors);
+                        physical_datagrams_sent =
+                            physical_datagrams_sent.saturating_add(successful_datagrams);
+                        physical_send_errors = physical_send_errors.saturating_add(failed_datagrams);
+                        update_live_birthday_counters(&live, |counters| {
+                            counters.logical_probes_sent =
+                                counters.logical_probes_sent.saturating_add(1);
+                            counters.physical_datagrams_sent = counters
+                                .physical_datagrams_sent
+                                .saturating_add(successful_datagrams);
+                            counters.physical_send_errors = counters
+                                .physical_send_errors
+                                .saturating_add(failed_datagrams);
+                        });
+                        if sent.physical_send_errors > 0 {
+                            failure_kind = combine_birthday_failure_kind(
+                                failure_kind,
+                                Some(BirthdaySweepFailureKind::Send),
+                            );
+                        }
                         if let Some(sent_at_ms) = sent.first_send_at_ms {
                             first_send_at_ms.get_or_insert(sent_at_ms);
                             last_send_at_ms = Some(
@@ -2918,9 +3011,22 @@ impl UdpTransport {
                             sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
                         }
                     }
-                    Err(error) => {
+                    Err(failure) => {
+                        physical_send_errors = physical_send_errors.saturating_add(u32::from(
+                            failure.physical_send_errors,
+                        ));
+                        update_live_birthday_counters(&live, |counters| {
+                            counters.physical_send_errors = counters
+                                .physical_send_errors
+                                .saturating_add(u32::from(failure.physical_send_errors));
+                        });
+                        failure_kind = combine_birthday_failure_kind(
+                            failure_kind,
+                            Some(BirthdaySweepFailureKind::Send),
+                        );
                         debug!(
-                            "Dynamic-socket punch to peer {peer_id} candidate {candidate} failed: {error}"
+                            "Dynamic-socket punch to peer {peer_id} candidate {candidate} failed: {}",
+                            failure.error
                         );
                     }
                 }
@@ -2943,6 +3049,10 @@ impl UdpTransport {
         }
         Ok(PunchSendReport {
             packets_sent,
+            logical_probes_attempted,
+            logical_probes_sent,
+            physical_datagrams_sent,
+            physical_send_errors,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
             first_send_at_ms,
             per_socket_sent: (per_socket_sent > 0)
@@ -2954,9 +3064,11 @@ impl UdpTransport {
             sent_target_endpoints: sent_endpoints.into_iter().collect(),
             last_send_at_ms,
             targets_assigned,
+            targets_examined,
             targets_attempted,
             targets_cancelled: targets_assigned.saturating_sub(targets_attempted),
             target_processing_completed,
+            failure_kind,
             ..PunchSendReport::default()
         })
     }
@@ -3118,35 +3230,88 @@ fn hard_hard_birthday_socket_plan(
 fn record_birthday_worker_result(
     wave_report: &mut PunchSendReport,
     wave_fully_completed: &mut bool,
-    ordinary_worker_failed: &mut bool,
-    join_worker_failed: &mut bool,
+    failure_kind: &mut Option<BirthdaySweepFailureKind>,
     joined: std::result::Result<(usize, Result<PunchSendReport>), tokio::task::JoinError>,
 ) {
     match joined {
         Ok((_assigned_count, Ok(report))) => {
-            *wave_fully_completed &= report.target_processing_completed;
+            *wave_fully_completed &=
+                report.target_processing_completed && report.failure_kind.is_none();
+            *failure_kind = combine_birthday_failure_kind(*failure_kind, report.failure_kind);
             merge_punch_send_reports(wave_report, report);
         }
         Ok((assigned_count, Err(_error))) => {
-            *ordinary_worker_failed = true;
             *wave_fully_completed = false;
+            *failure_kind = combine_birthday_failure_kind(
+                *failure_kind,
+                Some(BirthdaySweepFailureKind::Send),
+            );
             wave_report.targets_cancelled = wave_report
                 .targets_cancelled
                 .saturating_add(u32::try_from(assigned_count).unwrap_or(u32::MAX));
         }
         Err(_join_error) => {
-            *join_worker_failed = true;
             *wave_fully_completed = false;
+            *failure_kind = combine_birthday_failure_kind(
+                *failure_kind,
+                Some(BirthdaySweepFailureKind::WorkerJoin),
+            );
+            wave_report.worker_failed = true;
         }
     }
 }
 
+fn combine_birthday_failure_kind(
+    left: Option<BirthdaySweepFailureKind>,
+    right: Option<BirthdaySweepFailureKind>,
+) -> Option<BirthdaySweepFailureKind> {
+    match (left, right) {
+        (Some(BirthdaySweepFailureKind::WorkerJoin), _)
+        | (_, Some(BirthdaySweepFailureKind::WorkerJoin)) => {
+            Some(BirthdaySweepFailureKind::WorkerJoin)
+        }
+        (Some(BirthdaySweepFailureKind::Send), _) | (_, Some(BirthdaySweepFailureKind::Send)) => {
+            Some(BirthdaySweepFailureKind::Send)
+        }
+        (None, None) => None,
+    }
+}
+
 fn merge_punch_send_reports(destination: &mut PunchSendReport, source: PunchSendReport) {
-    destination.packets_sent = destination.packets_sent.saturating_add(source.packets_sent);
+    let source_logical_sent = source.logical_probes_sent.max(source.packets_sent);
+    let source_logical_attempted = source
+        .logical_probes_attempted
+        .max(source_logical_sent);
+    let source_targets_examined = source.targets_examined.max(source.targets_attempted);
+    let source_physical_datagrams_sent = source.physical_datagrams_sent.max(
+        source
+            .per_socket_sent
+            .iter()
+            .map(|(_, sent)| *sent)
+            .sum(),
+    );
+    destination.packets_sent = destination
+        .packets_sent
+        .saturating_add(source_logical_sent);
+    destination.logical_probes_sent = destination
+        .logical_probes_sent
+        .saturating_add(source_logical_sent);
+    destination.logical_probes_attempted = destination
+        .logical_probes_attempted
+        .saturating_add(source_logical_attempted);
+    destination.physical_datagrams_sent = destination
+        .physical_datagrams_sent
+        .saturating_add(source_physical_datagrams_sent);
+    destination.physical_send_errors = destination
+        .physical_send_errors
+        .saturating_add(source.physical_send_errors);
     destination.budget_skipped = destination.budget_skipped.saturating_add(source.budget_skipped);
     destination.targets_assigned = destination
         .targets_assigned
         .saturating_add(source.targets_assigned);
+    destination.targets_examined = destination
+        .targets_examined
+        .saturating_add(source_targets_examined);
     destination.targets_attempted = destination
         .targets_attempted
         .saturating_add(source.targets_attempted);
@@ -3158,7 +3323,12 @@ fn merge_punch_send_reports(destination: &mut PunchSendReport, source: PunchSend
     } else {
         destination.target_processing_completed &= source.target_processing_completed;
     }
-    destination.worker_failed |= source.worker_failed;
+    destination.worker_failed |= source.worker_failed
+        || source.failure_kind == Some(BirthdaySweepFailureKind::WorkerJoin);
+    destination.failure_kind = combine_birthday_failure_kind(
+        destination.failure_kind,
+        source.failure_kind,
+    );
     destination.epoch_budget_exhausted |= source.epoch_budget_exhausted;
     destination.candidate_iteration_capped |= source.candidate_iteration_capped;
     destination.first_send_at_ms = match (destination.first_send_at_ms, source.first_send_at_ms) {
@@ -3193,15 +3363,65 @@ pub(crate) fn update_birthday_sweep_counters(
     birthday: &mut BirthdaySweepReport,
     aggregate: &PunchSendReport,
 ) {
+    birthday.targets_assigned = birthday
+        .targets_assigned
+        .max(aggregate.targets_assigned as usize);
     birthday.targets_attempted = aggregate.targets_attempted as usize;
-    birthday.logical_probes_sent = aggregate.packets_sent as usize;
-    birthday.physical_datagrams_sent = aggregate
-        .per_socket_sent
-        .iter()
-        .map(|(_, sent)| *sent as usize)
-        .sum();
+    birthday.targets_examined = aggregate
+        .targets_examined
+        .max(aggregate.targets_attempted) as usize;
+    let logical_probes_sent = aggregate.logical_probes_sent.max(aggregate.packets_sent);
+    birthday.logical_probes_attempted = aggregate
+        .logical_probes_attempted
+        .max(logical_probes_sent) as usize;
+    birthday.logical_probes_sent = logical_probes_sent as usize;
+    birthday.physical_datagrams_sent = aggregate.physical_datagrams_sent.max(
+        aggregate
+            .per_socket_sent
+            .iter()
+            .map(|(_, sent)| *sent)
+            .sum(),
+    ) as usize;
+    birthday.physical_send_errors = aggregate.physical_send_errors as usize;
     birthday.targets_budget_skipped = aggregate.budget_skipped as usize;
     birthday.targets_cancelled = aggregate.targets_cancelled as usize;
+}
+
+fn update_live_birthday_counters(
+    live: &Option<Arc<StdMutex<LiveBirthdayCounters>>>,
+    update: impl FnOnce(&mut LiveBirthdayCounters),
+) {
+    let Some(live) = live else {
+        return;
+    };
+    let mut counters = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    update(&mut counters);
+}
+
+pub(crate) fn apply_live_birthday_counters(
+    report: &mut PunchSendReport,
+    live: &LiveBirthdayCounters,
+) {
+    report.targets_assigned = report.targets_assigned.max(live.targets_assigned);
+    report.targets_examined = report.targets_examined.max(live.targets_examined);
+    report.targets_attempted = report.targets_attempted.max(live.targets_attempted);
+    report.targets_cancelled = report.targets_cancelled.max(live.targets_cancelled);
+    report.budget_skipped = report.budget_skipped.max(live.budget_skipped);
+    report.logical_probes_sent = report
+        .logical_probes_sent
+        .max(live.logical_probes_sent)
+        .max(report.packets_sent);
+    report.logical_probes_attempted = report
+        .logical_probes_attempted
+        .max(live.logical_probes_attempted)
+        .max(report.logical_probes_sent);
+    report.packets_sent = report.packets_sent.max(report.logical_probes_sent);
+    report.physical_datagrams_sent = report
+        .physical_datagrams_sent
+        .max(live.physical_datagrams_sent);
+    report.physical_send_errors = report
+        .physical_send_errors
+        .max(live.physical_send_errors);
 }
 
 async fn publish_birthday_sweep_progress(
@@ -3212,9 +3432,24 @@ async fn publish_birthday_sweep_progress(
     let Some(progress) = progress else {
         return;
     };
+    let live = {
+        let current = progress.lock().await;
+        current.live.clone()
+    };
+    let live_snapshot = live
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut published_aggregate = aggregate.clone();
+    apply_live_birthday_counters(&mut published_aggregate, &live_snapshot);
+    let mut published_birthday = birthday.clone();
+    published_birthday.targets_assigned = published_birthday
+        .targets_assigned
+        .max(published_aggregate.targets_assigned as usize);
+    update_birthday_sweep_counters(&mut published_birthday, &published_aggregate);
     let mut current = progress.lock().await;
-    current.birthday = birthday.clone();
-    current.aggregate = aggregate.clone();
+    current.birthday = published_birthday;
+    current.aggregate = published_aggregate;
 }
 
 pub(crate) fn hard_hard_birthday_wave_count(socket_count: usize) -> usize {
@@ -4001,7 +4236,8 @@ mod birthday_tests {
         hard_hard_birthday_candidates, hard_hard_birthday_capacity_plan,
         hard_hard_birthday_packets_planned, hard_hard_birthday_socket_plan,
         hard_hard_birthday_wave_assignments, hard_hard_birthday_wave_count,
-        record_birthday_worker_result, HardHardSocketSnapshot, PunchSendReport,
+        record_birthday_worker_result, BirthdaySweepFailureKind, HardHardSocketSnapshot,
+        PunchSendReport,
     };
     use crate::error::DaemonError;
     use p2pnet_nat::mapping::AllocationModelKind;
@@ -4166,13 +4402,11 @@ mod birthday_tests {
     async fn birthday_worker_collection_preserves_partial_stats_and_join_errors() {
         let mut wave_report = PunchSendReport::default();
         let mut wave_fully_completed = true;
-        let mut ordinary_worker_failed = false;
-        let mut join_worker_failed = false;
+        let mut failure_kind = None;
         record_birthday_worker_result(
             &mut wave_report,
             &mut wave_fully_completed,
-            &mut ordinary_worker_failed,
-            &mut join_worker_failed,
+            &mut failure_kind,
             Ok((2, Ok(PunchSendReport {
                 packets_sent: 1,
                 per_socket_sent: vec![(41, 2)],
@@ -4185,21 +4419,19 @@ mod birthday_tests {
         assert_eq!(wave_report.packets_sent, 1);
         assert_eq!(wave_report.per_socket_sent, vec![(41, 2)]);
         assert!(wave_fully_completed);
-        assert!(!ordinary_worker_failed);
-        assert!(!join_worker_failed);
+        assert_eq!(failure_kind, None);
 
         record_birthday_worker_result(
             &mut wave_report,
             &mut wave_fully_completed,
-            &mut ordinary_worker_failed,
-            &mut join_worker_failed,
+            &mut failure_kind,
             Ok((3, Err(DaemonError::Network("injected worker error".to_string())))),
         );
         assert_eq!(wave_report.packets_sent, 1);
         assert_eq!(wave_report.per_socket_sent, vec![(41, 2)]);
         assert_eq!(wave_report.targets_cancelled, 3);
         assert!(!wave_fully_completed);
-        assert!(ordinary_worker_failed);
+        assert_eq!(failure_kind, Some(BirthdaySweepFailureKind::Send));
 
         let handle = tokio::spawn(async { std::future::pending::<()>().await });
         handle.abort();
@@ -4207,13 +4439,11 @@ mod birthday_tests {
         record_birthday_worker_result(
             &mut wave_report,
             &mut wave_fully_completed,
-            &mut ordinary_worker_failed,
-            &mut join_worker_failed,
+            &mut failure_kind,
             Err(join_error),
         );
         assert!(!wave_fully_completed);
-        assert!(ordinary_worker_failed);
-        assert!(join_worker_failed);
+        assert_eq!(failure_kind, Some(BirthdaySweepFailureKind::WorkerJoin));
         assert_eq!(wave_report.packets_sent, 1);
         assert_eq!(wave_report.per_socket_sent, vec![(41, 2)]);
     }

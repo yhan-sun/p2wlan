@@ -2603,13 +2603,20 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
                 .expect("birthday summary must report fully completed waves");
             let targets_assigned = parse_count(&event.detail, "targets_assigned=")
                 .expect("birthday summary must report assigned targets");
+            let targets_examined = parse_count(&event.detail, "targets_examined=")
+                .expect("birthday summary must report examined targets");
             let targets_attempted = parse_count(&event.detail, "targets_attempted=")
                 .expect("birthday summary must report attempted targets");
+            let logical_probes_attempted =
+                parse_count(&event.detail, "logical_probes_attempted=")
+                    .expect("birthday summary must report logical attempts");
             let logical_probes_sent = parse_count(&event.detail, "logical_probes_sent=")
                 .expect("birthday summary must report logical probes");
             let physical_datagrams_sent =
                 parse_count(&event.detail, "physical_datagrams_sent=")
                     .expect("birthday summary must report physical datagrams");
+            let physical_send_errors = parse_count(&event.detail, "physical_send_errors=")
+                .expect("birthday summary must report physical send errors");
             let targets_cancelled = parse_count(&event.detail, "targets_cancelled=")
                 .expect("birthday summary must report cancelled targets");
             assert_eq!(waves_planned, 2);
@@ -2624,9 +2631,13 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
             assert_eq!(unavailable_socket_count, requested_socket_count - usable_socket_count);
             assert!(waves_fully_completed <= waves_started);
             assert!(waves_started <= waves_planned);
+            assert!(targets_examined <= targets_assigned);
             assert!(targets_attempted <= targets_assigned);
+            assert!(targets_attempted <= targets_examined);
+            assert!(logical_probes_sent <= logical_probes_attempted);
             assert!(logical_probes_sent <= effective_target_count * 2);
             assert!(physical_datagrams_sent >= logical_probes_sent);
+            assert!(physical_send_errors <= effective_target_count * 2);
             assert_eq!(targets_cancelled, targets_assigned - targets_attempted);
             assert!(event.detail.contains("first_send_at_ms="));
             assert!(event.detail.contains("last_send_at_ms="));
@@ -2650,6 +2661,56 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
     })
     .await
     .expect("birthday losers must detach after the authenticated winner is selected");
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_hard_physical_send_error_reaches_one_consistent_terminal_reason() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let now = hard_hard_now_for_test();
+    set_hard_hard_test_now_ms(Some(now));
+    let _clock = HardHardClockReset;
+    let harness = build_two_peer_harness_with_stun_mode(
+        true,
+        false,
+        false,
+        HarnessStunProfile::FULL_CAPACITY,
+        HarnessNatMode::HighEntropy,
+    )
+    .await;
+
+    // This is the production Hard birthday entry point. Fail its first
+    // physical UDP send at the shared send abstraction; the socket itself is
+    // left open so this cannot be mistaken for socket_unavailable.
+    harness.udp_a.set_probe_send_failures_for_test([1]);
+    trigger_initial_offer(&harness).await;
+
+    let summary = wait_for_stage(
+        &harness.peers_a,
+        HARD_HARD_B,
+        "hard_hard_birthday_sweep_summary",
+    )
+    .await;
+    assert!(summary.detail.contains("physical_send_errors=1"));
+    assert!(summary.detail.contains("stop_reason=send_error"));
+    assert!(!summary.detail.contains("stop_reason=socket_unavailable"));
+
+    let sweep_failed = wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_sweep_failed")
+        .await;
+    let hard_failed = wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_failed").await;
+    assert!(sweep_failed.detail.contains("stop_reason=send_error"));
+    assert!(hard_failed.detail.contains("stop_reason=send_error"));
+
+    let summary_count = harness
+        .peers_a
+        .get_connection(HARD_HARD_B)
+        .await
+        .unwrap()
+        .direct_events
+        .iter()
+        .filter(|event| event.stage == "hard_hard_birthday_sweep_summary")
+        .count();
+    assert_eq!(summary_count, 1, "one session must emit one final birthday summary");
     harness.shutdown().await;
 }
 

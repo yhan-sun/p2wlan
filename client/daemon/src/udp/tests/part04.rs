@@ -373,6 +373,39 @@ async fn generation_env() -> (Arc<PeerManager>, Arc<UdpTransport>, SimulatedNat)
     (peers, Arc::new(transport), nat)
 }
 
+async fn committed_dynamic_socket_for_send_test(
+    peers: &Arc<PeerManager>,
+    transport: &Arc<UdpTransport>,
+    peer_id: &str,
+) -> usize {
+    let (socket_index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
+    let handoff = transport
+        .attach_dynamic_punch_socket(peer_id, socket_index, socket, 0, 1, None)
+        .await
+        .unwrap();
+    assert!(
+        handoff
+            .commit_and_pin(transport, peer_id, socket_index, 0, 1)
+            .await
+            .committed
+    );
+    assert!(handoff.finalize().await);
+    assert!(
+        transport
+            .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
+            .await
+            .is_some()
+    );
+    let _ = peers;
+    socket_index
+}
+
+async fn exact_send_report_fixture() -> (Arc<PeerManager>, Arc<UdpTransport>, SimulatedNat, usize) {
+    let (peers, transport, nat) = generation_env().await;
+    let socket_index = committed_dynamic_socket_for_send_test(&peers, &transport, "peer-b").await;
+    (peers, transport, nat, socket_index)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn dynamic_attach_waits_for_first_reader_poll_before_immediate_stun() {
     let (_peers, transport, nat) = generation_env().await;
@@ -743,6 +776,105 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
     );
 
     listener.abort();
+}
+
+#[tokio::test]
+async fn exact_dynamic_socket_send_error_is_reported_as_send_error() {
+    let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
+    transport.set_probe_send_failures_for_test([1]);
+
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index(
+            "peer-b",
+            socket_index,
+            vec![nat.peer_public],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.logical_probes_attempted, 1);
+    assert_eq!(report.logical_probes_sent, 0);
+    assert_eq!(report.physical_datagrams_sent, 0);
+    assert_eq!(report.physical_send_errors, 1);
+    assert_eq!(report.targets_assigned, 1);
+    assert_eq!(report.targets_examined, 1);
+    assert_eq!(report.targets_attempted, 1);
+    assert_eq!(report.targets_cancelled, 0);
+    assert_eq!(report.budget_skipped, 0);
+    assert_eq!(
+        report.failure_kind,
+        Some(crate::udp::BirthdaySweepFailureKind::Send)
+    );
+    assert_ne!(
+        report
+            .birthday
+            .as_ref()
+            .and_then(|birthday| birthday.stop_reason.as_deref()),
+        Some("socket_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn exact_dynamic_socket_partial_physical_failure_keeps_success_and_error_counts() {
+    let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
+    // The authenticated primary is physical attempt 1; the compatibility
+    // copy is attempt 2. Fail only that copy so one logical Probe still has a
+    // successful physical send and one physical error.
+    transport.set_probe_send_failures_for_test([2]);
+
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index(
+            "peer-b",
+            socket_index,
+            vec![nat.peer_public],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.logical_probes_attempted, 1);
+    assert_eq!(report.logical_probes_sent, 1);
+    assert_eq!(report.packets_sent, 1);
+    assert_eq!(report.physical_datagrams_sent, 1);
+    assert_eq!(report.physical_send_errors, 1);
+    assert_eq!(report.per_socket_sent, vec![(socket_index, 1)]);
+    assert_eq!(
+        report.failure_kind,
+        Some(crate::udp::BirthdaySweepFailureKind::Send)
+    );
+}
+
+#[tokio::test]
+async fn exact_dynamic_socket_all_physical_failures_keep_target_progress() {
+    let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
+    transport.set_probe_send_failures_for_test([1, 2]);
+
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index(
+            "peer-b",
+            socket_index,
+            vec![nat.peer_public, "127.0.0.1:41001".parse().unwrap()],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.logical_probes_attempted, 2);
+    assert_eq!(report.logical_probes_sent, 0);
+    assert_eq!(report.physical_datagrams_sent, 0);
+    assert_eq!(report.physical_send_errors, 2);
+    assert_eq!(report.targets_assigned, 2);
+    assert_eq!(report.targets_examined, 2);
+    assert_eq!(report.targets_attempted, 2);
+    assert_eq!(report.targets_cancelled, 0);
+    assert_eq!(
+        report.failure_kind,
+        Some(crate::udp::BirthdaySweepFailureKind::Send)
+    );
 }
 
 #[tokio::test]

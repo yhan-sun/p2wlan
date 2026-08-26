@@ -823,8 +823,9 @@ impl PeerManager {
         // control event loop. A direct probe, candidate handover or relay
         // renewal may briefly own the connection map while it commits state;
         // the typed timeline event below remains authoritative when that map
-        // is contended. Hard↔Hard lifecycle markers are the exception: they
-        // are bounded acceptance evidence and use the durable branch below.
+        // is contended. Hard↔Hard terminal markers remain durable, while the
+        // pre-send sweep marker is intentionally best-effort so it cannot
+        // delay the first UDP datagram.
         let generation = self.current_network_generation_sync();
         let stage = stage.into();
         let detail = detail.into();
@@ -918,16 +919,16 @@ impl PeerManager {
         );
     }
 
-    /// Hard↔Hard terminal and lifecycle markers are acceptance evidence, not
-    /// best-effort trace noise.  Wait for the connection writer for these
-    /// bounded events so reciprocal validation cannot silently drop the final
-    /// summary/failure while high-volume ordinary diagnostics remain
-    /// non-blocking.
+    /// Hard↔Hard terminal markers are acceptance evidence, not best-effort
+    /// trace noise. Wait for the connection writer for these bounded events so
+    /// reciprocal validation cannot silently drop the final summary/failure.
+    /// `hard_hard_sweep_started` is deliberately excluded: it runs on the
+    /// punch-at deadline path and must not hold the first UDP send behind the
+    /// connection writer.
     fn direct_event_requires_durable_ring(stage: &str) -> bool {
         matches!(
             stage,
-            "hard_hard_sweep_started"
-                | "hard_hard_direct_validation_started"
+            "hard_hard_direct_validation_started"
                 | "hard_hard_probe_summary"
                 | "hard_hard_birthday_sweep_summary"
                 | "hard_hard_sweep_completed"
@@ -1423,6 +1424,23 @@ impl PeerManager {
             .await
             .get(node_id)
             .and_then(|connection| connection.probe_session_id.clone())
+    }
+
+    /// Best-effort session snapshot for a deadline-sensitive send path. A
+    /// diagnostics/control writer may be holding the connection map exactly
+    /// at punch time; returning `None` keeps that unrelated writer from
+    /// delaying the first UDP datagram. The receive counter key remains
+    /// generation-scoped, so this only reduces optional ACK attribution when
+    /// the snapshot is contended.
+    pub(crate) fn probe_session_id_for_peer_try(&self, node_id: &str) -> Option<String> {
+        self.connections
+            .try_read()
+            .ok()
+            .and_then(|connections| {
+                connections
+                    .get(node_id)
+                    .and_then(|connection| connection.probe_session_id.clone())
+            })
     }
 
     /// Return role-tagged Probe-v2 keys for inbound authentication. Only an

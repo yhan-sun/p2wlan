@@ -2,6 +2,35 @@ use probe_budget::{
     RelayBackoffHeartbeatReservation, RelayBackoffHeartbeatReservationRejection,
 };
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ProbeSendFailureHook {
+    fail_on_attempts: HashSet<usize>,
+    physical_send_attempt: usize,
+}
+
+#[derive(Debug)]
+struct ProbeSendFailure {
+    error: DaemonError,
+    physical_send_errors: u8,
+}
+
+impl ProbeSendFailure {
+    fn new(error: DaemonError) -> Self {
+        Self {
+            error,
+            physical_send_errors: 0,
+        }
+    }
+
+    fn with_physical_send_error(error: DaemonError) -> Self {
+        Self {
+            error,
+            physical_send_errors: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProbeSendResult {
     nonce: ProbeNonce,
@@ -17,6 +46,9 @@ struct ProbeSendResult {
     /// Wall-clock timestamp sampled immediately after the first successful
     /// kernel send.  This is deliberately not the dispatch timestamp.
     first_send_at_ms: Option<u64>,
+    /// Physical sends which returned an error during this logical probe. A
+    /// compatibility-copy failure can coexist with a successful primary.
+    physical_send_errors: u8,
 }
 
 impl UdpTransport {
@@ -613,6 +645,30 @@ impl UdpTransport {
         purpose: PendingProbePurpose,
         hard_hard_session_token: Option<&str>,
     ) -> Result<ProbeSendResult> {
+        self.send_probe_on_socket_result_with_hard_hard_token_classified(
+            socket_index,
+            socket,
+            peer_id,
+            peer_addr,
+            use_candidate,
+            purpose,
+            hard_hard_session_token,
+        )
+        .await
+        .map_err(|failure| failure.error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_probe_on_socket_result_with_hard_hard_token_classified(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+        hard_hard_session_token: Option<&str>,
+    ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
         let remote_candidate_epoch = match peer_id {
             Some(peer_id) => self
                 .peers
@@ -695,7 +751,9 @@ impl UdpTransport {
                 let nonce = decode_punch_packet(&bytes)
                     .map(|packet| packet.nonce)
                     .ok_or_else(|| {
-                        DaemonError::Network("failed to create UDP probe".to_string())
+                        ProbeSendFailure::new(DaemonError::Network(
+                            "failed to create UDP probe".to_string(),
+                        ))
                     })?;
                 (bytes.to_vec(), nonce, false, true, None, None)
             };
@@ -724,9 +782,9 @@ impl UdpTransport {
                 None => 0,
             };
             if current_remote_candidate_epoch != remote_candidate_epoch {
-                return Err(DaemonError::Network(
+                return Err(ProbeSendFailure::new(DaemonError::Network(
                     "probe invalidated: remote candidate generation changed".to_string(),
-                ));
+                )));
             }
             let state = self.socket_state.lock().await;
             if self.peers.current_network_generation_sync() != generation {
@@ -734,9 +792,9 @@ impl UdpTransport {
                     "Probe to {} invalidated: the network generation changed while the packet was built",
                     peer_addr
                 );
-                return Err(DaemonError::Network(
+                return Err(ProbeSendFailure::new(DaemonError::Network(
                     "probe invalidated: network generation changed".to_string(),
-                ));
+                )));
             }
             let current_cleanup_epoch = peer_id
                 .and_then(|peer_id| state.probe_cleanup_epochs.get(peer_id).copied())
@@ -746,9 +804,9 @@ impl UdpTransport {
                     "Probe to {} invalidated: the peer was cleaned up while the packet was built (epoch {cleanup_epoch} -> {current_cleanup_epoch})",
                     peer_addr
                 );
-                return Err(DaemonError::Network(
+                return Err(ProbeSendFailure::new(DaemonError::Network(
                     "probe invalidated: peer cleanup raced the send".to_string(),
-                ));
+                )));
             }
             let send_lease = if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
                 state.dynamic.get(&socket_index).map(|entry| {
@@ -805,11 +863,11 @@ impl UdpTransport {
             send_lease
         };
 
-        if let Err(error) = socket.send_to(&bytes, peer_addr).await {
+        if let Err(error) = self.send_probe_datagram(&socket, &bytes, peer_addr).await {
             self.pending_probes.lock().await.remove(&nonce);
             self.clear_hard_hard_pending_probe_token(nonce).await;
-            return Err(DaemonError::Network(format!(
-                "UDP probe send to {peer_addr} failed: {error}"
+            return Err(ProbeSendFailure::with_physical_send_error(DaemonError::Network(
+                format!("UDP probe send to {peer_addr} failed: {error}"),
             )));
         }
         let first_send_at_ms = Some(monotonic_millis());
@@ -830,8 +888,12 @@ impl UdpTransport {
         }
 
         let mut datagrams_sent = 1u8;
+        let mut physical_send_errors = 0u8;
         if let Some(legacy_probe) = compat_legacy_probe.clone() {
-            match socket.send_to(&legacy_probe, peer_addr).await {
+            match self
+                .send_probe_datagram(&socket, &legacy_probe, peer_addr)
+                .await
+            {
                 Ok(_) => {
                     datagrams_sent = datagrams_sent.saturating_add(1);
                     self.update_socket_diagnostics(socket_index, |metrics| {
@@ -862,6 +924,7 @@ impl UdpTransport {
                     }
                 }
                 Err(err) => {
+                    physical_send_errors = physical_send_errors.saturating_add(1);
                     debug!(
                         "Failed to send compatibility legacy UDP punch probe to peer {} at {}: {}",
                         peer_id.unwrap_or("unknown"),
@@ -886,7 +949,43 @@ impl UdpTransport {
             datagrams_sent,
             socket_index,
             first_send_at_ms,
+            physical_send_errors,
         })
+    }
+
+    async fn send_probe_datagram(
+        &self,
+        socket: &UdpSocket,
+        bytes: &[u8],
+        peer_addr: SocketAddr,
+    ) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if self.should_fail_probe_send_for_test() {
+            return Err(std::io::Error::other(
+                "test-injected physical probe send failure",
+            ));
+        }
+        socket.send_to(bytes, peer_addr).await
+    }
+
+    #[cfg(test)]
+    fn should_fail_probe_send_for_test(&self) -> bool {
+        if !self
+            .probe_send_failure_hook_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        let mut hook = self
+            .probe_send_failure_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(hook) = hook.as_mut() else {
+            return false;
+        };
+        hook.physical_send_attempt = hook.physical_send_attempt.saturating_add(1);
+        hook.fail_on_attempts
+            .contains(&hook.physical_send_attempt)
     }
 
     /// Send an authenticated ICE-style nominated connectivity check for a direct trial.
