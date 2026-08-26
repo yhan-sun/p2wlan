@@ -411,7 +411,7 @@ async fn remote_candidate_refresh_retains_confirmed_direct_when_endpoint_is_omit
 }
 
 #[tokio::test]
-async fn remote_candidate_refresh_does_not_retain_direct_from_stale_local_generation() {
+async fn remote_candidate_refresh_defense_in_depth_rejects_mismatched_direct_generation() {
     let manager = PeerManager::new(test_config());
     let old_endpoint: SocketAddr = "203.0.113.10:41010".parse().unwrap();
     let fresh_endpoint: SocketAddr = "203.0.113.10:42010".parse().unwrap();
@@ -443,8 +443,10 @@ async fn remote_candidate_refresh_does_not_retain_direct_from_stale_local_genera
         let mut connections = manager.connections.write().await;
         let connection = connections.get_mut("peer1").expect("peer must remain present");
         assert_eq!(connection.state, ConnectionState::Direct);
-        // A Direct state from a different local generation is not valid
-        // evidence for retaining a changed remote transport context.
+        // Synthetic invariant violation: public lifecycle APIs update Direct
+        // state and direct_generation together under the shared epoch gate.
+        // This white-box case verifies the defense-in-depth fence if an
+        // impossible mismatch ever reaches candidate application.
         connection.direct_generation = generation.saturating_add(1);
     }
     let before = manager.get_connection("peer1").await.unwrap();
