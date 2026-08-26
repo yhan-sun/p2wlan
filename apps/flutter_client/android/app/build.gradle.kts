@@ -84,8 +84,23 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
 }
 
+val sourceIdentityFile = rootProject.file("../../../target/p2wlan-source-identity.env")
+val sourceIdentity = Properties()
+if (sourceIdentityFile.isFile) {
+    sourceIdentityFile.inputStream().use {
+        sourceIdentity.load(it)
+    }
+}
+val sourceIdentityKeys = listOf(
+    "P2WLAN_SOURCE_GIT_COMMIT",
+    "P2WLAN_SOURCE_BUILD_ID",
+    "P2WLAN_SOURCE_DIRTY",
+    "P2WLAN_SOURCE_DIFF_HASH",
+)
+
 val buildP2wlanNative by tasks.registering(Exec::class) {
     inputs.property("P2WLAN_ANDROID_ABIS", System.getenv("P2WLAN_ANDROID_ABIS") ?: "all")
+    inputs.file(sourceIdentityFile).optional()
     inputs.files(
         rootProject.file("../../../Cargo.toml"),
         rootProject.file("../../../Cargo.lock"),
@@ -97,6 +112,11 @@ val buildP2wlanNative by tasks.registering(Exec::class) {
         "bash",
         rootProject.file("../../../scripts/build_android_native.sh").absolutePath,
     )
+    sourceIdentityKeys.forEach { key ->
+        sourceIdentity.getProperty(key)?.let { value ->
+            environment(key, value)
+        }
+    }
 }
 
 tasks.named("preBuild").configure {
