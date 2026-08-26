@@ -35,6 +35,7 @@ FLUTTER_MANAGED=(
   "apps/flutter_client/pubspec.lock"
   "apps/flutter_client/analysis_options.yaml"
   "apps/flutter_client/.metadata"
+  "apps/flutter_client/android/app/build.gradle.kts"
   "apps/flutter_client/linux/flutter/generated_plugin_registrant.cc"
   "apps/flutter_client/linux/flutter/generated_plugin_registrant.h"
   "apps/flutter_client/linux/flutter/generated_plugins.cmake"

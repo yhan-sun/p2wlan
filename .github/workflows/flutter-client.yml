@@ -146,6 +146,30 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
+      - name: Restore Flutter-managed source files before identity stamping
+        working-directory: .
+        shell: bash
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Assert clean Flutter client identity
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_commit="$(git rev-parse HEAD)"
+          expected_build_id="${expected_commit:0:12}"
+          identity="$(python3 scripts/release/flutter_client_build_identity.py apk --release)"
+          printf '%s\n' "$identity"
+          grep -F -- "--dart-define=P2WLAN_CLIENT_GIT_COMMIT=${expected_commit}" <<<"$identity"
+          grep -F -- "--dart-define=P2WLAN_CLIENT_BUILD_ID=${expected_build_id}" <<<"$identity"
+          grep -F -- "--dart-define=P2WLAN_CLIENT_DIRTY=false" <<<"$identity"
+          grep -F -- "--dart-define=P2WLAN_CLIENT_DIFF_HASH=" <<<"$identity"
+          if grep -Fq -- "-dirty-" <<<"$identity"; then
+            echo "Flutter client identity unexpectedly contains a dirty build ID" >&2
+            exit 1
+          fi
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
       - name: Build arm64 release APK
         env:
           P2WLAN_ANDROID_ABIS: arm64-v8a
@@ -155,7 +179,7 @@ jobs:
           # a test APK, but only push/workflow-dispatch builds are distributable.
           P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: ${{ github.event_name == 'pull_request' && '1' || '0' }}
         run: >
-          flutter build apk
+          bash ../../scripts/release/build_flutter_client.sh apk
           --release
           --target-platform android-arm64
           --split-per-abi
@@ -176,6 +200,7 @@ jobs:
             echo "Expected only arm64-v8a in $apk, found: ${actual_abis:-none}" >&2
             exit 1
           fi
+          echo "android_apk_sha256=$(sha256sum "$apk" | awk '{print $1}')"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

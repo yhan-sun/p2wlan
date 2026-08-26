@@ -217,9 +217,13 @@ impl PeerManager {
         // failure remains the hard liveness fence that can demote it.  Without
         // Direct proof, a changed set is still a real handover and retains the
         // strict epoch/cancellation fence.
+        // The generation comparison is defense-in-depth: public lifecycle
+        // transitions update both values under the shared epoch gate, while
+        // this guard also rejects a synthetic invariant violation.
         let retained_direct_endpoint = remote_candidate_set_changed
             .then(|| {
-                (conn.state == ConnectionState::Direct)
+                (conn.state == ConnectionState::Direct
+                    && conn.direct_generation == generation)
                     .then(|| conn.selected_direct_endpoint_for_consent(generation))
                     .flatten()
             })

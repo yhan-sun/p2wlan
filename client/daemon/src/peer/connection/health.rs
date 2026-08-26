@@ -538,6 +538,7 @@ impl PeerConnection {
         retired_pair_count: usize,
     ) {
         debug_assert_eq!(self.state, ConnectionState::Direct);
+        debug_assert_eq!(self.direct_generation, local_generation);
         debug_assert!(self
             .selected_direct_endpoint_for_consent(local_generation)
             .is_some_and(|endpoint| endpoint == retained_endpoint));

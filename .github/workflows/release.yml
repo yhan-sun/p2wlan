@@ -102,7 +102,7 @@ jobs:
         env:
           P2WLAN_ANDROID_ABIS: arm64-v8a
         run: >
-          flutter build apk
+          bash ../../scripts/release/build_flutter_client.sh apk
           --release
           --target-platform android-arm64
           --split-per-abi
@@ -123,6 +123,7 @@ jobs:
             echo "Expected only arm64-v8a in $apk, found: ${actual_abis:-none}" >&2
             exit 1
           fi
+          echo "android_apk_sha256=$(sha256sum "$apk" | awk '{print $1}')"
 
       - name: Assemble Android release artifact
         run: |

@@ -115,6 +115,113 @@ fn build_epoch_ms() -> u128 {
         .unwrap_or_default()
 }
 
+const SOURCE_IDENTITY_ENV: [&str; 4] = [
+    "P2WLAN_SOURCE_GIT_COMMIT",
+    "P2WLAN_SOURCE_BUILD_ID",
+    "P2WLAN_SOURCE_DIRTY",
+    "P2WLAN_SOURCE_DIFF_HASH",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceIdentity {
+    commit: String,
+    build_id: String,
+    dirty: bool,
+    diff_hash: String,
+}
+
+fn is_hex(value: &str, length: usize) -> bool {
+    value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_source_identity(
+    commit: &str,
+    build_id: &str,
+    dirty_value: &str,
+    diff_hash: &str,
+) -> Result<SourceIdentity, String> {
+    if !is_hex(commit, 40) {
+        return Err(format!(
+            "P2WLAN_SOURCE_GIT_COMMIT must be a 40-character hexadecimal SHA-1, got {commit:?}"
+        ));
+    }
+    let dirty = match dirty_value {
+        "true" => true,
+        "false" => false,
+        _ => {
+            return Err(format!(
+                "P2WLAN_SOURCE_DIRTY must be exactly true or false, got {dirty_value:?}"
+            ));
+        }
+    };
+    if dirty {
+        if !is_hex(diff_hash, 40) {
+            return Err(format!(
+                "dirty source identity requires a 40-character hexadecimal diff hash, got {diff_hash:?}"
+            ));
+        }
+    } else if !diff_hash.is_empty() {
+        return Err(format!(
+            "clean source identity requires an empty diff hash, got {diff_hash:?}"
+        ));
+    }
+    let expected_build_id = if dirty {
+        format!("{}-dirty-{}", &commit[..12], &diff_hash[..12])
+    } else {
+        commit[..12].to_string()
+    };
+    if build_id != expected_build_id {
+        return Err(format!(
+            "P2WLAN_SOURCE_BUILD_ID does not match commit/dirty state: expected {expected_build_id:?}, got {build_id:?}"
+        ));
+    }
+    Ok(SourceIdentity {
+        commit: commit.to_string(),
+        build_id: build_id.to_string(),
+        dirty,
+        diff_hash: diff_hash.to_string(),
+    })
+}
+
+fn source_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} contains non-Unicode bytes")),
+    }
+}
+
+fn frozen_source_identity() -> Result<Option<SourceIdentity>, String> {
+    let values = [
+        (SOURCE_IDENTITY_ENV[0], source_env(SOURCE_IDENTITY_ENV[0])?),
+        (SOURCE_IDENTITY_ENV[1], source_env(SOURCE_IDENTITY_ENV[1])?),
+        (SOURCE_IDENTITY_ENV[2], source_env(SOURCE_IDENTITY_ENV[2])?),
+        (SOURCE_IDENTITY_ENV[3], source_env(SOURCE_IDENTITY_ENV[3])?),
+    ];
+    let provided = values.iter().filter(|(_, value)| value.is_some()).count();
+    if provided == 0 {
+        return Ok(None);
+    }
+    if provided != values.len() {
+        let missing = values
+            .iter()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "frozen source identity must provide all fields; missing: {missing}"
+        ));
+    }
+    validate_source_identity(
+        values[0].1.as_deref().expect("checked above"),
+        values[1].1.as_deref().expect("checked above"),
+        values[2].1.as_deref().expect("checked above"),
+        values[3].1.as_deref().expect("checked above"),
+    )
+    .map(Some)
+}
+
 fn build_identity(commit: &str, dirty: bool, diff_hash: &str) -> String {
     if dirty {
         format!(
@@ -199,7 +306,7 @@ fn checkout_state() -> (bool, String) {
 mod tests {
     use std::path::Path;
 
-    use super::{build_identity, dirty_material, repo_watch_path};
+    use super::{build_identity, dirty_material, repo_watch_path, validate_source_identity};
 
     #[test]
     fn untracked_content_changes_dirty_material() {
@@ -242,20 +349,84 @@ mod tests {
             "0123456789ab-dirty-fedcba987654"
         );
     }
+
+    #[test]
+    fn frozen_source_identity_accepts_clean_and_dirty_contracts() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            validate_source_identity(commit, "0123456789ab", "false", "").unwrap(),
+            super::SourceIdentity {
+                commit: commit.to_string(),
+                build_id: "0123456789ab".to_string(),
+                dirty: false,
+                diff_hash: String::new(),
+            }
+        );
+        assert!(validate_source_identity(
+            commit,
+            "0123456789ab-dirty-fedcba987654",
+            "true",
+            "fedcba98765432100123456789abcdef01234567"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn frozen_source_identity_rejects_malformed_contracts() {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let invalid = [
+            ("not-a-commit", "0123456789ab", "false", ""),
+            (commit, "0123456789ab", "maybe", ""),
+            (
+                commit,
+                "0123456789ab",
+                "false",
+                "fedcba98765432100123456789abcdef01234567",
+            ),
+            (commit, "0123456789ab-dirty-fedcba987654", "true", ""),
+            (commit, "wrong-build-id", "false", ""),
+        ];
+        for (commit, build_id, dirty, diff_hash) in invalid {
+            assert!(
+                validate_source_identity(commit, build_id, dirty, diff_hash).is_err(),
+                "invalid frozen identity unexpectedly accepted: {} {} {} {}",
+                commit,
+                build_id,
+                dirty,
+                diff_hash,
+            );
+        }
+    }
 }
 
 fn main() {
     println!("cargo:rerun-if-env-changed=P2WLAN_BUILD_EPOCH_MS");
-    let commit = git_root()
-        .as_deref()
-        .and_then(git_head)
-        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rerun-if-env-changed=P2WLAN_SOURCE_IDENTITY_REFRESH");
+    for name in SOURCE_IDENTITY_ENV {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let frozen = frozen_source_identity()
+        .unwrap_or_else(|error| panic!("invalid frozen source identity override: {}", error));
+    let (commit, dirty, diff_hash, build_id) = if let Some(identity) = frozen {
+        (
+            identity.commit,
+            identity.dirty,
+            identity.diff_hash,
+            identity.build_id,
+        )
+    } else {
+        let commit = git_root()
+            .as_deref()
+            .and_then(git_head)
+            .unwrap_or_else(|| "unknown".to_string());
+        let (dirty, diff_hash) = checkout_state();
+        let build_id = build_identity(&commit, dirty, &diff_hash);
+        (commit, dirty, diff_hash, build_id)
+    };
     println!("cargo:rustc-env=P2WLAN_GIT_COMMIT={commit}");
-    let (dirty, diff_hash) = checkout_state();
     println!("cargo:rustc-env=P2WLAN_DIRTY={dirty}");
     println!("cargo:rustc-env=P2WLAN_DIFF_HASH={diff_hash}");
     let build_ms = build_epoch_ms();
-    let build_id = build_identity(&commit, dirty, &diff_hash);
     println!("cargo:rustc-env=P2WLAN_BUILD_ID={build_id}");
     println!("cargo:rustc-env=P2WLAN_BUILD_TIME_MS={build_ms}");
     // Re-run when the checked-out commit moves so stale builds never claim a

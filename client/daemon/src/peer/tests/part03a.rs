@@ -411,6 +411,69 @@ async fn remote_candidate_refresh_retains_confirmed_direct_when_endpoint_is_omit
 }
 
 #[tokio::test]
+async fn remote_candidate_refresh_defense_in_depth_rejects_mismatched_direct_generation() {
+    let manager = PeerManager::new(test_config());
+    let old_endpoint: SocketAddr = "203.0.113.10:41010".parse().unwrap();
+    let fresh_endpoint: SocketAddr = "203.0.113.10:42010".parse().unwrap();
+    manager.add_peer(&test_peer("peer1", old_endpoint)).await;
+
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[old_endpoint.to_string()],
+                &HashMap::new(),
+                20,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+    manager
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            old_endpoint,
+            Some(Duration::from_millis(6)),
+        )
+        .await;
+    manager.record_direct_success("peer1", Some(old_endpoint)).await;
+
+    let generation = manager.current_network_generation().await;
+    {
+        let mut connections = manager.connections.write().await;
+        let connection = connections.get_mut("peer1").expect("peer must remain present");
+        assert_eq!(connection.state, ConnectionState::Direct);
+        // Synthetic invariant violation: public lifecycle APIs update Direct
+        // state and direct_generation together under the shared epoch gate.
+        // This white-box case verifies the defense-in-depth fence if an
+        // impossible mismatch ever reaches candidate application.
+        connection.direct_generation = generation.saturating_add(1);
+    }
+    let before = manager.get_connection("peer1").await.unwrap();
+    let previous_remote_epoch = before.remote_candidate_epoch();
+
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                "peer1",
+                &[fresh_endpoint.to_string()],
+                &HashMap::new(),
+                21,
+                Some(u64::MAX),
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    let after = manager.get_connection("peer1").await.unwrap();
+    assert!(after.remote_candidate_epoch() > previous_remote_epoch);
+    assert_eq!(after.state, ConnectionState::FallbackToRelay);
+    assert_eq!(after.endpoint, Some(fresh_endpoint));
+    assert!(!after.candidates.contains(&old_endpoint.to_string()));
+    assert!(after.candidates.contains(&fresh_endpoint.to_string()));
+}
+
+#[tokio::test]
 async fn identical_versioned_candidate_refresh_advances_only_freshness_revision() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "203.0.113.10:41030".parse().unwrap();
