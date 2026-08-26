@@ -70,6 +70,10 @@ build_native() {
   export "CC_${target_key}=$llvm_bin/$clang"
   export "CXX_${target_key}=$llvm_bin/${clang/clang/clang++}"
   export "AR_${target_key}=$llvm_bin/llvm-ar"
+  # Flutter may migrate tracked Android Gradle files during `flutter build`.
+  # Restore the managed checkout immediately before Cargo stamps the native
+  # daemon, so the embedded daemon identity describes the clean source HEAD.
+  P2WLAN_ROOT_DIR="$repo_root" bash "$repo_root/scripts/release/hermetic_build.sh" restore
   cargo build --manifest-path "$repo_root/Cargo.toml" \
     -p p2wlan-android-native --release --target "$target"
 
