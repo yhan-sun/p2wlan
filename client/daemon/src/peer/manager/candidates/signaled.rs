@@ -219,7 +219,8 @@ impl PeerManager {
         // strict epoch/cancellation fence.
         let retained_direct_endpoint = remote_candidate_set_changed
             .then(|| {
-                (conn.state == ConnectionState::Direct)
+                (conn.state == ConnectionState::Direct
+                    && conn.direct_generation == generation)
                     .then(|| conn.selected_direct_endpoint_for_consent(generation))
                     .flatten()
             })

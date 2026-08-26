@@ -155,7 +155,7 @@ jobs:
           # a test APK, but only push/workflow-dispatch builds are distributable.
           P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: ${{ github.event_name == 'pull_request' && '1' || '0' }}
         run: >
-          flutter build apk
+          bash ../../scripts/release/build_flutter_client.sh apk
           --release
           --target-platform android-arm64
           --split-per-abi
@@ -176,6 +176,7 @@ jobs:
             echo "Expected only arm64-v8a in $apk, found: ${actual_abis:-none}" >&2
             exit 1
           fi
+          echo "android_apk_sha256=$(sha256sum "$apk" | awk '{print $1}')"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
