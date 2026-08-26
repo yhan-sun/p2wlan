@@ -281,17 +281,23 @@ impl UdpTransport {
     pub(crate) fn set_probe_send_failures_for_test(
         &self,
         fail_on_attempts: impl IntoIterator<Item = usize>,
-    ) {
+    ) -> ProbeSendFailureGuard {
+        let fail_on_attempts = fail_on_attempts.into_iter().collect::<HashSet<_>>();
         let mut hook = self
             .probe_send_failure_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *hook = Some(ProbeSendFailureHook {
-            fail_on_attempts: fail_on_attempts.into_iter().collect(),
+            fail_on_attempts: fail_on_attempts.clone(),
             physical_send_attempt: 0,
         });
+        drop(hook);
         self.probe_send_failure_hook_enabled
-            .store(true, Ordering::Release);
+            .store(!fail_on_attempts.is_empty(), Ordering::Release);
+        ProbeSendFailureGuard {
+            hook: self.probe_send_failure_hook.clone(),
+            enabled: self.probe_send_failure_hook_enabled.clone(),
+        }
     }
 
     /// Add up to `count - 1` ephemeral sockets for an explicitly enabled
@@ -448,7 +454,7 @@ impl UdpTransport {
     /// generation.  The key is derived from the authenticated Probe-v2 source
     /// identity (or a matched pending probe for legacy compatibility), never
     /// from an unauthenticated source address.
-    async fn update_peer_probe_rx_diagnostics(
+    pub(crate) async fn update_peer_probe_rx_diagnostics(
         &self,
         peer_id: &str,
         generation: u64,

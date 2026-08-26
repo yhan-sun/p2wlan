@@ -63,6 +63,7 @@ impl PeerManager {
             c0_pair_ledgers: Arc::new(RwLock::new(HashMap::new())),
             direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_commit_notify: Arc::new(Notify::new()),
+            direct_commit_pair_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_confirm_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_confirm_notify: Arc::new(Notify::new()),
             relay_probe_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -550,6 +551,17 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active_generation(node_id)
+    }
+
+    /// Hold the connection writer for deterministic lock-contention tests.
+    /// Production code never needs to expose this guard; the test-only helper
+    /// makes it possible to prove timing-sensitive paths do not await this
+    /// lock.
+    #[cfg(test)]
+    pub(crate) async fn hold_connections_writer_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, PeerConnection>> {
+        self.connections.write().await
     }
 
     #[cfg(test)]

@@ -14,8 +14,8 @@ const NAT_IP: [u8; 4] = [127, 0, 0, 1];
 
 /// A simulated linear-symmetric NAT middlebox on the loopback address.
 /// (127.0.0.2 is not bound on every macOS build, so the public side shares
-/// 127.0.0.1 with the client; ports never overlap because the allocator
-/// starts at 45390 while ephemeral sockets use 49152+.)
+/// 127.0.0.1 with the client; every public and observer endpoint is still
+/// kernel-assigned.
 ///
 /// One fresh public port is allocated per (local socket, destination) pair,
 /// walking a configurable step sequence. STUN observer sockets double as the
@@ -25,11 +25,6 @@ const NAT_IP: [u8; 4] = [127, 0, 0, 1];
 /// forwarded back through the peer's public endpoint so the punching side
 /// sees the peer's stable public address.
 ///
-/// Every instance starts its allocator at a unique base port so parallel
-/// tests never fight over the same public forwarder bindings.
-static NAT_INSTANCE_BASE_PORTS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(45390);
-
 struct SimulatedNat {
     /// STUN observer endpoints (127.0.0.2:X) the client measures against.
     observers: Vec<SocketAddr>,
@@ -53,11 +48,72 @@ struct SimulatedNat {
     /// Per-public-port outbound forwarder sockets.
     forwarders: Arc<Mutex<HashMap<u16, Arc<UdpSocket>>>>,
     nat_ip: IpAddr,
+    /// Own every background router/observer task so a test releases its
+    /// synthetic NAT resources as soon as the fixture is dropped.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Reserve a short arithmetic run from a kernel-selected base. The simulator
+/// needs deterministic port deltas for the production learner, but it must
+/// not claim a process-global fixed range: a :0 seed plus an explicit
+/// reservation makes each test instance independent across test binaries.
+async fn reserve_linear_forwarders(
+    nat_ip: IpAddr,
+    step: i16,
+) -> (u16, HashMap<u16, Arc<UdpSocket>>) {
+    const RESERVED_MAPPING_PORTS: usize = 16;
+    const RESERVATION_RETRIES: usize = 64;
+
+    for _ in 0..RESERVATION_RETRIES {
+        let seed = UdpSocket::bind(SocketAddr::new(nat_ip, 0))
+            .await
+            .unwrap_or_else(|error| panic!("bind simulated NAT :0 seed: {error}"));
+        let base_port = seed
+            .local_addr()
+            .expect("simulated NAT seed must have a local address")
+            .port();
+        let mut reserved = HashMap::with_capacity(RESERVED_MAPPING_PORTS);
+        reserved.insert(base_port, Arc::new(seed));
+        if step == 0 {
+            return (base_port, reserved);
+        }
+        let mut port = base_port;
+        let mut available = true;
+        for _ in 1..RESERVED_MAPPING_PORTS {
+            port = port.wrapping_add(step as u16);
+            if port == 0 {
+                available = false;
+                break;
+            }
+            match UdpSocket::bind(SocketAddr::new(nat_ip, port)).await {
+                Ok(socket) => {
+                    reserved.insert(port, Arc::new(socket));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    available = false;
+                    break;
+                }
+                Err(error) => panic!("bind simulated NAT reserved forwarder: {error}"),
+            }
+        }
+        if available {
+            return (base_port, reserved);
+        }
+        // Dropping the reservation closes every candidate socket before the
+        // next :0 seed is selected.
+    }
+    panic!("could not reserve a kernel-selected simulated NAT port run");
 }
 
 impl SimulatedNat {
     async fn start(step: i16, consume_before_punch: bool) -> Self {
         let nat_ip = IpAddr::V4(Ipv4Addr::from(NAT_IP));
+        let (base_port, reserved_forwarders) = reserve_linear_forwarders(nat_ip, step).await;
         let mut observer_holders = Vec::new();
         let mut observers = Vec::new();
         for _ in 0..3 {
@@ -73,13 +129,8 @@ impl SimulatedNat {
                 .await
                 .unwrap();
         let peer_private = peer_private_socket.local_addr().unwrap();
-        drop(observer_holders);
 
-        let base_port = NAT_INSTANCE_BASE_PORTS
-            .fetch_add(256, std::sync::atomic::Ordering::Relaxed)
-            .min(u16::MAX as u32 - 4_096) as u16;
-
-        let nat = Self {
+        let mut nat = Self {
             observers,
             peer_public,
             peer_private,
@@ -90,9 +141,11 @@ impl SimulatedNat {
             next_port: Arc::new(Mutex::new(base_port)),
             step,
             consume_before_punch,
-            forwarders: Arc::new(Mutex::new(HashMap::new())),
+            forwarders: Arc::new(Mutex::new(reserved_forwarders)),
             nat_ip,
+            tasks: Vec::new(),
         };
+        let mut tasks = Vec::new();
 
         // Outbound/inbound router on the peer's public endpoint.
         {
@@ -105,7 +158,7 @@ impl SimulatedNat {
             let nat_ip = nat.nat_ip;
             let step = nat.step;
             let consume_before_punch = nat.consume_before_punch;
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
                 while let Ok((len, client_src)) = peer_public_socket.recv_from(&mut buf).await {
                     let data = buf[..len].to_vec();
@@ -182,7 +235,7 @@ impl SimulatedNat {
                     // mapping's public source port.
                     let _ = forwarder.send_to(&data, peer_private).await;
                 }
-            });
+            }));
         }
 
         // Per-mapping forwarder loops: inbound peer ACKs are forwarded back
@@ -193,7 +246,7 @@ impl SimulatedNat {
             let forwarders = nat.forwarders.clone();
             let mapping_sources = nat.mapping_sources.clone();
             let peer_public_socket = peer_public_socket.clone();
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
                 loop {
                     let sockets = {
@@ -225,7 +278,7 @@ impl SimulatedNat {
                         sleep(Duration::from_millis(2)).await;
                     }
                 }
-            });
+            }));
         }
 
         // STUN observer loops.
@@ -234,11 +287,10 @@ impl SimulatedNat {
             let next_port = nat.next_port.clone();
             let step = nat.step;
             let nat_ip = nat.nat_ip;
-            for observer in nat.observers.iter().copied() {
-                let socket = UdpSocket::bind(observer).await.unwrap();
+            for (observer, socket) in nat.observers.iter().copied().zip(observer_holders) {
                 let mappings = mappings.clone();
                 let next_port = next_port.clone();
-                tokio::spawn(async move {
+                tasks.push(tokio::spawn(async move {
                     let mut buf = vec![0u8; 2048];
                     while let Ok((len, client_src)) = socket.recv_from(&mut buf).await {
                         let data = buf[..len].to_vec();
@@ -268,10 +320,11 @@ impl SimulatedNat {
                             }
                         }
                     }
-                });
+                }));
             }
         }
 
+        nat.tasks = tasks;
         nat
     }
 
@@ -289,6 +342,14 @@ impl SimulatedNat {
             .await
             .get(&(client_src, self.peer_public))
             .expect("punch mapping assigned")
+    }
+}
+
+impl Drop for SimulatedNat {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
     }
 }
 
@@ -781,7 +842,7 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
 #[tokio::test]
 async fn exact_dynamic_socket_send_error_is_reported_as_send_error() {
     let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
-    transport.set_probe_send_failures_for_test([1]);
+    let _send_failures = transport.set_probe_send_failures_for_test([1]);
 
     let report = transport
         .punch_candidates_from_dynamic_socket_index(
@@ -822,7 +883,7 @@ async fn exact_dynamic_socket_partial_physical_failure_keeps_success_and_error_c
     // The authenticated primary is physical attempt 1; the compatibility
     // copy is attempt 2. Fail only that copy so one logical Probe still has a
     // successful physical send and one physical error.
-    transport.set_probe_send_failures_for_test([2]);
+    let _send_failures = transport.set_probe_send_failures_for_test([2]);
 
     let report = transport
         .punch_candidates_from_dynamic_socket_index(
@@ -840,17 +901,46 @@ async fn exact_dynamic_socket_partial_physical_failure_keeps_success_and_error_c
     assert_eq!(report.packets_sent, 1);
     assert_eq!(report.physical_datagrams_sent, 1);
     assert_eq!(report.physical_send_errors, 1);
+    assert_eq!(report.partial_physical_send_errors, 1);
     assert_eq!(report.per_socket_sent, vec![(socket_index, 1)]);
-    assert_eq!(
-        report.failure_kind,
-        Some(crate::udp::BirthdaySweepFailureKind::Send)
-    );
+    assert_eq!(report.failure_kind, None);
+}
+
+#[tokio::test]
+async fn exact_dynamic_socket_transient_primary_failure_continues_to_later_target() {
+    let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
+    // Fail only the first target's authenticated primary. The next target
+    // must still enter the same bounded exact-socket sweep and send.
+    let _send_failures = transport.set_probe_send_failures_for_test([1]);
+
+    let later_target: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index(
+            "peer-b",
+            socket_index,
+            vec![nat.peer_public, later_target],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.logical_probes_attempted, 2);
+    assert_eq!(report.logical_probes_sent, 1);
+    assert_eq!(report.logical_probe_send_failures, 1);
+    assert_eq!(report.physical_datagrams_sent, 2);
+    assert_eq!(report.physical_send_errors, 1);
+    assert_eq!(report.failure_kind, None);
+    assert_eq!(report.targets_attempted, 2);
+    assert_eq!(report.targets_cancelled, 0);
+    assert_eq!(report.unique_target_endpoints, 1);
+    assert_eq!(report.sent_target_endpoints, vec![later_target]);
 }
 
 #[tokio::test]
 async fn exact_dynamic_socket_all_physical_failures_keep_target_progress() {
     let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
-    transport.set_probe_send_failures_for_test([1, 2]);
+    let _send_failures = transport.set_probe_send_failures_for_test([1, 2]);
 
     let report = transport
         .punch_candidates_from_dynamic_socket_index(
@@ -908,11 +998,41 @@ async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends()
         .unwrap();
     assert_eq!(report.packets_sent, 0);
     assert_eq!(report.unique_target_endpoints, 0);
+    assert_eq!(report.probe_path_errors, 1);
+    assert_eq!(
+        report.failure_kind,
+        Some(crate::udp::BirthdaySweepFailureKind::SocketUnavailable)
+    );
     assert!(!peers.is_direct("peer-b").await);
     assert_eq!(
         peers.select_path_for_data("peer-b", true, true).await.path,
         Some(NetworkPath::Relay),
         "a detached exact Hard↔Hard socket must leave Relay as the data path"
+    );
+}
+
+#[tokio::test]
+async fn hard_hard_wrong_owner_exact_socket_is_revoked_not_unavailable() {
+    let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
+
+    let report = transport
+        .punch_candidates_from_dynamic_socket_index(
+            "peer-c",
+            socket_index,
+            vec![nat.peer_public],
+            Duration::ZERO,
+            1,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.packets_sent, 0);
+    assert_eq!(report.targets_assigned, 1);
+    assert_eq!(report.targets_cancelled, 1);
+    assert_eq!(report.probe_path_errors, 1);
+    assert_eq!(
+        report.failure_kind,
+        Some(crate::udp::BirthdaySweepFailureKind::SocketRevoked)
     );
 }
 

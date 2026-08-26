@@ -511,6 +511,40 @@ impl PeerManager {
                 == Some(identity.remote_profile_generation)
     }
 
+    /// Confirmation-time session fence that never waits on `connections`.
+    /// The full asynchronous predicate above remains the cleanup/diagnostic
+    /// authority; the grace timer uses this version because the Direct commit
+    /// mirror and UDP socket proof already carry the state that was validated
+    /// under the connection writer.  A connection-map writer therefore cannot
+    /// delay the confirmation start or consume its bounded grace.
+    pub(crate) async fn hard_hard_session_identity_is_current_for_confirmation(
+        &self,
+        identity: &HardHardFreshSocketIdentity,
+    ) -> bool {
+        let now = unix_time_millis();
+        let record = self
+            .hard_hard_sessions
+            .lock()
+            .await
+            .values()
+            .find(|record| {
+                record.peer_id == identity.peer_id
+                    && record.session_token == identity.session_token
+                    && record.expires_at_ms >= now
+            })
+            .cloned();
+        let Some(record) = record else {
+            return false;
+        };
+        record.local_network_generation == identity.network_generation
+            && record.remote_candidate_epoch == identity.remote_candidate_epoch
+            && record.local_profile_generation == identity.local_profile_generation
+            && record.remote_profile_generation == identity.remote_profile_generation
+            && record.fresh_socket == *identity
+            && self.current_network_generation_sync() == identity.network_generation
+            && self.current_local_profile_generation_sync() == identity.local_profile_generation
+    }
+
     /// Return true when the current authoritative Direct state selected a pair
     /// on this socket's exact local endpoint and current candidate epoch.  The
     /// UDP layer separately proves affinity and authenticated socket evidence;

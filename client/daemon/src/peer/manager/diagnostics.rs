@@ -438,6 +438,23 @@ mod diagnostics_tests {
         .await;
         assert!(started.is_ok(), "sweep start must not await the writer");
 
+        let validation_started = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.record_direct_event(
+                "peer-hard-lock",
+                "hard_hard_direct_validation_started",
+                None,
+                Some(64),
+                Some(1),
+                "confirmation grace must not await the writer",
+            ),
+        )
+        .await;
+        assert!(
+            validation_started.is_ok(),
+            "Direct confirmation start must not await the writer"
+        );
+
         let mut terminal = Box::pin(manager.record_direct_event(
             "peer-hard-lock",
             "hard_hard_birthday_sweep_summary",

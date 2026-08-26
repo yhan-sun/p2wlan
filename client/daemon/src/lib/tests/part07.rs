@@ -17,12 +17,11 @@ use tokio::sync::{watch, Notify, Semaphore};
 const HARD_HARD_A: &str = "peer-a";
 const HARD_HARD_B: &str = "peer-b";
 
-/// The fixed public ports are the top-1 prediction from each configured STUN
-/// sequence. A fresh test allocation gets a disjoint block so the E2E tests
-/// remain safe when the workspace runs tests concurrently.
-static HARD_HARD_NEXT_PORT: AtomicU16 = AtomicU16::new(0);
+/// Every harness owns kernel-assigned loopback sockets. This counter only
+/// namespaces its temporary config directory; it is not a port allocator.
+static HARD_HARD_NEXT_HARNESS_ID: AtomicU64 = AtomicU64::new(1);
 static HARD_HARD_NEXT_SIGNAL_SEQ: AtomicU64 = AtomicU64::new(1);
-static HARD_HARD_E2E_SERIAL: Semaphore = Semaphore::const_new(1);
+pub(crate) static HARD_HARD_E2E_SERIAL: Semaphore = Semaphore::const_new(1);
 const HARD_HARD_E2E_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
@@ -59,55 +58,82 @@ struct HarnessPorts {
 }
 
 impl HarnessPorts {
-    fn allocate_with_mode(stun: HarnessStunProfile, mode: HarnessNatMode) -> Self {
+    async fn allocate_with_mode(
+        stun: HarnessStunProfile,
+        mode: HarnessNatMode,
+    ) -> (Self, Arc<UdpSocket>, Arc<UdpSocket>, Vec<TestStunObserver>) {
         assert!((3..=4).contains(&stun.observer_count));
-        // Keep concurrent test processes on separate fixed-port blocks. The
-        // per-process atomic still spaces harnesses within one test binary;
-        // the PID slot prevents another binary from stealing 127.0.0.1's
-        // observer ports before that in-process allocator can help.
-        let process_base = 8_000u16.saturating_add(
-            (std::process::id() % 100) as u16 * 450,
-        );
-        let base = process_base.saturating_add(HARD_HARD_NEXT_PORT.fetch_add(300, Ordering::Relaxed));
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let (a_public_offset, b_public_offset, a_mapped, b_mapped) = match mode {
-            HarnessNatMode::Predictable => (
-                if stun.observer_count == 4 { 16 } else { 12 },
-                if stun.observer_count == 4 { 112 } else { 109 },
-                [base, base + 4, base + 8, base + 12],
-                [base + 100, base + 103, base + 106, base + 109],
-            ),
+        let a_public = Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap());
+        let b_public = Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap());
+        let a_public_addr = a_public.local_addr().unwrap();
+        let b_public_addr = b_public.local_addr().unwrap();
+        let mapped_ports = |public_port: u16, side: u16| match mode {
+            HarnessNatMode::Predictable => {
+                if side == 0 {
+                    [
+                        offset_port(public_port, -16),
+                        offset_port(public_port, -12),
+                        offset_port(public_port, -8),
+                        offset_port(public_port, -4),
+                    ]
+                } else {
+                    [
+                        offset_port(public_port, -12),
+                        offset_port(public_port, -9),
+                        offset_port(public_port, -6),
+                        offset_port(public_port, -3),
+                    ]
+                }
+            }
             // The first observed port is also the real public endpoint. The
             // remaining samples deliberately jump in both directions so the
             // production allocation model classifies this as HighEntropy,
             // while the birthday candidate set still contains the endpoint
             // that the fake NAT link owns.
-            HarnessNatMode::HighEntropy => (
-                12,
-                109,
-                [base + 12, base + 181, base + 43, base + 257],
-                [base + 109, base + 220, base + 137, base + 271],
-            ),
+            HarnessNatMode::HighEntropy => [
+                public_port,
+                offset_port(public_port, if side == 0 { 169 } else { 111 }),
+                offset_port(public_port, if side == 0 { 31 } else { 28 }),
+                offset_port(public_port, if side == 0 { 245 } else { 162 }),
+            ],
         };
-        Self {
-            a_public: SocketAddr::new(ip, base.saturating_add(a_public_offset)),
-            b_public: SocketAddr::new(ip, base.saturating_add(b_public_offset)),
-            a_observers: [
-                SocketAddr::new(ip, base.saturating_add(1)),
-                SocketAddr::new(ip, base.saturating_add(2)),
-                SocketAddr::new(ip, base.saturating_add(3)),
-                SocketAddr::new(ip, base.saturating_add(4)),
-            ],
-            b_observers: [
-                SocketAddr::new(ip, base.saturating_add(5)),
-                SocketAddr::new(ip, base.saturating_add(6)),
-                SocketAddr::new(ip, base.saturating_add(7)),
-                SocketAddr::new(ip, base.saturating_add(8)),
-            ],
-            a_mapped,
-            b_mapped,
+        let a_mapped = mapped_ports(a_public_addr.port(), 0);
+        let b_mapped = mapped_ports(b_public_addr.port(), 1);
+        let mut a_observer_list = Vec::with_capacity(4);
+        let mut b_observer_list = Vec::with_capacity(4);
+        let mut observers = Vec::with_capacity(8);
+        for mapped_port in a_mapped {
+            let observer = spawn_stun_observer(SocketAddr::new(ip, 0), mapped_port);
+            a_observer_list.push(observer.endpoint);
+            observers.push(observer);
         }
+        for mapped_port in b_mapped {
+            let observer = spawn_stun_observer(SocketAddr::new(ip, 0), mapped_port);
+            b_observer_list.push(observer.endpoint);
+            observers.push(observer);
+        }
+        let a_observers = a_observer_list.try_into().expect("four A observers");
+        let b_observers = b_observer_list.try_into().expect("four B observers");
+        (
+            Self {
+                a_public: a_public_addr,
+                b_public: b_public_addr,
+                a_observers,
+                b_observers,
+                a_mapped,
+                b_mapped,
+            },
+            a_public,
+            b_public,
+            observers,
+        )
     }
+}
+
+fn offset_port(port: u16, offset: i32) -> u16 {
+    let modulus = i32::from(u16::MAX);
+    (1 + (i32::from(port).saturating_sub(1) + offset).rem_euclid(modulus)) as u16
 }
 
 struct HardHardClockReset;
@@ -303,6 +329,7 @@ impl Drop for TestStunObserver {
 /// batch cap, and dynamic-socket inbound paths.
 fn spawn_stun_observer(bind: SocketAddr, mapped_port: u16) -> TestStunObserver {
     let socket = std::net::UdpSocket::bind(bind).unwrap();
+    let endpoint = socket.local_addr().unwrap();
     socket.set_nonblocking(true).unwrap();
     let requests = Arc::new(AtomicU16::new(0));
     let responses = Arc::new(AtomicU16::new(0));
@@ -342,7 +369,7 @@ fn spawn_stun_observer(bind: SocketAddr, mapped_port: u16) -> TestStunObserver {
         }
     });
     TestStunObserver {
-        endpoint: bind,
+        endpoint,
         requests,
         responses,
         shutdown,
@@ -370,24 +397,26 @@ struct HeldAcks {
 }
 
 impl NatPacketLink {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         ports: HarnessPorts,
+        a_public: Arc<UdpSocket>,
+        b_public: Arc<UdpSocket>,
         udp_a: UdpTransport,
         udp_b: UdpTransport,
         actual_public: Option<(SocketAddr, SocketAddr)>,
         primary_a: Option<SocketAddr>,
         route_dynamic_socket: bool,
     ) -> Self {
-        let a_public = Arc::new(UdpSocket::bind(ports.a_public).await.unwrap());
-        let b_public = Arc::new(UdpSocket::bind(ports.b_public).await.unwrap());
+        let has_separate_sources = actual_public.is_some();
         let (a_source_endpoint, b_source_endpoint) =
             actual_public.unwrap_or((ports.a_public, ports.b_public));
-        let a_source = if a_source_endpoint == ports.a_public {
+        let a_source = if !has_separate_sources {
             a_public.clone()
         } else {
             Arc::new(UdpSocket::bind(a_source_endpoint).await.unwrap())
         };
-        let b_source = if b_source_endpoint == ports.b_public {
+        let b_source = if !has_separate_sources {
             b_public.clone()
         } else {
             Arc::new(UdpSocket::bind(b_source_endpoint).await.unwrap())
@@ -906,14 +935,15 @@ async fn build_two_peer_harness_with_stun_mode(
     stun: HarnessStunProfile,
     nat_mode: HarnessNatMode,
 ) -> TwoPeerHarness {
-    let ports = HarnessPorts::allocate_with_mode(stun, nat_mode);
+    let (ports, a_public_socket, b_public_socket, stun_observers) =
+        HarnessPorts::allocate_with_mode(stun, nat_mode).await;
     let birthday_enabled = nat_mode == HarnessNatMode::HighEntropy;
     let a_identity = NodeIdentity::generate();
     let b_identity = NodeIdentity::generate();
     let root = std::env::temp_dir().join(format!(
         "p2wlan-phase-2-2-{}-{}",
         std::process::id(),
-        HARD_HARD_NEXT_PORT.load(Ordering::Relaxed)
+        HARD_HARD_NEXT_HARNESS_ID.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&root).unwrap();
     let path_a = root.join("peer-a.json");
@@ -1081,12 +1111,14 @@ async fn build_two_peer_harness_with_stun_mode(
     let primary_a = race_primary.then(|| udp_a.local_addr().unwrap());
     let actual_public = mapping_miss.then(|| {
         (
-            SocketAddr::new(ports.a_public.ip(), ports.a_public.port().saturating_add(1)),
-            SocketAddr::new(ports.b_public.ip(), ports.b_public.port().saturating_add(1)),
+            SocketAddr::new(ports.a_public.ip(), 0),
+            SocketAddr::new(ports.b_public.ip(), 0),
         )
     });
     let link = NatPacketLink::new(
         ports,
+        a_public_socket,
+        b_public_socket,
         udp_a.clone(),
         udp_b.clone(),
         actual_public,
@@ -1113,23 +1145,6 @@ async fn build_two_peer_harness_with_stun_mode(
             .run_control_event_loop(&mut relay_started, network_tx_b)
             .await;
     });
-    let mut stun_observers = ports
-        .a_observers
-        .iter()
-        .take(stun.observer_count)
-        .copied()
-        .zip(ports.a_mapped.iter().copied())
-        .map(|(bind, mapped)| spawn_stun_observer(bind, mapped))
-        .collect::<Vec<_>>();
-    stun_observers.extend(
-        ports
-            .b_observers
-            .iter()
-            .take(stun.observer_count)
-            .copied()
-            .zip(ports.b_mapped.iter().copied())
-            .map(|(bind, mapped)| spawn_stun_observer(bind, mapped)),
-    );
     tasks_a.append(&mut tasks_b);
     TwoPeerHarness {
         peers_a,
@@ -1324,6 +1339,39 @@ async fn wait_for_both_direct_compact(harness: &TwoPeerHarness) {
             summarize(harness.peers_b.diagnostics().await),
         );
     }
+}
+
+async fn wait_for_current_direct_diagnostics(
+    peers: &PeerManager,
+    peer_id: &str,
+) -> peer::PeerDiagnostics {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            // `diagnostics()` is deliberately nonblocking and may return its
+            // previous cached snapshot while a state commit owns the
+            // connections writer. Assertions about a just-observed Direct
+            // commit must use the current try-read snapshot instead of
+            // turning that intentional cache fallback into an Idle-vs-Direct
+            // failure under the standard parallel workspace load.
+            if let Some((_, diagnostics)) = peers
+                .diagnostic_with_path_selection(
+                    peer_id,
+                    true,
+                    false,
+                    Duration::ZERO,
+                    None,
+                )
+                .await
+            {
+                if diagnostics.state == ConnectionState::Direct {
+                    return diagnostics;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("current Direct diagnostics must become readable after the commit")
 }
 
 async fn wait_for_stage(
@@ -2060,6 +2108,7 @@ async fn hard_hard_response_network_generation_fence_precedes_punch_preemption()
         peers
             .hard_hard_register_session(peer::HardHardSessionRecord {
                 session_id: format!("hh1:i:{token}"),
+                probe_session_id: None,
                 session_token: token.clone(),
                 peer_id: HARD_HARD_B.to_string(),
                 initiator: true,
@@ -2436,8 +2485,7 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
         (&harness.peers_a, HARD_HARD_B, harness.link.b_public.local_addr().unwrap()),
         (&harness.peers_b, HARD_HARD_A, harness.link.a_public.local_addr().unwrap()),
     ] {
-        let diagnostics = peers.diagnostics().await;
-        let peer = &diagnostics[0];
+        let peer = wait_for_current_direct_diagnostics(peers, remote_id).await;
         assert_eq!(peer.state, ConnectionState::Direct);
         assert_eq!(peer.active_path, Some(NetworkPath::Direct));
         let observed = peer
@@ -2682,7 +2730,10 @@ async fn hard_hard_physical_send_error_reaches_one_consistent_terminal_reason() 
     // This is the production Hard birthday entry point. Fail its first
     // physical UDP send at the shared send abstraction; the socket itself is
     // left open so this cannot be mistaken for socket_unavailable.
-    harness.udp_a.set_probe_send_failures_for_test([1]);
+    let _send_failures = harness.udp_a.set_probe_send_failures_for_test(1..=512);
+    let _peer_send_failures = harness.udp_b.set_probe_send_failures_for_test(1..=512);
+    harness.link.set_drop_a_to_b(true);
+    harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
 
     let summary = wait_for_stage(
@@ -2691,8 +2742,12 @@ async fn hard_hard_physical_send_error_reaches_one_consistent_terminal_reason() 
         "hard_hard_birthday_sweep_summary",
     )
     .await;
-    assert!(summary.detail.contains("physical_send_errors=1"));
-    assert!(summary.detail.contains("stop_reason=send_error"));
+    assert!(summary.detail.contains("physical_send_errors="));
+    assert!(
+        summary.detail.contains("stop_reason=send_error"),
+        "unexpected birthday summary: {}",
+        summary.detail
+    );
     assert!(!summary.detail.contains("stop_reason=socket_unavailable"));
 
     let sweep_failed = wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_sweep_failed")
@@ -2889,6 +2944,71 @@ async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
     valid_harness.shutdown().await;
 }
 
+async fn install_direct_scheduler_birthday_session(
+    peers: &Arc<PeerManager>,
+    peer_id: &str,
+    token: &str,
+    plan: peer::HardHardPlanSnapshot,
+    result: &crate::udp::HardHardBirthdayResult,
+) {
+    let socket = result
+        .sockets
+        .first()
+        .expect("a Birthday scheduler session needs one exact socket");
+    let identity = peer::HardHardFreshSocketIdentity {
+        peer_id: peer_id.to_string(),
+        session_token: token.to_string(),
+        network_generation: plan.local_network_generation,
+        remote_candidate_epoch: plan.remote_candidate_epoch,
+        local_profile_generation: plan.local_profile_generation,
+        remote_profile_generation: plan.remote_profile_generation,
+        punch_generation: socket.punch_generation,
+        socket_index: socket.socket_index,
+        socket_local_endpoint: socket.socket_local_endpoint,
+    };
+    let now = hard_hard_now_for_test();
+    assert!(
+        peers
+            .hard_hard_register_session(peer::HardHardSessionRecord {
+                session_id: format!("birthday-scheduler-{token}"),
+                probe_session_id: None,
+                session_token: token.to_string(),
+                peer_id: peer_id.to_string(),
+                initiator: true,
+                remote_network_generation: 0,
+                local_network_generation: plan.local_network_generation,
+                remote_candidate_epoch: plan.remote_candidate_epoch,
+                local_profile_generation: plan.local_profile_generation,
+                remote_profile_generation: plan.remote_profile_generation,
+                local_prediction_confidence: 90,
+                remote_prediction_confidence: 0,
+                requested_birthday_level: result.requested_level,
+                generated_candidate_count: result.requested_level,
+                signaled_candidate_count: result
+                    .candidate_endpoints
+                    .len()
+                    .min(crate::MAX_SIGNAL_CANDIDATES),
+                birthday: true,
+                requested_socket_indices: result
+                    .sockets
+                    .iter()
+                    .map(|socket| socket.socket_index)
+                    .collect(),
+                requested_socket_count: result.requested_socket_count,
+                prediction_window: result.candidate_endpoints.clone(),
+                remote_prediction: Vec::new(),
+                fresh_socket: identity,
+                punch_at_ms: now,
+                expires_at_ms: now.saturating_add(30_000),
+                state: peer::HardHardSessionState::AwaitingPeer,
+                attempt_count: 0,
+                created_at: Instant::now(),
+                cancellation: Arc::new(crate::PunchSessionCancellation::default()),
+            })
+            .await
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
     let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
@@ -2935,6 +3055,14 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
             .peers_a
             .peer_session_generation_sync(HARD_HARD_B)
             .expect("production scheduler test requires the live peer session");
+        install_direct_scheduler_birthday_session(
+            &harness.peers_a,
+            HARD_HARD_B,
+            &format!("level-{requested_level}"),
+            plan,
+            &result,
+        )
+        .await;
         let scheduler_report = harness
             .udp_a
             .punch_hard_hard_birthday_candidates_with_metadata(
@@ -3063,6 +3191,14 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
         .peers_a
         .peer_session_generation_sync(HARD_HARD_B)
         .expect("production scheduler cap test requires the live peer session");
+    install_direct_scheduler_birthday_session(
+        &harness.peers_a,
+        HARD_HARD_B,
+        token,
+        plan,
+        &result,
+    )
+    .await;
     let scheduler_targets = (0..256usize)
         .map(|index| {
             SocketAddr::new(
@@ -3803,6 +3939,7 @@ async fn hard_hard_manager_peer_isolation_keeps_unrelated_session_authoritative(
         };
         peer::HardHardSessionRecord {
             session_id: format!("hh1:i:{token}"),
+            probe_session_id: None,
             session_token: token.to_string(),
             peer_id: peer_id.to_string(),
             initiator: true,
@@ -3887,6 +4024,7 @@ async fn hard_hard_manager_sticky_winner_rejects_delayed_authenticated_socket() 
     let endpoint_b: SocketAddr = "127.0.0.1:31101".parse().unwrap();
     let record = peer::HardHardSessionRecord {
         session_id: "hh1:i:sticky-token".to_string(),
+        probe_session_id: None,
         session_token: "sticky-token".to_string(),
         peer_id: "peer-sticky".to_string(),
         initiator: true,

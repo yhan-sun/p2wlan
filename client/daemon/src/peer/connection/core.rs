@@ -246,6 +246,12 @@ pub struct PeerConnection {
     /// dynamic-socket eviction can re-verify "is this peer Direct?" under its
     /// own socket-state lock without awaiting the async manager there.
     direct_cache: Option<Arc<std::sync::Mutex<HashSet<String>>>>,
+    /// Manager-owned lock-free snapshot of the exact pair selected by the
+    /// latest Direct commit. It is cleared with the Direct-set mirror on any
+    /// non-Direct transition so a generic state change cannot resurrect a
+    /// stale Hard↔Hard pair.
+    direct_pair_cache:
+        Option<Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>>,
 }
 
 impl PeerConnection {
@@ -390,6 +396,7 @@ impl PeerConnection {
             path_events: Vec::new(),
             direct_events: Vec::new(),
             direct_cache: None,
+            direct_pair_cache: None,
         }
     }
 
@@ -509,20 +516,36 @@ impl PeerConnection {
     /// connection's state, so the UDP layer can re-verify the nonevictable
     /// set inside its socket-state lock.
     fn sync_direct_cache(&self) {
-        let Some(cache) = &self.direct_cache else {
-            return;
-        };
-        let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.state == ConnectionState::Direct {
-            cache.insert(self.node_id.clone());
-        } else {
-            cache.remove(&self.node_id);
+        if let Some(cache) = &self.direct_cache {
+            let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.state == ConnectionState::Direct {
+                cache.insert(self.node_id.clone());
+            } else {
+                cache.remove(&self.node_id);
+            }
+        }
+        if self.state != ConnectionState::Direct {
+            if let Some(cache) = &self.direct_pair_cache {
+                cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&self.node_id);
+            }
         }
     }
 
     /// Attach the manager's synchronous Direct-set mirror (manager-owned).
     pub(crate) fn attach_direct_cache(&mut self, cache: Arc<std::sync::Mutex<HashSet<String>>>) {
         self.direct_cache = Some(cache);
+        self.sync_direct_cache();
+    }
+
+    /// Attach the manager's lock-free exact Direct-pair mirror.
+    pub(crate) fn attach_direct_pair_cache(
+        &mut self,
+        cache: Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
+    ) {
+        self.direct_pair_cache = Some(cache);
         self.sync_direct_cache();
     }
 

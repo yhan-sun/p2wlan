@@ -369,6 +369,7 @@ impl PeerManager {
         // Keep the synchronous Direct-set mirror attached to every connection
         // so its `transition` keeps the UDP eviction's nonevictable set fresh.
         conn.attach_direct_cache(self.direct_peers.clone());
+        conn.attach_direct_pair_cache(self.direct_commit_pair_mirror.clone());
 
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
@@ -922,14 +923,14 @@ impl PeerManager {
     /// Hard↔Hard terminal markers are acceptance evidence, not best-effort
     /// trace noise. Wait for the connection writer for these bounded events so
     /// reciprocal validation cannot silently drop the final summary/failure.
-    /// `hard_hard_sweep_started` is deliberately excluded: it runs on the
-    /// punch-at deadline path and must not hold the first UDP send behind the
-    /// connection writer.
+    /// `hard_hard_sweep_started` and
+    /// `hard_hard_direct_validation_started` are deliberately excluded: both
+    /// run on the punch-at/confirmation timing path and must not hold the
+    /// first UDP send or confirmation grace behind the connection writer.
     fn direct_event_requires_durable_ring(stage: &str) -> bool {
         matches!(
             stage,
-            "hard_hard_direct_validation_started"
-                | "hard_hard_probe_summary"
+            "hard_hard_probe_summary"
                 | "hard_hard_birthday_sweep_summary"
                 | "hard_hard_sweep_completed"
                 | "hard_hard_sweep_failed"
@@ -1424,23 +1425,6 @@ impl PeerManager {
             .await
             .get(node_id)
             .and_then(|connection| connection.probe_session_id.clone())
-    }
-
-    /// Best-effort session snapshot for a deadline-sensitive send path. A
-    /// diagnostics/control writer may be holding the connection map exactly
-    /// at punch time; returning `None` keeps that unrelated writer from
-    /// delaying the first UDP datagram. The receive counter key remains
-    /// generation-scoped, so this only reduces optional ACK attribution when
-    /// the snapshot is contended.
-    pub(crate) fn probe_session_id_for_peer_try(&self, node_id: &str) -> Option<String> {
-        self.connections
-            .try_read()
-            .ok()
-            .and_then(|connections| {
-                connections
-                    .get(node_id)
-                    .and_then(|connection| connection.probe_session_id.clone())
-            })
     }
 
     /// Return role-tagged Probe-v2 keys for inbound authentication. Only an

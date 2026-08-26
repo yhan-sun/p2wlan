@@ -9,16 +9,32 @@ struct ProbeSendFailureHook {
     physical_send_attempt: usize,
 }
 
+#[cfg(test)]
+pub(crate) struct ProbeSendFailureGuard {
+    hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
+    enabled: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl Drop for ProbeSendFailureGuard {
+    fn drop(&mut self) {
+        *self.hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.enabled.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 struct ProbeSendFailure {
     error: DaemonError,
+    kind: ProbeSendFailureKind,
     physical_send_errors: u8,
 }
 
 impl ProbeSendFailure {
-    fn new(error: DaemonError) -> Self {
+    fn new(kind: ProbeSendFailureKind, error: DaemonError) -> Self {
         Self {
             error,
+            kind,
             physical_send_errors: 0,
         }
     }
@@ -26,6 +42,7 @@ impl ProbeSendFailure {
     fn with_physical_send_error(error: DaemonError) -> Self {
         Self {
             error,
+            kind: ProbeSendFailureKind::PhysicalSend,
             physical_send_errors: 1,
         }
     }
@@ -576,6 +593,31 @@ impl UdpTransport {
         ))
     }
 
+    /// Classify an exact dynamic-socket lookup failure without substituting a
+    /// pool socket.  This is used by the bounded Hard↔Hard scheduler so a
+    /// detached member, a revoked owner and a stale network generation remain
+    /// distinguishable in the terminal report.
+    pub(crate) async fn classify_dynamic_socket_failure_kind(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+    ) -> ProbeSendFailureKind {
+        if socket_index < DYNAMIC_SOCKET_INDEX_BASE {
+            return ProbeSendFailureKind::SocketUnavailable;
+        }
+        let state = self.socket_state.lock().await;
+        let Some(dynamic) = state.dynamic.get(&socket_index) else {
+            return ProbeSendFailureKind::SocketUnavailable;
+        };
+        if dynamic.peer_id != peer_id || !dynamic.phase.is_usable() {
+            return ProbeSendFailureKind::SocketRevoked;
+        }
+        if dynamic.network_generation != self.peers.current_network_generation_sync() {
+            return ProbeSendFailureKind::NetworkGenerationChanged;
+        }
+        ProbeSendFailureKind::SocketUnavailable
+    }
+
     /// Send one authenticated/legacy probe from an explicit socket.
     ///
     /// This is the shared core for pool sockets and dedicated punch sockets:
@@ -653,6 +695,7 @@ impl UdpTransport {
             use_candidate,
             purpose,
             hard_hard_session_token,
+            false,
         )
         .await
         .map_err(|failure| failure.error)
@@ -668,6 +711,7 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
         hard_hard_session_token: Option<&str>,
+        require_exact_dynamic_owner: bool,
     ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
         let remote_candidate_epoch = match peer_id {
             Some(peer_id) => self
@@ -751,9 +795,12 @@ impl UdpTransport {
                 let nonce = decode_punch_packet(&bytes)
                     .map(|packet| packet.nonce)
                     .ok_or_else(|| {
-                        ProbeSendFailure::new(DaemonError::Network(
-                            "failed to create UDP probe".to_string(),
-                        ))
+                        ProbeSendFailure::new(
+                            ProbeSendFailureKind::ProbeEncodingFailed,
+                            DaemonError::Network(
+                                "failed to create UDP probe".to_string(),
+                            ),
+                        )
                     })?;
                 (bytes.to_vec(), nonce, false, true, None, None)
             };
@@ -782,9 +829,12 @@ impl UdpTransport {
                 None => 0,
             };
             if current_remote_candidate_epoch != remote_candidate_epoch {
-                return Err(ProbeSendFailure::new(DaemonError::Network(
-                    "probe invalidated: remote candidate generation changed".to_string(),
-                )));
+                return Err(ProbeSendFailure::new(
+                    ProbeSendFailureKind::CandidateEpochChanged,
+                    DaemonError::Network(
+                        "probe invalidated: remote candidate generation changed".to_string(),
+                    ),
+                ));
             }
             let state = self.socket_state.lock().await;
             if self.peers.current_network_generation_sync() != generation {
@@ -792,9 +842,12 @@ impl UdpTransport {
                     "Probe to {} invalidated: the network generation changed while the packet was built",
                     peer_addr
                 );
-                return Err(ProbeSendFailure::new(DaemonError::Network(
-                    "probe invalidated: network generation changed".to_string(),
-                )));
+                return Err(ProbeSendFailure::new(
+                    ProbeSendFailureKind::NetworkGenerationChanged,
+                    DaemonError::Network(
+                        "probe invalidated: network generation changed".to_string(),
+                    ),
+                ));
             }
             let current_cleanup_epoch = peer_id
                 .and_then(|peer_id| state.probe_cleanup_epochs.get(peer_id).copied())
@@ -804,9 +857,44 @@ impl UdpTransport {
                     "Probe to {} invalidated: the peer was cleaned up while the packet was built (epoch {cleanup_epoch} -> {current_cleanup_epoch})",
                     peer_addr
                 );
-                return Err(ProbeSendFailure::new(DaemonError::Network(
-                    "probe invalidated: peer cleanup raced the send".to_string(),
-                )));
+                return Err(ProbeSendFailure::new(
+                    ProbeSendFailureKind::PeerSessionChanged,
+                    DaemonError::Network("probe invalidated: peer cleanup raced the send".to_string()),
+                ));
+            }
+            if require_exact_dynamic_owner && socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
+                let Some(peer_id) = peer_id else {
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketRevoked,
+                        DaemonError::Network(
+                            "probe invalidated: dynamic socket has no peer owner".to_string(),
+                        ),
+                    ));
+                };
+                let Some(dynamic) = state.dynamic.get(&socket_index) else {
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketUnavailable,
+                        DaemonError::Network(format!(
+                            "UDP socket pool member {socket_index} is unavailable"
+                        )),
+                    ));
+                };
+                if dynamic.peer_id != peer_id || !dynamic.phase.is_usable() {
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketRevoked,
+                        DaemonError::Network(format!(
+                            "UDP socket pool member {socket_index} is no longer owned by peer"
+                        )),
+                    ));
+                }
+                if dynamic.network_generation != generation {
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::NetworkGenerationChanged,
+                        DaemonError::Network(
+                            "probe invalidated: dynamic socket generation changed".to_string(),
+                        ),
+                    ));
+                }
             }
             let send_lease = if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
                 state.dynamic.get(&socket_index).map(|entry| {
