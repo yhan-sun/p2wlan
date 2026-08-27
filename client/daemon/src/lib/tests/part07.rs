@@ -61,8 +61,40 @@ struct HarnessPorts {
 
 const A_PREDICTABLE_MAPPED_OFFSETS: [i32; 4] = [-16, -12, -8, -4];
 const B_PREDICTABLE_MAPPED_OFFSETS: [i32; 4] = [-12, -9, -6, -3];
-const A_PREDICTABLE_CANDIDATE_GUARD_OFFSETS: [i32; 5] = [-16, -12, -8, -4, 4];
-const B_PREDICTABLE_CANDIDATE_GUARD_OFFSETS: [i32; 5] = [-12, -9, -6, -3, 3];
+
+fn predictable_candidate_guard_offsets(mapped_offsets: &[i32; 4], step: i32) -> Vec<i32> {
+    let mut offsets = mapped_offsets.to_vec();
+    let last = *mapped_offsets.last().expect("predictable mapped samples");
+    for distance in 1..=p2pnet_nat::mapping::MAX_PREDICTED_PORTS {
+        let offset = last + step * distance as i32;
+        // The public link socket already owns offset zero.
+        if offset != 0 && !offsets.contains(&offset) {
+            offsets.push(offset);
+        }
+    }
+    offsets
+}
+
+#[test]
+fn hard_hard_predictable_candidate_guards_cover_complete_successor_windows() {
+    for (mapped_offsets, step) in [
+        (A_PREDICTABLE_MAPPED_OFFSETS, 4),
+        (B_PREDICTABLE_MAPPED_OFFSETS, 3),
+    ] {
+        let offsets = predictable_candidate_guard_offsets(&mapped_offsets, step);
+        assert!(mapped_offsets
+            .iter()
+            .all(|mapped| offsets.contains(mapped)));
+        let last = *mapped_offsets.last().unwrap();
+        for distance in 1..=p2pnet_nat::mapping::MAX_PREDICTED_PORTS {
+            let predicted = last + step * distance as i32;
+            if predicted != 0 {
+                assert!(offsets.contains(&predicted));
+            }
+        }
+        assert!(!offsets.contains(&0));
+    }
+}
 
 async fn reserve_predictable_public_endpoint(
     ip: IpAddr,
@@ -109,16 +141,18 @@ impl HarnessPorts {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let (a_public, b_public, candidate_guards) = match mode {
             HarnessNatMode::Predictable => {
-                let (a_public, mut guards) = reserve_predictable_public_endpoint(
-                    ip,
-                    &A_PREDICTABLE_CANDIDATE_GUARD_OFFSETS,
-                )
-                .await;
-                let (b_public, b_guards) = reserve_predictable_public_endpoint(
-                    ip,
-                    &B_PREDICTABLE_CANDIDATE_GUARD_OFFSETS,
-                )
-                .await;
+                // Reserve the complete production-bounded successor windows,
+                // not only their top candidates. Otherwise Windows can assign
+                // a dynamic socket one of the later predicted target ports and
+                // let traffic bypass the synthetic NAT link entirely.
+                let a_offsets =
+                    predictable_candidate_guard_offsets(&A_PREDICTABLE_MAPPED_OFFSETS, 4);
+                let b_offsets =
+                    predictable_candidate_guard_offsets(&B_PREDICTABLE_MAPPED_OFFSETS, 3);
+                let (a_public, mut guards) =
+                    reserve_predictable_public_endpoint(ip, &a_offsets).await;
+                let (b_public, b_guards) =
+                    reserve_predictable_public_endpoint(ip, &b_offsets).await;
                 guards.extend(b_guards);
                 (a_public, b_public, guards)
             }
@@ -1818,6 +1852,95 @@ async fn wait_for_current_direct_diagnostics(
     .expect("current Direct diagnostics must become readable after the commit")
 }
 
+struct CurrentFreshDirect {
+    diagnostics: peer::PeerDiagnostics,
+    socket_index: usize,
+    socket_local_endpoint: SocketAddr,
+    predicted_ports: Vec<u16>,
+}
+
+async fn wait_for_current_fresh_direct(
+    peers: &PeerManager,
+    udp: &UdpTransport,
+    peer_id: &str,
+) -> CurrentFreshDirect {
+    let current = timeout(Duration::from_secs(1), async {
+        loop {
+            let diagnostics = peers
+                .diagnostic_with_path_selection(
+                    peer_id,
+                    true,
+                    false,
+                    Duration::ZERO,
+                    None,
+                )
+                .await
+                .map(|(_, diagnostics)| diagnostics);
+            let fresh = peers.fresh_mapping_for_peer(peer_id).await;
+            let affinity = udp.affinity_pin_for_test(peer_id).await;
+            let selected = udp
+                .socket_for_peer(Some(peer_id))
+                .await
+                .and_then(|(index, socket)| {
+                    socket
+                        .local_addr()
+                        .ok()
+                        .map(|local_endpoint| (index, local_endpoint))
+                });
+
+            if let (Some(diagnostics), Some(fresh), Some(affinity), Some(selected)) =
+                (diagnostics, fresh, affinity, selected)
+            {
+                let pair_local_endpoint = diagnostics
+                    .current_direct_pair
+                    .as_ref()
+                    .and_then(|pair| pair.local_endpoint.as_deref());
+                if diagnostics.state == ConnectionState::Direct
+                    && diagnostics.active_path == Some(NetworkPath::Direct)
+                    && affinity.socket_index == fresh.socket_index
+                    && selected.0 == fresh.socket_index
+                    && selected.1 == fresh.socket_local_endpoint
+                    && pair_local_endpoint
+                        == Some(fresh.socket_local_endpoint.to_string()).as_deref()
+                {
+                    return CurrentFreshDirect {
+                        diagnostics,
+                        socket_index: fresh.socket_index,
+                        socket_local_endpoint: fresh.socket_local_endpoint,
+                        predicted_ports: fresh.predicted_ports,
+                    };
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    if let Ok(current) = current {
+        return current;
+    }
+
+    let diagnostics = peers
+        .diagnostic_with_path_selection(peer_id, true, false, Duration::ZERO, None)
+        .await
+        .map(|(_, diagnostics)| {
+            (
+                diagnostics.state,
+                diagnostics.active_path,
+                diagnostics.current_direct_pair,
+            )
+        });
+    let fresh = peers.fresh_mapping_for_peer(peer_id).await;
+    let affinity = udp.affinity_pin_for_test(peer_id).await;
+    let selected = udp
+        .socket_for_peer(Some(peer_id))
+        .await
+        .map(|(index, socket)| (index, socket.local_addr()));
+    panic!(
+        "fresh Direct socket state did not converge: peer={peer_id} diagnostics={diagnostics:#?} fresh={fresh:#?} affinity={affinity:#?} selected={selected:#?}"
+    );
+}
+
 async fn wait_for_stage(
     peers: &PeerManager,
     peer_id: &str,
@@ -2868,29 +2991,23 @@ async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
     assert!(sweep_detail.contains("exact_socket=true"));
     assert!(sweep_detail.contains("direct_confirmed=true"));
 
-    let peer_a = wait_for_current_direct_diagnostics(&harness.peers_a, HARD_HARD_B).await;
-    let peer_b = wait_for_current_direct_diagnostics(&harness.peers_b, HARD_HARD_A).await;
-    let fresh_a = harness
-        .peers_a
-        .fresh_mapping_for_peer(HARD_HARD_B)
-        .await
-        .expect("A must retain its measured fresh mapping");
-    let fresh_b = harness
-        .peers_b
-        .fresh_mapping_for_peer(HARD_HARD_A)
-        .await
-        .expect("B must retain its measured fresh mapping");
+    let fresh_direct_a =
+        wait_for_current_fresh_direct(&harness.peers_a, &harness.udp_a, HARD_HARD_B).await;
+    let fresh_direct_b =
+        wait_for_current_fresh_direct(&harness.peers_b, &harness.udp_b, HARD_HARD_A).await;
+    let peer_a = fresh_direct_a.diagnostics;
+    let peer_b = fresh_direct_b.diagnostics;
     for diagnostics in [&peer_a, &peer_b] {
         assert_eq!(diagnostics.state, ConnectionState::Direct);
         assert_eq!(diagnostics.active_path, Some(NetworkPath::Direct));
     }
 
-    let measured_a = fresh_a.socket_index;
-    let measured_b = fresh_b.socket_index;
-    assert!(!fresh_a.predicted_ports.is_empty());
-    assert!(!fresh_b.predicted_ports.is_empty());
+    let measured_a = fresh_direct_a.socket_index;
+    let measured_b = fresh_direct_b.socket_index;
+    assert!(!fresh_direct_a.predicted_ports.is_empty());
+    assert!(!fresh_direct_b.predicted_ports.is_empty());
     assert_eq!(
-        Some(fresh_a.socket_local_endpoint),
+        Some(fresh_direct_a.socket_local_endpoint),
         harness
             .udp_a
             .socket_for_peer(Some(HARD_HARD_B))
@@ -2898,7 +3015,7 @@ async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
             .and_then(|(_, socket)| socket.local_addr().ok())
     );
     assert_eq!(
-        Some(fresh_b.socket_local_endpoint),
+        Some(fresh_direct_b.socket_local_endpoint),
         harness
             .udp_b
             .socket_for_peer(Some(HARD_HARD_A))
@@ -2949,11 +3066,11 @@ async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
     );
     assert_eq!(
         current_pair_a.local_endpoint.as_deref(),
-        Some(fresh_a.socket_local_endpoint.to_string()).as_deref()
+        Some(fresh_direct_a.socket_local_endpoint.to_string()).as_deref()
     );
     assert_eq!(
         current_pair_b.local_endpoint.as_deref(),
-        Some(fresh_b.socket_local_endpoint.to_string()).as_deref()
+        Some(fresh_direct_b.socket_local_endpoint.to_string()).as_deref()
     );
     assert!(
         harness
