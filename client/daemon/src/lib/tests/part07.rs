@@ -61,6 +61,8 @@ struct HarnessPorts {
 
 const A_PREDICTABLE_MAPPED_OFFSETS: [i32; 4] = [-16, -12, -8, -4];
 const B_PREDICTABLE_MAPPED_OFFSETS: [i32; 4] = [-12, -9, -6, -3];
+const PREDICTABLE_RESERVATION_FIRST_PORT: u16 = 20_000;
+const PREDICTABLE_RESERVATION_STRIDE: u16 = 128;
 
 fn predictable_candidate_guard_offsets(mapped_offsets: &[i32; 4], step: i32) -> Vec<i32> {
     let mut offsets = mapped_offsets.to_vec();
@@ -77,6 +79,14 @@ fn predictable_candidate_guard_offsets(mapped_offsets: &[i32; 4], step: i32) -> 
 
 #[test]
 fn hard_hard_predictable_candidate_guards_cover_complete_successor_windows() {
+    let min_offset = A_PREDICTABLE_MAPPED_OFFSETS
+        .into_iter()
+        .chain(B_PREDICTABLE_MAPPED_OFFSETS)
+        .min()
+        .unwrap();
+    let max_offset = 4 * (p2pnet_nat::mapping::MAX_PREDICTED_PORTS as i32 - 1);
+    assert!(i32::from(PREDICTABLE_RESERVATION_STRIDE) > max_offset - min_offset);
+
     for (mapped_offsets, step) in [
         (A_PREDICTABLE_MAPPED_OFFSETS, 4),
         (B_PREDICTABLE_MAPPED_OFFSETS, 3),
@@ -100,11 +110,30 @@ async fn reserve_predictable_public_endpoint(
     ip: IpAddr,
     candidate_offsets: &[i32],
 ) -> (Arc<UdpSocket>, Vec<Arc<UdpSocket>>) {
-    const RESERVATION_RETRIES: usize = 64;
+    const RESERVATION_RETRIES: u16 = 64;
 
-    'reserve: for _ in 0..RESERVATION_RETRIES {
-        let public = Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap());
-        let public_port = public.local_addr().unwrap().port();
+    'reserve: for attempt in 0..RESERVATION_RETRIES {
+        // Windows commonly assigns consecutive `bind(0)` ports. Once the A
+        // side owns its complete guard window, repeatedly asking the kernel
+        // for B's base can therefore keep landing inside that same window.
+        // Scan explicit, non-overlapping fixture windows instead. Every port
+        // is still bound and ownership-checked before the harness starts.
+        let public_port = PREDICTABLE_RESERVATION_FIRST_PORT
+            .checked_add(PREDICTABLE_RESERVATION_STRIDE * attempt)
+            .expect("predictable reservation port range");
+        let public_endpoint = SocketAddr::new(ip, public_port);
+        let public = match UdpSocket::bind(public_endpoint).await {
+            Ok(socket) => Arc::new(socket),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => panic!("bind predictable public endpoint {public_endpoint}: {error}"),
+        };
         let mut guards = Vec::with_capacity(candidate_offsets.len());
         for offset in candidate_offsets {
             let endpoint = SocketAddr::new(ip, offset_port(public_port, *offset));
@@ -123,7 +152,7 @@ async fn reserve_predictable_public_endpoint(
         }
         return (public, guards);
     }
-    panic!("could not reserve a kernel-selected predictable candidate set");
+    panic!("could not reserve a predictable candidate fixture set");
 }
 
 impl HarnessPorts {
@@ -1218,6 +1247,8 @@ async fn install_test_daemon_udp(
     PeerReflexiveIngress,
     Arc<AtomicBool>,
     Vec<tokio::task::JoinHandle<()>>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
 ) {
     let peers = daemon.peers.clone();
     let (udp_inbound_tx, udp_inbound_rx) = mpsc::channel(256);
@@ -1279,12 +1310,9 @@ async fn install_test_daemon_udp(
         validation_ingress,
         peer_reflexive_ingress,
         validation_enabled,
-        vec![
-            udp_reader,
-            wg_reader,
-            validation_worker,
-            peer_reflexive_worker,
-        ],
+        vec![udp_reader, wg_reader],
+        validation_worker,
+        peer_reflexive_worker,
     )
 }
 
@@ -1555,10 +1583,24 @@ async fn build_two_peer_harness_with_stun_mode(
         advance_clock_on_response,
     );
 
-    let (udp_a, _validation_a, _prflx_a, validation_enabled_a, mut tasks_a) =
-        install_test_daemon_udp(&mut daemon_a, HARD_HARD_A, "10.20.0.1", &wg_a).await;
-    let (udp_b, _validation_b, _prflx_b, validation_enabled_b, mut tasks_b) =
-        install_test_daemon_udp(&mut daemon_b, HARD_HARD_B, "10.20.0.2", &wg_b).await;
+    let (
+        udp_a,
+        _validation_a,
+        _prflx_a,
+        validation_enabled_a,
+        mut tasks_a,
+        validation_task_a,
+        peer_reflexive_task_a,
+    ) = install_test_daemon_udp(&mut daemon_a, HARD_HARD_A, "10.20.0.1", &wg_a).await;
+    let (
+        udp_b,
+        _validation_b,
+        _prflx_b,
+        validation_enabled_b,
+        mut tasks_b,
+        validation_task_b,
+        peer_reflexive_task_b,
+    ) = install_test_daemon_udp(&mut daemon_b, HARD_HARD_B, "10.20.0.2", &wg_b).await;
     let primary_a = race_primary.then(|| udp_a.local_addr().unwrap());
     let actual_public = mapping_miss.then(|| {
         (
@@ -1616,8 +1658,8 @@ async fn build_two_peer_harness_with_stun_mode(
         shutdown_b,
         control_tasks: vec![control_task_a, control_task_b],
         udp_tasks: tasks_a,
-        validation_tasks: Vec::new(),
-        peer_reflexive_tasks: Vec::new(),
+        validation_tasks: vec![validation_task_a, validation_task_b],
+        peer_reflexive_tasks: vec![peer_reflexive_task_a, peer_reflexive_task_b],
         link,
         _candidate_guards: candidate_guards,
         validation_enabled_a,
@@ -2961,6 +3003,16 @@ async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness_with_stun(true, false, false, stun).await;
+    // Keep this scenario scoped to the production Hard-Hard path. The
+    // peer-reflexive worker also owns an ordinary primary-socket fast punch;
+    // under a loaded libtest runtime that independent path can legitimately
+    // become Direct first and turn this exact-socket test into the competing
+    // primary scenario covered separately below. The encrypted-validation
+    // workers remain live, so Hard-Hard still has to prove the real dynamic
+    // socket through the complete Request/ACK path.
+    for task in &harness.peer_reflexive_tasks {
+        task.abort();
+    }
     trigger_initial_offer(&harness).await;
     wait_for_both_direct(&harness).await;
     // Reciprocal exact-socket traffic can promote both peers before the
