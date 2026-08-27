@@ -120,6 +120,13 @@ pub struct UdpTransport {
     /// the worker re-validates its ownership before the actual send.
     #[cfg(test)]
     heartbeat_send_gate: Arc<std::sync::Mutex<Option<Arc<HeartbeatSendGate>>>>,
+    /// Test-only physical-send seam. It is absent from production builds and
+    /// disabled by default; tests can fail selected send attempts at the
+    /// shared UDP send abstraction without closing or replacing the socket.
+    #[cfg(test)]
+    probe_send_failure_hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
+    #[cfg(test)]
+    probe_send_failure_hook_enabled: Arc<AtomicBool>,
     /// One-shot lifecycle linearization seam used only by the remote-restart
     /// race regression.
     #[cfg(test)]
@@ -217,6 +224,10 @@ impl UdpTransport {
             #[cfg(test)]
             heartbeat_send_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
+            probe_send_failure_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            probe_send_failure_hook_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
             authenticated_punch_rate: Arc::new(Mutex::new(HashMap::new())),
@@ -262,6 +273,31 @@ impl UdpTransport {
     fn with_heartbeat_send_gate(mut self, gate: Arc<HeartbeatSendGate>) -> Self {
         self.heartbeat_send_gate = Arc::new(std::sync::Mutex::new(Some(gate)));
         self
+    }
+
+    /// Fail the selected one-based physical send attempts in tests. The hook
+    /// is deliberately cfg(test), opt-in and scoped to this transport clone.
+    #[cfg(test)]
+    pub(crate) fn set_probe_send_failures_for_test(
+        &self,
+        fail_on_attempts: impl IntoIterator<Item = usize>,
+    ) -> ProbeSendFailureGuard {
+        let fail_on_attempts = fail_on_attempts.into_iter().collect::<HashSet<_>>();
+        let mut hook = self
+            .probe_send_failure_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *hook = Some(ProbeSendFailureHook {
+            fail_on_attempts: fail_on_attempts.clone(),
+            physical_send_attempt: 0,
+        });
+        drop(hook);
+        self.probe_send_failure_hook_enabled
+            .store(!fail_on_attempts.is_empty(), Ordering::Release);
+        ProbeSendFailureGuard {
+            hook: self.probe_send_failure_hook.clone(),
+            enabled: self.probe_send_failure_hook_enabled.clone(),
+        }
     }
 
     /// Add up to `count - 1` ephemeral sockets for an explicitly enabled
@@ -418,7 +454,7 @@ impl UdpTransport {
     /// generation.  The key is derived from the authenticated Probe-v2 source
     /// identity (or a matched pending probe for legacy compatibility), never
     /// from an unauthenticated source address.
-    async fn update_peer_probe_rx_diagnostics(
+    pub(crate) async fn update_peer_probe_rx_diagnostics(
         &self,
         peer_id: &str,
         generation: u64,
@@ -1186,6 +1222,41 @@ impl UdpTransport {
         self.hard_hard_probe_bindings.lock().await.remove(&nonce);
     }
 
+    /// Remove pending probes owned by one exact Hard↔Hard token.  The token
+    /// binding is local-only, so this remains session-scoped even when the
+    /// dynamic socket entry was already removed or its token tag was lost.
+    /// Pending probes on an explicitly retained Direct socket are left in the
+    /// ordinary pending table but lose their Hard↔Hard ownership binding.
+    pub(crate) async fn clear_hard_hard_pending_probes_for_token(
+        &self,
+        peer_id: &str,
+        token: &str,
+        preserve_socket_index: Option<usize>,
+    ) {
+        let token_nonces = self
+            .hard_hard_probe_bindings
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, bound_token)| bound_token.as_str() == token)
+            .map(|(nonce, _)| *nonce)
+            .collect::<HashSet<_>>();
+        if token_nonces.is_empty() {
+            return;
+        }
+        self.pending_probes.lock().await.retain(|nonce, pending| {
+            pending.peer_id.as_deref() != Some(peer_id)
+                || !token_nonces.contains(nonce)
+                || preserve_socket_index == Some(pending.socket_index)
+        });
+        self.hard_hard_probe_bindings
+            .lock()
+            .await
+            .retain(|nonce, bound_token| {
+                bound_token.as_str() != token || !token_nonces.contains(nonce)
+            });
+    }
+
     async fn prune_hard_hard_probe_bindings(&self) {
         let pending = self.pending_probes.lock().await;
         let mut bindings = self.hard_hard_probe_bindings.lock().await;
@@ -1212,6 +1283,115 @@ impl UdpTransport {
                     && hard_hard_bindings.contains_key(*nonce)
             })
             .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hard_hard_pending_probe_count_for_token_for_test(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> usize {
+        let pending = self.pending_probes.lock().await;
+        let hard_hard_bindings = self.hard_hard_probe_bindings.lock().await;
+        pending
+            .iter()
+            .filter(|(nonce, probe)| {
+                probe.peer_id.as_deref() == Some(peer_id)
+                    && hard_hard_bindings.get(*nonce).is_some_and(|bound| bound == token)
+            })
+            .count()
+    }
+
+    /// Redacted lifecycle evidence for deterministic Hard↔Hard timeout
+    /// diagnostics. Tokens and nonces never leave this method; only an
+    /// equality bit and a short process-local digest are exposed.
+    #[cfg(test)]
+    pub(crate) async fn hard_hard_udp_lifecycle_snapshot_for_test(
+        &self,
+        peer_id: &str,
+        expected_token: Option<&str>,
+    ) -> HardHardUdpLifecycleSnapshot {
+        let token_digest = |token: &str| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(token, &mut hasher);
+            format!("{:08x}", std::hash::Hasher::finish(&hasher) as u32)
+        };
+        let mut dynamic_sockets = {
+            let state = self.socket_state.lock().await;
+            let selected = state.affinity.get(peer_id).map(|pin| pin.socket_index);
+            state
+                .dynamic
+                .values()
+                .filter(|entry| entry.peer_id == peer_id)
+                .map(|entry| HardHardDynamicSocketLifecycleSnapshot {
+                    socket_index: entry.socket_index,
+                    phase: entry.phase,
+                    network_generation: entry.network_generation,
+                    punch_generation: entry.punch_generation,
+                    token_present: entry.hard_hard_session_token.is_some(),
+                    token_matches_expected: expected_token.is_some_and(|expected| {
+                        entry.hard_hard_session_token.as_deref() == Some(expected)
+                    }),
+                    token_digest: entry
+                        .hard_hard_session_token
+                        .as_deref()
+                        .map(token_digest),
+                    authenticated_evidence: entry.authenticated_evidence,
+                    outstanding_send_leases: entry.send_leases.outstanding(),
+                    pending_probe_count: 0,
+                    reader_finished: entry.reader.is_finished(),
+                    affinity_selected: selected == Some(entry.socket_index),
+                })
+                .collect::<Vec<_>>()
+        };
+        dynamic_sockets.sort_by_key(|entry| entry.socket_index);
+        let dynamic_indices = dynamic_sockets
+            .iter()
+            .map(|entry| entry.socket_index)
+            .collect::<HashSet<_>>();
+
+        let now = Instant::now();
+        let pending = self.pending_probes.lock().await;
+        let bindings = self.hard_hard_probe_bindings.lock().await;
+        let mut pending_probes = pending
+            .iter()
+            .filter_map(|(nonce, probe)| {
+                let binding = bindings.get(nonce);
+                let peer_matches = probe.peer_id.as_deref() == Some(peer_id);
+                let token_matches_expected = expected_token
+                    .zip(binding.map(String::as_str))
+                    .is_some_and(|(expected, actual)| expected == actual);
+                (peer_matches
+                    && (binding.is_some() || dynamic_indices.contains(&probe.socket_index))
+                    || token_matches_expected)
+                    .then_some(HardHardPendingProbeLifecycleSnapshot {
+                        socket_index: probe.socket_index,
+                        token_matches_expected,
+                        peer_matches,
+                        expired: probe.is_expired(now),
+                        binding_present: binding.is_some(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        pending_probes.sort_by_key(|probe| probe.socket_index);
+        for socket in &mut dynamic_sockets {
+            socket.pending_probe_count = pending_probes
+                .iter()
+                .filter(|probe| probe.socket_index == socket.socket_index)
+                .count();
+        }
+        let orphan_probe_bindings = bindings
+            .keys()
+            .filter(|nonce| !pending.contains_key(*nonce))
+            .count();
+
+        HardHardUdpLifecycleSnapshot {
+            peer_id: peer_id.to_string(),
+            expected_token_present: expected_token.is_some(),
+            dynamic_sockets,
+            pending_probes,
+            orphan_probe_bindings,
+        }
     }
 
     /// Attach the local control-plane node ID used by authenticated UDP Probe v2.

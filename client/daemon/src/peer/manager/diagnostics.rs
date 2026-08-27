@@ -403,4 +403,84 @@ mod diagnostics_tests {
 
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn hard_sweep_started_is_nonblocking_but_terminal_summary_is_durable() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        manager
+            .add_peer(&crate::control::PeerInfo {
+                node_id: "peer-hard-lock".to_string(),
+                device_name: String::new(),
+                app_version: "0.2.0-test".to_string(),
+                public_key: "pk-hard-lock".to_string(),
+                endpoint: "127.0.0.1:41000".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.9".to_string(),
+                online: true,
+                last_seen: 1,
+                relay_rtt_ms: None,
+            })
+            .await;
+
+        let connection_writer = manager.connections.write().await;
+        let started = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.record_direct_event(
+                "peer-hard-lock",
+                "hard_hard_sweep_started",
+                None,
+                Some(64),
+                None,
+                "first-send timing marker",
+            ),
+        )
+        .await;
+        assert!(started.is_ok(), "sweep start must not await the writer");
+
+        let validation_started = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.record_direct_event(
+                "peer-hard-lock",
+                "hard_hard_direct_validation_started",
+                None,
+                Some(64),
+                Some(1),
+                "confirmation grace must not await the writer",
+            ),
+        )
+        .await;
+        assert!(
+            validation_started.is_ok(),
+            "Direct confirmation start must not await the writer"
+        );
+
+        let mut terminal = Box::pin(manager.record_direct_event(
+            "peer-hard-lock",
+            "hard_hard_birthday_sweep_summary",
+            None,
+            Some(1),
+            Some(1),
+            "stop_reason=send_error physical_send_errors=1",
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut terminal)
+                .await
+                .is_err(),
+            "terminal summary must remain durable and wait for the writer"
+        );
+        drop(connection_writer);
+        tokio::time::timeout(Duration::from_secs(1), terminal)
+            .await
+            .expect("terminal summary must finish after the writer is released");
+
+        let connection = manager
+            .get_connection("peer-hard-lock")
+            .await
+            .expect("test peer must remain in the manager");
+        assert!(connection
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_birthday_sweep_summary"));
+    }
 }

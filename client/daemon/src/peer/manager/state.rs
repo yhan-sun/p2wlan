@@ -12,6 +12,7 @@
 pub(crate) enum HardHardSessionState {
     AwaitingPeer,
     Sweeping,
+    Retiring,
 }
 
 /// Exact identity of the dedicated socket that produced one synchronized
@@ -31,9 +32,27 @@ pub(crate) struct HardHardFreshSocketIdentity {
     pub(crate) socket_local_endpoint: SocketAddr,
 }
 
+/// Lock-free snapshot of the pair selected by the latest authoritative Direct
+/// commit.  The snapshot is published while the network-epoch gate and the
+/// connection writer are held, then consumed by the Hard↔Hard confirmation
+/// wait without reacquiring the connection map.  The Direct-set mirror still
+/// supplies the active/inactive bit; this value only proves the exact local
+/// endpoint and remote candidate epoch of the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectCommitPairSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) remote_candidate_epoch: u64,
+    pub(crate) local_endpoint: Option<SocketAddr>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct HardHardSessionRecord {
     pub(crate) session_id: String,
+    /// Authoritative Probe receive-session identity captured before the
+    /// punch-at deadline path.  Hard↔Hard diagnostics reuse this exact value
+    /// before and after the sweep, even if the connection map is contended at
+    /// punch time; the full value is never emitted in diagnostics.
+    pub(crate) probe_session_id: Option<String>,
     pub(crate) session_token: String,
     pub(crate) peer_id: String,
     pub(crate) initiator: bool,
@@ -47,6 +66,19 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) remote_profile_generation: u64,
     pub(crate) local_prediction_confidence: u8,
     pub(crate) remote_prediction_confidence: u8,
+    /// Original Birthday level selected before candidate signaling is capped.
+    /// Zero denotes the predictable fresh-mapping lane, which has no Birthday
+    /// level.  This local ledger value is authoritative for the reciprocal
+    /// response path; it is never reconstructed from the signaled window.
+    pub(crate) requested_birthday_level: usize,
+    pub(crate) generated_candidate_count: usize,
+    pub(crate) signaled_candidate_count: usize,
+    pub(crate) birthday: bool,
+    /// Exact dynamic sockets created for this session.  A later scheduler
+    /// snapshot may find only a subset still attached/usable; it must never
+    /// replace a missing member with a pool socket.
+    pub(crate) requested_socket_indices: Vec<usize>,
+    pub(crate) requested_socket_count: usize,
     pub(crate) prediction_window: Vec<SocketAddr>,
     pub(crate) remote_prediction: Vec<SocketAddr>,
     pub(crate) fresh_socket: HardHardFreshSocketIdentity,
@@ -56,6 +88,45 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) attempt_count: u8,
     pub(crate) created_at: Instant,
     pub(crate) cancellation: Arc<crate::PunchSessionCancellation>,
+}
+
+#[cfg(test)]
+pub(crate) struct HardHardCleanupGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+    pub(crate) completed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct HardHardCleanupGateRegistration {
+    peer_id: String,
+    session_id: String,
+    session_token: String,
+    gate: Arc<HardHardCleanupGate>,
+}
+
+#[cfg(test)]
+pub(crate) struct HardHardCleanupGateGuard {
+    slot: Arc<std::sync::Mutex<Option<HardHardCleanupGateRegistration>>>,
+    installed: Arc<HardHardCleanupGate>,
+    previous: Option<HardHardCleanupGateRegistration>,
+}
+
+#[cfg(test)]
+impl Drop for HardHardCleanupGateGuard {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|registration| Arc::ptr_eq(&registration.gate, &self.installed))
+        {
+            *slot = self.previous.take();
+        }
+        self.installed.release.notify_waiters();
+    }
 }
 
 /// Hard ceiling for remote identity tombstones retained after `PeerLeft`.
@@ -232,6 +303,9 @@ pub struct PeerManager {
     peer_membership: Arc<std::sync::Mutex<PeerMembershipState>>,
     #[cfg(test)]
     authenticated_probe_verify_gate: AuthenticatedProbeVerifyGateSlot,
+    #[cfg(test)]
+    hard_hard_cleanup_gate:
+        Arc<std::sync::Mutex<Option<HardHardCleanupGateRegistration>>>,
     /// Last complete diagnostics snapshot.  Diagnostics must never turn a
     /// contended connection writer into a false empty roster; the snapshot is
     /// only a fallback while the live lock is unavailable.
@@ -287,6 +361,9 @@ pub struct PeerManager {
     /// measured.  Entries are short-lived and bounded; they are not a path
     /// selector or a Direct authority.
     hard_hard_sessions: Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
+    /// Exact cleanup ownership claims. A duplicate registration must not
+    /// start a second watcher that could later race a replacement session.
+    hard_hard_cleanup_owners: Arc<tokio::sync::Mutex<HashSet<(String, String, String)>>>,
     /// First authenticated socket selected by a bounded Hard↔Hard session.
     /// Kept outside the wire/session record so old test fixtures and the
     /// compact envelope remain compatible while a late packet cannot replace
@@ -383,6 +460,11 @@ pub struct PeerManager {
     /// Wake-up for any direct-commit bump.  Waiters re-check the peer's
     /// sequence after waking.
     direct_commit_notify: Arc<Notify>,
+    /// Lock-free exact pair selected by the latest Direct commit.  Hard↔Hard
+    /// confirmation reads this beside `direct_commit_seq_mirror` so a
+    /// contended connection writer cannot delay the grace timer.
+    direct_commit_pair_mirror:
+        Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
     /// Lock-free per-peer relay-confirm sequence mirror.  Bumped (and notified)
     /// whenever a peer's forced-relay encrypted probe/ACK confirms the relay
     /// path, so the outbound actor can flush a waiting first packet the moment

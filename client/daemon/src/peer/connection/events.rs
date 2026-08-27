@@ -390,6 +390,7 @@ fn is_protected_direct_event_stage(stage: &str) -> bool {
             | "hard_hard_sweep_started"
             | "hard_hard_direct_validation_started"
             | "hard_hard_probe_summary"
+            | "hard_hard_birthday_sweep_summary"
             | "hard_hard_sweep_completed"
             | "hard_hard_sweep_failed"
             | "hard_hard_failed"

@@ -32,6 +32,8 @@ impl PeerManager {
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
             #[cfg(test)]
             authenticated_probe_verify_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            hard_hard_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
@@ -46,6 +48,7 @@ impl PeerManager {
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
             hard_hard_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hard_hard_cleanup_owners: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             hard_hard_winners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -63,6 +66,7 @@ impl PeerManager {
             c0_pair_ledgers: Arc::new(RwLock::new(HashMap::new())),
             direct_commit_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct_commit_notify: Arc::new(Notify::new()),
+            direct_commit_pair_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_confirm_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_confirm_notify: Arc::new(Notify::new()),
             relay_probe_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -550,6 +554,17 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active_generation(node_id)
+    }
+
+    /// Hold the connection writer for deterministic lock-contention tests.
+    /// Production code never needs to expose this guard; the test-only helper
+    /// makes it possible to prove timing-sensitive paths do not await this
+    /// lock.
+    #[cfg(test)]
+    pub(crate) async fn hold_connections_writer_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, PeerConnection>> {
+        self.connections.write().await
     }
 
     #[cfg(test)]
