@@ -4846,6 +4846,15 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(false, false, false).await;
+    // Fence peer traffic before either production rendezvous worker exists.
+    // The test clock controls admission timestamps, but it cannot retime a
+    // Tokio sleep that a worker already armed. On a slower Windows runner the
+    // old post-response drop raced the natural 3.5s punch timer and sometimes
+    // produced a legitimate authenticated Direct path that cleanup correctly
+    // preserved. Starting disconnected makes the intended no-reachability
+    // scenario deterministic without weakening any cleanup assertion.
+    harness.link.set_drop_a_to_b(true);
+    harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
     let original_a = harness.udp_a.dynamic_socket_count().await;
@@ -4859,8 +4868,6 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     // durable deliveries to reach a terminal state before installing the next
     // candidate generation. This prevents an old queued offer from racing the
     // direct test mutation below while preserving the real responder ordering.
-    harness.link.set_drop_a_to_b(true);
-    harness.link.set_drop_b_to_a(true);
     set_hard_hard_test_now_ms(Some(
         response
             .punch_at_ms
