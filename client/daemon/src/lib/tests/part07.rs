@@ -10,7 +10,9 @@ use p2pnet_nat::{
     peek_authenticated_punch_identity, HairpinBehavior, MappingBehavior, MappingLifetime,
     NatProfile, PunchPacketKind, StunAttribute, StunMessage, StunObservation,
 };
-use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
+use p2pnet_wireguard::{
+    HandshakeInitiator, HandshakeResponder, TransportKeyPair, TransportSession,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::{watch, Notify, Semaphore};
 
@@ -394,6 +396,49 @@ struct NatPacketLink {
     worker: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct NatRouteTable {
+    outbound: Arc<StdMutex<HashMap<SocketAddr, SocketAddr>>>,
+    response: Arc<StdMutex<HashMap<(SocketAddr, NatResponseKey), SocketAddr>>>,
+}
+
+impl NatRouteTable {
+    fn new() -> Self {
+        Self {
+            outbound: Arc::new(StdMutex::new(HashMap::new())),
+            response: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NatPacketRole {
+    Request,
+    Response,
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum NatResponseKey {
+    Generic,
+    AuthenticatedPunch {
+        generation: u64,
+        nonce: [u8; 8],
+    },
+    DirectValidation {
+        generation: u64,
+        request_id: u16,
+        sequence: u8,
+        owner_token: u64,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct NatPacketClassification {
+    role: NatPacketRole,
+    response_key: NatResponseKey,
+}
+
 struct HeldAcks {
     a_to_b: Vec<Vec<u8>>,
     b_to_a: Vec<Vec<u8>>,
@@ -407,6 +452,8 @@ impl NatPacketLink {
         b_public: Arc<UdpSocket>,
         udp_a: UdpTransport,
         udp_b: UdpTransport,
+        a_keys: TransportKeyPair,
+        b_keys: TransportKeyPair,
         actual_public: Option<(SocketAddr, SocketAddr)>,
         primary_a: Option<SocketAddr>,
         route_dynamic_socket: bool,
@@ -432,8 +479,8 @@ impl NatPacketLink {
         let held_b_to_a = Arc::new(StdMutex::new(Vec::new()));
         let held_punch_a_to_b = Arc::new(StdMutex::new(Vec::new()));
         let held_punch_b_to_a = Arc::new(StdMutex::new(Vec::new()));
-        let a_to_b_routes = Arc::new(StdMutex::new(HashMap::new()));
-        let b_to_a_routes = Arc::new(StdMutex::new(HashMap::new()));
+        let a_to_b_routes = NatRouteTable::new();
+        let b_to_a_routes = NatRouteTable::new();
         let worker = Some(tokio::spawn(Self::run(
             a_public.clone(),
             b_public.clone(),
@@ -449,6 +496,8 @@ impl NatPacketLink {
             held_b_to_a.clone(),
             held_punch_a_to_b.clone(),
             held_punch_b_to_a.clone(),
+            b_keys,
+            a_keys,
             a_to_b_routes.clone(),
             b_to_a_routes.clone(),
             primary_a,
@@ -544,6 +593,68 @@ impl NatPacketLink {
         source_socket.send_to(data, target).await.is_ok()
     }
 
+    async fn endpoint_is_live(
+        target_udp: &UdpTransport,
+        target_peer: &str,
+        endpoint: SocketAddr,
+        route_dynamic_socket: bool,
+    ) -> bool {
+        if !route_dynamic_socket && target_udp.local_addr().ok() == Some(endpoint) {
+            return true;
+        }
+        target_udp
+            .dynamic_sockets_for_peer_for_test(target_peer)
+            .await
+            .into_iter()
+            .any(|(_, socket)| socket.local_addr().ok() == Some(endpoint))
+    }
+
+    fn classify_packet(
+        data: &[u8],
+        receiver_keys: &TransportKeyPair,
+    ) -> NatPacketClassification {
+        if let Some(identity) = peek_authenticated_punch_identity(data) {
+            let response_key = data
+                .get(6..14)
+                .and_then(|nonce| <[u8; 8]>::try_from(nonce).ok())
+                .map(|nonce| NatResponseKey::AuthenticatedPunch {
+                    generation: identity.generation,
+                    nonce,
+                })
+                .unwrap_or(NatResponseKey::Generic);
+            return NatPacketClassification {
+                role: match identity.kind {
+                    PunchPacketKind::Punch => NatPacketRole::Request,
+                    PunchPacketKind::Ack => NatPacketRole::Response,
+                },
+                response_key,
+            };
+        }
+        let mut decoder = TransportSession::new(receiver_keys.clone());
+        match decoder
+            .decrypt_from_bytes(data)
+            .ok()
+            .and_then(|packet| crate::transport::parse_direct_validation_token(&packet))
+        {
+            Some(token) => NatPacketClassification {
+                role: match token.kind {
+                    crate::transport::DirectValidationKind::Request => NatPacketRole::Request,
+                    crate::transport::DirectValidationKind::Ack => NatPacketRole::Response,
+                },
+                response_key: NatResponseKey::DirectValidation {
+                    generation: token.generation,
+                    request_id: token.request_id,
+                    sequence: token.sequence,
+                    owner_token: token.owner_token,
+                },
+            },
+            None => NatPacketClassification {
+                role: NatPacketRole::Other,
+                response_key: NatResponseKey::Generic,
+            },
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn forward_with_route(
         source_socket: &UdpSocket,
@@ -554,25 +665,73 @@ impl NatPacketLink {
         primary: Option<SocketAddr>,
         route_dynamic_socket: bool,
         dropped: &AtomicBool,
-        routes: &StdMutex<HashMap<SocketAddr, SocketAddr>>,
+        routes: &NatRouteTable,
+        reverse_routes: &NatRouteTable,
+        classification: NatPacketClassification,
     ) {
-        // The fake public endpoint has no kernel NAT table. Remember which
-        // local socket emitted the packet so a response from the selected
-        // peer socket returns to that exact socket, even if another punch
-        // ACK changes affinity before the response is forwarded.
+        // The fake public endpoint has no kernel NAT table. Keep the selected
+        // target separately for requests and responses: a dynamic socket can
+        // be both the source of a new request and the receiver of an earlier
+        // request, so one flat source->target map cannot represent both flows.
         let sticky_target = if primary.is_none() {
-            routes
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&source)
-                .copied()
+            match classification.role {
+                NatPacketRole::Response => routes
+                    .response
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&(source, classification.response_key))
+                    .copied(),
+                NatPacketRole::Request | NatPacketRole::Other => routes
+                    .outbound
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&source)
+                    .copied(),
+            }
         } else {
             None
         };
-        let target = if let Some(sticky_target) = sticky_target {
-            if Self::forward_to_endpoint(source_socket, data, sticky_target, dropped).await {
-                Some(sticky_target)
-            } else {
+        let target = match (classification.role, sticky_target) {
+            (NatPacketRole::Response, Some(sticky_target)) => {
+                if Self::endpoint_is_live(
+                    target_udp,
+                    target_peer,
+                    sticky_target,
+                    route_dynamic_socket,
+                )
+                .await
+                    && Self::forward_to_endpoint(source_socket, data, sticky_target, dropped).await
+                {
+                    Some(sticky_target)
+                } else {
+                    None
+                }
+            }
+            (_, Some(sticky_target)) => {
+                if Self::endpoint_is_live(
+                    target_udp,
+                    target_peer,
+                    sticky_target,
+                    route_dynamic_socket,
+                )
+                .await
+                    && Self::forward_to_endpoint(source_socket, data, sticky_target, dropped).await
+                {
+                    Some(sticky_target)
+                } else {
+                    Self::forward(
+                        source_socket,
+                        data,
+                        target_udp,
+                        target_peer,
+                        primary,
+                        route_dynamic_socket,
+                        dropped,
+                    )
+                    .await
+                }
+            }
+            (_, None) => {
                 Self::forward(
                     source_socket,
                     data,
@@ -584,23 +743,25 @@ impl NatPacketLink {
                 )
                 .await
             }
-        } else {
-            Self::forward(
-                source_socket,
-                data,
-                target_udp,
-                target_peer,
-                primary,
-                route_dynamic_socket,
-                dropped,
-            )
-            .await
         };
         if let Some(target) = target {
             routes
+                .outbound
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(source, target);
+            reverse_routes
+                .outbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(target, source);
+            if classification.role == NatPacketRole::Request {
+                reverse_routes
+                    .response
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert((target, classification.response_key), source);
+            }
         }
     }
 
@@ -620,8 +781,10 @@ impl NatPacketLink {
         held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
         held_punch_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
         held_punch_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
-        a_to_b_routes: Arc<StdMutex<HashMap<SocketAddr, SocketAddr>>>,
-        b_to_a_routes: Arc<StdMutex<HashMap<SocketAddr, SocketAddr>>>,
+        a_to_b_keys: TransportKeyPair,
+        b_to_a_keys: TransportKeyPair,
+        a_to_b_routes: NatRouteTable,
+        b_to_a_routes: NatRouteTable,
         primary_a: Option<SocketAddr>,
         route_dynamic_socket: bool,
     ) {
@@ -653,6 +816,7 @@ impl NatPacketLink {
                     // from B_PUBLIC so A observes the real reciprocal NAT
                     // source, and optionally duplicate it to A's primary
                     // socket for the competing-Direct race test.
+                    let classification = Self::classify_packet(&a_buf[..len], &b_to_a_keys);
                     Self::forward_with_route(
                         &b_source,
                         &a_buf[..len],
@@ -662,7 +826,9 @@ impl NatPacketLink {
                         primary_a,
                         route_dynamic_socket,
                         &drop_b_to_a,
-                        b_to_a_routes.as_ref(),
+                        &b_to_a_routes,
+                        &a_to_b_routes,
+                        classification,
                     ).await;
                 }
                 result = b_public.recv_from(&mut b_buf) => {
@@ -687,6 +853,7 @@ impl NatPacketLink {
                     }
                     // A's packet arrived at B's mapped public endpoint. Send
                     // from A_PUBLIC so B observes A's predicted source.
+                    let classification = Self::classify_packet(&b_buf[..len], &a_to_b_keys);
                     Self::forward_with_route(
                         &a_source,
                         &b_buf[..len],
@@ -696,7 +863,9 @@ impl NatPacketLink {
                         None,
                         route_dynamic_socket,
                         &drop_a_to_b,
-                        a_to_b_routes.as_ref(),
+                        &a_to_b_routes,
+                        &b_to_a_routes,
+                        classification,
                     ).await;
                 }
             }
@@ -1266,6 +1435,8 @@ async fn build_two_peer_harness_with_stun_mode(
         .consume_initiation_and_respond(&initiation)
         .unwrap();
     let a_keys = a_handshake.consume_response(&response).unwrap();
+    let a_keys_for_link = a_keys.clone();
+    let b_keys_for_link = b_keys.clone();
     let wg_a = daemon_a.transport.clone();
     let wg_b = daemon_b.transport.clone();
     wg_a.add_session(HARD_HARD_B, TransportSession::new(a_keys))
@@ -1313,6 +1484,8 @@ async fn build_two_peer_harness_with_stun_mode(
         b_public_socket,
         udp_a.clone(),
         udp_b.clone(),
+        a_keys_for_link,
+        b_keys_for_link,
         actual_public,
         primary_a,
         nat_mode == HarnessNatMode::HighEntropy,
@@ -1525,8 +1698,32 @@ async fn wait_for_both_direct_compact(harness: &TwoPeerHarness) {
                 })
                 .collect::<Vec<_>>()
         };
+        let events_a = summarize_hard_hard_diagnostics(&harness.peers_a, HARD_HARD_B).await;
+        let events_b = summarize_hard_hard_diagnostics(&harness.peers_b, HARD_HARD_A).await;
+        let session_a = harness
+            .peers_a
+            .hard_hard_session_for_test(HARD_HARD_B)
+            .await;
+        let session_b = harness
+            .peers_b
+            .hard_hard_session_for_test(HARD_HARD_A)
+            .await;
+        let sockets_a = harness
+            .udp_a
+            .dynamic_sockets_for_peer_for_test(HARD_HARD_B)
+            .await
+            .into_iter()
+            .map(|(index, socket)| (index, socket.local_addr().ok()))
+            .collect::<Vec<_>>();
+        let sockets_b = harness
+            .udp_b
+            .dynamic_sockets_for_peer_for_test(HARD_HARD_A)
+            .await
+            .into_iter()
+            .map(|(index, socket)| (index, socket.local_addr().ok()))
+            .collect::<Vec<_>>();
         panic!(
-            "birthday peers did not both become Direct: A={:?} B={:?}",
+            "birthday peers did not both become Direct: A={:?} B={:?}\nA events={events_a:#?}\nB events={events_b:#?}\nA session={session_a:#?}\nB session={session_b:#?}\nA sockets={sockets_a:?}\nB sockets={sockets_b:?}",
             summarize(harness.peers_a.diagnostics().await),
             summarize(harness.peers_b.diagnostics().await),
         );
@@ -2736,7 +2933,7 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
                 .iter()
                 .filter(|event| event.stage.starts_with("hard_hard_"))
                 .map(|event| (event.stage.as_str(), event.detail.as_str()))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         );
         let affinity_socket = if remote_id == HARD_HARD_B {
             harness

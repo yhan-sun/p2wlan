@@ -639,21 +639,6 @@ impl UdpTransport {
         else {
             return false;
         };
-        self.peers
-            .record_direct_event_for_generation_with_socket(
-                peer_id,
-                network_generation,
-                "hard_hard_peer_reflexive_learned",
-                None,
-                Some(identity.socket_index),
-                None,
-                None,
-                format!(
-                    "authenticated peer-reflexive evidence socket_index={} punch_generation={} local_endpoint={}",
-                    identity.socket_index, identity.punch_generation, identity.socket_local_endpoint
-                ),
-            )
-            .await;
         let losers = {
             let mut state = self.socket_state.lock().await;
             let Some(entry) = state.dynamic.get(&socket_index) else {
@@ -674,11 +659,12 @@ impl UdpTransport {
                     epoch,
                 },
             );
-            state
+            let winner = state
                 .dynamic
                 .get_mut(&socket_index)
-                .expect("winner entry verified above")
-                .phase = DynamicSocketPhase::Finalized;
+                .expect("winner entry verified above");
+            winner.authenticated_evidence = winner.authenticated_evidence.saturating_add(1);
+            winner.phase = DynamicSocketPhase::Finalized;
             let loser_indices = state
                 .dynamic
                 .iter()
@@ -695,6 +681,27 @@ impl UdpTransport {
                 .filter_map(|index| state.dynamic.remove(&index))
                 .collect::<Vec<_>>()
         };
+        // The authenticated packet, affinity pin and Finalized phase are one
+        // socket-state commit.  In particular, no durable diagnostics await
+        // may sit between manager winner selection and this local evidence:
+        // timeout cleanup is allowed to inspect the winner concurrently and
+        // must never retire the exact socket merely because the event ring is
+        // contended.
+        self.peers
+            .record_direct_event_for_generation_with_socket(
+                peer_id,
+                network_generation,
+                "hard_hard_peer_reflexive_learned",
+                None,
+                Some(identity.socket_index),
+                None,
+                None,
+                format!(
+                    "authenticated peer-reflexive evidence socket_index={} punch_generation={} local_endpoint={}",
+                    identity.socket_index, identity.punch_generation, identity.socket_local_endpoint
+                ),
+            )
+            .await;
         for entry in losers {
             self.detach_dynamic_entry(entry, "hard_hard_loser_socket")
                 .await;
@@ -715,6 +722,53 @@ impl UdpTransport {
             )
             .await;
         true
+    }
+
+    /// Exact token-tagged socket behind a manager-selected Hard↔Hard winner.
+    ///
+    /// This deliberately does not require affinity or the UDP evidence
+    /// counter: manager selection itself is only reachable from an
+    /// authenticated Probe v2 admission, and there is one cancellation point
+    /// between that manager commit and the socket-state commit above.  The
+    /// predicate is used only to keep that exact socket alive for the
+    /// remainder of the already-bounded session; it is never Direct proof.
+    pub(crate) async fn hard_hard_socket_identity_is_exact_session_socket(
+        &self,
+        identity: &crate::peer::HardHardFreshSocketIdentity,
+    ) -> bool {
+        let state = self.socket_state.lock().await;
+        state
+            .dynamic
+            .get(&identity.socket_index)
+            .is_some_and(|entry| {
+                entry.peer_id == identity.peer_id
+                    && entry.hard_hard_session_token.as_deref()
+                        == Some(identity.session_token.as_str())
+                    && entry.network_generation == identity.network_generation
+                    && entry.punch_generation == identity.punch_generation
+                    && entry.phase.is_usable()
+                    && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
+                    && self.peers.current_network_generation_sync() == identity.network_generation
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn promote_hard_hard_winner_for_test(
+        &self,
+        peer_id: &str,
+        token: &str,
+        socket_index: usize,
+        network_generation: u64,
+    ) -> bool {
+        let epoch_guard = self.network_epoch_gate.lock().await;
+        self.promote_hard_hard_winner_in_epoch(
+            &epoch_guard,
+            peer_id,
+            token,
+            socket_index,
+            network_generation,
+        )
+        .await
     }
 
     pub(crate) async fn hard_hard_socket_identity_is_current(
@@ -779,6 +833,13 @@ impl UdpTransport {
             .get(&socket_index)
             .map(|entry| entry.authenticated_evidence)
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn clear_authenticated_evidence_for_test(&self, socket_index: usize) {
+        if let Some(entry) = self.socket_state.lock().await.dynamic.get_mut(&socket_index) {
+            entry.authenticated_evidence = 0;
+        }
     }
 
     #[cfg(test)]

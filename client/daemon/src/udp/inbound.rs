@@ -667,15 +667,17 @@ impl UdpTransport {
                                 )
                                 .await;
                         }
-                        let _ = self
-                            .remember_peer_socket_for_generation_in_epoch(
-                                &epoch_guard,
-                                &identity.source_node_id,
-                                socket_index,
-                                generation,
-                                SocketEvidence::Fresh,
-                            )
-                            .await;
+                        if !hard_hard_winner_promoted {
+                            let _ = self
+                                .remember_peer_socket_for_generation_in_epoch(
+                                    &epoch_guard,
+                                    &identity.source_node_id,
+                                    socket_index,
+                                    generation,
+                                    SocketEvidence::Fresh,
+                                )
+                                .await;
+                        }
                         self.notify_peer_reflexive_observation(&identity.source_node_id, source)
                             .await;
 
@@ -935,8 +937,9 @@ impl UdpTransport {
                             let local_endpoint = pending.local_endpoint;
                             let purpose = pending.purpose;
                             let socket_epoch = pending.socket_epoch;
-                            if let Some(token) = hard_hard_token.as_deref() {
-                                let _ = self
+                            let hard_hard_winner_promoted =
+                                if let Some(token) = hard_hard_token.as_deref() {
+                                    self
                                     .promote_hard_hard_winner_in_epoch(
                                         &epoch_guard,
                                         &identity.source_node_id,
@@ -944,8 +947,10 @@ impl UdpTransport {
                                         socket_index,
                                         generation,
                                     )
-                                    .await;
-                            }
+                                    .await
+                                } else {
+                                    false
+                                };
                             self.update_socket_diagnostics(socket_index, |metrics| {
                                 metrics.probe_acks_received += 1
                             })
@@ -971,15 +976,17 @@ impl UdpTransport {
                                 },
                             )
                             .await;
-                            let _ = self
-                                .remember_peer_socket_for_generation_in_epoch(
-                                    &epoch_guard,
-                                    &identity.source_node_id,
-                                    socket_index,
-                                    generation,
-                                    SocketEvidence::Stamped(socket_epoch),
-                                )
-                                .await;
+                            if !hard_hard_winner_promoted {
+                                let _ = self
+                                    .remember_peer_socket_for_generation_in_epoch(
+                                        &epoch_guard,
+                                        &identity.source_node_id,
+                                        socket_index,
+                                        generation,
+                                        SocketEvidence::Stamped(socket_epoch),
+                                    )
+                                    .await;
+                            }
                             self.peers
                                 .learn_authenticated_endpoint_in_epoch(
                                     &epoch_guard,

@@ -1430,10 +1430,11 @@ async fn hard_hard_exact_direct_socket_is_current_for_cleanup(
 }
 
 /// An authenticated Hard↔Hard winner may reach the encrypted validation
-/// worker just after the short rendezvous sweep expires.  Keep that exact
-/// socket alive until the normal bounded session cleanup gets a chance to see
-/// the Direct commit; a winner with no authenticated evidence is still
-/// cleaned immediately by the caller.
+/// worker just after the short rendezvous sweep expires. Keep that exact
+/// token-tagged socket alive until the normal bounded session cleanup gets a
+/// chance to see the Direct commit. The manager winner is written only by the
+/// authenticated admission path; accepting its exact socket here closes the
+/// manager-to-socket commit window without treating it as Direct proof.
 async fn hard_hard_authenticated_winner_for_cleanup(
     udp: &UdpTransport,
     peers: &PeerManager,
@@ -1449,7 +1450,7 @@ async fn hard_hard_authenticated_winner_for_cleanup(
     if identity.socket_index != winner
         || !peers.hard_hard_session_identity_is_current(&identity).await
         || !udp
-            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
+            .hard_hard_socket_identity_is_exact_session_socket(&identity)
             .await
     {
         return None;
@@ -4010,6 +4011,135 @@ mod hard_hard_tests {
             .peer_session_generation_sync(&identity.peer_id)
             .expect("exact fixture peer must have an active lifecycle generation");
         (peers, udp, identity, remote, peer_session_generation)
+    }
+
+    #[tokio::test]
+    async fn hard_hard_winner_promotion_commits_evidence_before_durable_diagnostics() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        let (peers, udp, identity, remote, _peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        udp.clear_authenticated_evidence_for_test(identity.socket_index)
+            .await;
+        assert!(!udp
+            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
+            .await);
+
+        let sweeping = peers
+            .hard_hard_begin_sweep(
+                &identity.peer_id,
+                &identity.session_token,
+                vec![remote],
+                90,
+                0,
+            )
+            .await
+            .expect("fixture session must enter its single sweep");
+        assert_eq!(sweeping.fresh_socket, identity);
+
+        // Stop at the exact manager-selected/socket-not-yet-committed seam.
+        // Production reaches this state only after authenticated Probe v2
+        // admission. Cleanup must preserve the exact token-tagged socket for
+        // the remainder of the bounded session, without accepting it as
+        // Direct proof.
+        let selected = peers
+            .hard_hard_select_winner(
+                &identity.peer_id,
+                &identity.session_token,
+                identity.socket_index,
+                identity.network_generation,
+                identity.punch_generation,
+                identity.socket_local_endpoint,
+            )
+            .await
+            .expect("authenticated manager selection must accept the exact socket");
+        assert_eq!(selected, identity);
+        assert!(udp
+            .hard_hard_socket_identity_is_exact_session_socket(&identity)
+            .await);
+        assert_eq!(
+            hard_hard_authenticated_winner_for_cleanup(
+                &udp,
+                &peers,
+                &identity.peer_id,
+                &identity.session_token,
+            )
+            .await,
+            Some(identity.clone()),
+            "timeout cleanup must not retire a manager-selected exact socket in the commit seam"
+        );
+
+        // `hard_hard_winner_selected` is a durable event. Holding the
+        // connection writer parks the production promotion at that await and
+        // proves socket evidence was committed before diagnostics can block.
+        let connections_writer = peers.hold_connections_writer_for_test().await;
+        let socket_index = identity.socket_index;
+        let network_generation = identity.network_generation;
+        let promotion = tokio::spawn({
+            let udp = udp.clone();
+            let peer_id = identity.peer_id.clone();
+            let token = identity.session_token.clone();
+            async move {
+                udp.promote_hard_hard_winner_for_test(
+                    &peer_id,
+                    &token,
+                    socket_index,
+                    network_generation,
+                )
+                .await
+            }
+        });
+        for _ in 0..256 {
+            if udp
+                .hard_hard_socket_identity_has_authenticated_evidence(&selected)
+                .await
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(udp
+            .hard_hard_socket_identity_has_authenticated_evidence(&selected)
+            .await);
+        assert!(
+            !promotion.is_finished(),
+            "durable diagnostics must still be waiting on the held connection writer"
+        );
+        drop(connections_writer);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), promotion)
+                .await
+                .expect("promotion must finish after diagnostics are released")
+                .expect("promotion task must not panic")
+        );
+
+        assert!(peers
+            .hard_hard_retire_session(
+                &identity.peer_id,
+                &sweeping.session_id,
+                &identity.session_token,
+            )
+            .await);
+        udp.detach_hard_hard_sockets_for_token(
+            &identity.peer_id,
+            &identity.session_token,
+            None,
+            "test_winner_promotion_cleanup",
+        )
+        .await;
+        udp.clear_hard_hard_pending_probes_for_token(
+            &identity.peer_id,
+            &identity.session_token,
+            None,
+        )
+        .await;
+        assert!(peers
+            .hard_hard_complete_session_cleanup(
+                &identity.peer_id,
+                &sweeping.session_id,
+                &identity.session_token,
+            )
+            .await);
+        assert_eq!(udp.dynamic_socket_count().await, 0);
     }
 
     struct HardHardTestClockReset;
