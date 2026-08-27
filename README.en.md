@@ -1,8 +1,8 @@
 <div align="center">
-  <img src="assets/p2wlan_icon.svg" width="96" alt="P2WLAN icon" />
+  <img src="assets/p2wlan_icon.svg" width="88" alt="P2WLAN icon" />
   <h1>P2WLAN</h1>
-  <p><strong>An encrypted virtual LAN for real devices, real networks, and real diagnostics.</strong></p>
-  <p>Connect Mac, Windows, Linux, cloud servers, NAS devices, and home machines with stable private virtual IPs.</p>
+  <p><strong>Connect devices across different networks as if they were on the same LAN.</strong></p>
+  <p>Automatic virtual LAN · P2P first · Relay fallback · Cross-platform · Self-hostable</p>
 
   <p>
     <a href="README.md">简体中文</a>
@@ -10,333 +10,180 @@
   </p>
 
   <p>
-    <a href="https://github.com/yhan-sun/p2wlan/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/yhan-sun/p2wlan/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI" /></a>
-    <a href="https://github.com/yhan-sun/p2wlan/releases"><img src="https://img.shields.io/github/v/release/yhan-sun/p2wlan?style=for-the-badge&display_name=tag&label=Release" alt="Release" /></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2ea44f?style=for-the-badge" alt="MIT License" /></a>
-    <img src="https://img.shields.io/badge/Rust-core-dea584?style=for-the-badge" alt="Rust core" />
-    <img src="https://img.shields.io/badge/macOS%20%7C%20Windows%20%7C%20Linux-supported-4c8bf5?style=for-the-badge" alt="Platforms" />
+    <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>Download</strong></a>
+    · <a href="#quick-start">Quick Start</a>
+    · <a href="#how-it-works">How It Works</a>
+    · <a href="#self-hosting">Self-hosting</a>
   </p>
 
   <p>
-    <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>Download</strong></a>
-    · <a href="#quick-start">Quick Start</a>
-    · <a href="#connection-paths">Connection Paths</a>
-    · <a href="#protocol-boundaries">Protocols</a>
-    · <a href="#self-hosting">Self-hosting</a>
-    · <a href="#security-boundaries">Security</a>
+    <a href="https://github.com/yhan-sun/p2wlan/releases"><img src="https://img.shields.io/github/v/release/yhan-sun/p2wlan?display_name=tag&label=release" alt="Latest release" /></a>
+    <a href="https://github.com/yhan-sun/p2wlan/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/yhan-sun/p2wlan/ci.yml?branch=main&label=CI" alt="CI" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   </p>
 </div>
 
-## Overview
+## What is P2WLAN?
 
-P2WLAN is an open-source, P2P-first, self-hostable virtual LAN. It creates a real system network interface on each device, assigns stable `10.20.x.x` private addresses, and prefers end-to-end encrypted UDP direct paths whenever the network allows it.
+P2WLAN is an open-source, P2P-first, self-hostable virtual LAN. Each device gets a private virtual IP, so ordinary applications such as `ping`, SSH, RDP, databases, and web services can communicate without maintaining separate public ports and routes.
 
-When direct connectivity is blocked by NAT, CGNAT, enterprise firewalls, campus networks, or cloud security groups, P2WLAN falls back to encrypted relay forwarding so the private network stays usable. It also keeps connection state visible: peers can be LAN direct, public UDP direct, relayed, or unreachable.
+When a connection is established, P2WLAN prefers a local or public UDP direct path. If the network does not allow a direct path, it automatically falls back to an encrypted relay.
 
-> P2WLAN is currently in **Preview**. It already includes an encrypted data plane, NAT probing, UDP hole punching, and relay fallback, but it has not completed an independent security audit and should not be treated as an official WireGuard-compatible implementation. For sensitive production traffic, review the security model and remember that direct connectivity still depends on both network environments.
+> **Preview:** P2WLAN is intended for real-network testing, self-hosting, and development validation. It has not received an independent security audit and is not an official WireGuard implementation or a WireGuard interoperability solution.
 
-## Highlights
+## Why P2WLAN
 
-<table>
-  <tr>
-    <td width="33%" valign="top">
-      <h3>Real virtual interfaces</h3>
-      <p>macOS <code>utun</code>, Windows Wintun, and Linux TUN let virtual IPs work with <code>ping</code>, SSH, RDP, databases, and browsers.</p>
-    </td>
-    <td width="33%" valign="top">
-      <h3>P2P first</h3>
-      <p>Prefer LAN and public UDP direct paths, keep mappings alive, and fall back to relay only when direct transport is not confirmed.</p>
-    </td>
-    <td width="33%" valign="top">
-      <h3>Encrypted data plane</h3>
-      <p>Device traffic travels through WireGuard-like Noise sessions; relay nodes forward ciphertext and do not terminate private payloads.</p>
-    </td>
-  </tr>
-  <tr>
-    <td width="33%" valign="top">
-      <h3>Observable by design</h3>
-      <p>Inspect peer state, path type, latency, endpoint candidates, and local diagnostics from the desktop client or CLI.</p>
-    </td>
-    <td width="33%" valign="top">
-      <h3>Fully self-hostable</h3>
-      <p>Run the control plane, SQLite database, and relay on your own public Linux instance.</p>
-    </td>
-    <td width="33%" valign="top">
-      <h3>Cross-platform</h3>
-      <p>Releases publish the Flutter diagnostics client, while Linux keeps CLI/daemon packages for servers, NAS devices, and headless environments.</p>
-    </td>
-  </tr>
-</table>
+| Capability | What it means |
+| --- | --- |
+| **P2P First** | Prefer LAN and public UDP direct paths before using a relay. |
+| **NAT Traversal** | Probe network conditions and attempt UDP P2P connectivity; complex NAT environments are not guaranteed to succeed. |
+| **End-to-End Encryption** | Device traffic is carried in encrypted sessions; relays forward ciphertext only. |
+| **Automatic Relay Fallback** | If Direct cannot be confirmed, traffic can move to Relay without changing the application endpoint. |
+| **Cross-platform** | Flutter clients cover desktop and mobile preview targets; the Rust daemon / CLI also supports servers and headless environments. |
+| **Self-hosted** | The Control Plane, SQLite database, and Relay can run on your own Linux server. |
 
 ## Use Cases
 
-- **Cloud machine access**: reach SSH, RDP, dashboards, databases, and development services through virtual IPs.
-- **Home labs and NAS**: connect laptops, mini PCs, NAS devices, and remote servers without hand-maintained VPN routes.
-- **Cross-cloud networking**: give machines from different providers and regions one private address space.
-- **Temporary field networks**: connect devices across hotel Wi-Fi, mobile hotspots, campus networks, and home broadband.
-- **Self-hosted networking research**: inspect NAT probing, relay tickets, revocation feeds, diagnostics, and protocol boundaries from source.
+- Remote access to computers, cloud instances, NAS, and HomeLab machines
+- SSH / RDP / web administration / database access
+- Connecting development devices across regions or cloud providers
+- Linking devices across home broadband, mobile hotspots, campus networks, and other different networks
+- Running the Control Plane and Relay on infrastructure you control
 
 ## Quick Start
 
-Download the latest client from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases). The Flutter release client is moving to own the desktop daemon lifecycle; Rust p2wlan-daemon still owns the virtual adapter, routes, and data plane, then you can test another peer by virtual IP:
+**1. Download**
+
+Get the latest release from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases).
+
+| Platform | Release artifact | Status |
+| --- | --- | --- |
+| macOS Apple Silicon | `p2wlan-flutter-macos-arm64.dmg` | Supported |
+| macOS Intel | `p2wlan-flutter-macos-x64.dmg` | Supported |
+| Windows x64 | `p2wlan-flutter-windows-x64-setup.exe` | Supported |
+| Linux x64 | Flutter `.tar.gz` / CLI `.tar.gz` | Supported |
+| Linux arm64 | CLI `.tar.gz` | Supported |
+| Android arm64 | `p2wlan-flutter-android-arm64-release.apk` | Preview |
+| iOS arm64 | `p2wlan-flutter-ios-arm64-unsigned.ipa` | Experimental, requires signing |
+
+**2. Sign in**
+
+Open the client and sign in. On servers or headless systems, use the CLI:
+
+```bash
+p2wlan login -u you@example.com
+```
+
+**3. Start the virtual network**
+
+Start the network from the client, or run:
+
+```bash
+p2wlan up
+p2wlan status
+```
+
+**4. Use the virtual IP**
+
+Once the peer is connected, use its P2WLAN virtual IP like any other private address:
 
 ```bash
 ping 10.20.0.5
 ssh user@10.20.0.5
 ```
 
-### macOS
+**5. Check the connection path**
 
-Apple Silicon Macs use `p2wlan-flutter-macos-arm64.dmg`; Intel Macs use `p2wlan-flutter-macos-x64.dmg`. Drag the app into Applications and open `P2WLAN`.
-
-Preview builds may not yet be Apple-notarized. If Gatekeeper blocks the first launch, open the app from Finder with right-click -> Open.
-
-### Windows
-
-Intel / AMD PCs use `p2wlan-flutter-windows-x64-setup.exe`. Install it and launch `P2WLAN`. The Windows ARM Flutter installer is not enabled yet; it can be added once Flutter stable/action support reliably resolves the ARM64 SDK.
-
-The Flutter client now exposes daemon start/stop actions from Dashboard and the system tray. The Rust `p2wlan-daemon` still owns the virtual adapter, routes, and data plane; Windows UAC, Linux elevation, and packaged release smoke tests still need to pass before this is treated as the default desktop path.
-
-### Linux
-
-Linux desktops can use `p2wlan-flutter-linux-x64.tar.gz` for the Flutter diagnostics client. Servers, NAS devices, and headless environments should keep using the x64 / arm64 CLI/daemon package:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh
-
-p2wlan login -u you@example.com
-p2wlan up
-p2wlan status
-```
-
-Useful commands:
+The client shows the active peer path. For CLI diagnostics:
 
 ```bash
 p2wlan doctor
 p2wlan logs -f
-p2wlan down
-p2wlan update
 ```
 
-## Connection Paths
+For Linux CLI installation, the repository also provides an installer:
 
-P2WLAN shows the active path directly so troubleshooting starts with facts.
+```bash
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh
+```
 
-| Path | Meaning | Common environment |
-| --- | --- | --- |
-| **LAN direct** | Devices can reach each other on the local network. | Home LAN, office network, lab network |
-| **Public UDP direct** | Devices communicate through public UDP endpoints after NAT probing, peer-reflexive discovery, or explicit UDP exposure. | Cloud server with fixed UDP ingress, less restrictive NAT |
-| **Encrypted relay** | Direct path is not confirmed, so packets are forwarded as ciphertext through a DERP-like relay. | CGNAT, blocked UDP, missing cloud security-group rule |
-| **Unreachable** | No valid direct or relay path is currently confirmed. | Peer offline, expired credentials, network partition, relay unavailable |
+## How It Works
 
-Direct candidates can come from local interfaces, STUN observations, manual public UDP configuration, peer-reflexive observations, and a small bounded prediction window. In complex networks, direct success depends on both peers' NAT mapping and filtering behavior. For cloud servers that should accept public UDP directly, configure a stable UDP listen port and allow it in both the cloud firewall and the operating-system firewall.
-
-## Architecture
+P2WLAN separates connection control from data transport. The Control Plane handles identity, devices, virtual IPs, and signaling. The Rust daemon owns the local virtual interface, encrypted data plane, and path selection. A Relay is used only when needed and forwards ciphertext.
 
 ```mermaid
 flowchart LR
-    A["Device A<br/>Desktop / CLI<br/>TUN / Wintun / utun"]
-    B["Device B<br/>Desktop / CLI<br/>TUN / Wintun / utun"]
-    C["Control Plane<br/>auth, devices, IPs, signaling"]
-    R["Relay<br/>ciphertext forwarding"]
-
-    A <-->|"preferred: encrypted direct UDP"| B
-    A <-->|"registration and signaling"| C
-    B <-->|"registration and signaling"| C
-    A -.->|"fallback when direct fails"| R
-    B -.->|"fallback when direct fails"| R
+    A[Device A] <-->|"LAN Direct / UDP P2P"| B[Device B]
+    A -->|"Control Plane: auth / signaling"| C[Control Plane]
+    B -->|"Control Plane: auth / signaling"| C
+    A -.->|"Direct unavailable"| R[Encrypted Relay]
+    R -.-> B
 ```
 
-| Layer | Implementation | Responsibility |
+The connection strategy can be summarized as:
+
+**LAN Direct → Public UDP Direct → Encrypted Relay**
+
+Direct connectivity depends on both real network environments. NAT, CGNAT, firewalls, or cloud security groups can prevent direct connectivity; Relay provides the fallback path when it is available.
+
+## Connection Status
+
+| Status | Meaning |
+| --- | --- |
+| **LAN Direct** | Direct communication over the local network. |
+| **Direct** | P2P communication over public UDP. |
+| **Relay** | Ciphertext is forwarded through an encrypted relay path. |
+| **Connecting** | A connection path is being established or confirmed. |
+| **Offline** | The peer is offline or no usable path is currently confirmed. |
+
+## Architecture
+
+| Component | Technology | Responsibility |
 | --- | --- | --- |
-| Client UI | Flutter native client (sole GUI) | Device status, diagnostics, and control-plane actions. The React web console has been removed; see `docs/adr/0004`. |
-| Local daemon | Rust | Virtual interface, encrypted sessions, peer state, NAT probing, relay fallback |
-| Control plane | Go, SQLite | Accounts, device registry, virtual IPs, credential state, relay tickets, signaling |
-| Relay | Go | Ciphertext forwarding, ticket validation, revocation synchronization |
+| GUI | Flutter | Sign-in, device management, connection status, and diagnostics. |
+| Data Plane / Daemon | Rust | TUN, routing, peers, NAT traversal, encrypted sessions, and relay fallback. |
+| Virtual interface | macOS `utun` / Windows Wintun / Linux TUN | Provides a normal layer-3 virtual network interface to applications. |
+| Control Plane | Go + SQLite | Authentication, device registry, virtual IPs, credentials, signaling, and relay information. |
+| Relay | Go | Relay connections, ticket validation, and ciphertext forwarding. |
 
-## Protocol Boundaries
-
-P2WLAN currently uses a self-contained WireGuard-like data plane instead of calling kernel WireGuard or `wireguard-go` directly. This keeps TUN handling, desktop diagnostics, signaling, and relay fallback tightly integrated, but it also means production use needs stronger validation and review.
-
-| Boundary | Current implementation | Notes |
-| --- | --- | --- |
-| Data-plane handshake | `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` style | Tracks WireGuard's Noise IK shape, but does not claim official WireGuard interoperability |
-| Key exchange | X25519 | Used for peer-to-peer encrypted session negotiation |
-| Encryption | ChaCha20-Poly1305 | AEAD for handshake messages and transport payloads |
-| Hash / KDF | BLAKE2s / HKDF-BLAKE2s | Keeps WireGuard-style semantics; P2WLAN does not use BLAKE3 here |
-| Device auth | Ed25519 challenge-response | Used for control-plane device credentials and signaling identity binding |
-| Control signaling | JSON over HTTPS / WSS | Easy to inspect; `proto/` contains a protobuf draft |
-| Relay | DERP-like TCP/TLS ciphertext forwarder | Not standard TURN; relays do not decrypt private payloads |
-
-There are two credible production-hardening paths: reuse `boringtun`, `wireguard-go`, or platform WireGuard implementations to reduce cryptographic maintenance risk; or keep the in-repo data plane and keep adding test vectors, fuzzing, replay/rekey/malformed-packet coverage, interoperability notes, and independent security review. Current tests cover the RFC ChaCha20-Poly1305 AEAD vector and WireGuard-like replay-window boundaries.
-
-For the full release gate, see the [production hardening checklist](docs/production-hardening.en.md), use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) for real-network validation, and track long-term direction in the [v2 architecture roadmap](docs/v2-architecture-roadmap.en.md).
-
-## NAT And Relay
-
-P2WLAN's traversal layer is more than a single STUN lookup. The daemon gathers host and STUN server-reflexive candidates, performs UDP hole punching, learns peer-reflexive endpoints, maintains direct-path keepalives, and falls back to relay when direct transport is not confirmed.
-
-Important limits:
-
-- **Not a complete RFC8445 ICE checklist**: candidate priority, nomination, retries, and failure reasons exist as foundations, but this is not the full browser-grade ICE/TURN stack.
-- **Not standard TURN**: relay is a DERP-like forwarder. Environments that require TURN allocation/permission/channel semantics need an additional gateway or future implementation.
-- **Complex NAT success is not guaranteed**: campus networks, enterprise networks, mobile networks, CGNAT, and double symmetric NAT require real-world matrix testing; use the [NAT traversal acceptance matrix](docs/nat-traversal-matrix.en.md) to record each run.
-- **Relays still expose metadata**: relays see node identifiers, timing, and packet sizes even though payloads remain encrypted.
-
-## MTU And Performance
-
-The default TUN MTU is `1420`, which fits many WireGuard-style encapsulation scenarios, but it is not the result of automatic path MTU discovery. Some networks have a lower practical MTU and may show large-packet loss, stalled SSH sessions, incomplete page loads, or poor relay throughput.
-
-Troubleshooting guidance:
-
-- If small `ping` packets work but larger flows stall, try lowering MTU to `1380`, `1360`, or `1280`.
-- Relay paths carry ciphertext over TCP/TLS, so latency and congestion behavior differ from direct UDP.
-- `p2wlan doctor` and local diagnostics `/status` now emit structured MTU risk codes and a suggested downgrade when relay paths are observed above `1380`.
-- `scripts/mtu-smoke.sh` records daemon runtime MTU, relay-path state, risk codes, and suggested safe MTU in `summary.env`; use `P2WLAN_MTU_SMOKE_SELF_TEST=1` to verify the script parser.
-- Networks that drop ICMP fragmentation-needed messages can create PMTU blackholes; automatic PMTU probing is a key future hardening item.
-- P2WLAN is a transparent layer-3 virtual network. It does not split SSH, file transfer, or game traffic into separate application streams. If QUIC is introduced later, QUIC DATAGRAM or relay transport is the more natural starting point than rewriting application protocols.
-
-## Platform Status
-
-| Platform | Client | Virtual interface | Status |
-| --- | --- | --- | --- |
-| macOS Apple Silicon / Intel | Flutter DMG split by arm64 / x64 | `utun` via daemon path | Flutter diagnostics plus Dashboard/tray lifecycle controls; release smoke testing in progress |
-| Windows 10/11 x64 | Flutter setup installer | Wintun via daemon path | Flutter diagnostics plus Dashboard/tray entry points; UAC/installer smoke pending, ARM64 installer pending Flutter SDK/action support |
-| Linux x64 desktop; Linux x64 / arm64 CLI | Flutter bundle + CLI/daemon tarball | TUN | Desktop diagnostics plus tray entry point; server, elevation, and headless workflows stay on CLI |
-| Android arm64 | Flutter APK | Future Android VPN path | Release publishes arm64 only |
-| iOS arm64 | unsigned Flutter IPA | Future Network Extension path | CI artifact, requires signing before installation |
+P2WLAN uses a self-contained **WireGuard-like Noise** data plane with X25519, ChaCha20-Poly1305, BLAKE2s, and related primitives. **P2WLAN is not an official WireGuard implementation and does not claim WireGuard interoperability.**
 
 ## Self-hosting
 
-P2WLAN can run on your own public Linux server. For personal testing or small self-hosted networks, one small machine is usually enough for both control and relay services.
+The Control Plane and Relay live under [`server/`](server/). Linux CLI / daemon components are part of the Rust workspace. A minimal build from the repository root is:
 
 ```bash
 cd server
-mkdir -p data
 go build -o p2wlan-control .
 go build -o p2wlan-relay ./relay
 ```
 
-Control plane example:
-
-```bash
-JWT_SECRET="replace-with-a-long-random-secret" \
-DB_PATH="./data/p2wlan.db" \
-PORT=18080 \
-LOG_UPLOAD_DIR="./data/log-uploads" \
-LOG_UPLOAD_RETENTION_DAYS=14 \
-RELAY_SERVERS="default@relay.example.com:18081" \
-RELAY_REVOCATION_FEED_TOKEN="replace-with-a-second-random-secret" \
-./p2wlan-control
-```
-
-When enabled, the desktop client's Settings → Developer & Diagnostics action
-uploads only the current startup log files to `POST /api/v1/support/logs`.
-Uploads require a user JWT, are gzip-compressed and bounded, are stored as
-private `*.json.gz` files under `LOG_UPLOAD_DIR`, and are automatically pruned
-after `LOG_UPLOAD_RETENTION_DAYS` (14 by default). Put HTTPS in front of the
-control server before enabling this for users, because log bundles can contain
-network addresses and connection diagnostics.
-
-Relay example:
-
-```bash
-RELAY_BIND=":18081" \
-RELAY_REVOCATION_FEED_URL="https://control.example.com/api/v1/relay/revocations" \
-RELAY_REVOCATION_FEED_TOKEN="same-token-as-control-plane" \
-RELAY_REVOCATION_POLL_INTERVAL="30s" \
-RELAY_AUTH_FAILURE_LIMIT="20" \
-RELAY_AUTH_FAILURE_WINDOW="1m" \
-./p2wlan-relay
-```
-
-Put HTTPS/WSS in front of internet-facing control planes, and keep SQLite files, diagnostics endpoints, and relay tokens private. Relay runtime stats now count authentication failures and rate-limited attempts, with per-source windows exposed only as short hashed source keys so tickets, JWTs, and payload plaintext are not leaked.
+For production deployment, configure HTTPS/WSS, the database, authentication secrets, and relay addresses according to the current code under [`server/`](server/). The project homepage intentionally does not duplicate the full production configuration.
 
 ## Security Boundaries
 
-- Devices joined to the same virtual network should be treated as nodes within the same trust boundary.
-- X25519 node identity is used for data-plane handshakes; Ed25519 device identity is used for control-plane challenge signing and signaling identity binding.
-- The control plane can see accounts, device identities, virtual IPs, endpoint candidates, relay tickets, and connection metadata.
-- Relays can see node identifiers, timing, and packet sizes, but forward encrypted payloads.
-- Self-hosted internet-facing control planes should use HTTPS/WSS, public relays should use TLS, and operators should rotate JWT secrets, relay revocation tokens, and device credentials.
-- Local static denylists only affect the local daemon or relay instance; online relay revocation is driven by the control plane feed.
-- Preview releases have not completed independent security audit. For sensitive deployments, self-host, enable TLS, rotate relay tokens, review release artifacts, and roll out only within an accepted risk boundary.
+- Device traffic uses an encrypted data plane between endpoints.
+- Relays forward ciphertext and do not decrypt private payloads.
+- Relays may still observe connection metadata such as node identifiers, timing, and packet sizes.
+- The project is in **Preview** and has **not completed an independent security audit**.
+- P2P connectivity is not guaranteed across arbitrary NAT environments; relay availability also depends on the Control Plane and Relay being reachable.
+- For sensitive production environments, perform your own security assessment before deployment.
 
-## Troubleshooting
+## Developers
 
-| Symptom | Check first |
-| --- | --- |
-| Peer is online but direct path fails | Local firewall, UDP listen port, STUN reachability, cloud security-group UDP ingress |
-| Traffic always uses relay | CGNAT, enterprise/campus UDP filtering, symmetric NAT, expired candidates |
-| `ping` works but SSH/RDP stalls | MTU too high, PMTU blackhole, relay latency or loss |
-| Self-hosted relay cannot connect | Relay endpoint format, TLS certificate, revocation token, control-plane relay catalog |
-| Device credential fails | Ed25519 keypair, challenge-response flow, control-plane clock, credential state |
+The repository is organized by responsibility:
 
-## Build from Source
+- [`apps/flutter_client/`](apps/flutter_client/) — Flutter client
+- [`client/daemon/`](client/daemon/) — Rust daemon
+- [`client/cli/`](client/cli/) — Rust CLI
+- [`client/tun/`](client/tun/) — TUN / virtual interface abstraction
+- [`client/crypto/`](client/crypto/) — cryptographic components
+- [`server/`](server/) — Go Control Plane
+- [`server/relay/`](server/relay/) — Go Relay
 
-Install Rust stable, Go 1.22+, and Flutter stable. Linux Flutter desktop builds need GTK development dependencies.
-
-```bash
-git clone https://github.com/yhan-sun/p2wlan.git
-cd p2wlan
-
-cargo build -p p2wlan-daemon
-
-cd apps/flutter_client
-flutter pub get
-flutter run -d macos
-```
-
-For native macOS packages, use `apps/flutter_client/scripts/package_macos.sh`.
-
-## Quality Gates
-
-Run relevant checks before submitting code changes:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
-
-cd server
-go vet ./...
-go test ./... -count=1
-cd ..
-
-cd apps/flutter_client
-dart format --set-exit-if-changed .
-flutter analyze
-flutter test
-cd ..
-
-./scripts/control-smoke.sh
-```
-
-Real TUN smoke tests require administrator privileges:
-
-```bash
-sudo -E ./scripts/tun-ping-smoke.sh
-sudo -E ./scripts/mac-remote-smoke.sh --tun
-```
-
-## Repository Map
-
-```text
-client/       Rust networking core: TUN, encrypted sessions, NAT, relay, daemon, CLI, tray
-server/       Go control plane, auth, SQLite, signaling, relay server, revocation feed
-apps/flutter_client/ Flutter native client (sole GUI) for Android, iOS, macOS, Windows, and Linux
-scripts/      Build, install, packaging, direct-path, and cross-platform smoke scripts
-fuzz/         Protocol and parser fuzzing
-proto/        Protobuf protocol draft
-```
-
-## Contributing
-
-Issues, pull requests, real-world network reports, platform compatibility feedback, and security review are welcome.
-
-Please keep the repository clean. Do not commit `.docx`, `.pdf`, `.dmg`, `.zip`, `.tar.gz`, logs, local databases, or runtime-generated files. Use Markdown source files and reproducible scripts instead.
+Implementation details should be confirmed from source, tests, and CI rather than duplicated as internal state-machine documentation on the project homepage.
 
 ## License
 
-P2WLAN is released under the [MIT License](LICENSE).
+[MIT](LICENSE)
