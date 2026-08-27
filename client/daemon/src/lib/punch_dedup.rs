@@ -40,6 +40,11 @@ struct PunchAttemptRecord {
     /// sweep. It gives a short, bounded protection interval to a rendezvous
     /// that has already reached its first-send edge.
     first_send_started_at_ms: Option<u64>,
+    /// Number of owners holding this dedup record. The primary worker may
+    /// hand one ownership reference to a Hard↔Hard cleanup watcher so a
+    /// lower-priority retry cannot claim the peer while the exact UDP/ledger
+    /// cleanup transaction is still in flight.
+    owner_count: usize,
     cancellation: Arc<PunchSessionCancellation>,
 }
 
@@ -229,6 +234,21 @@ impl PunchSessionPermit {
     fn mark_first_send_started(&self) -> u64 {
         self.owner
             .mark_first_send_started(&self.peer_id, self.session_id)
+    }
+
+    /// Keep the exact dedup record owned by a cleanup watcher after the
+    /// short-lived worker releases its own permit. This is intentionally a
+    /// synchronous handoff: no await can interleave between the worker's
+    /// release and the cleanup owner's claim of the same record.
+    pub(crate) fn clone_for_cleanup(&self) -> Self {
+        self.owner
+            .retain(&self.peer_id, self.session_id);
+        Self {
+            owner: self.owner.clone(),
+            peer_id: self.peer_id.clone(),
+            session_id: self.session_id,
+            cancellation: self.cancellation.clone(),
+        }
     }
 }
 
@@ -517,6 +537,7 @@ impl PunchAttemptDeduplicator {
                 network_generation,
                 punch_at_ms,
                 first_send_started_at_ms: None,
+                owner_count: 1,
                 cancellation: cancellation.clone(),
             },
         );
@@ -552,7 +573,31 @@ impl PunchAttemptDeduplicator {
             .get(peer_id)
             .is_some_and(|active| active.session_id == session_id)
         {
-            state.active.remove(peer_id);
+            let remove = state
+                .active
+                .get_mut(peer_id)
+                .map(|active| {
+                    active.owner_count = active.owner_count.saturating_sub(1);
+                    active.owner_count == 0
+                })
+                .unwrap_or(false);
+            if remove {
+                state.active.remove(peer_id);
+            }
+        }
+    }
+
+    fn retain(&self, peer_id: &str, session_id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = state
+            .active
+            .get_mut(peer_id)
+            .filter(|active| active.session_id == session_id)
+        {
+            active.owner_count = active.owner_count.saturating_add(1);
         }
     }
 

@@ -2110,6 +2110,8 @@ pub(crate) async fn spawn_hard_hard_responder(
     let cancellation = session.cancellation_handle();
     let session_id = coordination.encode();
     tokio::spawn(async move {
+        let mut pending_session_cancellation =
+            PendingHardHardSessionCancellation::new(cancellation.clone());
         let Some(mut measurement) = run_hard_hard_local_measurement(
             &udp,
             &peers,
@@ -2258,11 +2260,18 @@ pub(crate) async fn spawn_hard_hard_responder(
         if !registered {
             return;
         }
-        let _cleanup_completion = spawn_hard_hard_session_cleanup(
+        let cleanup_owner = session.clone_for_cleanup();
+        let _cleanup_completion = spawn_hard_hard_session_cleanup_with_owner(
             udp.clone(),
             peers.clone(),
             cleanup_descriptor.clone(),
+            Some(cleanup_owner),
         );
+        // The registered ledger record and its cleanup owner now cover the
+        // exact cancellation path. Before this handoff, dropping the
+        // responder task must cancel the shared handle so the provisional
+        // measurement guard cannot outlive a pre-ledger return.
+        pending_session_cancellation.disarm();
         if cancellation.is_cancelled()
             || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
         {
@@ -3385,10 +3394,25 @@ fn spawn_hard_hard_session_cleanup(
     peers: Arc<PeerManager>,
     descriptor: HardHardCleanupDescriptor,
 ) -> HardHardCleanupCompletion {
+    spawn_hard_hard_session_cleanup_with_owner(udp, peers, descriptor, None)
+}
+
+fn spawn_hard_hard_session_cleanup_with_owner(
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    descriptor: HardHardCleanupDescriptor,
+    cleanup_owner: Option<PunchSessionPermit>,
+) -> HardHardCleanupCompletion {
     let completion = HardHardCleanupCompletion::new();
     let watcher_completion = completion.clone();
     tokio::spawn(async move {
+        // Keep the exact punch-dedup record occupied until this cleanup task
+        // has completed both the token-scoped UDP cleanup and the ledger
+        // removal. This closes the window in which a peer-reflexive worker
+        // could otherwise claim a lower-priority ordinary punch after the
+        // Hard↔Hard worker released its short-lived permit.
         let _completion_guard = HardHardCleanupCompletionGuard(watcher_completion);
+        let _cleanup_owner = cleanup_owner;
         if !peers
             .hard_hard_claim_cleanup_owner(
                 &descriptor.peer_id,
