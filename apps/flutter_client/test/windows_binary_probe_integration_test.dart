@@ -339,6 +339,7 @@ Future<_WindowsAclSnapshot> _readWindowsAcl(
     'protected = [bool]\$acl.AreAccessRulesProtected; '
     'sids = @(\$sids) '
     '} | ConvertTo-Json -Compress',
+    timeout: const Duration(seconds: 30),
   );
   expect(result.exitCode, 0, reason: result.stderr.toString());
   final decoded = jsonDecode(result.stdout.toString().trim());
