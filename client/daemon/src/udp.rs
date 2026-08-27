@@ -4,11 +4,11 @@
 //! ID. This module is the direct UDP sink: it resolves each peer endpoint from
 //! `PeerManager` and sends the encrypted datagram to that socket address.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

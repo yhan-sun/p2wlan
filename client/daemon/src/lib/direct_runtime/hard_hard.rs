@@ -5,6 +5,12 @@
 // machinery. It does not introduce a second wire protocol or promote a path:
 // the existing authenticated ACK and PathSelector remain authoritative.
 
+use crate::udp::{
+    apply_live_birthday_counters, hard_hard_birthday_socket_count, hard_hard_birthday_wave_count,
+    update_birthday_sweep_counters, BirthdaySweepFailureKind, BirthdaySweepProgress,
+    BirthdaySweepReport, UdpProbeRxSnapshot,
+};
+
 const HARD_HARD_SESSION_PREFIX: &str = "hh1";
 const HARD_HARD_PUNCH_LEAD: Duration = Duration::from_millis(3_500);
 const HARD_HARD_MIN_RESPONSE_LEAD: Duration = Duration::from_millis(1_250);
@@ -12,7 +18,10 @@ const HARD_HARD_MIN_RESPONSE_LEAD: Duration = Duration::from_millis(1_250);
 /// ordinary Relay/backoff recovery owns all later retries.
 const HARD_HARD_SESSION_TTL: Duration = Duration::from_secs(8);
 const HARD_HARD_SWEEP_DEADLINE: Duration = Duration::from_secs(3);
-const HARD_HARD_DIRECT_CONFIRMATION_GRACE: Duration = Duration::from_secs(1);
+// The validation worker's individual ACK lease is 750ms.  Keep a bounded
+// second lease for scheduler/ingress handoff under a busy executor without
+// changing the send budget or any identity/generation fence.
+const HARD_HARD_DIRECT_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
 const HARD_HARD_SWEEP_INTERVAL: Duration = Duration::from_millis(20);
 const HARD_HARD_SWEEP_ATTEMPTS: u32 = 2;
 const HARD_HARD_MAX_PREDICTION_TARGETS: usize = 32;
@@ -742,6 +751,12 @@ fn hard_hard_initiator_response_record_matches(
         && current.remote_profile_generation == expected.remote_profile_generation
         && current.local_prediction_confidence == expected.local_prediction_confidence
         && current.remote_prediction_confidence == expected.remote_prediction_confidence
+        && current.requested_birthday_level == expected.requested_birthday_level
+        && current.generated_candidate_count == expected.generated_candidate_count
+        && current.signaled_candidate_count == expected.signaled_candidate_count
+        && current.birthday == expected.birthday
+        && current.requested_socket_indices == expected.requested_socket_indices
+        && current.requested_socket_count == expected.requested_socket_count
         && current.prediction_window == expected.prediction_window
         && current.remote_prediction == expected.remote_prediction
         && current.fresh_socket == expected.fresh_socket
@@ -981,7 +996,13 @@ enum HardHardLocalMeasurement {
     Birthday(Box<HardHardBirthdayResult>),
 }
 
-type HardHardMeasurementPayload = (Vec<String>, HashMap<String, String>, u8, String);
+struct HardHardMeasurementPayload {
+    candidates: Vec<String>,
+    candidate_sources: HashMap<String, String>,
+    local_confidence: u8,
+    local_model: String,
+    candidate_contract: crate::candidate_refresh::SignalCandidateContract,
+}
 
 fn hard_hard_measurement_target_limit(measurement: &HardHardLocalMeasurement) -> usize {
     match measurement {
@@ -989,6 +1010,37 @@ fn hard_hard_measurement_target_limit(measurement: &HardHardLocalMeasurement) ->
         HardHardLocalMeasurement::Birthday(result) => result
             .level
             .min(HARD_HARD_MAX_BIRTHDAY_TARGETS),
+    }
+}
+
+fn hard_hard_measurement_is_birthday(measurement: &HardHardLocalMeasurement) -> bool {
+    matches!(measurement, HardHardLocalMeasurement::Birthday(_))
+}
+
+fn hard_hard_measurement_requested_level(measurement: &HardHardLocalMeasurement) -> usize {
+    match measurement {
+        HardHardLocalMeasurement::Predictable { .. } => 0,
+        HardHardLocalMeasurement::Birthday(result) => result.requested_level,
+    }
+}
+
+fn hard_hard_measurement_socket_indices(measurement: &HardHardLocalMeasurement) -> Vec<usize> {
+    match measurement {
+        HardHardLocalMeasurement::Predictable { result, .. } => vec![result.socket_index],
+        HardHardLocalMeasurement::Birthday(result) => result
+            .sockets
+            .iter()
+            .map(|socket| socket.socket_index)
+            .collect(),
+    }
+}
+
+fn hard_hard_measurement_requested_socket_count(
+    measurement: &HardHardLocalMeasurement,
+) -> usize {
+    match measurement {
+        HardHardLocalMeasurement::Predictable { .. } => 1,
+        HardHardLocalMeasurement::Birthday(result) => result.requested_socket_count,
     }
 }
 
@@ -1115,12 +1167,23 @@ fn hard_hard_measurement_payload(
     match measurement {
         HardHardLocalMeasurement::Predictable { result, .. } => {
             let (candidates, sources) = hard_hard_prediction_payload(result, boot_epoch_ms)?;
-            Some((
+            let (candidates, sources, candidate_contract) =
+                crate::candidate_refresh::normalize_signal_candidates_with_counts(
+                    &candidates,
+                    &sources,
+                    result
+                        .predicted_ports
+                        .len()
+                        .min(HARD_HARD_MAX_PREDICTION_TARGETS),
+                    candidates.len(),
+                );
+            (!candidates.is_empty()).then_some(HardHardMeasurementPayload {
                 candidates,
-                sources,
-                result.model.confidence,
-                hard_hard_model_label(&result.model.kind).to_string(),
-            ))
+                candidate_sources: sources,
+                local_confidence: result.model.confidence,
+                local_model: hard_hard_model_label(&result.model.kind).to_string(),
+                candidate_contract,
+            })
         }
         HardHardLocalMeasurement::Birthday(result) => {
             let fresh_id = FreshPredictionId {
@@ -1141,14 +1204,51 @@ fn hard_hard_measurement_payload(
                 sources.insert(endpoint.clone(), source.clone());
                 candidates.push(endpoint);
             }
-            (!candidates.is_empty()).then_some((
+            let (candidates, sources, candidate_contract) =
+                crate::candidate_refresh::normalize_signal_candidates_with_counts(
+                    &candidates,
+                    &sources,
+                    result.requested_level,
+                    candidates.len(),
+                );
+            (!candidates.is_empty()).then_some(HardHardMeasurementPayload {
                 candidates,
-                sources,
-                result.model_confidence,
-                result.model_label.clone(),
-            ))
+                candidate_sources: sources,
+                local_confidence: result.model_confidence,
+                local_model: result.model_label.clone(),
+                candidate_contract,
+            })
         }
     }
+}
+
+async fn record_hard_hard_candidate_contract(
+    peers: &PeerManager,
+    peer_id: &str,
+    contract: crate::candidate_refresh::SignalCandidateContract,
+    signaling_accepted: bool,
+) {
+    peers
+        .record_direct_event(
+            peer_id,
+            "hard_hard_candidate_contract",
+            None,
+            Some(contract.signaled_candidate_count),
+            None,
+            format!(
+                "requested_candidate_count={} generated_candidate_count={} deduplicated_candidate_count={} signaled_candidate_count={} cap={} capped={} candidate_source_count={} reason={} signaling_result={}",
+                contract.requested_candidate_count,
+                contract.generated_candidate_count,
+                contract.deduplicated_candidate_count,
+                contract.signaled_candidate_count,
+                contract.cap,
+                contract.capped,
+                contract.candidate_source_count,
+                contract.reason,
+                if signaling_accepted { "accepted" } else { "failed" },
+            ),
+        )
+        .await;
 }
 
 fn hard_hard_measurement_primary_socket(
@@ -1208,12 +1308,15 @@ async fn hard_hard_wait_for_exact_direct_confirmation(
 ) -> bool {
     let deadline = Instant::now() + HARD_HARD_DIRECT_CONFIRMATION_GRACE;
     loop {
-        if session.is_cancelled() || !peers.hard_hard_session_identity_is_current(identity).await {
+        let session_current = peers
+            .hard_hard_session_identity_is_current_for_confirmation(identity)
+            .await;
+        if session.is_cancelled() || !session_current {
             return false;
         }
 
         let commit_advanced = peers.direct_commit_seq_sync(&identity.peer_id) != from_commit_seq;
-        let manager_pair_matches = peers.hard_hard_direct_pair_is_current(identity).await;
+        let manager_pair_matches = peers.direct_commit_pair_matches_sync(identity);
         if commit_advanced
             && manager_pair_matches
             && udp
@@ -1234,20 +1337,18 @@ async fn hard_hard_wait_for_exact_direct_confirmation(
         if remaining.is_zero() {
             return false;
         }
-        if peers.is_direct_sync(&identity.peer_id) && manager_pair_matches {
-            tokio::select! {
-                _ = session.cancelled() => return false,
-                _ = sleep(remaining.min(Duration::from_millis(5))) => {}
-            }
-        } else {
-            tokio::select! {
-                _ = session.cancelled() => return false,
-                _ = peers.wait_for_direct_commit_or_timeout(
-                    &identity.peer_id,
-                    from_commit_seq,
-                    remaining,
-                ) => {}
-            }
+        // Wait on the commit sequence notification rather than polling at a
+        // fixed cadence.  The sequence is re-checked after every wake, and
+        // `enable` closes the check-to-wait race because `notify_waiters`
+        // itself does not retain a permit for a not-yet-enabled waiter.
+        let notify = peers.direct_commit_notify();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        tokio::select! {
+            _ = session.cancelled() => return false,
+            _ = notified => {}
+            _ = sleep(remaining) => return false,
         }
     }
 }
@@ -1495,6 +1596,11 @@ pub(crate) async fn spawn_hard_hard_initiator(
     let token = hard_hard_session_token(session.session_id());
     let coordination = hard_hard_coordination_from_plan(token, HardHardRole::Initiator, plan);
     let cancellation = session.cancellation_handle();
+    // Capture the authoritative Probe receive-session identity before the
+    // deadline-sensitive rendezvous task exists.  The sweep must not perform
+    // a best-effort try-read at punch time and accidentally attribute ACKs to
+    // the unscoped `None` bucket.
+    let probe_session_id = peers.probe_session_id_for_peer(&peer_id).await;
     bind_hard_hard_session_to_punch_invocation(invocation_shutdown_rx, cancellation.clone());
     tokio::spawn(async move {
         // Keep the dedup permit until the measured session is installed in the
@@ -1549,8 +1655,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 .await;
             return;
         }
-        let Some((candidates, candidate_sources, local_confidence, local_model)) =
-            hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
+        let Some(HardHardMeasurementPayload {
+            candidates,
+            candidate_sources,
+            local_confidence,
+            local_model,
+            candidate_contract,
+        }) = hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
         else {
             peers
                 .record_direct_event(
@@ -1597,8 +1708,12 @@ pub(crate) async fn spawn_hard_hard_initiator(
             &candidates,
             hard_hard_measurement_target_limit(&measurement),
         );
+        let requested_birthday_level = hard_hard_measurement_requested_level(&measurement);
+        let birthday = hard_hard_measurement_is_birthday(&measurement);
+        let requested_socket_indices = hard_hard_measurement_socket_indices(&measurement);
         let record = HardHardSessionRecord {
             session_id: session_id.clone(),
+            probe_session_id: probe_session_id.clone(),
             session_token: coordination.token.clone(),
             peer_id: peer_id.clone(),
             initiator: true,
@@ -1609,6 +1724,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
             remote_profile_generation: plan.remote_profile_generation,
             local_prediction_confidence: local_confidence,
             remote_prediction_confidence: 0,
+            requested_birthday_level,
+            generated_candidate_count: candidate_contract.generated_candidate_count,
+            signaled_candidate_count: candidate_contract.signaled_candidate_count,
+            birthday,
+            requested_socket_count:
+                hard_hard_measurement_requested_socket_count(&measurement),
+            requested_socket_indices,
             prediction_window,
             remote_prediction: Vec::new(),
             fresh_socket: primary_socket.clone(),
@@ -1686,6 +1808,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         } else {
             false
         };
+        record_hard_hard_candidate_contract(
+            &peers,
+            &peer_id,
+            candidate_contract,
+            advertised,
+        )
+        .await;
         if !advertised
             || peers.is_direct(&peer_id).await
             || cancellation.is_cancelled()
@@ -1962,8 +2091,13 @@ pub(crate) async fn spawn_hard_hard_responder(
                 .await;
             return;
         }
-        let Some((candidates, candidate_sources, local_confidence, local_model)) =
-            hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
+        let Some(HardHardMeasurementPayload {
+            candidates,
+            candidate_sources,
+            local_confidence,
+            local_model,
+            candidate_contract,
+        }) = hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
         else {
             return;
         };
@@ -2019,8 +2153,13 @@ pub(crate) async fn spawn_hard_hard_responder(
         if prediction_window.is_empty() {
             return;
         }
+        let requested_birthday_level = hard_hard_measurement_requested_level(&measurement);
+        let birthday = hard_hard_measurement_is_birthday(&measurement);
+        let requested_socket_indices = hard_hard_measurement_socket_indices(&measurement);
+        let probe_session_id = peers.probe_session_id_for_peer(&peer_id).await;
         let record = HardHardSessionRecord {
             session_id: session_id.clone(),
+            probe_session_id: probe_session_id.clone(),
             session_token: coordination.token.clone(),
             peer_id: peer_id.clone(),
             initiator: false,
@@ -2031,6 +2170,13 @@ pub(crate) async fn spawn_hard_hard_responder(
             remote_profile_generation: current_plan.remote_profile_generation,
             local_prediction_confidence: local_confidence,
             remote_prediction_confidence: coordination.local_prediction_confidence,
+            requested_birthday_level,
+            generated_candidate_count: candidate_contract.generated_candidate_count,
+            signaled_candidate_count: candidate_contract.signaled_candidate_count,
+            birthday,
+            requested_socket_count:
+                hard_hard_measurement_requested_socket_count(&measurement),
+            requested_socket_indices,
             prediction_window,
             remote_prediction: remote_prediction.clone(),
             fresh_socket: primary_socket.clone(),
@@ -2099,6 +2245,7 @@ pub(crate) async fn spawn_hard_hard_responder(
         } else {
             false
         };
+        record_hard_hard_candidate_contract(&peers, &peer_id, candidate_contract, sent).await;
         if !sent
             || cancellation.is_cancelled()
             || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
@@ -2156,16 +2303,8 @@ pub(crate) async fn spawn_hard_hard_responder(
             )
             .await;
         let fresh_socket = primary_socket;
-        let birthday_socket_indices = match &measurement {
-            HardHardLocalMeasurement::Birthday(result) => Some(
-                result
-                    .sockets
-                    .iter()
-                    .map(|socket| socket.socket_index)
-                    .collect::<Vec<_>>(),
-            ),
-            HardHardLocalMeasurement::Predictable { .. } => None,
-        };
+        let birthday_socket_indices = birthday
+            .then(|| hard_hard_measurement_socket_indices(&measurement));
         let cleanup_udp = udp.clone();
         let swept = hard_hard_wait_and_sweep(
             udp,
@@ -2177,12 +2316,16 @@ pub(crate) async fn spawn_hard_hard_responder(
             birthday_socket_indices,
             coordination.token.clone(),
             remote_prediction,
+            requested_birthday_level,
+            candidate_contract.generated_candidate_count,
+            candidate_contract.signaled_candidate_count,
             punch_at_ms,
             current_plan.local_network_generation,
             (
                 current_plan.local_profile_generation,
                 current_plan.remote_profile_generation,
             ),
+            probe_session_id,
             "responder",
         )
         .await;
@@ -2422,9 +2565,9 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         return HardHardRemoteStart::NotStarted;
     }
     let fresh_socket = record.fresh_socket.clone();
-    let birthday_socket_indices = udp
-        .hard_hard_socket_indices_for_token(&peer_id, &record.session_token)
-        .await;
+    let birthday_socket_indices = record
+        .birthday
+        .then(|| record.requested_socket_indices.clone());
     let cleanup_udp = udp.clone();
     let swept = hard_hard_wait_and_sweep(
         udp,
@@ -2433,15 +2576,20 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         peer_id.clone(),
         peer_session_generation,
         fresh_socket.clone(),
-        (!birthday_socket_indices.is_empty()).then_some(birthday_socket_indices),
+        birthday_socket_indices,
         record.session_token.clone(),
         remote_prediction,
+        record
+            .requested_birthday_level,
+        record.generated_candidate_count,
+        record.signaled_candidate_count,
         punch_at_ms,
         record.local_network_generation,
         (
             record.local_profile_generation,
             record.remote_profile_generation,
         ),
+        record.probe_session_id.clone(),
         "initiator",
     )
     .await;
@@ -2554,12 +2702,33 @@ async fn hard_hard_wait_and_sweep(
     birthday_socket_indices: Option<Vec<usize>>,
     session_token: String,
     targets: Vec<SocketAddr>,
+    requested_level: usize,
+    generated_candidate_count: usize,
+    signaled_candidate_count: usize,
     punch_at_ms: u64,
     network_generation: u64,
     profile_generations: (u64, u64),
+    probe_session_id: Option<String>,
     origin: &'static str,
 ) -> bool {
     let socket_index = fresh_socket.socket_index;
+    let birthday_waves_planned = birthday_socket_indices.as_ref().map_or(1, |indices| {
+        hard_hard_birthday_wave_count(indices.len())
+    });
+    let birthday_progress = birthday_socket_indices.as_ref().map(|_| {
+        Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
+            birthday: BirthdaySweepReport {
+                requested_level,
+                generated_candidate_count,
+                signaled_candidate_count,
+                effective_target_count: targets.len().min(crate::MAX_SIGNAL_CANDIDATES),
+                requested_socket_count: hard_hard_birthday_socket_count(requested_level),
+                ..BirthdaySweepReport::default()
+            },
+            aggregate: PunchSendReport::default(),
+            ..BirthdaySweepProgress::default()
+        }))
+    });
     let delay = punch_at_ms.saturating_sub(hard_hard_now_ms());
     if delay > 0 {
         tokio::select! {
@@ -2567,16 +2736,28 @@ async fn hard_hard_wait_and_sweep(
             _ = session.cancelled() => return false,
         }
     }
-    if peers.is_direct(&peer_id).await
+    if peers.is_direct_sync(&peer_id)
         || peers.current_network_generation_sync() != network_generation
-        || !udp
-            .hard_hard_socket_identity_is_current(&fresh_socket)
-            .await
+        || (birthday_socket_indices.is_none()
+            && !udp
+                .hard_hard_socket_identity_is_current(&fresh_socket)
+                .await)
         || session.is_cancelled()
         || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
     {
         return false;
     }
+    // Capture receive/commit baselines before the lifecycle marker. The
+    // marker is intentionally nonblocking, and no diagnostics-map write is
+    // allowed to sit in front of the first scheduled UDP send.
+    let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
+    let probe_rx_before = udp
+        .probe_rx_snapshot_for_peer_session(
+            &peer_id,
+            network_generation,
+            probe_session_id.as_deref(),
+        )
+        .await;
     let dispatch_at_ms = session.mark_first_send_started();
     peers
         .record_direct_event(
@@ -2586,34 +2767,33 @@ async fn hard_hard_wait_and_sweep(
             Some(targets.len()),
             None,
             format!(
-                "origin={origin} socket_count={} target_count={} attempt={} punch_at_ms={} local_clock_ms={} sweep_deadline_ms={}",
+                "origin={origin} mode={} socket_count={} target_count={} attempt={} waves_planned={} punch_at_ms={} local_clock_ms={} sweep_deadline_ms={}",
+                if birthday_socket_indices.is_some() { "birthday" } else { "predictable" },
                 birthday_socket_indices.as_ref().map_or(1, Vec::len),
                 targets.len(),
                 if birthday_socket_indices.is_some() { 1 } else { HARD_HARD_SWEEP_ATTEMPTS },
+                birthday_waves_planned,
                 punch_at_ms,
                 hard_hard_now_ms(),
                 HARD_HARD_SWEEP_DEADLINE.as_millis(),
             ),
         )
         .await;
-    let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
-    let probe_rx_session_id = peers.probe_session_id_for_peer(&peer_id).await;
-    let probe_rx_before = udp
-        .probe_rx_snapshot_for_peer_session(
-            &peer_id,
-            network_generation,
-            probe_rx_session_id.as_deref(),
-        )
-        .await;
     let mut report = None;
+    let birthday_progress_for_work = birthday_progress.clone();
     let outcome = run_owned_punch_session_with_deadline(&session, HARD_HARD_SWEEP_DEADLINE, async {
         report = Some(if let Some(socket_indices) = birthday_socket_indices.clone() {
-            udp.punch_hard_hard_birthday_candidates(
+            udp.punch_hard_hard_birthday_candidates_with_metadata(
                 &peer_id,
                 socket_indices,
                 targets.clone(),
+                requested_level,
+                generated_candidate_count,
+                signaled_candidate_count,
+                peer_session_generation,
                 profile_generations,
                 &session_token,
+                birthday_progress_for_work,
             )
             .await
         } else {
@@ -2634,23 +2814,54 @@ async fn hard_hard_wait_and_sweep(
         .probe_rx_snapshot_for_peer_session(
             &peer_id,
             network_generation,
-            probe_rx_session_id.as_deref(),
+            probe_session_id.as_deref(),
         )
         .await;
     let probe_rx_delta = probe_rx_after.delta_since(probe_rx_before);
     match (outcome, report) {
-        (PunchSessionOutcome::Completed, Some(Ok(report))) => {
-            let direct_confirmed = if report.packets_sent == 0 {
+        (PunchSessionOutcome::Completed, Some(Ok(mut report))) => {
+            let worker_failure_reason = report
+                .failure_kind
+                .map(BirthdaySweepFailureKind::stop_reason)
+                .or_else(|| {
+                    report.birthday.as_ref().and_then(|birthday| match birthday
+                        .stop_reason
+                        .as_deref()
+                    {
+                        Some(reason) if BirthdaySweepFailureKind::from_stop_reason(reason).is_some() => {
+                            Some(reason)
+                        }
+                        _ => None,
+                    })
+                });
+            let worker_failed = worker_failure_reason.is_some();
+            let confirmation_identity = if birthday_socket_indices.is_some() {
+                peers
+                    .hard_hard_fresh_socket_for_token(&peer_id, &session_token)
+                    .await
+                    .unwrap_or_else(|| fresh_socket.clone())
+            } else {
+                fresh_socket.clone()
+            };
+            let authenticated_winner_evidence = udp
+                .hard_hard_socket_identity_has_authenticated_evidence(&confirmation_identity)
+                .await;
+            let authenticated_winner_selected = peers
+                .hard_hard_winner_for_token(&peer_id, &session_token)
+                .await
+                .is_some_and(|winner| winner == confirmation_identity.socket_index);
+            // An authenticated exact-socket Probe can select the winner while
+            // the local worker is still before its first send.  A zero local
+            // send is not proof of failure when that evidence already exists;
+            // the bounded confirmation below still requires the authoritative
+            // Direct commit, selected pair, and every session fence.
+            let direct_confirmed = if worker_failed
+                || (report.packets_sent == 0
+                    && !authenticated_winner_evidence
+                    && !authenticated_winner_selected)
+            {
                 false
             } else {
-                let confirmation_identity = if birthday_socket_indices.is_some() {
-                    peers
-                        .hard_hard_fresh_socket_for_token(&peer_id, &session_token)
-                        .await
-                        .unwrap_or_else(|| fresh_socket.clone())
-                } else {
-                    fresh_socket.clone()
-                };
                 peers
                     .record_direct_event(
                         &peer_id,
@@ -2667,15 +2878,40 @@ async fn hard_hard_wait_and_sweep(
                         ),
                     )
                     .await;
-                hard_hard_wait_for_exact_direct_confirmation(
-                    &udp,
-                    &peers,
-                    &session,
-                    &confirmation_identity,
-                    direct_commit_seq,
+                let confirmed = tokio::time::timeout(
+                    HARD_HARD_DIRECT_CONFIRMATION_GRACE + Duration::from_millis(250),
+                    hard_hard_wait_for_exact_direct_confirmation(
+                        &udp,
+                        &peers,
+                        &session,
+                        &confirmation_identity,
+                        direct_commit_seq,
+                    ),
                 )
                 .await
+                .unwrap_or(false);
+                confirmed
             };
+            let session_stop_reason = if let Some(reason) = worker_failure_reason {
+                Some(reason.to_string())
+            } else if direct_confirmed {
+                None
+            } else {
+                Some("no_authenticated_direct_confirmation".to_string())
+            };
+            if let (Some(reason), Some(birthday)) =
+                (session_stop_reason.as_deref(), report.birthday.as_mut())
+            {
+                birthday.stop_reason = Some(reason.to_string());
+            }
+            let mut per_socket_counts = report.per_socket_sent.clone();
+            per_socket_counts.sort_by_key(|(socket_index, _)| *socket_index);
+            let per_socket_sent = per_socket_counts
+                .iter()
+                .map(|(socket_index, sent)| format!("{socket_index}:{sent}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let birthday_detail = birthday_sweep_detail(&report);
             peers
                 .record_direct_event_for_generation_with_socket(
                     &peer_id,
@@ -2684,20 +2920,52 @@ async fn hard_hard_wait_and_sweep(
                     targets.first().copied(),
                     Some(socket_index),
                     Some(report.unique_target_endpoints as usize),
-                    Some(report.packets_sent),
+                    Some(report.logical_probes_sent.max(report.packets_sent)),
                     format!(
-                        "origin={origin} sent={} received={} matched_ack={} authenticated_rx={} target_count={} unique_targets={} budget_skipped={} first_send_at_ms={:?}",
+                        "origin={origin} mode={} sent={} logical_probes_attempted={} logical_probes_sent={} logical_probe_send_failures={} physical_datagrams_sent={} physical_send_errors={} partial_physical_send_errors={} probe_path_errors={} targets_assigned={} targets_examined={} targets_attempted={} targets_cancelled={} received={} matched_ack={} authenticated_rx={} authenticated_ack_unmatched={} target_count={} unique_targets={} budget_skipped={} first_send_at_ms={:?} last_send_at_ms={:?} per_socket_sent={}{}",
+                        if birthday_detail.is_some() { "birthday" } else { "predictable" },
                         report.packets_sent,
+                        report.logical_probes_attempted,
+                        report.logical_probes_sent.max(report.packets_sent),
+                        report.logical_probe_send_failures,
+                        report.physical_datagrams_sent,
+                        report.physical_send_errors,
+                        report.partial_physical_send_errors,
+                        report.probe_path_errors,
+                        report.targets_assigned,
+                        report.targets_examined,
+                        report.targets_attempted,
+                        report.targets_cancelled,
                         probe_rx_delta.known_peer_ip_datagrams_received,
                         probe_rx_delta.probe_acks_received,
                         probe_rx_delta.authenticated_probe_packets_received,
+                        probe_rx_delta.authenticated_probe_acks_unmatched,
                         targets.len(),
                         report.unique_target_endpoints,
                         report.budget_skipped,
                         report.first_send_at_ms,
+                        report.last_send_at_ms,
+                        per_socket_sent,
+                        birthday_detail
+                            .as_deref()
+                            .map(|detail| format!(" {detail}"))
+                            .unwrap_or_default(),
                     ),
                 )
                 .await;
+            record_hard_hard_birthday_sweep_summary(
+                &peers,
+                &peer_id,
+                network_generation,
+                socket_index,
+                targets.first().copied(),
+                report.unique_target_endpoints as usize,
+                report.packets_sent,
+                origin,
+                &report,
+                probe_rx_delta,
+            )
+            .await;
             if direct_confirmed {
                 peers
                     .record_direct_event(
@@ -2740,7 +3008,8 @@ async fn hard_hard_wait_and_sweep(
                         Some(targets.len()),
                         Some(report.packets_sent),
                         format!(
-                            "origin={origin} exact-socket sweep found no authenticated Direct confirmation within {:?}",
+                            "origin={origin} stop_reason={} exact-socket sweep found no authenticated Direct confirmation within {:?}",
+                            session_stop_reason.as_deref().unwrap_or("no_authenticated_direct_confirmation"),
                             HARD_HARD_DIRECT_CONFIRMATION_GRACE,
                         ),
                     )
@@ -2753,7 +3022,9 @@ async fn hard_hard_wait_and_sweep(
                         Some(targets.len()),
                         Some(report.packets_sent),
                         format!(
-                            "origin={origin} stage=sweep reason=no_authenticated_direct_confirmation budget_used={}",
+                            "origin={origin} stage=sweep reason={} stop_reason={} budget_used={}",
+                            session_stop_reason.as_deref().unwrap_or("no_authenticated_direct_confirmation"),
+                            session_stop_reason.as_deref().unwrap_or("no_authenticated_direct_confirmation"),
                             report.packets_sent,
                         ),
                     )
@@ -2761,8 +3032,30 @@ async fn hard_hard_wait_and_sweep(
             }
             direct_confirmed
         }
-        (PunchSessionOutcome::Completed, Some(Err(error))) => {
-                peers
+        (PunchSessionOutcome::Completed, Some(Err(_error))) => {
+            let partial_report = birthday_terminal_report(&birthday_progress, "send_error").await;
+            let stop_reason = partial_report
+                .as_ref()
+                .and_then(|report| report.birthday.as_ref())
+                .and_then(|birthday| birthday.stop_reason.as_deref())
+                .unwrap_or("send_error")
+                .to_string();
+            if let Some(partial_report) = partial_report {
+                record_hard_hard_birthday_sweep_summary(
+                    &peers,
+                    &peer_id,
+                    network_generation,
+                    socket_index,
+                    targets.first().copied(),
+                    partial_report.unique_target_endpoints as usize,
+                    partial_report.packets_sent,
+                    origin,
+                    &partial_report,
+                    probe_rx_delta,
+                )
+                .await;
+            }
+            peers
                     .record_direct_event(
                         &peer_id,
                         "hard_hard_sweep_failed",
@@ -2770,7 +3063,8 @@ async fn hard_hard_wait_and_sweep(
                         Some(targets.len()),
                         None,
                         format!(
-                            "origin={origin} exact-socket sweep failed before confirmation: {error}"
+                            "origin={origin} stop_reason={} exact-socket sweep failed before confirmation",
+                            stop_reason.as_str(),
                         ),
                     )
                     .await;
@@ -2781,13 +3075,38 @@ async fn hard_hard_wait_and_sweep(
                         targets.first().copied(),
                         Some(targets.len()),
                         None,
-                        format!("origin={origin} exact-socket sweep error: {error}"),
+                        format!(
+                            "origin={origin} exact-socket sweep error stop_reason={}",
+                            stop_reason.as_str(),
+                        ),
                     )
                     .await;
             false
         }
         (PunchSessionOutcome::DeadlineExceeded, _) => {
-                peers
+            let partial_report = birthday_terminal_report(&birthday_progress, "deadline").await;
+            let stop_reason = partial_report
+                .as_ref()
+                .and_then(|report| report.birthday.as_ref())
+                .and_then(|birthday| birthday.stop_reason.as_deref())
+                .unwrap_or("deadline")
+                .to_string();
+            if let Some(partial_report) = partial_report {
+                record_hard_hard_birthday_sweep_summary(
+                    &peers,
+                    &peer_id,
+                    network_generation,
+                    socket_index,
+                    targets.first().copied(),
+                    partial_report.unique_target_endpoints as usize,
+                    partial_report.packets_sent,
+                    origin,
+                    &partial_report,
+                    probe_rx_delta,
+                )
+                .await;
+            }
+            peers
                     .record_direct_event(
                         &peer_id,
                         "hard_hard_sweep_failed",
@@ -2795,7 +3114,12 @@ async fn hard_hard_wait_and_sweep(
                         Some(targets.len()),
                         None,
                         format!(
-                            "origin={origin} exact-socket sweep deadline elapsed before authenticated Direct confirmation"
+                            "origin={origin} mode={} requested_level={} effective_target_count={} waves_planned={} stop_reason={} exact-socket sweep deadline elapsed before authenticated Direct confirmation",
+                            if birthday_socket_indices.is_some() { "birthday" } else { "predictable" },
+                            requested_level,
+                            targets.len(),
+                            birthday_waves_planned,
+                            stop_reason.as_str(),
                         ),
                     )
                     .await;
@@ -2807,16 +3131,222 @@ async fn hard_hard_wait_and_sweep(
                         Some(targets.len()),
                         None,
                         format!(
-                            "origin={origin} stage=sweep reason=deadline budget_ms={}",
-                            HARD_HARD_SWEEP_DEADLINE.as_millis()
+                            "origin={origin} mode={} stage=sweep reason={} stop_reason={} requested_level={} effective_target_count={} budget_ms={}",
+                            if birthday_socket_indices.is_some() { "birthday" } else { "predictable" },
+                            stop_reason.as_str(),
+                            stop_reason.as_str(),
+                            requested_level,
+                            targets.len(),
+                            HARD_HARD_SWEEP_DEADLINE.as_millis(),
                         ),
                     )
                     .await;
             false
         }
-        (PunchSessionOutcome::Cancelled, _) => false,
+        (PunchSessionOutcome::Cancelled, _) => {
+            let cancellation_reason = session
+                .cancellation_reason()
+                .map(PunchCancellationReason::label)
+                .unwrap_or("unknown");
+            let partial_report =
+                birthday_terminal_report(&birthday_progress, "session_cancelled").await;
+            let stop_reason = partial_report
+                .as_ref()
+                .and_then(|report| report.birthday.as_ref())
+                .and_then(|birthday| birthday.stop_reason.as_deref())
+                .unwrap_or("session_cancelled")
+                .to_string();
+            if let Some(partial_report) = partial_report {
+                record_hard_hard_birthday_sweep_summary(
+                    &peers,
+                    &peer_id,
+                    network_generation,
+                    socket_index,
+                    targets.first().copied(),
+                    partial_report.unique_target_endpoints as usize,
+                    partial_report.packets_sent,
+                    origin,
+                    &partial_report,
+                    probe_rx_delta,
+                )
+                .await;
+            }
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "hard_hard_sweep_failed",
+                    targets.first().copied(),
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} mode={} requested_level={} effective_target_count={} waves_planned={} stop_reason={} cancellation_reason={cancellation_reason}",
+                        if birthday_socket_indices.is_some() {
+                            "birthday"
+                        } else {
+                            "predictable"
+                        },
+                        requested_level,
+                        targets.len(),
+                        birthday_waves_planned,
+                        stop_reason.as_str(),
+                    ),
+                )
+                .await;
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "hard_hard_failed",
+                    targets.first().copied(),
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} mode={} stage=sweep reason={} stop_reason={} cancellation_reason={cancellation_reason}",
+                        if birthday_socket_indices.is_some() {
+                            "birthday"
+                        } else {
+                            "predictable"
+                        },
+                        stop_reason.as_str(),
+                        stop_reason.as_str(),
+                    ),
+                )
+                .await;
+            false
+        }
         _ => false,
     }
+}
+
+fn birthday_sweep_detail(report: &PunchSendReport) -> Option<String> {
+    let birthday = report.birthday.as_ref()?;
+    let mut per_socket_counts = report.per_socket_sent.clone();
+    per_socket_counts.sort_by_key(|(socket_index, _)| *socket_index);
+    let per_socket_sent = per_socket_counts
+        .iter()
+        .map(|(socket_index, sent)| format!("{socket_index}:{sent}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let physical_datagrams_sent = per_socket_counts
+        .iter()
+        .map(|(_, sent)| *sent as usize)
+        .sum::<usize>();
+    Some(format!(
+        "requested_level={} generated_candidate_count={} signaled_candidate_count={} effective_target_count={} requested_socket_count={} attached_socket_count={} usable_socket_count={} unavailable_socket_count={} socket_count={} degraded_reason={} waves_planned={} waves_started={} waves_fully_completed={} waves_completed={} targets_assigned={} targets_examined={} targets_attempted={} logical_probes_attempted={} logical_probes_sent={} logical_probe_send_failures={} physical_datagrams_sent={} physical_send_errors={} partial_physical_send_errors={} probe_path_errors={} failure_kind={:?} targets_budget_skipped={} targets_cancelled={} packets_planned={} packets_sent={} unique_target_endpoints={} budget_skipped={} per_socket_sent={} first_send_at_ms={:?} last_send_at_ms={:?} stop_reason={}",
+        birthday.requested_level,
+        birthday.generated_candidate_count,
+        birthday.signaled_candidate_count,
+        birthday.effective_target_count,
+        birthday.requested_socket_count,
+        birthday.attached_socket_count,
+        birthday.usable_socket_count,
+        birthday.unavailable_socket_count,
+        birthday.socket_count,
+        birthday.degraded_reason.as_deref().unwrap_or("none"),
+        birthday.waves_planned,
+        birthday.waves_started,
+        birthday.waves_fully_completed,
+        birthday.waves_completed,
+        birthday.targets_assigned,
+        birthday.targets_examined,
+        birthday.targets_attempted,
+        birthday.logical_probes_attempted,
+        birthday.logical_probes_sent,
+        birthday.logical_probe_send_failures,
+        physical_datagrams_sent,
+        birthday.physical_send_errors,
+        birthday.partial_physical_send_errors,
+        report.probe_path_errors,
+        report.failure_kind,
+        birthday.targets_budget_skipped,
+        birthday.targets_cancelled,
+        birthday.packets_planned,
+        report.packets_sent,
+        report.unique_target_endpoints,
+        report.budget_skipped,
+        per_socket_sent,
+        report.first_send_at_ms,
+        report.last_send_at_ms,
+        birthday.stop_reason.as_deref().unwrap_or("unknown"),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_hard_hard_birthday_sweep_summary(
+    peers: &PeerManager,
+    peer_id: &str,
+    network_generation: u64,
+    socket_index: usize,
+    target: Option<SocketAddr>,
+    unique_target_count: usize,
+    packets_sent: u32,
+    origin: &str,
+    report: &PunchSendReport,
+    probe_rx_delta: UdpProbeRxSnapshot,
+) {
+    let Some(detail) = birthday_sweep_detail(report) else {
+        return;
+    };
+    peers
+        .record_direct_event_for_generation_with_socket(
+            peer_id,
+            network_generation,
+            "hard_hard_birthday_sweep_summary",
+            target,
+            Some(socket_index),
+            Some(unique_target_count),
+            Some(packets_sent),
+            format!(
+                "origin={origin} mode=birthday {detail} known_peer_ip_rx_delta={} authenticated_probe_rx_delta={} matched_probe_ack_rx_delta={} authenticated_probe_ack_unmatched_delta={}",
+                probe_rx_delta.known_peer_ip_datagrams_received,
+                probe_rx_delta.authenticated_probe_packets_received,
+                probe_rx_delta.probe_acks_received,
+                probe_rx_delta.authenticated_probe_acks_unmatched,
+            ),
+        )
+        .await;
+}
+
+async fn birthday_terminal_report(
+    progress: &Option<Arc<tokio::sync::Mutex<BirthdaySweepProgress>>>,
+    stop_reason: &str,
+) -> Option<PunchSendReport> {
+    let progress = progress.as_ref()?;
+    let (mut report, mut birthday, live) = {
+        let current = progress.lock().await;
+        (
+            current.aggregate.clone(),
+            current.birthday.clone(),
+            current.live.clone(),
+        )
+    };
+    let live_snapshot = live
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    apply_live_birthday_counters(&mut report, &live_snapshot);
+    report.unique_target_endpoints =
+        u32::try_from(report.sent_target_endpoints.len()).unwrap_or(u32::MAX);
+    if birthday.stop_reason.is_none() {
+        birthday.stop_reason = Some(
+            report
+                .failure_kind
+                .map(BirthdaySweepFailureKind::stop_reason)
+                .unwrap_or(stop_reason)
+                .to_string(),
+        );
+    }
+    birthday.waves_completed = birthday.waves_fully_completed;
+    report.targets_assigned = report
+        .targets_assigned
+        .max(u32::try_from(birthday.targets_assigned).unwrap_or(u32::MAX));
+    report.targets_cancelled = report.targets_cancelled.max(
+        report
+            .targets_assigned
+            .saturating_sub(report.targets_attempted),
+    );
+    update_birthday_sweep_counters(&mut birthday, &report);
+    report.birthday = Some(birthday);
+    Some(report)
 }
 
 fn spawn_hard_hard_expiry_cleanup(
@@ -2946,6 +3476,787 @@ mod hard_hard_tests {
         }
     }
 
+    #[test]
+    fn initiator_response_match_keeps_raw_birthday_level_after_candidate_cap() {
+        let endpoint = "198.51.100.20:41000".parse().unwrap();
+        let identity = crate::peer::HardHardFreshSocketIdentity {
+            peer_id: "peer-raw-level".to_string(),
+            session_token: "raw-level-token".to_string(),
+            network_generation: 3,
+            remote_candidate_epoch: 5,
+            local_profile_generation: 7,
+            remote_profile_generation: 11,
+            punch_generation: 13,
+            socket_index: 4_096,
+            socket_local_endpoint: endpoint,
+        };
+        let expected = HardHardSessionRecord {
+            session_id: "hh1:i:raw-level-token:3:5:7:11:90:0:0".to_string(),
+            probe_session_id: None,
+            session_token: identity.session_token.clone(),
+            peer_id: identity.peer_id.clone(),
+            initiator: true,
+            remote_network_generation: 0,
+            local_network_generation: identity.network_generation,
+            remote_candidate_epoch: identity.remote_candidate_epoch,
+            local_profile_generation: identity.local_profile_generation,
+            remote_profile_generation: identity.remote_profile_generation,
+            local_prediction_confidence: 90,
+            remote_prediction_confidence: 0,
+            requested_birthday_level: 128,
+            generated_candidate_count: 128,
+            signaled_candidate_count: 96,
+            birthday: true,
+            requested_socket_indices: vec![4_096, 4_097, 4_098, 4_099],
+            requested_socket_count: 4,
+            prediction_window: vec![endpoint; 96],
+            remote_prediction: Vec::new(),
+            fresh_socket: identity.clone(),
+            punch_at_ms: hard_hard_now_ms().saturating_add(5_000),
+            expires_at_ms: hard_hard_now_ms().saturating_add(30_000),
+            state: HardHardSessionState::AwaitingPeer,
+            attempt_count: 0,
+            created_at: Instant::now(),
+            cancellation: Arc::new(crate::PunchSessionCancellation::default()),
+        };
+        assert!(hard_hard_initiator_response_record_matches(&expected, &expected));
+
+        let mut capped_level = expected.clone();
+        capped_level.requested_birthday_level = capped_level.signaled_candidate_count;
+        assert!(!hard_hard_initiator_response_record_matches(
+            &capped_level,
+            &expected
+        ));
+
+        let mut replaced_socket = expected.clone();
+        replaced_socket.requested_socket_indices = vec![4_096, 4_097, 4_098, 5_000];
+        assert!(!hard_hard_initiator_response_record_matches(
+            &replaced_socket,
+            &expected
+        ));
+    }
+
+    #[tokio::test]
+    async fn birthday_terminal_report_preserves_partial_logical_and_physical_progress() {
+        let progress = Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
+            birthday: BirthdaySweepReport {
+                requested_level: 256,
+                generated_candidate_count: 256,
+                signaled_candidate_count: 96,
+                effective_target_count: 96,
+                requested_socket_count: 8,
+                attached_socket_count: 8,
+                usable_socket_count: 8,
+                socket_count: 8,
+                waves_planned: 2,
+                waves_started: 1,
+                waves_fully_completed: 0,
+                waves_completed: 0,
+                targets_assigned: 96,
+                ..BirthdaySweepReport::default()
+            },
+            aggregate: PunchSendReport {
+                packets_sent: 2,
+                per_socket_sent: vec![(4_096, 3)],
+                sent_target_endpoints: vec![endpoint_for_test(41000), endpoint_for_test(41001)],
+                targets_assigned: 96,
+                targets_attempted: 2,
+                targets_cancelled: 94,
+                ..PunchSendReport::default()
+            },
+            ..BirthdaySweepProgress::default()
+        }));
+
+        let report = birthday_terminal_report(&Some(progress), "worker_failed")
+            .await
+            .expect("birthday progress must yield a terminal partial report");
+        let birthday = report
+            .birthday
+            .as_ref()
+            .expect("terminal report must retain Birthday details");
+        assert_eq!(birthday.requested_level, 256);
+        assert_eq!(birthday.signaled_candidate_count, 96);
+        assert_eq!(birthday.waves_fully_completed, 0);
+        assert_eq!(birthday.waves_completed, 0);
+        assert_eq!(birthday.logical_probes_sent, 2);
+        assert_eq!(birthday.physical_datagrams_sent, 3);
+        assert_eq!(birthday.targets_cancelled, 94);
+        assert_eq!(birthday.stop_reason.as_deref(), Some("worker_failed"));
+    }
+
+    #[tokio::test]
+    async fn birthday_terminal_report_reads_in_flight_live_counters() {
+        let progress = Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
+            birthday: BirthdaySweepReport {
+                targets_assigned: 4,
+                waves_planned: 2,
+                waves_started: 1,
+                ..BirthdaySweepReport::default()
+            },
+            ..BirthdaySweepProgress::default()
+        }));
+        {
+            let live = {
+                let current = progress.lock().await;
+                current.live.clone()
+            };
+            let mut progress = live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            progress.counters.targets_assigned = 4;
+            progress.counters.targets_examined = 3;
+            progress.counters.targets_attempted = 1;
+            progress.counters.targets_cancelled = 3;
+            progress.counters.budget_skipped = 1;
+            progress.counters.logical_probes_attempted = 1;
+            progress.counters.logical_probes_sent = 1;
+            progress.counters.physical_datagrams_sent = 2;
+            progress.counters.physical_send_errors = 1;
+            progress.sent_target_endpoints.insert(endpoint_for_test(41000));
+            progress.per_socket_sent.insert(4_096, 2);
+            progress.first_send_at_ms = Some(100);
+            progress.last_send_at_ms = Some(110);
+        }
+
+        let report = birthday_terminal_report(&Some(progress), "deadline")
+            .await
+            .expect("live birthday progress must produce a terminal report");
+        let birthday = report.birthday.as_ref().unwrap();
+        assert_eq!(report.targets_assigned, 4);
+        assert_eq!(report.targets_examined, 3);
+        assert_eq!(report.targets_attempted, 1);
+        assert_eq!(report.logical_probes_attempted, 1);
+        assert_eq!(report.logical_probes_sent, 1);
+        assert_eq!(report.physical_datagrams_sent, 2);
+        assert_eq!(report.physical_send_errors, 1);
+        assert_eq!(report.unique_target_endpoints, 1);
+        assert_eq!(report.per_socket_sent, vec![(4_096, 2)]);
+        assert_eq!(report.first_send_at_ms, Some(100));
+        assert_eq!(report.last_send_at_ms, Some(110));
+        assert_eq!(birthday.targets_examined, 3);
+        assert_eq!(birthday.logical_probes_attempted, 1);
+        assert_eq!(birthday.physical_send_errors, 1);
+        assert_eq!(birthday.targets_cancelled, 3);
+        assert_eq!(birthday.stop_reason.as_deref(), Some("deadline"));
+        assert!(report.logical_probes_sent <= report.logical_probes_attempted);
+        assert!(report.physical_datagrams_sent >= report.logical_probes_sent);
+        assert!(report.targets_attempted <= report.targets_examined);
+        assert!(report.targets_examined <= report.targets_assigned);
+    }
+
+    #[tokio::test]
+    async fn birthday_terminal_report_preserves_scheduler_failure_reason() {
+        let progress = Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
+            birthday: BirthdaySweepReport {
+                stop_reason: Some("worker_failed".to_string()),
+                ..BirthdaySweepReport::default()
+            },
+            aggregate: PunchSendReport {
+                failure_kind: Some(BirthdaySweepFailureKind::WorkerJoin),
+                worker_failed: true,
+                ..PunchSendReport::default()
+            },
+            ..BirthdaySweepProgress::default()
+        }));
+
+        let report = birthday_terminal_report(&Some(progress), "send_error")
+            .await
+            .expect("scheduler failure must remain observable");
+        assert_eq!(
+            report.birthday.unwrap().stop_reason.as_deref(),
+            Some("worker_failed")
+        );
+    }
+
+    #[test]
+    fn direct_confirmation_grace_is_bounded_after_busy_executor_regression() {
+        // The earlier one-second grace was insufficient in the full reciprocal
+        // birthday suite when validation and durable event work shared a busy
+        // executor. Keep the evidence-backed two-second lease, but retain the
+        // explicit outer 250ms bound so this is not an unbounded wait.
+        assert_eq!(HARD_HARD_DIRECT_CONFIRMATION_GRACE, Duration::from_secs(2));
+        assert!(
+            HARD_HARD_DIRECT_CONFIRMATION_GRACE + Duration::from_millis(250)
+                <= HARD_HARD_SWEEP_DEADLINE
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_confirmation_grace_accepts_an_exact_commit_after_one_second() {
+        let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
+        let deduplicator = PunchAttemptDeduplicator::default();
+        let session = deduplicator
+            .claim("peer-exact-proof")
+            .await
+            .expect("test must own the confirmation session");
+        let wait = tokio::spawn({
+            let peers = peers.clone();
+            let udp = udp.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_for_exact_direct_confirmation(
+                    &udp,
+                    &peers,
+                    &session,
+                    &identity,
+                    None,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished(), "confirmation must still be pending");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "one second must not exhaust the two-second confirmation grace"
+        );
+
+        assert!(
+            peers
+                .record_direct_success_for_generation_with_local_endpoint(
+                    &identity.peer_id,
+                    Some(remote),
+                    identity.network_generation,
+                    Some(identity.socket_local_endpoint),
+                )
+                .await
+        );
+        assert!(wait.await.unwrap());
+        udp.detach_all_dynamic_punch_sockets("test_confirmation_grace").await;
+    }
+
+    #[tokio::test]
+    async fn direct_confirmation_start_does_not_wait_for_connection_writer() {
+        let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
+        let session = PunchAttemptDeduplicator::default()
+            .claim("peer-exact-proof")
+            .await
+            .expect("test must own the confirmation session");
+        let before_commit = peers.direct_commit_seq_sync(&identity.peer_id);
+        assert!(
+            peers
+                .record_direct_success_for_generation_with_local_endpoint(
+                    &identity.peer_id,
+                    Some(remote),
+                    identity.network_generation,
+                    Some(identity.socket_local_endpoint),
+                )
+                .await
+        );
+
+        let connection_writer = peers.hold_connections_writer_for_test().await;
+        let confirmed = tokio::time::timeout(
+            Duration::from_millis(100),
+            hard_hard_wait_for_exact_direct_confirmation(
+                &udp,
+                &peers,
+                &session,
+                &identity,
+                before_commit,
+            ),
+        )
+        .await
+        .expect("confirmation must not await the connection writer");
+        assert!(confirmed);
+        drop(connection_writer);
+
+        peers
+            .record_direct_event(
+                &identity.peer_id,
+                "hard_hard_failed",
+                Some(remote),
+                Some(1),
+                Some(1),
+                "lock contention terminal event",
+            )
+            .await;
+        assert!(peers
+            .diagnostics()
+            .await
+            .into_iter()
+            .flat_map(|peer| peer.direct_events)
+            .any(|event| event.stage == "hard_hard_failed"));
+        udp.detach_all_dynamic_punch_sockets("test_confirmation_writer").await;
+    }
+
+    #[tokio::test]
+    async fn exact_probe_session_diagnostics_survive_connection_writer_contention() {
+        let (peers, udp, identity, _remote) = exact_socket_proof_fixture().await;
+        udp.update_peer_probe_rx_diagnostics(
+            &identity.peer_id,
+            identity.network_generation,
+            Some("probe-session-exact"),
+            |snapshot| {
+                snapshot.authenticated_probe_acks_observed = 3;
+                snapshot.probe_acks_received = 2;
+            },
+        )
+        .await;
+
+        let connection_writer = peers.hold_connections_writer_for_test().await;
+        let snapshot = tokio::time::timeout(
+            Duration::from_millis(100),
+            udp.probe_rx_snapshot_for_peer_session(
+                &identity.peer_id,
+                identity.network_generation,
+                Some("probe-session-exact"),
+            ),
+        )
+        .await
+        .expect("exact session diagnostics must not consult connections");
+        drop(connection_writer);
+        assert_eq!(snapshot.authenticated_probe_acks_observed, 3);
+        assert_eq!(snapshot.probe_acks_received, 2);
+        udp.detach_all_dynamic_punch_sockets("test_probe_session_lock").await;
+    }
+
+    fn birthday_runtime_nat_profile() -> p2pnet_nat::NatProfile {
+        p2pnet_nat::NatProfile {
+            local_addr: "127.0.0.1:0".to_string(),
+            observations: Vec::new(),
+            udp_blocked: false,
+            public_endpoint: Some("198.51.100.10:40000".to_string()),
+            public_ip_stable: Some(true),
+            public_port_stable: Some(false),
+            port_preserved: Some(false),
+            port_delta: None,
+            likely_symmetric: Some(true),
+            mapping_behavior: p2pnet_nat::MappingBehavior::AddressOrPortDependent,
+            filtering_behavior: p2pnet_nat::FilteringBehavior::AddressOrPortDependent,
+            hairpin_behavior: p2pnet_nat::HairpinBehavior::Unknown,
+            mapping_lifetime: p2pnet_nat::MappingLifetime::Unknown,
+            prediction_candidate: false,
+            predicted_endpoints: Vec::new(),
+            birthday_candidate: true,
+            confidence: 70,
+        }
+    }
+
+    async fn exact_birthday_runtime_fixture() -> (
+        Arc<PeerManager>,
+        UdpTransport,
+        crate::peer::HardHardFreshSocketIdentity,
+        SocketAddr,
+        crate::peer::PeerSessionGeneration,
+    ) {
+        let (peers, udp, mut identity, remote) = exact_socket_proof_fixture().await;
+        let mut record = peers
+            .hard_hard_session_for_test(&identity.peer_id)
+            .await
+            .expect("exact fixture must install a session ledger record");
+
+        peers.update_nat_profile(birthday_runtime_nat_profile()).await;
+        let local_profile_generation = peers.current_local_profile_generation_sync();
+        let session_token = "birthday-runtime-token".to_string();
+        identity.session_token = session_token.clone();
+        identity.local_profile_generation = local_profile_generation;
+        record.session_id = "birthday-runtime-session".to_string();
+        record.session_token = session_token.clone();
+        record.probe_session_id = Some("probe-session-exact".to_string());
+        record.local_profile_generation = local_profile_generation;
+        record.requested_birthday_level = 64;
+        record.generated_candidate_count = 64;
+        record.signaled_candidate_count = 1;
+        record.birthday = true;
+        record.requested_socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        record.requested_socket_count = 2;
+        record.prediction_window = vec![remote];
+        record.remote_prediction = vec![remote];
+        record.fresh_socket = identity.clone();
+        record.punch_at_ms = hard_hard_now_ms();
+        record.expires_at_ms = record.punch_at_ms.saturating_add(30_000);
+        record.state = crate::peer::HardHardSessionState::AwaitingPeer;
+        record.attempt_count = 0;
+        record.cancellation = Arc::new(crate::PunchSessionCancellation::default());
+        assert!(peers.hard_hard_register_session(record).await);
+        assert!(
+            udp.tag_hard_hard_socket(&identity.peer_id, identity.socket_index, &session_token)
+                .await
+        );
+        let peer_session_generation = peers
+            .peer_session_generation_sync(&identity.peer_id)
+            .expect("exact fixture peer must have an active lifecycle generation");
+        (peers, udp, identity, remote, peer_session_generation)
+    }
+
+    async fn wait_for_birthday_worker_gate(
+        gate: &Arc<crate::udp::BirthdayWorkerCompletionGate>,
+    ) {
+        let reached = gate.reached.notified();
+        let mut watchdog = tokio::spawn(async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        });
+        tokio::select! {
+            _ = reached => {
+                watchdog.abort();
+            }
+            _ = &mut watchdog => panic!("production Birthday worker did not publish live progress"),
+        }
+    }
+
+    async fn wait_for_birthday_post_send_gate(
+        gate: &Arc<crate::udp::ProbePostSendGate>,
+    ) {
+        // Register the waiter before starting the production task: the hook
+        // uses notify_waiters, so an already-reached gate must not be lost.
+        let reached = gate.reached.notified();
+        let mut watchdog = tokio::spawn(async {
+            for _ in 0..128 {
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::select! {
+            _ = reached => {
+                watchdog.abort();
+            }
+            _ = &mut watchdog => panic!("production Birthday send did not reach the post-send gate"),
+        }
+    }
+
+    fn assert_live_birthday_terminal_summary(
+        events: &[crate::peer::DirectTraversalEventDiagnostics],
+        stop_reason: &str,
+    ) {
+        let summary = events
+            .iter()
+            .find(|event| event.stage == "hard_hard_birthday_sweep_summary")
+            .expect("terminal Birthday summary must be durable");
+        for field in [
+            "physical_datagrams_sent=",
+            "per_socket_sent=",
+            "first_send_at_ms=Some(",
+            "last_send_at_ms=Some(",
+            "unique_target_endpoints=1",
+            "waves_fully_completed=0",
+        ] {
+            assert!(
+                summary.detail.contains(field),
+                "terminal summary is missing {field}: {}",
+                summary.detail
+            );
+        }
+        assert!(
+            summary.detail.contains(&format!("stop_reason={stop_reason}")),
+            "terminal summary has an unexpected stop reason: {}",
+            summary.detail
+        );
+    }
+
+    fn assert_post_send_race_summary(
+        events: &[crate::peer::DirectTraversalEventDiagnostics],
+        stop_reason: &str,
+        require_physical_error: bool,
+    ) {
+        let summary = events
+            .iter()
+            .find(|event| event.stage == "hard_hard_birthday_sweep_summary")
+            .expect("post-send race must emit a durable Birthday summary");
+        let count = |key: &str| {
+            summary
+                .detail
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix(key)?.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("summary is missing {key}: {}", summary.detail))
+        };
+        if require_physical_error {
+            assert!(count("physical_send_errors=") >= 1);
+        } else {
+            assert!(count("physical_datagrams_sent=") >= 1);
+            assert!(count("logical_probes_sent=") >= 1);
+            assert!(count("unique_target_endpoints=") >= 1);
+            assert!(summary.detail.contains("per_socket_sent=") && !summary.detail.contains("per_socket_sent= "));
+            assert!(summary.detail.contains("first_send_at_ms=Some("));
+            assert!(summary.detail.contains("last_send_at_ms=Some("));
+        }
+        assert!(summary.detail.contains("waves_fully_completed=0"));
+        assert!(
+            summary
+                .detail
+                .contains(&format!("stop_reason={stop_reason}")),
+            "terminal summary has an unexpected stop reason: {}",
+            summary.detail
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_deadline_snapshots_live_progress_at_production_entry() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let (gate, _gate_guard) = crate::udp::install_birthday_worker_completion_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-deadline",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_worker_gate(&gate).await;
+        tokio::time::advance(HARD_HARD_SWEEP_DEADLINE).await;
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_live_birthday_terminal_summary(&events, "deadline");
+        assert!(events
+            .iter()
+            .any(|event| event.stage == "hard_hard_sweep_failed"));
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_deadline_live_progress")
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_cancellation_snapshots_live_progress_at_production_entry() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let cancellation = session.cancellation_handle();
+        let (gate, _gate_guard) = crate::udp::install_birthday_worker_completion_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-cancel",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_worker_gate(&gate).await;
+        cancellation.cancel_for_hard_hard_cleanup();
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_live_birthday_terminal_summary(&events, "session_cancelled");
+        assert!(events
+            .iter()
+            .any(|event| event.stage == "hard_hard_failed"));
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_cancel_live_progress")
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_post_send_deadline_preserves_live_progress() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-post-send-deadline",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_post_send_gate(&gate).await;
+        tokio::time::advance(HARD_HARD_SWEEP_DEADLINE).await;
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_post_send_race_summary(&events, "deadline", false);
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_post_send_deadline").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_post_send_cancellation_preserves_live_progress() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let cancellation = session.cancellation_handle();
+        let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-post-send-cancel",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_post_send_gate(&gate).await;
+        cancellation.cancel_for_hard_hard_cleanup();
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_post_send_race_summary(&events, "session_cancelled", false);
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_post_send_cancellation")
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_hard_birthday_primary_send_error_is_recorded_before_cleanup_cancel() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+        set_hard_hard_test_now_ms(None);
+        let (peers, udp, identity, _remote, peer_session_generation) =
+            exact_birthday_runtime_fixture().await;
+        let remote: SocketAddr = "127.0.0.1:41004".parse().unwrap();
+        let session = PunchAttemptDeduplicator::default()
+            .claim(&identity.peer_id)
+            .await
+            .expect("test must own the production Hard↔Hard punch session");
+        let cancellation = session.cancellation_handle();
+        let _send_failures = udp.set_probe_send_failures_for_test([1]);
+        let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
+        let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let task = tokio::spawn({
+            let udp = udp.clone();
+            let peers = peers.clone();
+            let identity = identity.clone();
+            async move {
+                hard_hard_wait_and_sweep(
+                    udp,
+                    peers,
+                    session,
+                    identity.peer_id.clone(),
+                    peer_session_generation,
+                    identity,
+                    Some(socket_indices),
+                    "birthday-runtime-token".to_string(),
+                    vec![remote],
+                    64,
+                    64,
+                    1,
+                    hard_hard_now_ms(),
+                    0,
+                    (1, 7),
+                    Some("probe-session-exact".to_string()),
+                    "test-primary-error-cancel",
+                )
+                .await
+            }
+        });
+        wait_for_birthday_post_send_gate(&gate).await;
+        cancellation.cancel_for_hard_hard_cleanup();
+        tokio::task::yield_now().await;
+        assert!(!task.await.unwrap());
+
+        let events = peers.diagnostics().await[0].direct_events.clone();
+        assert_post_send_race_summary(&events, "session_cancelled", true);
+        gate.release.notify_waiters();
+        udp.detach_all_dynamic_punch_sockets("test_primary_error_cancel")
+            .await;
+    }
+
+    fn endpoint_for_test(port: u16) -> SocketAddr {
+        SocketAddr::new("198.51.100.20".parse().unwrap(), port)
+    }
+
     async fn exact_socket_proof_fixture() -> (
         Arc<PeerManager>,
         UdpTransport,
@@ -2983,6 +4294,14 @@ mod hard_hard_tests {
         assert!(
             peers
                 .bind_remote_nat_profile_to_candidate_epoch("peer-exact-proof", 7)
+                .await
+        );
+        assert!(
+            peers
+                .set_probe_session_id(
+                    "peer-exact-proof",
+                    Some("probe-session-exact".to_string()),
+                )
                 .await
         );
 
@@ -3026,6 +4345,7 @@ mod hard_hard_tests {
             peers
                 .hard_hard_register_session(crate::peer::HardHardSessionRecord {
                     session_id: "proof-session".to_string(),
+                    probe_session_id: Some("probe-session-exact".to_string()),
                     session_token: identity.session_token.clone(),
                     peer_id: identity.peer_id.clone(),
                     initiator: true,
@@ -3036,6 +4356,12 @@ mod hard_hard_tests {
                     remote_profile_generation: identity.remote_profile_generation,
                     local_prediction_confidence: 90,
                     remote_prediction_confidence: 90,
+                    requested_birthday_level: 0,
+                    generated_candidate_count: 1,
+                    signaled_candidate_count: 1,
+                    birthday: false,
+                    requested_socket_indices: vec![socket_index],
+                    requested_socket_count: 1,
                     prediction_window: vec![remote],
                     remote_prediction: vec![remote],
                     fresh_socket: identity.clone(),
@@ -3417,6 +4743,7 @@ mod hard_hard_tests {
             };
             crate::peer::HardHardSessionRecord {
                 session_id: format!("hh1:i:{token}:1:2:3:4:90:0:0"),
+                probe_session_id: None,
                 session_token: token.to_string(),
                 peer_id: peer_id.to_string(),
                 initiator: true,
@@ -3427,6 +4754,12 @@ mod hard_hard_tests {
                 remote_profile_generation: 4,
                 local_prediction_confidence: 90,
                 remote_prediction_confidence: 0,
+                requested_birthday_level: 0,
+                generated_candidate_count: 1,
+                signaled_candidate_count: 1,
+                birthday: false,
+                requested_socket_indices: vec![4_096],
+                requested_socket_count: 1,
                 prediction_window: vec!["198.51.100.1:40000".parse().unwrap()],
                 remote_prediction: Vec::new(),
                 fresh_socket: identity,

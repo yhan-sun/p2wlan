@@ -1369,6 +1369,52 @@ impl PeerManager {
             .copied()
     }
 
+    /// Publish the exact local endpoint and remote candidate epoch selected by
+    /// an authoritative Direct commit.  The caller holds the shared network
+    /// epoch gate and the connection writer, so this snapshot is ordered with
+    /// the corresponding Direct state transition and commit sequence bump.
+    pub(crate) fn publish_direct_commit_pair(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        remote_candidate_epoch: u64,
+        local_endpoint: Option<SocketAddr>,
+    ) {
+        self.direct_commit_pair_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                peer_id.to_string(),
+                DirectCommitPairSnapshot {
+                    generation,
+                    remote_candidate_epoch,
+                    local_endpoint,
+                },
+            );
+    }
+
+    /// Check the latest exact Direct pair without touching the async
+    /// connection map.  `is_direct_sync` is checked separately from the pair
+    /// snapshot so a transition to Relay/Closed cannot leave a stale exact
+    /// pair looking current.
+    pub(crate) fn direct_commit_pair_matches_sync(
+        &self,
+        identity: &HardHardFreshSocketIdentity,
+    ) -> bool {
+        if !self.is_direct_sync(&identity.peer_id) {
+            return false;
+        }
+        self.direct_commit_pair_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&identity.peer_id)
+            .is_some_and(|snapshot| {
+                snapshot.generation == identity.network_generation
+                    && snapshot.remote_candidate_epoch == identity.remote_candidate_epoch
+                    && snapshot.local_endpoint == Some(identity.socket_local_endpoint)
+            })
+    }
+
     /// Bump the direct-commit sequence for a peer and wake every waiters.
     /// Must be called inside the network-epoch critical section together
     /// with the Direct state transition.

@@ -120,6 +120,13 @@ pub struct UdpTransport {
     /// the worker re-validates its ownership before the actual send.
     #[cfg(test)]
     heartbeat_send_gate: Arc<std::sync::Mutex<Option<Arc<HeartbeatSendGate>>>>,
+    /// Test-only physical-send seam. It is absent from production builds and
+    /// disabled by default; tests can fail selected send attempts at the
+    /// shared UDP send abstraction without closing or replacing the socket.
+    #[cfg(test)]
+    probe_send_failure_hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
+    #[cfg(test)]
+    probe_send_failure_hook_enabled: Arc<AtomicBool>,
     /// One-shot lifecycle linearization seam used only by the remote-restart
     /// race regression.
     #[cfg(test)]
@@ -217,6 +224,10 @@ impl UdpTransport {
             #[cfg(test)]
             heartbeat_send_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
+            probe_send_failure_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            probe_send_failure_hook_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
             authenticated_punch_rate: Arc::new(Mutex::new(HashMap::new())),
@@ -262,6 +273,31 @@ impl UdpTransport {
     fn with_heartbeat_send_gate(mut self, gate: Arc<HeartbeatSendGate>) -> Self {
         self.heartbeat_send_gate = Arc::new(std::sync::Mutex::new(Some(gate)));
         self
+    }
+
+    /// Fail the selected one-based physical send attempts in tests. The hook
+    /// is deliberately cfg(test), opt-in and scoped to this transport clone.
+    #[cfg(test)]
+    pub(crate) fn set_probe_send_failures_for_test(
+        &self,
+        fail_on_attempts: impl IntoIterator<Item = usize>,
+    ) -> ProbeSendFailureGuard {
+        let fail_on_attempts = fail_on_attempts.into_iter().collect::<HashSet<_>>();
+        let mut hook = self
+            .probe_send_failure_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *hook = Some(ProbeSendFailureHook {
+            fail_on_attempts: fail_on_attempts.clone(),
+            physical_send_attempt: 0,
+        });
+        drop(hook);
+        self.probe_send_failure_hook_enabled
+            .store(!fail_on_attempts.is_empty(), Ordering::Release);
+        ProbeSendFailureGuard {
+            hook: self.probe_send_failure_hook.clone(),
+            enabled: self.probe_send_failure_hook_enabled.clone(),
+        }
     }
 
     /// Add up to `count - 1` ephemeral sockets for an explicitly enabled
@@ -418,7 +454,7 @@ impl UdpTransport {
     /// generation.  The key is derived from the authenticated Probe-v2 source
     /// identity (or a matched pending probe for legacy compatibility), never
     /// from an unauthenticated source address.
-    async fn update_peer_probe_rx_diagnostics(
+    pub(crate) async fn update_peer_probe_rx_diagnostics(
         &self,
         peer_id: &str,
         generation: u64,

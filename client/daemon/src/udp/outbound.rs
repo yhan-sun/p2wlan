@@ -1105,6 +1105,8 @@ impl UdpTransport {
             budget_skipped,
             epoch_budget_exhausted,
             candidate_iteration_capped,
+            sent_target_endpoints: sent_endpoints.into_iter().collect(),
+            ..PunchSendReport::default()
         })
     }
 

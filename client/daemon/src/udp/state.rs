@@ -121,6 +121,125 @@ impl HeartbeatSendGate {
     }
 }
 
+/// Deterministic seam for production-entry terminal-progress tests. A real
+/// Birthday worker can publish its first sends and then pause before returning
+/// to the scheduler, allowing deadline/cancellation code to snapshot live
+/// progress without waiting for a real multi-second deadline.
+#[cfg(test)]
+pub(crate) struct BirthdayWorkerCompletionGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct BirthdayWorkerCompletionGateGuard {
+    _gate: Arc<BirthdayWorkerCompletionGate>,
+}
+
+#[cfg(test)]
+static BIRTHDAY_WORKER_COMPLETION_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<Arc<BirthdayWorkerCompletionGate>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+impl Drop for BirthdayWorkerCompletionGateGuard {
+    fn drop(&mut self) {
+        *BIRTHDAY_WORKER_COMPLETION_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_birthday_worker_completion_gate_for_test() -> (
+    Arc<BirthdayWorkerCompletionGate>,
+    BirthdayWorkerCompletionGateGuard,
+) {
+    let gate = Arc::new(BirthdayWorkerCompletionGate {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    *BIRTHDAY_WORKER_COMPLETION_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
+    (
+        gate.clone(),
+        BirthdayWorkerCompletionGateGuard { _gate: gate },
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn wait_for_birthday_worker_completion_gate_for_test() {
+    let gate = BIRTHDAY_WORKER_COMPLETION_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(gate) = gate {
+        gate.reached.notify_waiters();
+        gate.release.notified().await;
+    }
+}
+
+/// Deterministic seam immediately after the production main `send_to` returns
+/// and after its session-local live recorder commit, but before the first
+/// post-send diagnostics/cleanup await.  The guard restores the hook and
+/// releases a parked sender when a test exits through an assertion failure.
+#[cfg(test)]
+pub(crate) struct ProbePostSendGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct ProbePostSendGateGuard {
+    gate: Arc<ProbePostSendGate>,
+}
+
+#[cfg(test)]
+static PROBE_POST_SEND_GATE: std::sync::LazyLock<
+    std::sync::Mutex<Option<Arc<ProbePostSendGate>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+impl Drop for ProbePostSendGateGuard {
+    fn drop(&mut self) {
+        *PROBE_POST_SEND_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.gate.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_probe_post_send_gate_for_test() -> (
+    Arc<ProbePostSendGate>,
+    ProbePostSendGateGuard,
+) {
+    let gate = Arc::new(ProbePostSendGate {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    *PROBE_POST_SEND_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
+    (
+        gate.clone(),
+        ProbePostSendGateGuard { gate },
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn wait_for_probe_post_send_gate_for_test() {
+    let gate = PROBE_POST_SEND_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(gate) = gate {
+        gate.reached.notify_waiters();
+        gate.release.notified().await;
+    }
+}
+
 /// Deterministic one-shot seam after UDP lifecycle cleanup but before the
 /// remote-incarnation reset is published. The transaction still owns the
 /// peer adoption lock while parked here.
@@ -1351,8 +1470,321 @@ impl PunchSocketPolicy {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BirthdaySweepReport {
+    pub requested_level: usize,
+    pub generated_candidate_count: usize,
+    pub signaled_candidate_count: usize,
+    pub effective_target_count: usize,
+    pub requested_socket_count: usize,
+    pub attached_socket_count: usize,
+    pub usable_socket_count: usize,
+    pub unavailable_socket_count: usize,
+    /// Kept as a compatibility alias for existing diagnostics consumers; it
+    /// is always the exact usable socket count for this sweep.
+    pub socket_count: usize,
+    pub degraded_reason: Option<String>,
+    pub waves_planned: usize,
+    pub waves_started: usize,
+    pub waves_fully_completed: usize,
+    /// Compatibility alias retained for existing event parsers.  It has the
+    /// same value as `waves_fully_completed` and is never a worker-join count.
+    pub waves_completed: usize,
+    pub packets_planned: usize,
+    pub targets_assigned: usize,
+    pub targets_examined: usize,
+    pub targets_attempted: usize,
+    pub logical_probes_attempted: usize,
+    pub logical_probes_sent: usize,
+    /// Logical probes for which every protocol-required physical datagram
+    /// failed.  A transient failure is recorded here but does not stop the
+    /// bounded sweep; the scheduler decides at the end whether all probes
+    /// failed and only then exposes `send_error`.
+    pub logical_probe_send_failures: usize,
+    pub physical_datagrams_sent: usize,
+    pub physical_send_errors: usize,
+    /// Physical errors belonging to a logical probe that still had at least
+    /// one successful datagram.  Compatibility-copy failures are the usual
+    /// example and never become a session failure by themselves.
+    pub partial_physical_send_errors: usize,
+    pub targets_budget_skipped: usize,
+    pub targets_cancelled: usize,
+    pub stop_reason: Option<String>,
+}
+
+/// Classification of a failed Probe send path.  The physical-send variant is
+/// deliberately distinct from generation/session fences: a fence can return
+/// `Err` without any datagram having failed at the kernel boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeSendFailureKind {
+    PhysicalSend,
+    NetworkGenerationChanged,
+    CandidateEpochChanged,
+    LocalProfileGenerationChanged,
+    RemoteProfileGenerationChanged,
+    PeerSessionChanged,
+    SessionRetired,
+    SocketUnavailable,
+    SocketRevoked,
+    ProbeRegistrationFailed,
+    ProbeEncodingFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BirthdaySweepFailureKind {
+    Send,
+    WorkerJoin,
+    NetworkGenerationChanged,
+    CandidateEpochChanged,
+    ProfileGenerationChanged,
+    PeerSessionChanged,
+    SessionRetired,
+    SocketUnavailable,
+    SocketRevoked,
+    ProbeRegistrationFailed,
+    ProbeEncodingFailed,
+}
+
+impl BirthdaySweepFailureKind {
+    pub(crate) const fn stop_reason(self) -> &'static str {
+        match self {
+            Self::Send => "send_error",
+            Self::WorkerJoin => "worker_failed",
+            Self::NetworkGenerationChanged => "network_generation_changed",
+            Self::CandidateEpochChanged => "candidate_epoch_changed",
+            Self::ProfileGenerationChanged => "profile_generation_changed",
+            Self::PeerSessionChanged => "peer_session_changed",
+            Self::SessionRetired => "session_retired",
+            Self::SocketUnavailable => "socket_unavailable",
+            Self::SocketRevoked => "socket_revoked",
+            Self::ProbeRegistrationFailed => "probe_registration_failed",
+            Self::ProbeEncodingFailed => "probe_encoding_failed",
+        }
+    }
+
+    pub(crate) const fn from_probe_failure(kind: ProbeSendFailureKind) -> Self {
+        match kind {
+            ProbeSendFailureKind::PhysicalSend => Self::Send,
+            ProbeSendFailureKind::NetworkGenerationChanged => Self::NetworkGenerationChanged,
+            ProbeSendFailureKind::CandidateEpochChanged => Self::CandidateEpochChanged,
+            ProbeSendFailureKind::LocalProfileGenerationChanged
+            | ProbeSendFailureKind::RemoteProfileGenerationChanged => Self::ProfileGenerationChanged,
+            ProbeSendFailureKind::PeerSessionChanged => Self::PeerSessionChanged,
+            ProbeSendFailureKind::SessionRetired => Self::SessionRetired,
+            ProbeSendFailureKind::SocketUnavailable => Self::SocketUnavailable,
+            ProbeSendFailureKind::SocketRevoked => Self::SocketRevoked,
+            ProbeSendFailureKind::ProbeRegistrationFailed => Self::ProbeRegistrationFailed,
+            ProbeSendFailureKind::ProbeEncodingFailed => Self::ProbeEncodingFailed,
+        }
+    }
+
+    pub(crate) fn from_stop_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "send_error" => Some(Self::Send),
+            "worker_failed" => Some(Self::WorkerJoin),
+            "network_generation_changed" => Some(Self::NetworkGenerationChanged),
+            "candidate_epoch_changed" => Some(Self::CandidateEpochChanged),
+            "profile_generation_changed" => Some(Self::ProfileGenerationChanged),
+            "peer_session_changed" => Some(Self::PeerSessionChanged),
+            "session_retired" => Some(Self::SessionRetired),
+            "socket_unavailable" => Some(Self::SocketUnavailable),
+            "socket_revoked" => Some(Self::SocketRevoked),
+            "probe_registration_failed" => Some(Self::ProbeRegistrationFailed),
+            "probe_encoding_failed" => Some(Self::ProbeEncodingFailed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveBirthdayCounters {
+    pub targets_assigned: u32,
+    pub targets_examined: u32,
+    pub targets_attempted: u32,
+    pub targets_cancelled: u32,
+    pub budget_skipped: u32,
+    pub logical_probes_attempted: u32,
+    pub logical_probes_sent: u32,
+    pub logical_probe_send_failures: u32,
+    pub physical_datagrams_sent: u32,
+    pub physical_send_errors: u32,
+    pub partial_physical_send_errors: u32,
+    pub probe_path_errors: u32,
+    pub workers_completed: u32,
+}
+
+/// Complete session-level live progress.  The counter values alone cannot
+/// explain which target/socket emitted a partial sweep, so the endpoint set,
+/// socket histogram and physical-send timestamps are kept beside them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveBirthdayProgress {
+    pub counters: LiveBirthdayCounters,
+    pub sent_target_endpoints: HashSet<SocketAddr>,
+    pub per_socket_sent: BTreeMap<usize, u32>,
+    pub first_send_at_ms: Option<u64>,
+    pub last_send_at_ms: Option<u64>,
+}
+
+/// Synchronous session-local telemetry for a bounded Birthday sweep.
+///
+/// Admission owns the physical `send_to` boundary, so this recorder is called
+/// immediately after each send future resolves and before diagnostics,
+/// pending-probe cleanup, or any other follow-up await.  It contains no
+/// connection-manager state and never awaits while holding its short-lived
+/// standard mutex.
+#[derive(Clone)]
+pub(crate) struct BirthdayLiveRecorder {
+    progress: Arc<StdMutex<LiveBirthdayProgress>>,
+}
+
+impl BirthdayLiveRecorder {
+    pub(crate) fn new(progress: Arc<StdMutex<LiveBirthdayProgress>>) -> Self {
+        Self { progress }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut LiveBirthdayProgress)) {
+        let mut progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut progress);
+    }
+
+    fn record_success_timestamp(progress: &mut LiveBirthdayProgress, sent_at_ms: u64) {
+        progress.first_send_at_ms = Some(
+            progress
+                .first_send_at_ms
+                .map_or(sent_at_ms, |first| first.min(sent_at_ms)),
+        );
+        progress.last_send_at_ms = Some(
+            progress
+                .last_send_at_ms
+                .map_or(sent_at_ms, |last| last.max(sent_at_ms)),
+        );
+    }
+
+    /// Commit the authenticated/main datagram. This is the one logical Probe
+    /// contribution and the first physical datagram contribution.
+    pub(crate) fn record_primary_success(
+        &self,
+        socket_index: usize,
+        target: SocketAddr,
+        sent_at_ms: u64,
+    ) {
+        self.update(|progress| {
+            progress.counters.logical_probes_sent = progress
+                .counters
+                .logical_probes_sent
+                .saturating_add(1);
+            progress.counters.physical_datagrams_sent = progress
+                .counters
+                .physical_datagrams_sent
+                .saturating_add(1);
+            progress.sent_target_endpoints.insert(target);
+            let sent = progress.per_socket_sent.entry(socket_index).or_default();
+            *sent = sent.saturating_add(1);
+            Self::record_success_timestamp(progress, sent_at_ms);
+        });
+    }
+
+    /// Commit a compatibility datagram. It is physical-only: the logical
+    /// Probe and unique target were already committed with the main packet.
+    pub(crate) fn record_compatibility_success(
+        &self,
+        socket_index: usize,
+        sent_at_ms: u64,
+    ) {
+        self.update(|progress| {
+            progress.counters.physical_datagrams_sent = progress
+                .counters
+                .physical_datagrams_sent
+                .saturating_add(1);
+            let sent = progress.per_socket_sent.entry(socket_index).or_default();
+            *sent = sent.saturating_add(1);
+            Self::record_success_timestamp(progress, sent_at_ms);
+        });
+    }
+
+    /// Commit a failed main physical send before pending-probe cleanup.
+    pub(crate) fn record_primary_error(&self) {
+        self.update(|progress| {
+            progress.counters.logical_probe_send_failures = progress
+                .counters
+                .logical_probe_send_failures
+                .saturating_add(1);
+            progress.counters.physical_send_errors = progress
+                .counters
+                .physical_send_errors
+                .saturating_add(1);
+        });
+    }
+
+    /// Commit a failed compatibility copy as a partial physical error. The
+    /// logical Probe remains successful because its main datagram succeeded.
+    pub(crate) fn record_compatibility_error(&self) {
+        self.update(|progress| {
+            progress.counters.physical_send_errors = progress
+                .counters
+                .physical_send_errors
+                .saturating_add(1);
+            progress.counters.partial_physical_send_errors = progress
+                .counters
+                .partial_physical_send_errors
+                .saturating_add(1);
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BirthdaySweepProgress {
+    pub birthday: BirthdaySweepReport,
+    /// Partial logical/physical send counters published after every worker
+    /// wave.  This lets the caller emit a terminal summary when its deadline
+    /// or cancellation drops the scheduler future before it returns.
+    pub aggregate: PunchSendReport,
+    /// Session-scoped counters updated at each target/send event. This lock
+    /// is independent of the peer connection map and is never held across a
+    /// UDP send or another await.
+    pub live: Arc<StdMutex<LiveBirthdayProgress>>,
+}
+
+impl Default for BirthdaySweepProgress {
+    fn default() -> Self {
+        Self {
+            birthday: BirthdaySweepReport::default(),
+            aggregate: PunchSendReport::default(),
+            live: Arc::new(StdMutex::new(LiveBirthdayProgress::default())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HardHardSocketSnapshot {
+    pub socket_index: usize,
+    pub attached: bool,
+    pub usable: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PunchSendReport {
     pub packets_sent: u32,
+    /// Logical probes that passed admission and entered Probe construction or
+    /// the physical send path.
+    pub logical_probes_attempted: u32,
+    /// Logical probes with at least one successful physical datagram send.
+    pub logical_probes_sent: u32,
+    /// Logical probes whose every required physical send failed.
+    pub logical_probe_send_failures: u32,
+    /// Successful physical UDP datagrams, including compatibility copies.
+    pub physical_datagrams_sent: u32,
+    /// Physical UDP sends that returned an error, including compatibility
+    /// copies after a successful primary send.
+    pub physical_send_errors: u32,
+    /// Errors from a logical probe that still had at least one successful
+    /// physical datagram.  These are degraded sends, not session failures.
+    pub partial_physical_send_errors: u32,
+    /// Non-physical errors in the Probe build/registration path.  This keeps
+    /// a `send_error` classification explainable when no kernel send failed.
+    pub probe_path_errors: u32,
     pub unique_target_endpoints: u32,
     /// Wall-clock UNIX milliseconds captured immediately after the first
     /// successful kernel UDP send in this punch session.  `None` means the
@@ -1375,6 +1807,33 @@ pub(crate) struct PunchSendReport {
     /// The session stopped enumerating candidates because the epoch's hard
     /// candidate-iteration budget was reached.
     pub candidate_iteration_capped: bool,
+    /// Exact endpoints that accepted at least one logical probe. This is an
+    /// internal aggregation aid for multi-wave Hard↔Hard diagnostics; callers
+    /// must use `unique_target_endpoints` for the bounded count.
+    pub sent_target_endpoints: Vec<SocketAddr>,
+    /// Wall-clock UNIX milliseconds captured after the last successful
+    /// kernel UDP send in this punch session.
+    pub last_send_at_ms: Option<u64>,
+    /// Present only for the bounded Hard↔Hard Birthday scheduler.
+    pub birthday: Option<BirthdaySweepReport>,
+    /// Number of exact targets assigned to this worker and how far the
+    /// worker progressed through them.  A worker that exits on a fence is not
+    /// complete even if its task joins successfully.
+    pub targets_assigned: u32,
+    /// Targets dequeued by this worker.
+    pub targets_examined: u32,
+    pub targets_attempted: u32,
+    pub targets_cancelled: u32,
+    pub target_processing_completed: bool,
+    /// Set when the scheduler observed a worker JoinError or panic. Normal
+    /// worker/business failures are carried by `failure_kind=Send` instead.
+    /// The caller still receives the partial report so it can emit one final
+    /// summary before returning the Hard↔Hard sweep as failed.
+    pub worker_failed: bool,
+    /// Typed failure retained through scheduler aggregation. `Send` covers
+    /// ordinary worker/business errors and actual UDP send failures;
+    /// `WorkerJoin` covers a JoinError or panic.
+    pub failure_kind: Option<BirthdaySweepFailureKind>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

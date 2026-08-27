@@ -9,6 +9,8 @@ const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
 /// immediately.  Bound the handshake so a broken runtime/task cannot leave a
 /// fresh-mapping generation waiting forever before its first STUN request.
 const DYNAMIC_READER_READY_TIMEOUT: Duration = Duration::from_secs(1);
+const HARD_HARD_BIRTHDAY_WAVE_INTERVAL: Duration = Duration::from_millis(20);
+const HARD_HARD_BIRTHDAY_WAVES: usize = 2;
 
 /// Adaptive-prediction learner state for one network generation, scoped by
 /// destination so a stride learned toward STUN observers is not blindly applied
@@ -494,6 +496,7 @@ impl UdpTransport {
             .and_then(|entry| entry.hard_hard_session_token.clone())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn hard_hard_socket_indices_for_token(
         &self,
         peer_id: &str,
@@ -510,6 +513,44 @@ impl UdpTransport {
                     && entry.phase.is_usable()
             })
             .map(|(index, _)| *index)
+            .collect()
+    }
+
+    /// Snapshot the exact sockets requested by one Hard↔Hard session without
+    /// following affinity or falling back to the ordinary pool.  The caller
+    /// owns the requested index list from the session ledger; a missing entry
+    /// is represented explicitly as detached/unusable so diagnostics can
+    /// distinguish it from a smaller request.
+    pub(crate) async fn hard_hard_socket_snapshot_for_token(
+        &self,
+        peer_id: &str,
+        token: &str,
+        requested_socket_indices: &[usize],
+    ) -> Vec<HardHardSocketSnapshot> {
+        let state = self.socket_state.lock().await;
+        let mut seen = HashSet::with_capacity(requested_socket_indices.len());
+        requested_socket_indices
+            .iter()
+            .copied()
+            .filter(|socket_index| seen.insert(*socket_index))
+            .map(|socket_index| {
+                let entry = state.dynamic.get(&socket_index);
+                let attached = entry.is_some_and(|entry| {
+                    entry.peer_id == peer_id
+                        && entry.hard_hard_session_token.as_deref() == Some(token)
+                });
+                let usable = attached
+                    && entry.is_some_and(|entry| {
+                        entry.phase.is_usable()
+                            && entry.network_generation
+                                == self.peers.current_network_generation_sync()
+                    });
+                HardHardSocketSnapshot {
+                    socket_index,
+                    attached,
+                    usable,
+                }
+            })
             .collect()
     }
 
@@ -651,7 +692,8 @@ impl UdpTransport {
                 .collect::<Vec<_>>()
         };
         for entry in losers {
-            self.detach_dynamic_entry(entry, "hard_hard_loser_socket").await;
+            self.detach_dynamic_entry(entry, "hard_hard_loser_socket")
+                .await;
         }
         self.peers
             .record_direct_event_for_generation_with_socket(
@@ -1227,8 +1269,11 @@ impl UdpTransport {
             };
             let local_endpoint = socket.local_addr().ok();
             let Some(local_endpoint) = local_endpoint else {
-                self.detach_dynamic_socket_by_index(socket_index, "hard_hard_birthday_no_local_endpoint")
-                    .await;
+                self.detach_dynamic_socket_by_index(
+                    socket_index,
+                    "hard_hard_birthday_no_local_endpoint",
+                )
+                .await;
                 for attached_socket in &attached {
                     self.detach_dynamic_socket_by_index(
                         attached_socket.0,
@@ -1274,7 +1319,13 @@ impl UdpTransport {
                     });
                 }
             };
-            attached.push((socket_index, socket, guard, punch_generation, local_endpoint));
+            attached.push((
+                socket_index,
+                socket,
+                guard,
+                punch_generation,
+                local_endpoint,
+            ));
         }
 
         if capacity_rejected {
@@ -1354,8 +1405,11 @@ impl UdpTransport {
             || self.peers.is_direct(peer_id).await
         {
             for attached_socket in &attached {
-                self.detach_dynamic_socket_by_index(attached_socket.0, "hard_hard_birthday_superseded")
-                    .await;
+                self.detach_dynamic_socket_by_index(
+                    attached_socket.0,
+                    "hard_hard_birthday_superseded",
+                )
+                .await;
             }
             return Err(FreshMappingRejection::Superseded);
         }
@@ -1393,12 +1447,8 @@ impl UdpTransport {
         observed_ports.dedup();
         let local_model = infer_allocation_model(&observations_by_socket[0]);
         let model_label = local_model.kind.label().to_string();
-        let candidate_endpoints = hard_hard_birthday_candidates(
-            public_ip,
-            &observed_ports,
-                    level,
-                    session_token,
-        );
+        let candidate_endpoints =
+            hard_hard_birthday_candidates(public_ip, &observed_ports, level, session_token);
         if candidate_endpoints.len() != level {
             for attached_socket in &attached {
                 self.detach_dynamic_socket_by_index(
@@ -1415,8 +1465,7 @@ impl UdpTransport {
         // every earlier guard fail its finalize revalidation.  The remaining
         // guards use the no-affinity speculative commit below and are still
         // protected by the same generation/cancellation fences.
-        for (position, (socket_index, _, guard, punch_generation, _)) in
-            attached.iter().enumerate()
+        for (position, (socket_index, _, guard, punch_generation, _)) in attached.iter().enumerate()
         {
             let committed = if position == 0 {
                 guard
@@ -1441,7 +1490,11 @@ impl UdpTransport {
                     .await
                     .committed
             };
-            if !committed || !self.tag_hard_hard_socket(peer_id, *socket_index, session_token).await {
+            if !committed
+                || !self
+                    .tag_hard_hard_socket(peer_id, *socket_index, session_token)
+                    .await
+            {
                 for attached_socket in &attached {
                     self.detach_dynamic_socket_by_index(
                         attached_socket.0,
@@ -1475,15 +1528,17 @@ impl UdpTransport {
             .await;
         let sockets = attached
             .into_iter()
-            .map(|(socket_index, _, guard, punch_generation, socket_local_endpoint)| {
-                HardHardBirthdaySocket {
-                    punch_generation,
-                    socket_index,
-                    socket_local_endpoint,
-                    guard,
-                }
-        })
-        .collect();
+            .map(
+                |(socket_index, _, guard, punch_generation, socket_local_endpoint)| {
+                    HardHardBirthdaySocket {
+                        punch_generation,
+                        socket_index,
+                        socket_local_endpoint,
+                        guard,
+                    }
+                },
+            )
+            .collect();
         Ok(HardHardBirthdayResult {
             requested_level,
             requested_socket_count,
@@ -2223,6 +2278,7 @@ impl UdpTransport {
             attempts,
             None,
             None,
+            None,
         )
         .await
     }
@@ -2251,66 +2307,444 @@ impl UdpTransport {
     }
 
     /// Fan a bounded Hard↔Hard birthday window across the committed candidate
-    /// sockets. Each target is sent once from exactly one socket, so the
-    /// physical datagram count is the negotiated 64/128/256 level rather than
-    /// a socket-count Cartesian product.
+    /// sockets in up to two deterministic waves. Each wave sends every target
+    /// from exactly one socket; the second wave rotates the socket assignment
+    /// so a target is retried from a different source port without creating a
+    /// socket-count Cartesian product.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) async fn punch_hard_hard_birthday_candidates(
         &self,
         peer_id: &str,
         socket_indices: Vec<usize>,
         targets: Vec<SocketAddr>,
+        requested_level: usize,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
         profile_fence: (u64, u64),
         session_token: &str,
     ) -> Result<PunchSendReport> {
-        if socket_indices.is_empty() || targets.is_empty() {
-            return Ok(PunchSendReport::default());
-        }
-        let mut assignments = hard_hard_birthday_assignments(socket_indices.len(), targets);
-        let mut workers = JoinSet::new();
-        for (socket_position, socket_index) in socket_indices.into_iter().enumerate() {
-            let assigned = std::mem::take(&mut assignments[socket_position]);
-            if assigned.is_empty() {
+        self.punch_hard_hard_birthday_candidates_with_metadata(
+            peer_id,
+            socket_indices,
+            targets.clone(),
+            requested_level,
+            targets.len(),
+            targets.len(),
+            peer_session_generation,
+            profile_fence,
+            session_token,
+            None,
+        )
+        .await
+    }
+
+    /// Scheduler entry used by the Hard↔Hard runtime.  The metadata counts
+    /// come from the local session ledger's pre-cap measurement contract; the
+    /// scheduler never derives them from the remote/effective target list.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn punch_hard_hard_birthday_candidates_with_metadata(
+        &self,
+        peer_id: &str,
+        requested_socket_indices: Vec<usize>,
+        targets: Vec<SocketAddr>,
+        requested_level: usize,
+        generated_candidate_count: usize,
+        signaled_candidate_count: usize,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        profile_fence: (u64, u64),
+        session_token: &str,
+        progress: Option<Arc<Mutex<BirthdaySweepProgress>>>,
+    ) -> Result<PunchSendReport> {
+        let live = if let Some(progress) = progress.as_ref() {
+            Some(progress.lock().await.live.clone())
+        } else {
+            None
+        };
+        let mut effective_targets =
+            Vec::with_capacity(targets.len().min(crate::MAX_SIGNAL_CANDIDATES));
+        for target in targets {
+            if target.port() == 0 || effective_targets.contains(&target) {
                 continue;
             }
-            let transport = self.clone();
-            let peer_id = peer_id.to_string();
-            let session_token = session_token.to_string();
-            workers.spawn(async move {
-                transport
-                    .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
-                        &peer_id,
-                        socket_index,
-                        assigned,
-                        Duration::from_millis(20),
-                        1,
-                        Some(profile_fence),
-                        Some(&session_token),
-                    )
-                    .await
-            });
+            effective_targets.push(target);
+            if effective_targets.len() == crate::MAX_SIGNAL_CANDIDATES {
+                break;
+            }
+        }
+        let requested_socket_count = hard_hard_birthday_socket_count(requested_level);
+        // This is the only socket snapshot used for scheduling.  It is exact
+        // and session-token scoped; a detached member becomes unavailable and
+        // can never be replaced by a pool socket.
+        let socket_snapshot = self
+            .hard_hard_socket_snapshot_for_token(peer_id, session_token, &requested_socket_indices)
+            .await;
+        let socket_plan = hard_hard_birthday_socket_plan(requested_level, socket_snapshot);
+        let attached_socket_count = socket_plan.attached_socket_count;
+        let effective_socket_indices = socket_plan.usable_socket_indices;
+        let usable_socket_count = socket_plan.usable_socket_count;
+        let unavailable_socket_count = socket_plan.unavailable_socket_count;
+        let waves_planned = hard_hard_birthday_wave_count(usable_socket_count);
+        let mut birthday = BirthdaySweepReport {
+            requested_level,
+            generated_candidate_count,
+            signaled_candidate_count,
+            effective_target_count: effective_targets.len(),
+            requested_socket_count,
+            attached_socket_count,
+            usable_socket_count,
+            unavailable_socket_count,
+            socket_count: usable_socket_count,
+            waves_planned,
+            packets_planned: hard_hard_birthday_packets_planned(
+                usable_socket_count,
+                effective_targets.len(),
+            ),
+            ..BirthdaySweepReport::default()
+        };
+        if usable_socket_count == 1 {
+            birthday.degraded_reason = Some(
+                if requested_socket_count > 1 {
+                    "partial_socket_unavailable"
+                } else {
+                    "single_socket"
+                }
+                .to_string(),
+            );
+        } else if usable_socket_count > 0 && usable_socket_count < requested_socket_count {
+            birthday.degraded_reason = Some("partial_socket_unavailable".to_string());
         }
         let mut aggregate = PunchSendReport::default();
-        while let Some(joined) = workers.join_next().await {
-            let Ok(result) = joined else {
-                continue;
-            };
-            let report = result?;
-            aggregate.packets_sent = aggregate.packets_sent.saturating_add(report.packets_sent);
-            aggregate.unique_target_endpoints = aggregate
-                .unique_target_endpoints
-                .saturating_add(report.unique_target_endpoints);
-            aggregate.budget_skipped = aggregate.budget_skipped.saturating_add(report.budget_skipped);
-            aggregate.epoch_budget_exhausted |= report.epoch_budget_exhausted;
-            aggregate.candidate_iteration_capped |= report.candidate_iteration_capped;
-            aggregate.first_send_at_ms = match (aggregate.first_send_at_ms, report.first_send_at_ms) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                (None, right) => right,
-                (left, None) => left,
-            };
-            aggregate.per_socket_sent.extend(report.per_socket_sent);
+        publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+        if effective_targets.is_empty() {
+            birthday.stop_reason = Some("empty_targets".to_string());
+            update_birthday_sweep_counters(&mut birthday, &aggregate);
+            aggregate.birthday = Some(birthday);
+            publish_birthday_sweep_progress(
+                &progress,
+                aggregate
+                    .birthday
+                    .as_ref()
+                    .expect("birthday report just set"),
+                &aggregate,
+            )
+            .await;
+            return Ok(aggregate);
         }
+        if effective_socket_indices.is_empty() {
+            birthday.stop_reason = Some("socket_unavailable".to_string());
+            aggregate.failure_kind = Some(BirthdaySweepFailureKind::SocketUnavailable);
+            update_birthday_sweep_counters(&mut birthday, &aggregate);
+            aggregate.birthday = Some(birthday);
+            publish_birthday_sweep_progress(
+                &progress,
+                aggregate
+                    .birthday
+                    .as_ref()
+                    .expect("birthday report just set"),
+                &aggregate,
+            )
+            .await;
+            return Ok(aggregate);
+        }
+
+        let network_generation_at_start = self.peers.current_network_generation_sync();
+        let remote_candidate_epoch_at_start = self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or_default();
+        let direct_commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
+        for wave in 0..birthday.waves_planned {
+            if wave > 0 {
+                sleep(HARD_HARD_BIRTHDAY_WAVE_INTERVAL).await;
+            }
+            if wave > 0 {
+                if let Some(reason) = self
+                    .hard_hard_birthday_stop_reason(
+                        peer_id,
+                        session_token,
+                        profile_fence,
+                        peer_session_generation,
+                        network_generation_at_start,
+                        remote_candidate_epoch_at_start,
+                        direct_commit_seq_at_start,
+                    )
+                    .await
+                {
+                    birthday.stop_reason = Some(reason.to_string());
+                    if let Some(failure_kind) = BirthdaySweepFailureKind::from_stop_reason(reason) {
+                        aggregate.failure_kind = combine_birthday_failure_kind(
+                            aggregate.failure_kind,
+                            Some(failure_kind),
+                        );
+                        update_birthday_sweep_counters(&mut birthday, &aggregate);
+                        publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                        return Err(DaemonError::Network(format!(
+                            "hard-hard birthday stopped: {reason}"
+                        )));
+                    }
+                    break;
+                }
+            }
+
+            birthday.waves_started = birthday.waves_started.saturating_add(1);
+            let mut assignments = hard_hard_birthday_wave_assignments(
+                effective_socket_indices.len(),
+                effective_targets.clone(),
+                wave,
+            );
+            let wave_assigned_count = assignments.iter().map(Vec::len).sum::<usize>();
+            birthday.targets_assigned = birthday
+                .targets_assigned
+                .saturating_add(effective_targets.len());
+            update_live_birthday_counters(&live, |counters| {
+                counters.targets_assigned = counters
+                    .targets_assigned
+                    .saturating_add(u32::try_from(wave_assigned_count).unwrap_or(u32::MAX));
+            });
+            let mut workers = JoinSet::new();
+            for (socket_position, socket_index) in
+                effective_socket_indices.iter().copied().enumerate()
+            {
+                let assigned = std::mem::take(&mut assignments[socket_position]);
+                if assigned.is_empty() {
+                    continue;
+                }
+                let transport = self.clone();
+                let peer_id = peer_id.to_string();
+                let session_token = session_token.to_string();
+                let live_counters = live.clone();
+                let assigned_count = assigned.len();
+                workers.spawn(async move {
+                    let result = transport
+                        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
+                            &peer_id,
+                            socket_index,
+                            assigned,
+                            HARD_HARD_BIRTHDAY_WAVE_INTERVAL,
+                            1,
+                            Some(profile_fence),
+                            Some(&session_token),
+                            live_counters,
+                        )
+                        .await;
+                    (assigned_count, result)
+                });
+            }
+            update_birthday_sweep_counters(&mut birthday, &aggregate);
+            publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+
+            let mut wave_report = PunchSendReport::default();
+            let mut wave_fully_completed = true;
+            let mut failure_kind = None;
+            while let Some(joined) = workers.join_next().await {
+                update_live_birthday_counters(&live, |counters| {
+                    counters.workers_completed = counters.workers_completed.saturating_add(1);
+                });
+                record_birthday_worker_result(
+                    &mut wave_report,
+                    &mut wave_fully_completed,
+                    &mut failure_kind,
+                    joined,
+                );
+            }
+            // A JoinError has no return payload, so normalize the wave's
+            // assigned count from the scheduler plan and retain every target
+            // not reached by a returned worker as cancelled progress.
+            wave_report.targets_assigned = u32::try_from(wave_assigned_count).unwrap_or(u32::MAX);
+            wave_report.targets_cancelled = wave_report.targets_cancelled.max(
+                u32::try_from(wave_assigned_count)
+                    .unwrap_or(u32::MAX)
+                    .saturating_sub(wave_report.targets_attempted),
+            );
+            update_live_birthday_counters(&live, |counters| {
+                counters.targets_cancelled = counters
+                    .targets_cancelled
+                    .saturating_add(wave_report.targets_cancelled);
+            });
+            merge_punch_send_reports(&mut aggregate, wave_report.clone());
+            if let Some(failure_kind) = failure_kind.or(wave_report.failure_kind) {
+                aggregate.failure_kind = Some(failure_kind);
+                aggregate.worker_failed |= failure_kind == BirthdaySweepFailureKind::WorkerJoin;
+                let stop_reason = failure_kind.stop_reason();
+                birthday.stop_reason = Some(stop_reason.to_string());
+                update_birthday_sweep_counters(&mut birthday, &aggregate);
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                return Err(DaemonError::Network(format!(
+                    "hard-hard birthday worker stopped: {stop_reason}"
+                )));
+            }
+            if !wave_fully_completed {
+                birthday.stop_reason = Some(
+                    self.hard_hard_birthday_stop_reason(
+                        peer_id,
+                        session_token,
+                        profile_fence,
+                        peer_session_generation,
+                        network_generation_at_start,
+                        remote_candidate_epoch_at_start,
+                        direct_commit_seq_at_start,
+                    )
+                    .await
+                    .unwrap_or("socket_unavailable")
+                    .to_string(),
+                );
+                update_birthday_sweep_counters(&mut birthday, &aggregate);
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                break;
+            }
+            birthday.waves_fully_completed = birthday.waves_fully_completed.saturating_add(1);
+            birthday.waves_completed = birthday.waves_fully_completed;
+            update_birthday_sweep_counters(&mut birthday, &aggregate);
+            publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+            if let Some(reason) = self
+                .hard_hard_birthday_stop_reason(
+                    peer_id,
+                    session_token,
+                    profile_fence,
+                    peer_session_generation,
+                    network_generation_at_start,
+                    remote_candidate_epoch_at_start,
+                    direct_commit_seq_at_start,
+                )
+                .await
+            {
+                birthday.stop_reason = Some(reason.to_string());
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                break;
+            }
+            if wave_report.epoch_budget_exhausted {
+                birthday.stop_reason = Some("epoch_budget_exhausted".to_string());
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                break;
+            }
+            if wave_report.candidate_iteration_capped {
+                birthday.stop_reason = Some("candidate_iteration_capped".to_string());
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                break;
+            }
+            if wave_report.packets_sent == 0 && wave_report.budget_skipped > 0 {
+                birthday.stop_reason = Some("budget_exhausted".to_string());
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                break;
+            }
+            if wave_report.packets_sent == 0 && wave_report.budget_skipped == 0 {
+                // A physical send failure is local to the logical target.
+                // Keep the bounded scheduler alive so a later target (or the
+                // rotated second wave) can still establish the path.  Only a
+                // wave that made no logical attempt and had no physical error
+                // is an unavailable-socket verdict.
+                if wave_report.logical_probes_attempted == 0
+                    && wave_report.physical_send_errors == 0
+                {
+                    birthday.stop_reason = Some("socket_unavailable".to_string());
+                    aggregate.failure_kind = Some(BirthdaySweepFailureKind::SocketUnavailable);
+                    publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                    break;
+                }
+            }
+        }
+
+        // Do not turn one or more transient target send failures into an
+        // early scheduler abort.  The terminal send verdict is only emitted
+        // after every bounded wave has had its chance and every logical Probe
+        // attempted by this session failed at the physical send boundary.
+        if birthday.stop_reason.is_none()
+            && aggregate.logical_probes_attempted > 0
+            && aggregate.logical_probes_sent == 0
+            && aggregate.logical_probe_send_failures > 0
+            && aggregate.physical_send_errors > 0
+        {
+            aggregate.failure_kind = Some(BirthdaySweepFailureKind::Send);
+            birthday.stop_reason = Some("send_error".to_string());
+            update_birthday_sweep_counters(&mut birthday, &aggregate);
+            publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+            return Err(DaemonError::Network(
+                "hard-hard birthday probes all failed at the physical send boundary".to_string(),
+            ));
+        }
+
+        if birthday.stop_reason.is_none() {
+            birthday.stop_reason = Some("completed".to_string());
+        }
+        aggregate.unique_target_endpoints =
+            u32::try_from(aggregate.sent_target_endpoints.len()).unwrap_or(u32::MAX);
+        update_birthday_sweep_counters(&mut birthday, &aggregate);
+        aggregate.birthday = Some(birthday);
+        publish_birthday_sweep_progress(
+            &progress,
+            aggregate
+                .birthday
+                .as_ref()
+                .expect("birthday report just set"),
+            &aggregate,
+        )
+        .await;
         Ok(aggregate)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hard_hard_birthday_stop_reason(
+        &self,
+        peer_id: &str,
+        session_token: &str,
+        profile_fence: (u64, u64),
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        network_generation: u64,
+        remote_candidate_epoch: u64,
+        direct_commit_seq: Option<u64>,
+    ) -> Option<&'static str> {
+        if self
+            .peers
+            .hard_hard_winner_for_token(peer_id, session_token)
+            .await
+            .is_some()
+        {
+            return Some("winner_selected");
+        }
+        if self.peers.is_direct_sync(peer_id) {
+            return Some("direct_confirmed");
+        }
+        if self.peers.current_network_generation_sync() != network_generation {
+            return Some("network_generation_changed");
+        }
+        if !self
+            .peers
+            .peer_session_is_current_sync(peer_id, peer_session_generation)
+        {
+            return Some("peer_session_changed");
+        }
+        if self
+            .peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .unwrap_or_default()
+            != remote_candidate_epoch
+        {
+            return Some("candidate_epoch_changed");
+        }
+        let profile_current = self
+            .peers
+            .hard_hard_plan_for_peer(peer_id)
+            .await
+            .is_some_and(|plan| {
+                plan.local_profile_generation == profile_fence.0
+                    && plan.remote_profile_generation == profile_fence.1
+            });
+        if !profile_current {
+            return Some("profile_generation_changed");
+        }
+        if !self
+            .peers
+            .hard_hard_session_token_is_current(peer_id, session_token)
+            .await
+        {
+            return Some("session_retired");
+        }
+        if self.peers.direct_commit_seq_sync(peer_id) != direct_commit_seq {
+            return Some("direct_commit_seq_changed");
+        }
+        None
     }
 
     /// Exact-index sweep with an optional Hard↔Hard profile-generation fence.
@@ -2349,11 +2783,48 @@ impl UdpTransport {
         profile_fence: Option<(u64, u64)>,
         hard_hard_session_token: Option<&str>,
     ) -> Result<PunchSendReport> {
+        let mut report = self
+            .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
+                peer_id,
+                socket_index,
+                candidates,
+                probe_interval,
+                attempts,
+                profile_fence,
+                hard_hard_session_token,
+                None,
+            )
+            .await?;
+        finalize_physical_send_failure(&mut report);
+        Ok(report)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session_and_live(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        candidates: Vec<SocketAddr>,
+        probe_interval: Duration,
+        attempts: u32,
+        profile_fence: Option<(u64, u64)>,
+        hard_hard_session_token: Option<&str>,
+        live: Option<Arc<StdMutex<LiveBirthdayProgress>>>,
+    ) -> Result<PunchSendReport> {
         let Some((index, socket, _lease)) = self
             .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
             .await
         else {
-            return Ok(PunchSendReport::default());
+            let failure_kind = self
+                .classify_dynamic_socket_failure_kind(peer_id, socket_index)
+                .await;
+            return Ok(PunchSendReport {
+                targets_assigned: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+                targets_cancelled: u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+                probe_path_errors: 1,
+                failure_kind: Some(BirthdaySweepFailureKind::from_probe_failure(failure_kind)),
+                ..PunchSendReport::default()
+            });
         };
         self.punch_candidates_from_dynamic_socket_resolved(
             peer_id,
@@ -2364,6 +2835,7 @@ impl UdpTransport {
             attempts,
             profile_fence,
             hard_hard_session_token,
+            live,
         )
         .await
     }
@@ -2379,14 +2851,30 @@ impl UdpTransport {
         attempts: u32,
         profile_fence: Option<(u64, u64)>,
         hard_hard_session_token: Option<&str>,
+        live: Option<Arc<StdMutex<LiveBirthdayProgress>>>,
     ) -> Result<PunchSendReport> {
         let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
         let mut packets_sent = 0u32;
+        let mut logical_probes_attempted = 0u32;
+        let mut logical_probes_sent = 0u32;
+        let mut logical_probe_send_failures = 0u32;
+        let mut physical_datagrams_sent = 0u32;
+        let mut physical_send_errors = 0u32;
+        let mut partial_physical_send_errors = 0u32;
+        let mut probe_path_errors = 0u32;
         let mut budget_skipped = 0u32;
         let mut last_budget_reason = None;
         let mut sent_endpoints = HashSet::new();
         let mut first_send_at_ms = None;
+        let mut last_send_at_ms: Option<u64> = None;
         let mut per_socket_sent = 0u32;
+        let mut per_socket_sent_index = index;
+        let targets_assigned = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+        let mut targets_examined = 0u32;
+        let mut targets_attempted = 0u32;
+        let mut target_processing_completed = true;
+        let mut failure_kind = None;
+        let live_recorder = live.clone().map(BirthdayLiveRecorder::new);
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         let network_generation_at_start = self.peers.current_network_generation_sync();
         let remote_candidate_epoch_at_start = self
@@ -2399,12 +2887,21 @@ impl UdpTransport {
                 trace!(
                     "Aborting dynamic-socket punch for peer {peer_id}: network generation changed mid-session"
                 );
+                target_processing_completed = false;
+                failure_kind = combine_birthday_failure_kind(
+                    failure_kind,
+                    Some(BirthdaySweepFailureKind::NetworkGenerationChanged),
+                );
                 break;
             }
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
             }
             for candidate in round.endpoints {
+                targets_examined = targets_examined.saturating_add(1);
+                update_live_birthday_counters(&live, |counters| {
+                    counters.targets_examined = counters.targets_examined.saturating_add(1);
+                });
                 if let Some(token) = hard_hard_session_token {
                     if self
                         .peers
@@ -2415,12 +2912,18 @@ impl UdpTransport {
                         trace!(
                             "Aborting dynamic-socket Hard↔Hard scatter for peer {peer_id}: winner already selected"
                         );
+                        target_processing_completed = false;
                         break 'schedule;
                     }
                 }
                 if self.peers.current_network_generation_sync() != network_generation_at_start {
                     trace!(
                         "Aborting dynamic-socket punch for peer {peer_id}: network generation changed before candidate send"
+                    );
+                    target_processing_completed = false;
+                    failure_kind = combine_birthday_failure_kind(
+                        failure_kind,
+                        Some(BirthdaySweepFailureKind::NetworkGenerationChanged),
                     );
                     break;
                 }
@@ -2434,20 +2937,38 @@ impl UdpTransport {
                     trace!(
                         "Aborting dynamic-socket punch for peer {peer_id}: remote candidate epoch changed before candidate send"
                     );
+                    target_processing_completed = false;
+                    failure_kind = combine_birthday_failure_kind(
+                        failure_kind,
+                        Some(BirthdaySweepFailureKind::CandidateEpochChanged),
+                    );
                     break;
                 }
                 if let Some((local_profile_generation, remote_profile_generation)) = profile_fence {
-                    let profile_current = self
-                        .peers
-                        .hard_hard_plan_for_peer(peer_id)
-                        .await
-                        .is_some_and(|plan| {
-                            plan.local_profile_generation == local_profile_generation
-                                && plan.remote_profile_generation == remote_profile_generation
-                        });
-                    if !profile_current {
+                    let current_plan = self.peers.hard_hard_plan_for_peer(peer_id).await;
+                    let profile_failure = match current_plan {
+                        Some(plan)
+                            if plan.local_profile_generation == local_profile_generation
+                                && plan.remote_profile_generation == remote_profile_generation =>
+                        {
+                            None
+                        }
+                        Some(plan) if plan.local_profile_generation != local_profile_generation => {
+                            Some(ProbeSendFailureKind::LocalProfileGenerationChanged)
+                        }
+                        Some(_) => Some(ProbeSendFailureKind::RemoteProfileGenerationChanged),
+                        None => Some(ProbeSendFailureKind::PeerSessionChanged),
+                    };
+                    if let Some(profile_failure) = profile_failure {
                         trace!(
                             "Aborting dynamic-socket punch for peer {peer_id}: Hard↔Hard profile generation changed before candidate send"
+                        );
+                        target_processing_completed = false;
+                        failure_kind = combine_birthday_failure_kind(
+                            failure_kind,
+                            Some(BirthdaySweepFailureKind::from_probe_failure(
+                                profile_failure,
+                            )),
                         );
                         break;
                     }
@@ -2461,6 +2982,13 @@ impl UdpTransport {
                         trace!(
                             "Aborting dynamic-socket Hard↔Hard punch for peer {peer_id}: session token was retired"
                         );
+                        target_processing_completed = false;
+                        failure_kind = combine_birthday_failure_kind(
+                            failure_kind,
+                            Some(BirthdaySweepFailureKind::from_probe_failure(
+                                ProbeSendFailureKind::SessionRetired,
+                            )),
+                        );
                         break;
                     }
                 }
@@ -2470,14 +2998,24 @@ impl UdpTransport {
                     trace!(
                         "Aborting dynamic-socket UDP punch for peer {peer_id}: Direct was confirmed mid-session"
                     );
+                    target_processing_completed = false;
                     break;
                 }
                 if self.peers.direct_commit_seq_sync(peer_id) != commit_seq_at_start {
                     trace!(
                         "Aborting dynamic-socket UDP punch for peer {peer_id}: direct_commit_seq advanced past {commit_seq_at_start:?} mid-session"
                     );
+                    target_processing_completed = false;
                     break;
                 }
+                // All session, network, profile, winner, Direct and commit
+                // fences passed. A budget rejection below is still an
+                // attempted target: it entered this worker's admission path,
+                // but it is not a logical Probe construction/send attempt.
+                targets_attempted = targets_attempted.saturating_add(1);
+                update_live_birthday_counters(&live, |counters| {
+                    counters.targets_attempted = counters.targets_attempted.saturating_add(1);
+                });
                 if self
                     .peers
                     .direct_probe_endpoint_quarantined(
@@ -2489,6 +3027,9 @@ impl UdpTransport {
                 {
                     budget_skipped = budget_skipped.saturating_add(1);
                     last_budget_reason = Some("direct_slow_relay_retained");
+                    update_live_birthday_counters(&live, |counters| {
+                        counters.budget_skipped = counters.budget_skipped.saturating_add(1);
+                    });
                     trace!(
                         "Skipped dynamic-socket punch for peer {peer_id} candidate {candidate}: recent slow ACK quarantine"
                     );
@@ -2506,11 +3047,19 @@ impl UdpTransport {
                         // credit all apply to fresh-mapping punches.
                         budget_skipped = budget_skipped.saturating_add(1);
                         last_budget_reason = Some(outbound_probe_admission_reason(limited));
+                        update_live_birthday_counters(&live, |counters| {
+                            counters.budget_skipped = counters.budget_skipped.saturating_add(1);
+                        });
                         continue;
                     }
                 }
+                logical_probes_attempted = logical_probes_attempted.saturating_add(1);
+                update_live_birthday_counters(&live, |counters| {
+                    counters.logical_probes_attempted =
+                        counters.logical_probes_attempted.saturating_add(1);
+                });
                 match self
-                    .send_probe_on_socket_result_with_hard_hard_token(
+                    .send_probe_on_socket_result_with_hard_hard_token_classified(
                         index,
                         socket.clone(),
                         Some(peer_id),
@@ -2518,17 +3067,36 @@ impl UdpTransport {
                         false,
                         PendingProbePurpose::ConnectivityCheck,
                         hard_hard_session_token,
+                        true,
+                        live_recorder.clone(),
                     )
                     .await
                 {
                     Ok(sent) => {
                         packets_sent = packets_sent.saturating_add(1);
+                        logical_probes_sent = logical_probes_sent.saturating_add(1);
+                        let successful_datagrams = u32::from(sent.datagrams_sent);
+                        let failed_datagrams = u32::from(sent.physical_send_errors);
+                        per_socket_sent_index = sent.socket_index;
+                        physical_datagrams_sent =
+                            physical_datagrams_sent.saturating_add(successful_datagrams);
+                        physical_send_errors =
+                            physical_send_errors.saturating_add(failed_datagrams);
+                        if failed_datagrams > 0 {
+                            partial_physical_send_errors =
+                                partial_physical_send_errors.saturating_add(failed_datagrams);
+                        }
                         if let Some(sent_at_ms) = sent.first_send_at_ms {
                             first_send_at_ms.get_or_insert(sent_at_ms);
+                            last_send_at_ms = Some(
+                                last_send_at_ms.map_or(sent_at_ms, |last| last.max(sent_at_ms)),
+                            );
                         }
                         per_socket_sent =
                             per_socket_sent.saturating_add(u32::from(sent.datagrams_sent));
-                        sent_endpoints.insert(candidate);
+                        if successful_datagrams > 0 {
+                            sent_endpoints.insert(candidate);
+                        }
                         self.peers
                             .record_direct_probe_sent(peer_id, candidate)
                             .await;
@@ -2540,10 +3108,34 @@ impl UdpTransport {
                             sleep(OUTBOUND_CONNECTIVITY_PROBE_SPACING).await;
                         }
                     }
-                    Err(error) => {
+                    Err(failure) => {
+                        let failed_datagrams = u32::from(failure.physical_send_errors);
+                        if failure.kind == ProbeSendFailureKind::PhysicalSend
+                            && failed_datagrams > 0
+                        {
+                            physical_send_errors =
+                                physical_send_errors.saturating_add(failed_datagrams);
+                            logical_probe_send_failures =
+                                logical_probe_send_failures.saturating_add(1);
+                        } else {
+                            probe_path_errors = probe_path_errors.saturating_add(1);
+                            update_live_birthday_counters(&live, |counters| {
+                                counters.probe_path_errors =
+                                    counters.probe_path_errors.saturating_add(1);
+                            });
+                            failure_kind = combine_birthday_failure_kind(
+                                failure_kind,
+                                Some(BirthdaySweepFailureKind::from_probe_failure(failure.kind)),
+                            );
+                            target_processing_completed = false;
+                        }
                         debug!(
-                            "Dynamic-socket punch to peer {peer_id} candidate {candidate} failed: {error}"
+                            "Dynamic-socket punch to peer {peer_id} candidate {candidate} failed kind={:?}: {}",
+                            failure.kind, failure.error
                         );
+                        if failure.kind != ProbeSendFailureKind::PhysicalSend {
+                            break 'schedule;
+                        }
                     }
                 }
             }
@@ -2563,17 +3155,50 @@ impl UdpTransport {
                 )
                 .await;
         }
+        #[cfg(test)]
+        wait_for_birthday_worker_completion_gate_for_test().await;
         Ok(PunchSendReport {
             packets_sent,
+            logical_probes_attempted,
+            logical_probes_sent,
+            logical_probe_send_failures,
+            physical_datagrams_sent,
+            physical_send_errors,
+            partial_physical_send_errors,
+            probe_path_errors,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
             first_send_at_ms,
             per_socket_sent: (per_socket_sent > 0)
-                .then_some(vec![(index, per_socket_sent)])
+                .then_some(vec![(per_socket_sent_index, per_socket_sent)])
                 .unwrap_or_default(),
             budget_skipped,
             epoch_budget_exhausted: false,
             candidate_iteration_capped: false,
+            sent_target_endpoints: sent_endpoints.into_iter().collect(),
+            last_send_at_ms,
+            targets_assigned,
+            targets_examined,
+            targets_attempted,
+            targets_cancelled: targets_assigned.saturating_sub(targets_attempted),
+            target_processing_completed,
+            failure_kind,
+            ..PunchSendReport::default()
         })
+    }
+}
+
+/// The standalone exact-socket API returns a complete report to its caller,
+/// so it performs the terminal all-physical-failure classification itself.
+/// Birthday workers intentionally do not call this helper: their scheduler
+/// must first give every target and bounded wave an opportunity to send.
+fn finalize_physical_send_failure(report: &mut PunchSendReport) {
+    if report.failure_kind.is_none()
+        && report.logical_probes_attempted > 0
+        && report.logical_probes_sent == 0
+        && report.logical_probe_send_failures > 0
+        && report.physical_send_errors > 0
+    {
+        report.failure_kind = Some(BirthdaySweepFailureKind::Send);
     }
 }
 
@@ -2659,7 +3284,7 @@ fn hard_hard_birthday_candidates(
     candidates
 }
 
-fn hard_hard_birthday_socket_count(level: usize) -> usize {
+pub(crate) fn hard_hard_birthday_socket_count(level: usize) -> usize {
     match level {
         0..=64 => 2,
         65..=128 => 4,
@@ -2696,16 +3321,363 @@ fn hard_hard_birthday_capacity_plan(
     Some((actual_level, actual_socket_count))
 }
 
-fn hard_hard_birthday_assignments(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BirthdaySocketPlan {
+    requested_socket_count: usize,
+    attached_socket_count: usize,
+    usable_socket_count: usize,
+    unavailable_socket_count: usize,
+    usable_socket_indices: Vec<usize>,
+}
+
+/// Convert the exact session socket snapshot into the only socket list the
+/// birthday scheduler is allowed to use.  This deliberately has no pool
+/// lookup or "best effort" substitution: a missing requested member remains
+/// unavailable and lowers the wave plan.
+fn hard_hard_birthday_socket_plan(
+    requested_level: usize,
+    snapshot: Vec<HardHardSocketSnapshot>,
+) -> BirthdaySocketPlan {
+    let requested_socket_count = hard_hard_birthday_socket_count(requested_level);
+    let attached_socket_count = snapshot.iter().filter(|entry| entry.attached).count();
+    let usable_socket_indices = snapshot
+        .into_iter()
+        .filter(|entry| entry.usable)
+        .map(|entry| entry.socket_index)
+        .collect::<Vec<_>>();
+    let usable_socket_count = usable_socket_indices.len();
+    BirthdaySocketPlan {
+        requested_socket_count,
+        attached_socket_count,
+        usable_socket_count,
+        unavailable_socket_count: requested_socket_count.saturating_sub(usable_socket_count),
+        usable_socket_indices,
+    }
+}
+
+fn record_birthday_worker_result(
+    wave_report: &mut PunchSendReport,
+    wave_fully_completed: &mut bool,
+    failure_kind: &mut Option<BirthdaySweepFailureKind>,
+    joined: std::result::Result<(usize, Result<PunchSendReport>), tokio::task::JoinError>,
+) {
+    match joined {
+        Ok((_assigned_count, Ok(report))) => {
+            *wave_fully_completed &=
+                report.target_processing_completed && report.failure_kind.is_none();
+            *failure_kind = combine_birthday_failure_kind(*failure_kind, report.failure_kind);
+            merge_punch_send_reports(wave_report, report);
+        }
+        Ok((assigned_count, Err(_error))) => {
+            *wave_fully_completed = false;
+            *failure_kind = combine_birthday_failure_kind(
+                *failure_kind,
+                Some(BirthdaySweepFailureKind::from_probe_failure(
+                    ProbeSendFailureKind::ProbeRegistrationFailed,
+                )),
+            );
+            wave_report.probe_path_errors = wave_report.probe_path_errors.saturating_add(1);
+            wave_report.targets_cancelled = wave_report
+                .targets_cancelled
+                .saturating_add(u32::try_from(assigned_count).unwrap_or(u32::MAX));
+        }
+        Err(_join_error) => {
+            *wave_fully_completed = false;
+            *failure_kind = combine_birthday_failure_kind(
+                *failure_kind,
+                Some(BirthdaySweepFailureKind::WorkerJoin),
+            );
+            wave_report.worker_failed = true;
+        }
+    }
+}
+
+fn combine_birthday_failure_kind(
+    left: Option<BirthdaySweepFailureKind>,
+    right: Option<BirthdaySweepFailureKind>,
+) -> Option<BirthdaySweepFailureKind> {
+    match (left, right) {
+        (None, value) | (value, None) => value,
+        (Some(left), Some(right)) => {
+            if birthday_failure_priority(right) > birthday_failure_priority(left) {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+    }
+}
+
+const fn birthday_failure_priority(kind: BirthdaySweepFailureKind) -> u8 {
+    match kind {
+        BirthdaySweepFailureKind::WorkerJoin => 100,
+        BirthdaySweepFailureKind::NetworkGenerationChanged => 90,
+        BirthdaySweepFailureKind::CandidateEpochChanged => 80,
+        BirthdaySweepFailureKind::ProfileGenerationChanged => 70,
+        BirthdaySweepFailureKind::PeerSessionChanged => 60,
+        BirthdaySweepFailureKind::SessionRetired => 50,
+        BirthdaySweepFailureKind::SocketRevoked => 40,
+        BirthdaySweepFailureKind::SocketUnavailable => 30,
+        BirthdaySweepFailureKind::ProbeRegistrationFailed => 20,
+        BirthdaySweepFailureKind::ProbeEncodingFailed => 10,
+        BirthdaySweepFailureKind::Send => 1,
+    }
+}
+
+fn merge_punch_send_reports(destination: &mut PunchSendReport, source: PunchSendReport) {
+    let source_logical_sent = source.logical_probes_sent.max(source.packets_sent);
+    let source_logical_attempted = source.logical_probes_attempted.max(source_logical_sent);
+    let source_targets_examined = source.targets_examined.max(source.targets_attempted);
+    let source_physical_datagrams_sent = source
+        .physical_datagrams_sent
+        .max(source.per_socket_sent.iter().map(|(_, sent)| *sent).sum());
+    destination.packets_sent = destination.packets_sent.saturating_add(source_logical_sent);
+    destination.logical_probes_sent = destination
+        .logical_probes_sent
+        .saturating_add(source_logical_sent);
+    destination.logical_probes_attempted = destination
+        .logical_probes_attempted
+        .saturating_add(source_logical_attempted);
+    destination.logical_probe_send_failures = destination
+        .logical_probe_send_failures
+        .saturating_add(source.logical_probe_send_failures);
+    destination.physical_datagrams_sent = destination
+        .physical_datagrams_sent
+        .saturating_add(source_physical_datagrams_sent);
+    destination.physical_send_errors = destination
+        .physical_send_errors
+        .saturating_add(source.physical_send_errors);
+    destination.partial_physical_send_errors = destination
+        .partial_physical_send_errors
+        .saturating_add(source.partial_physical_send_errors);
+    destination.probe_path_errors = destination
+        .probe_path_errors
+        .saturating_add(source.probe_path_errors);
+    destination.budget_skipped = destination
+        .budget_skipped
+        .saturating_add(source.budget_skipped);
+    destination.targets_assigned = destination
+        .targets_assigned
+        .saturating_add(source.targets_assigned);
+    destination.targets_examined = destination
+        .targets_examined
+        .saturating_add(source_targets_examined);
+    destination.targets_attempted = destination
+        .targets_attempted
+        .saturating_add(source.targets_attempted);
+    destination.targets_cancelled = destination
+        .targets_cancelled
+        .saturating_add(source.targets_cancelled);
+    if destination.targets_assigned == 0 {
+        destination.target_processing_completed = source.target_processing_completed;
+    } else {
+        destination.target_processing_completed &= source.target_processing_completed;
+    }
+    destination.worker_failed |=
+        source.worker_failed || source.failure_kind == Some(BirthdaySweepFailureKind::WorkerJoin);
+    destination.failure_kind =
+        combine_birthday_failure_kind(destination.failure_kind, source.failure_kind);
+    destination.epoch_budget_exhausted |= source.epoch_budget_exhausted;
+    destination.candidate_iteration_capped |= source.candidate_iteration_capped;
+    destination.first_send_at_ms = match (destination.first_send_at_ms, source.first_send_at_ms) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (None, right) => right,
+        (left, None) => left,
+    };
+    destination.last_send_at_ms = match (destination.last_send_at_ms, source.last_send_at_ms) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (None, right) => right,
+        (left, None) => left,
+    };
+    for endpoint in source.sent_target_endpoints {
+        if !destination.sent_target_endpoints.contains(&endpoint) {
+            destination.sent_target_endpoints.push(endpoint);
+        }
+    }
+    for (socket_index, sent) in source.per_socket_sent {
+        if let Some((_, existing)) = destination
+            .per_socket_sent
+            .iter_mut()
+            .find(|(index, _)| *index == socket_index)
+        {
+            *existing = existing.saturating_add(sent);
+        } else {
+            destination.per_socket_sent.push((socket_index, sent));
+        }
+    }
+    normalize_physical_send_dimensions(destination);
+}
+
+/// Keep the terminal/live physical-send invariant exact after reports from
+/// several workers have been merged.  Every production Hard↔Hard physical
+/// send records the actual socket, so the histogram is the authoritative
+/// successful-datagram total rather than a lower/upper-bound diagnostic.
+fn normalize_physical_send_dimensions(report: &mut PunchSendReport) {
+    report
+        .per_socket_sent
+        .sort_unstable_by_key(|(socket_index, _)| *socket_index);
+    report.physical_datagrams_sent = report.per_socket_sent.iter().map(|(_, sent)| *sent).sum();
+}
+
+pub(crate) fn update_birthday_sweep_counters(
+    birthday: &mut BirthdaySweepReport,
+    aggregate: &PunchSendReport,
+) {
+    birthday.targets_assigned = birthday
+        .targets_assigned
+        .max(aggregate.targets_assigned as usize);
+    birthday.targets_attempted = aggregate.targets_attempted as usize;
+    birthday.targets_examined =
+        aggregate.targets_examined.max(aggregate.targets_attempted) as usize;
+    let logical_probes_sent = aggregate.logical_probes_sent.max(aggregate.packets_sent);
+    birthday.logical_probes_attempted =
+        aggregate.logical_probes_attempted.max(logical_probes_sent) as usize;
+    birthday.logical_probes_sent = logical_probes_sent as usize;
+    birthday.logical_probe_send_failures = aggregate.logical_probe_send_failures as usize;
+    birthday.physical_datagrams_sent = aggregate
+        .per_socket_sent
+        .iter()
+        .map(|(_, sent)| *sent)
+        .sum::<u32>() as usize;
+    birthday.physical_send_errors = aggregate.physical_send_errors as usize;
+    birthday.partial_physical_send_errors = aggregate.partial_physical_send_errors as usize;
+    birthday.targets_budget_skipped = aggregate.budget_skipped as usize;
+    birthday.targets_cancelled = aggregate.targets_cancelled as usize;
+}
+
+fn update_live_birthday_counters(
+    live: &Option<Arc<StdMutex<LiveBirthdayProgress>>>,
+    update: impl FnOnce(&mut LiveBirthdayCounters),
+) {
+    update_live_birthday_progress(live, |progress| update(&mut progress.counters));
+}
+
+fn update_live_birthday_progress(
+    live: &Option<Arc<StdMutex<LiveBirthdayProgress>>>,
+    update: impl FnOnce(&mut LiveBirthdayProgress),
+) {
+    let Some(live) = live else {
+        return;
+    };
+    let mut progress = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    update(&mut progress);
+}
+
+pub(crate) fn apply_live_birthday_counters(
+    report: &mut PunchSendReport,
+    live: &LiveBirthdayProgress,
+) {
+    let counters = &live.counters;
+    report.targets_assigned = report.targets_assigned.max(counters.targets_assigned);
+    report.targets_examined = report.targets_examined.max(counters.targets_examined);
+    report.targets_attempted = report.targets_attempted.max(counters.targets_attempted);
+    report.targets_cancelled = report.targets_cancelled.max(counters.targets_cancelled);
+    report.budget_skipped = report.budget_skipped.max(counters.budget_skipped);
+    report.logical_probes_sent = report
+        .logical_probes_sent
+        .max(counters.logical_probes_sent)
+        .max(report.packets_sent);
+    report.logical_probes_attempted = report
+        .logical_probes_attempted
+        .max(counters.logical_probes_attempted)
+        .max(report.logical_probes_sent);
+    report.logical_probe_send_failures = report
+        .logical_probe_send_failures
+        .max(counters.logical_probe_send_failures);
+    report.packets_sent = report.packets_sent.max(report.logical_probes_sent);
+    report.physical_datagrams_sent = report
+        .physical_datagrams_sent
+        .max(counters.physical_datagrams_sent);
+    report.physical_send_errors = report
+        .physical_send_errors
+        .max(counters.physical_send_errors);
+    report.partial_physical_send_errors = report
+        .partial_physical_send_errors
+        .max(counters.partial_physical_send_errors);
+    report.probe_path_errors = report.probe_path_errors.max(counters.probe_path_errors);
+    for endpoint in &live.sent_target_endpoints {
+        if !report.sent_target_endpoints.contains(endpoint) {
+            report.sent_target_endpoints.push(*endpoint);
+        }
+    }
+    report.unique_target_endpoints =
+        u32::try_from(report.sent_target_endpoints.len()).unwrap_or(u32::MAX);
+    for (socket_index, sent) in &live.per_socket_sent {
+        if let Some((_, existing)) = report
+            .per_socket_sent
+            .iter_mut()
+            .find(|(index, _)| index == socket_index)
+        {
+            *existing = (*existing).max(*sent);
+        } else {
+            report.per_socket_sent.push((*socket_index, *sent));
+        }
+    }
+    report.first_send_at_ms = match (report.first_send_at_ms, live.first_send_at_ms) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (None, right) => right,
+        (left, None) => left,
+    };
+    report.last_send_at_ms = match (report.last_send_at_ms, live.last_send_at_ms) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (None, right) => right,
+        (left, None) => left,
+    };
+    normalize_physical_send_dimensions(report);
+}
+
+async fn publish_birthday_sweep_progress(
+    progress: &Option<Arc<Mutex<BirthdaySweepProgress>>>,
+    birthday: &BirthdaySweepReport,
+    aggregate: &PunchSendReport,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    let live = {
+        let current = progress.lock().await;
+        current.live.clone()
+    };
+    let live_snapshot = live
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut published_aggregate = aggregate.clone();
+    apply_live_birthday_counters(&mut published_aggregate, &live_snapshot);
+    let mut published_birthday = birthday.clone();
+    published_birthday.targets_assigned = published_birthday
+        .targets_assigned
+        .max(published_aggregate.targets_assigned as usize);
+    update_birthday_sweep_counters(&mut published_birthday, &published_aggregate);
+    let mut current = progress.lock().await;
+    current.birthday = published_birthday;
+    current.aggregate = published_aggregate;
+}
+
+pub(crate) fn hard_hard_birthday_wave_count(socket_count: usize) -> usize {
+    match socket_count {
+        0 => 0,
+        1 => 1,
+        _ => HARD_HARD_BIRTHDAY_WAVES,
+    }
+}
+
+fn hard_hard_birthday_packets_planned(socket_count: usize, target_count: usize) -> usize {
+    target_count.saturating_mul(hard_hard_birthday_wave_count(socket_count))
+}
+
+fn hard_hard_birthday_wave_assignments(
     socket_count: usize,
     targets: Vec<SocketAddr>,
+    wave: usize,
 ) -> Vec<Vec<SocketAddr>> {
     if socket_count == 0 {
         return Vec::new();
     }
     let mut assignments = vec![Vec::new(); socket_count];
+    let socket_offset = wave % socket_count;
     for (index, target) in targets.into_iter().enumerate() {
-        assignments[index % socket_count].push(target);
+        assignments[(index + socket_offset) % socket_count].push(target);
     }
     assignments
 }
@@ -3125,8 +4097,7 @@ impl ProvisionalSocketGuard {
         {
             return refused;
         }
-        let Some(generation_fence) = state.committed_punch_generations.get(peer_id).copied()
-        else {
+        let Some(generation_fence) = state.committed_punch_generations.get(peer_id).copied() else {
             return refused;
         };
         let evidence_at_commit = state
@@ -3246,12 +4217,9 @@ impl ProvisionalSocketGuard {
                             // socket's generation fence but intentionally do
                             // not own the peer affinity pin.
                             punch_generation != 0
-                                && state
-                                    .dynamic
-                                    .get(&self.socket_index)
-                                    .is_some_and(|entry| {
-                                        entry.phase == DynamicSocketPhase::CommittedPendingHandoff
-                                    })
+                                && state.dynamic.get(&self.socket_index).is_some_and(|entry| {
+                                    entry.phase == DynamicSocketPhase::CommittedPendingHandoff
+                                })
                         }
                     }
                 });
@@ -3336,8 +4304,8 @@ impl UdpTransport {
             if entry.phase == DynamicSocketPhase::Finalized {
                 return None;
             }
-            let has_post_commit_evidence = entry.authenticated_evidence
-                > outcome.evidence_at_commit;
+            let has_post_commit_evidence =
+                entry.authenticated_evidence > outcome.evidence_at_commit;
             if has_post_commit_evidence {
                 state
                     .dynamic
@@ -3463,11 +4431,15 @@ impl Drop for ProvisionalSocketGuard {
 #[cfg(test)]
 mod birthday_tests {
     use super::{
-        hard_hard_birthday_assignments, hard_hard_birthday_candidates,
-        hard_hard_birthday_capacity_plan,
+        hard_hard_birthday_candidates, hard_hard_birthday_capacity_plan,
+        hard_hard_birthday_packets_planned, hard_hard_birthday_socket_plan,
+        hard_hard_birthday_wave_assignments, hard_hard_birthday_wave_count,
+        record_birthday_worker_result, BirthdaySweepFailureKind, HardHardSocketSnapshot,
+        ProbeSendFailureKind, PunchSendReport,
     };
+    use crate::error::DaemonError;
     use p2pnet_nat::mapping::AllocationModelKind;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
@@ -3481,10 +4453,13 @@ mod birthday_tests {
                 token,
             );
             assert_eq!(candidates.len(), level);
-            assert!(candidates.iter().all(|candidate| {
-                candidate.ip() == public_ip && candidate.port() != 0
-            }));
-            let unique = candidates.iter().map(SocketAddr::port).collect::<HashSet<_>>();
+            assert!(candidates
+                .iter()
+                .all(|candidate| { candidate.ip() == public_ip && candidate.port() != 0 }));
+            let unique = candidates
+                .iter()
+                .map(SocketAddr::port)
+                .collect::<HashSet<_>>();
             assert_eq!(unique.len(), level);
             assert!(level < usize::from(u16::MAX));
         }
@@ -3501,18 +4476,87 @@ mod birthday_tests {
     }
 
     #[test]
-    fn birthday_assignments_send_each_target_once_without_socket_cartesian_product() {
+    fn probe_failure_kinds_keep_precise_terminal_stop_reasons() {
+        let cases = [
+            (ProbeSendFailureKind::PhysicalSend, "send_error"),
+            (
+                ProbeSendFailureKind::NetworkGenerationChanged,
+                "network_generation_changed",
+            ),
+            (
+                ProbeSendFailureKind::CandidateEpochChanged,
+                "candidate_epoch_changed",
+            ),
+            (
+                ProbeSendFailureKind::LocalProfileGenerationChanged,
+                "profile_generation_changed",
+            ),
+            (
+                ProbeSendFailureKind::RemoteProfileGenerationChanged,
+                "profile_generation_changed",
+            ),
+            (
+                ProbeSendFailureKind::PeerSessionChanged,
+                "peer_session_changed",
+            ),
+            (ProbeSendFailureKind::SessionRetired, "session_retired"),
+            (ProbeSendFailureKind::SocketUnavailable, "socket_unavailable"),
+            (ProbeSendFailureKind::SocketRevoked, "socket_revoked"),
+            (
+                ProbeSendFailureKind::ProbeRegistrationFailed,
+                "probe_registration_failed",
+            ),
+            (
+                ProbeSendFailureKind::ProbeEncodingFailed,
+                "probe_encoding_failed",
+            ),
+        ];
+        for (probe_failure, stop_reason) in cases {
+            let failure = BirthdaySweepFailureKind::from_probe_failure(probe_failure);
+            assert_eq!(failure.stop_reason(), stop_reason);
+            assert_eq!(
+                BirthdaySweepFailureKind::from_stop_reason(stop_reason),
+                Some(failure)
+            );
+        }
+    }
+
+    #[test]
+    fn birthday_two_waves_rotate_targets_without_socket_cartesian_product() {
         for (socket_count, level) in [(2, 64), (4, 128), (8, 256)] {
             let targets = (1..=level)
                 .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port as u16))
                 .collect::<Vec<_>>();
-            let assignments = hard_hard_birthday_assignments(socket_count, targets.clone());
-            assert_eq!(assignments.len(), socket_count);
-            let flattened = assignments.into_iter().flatten().collect::<Vec<_>>();
-            assert_eq!(flattened.len(), level);
-            assert_eq!(flattened.iter().collect::<HashSet<_>>().len(), level);
-            assert!(flattened.iter().all(|target| targets.contains(target)));
+            assert_eq!(hard_hard_birthday_wave_count(socket_count), 2);
+            let first = hard_hard_birthday_wave_assignments(socket_count, targets.clone(), 0);
+            let second = hard_hard_birthday_wave_assignments(socket_count, targets.clone(), 1);
+            assert_eq!(first.len(), socket_count);
+            assert_eq!(second.len(), socket_count);
+            for assignments in [&first, &second] {
+                let flattened = assignments.iter().flatten().copied().collect::<Vec<_>>();
+                assert_eq!(flattened.len(), level);
+                assert_eq!(flattened.iter().collect::<HashSet<_>>().len(), level);
+                assert!(flattened.iter().all(|target| targets.contains(target)));
+            }
+            let first_socket = first
+                .iter()
+                .enumerate()
+                .flat_map(|(socket, assigned)| assigned.iter().map(move |target| (*target, socket)))
+                .collect::<HashMap<_, _>>();
+            let second_socket = second
+                .iter()
+                .enumerate()
+                .flat_map(|(socket, assigned)| assigned.iter().map(move |target| (*target, socket)))
+                .collect::<HashMap<_, _>>();
+            assert!(targets
+                .iter()
+                .all(|target| first_socket[target] != second_socket[target]));
         }
+        assert_eq!(hard_hard_birthday_wave_count(1), 1);
+        assert_eq!(hard_hard_birthday_wave_count(0), 0);
+        assert_eq!(hard_hard_birthday_packets_planned(2, 64), 128);
+        assert_eq!(hard_hard_birthday_packets_planned(4, 96), 192);
+        assert_eq!(hard_hard_birthday_packets_planned(1, 96), 96);
     }
 
     #[test]
@@ -3522,5 +4566,150 @@ mod birthday_tests {
         assert_eq!(hard_hard_birthday_capacity_plan(256, 7), Some((128, 4)));
         assert_eq!(hard_hard_birthday_capacity_plan(256, 8), Some((256, 8)));
         assert_eq!(hard_hard_birthday_capacity_plan(256, 1), None);
+    }
+
+    #[test]
+    fn birthday_socket_plan_is_exact_and_fails_closed() {
+        let partial = hard_hard_birthday_socket_plan(
+            64,
+            vec![
+                HardHardSocketSnapshot {
+                    socket_index: 41,
+                    attached: true,
+                    usable: true,
+                },
+                HardHardSocketSnapshot {
+                    socket_index: 42,
+                    attached: true,
+                    usable: false,
+                },
+            ],
+        );
+        assert_eq!(partial.requested_socket_count, 2);
+        assert_eq!(partial.attached_socket_count, 2);
+        assert_eq!(partial.usable_socket_count, 1);
+        assert_eq!(partial.unavailable_socket_count, 1);
+        assert_eq!(partial.usable_socket_indices, vec![41]);
+        assert_eq!(
+            hard_hard_birthday_wave_count(partial.usable_socket_count),
+            1
+        );
+
+        let detached = hard_hard_birthday_socket_plan(
+            64,
+            vec![
+                HardHardSocketSnapshot {
+                    socket_index: 41,
+                    attached: false,
+                    usable: false,
+                },
+                HardHardSocketSnapshot {
+                    socket_index: 42,
+                    attached: false,
+                    usable: false,
+                },
+            ],
+        );
+        assert_eq!(detached.attached_socket_count, 0);
+        assert_eq!(detached.usable_socket_count, 0);
+        assert_eq!(detached.unavailable_socket_count, 2);
+        assert!(detached.usable_socket_indices.is_empty());
+        assert_eq!(
+            hard_hard_birthday_wave_count(detached.usable_socket_count),
+            0
+        );
+
+        let full = hard_hard_birthday_socket_plan(
+            128,
+            (0..4)
+                .map(|offset| HardHardSocketSnapshot {
+                    socket_index: 100 + offset,
+                    attached: true,
+                    usable: true,
+                })
+                .collect(),
+        );
+        assert_eq!(full.requested_socket_count, 4);
+        assert_eq!(full.attached_socket_count, 4);
+        assert_eq!(full.usable_socket_count, 4);
+        assert_eq!(full.unavailable_socket_count, 0);
+        assert_eq!(hard_hard_birthday_wave_count(full.usable_socket_count), 2);
+
+        let capped = hard_hard_birthday_socket_plan(
+            256,
+            (0..4)
+                .map(|offset| HardHardSocketSnapshot {
+                    socket_index: 200 + offset,
+                    attached: true,
+                    usable: true,
+                })
+                .collect(),
+        );
+        assert_eq!(capped.requested_socket_count, 8);
+        assert_eq!(capped.usable_socket_count, 4);
+        assert_eq!(capped.unavailable_socket_count, 4);
+        assert_eq!(capped.usable_socket_indices, vec![200, 201, 202, 203]);
+    }
+
+    #[tokio::test]
+    async fn birthday_worker_collection_preserves_partial_stats_and_join_errors() {
+        let mut wave_report = PunchSendReport::default();
+        let mut wave_fully_completed = true;
+        let mut failure_kind = None;
+        record_birthday_worker_result(
+            &mut wave_report,
+            &mut wave_fully_completed,
+            &mut failure_kind,
+            Ok((
+                2,
+                Ok(PunchSendReport {
+                    packets_sent: 1,
+                    per_socket_sent: vec![(41, 2)],
+                    targets_assigned: 2,
+                    targets_attempted: 2,
+                    target_processing_completed: true,
+                    ..PunchSendReport::default()
+                }),
+            )),
+        );
+        assert_eq!(wave_report.packets_sent, 1);
+        assert_eq!(wave_report.per_socket_sent, vec![(41, 2)]);
+        assert!(wave_fully_completed);
+        assert_eq!(failure_kind, None);
+
+        record_birthday_worker_result(
+            &mut wave_report,
+            &mut wave_fully_completed,
+            &mut failure_kind,
+            Ok((
+                3,
+                Err(DaemonError::Network("injected worker error".to_string())),
+            )),
+        );
+        assert_eq!(wave_report.packets_sent, 1);
+        assert_eq!(wave_report.per_socket_sent, vec![(41, 2)]);
+        assert_eq!(wave_report.targets_cancelled, 3);
+        assert_eq!(wave_report.probe_path_errors, 1);
+        assert!(!wave_fully_completed);
+        assert_eq!(
+            failure_kind,
+            Some(BirthdaySweepFailureKind::ProbeRegistrationFailed)
+        );
+
+        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("aborted worker must yield JoinError");
+        record_birthday_worker_result(
+            &mut wave_report,
+            &mut wave_fully_completed,
+            &mut failure_kind,
+            Err(join_error),
+        );
+        assert!(!wave_fully_completed);
+        assert_eq!(failure_kind, Some(BirthdaySweepFailureKind::WorkerJoin));
+        assert_eq!(wave_report.packets_sent, 1);
+        assert_eq!(wave_report.per_socket_sent, vec![(41, 2)]);
     }
 }

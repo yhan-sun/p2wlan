@@ -31,9 +31,27 @@ pub(crate) struct HardHardFreshSocketIdentity {
     pub(crate) socket_local_endpoint: SocketAddr,
 }
 
+/// Lock-free snapshot of the pair selected by the latest authoritative Direct
+/// commit.  The snapshot is published while the network-epoch gate and the
+/// connection writer are held, then consumed by the Hard↔Hard confirmation
+/// wait without reacquiring the connection map.  The Direct-set mirror still
+/// supplies the active/inactive bit; this value only proves the exact local
+/// endpoint and remote candidate epoch of the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectCommitPairSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) remote_candidate_epoch: u64,
+    pub(crate) local_endpoint: Option<SocketAddr>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct HardHardSessionRecord {
     pub(crate) session_id: String,
+    /// Authoritative Probe receive-session identity captured before the
+    /// punch-at deadline path.  Hard↔Hard diagnostics reuse this exact value
+    /// before and after the sweep, even if the connection map is contended at
+    /// punch time; the full value is never emitted in diagnostics.
+    pub(crate) probe_session_id: Option<String>,
     pub(crate) session_token: String,
     pub(crate) peer_id: String,
     pub(crate) initiator: bool,
@@ -47,6 +65,19 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) remote_profile_generation: u64,
     pub(crate) local_prediction_confidence: u8,
     pub(crate) remote_prediction_confidence: u8,
+    /// Original Birthday level selected before candidate signaling is capped.
+    /// Zero denotes the predictable fresh-mapping lane, which has no Birthday
+    /// level.  This local ledger value is authoritative for the reciprocal
+    /// response path; it is never reconstructed from the signaled window.
+    pub(crate) requested_birthday_level: usize,
+    pub(crate) generated_candidate_count: usize,
+    pub(crate) signaled_candidate_count: usize,
+    pub(crate) birthday: bool,
+    /// Exact dynamic sockets created for this session.  A later scheduler
+    /// snapshot may find only a subset still attached/usable; it must never
+    /// replace a missing member with a pool socket.
+    pub(crate) requested_socket_indices: Vec<usize>,
+    pub(crate) requested_socket_count: usize,
     pub(crate) prediction_window: Vec<SocketAddr>,
     pub(crate) remote_prediction: Vec<SocketAddr>,
     pub(crate) fresh_socket: HardHardFreshSocketIdentity,
@@ -383,6 +414,11 @@ pub struct PeerManager {
     /// Wake-up for any direct-commit bump.  Waiters re-check the peer's
     /// sequence after waking.
     direct_commit_notify: Arc<Notify>,
+    /// Lock-free exact pair selected by the latest Direct commit.  Hard↔Hard
+    /// confirmation reads this beside `direct_commit_seq_mirror` so a
+    /// contended connection writer cannot delay the grace timer.
+    direct_commit_pair_mirror:
+        Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
     /// Lock-free per-peer relay-confirm sequence mirror.  Bumped (and notified)
     /// whenever a peer's forced-relay encrypted probe/ACK confirms the relay
     /// path, so the outbound actor can flush a waiting first packet the moment

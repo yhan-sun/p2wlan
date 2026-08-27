@@ -116,6 +116,123 @@ fn fresh_mapping_signal_payload_passes_control_plane_validation() {
 }
 
 #[test]
+fn signal_candidate_contract_deduplicates_and_caps_all_birthday_levels() {
+    for requested in [64usize, 128, 256] {
+        let candidates = (0..requested)
+            .map(|offset| format!("8.8.8.8:{}", 40_000 + offset))
+            .collect::<Vec<_>>();
+        let sources = candidates
+            .iter()
+            .map(|candidate| (candidate.clone(), "predicted".to_string()))
+            .collect::<HashMap<_, _>>();
+
+        let (effective, effective_sources, contract) =
+            crate::candidate_refresh::normalize_signal_candidates(&candidates, &sources);
+        let expected = requested.min(crate::MAX_SIGNAL_CANDIDATES);
+        assert_eq!(effective.len(), expected);
+        assert_eq!(contract.requested_candidate_count, requested);
+        assert_eq!(contract.generated_candidate_count, requested);
+        assert_eq!(contract.deduplicated_candidate_count, requested);
+        assert_eq!(contract.signaled_candidate_count, expected);
+        assert_eq!(contract.cap, crate::MAX_SIGNAL_CANDIDATES);
+        assert_eq!(contract.capped, requested > crate::MAX_SIGNAL_CANDIDATES);
+        assert!(effective_sources
+            .keys()
+            .all(|candidate| effective.contains(candidate)));
+    }
+
+    let duplicate = "8.8.4.4:41000".to_string();
+    let mut candidates = vec![duplicate.clone(), duplicate.clone()];
+    candidates.extend((0..62).map(|offset| format!("8.8.4.4:{}", 41_000 + offset)));
+    let sources = candidates
+        .iter()
+        .map(|candidate| (candidate.clone(), "stun_observed".to_string()))
+        .collect::<HashMap<_, _>>();
+    let (effective, effective_sources, contract) =
+        crate::candidate_refresh::normalize_signal_candidates(&candidates, &sources);
+    assert_eq!(effective.len(), 62);
+    assert_eq!(contract.deduplicated_candidate_count, 62);
+    assert!(!contract.capped);
+    assert_eq!(contract.reason, "deduplicated");
+    assert_eq!(effective_sources.len(), effective.len());
+}
+
+#[test]
+fn shared_signal_candidate_cap_fixture_matches_daemon_constant() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/fixtures/signal_candidate_cap.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read shared cap fixture {path:?}: {error}"));
+    let fixture: serde_json::Value =
+        serde_json::from_str(&raw).expect("signal_candidate_cap.json must be valid JSON");
+    assert_eq!(
+        fixture["max_signal_candidates"].as_u64(),
+        Some(crate::MAX_SIGNAL_CANDIDATES as u64),
+        "Rust candidate cap must match the shared contract fixture"
+    );
+}
+
+#[test]
+fn high_priority_observed_and_fresh_candidates_survive_tail_cap() {
+    let observed = "8.8.8.8:41000".to_string();
+    let fresh = "1.1.1.1:42000".to_string();
+    let fresh_source = crate::fresh_prediction_source_label(FreshPredictionId {
+        boot_epoch: 1_742_987_654_321,
+        generation: 7,
+    });
+    let mut candidates = vec![observed.clone(), fresh.clone()];
+    candidates.extend((0..128).map(|index| format!("198.51.100.10:{}", 43000 + index)));
+    let mut sources = HashMap::new();
+    sources.insert(observed.clone(), "stun_observed".to_string());
+    sources.insert(fresh.clone(), fresh_source);
+    for candidate in candidates.iter().skip(2) {
+        sources.insert(candidate.clone(), "signaled".to_string());
+    }
+
+    let (effective, effective_sources, contract) =
+        crate::candidate_refresh::normalize_signal_candidates(&candidates, &sources);
+    assert_eq!(effective.len(), crate::MAX_SIGNAL_CANDIDATES);
+    assert!(effective.contains(&observed));
+    assert!(effective.contains(&fresh));
+    assert_eq!(effective_sources.len(), effective.len());
+    assert!(contract.capped);
+}
+
+#[test]
+fn signal_payload_boundary_never_emits_more_than_server_cap() {
+    let candidates = (0..256usize)
+        .map(|offset| format!("8.8.8.8:{}", 42_000 + offset))
+        .collect::<Vec<_>>();
+    let sources = candidates
+        .iter()
+        .map(|candidate| (candidate.clone(), "birthday".to_string()))
+        .collect::<HashMap<_, _>>();
+    let payload = crate::control::prepare_signal_payload_for_test(
+        "node-a",
+        "node-b",
+        "peer_offer_fresh",
+        &candidates,
+        &sources,
+        b"handshake-bytes",
+        Some(1_000),
+        None,
+        Some("session-1"),
+        None,
+        None,
+    )
+    .expect("signal payload must build");
+    let json_candidates = payload["candidates"].as_array().unwrap();
+    let json_sources = payload["candidate_sources"].as_object().unwrap();
+    assert_eq!(json_candidates.len(), crate::MAX_SIGNAL_CANDIDATES);
+    assert!(json_sources.len() <= json_candidates.len());
+    assert!(json_sources.keys().all(|endpoint| {
+        json_candidates
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(endpoint))
+    }));
+}
+
+#[test]
 fn fresh_mapping_signal_payload_without_public_ip_falls_back_to_unspecified_ip() {
     let mut result = sample_result();
     result.public_ip = None;

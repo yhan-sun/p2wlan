@@ -50,6 +50,10 @@ pub(crate) fn prepare_signal_payload(
     probe_ephemeral_public_key: Option<&str>,
     signing_identity: Option<&SignalSigningIdentity>,
 ) -> Result<serde_json::Value> {
+    let (candidates, candidate_sources, _) = crate::candidate_refresh::normalize_signal_candidates(
+        candidates,
+        candidate_sources,
+    );
     // `candidate_generation` is the signal/candidate freshness revision, not
     // a declaration that this process rebound its UDP transport. A fresh
     // offer/answer (including a routine WireGuard rekey) deliberately gets a

@@ -243,6 +243,18 @@ impl PeerManager {
                 conn.direct_health.record_success();
             }
             conn.clear_direct_reclaim_window();
+            self.publish_direct_commit_pair(
+                node_id,
+                generation,
+                conn.remote_candidate_epoch(),
+                local_endpoint,
+            );
+            // Publish the Direct-set mirror before waking confirmation
+            // waiters. The pair snapshot and the active-state bit must be
+            // visible together; otherwise a waiter can wake on the sequence
+            // bump between these two writes, observe a non-Direct peer, and
+            // miss the only notification for this commit.
+            conn.transition(ConnectionState::Direct);
             if direct_confirmation_changed {
                 // The direct-commit sequence is bumped inside the SAME
                 // network-epoch critical section as the state transition, so
@@ -262,7 +274,6 @@ impl PeerManager {
                     ),
                 );
             }
-            conn.transition(ConnectionState::Direct);
             // Keep the persisted selector in lock-step with the Direct
             // promotion.  The current encrypted-confirmed Direct pair wins
             // past relay-first business gating; only an explicit current
