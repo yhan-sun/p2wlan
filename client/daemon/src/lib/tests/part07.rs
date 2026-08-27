@@ -384,9 +384,12 @@ struct NatPacketLink {
     _b_source: Arc<UdpSocket>,
     drop_a_to_b: Arc<AtomicBool>,
     drop_b_to_a: Arc<AtomicBool>,
+    hold_authenticated_punch: Arc<AtomicBool>,
     hold_ack: Arc<AtomicBool>,
     held_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
     held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
+    held_punch_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
+    held_punch_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
     route_dynamic_socket: bool,
     worker: Option<tokio::task::JoinHandle<()>>,
 }
@@ -423,9 +426,12 @@ impl NatPacketLink {
         };
         let drop_a_to_b = Arc::new(AtomicBool::new(false));
         let drop_b_to_a = Arc::new(AtomicBool::new(false));
+        let hold_authenticated_punch = Arc::new(AtomicBool::new(false));
         let hold_ack = Arc::new(AtomicBool::new(false));
         let held_a_to_b = Arc::new(StdMutex::new(Vec::new()));
         let held_b_to_a = Arc::new(StdMutex::new(Vec::new()));
+        let held_punch_a_to_b = Arc::new(StdMutex::new(Vec::new()));
+        let held_punch_b_to_a = Arc::new(StdMutex::new(Vec::new()));
         let worker = Some(tokio::spawn(Self::run(
             a_public.clone(),
             b_public.clone(),
@@ -435,9 +441,12 @@ impl NatPacketLink {
             udp_b.clone(),
             drop_a_to_b.clone(),
             drop_b_to_a.clone(),
+            hold_authenticated_punch.clone(),
             hold_ack.clone(),
             held_a_to_b.clone(),
             held_b_to_a.clone(),
+            held_punch_a_to_b.clone(),
+            held_punch_b_to_a.clone(),
             primary_a,
             route_dynamic_socket,
         )));
@@ -448,9 +457,12 @@ impl NatPacketLink {
             _b_source: b_source,
             drop_a_to_b,
             drop_b_to_a,
+            hold_authenticated_punch,
             hold_ack,
             held_a_to_b,
             held_b_to_a,
+            held_punch_a_to_b,
+            held_punch_b_to_a,
             route_dynamic_socket,
             worker,
         }
@@ -514,9 +526,12 @@ impl NatPacketLink {
         udp_b: UdpTransport,
         drop_a_to_b: Arc<AtomicBool>,
         drop_b_to_a: Arc<AtomicBool>,
+        hold_authenticated_punch: Arc<AtomicBool>,
         hold_ack: Arc<AtomicBool>,
         held_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
         held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
+        held_punch_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
+        held_punch_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
         primary_a: Option<SocketAddr>,
         route_dynamic_socket: bool,
     ) {
@@ -530,6 +545,15 @@ impl NatPacketLink {
                         && Self::is_authenticated_ack(&a_buf[..len])
                     {
                         held_b_to_a
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(a_buf[..len].to_vec());
+                        continue;
+                    }
+                    if hold_authenticated_punch.load(Ordering::Acquire)
+                        && Self::is_authenticated_punch(&a_buf[..len])
+                    {
+                        held_punch_b_to_a
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .push(a_buf[..len].to_vec());
@@ -560,6 +584,15 @@ impl NatPacketLink {
                             .push(b_buf[..len].to_vec());
                         continue;
                     }
+                    if hold_authenticated_punch.load(Ordering::Acquire)
+                        && Self::is_authenticated_punch(&b_buf[..len])
+                    {
+                        held_punch_a_to_b
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(b_buf[..len].to_vec());
+                        continue;
+                    }
                     // A's packet arrived at B's mapped public endpoint. Send
                     // from A_PUBLIC so B observes A's predicted source.
                     Self::forward(
@@ -581,12 +614,77 @@ impl NatPacketLink {
             .is_some_and(|identity| identity.kind == PunchPacketKind::Ack)
     }
 
+    fn is_authenticated_punch(data: &[u8]) -> bool {
+        peek_authenticated_punch_identity(data)
+            .is_some_and(|identity| identity.kind == PunchPacketKind::Punch)
+    }
+
     fn set_drop_a_to_b(&self, drop: bool) {
         self.drop_a_to_b.store(drop, Ordering::Release);
     }
 
     fn set_drop_b_to_a(&self, drop: bool) {
         self.drop_b_to_a.store(drop, Ordering::Release);
+    }
+
+    fn set_hold_authenticated_punch(&self, hold: bool) {
+        self.hold_authenticated_punch
+            .store(hold, Ordering::Release);
+    }
+
+    fn held_authenticated_punch_count(&self) -> usize {
+        self.held_punch_a_to_b
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            + self
+                .held_punch_b_to_a
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+    }
+
+    async fn release_held_authenticated_punches(
+        &self,
+        udp_a: &UdpTransport,
+        udp_b: &UdpTransport,
+    ) {
+        let held_a_to_b = std::mem::take(
+            &mut *self
+                .held_punch_a_to_b
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let held_b_to_a = std::mem::take(
+            &mut *self
+                .held_punch_b_to_a
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for packet in held_a_to_b {
+            Self::forward(
+                &self._a_source,
+                &packet,
+                udp_b,
+                HARD_HARD_A,
+                None,
+                self.route_dynamic_socket,
+                &self.drop_a_to_b,
+            )
+            .await;
+        }
+        for packet in held_b_to_a {
+            Self::forward(
+                &self._b_source,
+                &packet,
+                udp_a,
+                HARD_HARD_B,
+                None,
+                self.route_dynamic_socket,
+                &self.drop_b_to_a,
+            )
+            .await;
+        }
     }
 
     fn set_hold_ack(&self, hold: bool) {
@@ -1550,6 +1648,16 @@ async fn wait_for_failed_attempt_cleanup(harness: &TwoPeerHarness) {
                     .peers_b
                     .hard_hard_session_is_active(HARD_HARD_A)
                     .await
+                && harness
+                    .peers_a
+                    .hard_hard_session_for_test(HARD_HARD_B)
+                    .await
+                    .is_none()
+                && harness
+                    .peers_b
+                    .hard_hard_session_for_test(HARD_HARD_A)
+                    .await
+                    .is_none()
                 && harness.udp_a.dynamic_socket_count().await == 0
                 && harness.udp_b.dynamic_socket_count().await == 0
                 && harness
@@ -2837,6 +2945,103 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_hard_birthday_production_cleanup_waits_for_udp_completion() {
+    let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let now = hard_hard_now_for_test();
+    set_hard_hard_test_now_ms(Some(now));
+    let _clock = HardHardClockReset;
+    let harness = build_two_peer_harness_with_stun_mode(
+        true,
+        false,
+        false,
+        HarnessStunProfile::FULL_CAPACITY,
+        HarnessNatMode::HighEntropy,
+    )
+    .await;
+    harness.link.set_drop_a_to_b(true);
+    harness.link.set_drop_b_to_a(true);
+    trigger_initial_offer(&harness).await;
+
+    let record = timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(record) = harness.peers_b.hard_hard_session_for_test(HARD_HARD_A).await {
+                if record.state != peer::HardHardSessionState::Retiring
+                    && harness.udp_b.dynamic_socket_count().await > 0
+                    && harness
+                        .udp_b
+                        .hard_hard_pending_probe_count_for_test(HARD_HARD_A)
+                        .await
+                        > 0
+                {
+                    return record;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("production Birthday entry must expose a live socket and pending Probe");
+    let (gate, _gate_guard) = harness.peers_b.install_hard_hard_cleanup_gate_for_test(
+        &record.peer_id,
+        &record.session_id,
+        &record.session_token,
+    );
+    let reached = gate.reached.notified();
+    harness
+        .peers_b
+        .clear_hard_hard_sessions(Some(HARD_HARD_A))
+        .await;
+    timeout(Duration::from_secs(3), reached)
+        .await
+        .expect("production cleanup must reach the pre-UDP test gate");
+
+    let retiring = harness
+        .peers_b
+        .hard_hard_session_snapshot_for_cleanup(
+            &record.peer_id,
+            &record.session_id,
+            &record.session_token,
+        )
+        .await
+        .expect("Retiring ledger entry must remain until UDP cleanup completes");
+    assert_eq!(retiring.state, peer::HardHardSessionState::Retiring);
+    assert!(!harness
+        .peers_b
+        .hard_hard_session_is_active(HARD_HARD_A)
+        .await);
+    assert!(harness.udp_b.dynamic_socket_count().await > 0);
+    assert!(harness
+        .udp_b
+        .hard_hard_pending_probe_count_for_test(HARD_HARD_A)
+        .await
+        > 0);
+
+    let completed = gate.completed.notified();
+    gate.release.notify_waiters();
+    timeout(Duration::from_secs(5), completed)
+        .await
+        .expect("production cleanup must publish completion after UDP cleanup");
+    assert!(harness
+        .peers_b
+        .hard_hard_session_snapshot_for_cleanup(
+            &record.peer_id,
+            &record.session_id,
+            &record.session_token,
+        )
+        .await
+        .is_none());
+    assert_eq!(harness.udp_b.dynamic_socket_count().await, 0);
+    assert_eq!(
+        harness
+            .udp_b
+            .hard_hard_pending_probe_count_for_test(HARD_HARD_A)
+            .await,
+        0
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
     let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
     let now = hard_hard_now_for_test();
@@ -3756,7 +3961,11 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
 
     // Keep ACK holding enabled while S2 is pending. This leaves S2's own
     // pending Probe-v2 transactions alive so replaying only S1's packets is a
-    // meaningful stale-ACK assertion rather than a post-success no-op.
+    // meaningful stale-ACK assertion rather than a post-success no-op.  Hold
+    // only authenticated Punch packets at the harness boundary so one side
+    // cannot select a winner before the other side has admitted its own S2
+    // pending probes; ACK packets remain held and are still replayed below.
+    harness.link.set_hold_authenticated_punch(true);
     sleep(Duration::from_millis(2_100)).await;
     trigger_retry_offer_with_current_candidates(&harness, &response_s1).await;
     let response_s2 = wait_for_hard_hard_response_signal_number(&harness, 2).await;
@@ -3778,7 +3987,7 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
     );
     let s2_probe_wait = timeout(Duration::from_secs(5), async {
         loop {
-            if harness.link.held_ack_count() > 0
+            if harness.link.held_authenticated_punch_count() > 0
                 && harness
                     .udp_a
                     .hard_hard_pending_probe_count_for_test(HARD_HARD_B)
@@ -3880,6 +4089,21 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
 
     harness.validation_enabled_a.store(true, Ordering::Release);
     harness.validation_enabled_b.store(true, Ordering::Release);
+    harness
+        .link
+        .release_held_authenticated_punches(&harness.udp_a, &harness.udp_b)
+        .await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if harness.link.held_ack_count() > 0 {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("S2 Punch release must produce held ACKs");
+    harness.link.set_hold_authenticated_punch(false);
     harness.link.set_hold_ack(false);
     let s2_acks = harness.link.take_held_acks();
     harness

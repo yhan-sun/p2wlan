@@ -12,6 +12,7 @@
 pub(crate) enum HardHardSessionState {
     AwaitingPeer,
     Sweeping,
+    Retiring,
 }
 
 /// Exact identity of the dedicated socket that produced one synchronized
@@ -87,6 +88,45 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) attempt_count: u8,
     pub(crate) created_at: Instant,
     pub(crate) cancellation: Arc<crate::PunchSessionCancellation>,
+}
+
+#[cfg(test)]
+pub(crate) struct HardHardCleanupGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+    pub(crate) completed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+struct HardHardCleanupGateRegistration {
+    peer_id: String,
+    session_id: String,
+    session_token: String,
+    gate: Arc<HardHardCleanupGate>,
+}
+
+#[cfg(test)]
+pub(crate) struct HardHardCleanupGateGuard {
+    slot: Arc<std::sync::Mutex<Option<HardHardCleanupGateRegistration>>>,
+    installed: Arc<HardHardCleanupGate>,
+    previous: Option<HardHardCleanupGateRegistration>,
+}
+
+#[cfg(test)]
+impl Drop for HardHardCleanupGateGuard {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|registration| Arc::ptr_eq(&registration.gate, &self.installed))
+        {
+            *slot = self.previous.take();
+        }
+        self.installed.release.notify_waiters();
+    }
 }
 
 /// Hard ceiling for remote identity tombstones retained after `PeerLeft`.
@@ -263,6 +303,9 @@ pub struct PeerManager {
     peer_membership: Arc<std::sync::Mutex<PeerMembershipState>>,
     #[cfg(test)]
     authenticated_probe_verify_gate: AuthenticatedProbeVerifyGateSlot,
+    #[cfg(test)]
+    hard_hard_cleanup_gate:
+        Arc<std::sync::Mutex<Option<HardHardCleanupGateRegistration>>>,
     /// Last complete diagnostics snapshot.  Diagnostics must never turn a
     /// contended connection writer into a false empty roster; the snapshot is
     /// only a fallback while the live lock is unavailable.
@@ -318,6 +361,9 @@ pub struct PeerManager {
     /// measured.  Entries are short-lived and bounded; they are not a path
     /// selector or a Direct authority.
     hard_hard_sessions: Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
+    /// Exact cleanup ownership claims. A duplicate registration must not
+    /// start a second watcher that could later race a replacement session.
+    hard_hard_cleanup_owners: Arc<tokio::sync::Mutex<HashSet<(String, String, String)>>>,
     /// First authenticated socket selected by a bounded Hard↔Hard session.
     /// Kept outside the wire/session record so old test fixtures and the
     /// compact envelope remain compatible while a late packet cannot replace

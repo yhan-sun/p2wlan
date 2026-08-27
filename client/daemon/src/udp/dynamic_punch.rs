@@ -456,6 +456,10 @@ impl UdpTransport {
                     entry.peer_id == identity.peer_id
                         && entry.network_generation == identity.network_generation
                         && entry.punch_generation == identity.punch_generation
+                        && entry
+                            .hard_hard_session_token
+                            .as_deref()
+                            .is_none_or(|token| token == identity.session_token)
                         && entry.phase.is_usable()
                         && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
                 })

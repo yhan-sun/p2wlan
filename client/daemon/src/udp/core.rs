@@ -1222,6 +1222,41 @@ impl UdpTransport {
         self.hard_hard_probe_bindings.lock().await.remove(&nonce);
     }
 
+    /// Remove pending probes owned by one exact Hard↔Hard token.  The token
+    /// binding is local-only, so this remains session-scoped even when the
+    /// dynamic socket entry was already removed or its token tag was lost.
+    /// Pending probes on an explicitly retained Direct socket are left in the
+    /// ordinary pending table but lose their Hard↔Hard ownership binding.
+    pub(crate) async fn clear_hard_hard_pending_probes_for_token(
+        &self,
+        peer_id: &str,
+        token: &str,
+        preserve_socket_index: Option<usize>,
+    ) {
+        let token_nonces = self
+            .hard_hard_probe_bindings
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, bound_token)| bound_token.as_str() == token)
+            .map(|(nonce, _)| *nonce)
+            .collect::<HashSet<_>>();
+        if token_nonces.is_empty() {
+            return;
+        }
+        self.pending_probes.lock().await.retain(|nonce, pending| {
+            pending.peer_id.as_deref() != Some(peer_id)
+                || !token_nonces.contains(nonce)
+                || preserve_socket_index == Some(pending.socket_index)
+        });
+        self.hard_hard_probe_bindings
+            .lock()
+            .await
+            .retain(|nonce, bound_token| {
+                bound_token.as_str() != token || !token_nonces.contains(nonce)
+            });
+    }
+
     async fn prune_hard_hard_probe_bindings(&self) {
         let pending = self.pending_probes.lock().await;
         let mut bindings = self.hard_hard_probe_bindings.lock().await;
@@ -1246,6 +1281,23 @@ impl UdpTransport {
             .filter(|(nonce, probe)| {
                 probe.peer_id.as_deref() == Some(peer_id)
                     && hard_hard_bindings.contains_key(*nonce)
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hard_hard_pending_probe_count_for_token_for_test(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> usize {
+        let pending = self.pending_probes.lock().await;
+        let hard_hard_bindings = self.hard_hard_probe_bindings.lock().await;
+        pending
+            .iter()
+            .filter(|(nonce, probe)| {
+                probe.peer_id.as_deref() == Some(peer_id)
+                    && hard_hard_bindings.get(*nonce).is_some_and(|bound| bound == token)
             })
             .count()
     }

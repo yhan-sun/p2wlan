@@ -32,6 +32,8 @@ impl PeerManager {
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
             #[cfg(test)]
             authenticated_probe_verify_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            hard_hard_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
@@ -46,6 +48,7 @@ impl PeerManager {
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
             hard_hard_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hard_hard_cleanup_owners: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             hard_hard_winners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
             remote_fresh_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
