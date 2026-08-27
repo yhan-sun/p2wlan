@@ -1929,6 +1929,18 @@ async fn wait_for_injected_offer_disposition(
 }
 
 async fn wait_for_failed_attempt_cleanup(harness: &TwoPeerHarness) {
+    // Capture the expected identities before retirement removes the ledger.
+    // Timeout diagnostics compare tokens without ever printing them.
+    let expected_a = harness
+        .peers_a
+        .hard_hard_session_for_test(HARD_HARD_B)
+        .await
+        .map(|record| (record.session_id, record.session_token));
+    let expected_b = harness
+        .peers_b
+        .hard_hard_session_for_test(HARD_HARD_A)
+        .await
+        .map(|record| (record.session_id, record.session_token));
     let result = timeout(HARD_HARD_E2E_TIMEOUT, async {
         loop {
             let clean = !harness
@@ -1987,8 +1999,86 @@ async fn wait_for_failed_attempt_cleanup(harness: &TwoPeerHarness) {
             .udp_b
             .hard_hard_pending_probe_count_for_test(HARD_HARD_A)
             .await;
+        let a_session = harness
+            .peers_a
+            .hard_hard_session_for_test(HARD_HARD_B)
+            .await
+            .map(|record| {
+                (
+                    record.state,
+                    record.cancellation.is_cancelled(),
+                    record.expires_at_ms,
+                    record.fresh_socket.socket_index,
+                    expected_a
+                        .as_ref()
+                        .is_some_and(|(_, token)| token == &record.session_token),
+                )
+            });
+        let b_session = harness
+            .peers_b
+            .hard_hard_session_for_test(HARD_HARD_A)
+            .await
+            .map(|record| {
+                (
+                    record.state,
+                    record.cancellation.is_cancelled(),
+                    record.expires_at_ms,
+                    record.fresh_socket.socket_index,
+                    expected_b
+                        .as_ref()
+                        .is_some_and(|(_, token)| token == &record.session_token),
+                )
+            });
+        let a_cleanup_owner = if let Some((session_id, token)) = expected_a.as_ref() {
+            harness
+                .peers_a
+                .hard_hard_cleanup_owner_claimed_for_test(HARD_HARD_B, session_id, token)
+                .await
+        } else {
+            false
+        };
+        let b_cleanup_owner = if let Some((session_id, token)) = expected_b.as_ref() {
+            harness
+                .peers_b
+                .hard_hard_cleanup_owner_claimed_for_test(HARD_HARD_A, session_id, token)
+                .await
+        } else {
+            false
+        };
+        let a_winner = if let Some((_, token)) = expected_a.as_ref() {
+            harness
+                .peers_a
+                .hard_hard_winner_for_token(HARD_HARD_B, token)
+                .await
+        } else {
+            None
+        };
+        let b_winner = if let Some((_, token)) = expected_b.as_ref() {
+            harness
+                .peers_b
+                .hard_hard_winner_for_token(HARD_HARD_A, token)
+                .await
+        } else {
+            None
+        };
+        let a_udp = harness
+            .udp_a
+            .hard_hard_udp_lifecycle_snapshot_for_test(
+                HARD_HARD_B,
+                expected_a.as_ref().map(|(_, token)| token.as_str()),
+            )
+            .await;
+        let b_udp = harness
+            .udp_b
+            .hard_hard_udp_lifecycle_snapshot_for_test(
+                HARD_HARD_A,
+                expected_b.as_ref().map(|(_, token)| token.as_str()),
+            )
+            .await;
         panic!(
-            "failed Hard↔Hard attempt cleanup: A active={a_active} sockets={a_sockets} pending={a_pending}; B active={b_active} sockets={b_sockets} pending={b_pending}"
+            "failed Hard↔Hard attempt cleanup:\nA active={a_active} direct={} sockets={a_sockets} pending={a_pending} session(state,cancelled,expires_at_ms,socket,token_match)={a_session:?} cleanup_owner={a_cleanup_owner} winner={a_winner:?} udp={a_udp:#?}\nB active={b_active} direct={} sockets={b_sockets} pending={b_pending} session(state,cancelled,expires_at_ms,socket,token_match)={b_session:?} cleanup_owner={b_cleanup_owner} winner={b_winner:?} udp={b_udp:#?}",
+            harness.peers_a.is_direct(HARD_HARD_B).await,
+            harness.peers_b.is_direct(HARD_HARD_A).await,
         );
     }
 }

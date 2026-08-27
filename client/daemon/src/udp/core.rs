@@ -1302,6 +1302,98 @@ impl UdpTransport {
             .count()
     }
 
+    /// Redacted lifecycle evidence for deterministic Hard↔Hard timeout
+    /// diagnostics. Tokens and nonces never leave this method; only an
+    /// equality bit and a short process-local digest are exposed.
+    #[cfg(test)]
+    pub(crate) async fn hard_hard_udp_lifecycle_snapshot_for_test(
+        &self,
+        peer_id: &str,
+        expected_token: Option<&str>,
+    ) -> HardHardUdpLifecycleSnapshot {
+        let token_digest = |token: &str| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(token, &mut hasher);
+            format!("{:08x}", std::hash::Hasher::finish(&hasher) as u32)
+        };
+        let mut dynamic_sockets = {
+            let state = self.socket_state.lock().await;
+            let selected = state.affinity.get(peer_id).map(|pin| pin.socket_index);
+            state
+                .dynamic
+                .values()
+                .filter(|entry| entry.peer_id == peer_id)
+                .map(|entry| HardHardDynamicSocketLifecycleSnapshot {
+                    socket_index: entry.socket_index,
+                    phase: entry.phase,
+                    network_generation: entry.network_generation,
+                    punch_generation: entry.punch_generation,
+                    token_present: entry.hard_hard_session_token.is_some(),
+                    token_matches_expected: expected_token.is_some_and(|expected| {
+                        entry.hard_hard_session_token.as_deref() == Some(expected)
+                    }),
+                    token_digest: entry
+                        .hard_hard_session_token
+                        .as_deref()
+                        .map(token_digest),
+                    authenticated_evidence: entry.authenticated_evidence,
+                    outstanding_send_leases: entry.send_leases.outstanding(),
+                    pending_probe_count: 0,
+                    reader_finished: entry.reader.is_finished(),
+                    affinity_selected: selected == Some(entry.socket_index),
+                })
+                .collect::<Vec<_>>()
+        };
+        dynamic_sockets.sort_by_key(|entry| entry.socket_index);
+        let dynamic_indices = dynamic_sockets
+            .iter()
+            .map(|entry| entry.socket_index)
+            .collect::<HashSet<_>>();
+
+        let now = Instant::now();
+        let pending = self.pending_probes.lock().await;
+        let bindings = self.hard_hard_probe_bindings.lock().await;
+        let mut pending_probes = pending
+            .iter()
+            .filter_map(|(nonce, probe)| {
+                let binding = bindings.get(nonce);
+                let peer_matches = probe.peer_id.as_deref() == Some(peer_id);
+                let token_matches_expected = expected_token
+                    .zip(binding.map(String::as_str))
+                    .is_some_and(|(expected, actual)| expected == actual);
+                (peer_matches
+                    && (binding.is_some() || dynamic_indices.contains(&probe.socket_index))
+                    || token_matches_expected)
+                    .then_some(HardHardPendingProbeLifecycleSnapshot {
+                        socket_index: probe.socket_index,
+                        token_matches_expected,
+                        peer_matches,
+                        expired: probe.is_expired(now),
+                        binding_present: binding.is_some(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        pending_probes.sort_by_key(|probe| probe.socket_index);
+        for socket in &mut dynamic_sockets {
+            socket.pending_probe_count = pending_probes
+                .iter()
+                .filter(|probe| probe.socket_index == socket.socket_index)
+                .count();
+        }
+        let orphan_probe_bindings = bindings
+            .keys()
+            .filter(|nonce| !pending.contains_key(*nonce))
+            .count();
+
+        HardHardUdpLifecycleSnapshot {
+            peer_id: peer_id.to_string(),
+            expected_token_present: expected_token.is_some(),
+            dynamic_sockets,
+            pending_probes,
+            orphan_probe_bindings,
+        }
+    }
+
     /// Attach the local control-plane node ID used by authenticated UDP Probe v2.
     pub fn with_local_node_id(mut self, node_id: impl Into<String>) -> Self {
         self.local_node_id = Some(node_id.into());

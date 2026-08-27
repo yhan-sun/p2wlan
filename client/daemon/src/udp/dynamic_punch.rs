@@ -608,8 +608,15 @@ impl UdpTransport {
         socket_index: usize,
         network_generation: u64,
     ) -> bool {
-        let (punch_generation, local_endpoint) = {
-            let state = self.socket_state.lock().await;
+        let (identity, losers) = {
+            // Keep the exact socket entry locked across manager selection.
+            // `hard_hard_select_winner` commits its session record and sticky
+            // winner without any later await; once it returns, this same poll
+            // writes authenticated evidence, affinity and Finalized phase.
+            // Cancellation therefore observes either no winner transaction or
+            // the complete manager + UDP transaction, never a preservable
+            // manager-only half state.
+            let mut state = self.socket_state.lock().await;
             let Some(entry) = state.dynamic.get(&socket_index) else {
                 return false;
             };
@@ -623,34 +630,21 @@ impl UdpTransport {
             let Some(local_endpoint) = entry.socket.local_addr().ok() else {
                 return false;
             };
-            (entry.punch_generation, local_endpoint)
-        };
-        let Some(identity) = self
-            .peers
-            .hard_hard_select_winner(
-                peer_id,
-                token,
-                socket_index,
-                network_generation,
-                punch_generation,
-                local_endpoint,
-            )
-            .await
-        else {
-            return false;
-        };
-        let losers = {
-            let mut state = self.socket_state.lock().await;
-            let Some(entry) = state.dynamic.get(&socket_index) else {
+            let punch_generation = entry.punch_generation;
+            let Some(identity) = self
+                .peers
+                .hard_hard_select_winner(
+                    peer_id,
+                    token,
+                    socket_index,
+                    network_generation,
+                    punch_generation,
+                    local_endpoint,
+                )
+                .await
+            else {
                 return false;
             };
-            if entry.peer_id != peer_id
-                || entry.network_generation != network_generation
-                || entry.punch_generation != punch_generation
-                || entry.hard_hard_session_token.as_deref() != Some(token)
-            {
-                return false;
-            }
             let epoch = state.next_epoch();
             state.affinity.insert(
                 peer_id.to_string(),
@@ -676,10 +670,11 @@ impl UdpTransport {
                 })
                 .map(|(index, _)| *index)
                 .collect::<Vec<_>>();
-            loser_indices
+            let losers = loser_indices
                 .into_iter()
                 .filter_map(|index| state.dynamic.remove(&index))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (identity, losers)
         };
         // The authenticated packet, affinity pin and Finalized phase are one
         // socket-state commit.  In particular, no durable diagnostics await
@@ -722,34 +717,6 @@ impl UdpTransport {
             )
             .await;
         true
-    }
-
-    /// Exact token-tagged socket behind a manager-selected Hard↔Hard winner.
-    ///
-    /// This deliberately does not require affinity or the UDP evidence
-    /// counter: manager selection itself is only reachable from an
-    /// authenticated Probe v2 admission, and there is one cancellation point
-    /// between that manager commit and the socket-state commit above.  The
-    /// predicate is used only to keep that exact socket alive for the
-    /// remainder of the already-bounded session; it is never Direct proof.
-    pub(crate) async fn hard_hard_socket_identity_is_exact_session_socket(
-        &self,
-        identity: &crate::peer::HardHardFreshSocketIdentity,
-    ) -> bool {
-        let state = self.socket_state.lock().await;
-        state
-            .dynamic
-            .get(&identity.socket_index)
-            .is_some_and(|entry| {
-                entry.peer_id == identity.peer_id
-                    && entry.hard_hard_session_token.as_deref()
-                        == Some(identity.session_token.as_str())
-                    && entry.network_generation == identity.network_generation
-                    && entry.punch_generation == identity.punch_generation
-                    && entry.phase.is_usable()
-                    && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
-                    && self.peers.current_network_generation_sync() == identity.network_generation
-            })
     }
 
     #[cfg(test)]
@@ -853,6 +820,11 @@ impl UdpTransport {
             .dynamic
             .get(&socket_index)
             .map(|entry| entry.phase)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hard_hard_socket_state_is_locked_for_test(&self) -> bool {
+        self.socket_state.try_lock().is_err()
     }
 
     /// Detach a superseded generation's predecessor socket, unless the

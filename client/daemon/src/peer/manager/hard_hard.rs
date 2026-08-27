@@ -192,7 +192,6 @@ impl PeerManager {
         let now = hard_hard_now_ms();
         let mut cancelled = Vec::new();
         let mut retired_winners = Vec::new();
-        let mut duplicate_result = None;
         let mut sessions = self.hard_hard_sessions.lock().await;
         let expired_keys = sessions
             .iter()
@@ -211,20 +210,13 @@ impl PeerManager {
         }
         let key = (record.peer_id.clone(), record.session_id.clone());
         let winner_key = (record.peer_id.clone(), record.session_token.clone());
-        if let Some(existing) = sessions.get(&key) {
-            duplicate_result = Some(existing.state != HardHardSessionState::Retiring
-                && existing.initiator == record.initiator
-                && existing.local_network_generation == record.local_network_generation
-                && existing.remote_candidate_epoch == record.remote_candidate_epoch
-                && existing.local_profile_generation == record.local_profile_generation
-                && existing.remote_profile_generation == record.remote_profile_generation
-                && existing.requested_birthday_level == record.requested_birthday_level
-                && existing.generated_candidate_count == record.generated_candidate_count
-                && existing.signaled_candidate_count == record.signaled_candidate_count
-                && existing.birthday == record.birthday
-                && existing.requested_socket_indices == record.requested_socket_indices
-                && existing.requested_socket_count == record.requested_socket_count
-                && existing.prediction_window == record.prediction_window);
+        // `true` means THIS record became the authoritative owner. An exact
+        // duplicate is accepted by the control-plane state machine, but it
+        // must not make a second measurement believe it owns the existing
+        // record's cleanup watcher. Returning false keeps that measurement's
+        // provisional guard armed so its token-tagged socket rolls back.
+        let inserted = if sessions.contains_key(&key) {
+            false
         } else {
             // One live session per peer.  A newer fresh measurement supersedes
             // every older response fence before it can reuse an exact socket.
@@ -264,11 +256,12 @@ impl PeerManager {
                 }
             }
             sessions.insert(key, record);
-        }
+            true
+        };
         drop(sessions);
-        if duplicate_result.is_none() || !retired_winners.is_empty() {
+        if inserted || !retired_winners.is_empty() {
             let mut winners = self.hard_hard_winners.lock().await;
-            if duplicate_result.is_none() {
+            if inserted {
                 winners.remove(&winner_key);
             }
             for key in retired_winners {
@@ -278,7 +271,7 @@ impl PeerManager {
         for cancellation in cancelled {
             cancellation.cancel_for_hard_hard_cleanup();
         }
-        duplicate_result.unwrap_or(true)
+        inserted
     }
 
     /// A live session suppresses a second initiator while its bounded socket
@@ -409,12 +402,14 @@ impl PeerManager {
     ) -> Option<HardHardFreshSocketIdentity> {
         let now = hard_hard_now_ms();
         let key = (peer_id.to_string(), token.to_string());
-        let eligible = self
-            .hard_hard_sessions
-            .lock()
-            .await
-            .values()
-            .any(|record| {
+        // Keep the session record locked through the sticky-winner update.
+        // Every other path either takes `hard_hard_sessions` first or drops
+        // it before touching `hard_hard_winners`, so this ordering cannot
+        // deadlock. More importantly, cancellation can no longer leave a
+        // winner map entry behind after the eligible-session check but before
+        // the exact fresh-socket identity is committed to the record.
+        let mut sessions = self.hard_hard_sessions.lock().await;
+        let record = sessions.values_mut().find(|record| {
                 record.peer_id == peer_id
                     && record.session_token == token
                     && record.state != HardHardSessionState::Retiring
@@ -423,42 +418,15 @@ impl PeerManager {
                     && record.local_network_generation == network_generation
                     && (record.state == HardHardSessionState::Sweeping
                         || (!record.initiator && record.state == HardHardSessionState::AwaitingPeer))
-            });
-        if !eligible {
-            return None;
+            })?;
+        let mut winners = self.hard_hard_winners.lock().await;
+        if let Some(existing) = winners.get(&key) {
+            if *existing != socket_index {
+                return None;
+            }
+        } else {
+            winners.insert(key, socket_index);
         }
-        let inserted_winner = {
-            let mut winners = self.hard_hard_winners.lock().await;
-            if let Some(existing) = winners.get(&key) {
-                if *existing != socket_index {
-                    return None;
-                }
-                false
-            } else {
-                winners.insert(key.clone(), socket_index);
-                true
-            }
-        };
-        let mut sessions = self.hard_hard_sessions.lock().await;
-        let Some(record) = sessions.values_mut().find(|record| {
-            record.peer_id == peer_id
-                && record.session_token == token
-                && record.state != HardHardSessionState::Retiring
-                && !record.cancellation.is_cancelled()
-                && record.expires_at_ms >= now
-                && record.local_network_generation == network_generation
-                && (record.state == HardHardSessionState::Sweeping
-                    || (!record.initiator && record.state == HardHardSessionState::AwaitingPeer))
-        }) else {
-            drop(sessions);
-            if inserted_winner {
-                self.hard_hard_winners
-                    .lock()
-                    .await
-                    .remove(&key);
-            }
-            return None;
-        };
         record.fresh_socket.socket_index = socket_index;
         record.fresh_socket.punch_generation = punch_generation.max(1);
         record.fresh_socket.socket_local_endpoint = socket_local_endpoint;
@@ -491,6 +459,14 @@ impl PeerManager {
             .await
             .get(&(peer_id.to_string(), token.to_string()))
             .copied()
+    }
+
+    /// Hold the sticky-winner writer for deterministic cancellation tests.
+    #[cfg(test)]
+    pub(crate) async fn hold_hard_hard_winner_writer_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), usize>> {
+        self.hard_hard_winners.lock().await
     }
 
     /// Admit the one expected reciprocal response after the remote candidate

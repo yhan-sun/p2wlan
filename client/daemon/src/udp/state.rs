@@ -965,6 +965,46 @@ pub(crate) enum DynamicSocketPhase {
     Finalized,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct HardHardDynamicSocketLifecycleSnapshot {
+    pub(crate) socket_index: usize,
+    pub(crate) phase: DynamicSocketPhase,
+    pub(crate) network_generation: u64,
+    pub(crate) punch_generation: u64,
+    pub(crate) token_present: bool,
+    pub(crate) token_matches_expected: bool,
+    pub(crate) token_digest: Option<String>,
+    pub(crate) authenticated_evidence: u64,
+    pub(crate) outstanding_send_leases: usize,
+    pub(crate) pending_probe_count: usize,
+    pub(crate) reader_finished: bool,
+    pub(crate) affinity_selected: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct HardHardPendingProbeLifecycleSnapshot {
+    pub(crate) socket_index: usize,
+    pub(crate) token_matches_expected: bool,
+    pub(crate) peer_matches: bool,
+    pub(crate) expired: bool,
+    pub(crate) binding_present: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct HardHardUdpLifecycleSnapshot {
+    pub(crate) peer_id: String,
+    pub(crate) expected_token_present: bool,
+    pub(crate) dynamic_sockets: Vec<HardHardDynamicSocketLifecycleSnapshot>,
+    pub(crate) pending_probes: Vec<HardHardPendingProbeLifecycleSnapshot>,
+    pub(crate) orphan_probe_bindings: usize,
+}
+
 impl DynamicSocketPhase {
     /// Whether a dynamic socket may be handed out as the peer's traffic path.
     ///
