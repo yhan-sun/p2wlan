@@ -4846,13 +4846,14 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(false, false, false).await;
-    // Fence peer traffic before either production rendezvous worker exists.
-    // The test clock controls admission timestamps, but it cannot retime a
-    // Tokio sleep that a worker already armed. On a slower Windows runner the
-    // old post-response drop raced the natural 3.5s punch timer and sometimes
-    // produced a legitimate authenticated Direct path that cleanup correctly
-    // preserved. Starting disconnected makes the intended no-reachability
-    // scenario deterministic without weakening any cleanup assertion.
+    // Windows allocates loopback ephemeral ports predictably enough that a
+    // production candidate window can occasionally hit the peer's real test
+    // socket directly, bypassing the synthetic NAT link and its drop flags.
+    // Keep the real probe registration, successful-send telemetry and cleanup
+    // path, but stop these test datagrams at the shared cfg(test) send seam.
+    // The RAII guards restore normal sending before the next exact test.
+    let _blackhole_a = harness.udp_a.blackhole_probe_sends_for_test();
+    let _blackhole_b = harness.udp_b.blackhole_probe_sends_for_test();
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;

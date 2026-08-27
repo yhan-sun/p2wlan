@@ -3,20 +3,28 @@ use probe_budget::{
 };
 
 #[cfg(test)]
-#[derive(Debug, Default)]
-struct ProbeSendFailureHook {
-    fail_on_attempts: HashSet<usize>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeSendTestAction {
+    Fail,
+    Blackhole,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ProbeSendTestHook {
+    action: ProbeSendTestAction,
+    selected_attempts: Option<HashSet<usize>>,
     physical_send_attempt: usize,
 }
 
 #[cfg(test)]
-pub(crate) struct ProbeSendFailureGuard {
-    hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
+pub(crate) struct ProbeSendTestGuard {
+    hook: Arc<std::sync::Mutex<Option<ProbeSendTestHook>>>,
     enabled: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
-impl Drop for ProbeSendFailureGuard {
+impl Drop for ProbeSendTestGuard {
     fn drop(&mut self) {
         *self.hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.enabled.store(false, Ordering::Release);
@@ -1077,32 +1085,36 @@ impl UdpTransport {
         peer_addr: SocketAddr,
     ) -> std::io::Result<usize> {
         #[cfg(test)]
-        if self.should_fail_probe_send_for_test() {
-            return Err(std::io::Error::other(
-                "test-injected physical probe send failure",
-            ));
+        match self.probe_send_action_for_test() {
+            Some(ProbeSendTestAction::Fail) => {
+                return Err(std::io::Error::other(
+                    "test-injected physical probe send failure",
+                ));
+            }
+            Some(ProbeSendTestAction::Blackhole) => return Ok(bytes.len()),
+            None => {}
         }
         socket.send_to(bytes, peer_addr).await
     }
 
     #[cfg(test)]
-    fn should_fail_probe_send_for_test(&self) -> bool {
+    fn probe_send_action_for_test(&self) -> Option<ProbeSendTestAction> {
         if !self
-            .probe_send_failure_hook_enabled
+            .probe_send_test_hook_enabled
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return false;
+            return None;
         }
         let mut hook = self
-            .probe_send_failure_hook
+            .probe_send_test_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(hook) = hook.as_mut() else {
-            return false;
-        };
+        let hook = hook.as_mut()?;
         hook.physical_send_attempt = hook.physical_send_attempt.saturating_add(1);
-        hook.fail_on_attempts
-            .contains(&hook.physical_send_attempt)
+        match hook.selected_attempts.as_ref() {
+            Some(selected) if !selected.contains(&hook.physical_send_attempt) => None,
+            _ => Some(hook.action),
+        }
     }
 
     /// Send an authenticated ICE-style nominated connectivity check for a direct trial.

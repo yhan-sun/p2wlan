@@ -878,6 +878,52 @@ async fn exact_dynamic_socket_send_error_is_reported_as_send_error() {
 }
 
 #[tokio::test]
+async fn probe_send_blackhole_is_successful_and_raii_scoped() {
+    let (_peers, transport, _nat) = generation_env().await;
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_endpoint = receiver.local_addr().unwrap();
+    let payload = b"probe-send-blackhole";
+    let mut received = [0u8; 64];
+
+    let blackhole = transport.blackhole_probe_sends_for_test();
+    assert_eq!(
+        transport
+            .send_probe_datagram(&sender, payload, receiver_endpoint)
+            .await
+            .unwrap(),
+        payload.len()
+    );
+    assert!(
+        timeout(
+            Duration::from_millis(50),
+            receiver.recv_from(&mut received)
+        )
+        .await
+        .is_err(),
+        "a blackholed test datagram must not enter the kernel"
+    );
+
+    drop(blackhole);
+    assert_eq!(
+        transport
+            .send_probe_datagram(&sender, payload, receiver_endpoint)
+            .await
+            .unwrap(),
+        payload.len()
+    );
+    let (received_len, source) = timeout(
+        Duration::from_secs(1),
+        receiver.recv_from(&mut received),
+    )
+    .await
+    .expect("dropping the guard must restore the real UDP send")
+    .unwrap();
+    assert_eq!(&received[..received_len], payload);
+    assert_eq!(source, sender.local_addr().unwrap());
+}
+
+#[tokio::test]
 async fn exact_dynamic_socket_partial_physical_failure_keeps_success_and_error_counts() {
     let (_peers, transport, nat, socket_index) = exact_send_report_fixture().await;
     // The authenticated primary is physical attempt 1; the compatibility
