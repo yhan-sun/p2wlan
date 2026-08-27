@@ -124,9 +124,9 @@ pub struct UdpTransport {
     /// disabled by default; tests can fail selected send attempts at the
     /// shared UDP send abstraction without closing or replacing the socket.
     #[cfg(test)]
-    probe_send_test_hook: Arc<std::sync::Mutex<Option<ProbeSendTestHook>>>,
+    probe_send_failure_hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
     #[cfg(test)]
-    probe_send_test_hook_enabled: Arc<AtomicBool>,
+    probe_send_failure_hook_enabled: Arc<AtomicBool>,
     /// One-shot lifecycle linearization seam used only by the remote-restart
     /// race regression.
     #[cfg(test)]
@@ -224,9 +224,9 @@ impl UdpTransport {
             #[cfg(test)]
             heartbeat_send_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
-            probe_send_test_hook: Arc::new(std::sync::Mutex::new(None)),
+            probe_send_failure_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
-            probe_send_test_hook_enabled: Arc::new(AtomicBool::new(false)),
+            probe_send_failure_hook_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
@@ -281,47 +281,22 @@ impl UdpTransport {
     pub(crate) fn set_probe_send_failures_for_test(
         &self,
         fail_on_attempts: impl IntoIterator<Item = usize>,
-    ) -> ProbeSendTestGuard {
+    ) -> ProbeSendFailureGuard {
         let fail_on_attempts = fail_on_attempts.into_iter().collect::<HashSet<_>>();
         let mut hook = self
-            .probe_send_test_hook
+            .probe_send_failure_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *hook = Some(ProbeSendTestHook {
-            action: ProbeSendTestAction::Fail,
-            selected_attempts: Some(fail_on_attempts.clone()),
+        *hook = Some(ProbeSendFailureHook {
+            fail_on_attempts: fail_on_attempts.clone(),
             physical_send_attempt: 0,
         });
         drop(hook);
-        self.probe_send_test_hook_enabled
+        self.probe_send_failure_hook_enabled
             .store(!fail_on_attempts.is_empty(), Ordering::Release);
-        ProbeSendTestGuard {
-            hook: self.probe_send_test_hook.clone(),
-            enabled: self.probe_send_test_hook_enabled.clone(),
-        }
-    }
-
-    /// Report every probe datagram as accepted without entering the kernel.
-    /// This keeps the production pending-probe and telemetry path intact while
-    /// deterministic no-reachability tests avoid platform ephemeral-port
-    /// collisions that can bypass their synthetic NAT link.
-    #[cfg(test)]
-    pub(crate) fn blackhole_probe_sends_for_test(&self) -> ProbeSendTestGuard {
-        let mut hook = self
-            .probe_send_test_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *hook = Some(ProbeSendTestHook {
-            action: ProbeSendTestAction::Blackhole,
-            selected_attempts: None,
-            physical_send_attempt: 0,
-        });
-        drop(hook);
-        self.probe_send_test_hook_enabled
-            .store(true, Ordering::Release);
-        ProbeSendTestGuard {
-            hook: self.probe_send_test_hook.clone(),
-            enabled: self.probe_send_test_hook_enabled.clone(),
+        ProbeSendFailureGuard {
+            hook: self.probe_send_failure_hook.clone(),
+            enabled: self.probe_send_failure_hook_enabled.clone(),
         }
     }
 

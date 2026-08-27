@@ -3813,6 +3813,7 @@ mod hard_hard_tests {
 
     #[tokio::test(start_paused = true)]
     async fn direct_confirmation_grace_accepts_an_exact_commit_after_one_second() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
         let deduplicator = PunchAttemptDeduplicator::default();
         let session = deduplicator
@@ -3860,6 +3861,7 @@ mod hard_hard_tests {
 
     #[tokio::test]
     async fn direct_confirmation_start_does_not_wait_for_connection_writer() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
         let session = PunchAttemptDeduplicator::default()
             .claim("peer-exact-proof")
@@ -3914,6 +3916,7 @@ mod hard_hard_tests {
 
     #[tokio::test]
     async fn exact_probe_session_diagnostics_survive_connection_writer_contention() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
         let (peers, udp, identity, _remote) = exact_socket_proof_fixture().await;
         udp.update_peer_probe_rx_diagnostics(
             &identity.peer_id,
@@ -5352,6 +5355,7 @@ mod hard_hard_tests {
 
     #[tokio::test]
     async fn hard_hard_exact_proof_rejects_peer_global_direct_on_other_socket() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
         let other_local: SocketAddr = "127.0.0.1:41001".parse().unwrap();
         let commit_before = peers.direct_commit_seq_sync(&identity.peer_id);
@@ -5393,6 +5397,7 @@ mod hard_hard_tests {
 
     #[tokio::test]
     async fn hard_hard_exact_proof_requires_selected_pair_and_authenticated_evidence() {
+        let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
         let commit_before = peers.direct_commit_seq_sync(&identity.peer_id);
         assert!(

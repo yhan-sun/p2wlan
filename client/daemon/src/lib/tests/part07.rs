@@ -59,33 +59,85 @@ struct HarnessPorts {
     b_mapped: [u16; 4],
 }
 
+const A_PREDICTABLE_MAPPED_OFFSETS: [i32; 4] = [-16, -12, -8, -4];
+const B_PREDICTABLE_MAPPED_OFFSETS: [i32; 4] = [-12, -9, -6, -3];
+const A_PREDICTABLE_CANDIDATE_GUARD_OFFSETS: [i32; 5] = [-16, -12, -8, -4, 4];
+const B_PREDICTABLE_CANDIDATE_GUARD_OFFSETS: [i32; 5] = [-12, -9, -6, -3, 3];
+
+async fn reserve_predictable_public_endpoint(
+    ip: IpAddr,
+    candidate_offsets: &[i32],
+) -> (Arc<UdpSocket>, Vec<Arc<UdpSocket>>) {
+    const RESERVATION_RETRIES: usize = 64;
+
+    'reserve: for _ in 0..RESERVATION_RETRIES {
+        let public = Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap());
+        let public_port = public.local_addr().unwrap().port();
+        let mut guards = Vec::with_capacity(candidate_offsets.len());
+        for offset in candidate_offsets {
+            let endpoint = SocketAddr::new(ip, offset_port(public_port, *offset));
+            match UdpSocket::bind(endpoint).await {
+                Ok(socket) => guards.push(Arc::new(socket)),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    continue 'reserve;
+                }
+                Err(error) => panic!("bind predictable candidate guard {endpoint}: {error}"),
+            }
+        }
+        return (public, guards);
+    }
+    panic!("could not reserve a kernel-selected predictable candidate set");
+}
+
 impl HarnessPorts {
     async fn allocate_with_mode(
         stun: HarnessStunProfile,
         mode: HarnessNatMode,
-    ) -> (Self, Arc<UdpSocket>, Arc<UdpSocket>, Vec<TestStunObserver>) {
+    ) -> (
+        Self,
+        Arc<UdpSocket>,
+        Arc<UdpSocket>,
+        Vec<TestStunObserver>,
+        Vec<Arc<UdpSocket>>,
+    ) {
         assert!((3..=4).contains(&stun.observer_count));
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let a_public = Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap());
-        let b_public = Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap());
+        let (a_public, b_public, candidate_guards) = match mode {
+            HarnessNatMode::Predictable => {
+                let (a_public, mut guards) = reserve_predictable_public_endpoint(
+                    ip,
+                    &A_PREDICTABLE_CANDIDATE_GUARD_OFFSETS,
+                )
+                .await;
+                let (b_public, b_guards) = reserve_predictable_public_endpoint(
+                    ip,
+                    &B_PREDICTABLE_CANDIDATE_GUARD_OFFSETS,
+                )
+                .await;
+                guards.extend(b_guards);
+                (a_public, b_public, guards)
+            }
+            HarnessNatMode::HighEntropy => (
+                Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap()),
+                Arc::new(UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap()),
+                Vec::new(),
+            ),
+        };
         let a_public_addr = a_public.local_addr().unwrap();
         let b_public_addr = b_public.local_addr().unwrap();
         let mapped_ports = |public_port: u16, side: u16| match mode {
             HarnessNatMode::Predictable => {
                 if side == 0 {
-                    [
-                        offset_port(public_port, -16),
-                        offset_port(public_port, -12),
-                        offset_port(public_port, -8),
-                        offset_port(public_port, -4),
-                    ]
+                    A_PREDICTABLE_MAPPED_OFFSETS
+                        .map(|offset| offset_port(public_port, offset))
                 } else {
-                    [
-                        offset_port(public_port, -12),
-                        offset_port(public_port, -9),
-                        offset_port(public_port, -6),
-                        offset_port(public_port, -3),
-                    ]
+                    B_PREDICTABLE_MAPPED_OFFSETS
+                        .map(|offset| offset_port(public_port, offset))
                 }
             }
             // The first observed port is also the real public endpoint. The
@@ -129,6 +181,7 @@ impl HarnessPorts {
             a_public,
             b_public,
             observers,
+            candidate_guards,
         )
     }
 }
@@ -1039,6 +1092,7 @@ struct TwoPeerHarness {
     validation_tasks: Vec<tokio::task::JoinHandle<()>>,
     peer_reflexive_tasks: Vec<tokio::task::JoinHandle<()>>,
     link: NatPacketLink,
+    _candidate_guards: Vec<Arc<UdpSocket>>,
     validation_enabled_a: Arc<AtomicBool>,
     validation_enabled_b: Arc<AtomicBool>,
     stun_observers: Vec<TestStunObserver>,
@@ -1296,7 +1350,7 @@ async fn build_two_peer_harness_with_stun_mode(
     stun: HarnessStunProfile,
     nat_mode: HarnessNatMode,
 ) -> TwoPeerHarness {
-    let (ports, a_public_socket, b_public_socket, stun_observers) =
+    let (ports, a_public_socket, b_public_socket, stun_observers, candidate_guards) =
         HarnessPorts::allocate_with_mode(stun, nat_mode).await;
     let birthday_enabled = nat_mode == HarnessNatMode::HighEntropy;
     let a_identity = NodeIdentity::generate();
@@ -1531,6 +1585,7 @@ async fn build_two_peer_harness_with_stun_mode(
         validation_tasks: Vec::new(),
         peer_reflexive_tasks: Vec::new(),
         link,
+        _candidate_guards: candidate_guards,
         validation_enabled_a,
         validation_enabled_b,
         stun_observers,
@@ -2813,10 +2868,8 @@ async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
     assert!(sweep_detail.contains("exact_socket=true"));
     assert!(sweep_detail.contains("direct_confirmed=true"));
 
-    let diagnostics_a = harness.peers_a.diagnostics().await;
-    let diagnostics_b = harness.peers_b.diagnostics().await;
-    let peer_a = &diagnostics_a[0];
-    let peer_b = &diagnostics_b[0];
+    let peer_a = wait_for_current_direct_diagnostics(&harness.peers_a, HARD_HARD_B).await;
+    let peer_b = wait_for_current_direct_diagnostics(&harness.peers_b, HARD_HARD_A).await;
     let fresh_a = harness
         .peers_a
         .fresh_mapping_for_peer(HARD_HARD_B)
@@ -2827,7 +2880,7 @@ async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
         .fresh_mapping_for_peer(HARD_HARD_A)
         .await
         .expect("B must retain its measured fresh mapping");
-    for diagnostics in [peer_a, peer_b] {
+    for diagnostics in [&peer_a, &peer_b] {
         assert_eq!(diagnostics.state, ConnectionState::Direct);
         assert_eq!(diagnostics.active_path, Some(NetworkPath::Direct));
     }
@@ -4846,14 +4899,9 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(false, false, false).await;
-    // Windows allocates loopback ephemeral ports predictably enough that a
-    // production candidate window can occasionally hit the peer's real test
-    // socket directly, bypassing the synthetic NAT link and its drop flags.
-    // Keep the real probe registration, successful-send telemetry and cleanup
-    // path, but stop these test datagrams at the shared cfg(test) send seam.
-    // The RAII guards restore normal sending before the next exact test.
-    let _blackhole_a = harness.udp_a.blackhole_probe_sends_for_test();
-    let _blackhole_b = harness.udp_b.blackhole_probe_sends_for_test();
+    // The predictable harness reserves every signaled candidate port, so a
+    // Windows ephemeral dynamic socket cannot bypass these NAT drop flags by
+    // binding one of the synthetic public targets directly.
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
