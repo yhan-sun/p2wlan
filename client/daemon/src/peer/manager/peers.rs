@@ -920,9 +920,10 @@ impl PeerManager {
         );
     }
 
-    /// Hard↔Hard terminal markers are acceptance evidence, not best-effort
-    /// trace noise. Wait for the connection writer for these bounded events so
-    /// reciprocal validation cannot silently drop the final summary/failure.
+    /// Hard↔Hard winner and terminal markers are acceptance evidence, not
+    /// best-effort trace noise. Wait for the connection writer for these
+    /// bounded events so reciprocal validation cannot silently drop the
+    /// selected-socket or final summary/failure evidence.
     /// `hard_hard_sweep_started` and
     /// `hard_hard_direct_validation_started` are deliberately excluded: both
     /// run on the punch-at/confirmation timing path and must not hold the
@@ -935,6 +936,7 @@ impl PeerManager {
                 | "hard_hard_sweep_completed"
                 | "hard_hard_sweep_failed"
                 | "hard_hard_failed"
+                | "hard_hard_winner_selected"
         )
     }
 

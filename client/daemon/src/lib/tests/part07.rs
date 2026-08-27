@@ -432,6 +432,8 @@ impl NatPacketLink {
         let held_b_to_a = Arc::new(StdMutex::new(Vec::new()));
         let held_punch_a_to_b = Arc::new(StdMutex::new(Vec::new()));
         let held_punch_b_to_a = Arc::new(StdMutex::new(Vec::new()));
+        let a_to_b_routes = Arc::new(StdMutex::new(HashMap::new()));
+        let b_to_a_routes = Arc::new(StdMutex::new(HashMap::new()));
         let worker = Some(tokio::spawn(Self::run(
             a_public.clone(),
             b_public.clone(),
@@ -447,6 +449,8 @@ impl NatPacketLink {
             held_b_to_a.clone(),
             held_punch_a_to_b.clone(),
             held_punch_b_to_a.clone(),
+            a_to_b_routes.clone(),
+            b_to_a_routes.clone(),
             primary_a,
             route_dynamic_socket,
         )));
@@ -476,9 +480,9 @@ impl NatPacketLink {
         primary: Option<SocketAddr>,
         _route_dynamic_socket: bool,
         dropped: &AtomicBool,
-    ) {
+    ) -> Option<SocketAddr> {
         if dropped.load(Ordering::Acquire) {
-            return;
+            return None;
         }
         // `primary` models the exact NAT mapping which originated the
         // competing ordinary punch. Route the reply only to that owner: a
@@ -486,8 +490,11 @@ impl NatPacketLink {
         // ACK expectation first and make the intended primary winner depend on
         // platform task scheduling.
         if let Some(primary) = primary {
-            let _ = source_socket.send_to(data, primary).await;
-            return;
+            return source_socket
+                .send_to(data, primary)
+                .await
+                .ok()
+                .map(|_| primary);
         }
         // Once a Hard↔Hard winner is selected, use its exact affinity pin.
         // Before that transaction completes, an authenticated probe or the
@@ -501,18 +508,99 @@ impl NatPacketLink {
         if has_dynamic_socket {
             if let Some((_, socket)) = target_udp.socket_for_peer(Some(target_peer)).await {
                 if let Ok(target) = socket.local_addr() {
-                    let _ = source_socket.send_to(data, target).await;
+                    return source_socket
+                        .send_to(data, target)
+                        .await
+                        .ok()
+                        .map(|_| target);
                 }
-                return;
             }
+            return None;
         }
         let sockets = target_udp
             .dynamic_sockets_for_peer_for_test(target_peer)
             .await;
         if let Some((_, socket)) = sockets.into_iter().min_by_key(|(index, _)| *index) {
             if let Ok(target) = socket.local_addr() {
-                let _ = source_socket.send_to(data, target).await;
+                return source_socket
+                    .send_to(data, target)
+                    .await
+                    .ok()
+                    .map(|_| target);
             }
+        }
+        None
+    }
+
+    async fn forward_to_endpoint(
+        source_socket: &UdpSocket,
+        data: &[u8],
+        target: SocketAddr,
+        dropped: &AtomicBool,
+    ) -> bool {
+        if dropped.load(Ordering::Acquire) {
+            return false;
+        }
+        source_socket.send_to(data, target).await.is_ok()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_with_route(
+        source_socket: &UdpSocket,
+        data: &[u8],
+        source: SocketAddr,
+        target_udp: &UdpTransport,
+        target_peer: &str,
+        primary: Option<SocketAddr>,
+        route_dynamic_socket: bool,
+        dropped: &AtomicBool,
+        routes: &StdMutex<HashMap<SocketAddr, SocketAddr>>,
+    ) {
+        // The fake public endpoint has no kernel NAT table. Remember which
+        // local socket emitted the packet so a response from the selected
+        // peer socket returns to that exact socket, even if another punch
+        // ACK changes affinity before the response is forwarded.
+        let sticky_target = if primary.is_none() {
+            routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&source)
+                .copied()
+        } else {
+            None
+        };
+        let target = if let Some(sticky_target) = sticky_target {
+            if Self::forward_to_endpoint(source_socket, data, sticky_target, dropped).await {
+                Some(sticky_target)
+            } else {
+                Self::forward(
+                    source_socket,
+                    data,
+                    target_udp,
+                    target_peer,
+                    primary,
+                    route_dynamic_socket,
+                    dropped,
+                )
+                .await
+            }
+        } else {
+            Self::forward(
+                source_socket,
+                data,
+                target_udp,
+                target_peer,
+                primary,
+                route_dynamic_socket,
+                dropped,
+            )
+            .await
+        };
+        if let Some(target) = target {
+            routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(source, target);
         }
     }
 
@@ -532,6 +620,8 @@ impl NatPacketLink {
         held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
         held_punch_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
         held_punch_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
+        a_to_b_routes: Arc<StdMutex<HashMap<SocketAddr, SocketAddr>>>,
+        b_to_a_routes: Arc<StdMutex<HashMap<SocketAddr, SocketAddr>>>,
         primary_a: Option<SocketAddr>,
         route_dynamic_socket: bool,
     ) {
@@ -540,7 +630,7 @@ impl NatPacketLink {
         loop {
             tokio::select! {
                 result = a_public.recv_from(&mut a_buf) => {
-                    let Ok((len, _)) = result else { return; };
+                    let Ok((len, source)) = result else { return; };
                     if hold_ack.load(Ordering::Acquire)
                         && Self::is_authenticated_ack(&a_buf[..len])
                     {
@@ -563,18 +653,20 @@ impl NatPacketLink {
                     // from B_PUBLIC so A observes the real reciprocal NAT
                     // source, and optionally duplicate it to A's primary
                     // socket for the competing-Direct race test.
-                    Self::forward(
+                    Self::forward_with_route(
                         &b_source,
                         &a_buf[..len],
+                        source,
                         &udp_a,
                         HARD_HARD_B,
                         primary_a,
                         route_dynamic_socket,
                         &drop_b_to_a,
+                        b_to_a_routes.as_ref(),
                     ).await;
                 }
                 result = b_public.recv_from(&mut b_buf) => {
-                    let Ok((len, _)) = result else { return; };
+                    let Ok((len, source)) = result else { return; };
                     if hold_ack.load(Ordering::Acquire)
                         && Self::is_authenticated_ack(&b_buf[..len])
                     {
@@ -595,14 +687,16 @@ impl NatPacketLink {
                     }
                     // A's packet arrived at B's mapped public endpoint. Send
                     // from A_PUBLIC so B observes A's predicted source.
-                    Self::forward(
+                    Self::forward_with_route(
                         &a_source,
                         &b_buf[..len],
+                        source,
                         &udp_b,
                         HARD_HARD_A,
                         None,
                         route_dynamic_socket,
                         &drop_a_to_b,
+                        a_to_b_routes.as_ref(),
                     ).await;
                 }
             }
