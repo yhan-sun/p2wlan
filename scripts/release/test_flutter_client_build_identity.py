@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,11 @@ ANDROID_WORKFLOWS = (
     ".github/workflows/package-test.yml",
     ".github/workflows/release.yml",
 )
+ANDROID_APK_JOB_MARKERS = {
+    ".github/workflows/flutter-client.yml": "  android:\n",
+    ".github/workflows/package-test.yml": "  android-arm64:\n",
+    ".github/workflows/release.yml": "  flutter-android:\n",
+}
 SOURCE_ENV_KEYS = (
     "P2WLAN_SOURCE_GIT_COMMIT",
     "P2WLAN_SOURCE_BUILD_ID",
@@ -110,7 +116,9 @@ def parse_defines(output: str) -> dict[str, str]:
     return values
 
 
-def make_identity_repo() -> tuple[tempfile.TemporaryDirectory, Path, Path]:
+def make_identity_repo(
+    *, with_hermetic_build: bool = False
+) -> tuple[tempfile.TemporaryDirectory, Path, Path]:
     temp_dir = tempfile.TemporaryDirectory(prefix="p2wlan-client-identity-")
     repo = Path(temp_dir.name)
     script = repo / "scripts/release/flutter_client_build_identity.py"
@@ -122,8 +130,28 @@ def make_identity_repo() -> tuple[tempfile.TemporaryDirectory, Path, Path]:
         "name: identity_test\nversion: 9.8.7+1\n",
         encoding="utf-8",
     )
+    if with_hermetic_build:
+        hermetic = repo / "scripts/release/hermetic_build.sh"
+        shutil.copy2(HERMETIC_BUILD, hermetic)
+        for relative_path in (
+            "apps/flutter_client/pubspec.lock",
+            "apps/flutter_client/analysis_options.yaml",
+            "apps/flutter_client/.metadata",
+        ):
+            path = repo / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("managed source\n", encoding="utf-8")
     init_git_repo(repo)
     return temp_dir, repo, script
+
+
+def workflow_job(workflow: str, marker: str) -> str:
+    start = workflow.index(marker)
+    next_job = re.search(
+        r"(?m)^  [A-Za-z0-9_-]+:\n", workflow[start + len(marker) :]
+    )
+    end = start + len(marker) + next_job.start() if next_job else len(workflow)
+    return workflow[start:end]
 
 
 def make_native_safety_repo() -> tuple[tempfile.TemporaryDirectory, Path, Path, Path]:
@@ -425,6 +453,7 @@ class FlutterClientBuildIdentityTest(unittest.TestCase):
         self.assertEqual(values["P2WLAN_CLIENT_DIRTY"], "false")
         self.assertEqual(values["P2WLAN_CLIENT_DIFF_HASH"], "")
         self.assertEqual(values["P2WLAN_CLIENT_BUILD_ID"], expected_commit[:12])
+        self.assertNotEqual(values["P2WLAN_CLIENT_BUILD_ID"], "unknown")
         self.assertEqual(values["P2WLAN_CLIENT_PROFILE"], "release")
         self.assertEqual(
             set(values),
@@ -437,6 +466,46 @@ class FlutterClientBuildIdentityTest(unittest.TestCase):
                 "P2WLAN_CLIENT_PROFILE",
             },
         )
+
+    def test_flutter_managed_restore_returns_checkout_to_clean_identity(self):
+        temp_dir, repo, script = make_identity_repo(with_hermetic_build=True)
+        self.addCleanup(temp_dir.cleanup)
+        managed_files = (
+            repo / "apps/flutter_client/pubspec.lock",
+            repo / "apps/flutter_client/analysis_options.yaml",
+            repo / "apps/flutter_client/.metadata",
+        )
+        for path in managed_files:
+            path.write_text(
+                path.read_text(encoding="utf-8") + "flutter migration\n",
+                encoding="utf-8",
+            )
+
+        dirty_status = run_git(
+            repo, "status", "--porcelain=v1", "--untracked-files=all"
+        )
+        self.assertTrue(dirty_status)
+        restored = subprocess.run(
+            ["bash", str(repo / "scripts/release/hermetic_build.sh"), "restore"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(restored.returncode, 0, restored.stdout + restored.stderr)
+        self.assertEqual(
+            run_git(repo, "status", "--porcelain=v1", "--untracked-files=all"), ""
+        )
+        values = parse_defines(
+            subprocess.check_output(
+                ["python3", str(script), "apk", "--release"], cwd=repo, text=True
+            )
+        )
+        self.assertEqual(
+            values["P2WLAN_CLIENT_GIT_COMMIT"], run_git(repo, "rev-parse", "HEAD")
+        )
+        self.assertEqual(values["P2WLAN_CLIENT_DIRTY"], "false")
+        self.assertEqual(values["P2WLAN_CLIENT_DIFF_HASH"], "")
+        self.assertNotIn("-dirty-", values["P2WLAN_CLIENT_BUILD_ID"])
 
     def test_real_dirty_temporary_checkout_has_stable_diff_identity(self):
         temp_dir, repo, script = make_identity_repo()
@@ -1361,20 +1430,34 @@ test "$(sed -n 's/^P2WLAN_SOURCE_GIT_COMMIT=//p' "$snapshot")" = "$P2WLAN_TEST_C
 
     def test_flutter_android_workflow_orders_restore_identity_and_wrapper(self):
         workflow = (ROOT / ANDROID_WORKFLOWS[0]).read_text(encoding="utf-8")
-        android_job = workflow[workflow.index("  android:\n") :]
+        android_job = workflow_job(workflow, ANDROID_APK_JOB_MARKERS[ANDROID_WORKFLOWS[0]])
         pub_get = android_job.index("run: flutter pub get")
-        restore = android_job.index(
+        restore_label = android_job.index(
             "Restore Flutter-managed source files before identity stamping"
         )
-        identity = android_job.index("Assert clean Flutter client identity")
+        restore = restore_label
+        identity_label = android_job.index("Assert clean Flutter client identity")
+        identity = identity_label
         wrapper = android_job.index("scripts/release/build_flutter_client.sh apk")
         self.assertLess(pub_get, restore)
         self.assertLess(restore, identity)
         self.assertLess(identity, wrapper)
-        self.assertIn("bash scripts/release/hermetic_build.sh restore", android_job)
+        restore_step = android_job[restore_label:identity_label]
+        self.assertIn("working-directory: .", restore_step)
+        self.assertIn("shell: bash", restore_step)
+        self.assertIn("run: bash scripts/release/hermetic_build.sh restore", restore_step)
+        identity_step = android_job[identity_label:wrapper]
+        self.assertIn("working-directory: .", identity_step)
+        self.assertIn("expected_commit=\"$(git rev-parse HEAD)\"", identity_step)
         self.assertIn(
             "python3 scripts/release/flutter_client_build_identity.py apk --release",
             android_job,
+        )
+        self.assertIn(
+            'grep -Fx -- "--dart-define=P2WLAN_CLIENT_DIRTY=false"', identity_step
+        )
+        self.assertIn(
+            'grep -Fx -- "--dart-define=P2WLAN_CLIENT_DIFF_HASH="', identity_step
         )
         gradle = (ROOT / "apps/flutter_client/android/app/build.gradle.kts").read_text(
             encoding="utf-8"
@@ -1401,9 +1484,16 @@ test "$(sed -n 's/^P2WLAN_SOURCE_GIT_COMMIT=//p' "$snapshot")" = "$P2WLAN_TEST_C
     def test_android_workflows_use_wrapper_without_bare_flutter_apk_build(self):
         for workflow_path in ANDROID_WORKFLOWS:
             workflow = (ROOT / workflow_path).read_text(encoding="utf-8")
-            self.assertIn("build_flutter_client.sh apk", workflow, workflow_path)
+            android_job = workflow_job(
+                workflow, ANDROID_APK_JOB_MARKERS[workflow_path]
+            )
+            self.assertRegex(
+                android_job,
+                r"(?m)^\s*bash\s+[^\n]*scripts/release/build_flutter_client\.sh apk(?:\s|$)",
+                workflow_path,
+            )
             self.assertNotRegex(
-                workflow,
+                android_job,
                 r"(?m)^\s*(?:run:\s+)?flutter build apk(?:\s|$)",
                 workflow_path,
             )
