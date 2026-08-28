@@ -1,0 +1,38 @@
+name: Sync NAT Topology Branch
+
+on:
+  push:
+    branches:
+      - test/nat-topology-matrix-20260828
+    paths:
+      - ".github/workflows/sync-nat-topology-main.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-nat-topology-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/nat-topology-matrix-20260828
+          fetch-depth: 0
+
+      - name: Merge current main and remove one-shot workflow
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git fetch origin main
+          git merge --no-edit origin/main
+          rm .github/workflows/sync-nat-topology-main.yml
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync main into NAT topology branch"
+          fi
+          git push origin HEAD:test/nat-topology-matrix-20260828
