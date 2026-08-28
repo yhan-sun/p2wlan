@@ -8,29 +8,24 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
-def replace_last(text: str, old: str, new: str, label: str) -> str:
-    index = text.rfind(old)
-    if index < 0:
-        raise SystemExit(f"{label}: match not found")
-    return text[:index] + new + text[index + len(old) :]
-
-
+# Fix the Direct ingress branch without shadowing Option<SocketAddr> and then
+# calling Option-only methods on the bound SocketAddr.
 transport_path = Path("client/daemon/src/transport.rs")
 transport = transport_path.read_text(encoding="utf-8")
-transport_start = """                            } else if source.is_some() {
+branch_start = """                            } else if source.is_some() {
 """
-transport_end = """                            } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
+branch_end = """                            } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
 """
-if transport.count(transport_start) != 1:
+if transport.count(branch_start) != 1:
     raise SystemExit(
-        f"transport source branch: expected one match, found {transport.count(transport_start)}"
+        f"transport Direct source branch: expected one match, found {transport.count(branch_start)}"
     )
-start = transport.index(transport_start)
-end = transport.index(transport_end, start)
+start = transport.index(branch_start)
+end = transport.index(branch_end, start)
 block = transport[start:end]
 block = replace_once(
     block,
-    transport_start,
+    branch_start,
     """                            } else if let Some(source) = source {
 """,
     "transport source binding",
@@ -51,7 +46,7 @@ block = replace_once(
                                     direct_validation,
                                 ) {
 """,
-    "transport direct-validation predicate",
+    "transport Direct validation predicate",
 )
 block = replace_once(
     block,
@@ -62,44 +57,15 @@ block = replace_once(
     "transport retired-owner predicate",
 )
 if "source.expect(" in block or "source.is_some() && !owns_direct_packet" in block:
-    raise SystemExit("transport source rewrite left an Option-only operation after binding")
-transport = transport[:start] + block + transport[end:]
-transport_path.write_text(transport, encoding="utf-8")
+    raise SystemExit("transport Direct source rewrite left an Option-only operation")
+transport_path.write_text(transport[:start] + block + transport[end:], encoding="utf-8")
 
 
+# Direct mode must prove Relay confirmation before Direct promotion, then prove
+# real Direct business ingress. It must not require the Direct-only overlay
+# generator to manufacture a Relay business packet.
 smoke_path = Path("scripts/nat-sim/nat-sim-smoke.sh")
 smoke = smoke_path.read_text(encoding="utf-8")
-smoke = replace_once(
-    smoke,
-    """node_event_tms() {
-  local log="$1" ev="$2"
-  # The same event is intentionally logged twice: a subsystem DEBUG line and
-  # a structured ConnectionTimeline INFO line.  The DEBUG line has no t_ms.
-  # Do not use grep -m1 before extracting t_ms, or a perfectly valid timeline
-  # event is reported as missing (this made Direct rounds fail closed with
-  # first_usable_delta_missing even though both timestamps were present).
-  strip_ansi < "$log" \\
-    | grep "event=\"${ev}\"" \\
-    | grep -oE 't_ms=[0-9]+' \\
-    | head -1 \\
-    | cut -d= -f2 || true
-}
-""",
-    """node_event_tms() {
-  local log="$1" ev="$2"
-  # Read the first structured timeline occurrence in one pass.  Avoid a
-  # sed/grep/head pipeline: head closes early on large DEBUG logs, which used
-  # to emit Broken pipe noise under pipefail even when the timestamp existed.
-  awk -v needle="event=\"${ev}\"" '
-    index($0, needle) && match($0, /t_ms=[0-9]+/) {
-      print substr($0, RSTART + 5, RLENGTH - 5)
-      exit
-    }
-  ' "$log"
-}
-""",
-    "timeline timestamp extractor",
-)
 smoke = replace_once(
     smoke,
     """    # Direct mode: relay-first is still mandatory.  Require BOTH Direct
@@ -125,12 +91,12 @@ smoke = replace_once(
     done
 """,
     """    # Direct mode proves make-before-break without asking the Direct-only
-    # overlay generator to manufacture Relay business traffic.  Each side must
+    # overlay generator to manufacture Relay business traffic. Each side must
     # first confirm Relay with an encrypted probe ACK, then promote Direct via
     # the owned encrypted request/ACK flow, and finally complete a real
     # bidirectional business overlay whose authenticated ingress is Direct.
-    # The overlay check is field-order independent: both tokens must occur on
-    # the same log record, regardless of tracing's rendered field order.
+    # Field checks are order-independent because tracing may render fields in
+    # either order on the same structured log record.
     direct_ok=0
     for _ in $(seq 1 $((DIRECT_TIMEOUT_S * 2))); do
       if grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null && \\
@@ -156,19 +122,22 @@ smoke = replace_once(
 """,
     """    # A single-sided Direct, Relay confirmation after Direct promotion,
     # unverified Direct business ingress, loss/replay/invalid packets, or a
-    # missing/slow relay-ready-to-business delta is a failure.  The Direct-only
+    # missing/slow relay-ready-to-business delta is a failure. The Direct-only
     # overlay generator intentionally does not create Relay business traffic.
 """,
     "Direct acceptance comment",
 )
 
-direct_start_marker = """    # A single-sided Direct, Relay confirmation after Direct promotion,
+direct_start = smoke.index(
+    """    # A single-sided Direct, Relay confirmation after Direct promotion,
 """
-direct_end_marker = """
+)
+direct_end = smoke.index(
+    """
   # Relay resilience scenarios (diagnostic; only run in relay-only mode where
-"""
-direct_start = smoke.index(direct_start_marker)
-direct_end = smoke.index(direct_end_marker, direct_start)
+""",
+    direct_start,
+)
 direct = smoke[direct_start:direct_end]
 direct = replace_once(
     direct,
@@ -231,9 +200,6 @@ direct = replace_once(
 """,
     "Direct PASS evidence",
 )
-if "first_real_business_ingress\".*path=\"relay" in direct:
-    raise SystemExit("Direct section still requires synthetic Relay business ingress")
 if "a_relay_first" in direct or "b_relay_first" in direct:
-    raise SystemExit("Direct section still depends on Relay as the first business ingress")
-smoke = smoke[:direct_start] + direct + smoke[direct_end:]
-smoke_path.write_text(smoke, encoding="utf-8")
+    raise SystemExit("Direct acceptance still treats Relay as the first business ingress")
+smoke_path.write_text(smoke[:direct_start] + direct + smoke[direct_end:], encoding="utf-8")
