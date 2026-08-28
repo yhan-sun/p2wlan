@@ -310,6 +310,11 @@ class StatusStore extends ChangeNotifier {
       // which it started. Invalidate it before Android/iOS suspends sockets so
       // a late Wi-Fi/cellular response cannot mutate the resumed snapshot.
       _eventLoopGeneration += 1;
+      // Detach the slot immediately. The in-flight HTTP future is still
+      // bounded by its request timeout, but its completion is generation-
+      // fenced and `identical` will be false, so resume can start a fresh poll
+      // without waiting for the suspended socket to wake up.
+      _eventLoopFuture = null;
     }
     _schedulePolling();
     if (_autoRefreshEnabled && appInForeground) {

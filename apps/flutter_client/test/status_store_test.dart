@@ -436,15 +436,15 @@ void main() {
 
       stores.statusStore.updateAppLifecycleState(AppLifecycleState.paused);
       expect(stores.statusStore.appInForeground, isFalse);
-      api.completeEventRequest(0, fixture);
       await Future<void>.delayed(const Duration(milliseconds: 50));
       expect(
         api.eventRequests,
         hasLength(1),
-        reason:
-            'a completed pre-suspend long poll must not restart in background',
+        reason: 'backgrounding must not create another long poll',
       );
 
+      // Resume while the pre-suspend request is still pending. The new event
+      // loop must not wait for that stale network future to reach its timeout.
       stores.statusStore.updateAppLifecycleState(AppLifecycleState.resumed);
       await _waitUntil(() => api.statusFetchCount > statusCountBeforePause);
       await _waitUntil(() => api.eventRequests.length == 2);
@@ -455,6 +455,12 @@ void main() {
         reason:
             'resume must rebuild the event cursor from the refreshed process',
       );
+
+      // A late completion from the suspended network epoch is ignored and
+      // must not spawn a third request beside the current resumed loop.
+      api.completeEventRequest(0, fixture);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(api.eventRequests, hasLength(2));
 
       stores.statusStore.setAutoRefresh(enabled: false);
       api.completeEventRequest(1, fixture);
