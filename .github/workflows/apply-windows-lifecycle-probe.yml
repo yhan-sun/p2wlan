@@ -44,3 +44,5 @@ jobs:
             client/daemon/src/main/lifecycle_probe.rs
           git commit -m "fix(windows): add side-effect-free lifecycle probe modes"
           git push origin HEAD:fix/windows-lifecycle-dart-format-20260828
+
+# Trigger marker: v2
