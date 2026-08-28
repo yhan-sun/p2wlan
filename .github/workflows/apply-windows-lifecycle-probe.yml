@@ -1,0 +1,46 @@
+name: Apply Windows lifecycle probe
+
+on:
+  push:
+    branches:
+      - fix/windows-lifecycle-dart-format-20260828
+    paths:
+      - ".github/workflows/apply-windows-lifecycle-probe.yml"
+      - ".github/patches/windows-lifecycle-probe.patch"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/windows-lifecycle-dart-format-20260828
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply and validate lifecycle probe
+        run: |
+          set -euo pipefail
+          git apply --check .github/patches/windows-lifecycle-probe.patch
+          git apply .github/patches/windows-lifecycle-probe.patch
+          cargo fmt --all
+          cargo check -p p2wlan-daemon --all-targets
+          cargo test -p p2wlan-daemon --lib main::tests:: -- --test-threads=1
+          git diff --check
+      - name: Commit implementation
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            client/daemon/src/main.rs \
+            client/daemon/src/main/cli.rs \
+            client/daemon/src/main/validation.rs \
+            client/daemon/src/main/runtime.rs \
+            client/daemon/src/main/lifecycle_probe.rs
+          git commit -m "fix(windows): add side-effect-free lifecycle probe modes"
+          git push origin HEAD:fix/windows-lifecycle-dart-format-20260828
