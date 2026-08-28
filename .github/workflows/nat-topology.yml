@@ -1,0 +1,144 @@
+name: NAT Topology
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/nat-topology.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "client/daemon/**"
+      - "client/nat/**"
+      - "client/netbind/**"
+      - "client/relay/**"
+      - "client/wireguard/**"
+      - "contracts/**"
+      - "scripts/diagnostics-auth.sh"
+      - "scripts/nat-sim/**"
+      - "server/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nat-topology.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "client/daemon/**"
+      - "client/nat/**"
+      - "client/netbind/**"
+      - "client/relay/**"
+      - "client/wireguard/**"
+      - "contracts/**"
+      - "scripts/diagnostics-auth.sh"
+      - "scripts/nat-sim/**"
+      - "server/**"
+  schedule:
+    - cron: "17 18 * * *"
+      timezone: "Asia/Tokyo"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Topology profile"
+        required: true
+        type: choice
+        options:
+          - pr
+          - extended
+        default: pr
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nat-topology-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: NAT simulator contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate simulator and matrix contracts
+        run: bash scripts/nat-sim/run-topology-matrix.sh unit
+
+  pr_topology:
+    name: NAT topology ${{ matrix.scenario }}
+    needs: unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - direct-baseline
+          - relay-blackhole
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run deterministic topology
+        env:
+          NAT_TOPOLOGY_ARTIFACT_ROOT: ${{ runner.temp }}/nat-topology-${{ matrix.scenario }}
+        run: bash scripts/nat-sim/run-topology-matrix.sh "${{ matrix.scenario }}"
+      - name: Upload topology evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-topology-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/nat-topology-${{ matrix.scenario }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  extended_topology:
+    name: Extended NAT topology ${{ matrix.scenario }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'extended') }}
+    needs: unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - strict-hard
+          - reordered-lossy
+          - relay-restart
+          - relay-failover
+          - status-failclosed
+          - metrics-failclosed
+          - schema-failclosed
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run extended deterministic topology
+        env:
+          NAT_TOPOLOGY_ARTIFACT_ROOT: ${{ runner.temp }}/nat-topology-${{ matrix.scenario }}
+        run: bash scripts/nat-sim/run-topology-matrix.sh "${{ matrix.scenario }}"
+      - name: Upload topology evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-topology-extended-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/nat-topology-${{ matrix.scenario }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  required:
+    name: NAT Topology Required
+    if: always()
+    needs: [unit, pr_topology]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce required topology results
+        run: |
+          test "${{ needs.unit.result }}" = "success"
+          test "${{ needs.pr_topology.result }}" = "success"
+          echo "required NAT topology scenarios passed"
