@@ -1,0 +1,37 @@
+name: Export NAT debug source
+
+on:
+  push:
+    branches:
+      - test/nat-topology-gate-v4-20260828
+    paths:
+      - .github/workflows/export-nat-debug-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/nat-topology-gate-v4-20260828
+          fetch-depth: 0
+      - name: Archive source used by NAT convergence
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf nat-debug-source.tar.gz \
+            Cargo.toml Cargo.lock \
+            client/daemon/Cargo.toml \
+            client/daemon/src \
+            scripts/nat-sim \
+            .github/workflows/nat-topology-gate.yml \
+            .github/workflows/apply-relay-before-direct-promotion.yml \
+            .github/scripts/apply_relay_before_direct_promotion.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nat-debug-source-${{ github.sha }}
+          path: nat-debug-source.tar.gz
+          retention-days: 1
