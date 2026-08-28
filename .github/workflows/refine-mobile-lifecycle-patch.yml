@@ -1,0 +1,51 @@
+name: Refine Mobile Lifecycle Patch
+
+on:
+  push:
+    branches:
+      - test/mobile-lifecycle-regression-20260828
+    paths:
+      - ".github/workflows/refine-mobile-lifecycle-patch.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refine-mobile-lifecycle-patch
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/mobile-lifecycle-regression-20260828
+          fetch-depth: 0
+      - name: Apply race refinement
+        run: python3 scripts/dev/refine_mobile_lifecycle_patch.py
+      - name: Set up Flutter formatter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Format and validate
+        run: |
+          dart format \
+            apps/flutter_client/lib/core/state/status_store.dart \
+            apps/flutter_client/test/status_store_test.dart
+          git diff --check
+      - name: Remove one-shot machinery
+        run: |
+          rm scripts/dev/refine_mobile_lifecycle_patch.py
+          rm .github/workflows/refine-mobile-lifecycle-patch.yml
+          rmdir scripts/dev 2>/dev/null || true
+      - name: Commit refinement
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(mobile): detach suspended event loop slot"
+          git push origin HEAD:test/mobile-lifecycle-regression-20260828
