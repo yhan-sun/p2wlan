@@ -254,7 +254,15 @@ impl PeerManager {
             // visible together; otherwise a waiter can wake on the sequence
             // bump between these two writes, observe a non-Direct peer, and
             // miss the only notification for this commit.
-            conn.transition(ConnectionState::Direct);
+            let candidate_generation = conn.last_candidate_generation;
+            if !conn.transition_for_generation(
+                ConnectionState::Direct,
+                generation,
+                candidate_generation,
+                "direct_confirmed",
+            ) {
+                return false;
+            }
             if direct_confirmation_changed {
                 // The direct-commit sequence is bumped inside the SAME
                 // network-epoch critical section as the state transition, so

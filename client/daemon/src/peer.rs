@@ -498,6 +498,7 @@ pub use types::{
     PathScore, PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
 };
 
+include!("peer/path_state_machine.rs");
 include!("peer/connection/core.rs");
 include!("peer/connection/candidates.rs");
 include!("peer/connection/selection.rs");

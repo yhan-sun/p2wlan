@@ -139,6 +139,10 @@ pub struct PeerConnection {
     pub remote_relay_rtt_ms: Option<u64>,
     /// Current connection state.
     pub state: ConnectionState,
+    /// Generation-aware transition authority. `state` above is the
+    /// compatibility mirror and may only change after this machine accepts
+    /// the request.
+    pub(crate) path_state_machine: PathStateMachine,
     /// When the connection was established.
     pub connected_at: Option<Instant>,
     /// Bytes sent to this peer.
@@ -360,6 +364,7 @@ impl PeerConnection {
             last_seen: 0,
             remote_relay_rtt_ms: None,
             state: ConnectionState::Idle,
+            path_state_machine: PathStateMachine::new(ConnectionState::Idle),
             connected_at: None,
             bytes_sent: 0,
             bytes_received: 0,
@@ -416,6 +421,7 @@ impl PeerConnection {
         self.remote_candidate_epoch = 0;
         self.last_candidates_expires_at_ms = None;
         self.candidate_sources.clear();
+        self.path_state_machine.reset(ConnectionState::Idle);
         self.state = ConnectionState::Idle;
         self.connected_at = None;
         self.relay_server = None;
@@ -470,8 +476,51 @@ impl PeerConnection {
         self.state == ConnectionState::Relay
     }
 
-    /// Transition to a new state.
-    pub fn transition(&mut self, new_state: ConnectionState) {
+    /// Immutable machine snapshot for diagnostics and transition tests.
+    pub(crate) fn path_state_machine_snapshot(&self) -> PathStateMachineSnapshot {
+        self.path_state_machine.snapshot()
+    }
+
+    fn current_path_generation(&self) -> u64 {
+        self.direct_generation
+            .max(self.relay_ready_generation.unwrap_or(0))
+            .max(self.relay_confirmed_generation.unwrap_or(0))
+    }
+
+    /// Apply a generation-bound path transition. Returns false when stale or
+    /// illegal evidence was rejected and leaves every compatibility mirror
+    /// unchanged in that case.
+    pub(crate) fn transition_for_generation(
+        &mut self,
+        new_state: ConnectionState,
+        network_generation: u64,
+        candidate_generation: u64,
+        reason_code: &'static str,
+    ) -> bool {
+        let outcome = self.path_state_machine.apply(
+            new_state,
+            network_generation,
+            candidate_generation,
+        );
+        if !outcome.accepted() {
+            warn!(target: "p2pnet_daemon::peer::connection",
+                event = "peer_path_transition_rejected",
+                peer_id = %self.node_id,
+                previous_state = ?outcome.previous_state,
+                requested_state = ?outcome.requested_state,
+                decision = ?outcome.decision,
+                network_generation,
+                candidate_generation,
+                machine_generation = outcome.snapshot.network_generation,
+                machine_candidate_generation = outcome.snapshot.candidate_generation,
+                path_revision = outcome.snapshot.revision,
+                rejected_transitions = outcome.snapshot.rejected_transitions,
+                reason_code,
+                "peer path transition rejected"
+            );
+            return false;
+        }
+
         if self.state != new_state {
             let previous_state = self.state;
             info!(target: "p2pnet_daemon::peer::connection",
@@ -479,6 +528,10 @@ impl PeerConnection {
                 peer_id = %self.node_id,
                 previous_state = ?previous_state,
                 new_state = ?new_state,
+                network_generation,
+                candidate_generation,
+                path_revision = outcome.snapshot.revision,
+                transition_reason = reason_code,
                 direct_generation = self.direct_generation,
                 relay_ready_generation = ?self.relay_ready_generation,
                 relay_confirmed_generation = ?self.relay_confirmed_generation,
@@ -510,6 +563,22 @@ impl PeerConnection {
         }
         self.state = new_state;
         self.sync_direct_cache();
+        true
+    }
+
+    /// Compatibility transition for call sites that already performed their
+    /// own epoch validation. New path confirmation code should prefer
+    /// `transition_for_generation` so stale evidence returns an explicit
+    /// result instead of relying only on the caller's pre-check.
+    pub fn transition(&mut self, new_state: ConnectionState) {
+        let generation = self.current_path_generation();
+        let candidate_generation = self.last_candidate_generation;
+        let _ = self.transition_for_generation(
+            new_state,
+            generation,
+            candidate_generation,
+            "compatibility_transition",
+        );
     }
 
     /// Keep the manager's synchronous Direct-set mirror in lockstep with this

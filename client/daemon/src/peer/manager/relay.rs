@@ -239,7 +239,13 @@ impl PeerManager {
                     conn.relay_first.preconfirmation = None;
                     conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
                     if conn.state == ConnectionState::Relay {
-                        conn.transition(ConnectionState::FallbackToRelay);
+                        let candidate_generation = conn.last_candidate_generation;
+                        let _ = conn.transition_for_generation(
+                            ConnectionState::FallbackToRelay,
+                            generation,
+                            candidate_generation,
+                            "relay_transport_replaced",
+                        );
                     }
                     // Keep the synchronous waiter mirror aligned with the
                     // state transition while the epoch gate is held.
@@ -569,7 +575,15 @@ impl PeerManager {
                     conn.relay_first.business_pathcommit_generation = None;
                     conn.relay_first.preconfirmation = None;
                     if conn.state != ConnectionState::Direct {
-                        conn.transition(ConnectionState::Relay);
+                        let candidate_generation = conn.last_candidate_generation;
+                        if !conn.transition_for_generation(
+                            ConnectionState::Relay,
+                            generation,
+                            candidate_generation,
+                            "relay_peer_confirmed",
+                        ) {
+                            return false;
+                        }
                     }
                     (true, preconfirmation_business_received)
                 } else {
@@ -598,7 +612,15 @@ impl PeerManager {
                     conn.relay_first.business_pathcommit_generation = None;
                     conn.relay_first.preconfirmation = None;
                     if conn.state != ConnectionState::Direct {
-                        conn.transition(ConnectionState::Relay);
+                        let candidate_generation = conn.last_candidate_generation;
+                        if !conn.transition_for_generation(
+                            ConnectionState::Relay,
+                            generation,
+                            candidate_generation,
+                            "relay_peer_confirmed",
+                        ) {
+                            return false;
+                        }
                     }
                     (true, preconfirmation_business_received)
                 };
