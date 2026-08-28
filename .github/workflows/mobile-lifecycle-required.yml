@@ -1,0 +1,138 @@
+name: Mobile Lifecycle Required
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/mobile-lifecycle-required.yml"
+      - "apps/flutter_client/**"
+      - "client/android-native/**"
+      - "client/daemon/**"
+      - "client/tun/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/mobile-lifecycle-required.yml"
+      - "apps/flutter_client/**"
+      - "client/android-native/**"
+      - "client/daemon/**"
+      - "client/tun/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mobile_lifecycle:
+    name: Mobile Lifecycle Required
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Flutter dependencies
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Prove required lifecycle scenarios are tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+          tracked="$(git ls-files \
+            'apps/flutter_client/**' \
+            'client/android-native/**' \
+            'client/daemon/**' \
+            'contracts/**')"
+          test -n "$tracked"
+          grep_tracked() {
+            local pattern=$1
+            if ! printf '%s\n' "$tracked" | xargs -r grep -Ein "$pattern" >/tmp/mobile-match; then
+              echo "missing mobile lifecycle evidence: $pattern" >&2
+              exit 1
+            fi
+            head -20 /tmp/mobile-match
+          }
+          grep_tracked 'foreground|background|resume|paused|inactive'
+          grep_tracked 'wifi|wi-fi|cellular|hotspot|network.*(change|handoff)'
+          grep_tracked 'network[_ -]?epoch|generation.*stale|stale.*generation'
+          grep_tracked 'relay.*(keep|retain|usable)|retain.*relay|relay.*direct'
+
+      - name: Dart formatting
+        working-directory: apps/flutter_client
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Flutter analysis
+        working-directory: apps/flutter_client
+        run: flutter analyze
+
+      - name: Discover and run focused mobile lifecycle tests
+        shell: bash
+        working-directory: apps/flutter_client
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(
+            find test -type f -name '*_test.dart' -print0 \
+              | xargs -0 grep -Eil 'foreground|background|resume|network.?epoch|handoff|cellular|hotspot|retain.*relay|relay.*direct' \
+              | sort -u
+          )
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo "no focused mobile lifecycle tests discovered" >&2
+            exit 1
+          fi
+          printf '%s\n' "${tests[@]}"
+          for test_file in "${tests[@]}"; do
+            flutter test "$test_file"
+          done
+
+      - name: Android bridge and daemon tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path client/android-native/Cargo.toml --all-targets -- --test-threads=1
+          cargo test -p p2wlan-daemon --lib -- --test-threads=1
+
+      - name: Android JVM unit tests when present
+        shell: bash
+        working-directory: apps/flutter_client/android
+        run: |
+          set -euo pipefail
+          if find . -path '*/src/test/*' -type f | grep -q .; then
+            ./gradlew testDebugUnitTest --no-daemon --stacktrace
+          else
+            echo "no Android JVM unit tests; Flutter/Rust contract suite is authoritative"
+          fi
+
+      - name: Verify checkout remains clean
+        shell: bash
+        run: |
+          bash scripts/release/hermetic_build.sh restore
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
