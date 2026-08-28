@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/apply-nat-gate-convergence-fix.yml
       - .github/scripts/apply_nat_gate_fix.py
+      - .github/scripts/fix_relay_observation_test.py
 
 permissions:
   contents: write
@@ -27,7 +28,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Apply exact source transformations
-        run: python3 .github/scripts/apply_nat_gate_fix.py
+        run: |
+          python3 .github/scripts/apply_nat_gate_fix.py
+          python3 .github/scripts/fix_relay_observation_test.py
       - name: Validate transformed tree
         shell: bash
         run: |
@@ -35,6 +38,7 @@ jobs:
           bash -n scripts/nat-sim/nat-sim-smoke.sh
           cargo fmt --all --check
           cargo clippy -p p2wlan-daemon --all-targets --all-features -- -D warnings
+          cargo test -p p2wlan-daemon --lib transport::tests::initial_wireguard_confirmation_promotes_matching_probe_binding -- --exact --test-threads=1
           cargo test -p p2wlan-daemon --lib -- --test-threads=1
           python3 scripts/nat-sim/test_nat_sim.py
           git diff --check
@@ -46,7 +50,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/apply-nat-gate-convergence-fix.yml
           git rm .github/scripts/apply_nat_gate_fix.py
-          git add client/daemon/src/transport.rs scripts/nat-sim/nat-sim-smoke.sh
+          git rm .github/scripts/fix_relay_observation_test.py
+          git add client/daemon/src/transport.rs \
+                  client/daemon/src/transport/tests.rs \
+                  scripts/nat-sim/nat-sim-smoke.sh
           git diff --cached --check
           git commit -m "fix(nat): prove relay-before-direct without synthetic relay business"
           git push origin HEAD:test/nat-topology-gate-v4-20260828
