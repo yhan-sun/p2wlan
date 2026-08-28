@@ -1,0 +1,170 @@
+name: NAT Topology Gate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/nat-topology-gate.yml"
+      - "scripts/nat-sim/**"
+      - "scripts/diagnostics-auth.sh"
+      - "client/nat/**"
+      - "client/daemon/**"
+      - "client/relay/**"
+      - "server/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nat-topology-gate.yml"
+      - "scripts/nat-sim/**"
+      - "scripts/diagnostics-auth.sh"
+      - "client/nat/**"
+      - "client/daemon/**"
+      - "client/relay/**"
+      - "server/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  schedule:
+    - cron: "23 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nat-topology-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit:
+    name: NAT simulator unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Run simulator parser and unit tests
+        run: bash scripts/nat-sim/run-ci-topology.sh unit
+      - name: Upload unit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-topology-unit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p2wlan-nat-topology-*.log
+          if-no-files-found: error
+          retention-days: 14
+
+  direct:
+    name: Direct cold-start topology
+    needs: unit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+      - name: Run deterministic Direct topology
+        run: bash scripts/nat-sim/run-ci-topology.sh direct
+      - name: Upload Direct evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-topology-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/p2wlan-nat-topology-*.log
+            ${{ runner.temp }}/p2wlan-nat-topology-*/**
+          if-no-files-found: error
+          retention-days: 14
+
+  relay:
+    name: Relay blackhole topology
+    needs: direct
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+      - name: Run deterministic Relay topology
+        run: bash scripts/nat-sim/run-ci-topology.sh relay
+      - name: Upload Relay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-topology-relay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/p2wlan-nat-topology-*.log
+            ${{ runner.temp }}/p2wlan-nat-topology-*/**
+          if-no-files-found: error
+          retention-days: 14
+
+  fail_closed:
+    name: Observability fail-closed injection
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    needs: relay
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+      - name: Prove missing status evidence fails closed
+        run: bash scripts/nat-sim/run-ci-topology.sh fail-closed
+      - name: Upload failure-injection evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-topology-fail-closed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/p2wlan-nat-topology-*.log
+            ${{ runner.temp }}/p2wlan-nat-topology-*/**
+          if-no-files-found: error
+          retention-days: 14
+
+  required:
+    name: NAT Topology Required
+    if: always()
+    needs: [unit, direct, relay]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce required topology results
+        run: |
+          test "${{ needs.unit.result }}" = "success"
+          test "${{ needs.direct.result }}" = "success"
+          test "${{ needs.relay.result }}" = "success"
+          echo "all required NAT topology profiles succeeded"
