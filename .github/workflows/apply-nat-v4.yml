@@ -5,7 +5,6 @@ on:
     branches:
       - test/nat-topology-gate-v4-20260828
     paths:
-      - ".github/workflows/apply-nat-v4.yml"
       - ".github/patches/nat-v4.patch"
 
 permissions:
@@ -19,20 +18,24 @@ jobs:
         with:
           ref: test/nat-topology-gate-v4-20260828
           fetch-depth: 0
-      - name: Apply reviewed patch
+      - name: Apply reviewed code-only patch
         run: |
           set -euo pipefail
           git apply --check .github/patches/nat-v4.patch
           git apply .github/patches/nat-v4.patch
-          rm .github/patches/nat-v4.patch .github/workflows/apply-nat-v4.yml
           bash -n scripts/nat-sim/nat-sim-smoke.sh
           bash -n scripts/nat-sim/run-ci-topology.sh
           git diff --check
-      - name: Commit implementation
+      - name: Commit code implementation
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "test(nat): add deterministic topology gate"
+          git add \
+            client/daemon/src/lib/daemon/udp_direct.rs \
+            client/daemon/src/lib/daemon/run.rs \
+            client/daemon/NAT_TOPOLOGY_CI.md \
+            scripts/nat-sim/nat-sim-smoke.sh \
+            scripts/nat-sim/run-ci-topology.sh
+          git commit -m "test(nat): implement deterministic topology harness"
           git push origin HEAD:test/nat-topology-gate-v4-20260828
