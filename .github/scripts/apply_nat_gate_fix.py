@@ -1,36 +1,42 @@
 from pathlib import Path
 
 
-def replace_once(path: Path, old: str, new: str, label: str) -> None:
-    text = path.read_text()
+def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
     if count != 1:
         raise SystemExit(f"{label}: expected exactly one match, found {count}")
-    path.write_text(text.replace(old, new, 1))
+    return text.replace(old, new, 1)
 
 
-def replace_last(path: Path, old: str, new: str, label: str, expected: int) -> None:
-    text = path.read_text()
-    count = text.count(old)
-    if count != expected:
-        raise SystemExit(f"{label}: expected {expected} matches, found {count}")
-    head, separator, tail = text.rpartition(old)
-    if not separator:
-        raise SystemExit(f"{label}: last match disappeared")
-    path.write_text(head + new + tail)
+def replace_last(text: str, old: str, new: str, label: str) -> str:
+    index = text.rfind(old)
+    if index < 0:
+        raise SystemExit(f"{label}: match not found")
+    return text[:index] + new + text[index + len(old) :]
 
 
-transport = Path("client/daemon/src/transport.rs")
-replace_once(
-    transport,
-    """                            } else if source.is_some() {
-""",
+transport_path = Path("client/daemon/src/transport.rs")
+transport = transport_path.read_text(encoding="utf-8")
+transport_start = """                            } else if source.is_some() {
+"""
+transport_end = """                            } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
+"""
+if transport.count(transport_start) != 1:
+    raise SystemExit(
+        f"transport source branch: expected one match, found {transport.count(transport_start)}"
+    )
+start = transport.index(transport_start)
+end = transport.index(transport_end, start)
+block = transport[start:end]
+block = replace_once(
+    block,
+    transport_start,
     """                            } else if let Some(source) = source {
 """,
     "transport source binding",
 )
-replace_once(
-    transport,
+block = replace_once(
+    block,
     """                                if should_request_direct_validation_after_decrypt(
                                     owns_direct_packet,
                                     source,
@@ -47,9 +53,54 @@ replace_once(
 """,
     "transport direct-validation predicate",
 )
+block = replace_once(
+    block,
+    """                                } else if source.is_some() && !owns_direct_packet {
+""",
+    """                                } else if !owns_direct_packet {
+""",
+    "transport retired-owner predicate",
+)
+if "source.expect(" in block or "source.is_some() && !owns_direct_packet" in block:
+    raise SystemExit("transport source rewrite left an Option-only operation after binding")
+transport = transport[:start] + block + transport[end:]
+transport_path.write_text(transport, encoding="utf-8")
 
-smoke = Path("scripts/nat-sim/nat-sim-smoke.sh")
-replace_once(
+
+smoke_path = Path("scripts/nat-sim/nat-sim-smoke.sh")
+smoke = smoke_path.read_text(encoding="utf-8")
+smoke = replace_once(
+    smoke,
+    """node_event_tms() {
+  local log="$1" ev="$2"
+  # The same event is intentionally logged twice: a subsystem DEBUG line and
+  # a structured ConnectionTimeline INFO line.  The DEBUG line has no t_ms.
+  # Do not use grep -m1 before extracting t_ms, or a perfectly valid timeline
+  # event is reported as missing (this made Direct rounds fail closed with
+  # first_usable_delta_missing even though both timestamps were present).
+  strip_ansi < "$log" \\
+    | grep "event=\"${ev}\"" \\
+    | grep -oE 't_ms=[0-9]+' \\
+    | head -1 \\
+    | cut -d= -f2 || true
+}
+""",
+    """node_event_tms() {
+  local log="$1" ev="$2"
+  # Read the first structured timeline occurrence in one pass.  Avoid a
+  # sed/grep/head pipeline: head closes early on large DEBUG logs, which used
+  # to emit Broken pipe noise under pipefail even when the timestamp existed.
+  awk -v needle="event=\"${ev}\"" '
+    index($0, needle) && match($0, /t_ms=[0-9]+/) {
+      print substr($0, RSTART + 5, RLENGTH - 5)
+      exit
+    }
+  ' "$log"
+}
+""",
+    "timeline timestamp extractor",
+)
+smoke = replace_once(
     smoke,
     """    # Direct mode: relay-first is still mandatory.  Require BOTH Direct
     # promotions, a relay-ingress first usable proof, and a later bidirectional
@@ -78,14 +129,16 @@ replace_once(
     # first confirm Relay with an encrypted probe ACK, then promote Direct via
     # the owned encrypted request/ACK flow, and finally complete a real
     # bidirectional business overlay whose authenticated ingress is Direct.
+    # The overlay check is field-order independent: both tokens must occur on
+    # the same log record, regardless of tracing's rendered field order.
     direct_ok=0
     for _ in $(seq 1 $((DIRECT_TIMEOUT_S * 2))); do
       if grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null && \\
          grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null && \\
-         grep -q '→ direct' "$ROUND_DIR/node-a.log" 2>/dev/null && \\
-         grep -q '→ direct' "$ROUND_DIR/node-b.log" 2>/dev/null && \\
-         grep -q 'overlay_payload_verified.*ingress=direct' "$ROUND_DIR/node-a.log" 2>/dev/null && \\
-         grep -q 'overlay_payload_verified.*ingress=direct' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+         grep -q 'event="direct_promoted"' "$ROUND_DIR/node-a.log" 2>/dev/null && \\
+         grep -q 'event="direct_promoted"' "$ROUND_DIR/node-b.log" 2>/dev/null && \\
+         awk 'index($0, "overlay_payload_verified") && index($0, "ingress=direct") { found=1; exit } END { exit(found ? 0 : 1) }' "$ROUND_DIR/node-a.log" && \\
+         awk 'index($0, "overlay_payload_verified") && index($0, "ingress=direct") { found=1; exit } END { exit(found ? 0 : 1) }' "$ROUND_DIR/node-b.log"; then
         direct_ok=1
         break
       fi
@@ -94,7 +147,7 @@ replace_once(
 """,
     "Direct convergence predicate",
 )
-replace_once(
+smoke = replace_once(
     smoke,
     """    # A single-sided Direct, missing relay-first evidence, unverified Direct
     # echo, loss/replay/invalid packets, or a missing/slow relay-ready delta is
@@ -108,8 +161,17 @@ replace_once(
 """,
     "Direct acceptance comment",
 )
-replace_last(
-    smoke,
+
+direct_start_marker = """    # A single-sided Direct, Relay confirmation after Direct promotion,
+"""
+direct_end_marker = """
+  # Relay resilience scenarios (diagnostic; only run in relay-only mode where
+"""
+direct_start = smoke.index(direct_start_marker)
+direct_end = smoke.index(direct_end_marker, direct_start)
+direct = smoke[direct_start:direct_end]
+direct = replace_once(
+    direct,
     """    a_relay_first=0
     b_relay_first=0
     [[ "$A_INGRESS" == relay:* ]] && a_relay_first=1
@@ -133,10 +195,9 @@ replace_last(
     [[ "$B_INGRESS" == "direct" ]] && b_direct_business=1
 """,
     "Direct ordering evidence",
-    2,
 )
-replace_last(
-    smoke,
+direct = replace_once(
+    direct,
     """          && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \\
           && "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 \\
           && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \\
@@ -147,10 +208,9 @@ replace_last(
           && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \\
 """,
     "Direct final predicate",
-    2,
 )
-replace_once(
-    smoke,
+direct = replace_once(
+    direct,
     """      elif [[ "$A_RELAY_CONFIRMED" -lt 1 || "$B_RELAY_CONFIRMED" -lt 1 || "$a_relay_first" -ne 1 || "$b_relay_first" -ne 1 ]]; then
         DIRECT_REASON="relay_first_evidence_missing"
 """,
@@ -163,11 +223,17 @@ replace_once(
 """,
     "Direct failure reasons",
 )
-replace_once(
-    smoke,
+direct = replace_once(
+    direct,
     """      echo "[nat-sim] ROUND $round: PASS both_direct a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (a_direct=$A_DIRECT b_direct=$B_DIRECT) a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY evidence=$ROUND_DIR/evidence.log"
 """,
     """      echo "[nat-sim] ROUND $round: PASS both_direct relay_before_direct=1 a_relay_confirmed_t_ms=$A_RELAY_CONFIRMED_TMS b_relay_confirmed_t_ms=$B_RELAY_CONFIRMED_TMS a_direct_promoted_t_ms=$A_DIRECT_PROMOTED_TMS b_direct_promoted_t_ms=$B_DIRECT_PROMOTED_TMS a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (a_direct=$A_DIRECT b_direct=$B_DIRECT) a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY evidence=$ROUND_DIR/evidence.log"
 """,
     "Direct PASS evidence",
 )
+if "first_real_business_ingress\".*path=\"relay" in direct:
+    raise SystemExit("Direct section still requires synthetic Relay business ingress")
+if "a_relay_first" in direct or "b_relay_first" in direct:
+    raise SystemExit("Direct section still depends on Relay as the first business ingress")
+smoke = smoke[:direct_start] + direct + smoke[direct_end:]
+smoke_path.write_text(smoke, encoding="utf-8")

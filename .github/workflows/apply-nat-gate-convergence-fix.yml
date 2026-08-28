@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: apply-nat-topology-convergence-fix
+  cancel-in-progress: false
+
 jobs:
   apply:
     runs-on: ubuntu-24.04
@@ -22,41 +26,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Correct scoped transformer expectations
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('.github/scripts/apply_nat_gate_fix.py')
-          text = path.read_text()
-          old = '    "Direct final predicate",\n    2,\n)'
-          new = '    "Direct final predicate",\n    1,\n)'
-          if text.count(old) != 1:
-              raise SystemExit('Direct final predicate expectation marker drifted')
-          path.write_text(text.replace(old, new, 1))
-          PY
       - name: Apply exact source transformations
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/apply_nat_gate_fix.py
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('client/daemon/src/transport.rs')
-          text = path.read_text()
-          old = '} else if source.is_some() && !owns_direct_packet {'
-          new = '} else if !owns_direct_packet {'
-          if text.count(old) != 1:
-              raise SystemExit(f'retired-owner source predicate drifted: {text.count(old)} matches')
-          path.write_text(text.replace(old, new, 1))
-          PY
+        run: python3 .github/scripts/apply_nat_gate_fix.py
       - name: Validate transformed tree
         shell: bash
         run: |
           set -euo pipefail
           bash -n scripts/nat-sim/nat-sim-smoke.sh
           cargo fmt --all --check
-          cargo clippy -p p2wlan-daemon --all-targets --all-features -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test -p p2wlan-daemon --lib -- --test-threads=1
           python3 scripts/nat-sim/test_nat_sim.py
           git diff --check
@@ -69,5 +47,6 @@ jobs:
           git rm .github/workflows/apply-nat-gate-convergence-fix.yml
           git rm .github/scripts/apply_nat_gate_fix.py
           git add client/daemon/src/transport.rs scripts/nat-sim/nat-sim-smoke.sh
-          git commit -m "fix(nat): require relay confirmation before Direct business proof"
+          git diff --cached --check
+          git commit -m "fix(nat): prove relay-before-direct without synthetic relay business"
           git push origin HEAD:test/nat-topology-gate-v4-20260828
