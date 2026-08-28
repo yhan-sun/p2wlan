@@ -225,3 +225,72 @@ fn emit_tray_lifecycle_probe(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod lifecycle_probe_tests {
+    use super::*;
+
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn ordinary_daemon_arguments_are_not_intercepted() {
+        assert_eq!(
+            parse_lifecycle_probe_args(&owned(&["--config", "daemon.json"]))
+                .expect("ordinary arguments must parse"),
+            None
+        );
+    }
+
+    #[test]
+    fn binary_probe_is_exact_and_standalone() {
+        assert_eq!(
+            parse_lifecycle_probe_args(&owned(&[BINARY_PROBE_FLAG]))
+                .expect("binary probe must parse"),
+            Some(LifecycleProbeCommand::Binary)
+        );
+        let error = parse_lifecycle_probe_args(&owned(&[
+            BINARY_PROBE_FLAG,
+            "--config",
+            "daemon.json",
+        ]))
+        .expect_err("binary probe must reject mixed daemon arguments");
+        assert!(error.to_string().contains("must be the only argument"));
+    }
+
+    #[test]
+    fn tray_probe_defaults_are_bounded_and_preserve_raw_event() {
+        let event = r#"{"event_type":"status","sequence":77}"#;
+        assert_eq!(
+            parse_lifecycle_probe_args(&owned(&[
+                TRAY_SOURCE_FLAG,
+                TRAY_EVENT_FLAG,
+                event,
+            ]))
+            .expect("tray probe must parse"),
+            Some(LifecycleProbeCommand::Tray {
+                event: event.to_string(),
+                count: 1,
+                delay_ms: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn tray_probe_rejects_missing_event_and_unbounded_count() {
+        let missing = parse_lifecycle_probe_args(&owned(&[TRAY_SOURCE_FLAG]))
+            .expect_err("tray source without an event must fail");
+        assert!(missing.to_string().contains("requires --test-tray-event"));
+
+        let too_many = parse_lifecycle_probe_args(&owned(&[
+            TRAY_SOURCE_FLAG,
+            TRAY_EVENT_FLAG,
+            r#"{"sequence":1}"#,
+            TRAY_COUNT_FLAG,
+            "1025",
+        ]))
+        .expect_err("unbounded tray output must fail");
+        assert!(too_many.to_string().contains("between 1 and 1024"));
+    }
+}
