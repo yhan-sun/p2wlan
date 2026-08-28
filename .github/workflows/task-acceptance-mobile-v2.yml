@@ -1,0 +1,96 @@
+name: Task Acceptance - Mobile Lifecycle v2
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: task-acceptance-mobile-v2-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  accept:
+    name: Mobile lifecycle exact-head acceptance
+    if: github.head_ref == 'test/mobile-lifecycle-regression-20260828'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Wait for Windows lifecycle to land on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 300); do
+            if gh api "repos/$REPO/contents/.github/workflows/windows-lifecycle-required.yml?ref=main" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 30
+          done
+          exit 1
+      - name: Require current main ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/$REPO/git/ref/heads/main" --jq '.object.sha')"
+          status="$(gh api "repos/$REPO/compare/$main_sha...$HEAD_SHA" --jq '.status')"
+          echo "main=$main_sha head=$HEAD_SHA compare=$status"
+          [[ "$status" == ahead || "$status" == identical ]] || {
+            echo "mobile branch must be synchronized with current main" >&2
+            exit 1
+          }
+      - name: Wait for all exact-head mobile checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "CI Required"
+            "NAT Topology Required"
+            "Windows Lifecycle Required"
+            "Mobile Lifecycle Required"
+            "Analyze and Test"
+            "Android arm64 Release APK"
+            "Linux x64 Release Bundle"
+            "macOS Release Apps"
+            "Windows x64 Release Bundle"
+            "iOS Compile"
+            "macOS arm64 test DMG"
+            "Android arm64 test APK"
+          )
+          for attempt in $(seq 1 220); do
+            checks="$(gh api -H 'Accept: application/vnd.github+json' \
+              "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+              --jq '.check_runs | map({name, status, conclusion})')"
+            failed=0
+            pending=0
+            for name in "${required[@]}"; do
+              state="$(jq -r --arg name "$name" '
+                [.[] | select(.name == $name)]
+                | if length == 0 then "missing"
+                  elif any(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "stale" or .conclusion == "skipped") then "failed"
+                  elif any(.status != "completed") then "pending"
+                  elif all(.conclusion == "success" or .conclusion == "neutral") then "success"
+                  else "pending" end
+              ' <<<"$checks")"
+              printf '%-40s %s\n' "$name" "$state"
+              case "$state" in failed) failed=1 ;; missing|pending) pending=1 ;; esac
+            done
+            [[ "$failed" -eq 0 ]] || exit 1
+            [[ "$pending" -ne 0 ]] || exit 0
+            sleep 30
+          done
+          exit 1
+      - name: Merge exact accepted head
+        shell: bash
+        run: |
+          current="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')"
+          test "$current" = "$HEAD_SHA"
+          gh pr merge "$PR" --repo "$REPO" --merge --match-head-commit "$HEAD_SHA"
