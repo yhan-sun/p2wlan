@@ -1,0 +1,56 @@
+name: Apply atomic path runtime
+
+on:
+  push:
+    branches:
+      - refactor/atomic-path-mtu-observability-20260828
+    paths:
+      - .github/workflows/apply-atomic-path-runtime.yml
+      - .github/scripts/apply_atomic_path_runtime.py
+      - client/daemon/src/peer/path_state_machine.rs
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-atomic-path-runtime
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/atomic-path-mtu-observability-20260828
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply atomic state-machine integration
+        run: python3 .github/scripts/apply_atomic_path_runtime.py
+      - name: Format and validate daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all --check
+          cargo clippy -p p2wlan-daemon --all-targets --all-features -- -D warnings
+          cargo test -p p2wlan-daemon --lib path_state_machine_tests -- --test-threads=1
+          cargo test -p p2wlan-daemon --lib -- --test-threads=1
+          git diff --check
+      - name: Commit validated runtime and remove applicator
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-atomic-path-runtime.yml
+          git rm .github/scripts/apply_atomic_path_runtime.py
+          git add client/daemon/src/peer.rs \
+                  client/daemon/src/peer/path_state_machine.rs \
+                  client/daemon/src/peer/connection/core.rs \
+                  client/daemon/src/peer/manager/direct_success.rs
+          git diff --cached --check
+          git commit -m "refactor(peer): atomically commit path and per-generation MTU state"
+          git push origin HEAD:refactor/atomic-path-mtu-observability-20260828
