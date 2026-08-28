@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/apply-atomic-path-runtime.yml
       - .github/scripts/apply_atomic_path_runtime.py
+      - .github/scripts/apply_path_diagnostics.py
       - client/daemon/src/peer/path_state_machine.rs
 
 permissions:
@@ -28,7 +29,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Apply atomic state-machine integration
-        run: python3 .github/scripts/apply_atomic_path_runtime.py
+        run: |
+          python3 .github/scripts/apply_atomic_path_runtime.py
+          python3 .github/scripts/apply_path_diagnostics.py
       - name: Format and validate daemon
         shell: bash
         run: |
@@ -47,10 +50,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/apply-atomic-path-runtime.yml
           git rm .github/scripts/apply_atomic_path_runtime.py
+          git rm .github/scripts/apply_path_diagnostics.py
           git add client/daemon/src/peer.rs \
                   client/daemon/src/peer/path_state_machine.rs \
                   client/daemon/src/peer/connection/core.rs \
-                  client/daemon/src/peer/manager/direct_success.rs
+                  client/daemon/src/peer/manager/direct_success.rs \
+                  client/daemon/src/peer/diagnostics/peer.rs
           git diff --cached --check
           git commit -m "refactor(peer): atomically commit path and per-generation MTU state"
           git push origin HEAD:refactor/atomic-path-mtu-observability-20260828
