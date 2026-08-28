@@ -6,6 +6,7 @@ on:
       - test/nat-topology-gate-v4-20260828
     paths:
       - .github/workflows/apply-nat-gate-convergence-fix.yml
+      - .github/scripts/apply_nat_gate_fix.py
 
 permissions:
   contents: write
