@@ -230,7 +230,7 @@ node_post_failover_relay_ingress() {
 # incomplete schema is an acceptance failure.  In particular, this function
 # never writes `{}` as a substitute for missing status/metrics evidence.
 fetch_required_json() {
-  local url="$1" output="$2" kind="$3"
+  local url="$1" output="$2" kind="$3" token_file="${4:-}"
   if [[ "$kind" == "status" && "$STATUS_FAILURE_INJECTION" == "1" ]]; then
     echo "[nat-sim] FAIL reason_code=status_http_500_injected url=$url" >&2
     return 1
@@ -241,7 +241,11 @@ fetch_required_json() {
   fi
   local curl_status=0
   if [[ "$kind" == "status" ]]; then
-    DIAGNOSTICS_AUTH_TOKEN_FILE="$ROUND_DIR/p2wlan-daemon.diag-auth" \
+    if [[ -z "$token_file" || ! -s "$token_file" ]]; then
+      echo "[nat-sim] FAIL reason_code=status_auth_token_missing path=${token_file:-missing}" >&2
+      return 1
+    fi
+    DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
       p2wlan_diagnostics_curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
   else
     curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
@@ -329,7 +333,9 @@ round_num=0
 for round in $(seq 1 "$ROUNDS"); do
   round_num=$round
   ROUND_DIR="$BASE_DIR/round-$round"
-  mkdir -p "$ROUND_DIR"
+  NODE_A_RUNTIME="$ROUND_DIR/node-a-runtime"
+  NODE_B_RUNTIME="$ROUND_DIR/node-b-runtime"
+  mkdir -p "$ROUND_DIR" "$NODE_A_RUNTIME" "$NODE_B_RUNTIME"
   NAT_SEED=$((NAT_SEED_BASE + round))
   ROUND_RUN_ID="${NAT_SIM_RUN_ID}-round-${round}"
 
@@ -456,7 +462,7 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ "${PREFER_RELAY:-0}" == "1" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-only"; fi
 
   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
-    --config "$ROUND_DIR/node-a.json" \
+    --config "$NODE_A_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
     --token-stdin \
@@ -479,7 +485,7 @@ for round in $(seq 1 "$ROUNDS"); do
   done
 
   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
-    --config "$ROUND_DIR/node-b.json" \
+    --config "$NODE_B_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
     --token-stdin \
@@ -555,8 +561,16 @@ for round in $(seq 1 "$ROUNDS"); do
   END_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
   ELAPSED_MS=$((END_MS - START_MS))
   STATUS_SCHEMA_OK=1
-  fetch_required_json "http://127.0.0.1:$DIAG_A_PORT/status" "$ROUND_DIR/node-a.status.json" status || STATUS_SCHEMA_OK=0
-  fetch_required_json "http://127.0.0.1:$DIAG_B_PORT/status" "$ROUND_DIR/node-b.status.json" status || STATUS_SCHEMA_OK=0
+  fetch_required_json \
+    "http://127.0.0.1:$DIAG_A_PORT/status" \
+    "$ROUND_DIR/node-a.status.json" \
+    status \
+    "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" || STATUS_SCHEMA_OK=0
+  fetch_required_json \
+    "http://127.0.0.1:$DIAG_B_PORT/status" \
+    "$ROUND_DIR/node-b.status.json" \
+    status \
+    "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" || STATUS_SCHEMA_OK=0
   METRICS_SCHEMA_OK=1
   fetch_required_json "http://127.0.0.1:$((RELAY_METRICS_PORT))/metrics" "$ROUND_DIR/relay.metrics.json" metrics || METRICS_SCHEMA_OK=0
 
