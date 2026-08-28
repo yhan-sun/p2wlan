@@ -25,6 +25,8 @@ jobs:
             --exclude='apps/flutter_client/build' \
             --exclude='**/.dart_tool' \
             --exclude='**/.gradle' \
+            --exclude='./p2wlan-source.tar.gz' \
+            --exclude='./p2wlan-source.tar.gz.sha256' \
             -czf p2wlan-source.tar.gz .
           sha256sum p2wlan-source.tar.gz > p2wlan-source.tar.gz.sha256
       - uses: actions/upload-artifact@v4
