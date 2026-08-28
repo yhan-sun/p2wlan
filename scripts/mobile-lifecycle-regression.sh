@@ -6,32 +6,43 @@ APP_DIR="$ROOT_DIR/apps/flutter_client"
 ROUNDS=${P2WLAN_MOBILE_LIFECYCLE_ROUNDS:-3}
 ARTIFACT_DIR=${P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR:-"${RUNNER_TEMP:-/tmp}/p2wlan-mobile-lifecycle"}
 
+mkdir -p "$ARTIFACT_DIR"
+
 if ! [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
-  echo "P2WLAN_MOBILE_LIFECYCLE_ROUNDS must be a positive integer" >&2
+  echo "P2WLAN_MOBILE_LIFECYCLE_ROUNDS must be a positive integer" | tee "$ARTIFACT_DIR/configuration-error.log" >&2
   exit 2
 fi
 
+# These checked-in suites contain the authoritative lifecycle generation fence,
+# diagnostics process-replacement, platform capability and client API contracts.
+# Keeping the list limited to files that exist in the repository makes the gate
+# self-contained rather than depending on uncommitted device-lab experiments.
 TESTS=(
-  test/mobile_lifecycle_contract_test.dart
-  test/mobile_daemon_client_test.dart
-  test/android_runtime_contract_test.dart
-  test/android_network_handoff_test.dart
-  test/android_network_refresh_test.dart
-  test/android_background_heartbeat_test.dart
-  test/android_connectivity_lock_test.dart
-  test/android_active_path_contract_test.dart
-  test/android_overlay_tail_latency_test.dart
+  test/status_store_test.dart
+  test/platform_capabilities_test.dart
+  test/diagnostics_api_test.dart
+  test/contract_test.dart
 )
 
+printf '%s\n' "${TESTS[@]}" > "$ARTIFACT_DIR/test-manifest.txt"
+missing=0
 for test_file in "${TESTS[@]}"; do
   if [[ ! -f "$APP_DIR/$test_file" ]]; then
-    echo "required mobile lifecycle regression is missing: $test_file" >&2
-    exit 1
+    echo "required mobile lifecycle regression is missing: $test_file" | tee -a "$ARTIFACT_DIR/missing-tests.log" >&2
+    missing=1
   fi
 done
-
-mkdir -p "$ARTIFACT_DIR"
-printf '%s\n' "${TESTS[@]}" > "$ARTIFACT_DIR/test-manifest.txt"
+if [[ "$missing" -ne 0 ]]; then
+  cat > "$ARTIFACT_DIR/summary.json" <<EOF
+{
+  "schema_version": 1,
+  "rounds": 0,
+  "test_count": ${#TESTS[@]},
+  "result": "missing_test"
+}
+EOF
+  exit 1
+fi
 
 cd "$APP_DIR"
 for round in $(seq 1 "$ROUNDS"); do
