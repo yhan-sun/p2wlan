@@ -9,6 +9,17 @@ def replace_once(path: Path, old: str, new: str, label: str) -> None:
     path.write_text(text.replace(old, new, 1))
 
 
+def replace_last(path: Path, old: str, new: str, label: str, expected: int) -> None:
+    text = path.read_text()
+    count = text.count(old)
+    if count != expected:
+        raise SystemExit(f"{label}: expected {expected} matches, found {count}")
+    head, separator, tail = text.rpartition(old)
+    if not separator:
+        raise SystemExit(f"{label}: last match disappeared")
+    path.write_text(head + new + tail)
+
+
 transport = Path("client/daemon/src/transport.rs")
 replace_once(
     transport,
@@ -97,7 +108,7 @@ replace_once(
 """,
     "Direct acceptance comment",
 )
-replace_once(
+replace_last(
     smoke,
     """    a_relay_first=0
     b_relay_first=0
@@ -122,8 +133,9 @@ replace_once(
     [[ "$B_INGRESS" == "direct" ]] && b_direct_business=1
 """,
     "Direct ordering evidence",
+    2,
 )
-replace_once(
+replace_last(
     smoke,
     """          && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \\
           && "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 \\
@@ -135,6 +147,7 @@ replace_once(
           && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \\
 """,
     "Direct final predicate",
+    2,
 )
 replace_once(
     smoke,
