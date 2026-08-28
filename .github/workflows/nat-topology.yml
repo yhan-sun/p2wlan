@@ -1,0 +1,119 @@
+name: NAT Topology
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/nat-topology.yml"
+      - "scripts/nat-sim/**"
+      - "scripts/diagnostics-auth.sh"
+      - "scripts/relay_keygen.go"
+      - "client/nat/**"
+      - "client/daemon/**"
+      - "client/relay/**"
+      - "server/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nat-topology.yml"
+      - "scripts/nat-sim/**"
+      - "scripts/diagnostics-auth.sh"
+      - "scripts/relay_keygen.go"
+      - "client/nat/**"
+      - "client/daemon/**"
+      - "client/relay/**"
+      - "server/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  schedule:
+    - cron: "19 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nat-topology-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  simulator_unit:
+    name: NAT Topology Required
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate harness shell syntax
+        run: |
+          bash -n scripts/nat-sim/nat-sim-smoke.sh
+          bash -n scripts/nat-sim/run-topology-scenario.sh
+
+      - name: Validate registered scenarios
+        run: |
+          scenarios="$(bash scripts/nat-sim/run-topology-scenario.sh --list)"
+          test "$(printf '%s\n' "$scenarios" | sed '/^$/d' | sort -u | wc -l)" -eq 6
+          printf '%s\n' "$scenarios"
+
+      - name: Run deterministic simulator tests
+        run: bash scripts/nat-sim/run-topology-scenario.sh simulator-unit
+
+  topology_smoke:
+    name: NAT smoke (${{ matrix.scenario }})
+    if: github.event_name != 'pull_request'
+    needs: simulator_unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        scenario:
+          - direct-baseline
+          - hard-hard-strict
+          - relay-blackhole
+          - relay-failover
+          - observability-fail-closed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: server/go.sum
+
+      - name: Run topology scenario
+        run: bash scripts/nat-sim/run-topology-scenario.sh "${{ matrix.scenario }}"
+
+      - name: Upload topology evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-topology-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/p2wlan-nat-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 14
