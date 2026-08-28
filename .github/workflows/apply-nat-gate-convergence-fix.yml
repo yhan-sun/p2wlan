@@ -22,7 +22,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Correct scoped transformer expectation
+      - name: Correct scoped transformer expectations
         shell: bash
         run: |
           python3 - <<'PY'
@@ -36,7 +36,20 @@ jobs:
           path.write_text(text.replace(old, new, 1))
           PY
       - name: Apply exact source transformations
-        run: python3 .github/scripts/apply_nat_gate_fix.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/apply_nat_gate_fix.py
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('client/daemon/src/transport.rs')
+          text = path.read_text()
+          old = '} else if source.is_some() && !owns_direct_packet {'
+          new = '} else if !owns_direct_packet {'
+          if text.count(old) != 1:
+              raise SystemExit(f'retired-owner source predicate drifted: {text.count(old)} matches')
+          path.write_text(text.replace(old, new, 1))
+          PY
       - name: Validate transformed tree
         shell: bash
         run: |
