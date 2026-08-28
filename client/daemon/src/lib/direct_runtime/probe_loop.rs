@@ -508,7 +508,7 @@ async fn run_direct_probe_loop(
                                         // send failure or a cancellation during
                                         // the advertise keeps the socket
                                         // rollable.
-                                        let advertised = if !peers
+                                        let advertised_punch_at_ms = if !peers
                                             .try_consume_recovery_http_quota_for_identity(
                                                 &peer_id,
                                                 recovery_identity,
@@ -535,7 +535,7 @@ async fn run_direct_probe_loop(
                                                     ),
                                                 )
                                                 .await;
-                                            false
+                                            None
                                         } else if cancellation.is_cancelled()
                                             || !peers.peer_session_is_current_sync(
                                                 &peer_id,
@@ -544,22 +544,30 @@ async fn run_direct_probe_loop(
                                         {
                                             return;
                                         } else {
+                                            let fresh_punch_at_ms =
+                                                relay_assisted_punch_at_ms();
                                             advertise_fresh_mapping_prediction(
                                                 &signal,
                                                 &peers,
                                                 &peer_id,
                                                 &*result,
                                                 &cancellation,
+                                                fresh_punch_at_ms,
                                             )
                                             .await
+                                            .then_some(fresh_punch_at_ms)
                                         };
-                                        if advertised
-                                            && !cancellation.is_cancelled()
-                                            && peers.peer_session_is_current_sync(
-                                                &peer_id,
-                                                peer_session_generation,
-                                            )
+                                        if let Some(fresh_punch_at_ms) =
+                                            advertised_punch_at_ms
                                         {
+                                            if cancellation.is_cancelled()
+                                                || !peers.peer_session_is_current_sync(
+                                                    &peer_id,
+                                                    peer_session_generation,
+                                                )
+                                            {
+                                                return;
+                                            }
                                             let finalized = handoff.finalize().await;
                                             if cancellation.is_cancelled()
                                                 || !peers.peer_session_is_current_sync(
@@ -569,7 +577,19 @@ async fn run_direct_probe_loop(
                                             {
                                                 return;
                                             }
-                                            if !finalized {
+                                            if finalized {
+                                                resend_fresh_mapping_on_exact_socket(
+                                                    &udp,
+                                                    &peers,
+                                                    &peer_id,
+                                                    peer_session_generation,
+                                                    result.socket_index,
+                                                    targets.clone(),
+                                                    fresh_punch_at_ms,
+                                                    &cancellation,
+                                                )
+                                                .await;
+                                            } else {
                                                 peers
                                                     .record_direct_event(
                                                         &peer_id,

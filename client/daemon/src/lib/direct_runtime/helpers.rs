@@ -147,6 +147,15 @@ fn relay_assisted_punch_at_ms() -> u64 {
     unix_time_millis().saturating_add(RELAY_ASSISTED_PUNCH_DELAY.as_millis() as u64)
 }
 
+/// Delay until the exact fresh socket should begin its bounded rendezvous
+/// resend.  Starting just before the shared timestamp covers small clock and
+/// scheduler skew; a stale timestamp dispatches immediately.
+fn fresh_mapping_exact_resend_delay(punch_at_ms: u64) -> Duration {
+    let dispatch_at_ms = punch_at_ms
+        .saturating_sub(FRESH_MAPPING_EXACT_RESEND_LEAD.as_millis() as u64);
+    Duration::from_millis(dispatch_at_ms.saturating_sub(unix_time_millis()))
+}
+
 fn new_probe_session_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);

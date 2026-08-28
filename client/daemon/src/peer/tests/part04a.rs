@@ -90,6 +90,83 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
 }
 
 #[tokio::test]
+async fn structured_random_remote_starts_full_initial_birthday_window_on_one_stable_socket() {
+    let manager = PeerManager::new(test_config());
+    let observed: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+    let mut peer = test_peer("peer-random-air", observed);
+    peer.nat_type = "p2v2:m=address_or_port_dependent;a=random;d=?;c=90;f=address_or_port_dependent;h=unknown;g=2".to_string();
+    manager.add_peer(&peer).await;
+
+    // Reproduce the old/broken peer behavior: despite advertising a=random,
+    // it also sends a full 96-port fresh prediction.  The stable side must
+    // treat the profile as authoritative, discard that speculative window
+    // from the Initial budget, and immediately spend the budget on distinct
+    // birthday targets instead.
+    let predicted = (41_001..=41_096)
+        .map(|port| SocketAddr::new(observed.ip(), port))
+        .collect::<Vec<_>>();
+    let mut candidates = vec![observed.to_string()];
+    candidates.extend(predicted.iter().map(ToString::to_string));
+    let mut sources = predicted
+        .iter()
+        .map(|endpoint| (endpoint.to_string(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    sources.insert(observed.to_string(), "stun_observed".to_string());
+    manager
+        .add_candidates_with_sources("peer-random-air", &candidates, &sources)
+        .await;
+
+    let mut stable_profile = birthday_nat_profile();
+    stable_profile.mapping_behavior = MappingBehavior::EndpointIndependent;
+    stable_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::AddressOrPortDependent;
+    stable_profile.public_port_stable = Some(true);
+    stable_profile.likely_symmetric = Some(false);
+    stable_profile.prediction_candidate = false;
+    stable_profile.predicted_endpoints.clear();
+    stable_profile.birthday_candidate = false;
+    manager.update_nat_profile(stable_profile).await;
+
+    let sets = manager
+        .direct_probe_targets_due(Duration::ZERO)
+        .await;
+    let set = sets
+        .iter()
+        .find(|set| set.peer_id == "peer-random-air")
+        .expect("random remote must receive Initial-stage recovery work");
+    let plan = set
+        .birthday_plan
+        .as_ref()
+        .expect("a=random must open the birthday lane in the Initial stage");
+    assert!(set.remote_scatter_pool);
+    assert!(set.stable_remote_scatter);
+    assert!(plan.stable_side_unique_scatter);
+    assert_eq!(
+        set.candidates.len(),
+        RECOVERY_STAGE_INITIAL_MAX_PROBES as usize,
+        "one stable socket must cover the complete 96-target Initial budget"
+    );
+    assert_eq!(
+        set.candidates
+            .iter()
+            .map(|endpoint| endpoint.port())
+            .collect::<HashSet<_>>()
+            .len(),
+        set.candidates.len(),
+        "the Initial window must contain distinct remote ports, not 32 ports repeated across three sockets"
+    );
+    let connection = manager
+        .get_connection("peer-random-air")
+        .await
+        .expect("random peer connection");
+    assert!(
+        set.candidates.iter().all(|endpoint| connection
+            .candidate_source_for_endpoint(*endpoint)
+            != CandidatePairSource::Predicted),
+        "the peer's contradictory predicted window must not crowd birthday targets out of the Initial budget"
+    );
+}
+
+#[tokio::test]
 async fn probe_target_sort_uses_single_time_snapshot_for_freshness() {
     let manager = PeerManager::new(test_config());
     let base_ip = "8.8.8.8";

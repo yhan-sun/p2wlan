@@ -1081,6 +1081,9 @@ pub(crate) struct HardHardBirthdayResult {
 pub(crate) enum FreshMappingRejection {
     /// Local NAT profile is stable; no dynamic mapping to predict.
     StableLocalNat,
+    /// The long-lived local profile explicitly rejects port prediction (for
+    /// example random/high-entropy allocation or insufficient confidence).
+    UnpredictableLocalNatProfile,
     /// No stable authoritative peer endpoint to punch toward.
     NoStablePeerEndpoint,
     /// Fewer than three successful STUN samples in send order.
@@ -1093,6 +1096,9 @@ pub(crate) enum FreshMappingRejection {
     PublicIpChanged,
     /// The port sequence had no consistent linear behavior.
     UnpredictableSequence,
+    /// The short measurement produced only a speculative model below the
+    /// minimum confidence required for an advertised prediction window.
+    LowConfidenceModel,
     /// The dedicated socket could not be bound.
     BindFailed,
     /// The dynamic socket cap had no safely evictable entry, so the new
@@ -1112,12 +1118,14 @@ impl FreshMappingRejection {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::StableLocalNat => "stable_local_nat",
+            Self::UnpredictableLocalNatProfile => "unpredictable_local_nat_profile",
             Self::NoStablePeerEndpoint => "no_stable_peer_endpoint",
             Self::InsufficientSamples => "insufficient_samples",
             Self::InconsistentBatch => "inconsistent_batch",
             Self::BatchStale => "batch_stale",
             Self::PublicIpChanged => "public_ip_changed",
             Self::UnpredictableSequence => "unpredictable_sequence",
+            Self::LowConfidenceModel => "low_confidence_model",
             Self::BindFailed => "bind_failed",
             Self::CapacityRejected => "capacity_rejected",
             Self::MissingProbeKey => "missing_probe_key",

@@ -680,6 +680,25 @@ impl PeerConnection {
         } else {
             self.probe_candidate_endpoints()
         };
+        if self.remote_nat_allocation_is_random() {
+            // A structured `a=random` profile is stronger evidence than a
+            // short fresh signal which happened to move monotonically.  Do
+            // not let a buggy/older peer's 96 predicted ports consume the
+            // whole Initial-stage target budget and crowd out the birthday
+            // window.  Keep one predicted endpoint only when it is the sole
+            // public-IP seed available for bounded scatter generation.
+            let predicted_seed = endpoints.iter().copied().find(|endpoint| {
+                self.candidate_source_for_endpoint(*endpoint) == CandidatePairSource::Predicted
+            });
+            endpoints.retain(|endpoint| {
+                self.candidate_source_for_endpoint(*endpoint) != CandidatePairSource::Predicted
+            });
+            if !endpoints.iter().any(|endpoint| is_public_probe_endpoint(*endpoint)) {
+                if let Some(seed) = predicted_seed {
+                    endpoints.push(seed);
+                }
+            }
+        }
         // The asymmetric role NEVER birthday-sweeps: the easy peer's
         // multi-port set was already accepted as a stable socket pool (the
         // role gate bounds it), and scanning it as "port churn" would turn
@@ -962,6 +981,10 @@ impl PeerConnection {
         // empty, corrupted) — so behavior is unchanged for old labels.  The
         // six call sites (candidates.rs + probe_targets.rs) all funnel here.
         scatter_decision(&self.nat_type)
+    }
+
+    fn remote_nat_allocation_is_random(&self) -> bool {
+        random_allocation_decision(&self.nat_type)
     }
 
     fn explicit_predicted_window_failed(&self, local_generation: u64) -> bool {

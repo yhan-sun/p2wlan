@@ -251,6 +251,13 @@ const RELAY_ASSISTED_PUNCH_DELAY: Duration = Duration::from_millis(500);
 /// HTTP wake-up jitter, and scheduler latency while still keeping the packet
 /// budget bounded by the existing probe schedule.
 const RELAY_ASSISTED_PUNCH_LEAD: Duration = Duration::from_millis(250);
+/// Re-open the measured peer-facing mapping on the exact fresh socket around
+/// the timestamp advertised with its prediction.  The first generation punch
+/// happens before HTTP signaling; without this second bounded burst it can be
+/// hundreds of milliseconds old by the time the stable peer starts scanning.
+const FRESH_MAPPING_EXACT_RESEND_LEAD: Duration = Duration::from_millis(40);
+const FRESH_MAPPING_EXACT_RESEND_INTERVAL: Duration = Duration::from_millis(80);
+const FRESH_MAPPING_EXACT_RESEND_ATTEMPTS: u32 = 3;
 /// Send a small immediate candidate window before the synchronized rendezvous
 /// window. The synchronized window is still required for dependent NATs, but
 /// waiting for it makes ordinary/public paths pay an avoidable 500ms tax.

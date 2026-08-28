@@ -428,39 +428,63 @@ async fn recovery_target_cap_scales_with_socket_count_for_complete_windows() {
     // never scanned and the birthday cursor could not advance.  v0.1.116
     // bounds every ActivePool stage by the 192-datagram session cap so a
     // window always fits one controlled coverage.
-    let three_sockets = recovery_target_cap(Some(RecoveryStage::ScatterSmall), false, 3, false);
+    let active_pool = |socket_count| RecoveryProbeShape {
+        socket_count,
+        remote_port_dependent: false,
+        stable_side_unique_scatter: false,
+        remote_allocation_random: false,
+    };
+    let stable_scatter = |socket_count| RecoveryProbeShape {
+        socket_count,
+        remote_port_dependent: true,
+        stable_side_unique_scatter: true,
+        remote_allocation_random: false,
+    };
+    let three_sockets = recovery_target_cap(
+        Some(RecoveryStage::ScatterSmall),
+        false,
+        active_pool(3),
+    );
     assert_eq!(
         three_sockets,
         Some(192 / 3),
         "ScatterSmall with 3 sockets must plan candidates that a 192-datagram session can fully cover"
     );
-    let one_socket = recovery_target_cap(Some(RecoveryStage::ScatterSmall), false, 1, false);
+    let one_socket = recovery_target_cap(
+        Some(RecoveryStage::ScatterSmall),
+        false,
+        active_pool(1),
+    );
     assert_eq!(
         one_socket,
         Some(192),
         "a single socket keeps the full 192-candidate window"
     );
-    let predicted = recovery_target_cap(Some(RecoveryStage::Predicted), false, 3, false);
+    let predicted = recovery_target_cap(Some(RecoveryStage::Predicted), false, active_pool(3));
     assert_eq!(
         predicted,
         Some(192 / 3),
         "Predicted with 3 sockets must fit the 192-datagram ceiling"
     );
-    let relay_backed = recovery_target_cap(Some(RecoveryStage::ScatterExtended), true, 3, false);
+    let relay_backed = recovery_target_cap(
+        Some(RecoveryStage::ScatterExtended),
+        true,
+        active_pool(3),
+    );
     assert_eq!(
         relay_backed,
         Some(96 / 3),
         "a relay-backed wide stage is downgraded to the bounded heartbeat ceiling, socket-scaled"
     );
     let port_dependent_predicted =
-        recovery_target_cap(Some(RecoveryStage::Predicted), false, 3, true);
+        recovery_target_cap(Some(RecoveryStage::Predicted), false, stable_scatter(3));
     assert_eq!(
         port_dependent_predicted,
         Some(192),
         "a port-dependent remote opens the wide ceiling as soon as its predicted window had no ACK; the stable side sweeps via StableUniqueScatter (one socket), so the full 192-datagram ceiling is 192 distinct ports, NOT ceiling/sockets (field evidence v0.1.116: the 192/3=64 division spent only 64 unique CGNAT ports)"
     );
     let port_dependent_relay_backed =
-        recovery_target_cap(Some(RecoveryStage::Predicted), true, 3, true);
+        recovery_target_cap(Some(RecoveryStage::Predicted), true, stable_scatter(3));
     assert_eq!(
         port_dependent_relay_backed,
         Some(96),
@@ -468,8 +492,14 @@ async fn recovery_target_cap_scales_with_socket_count_for_complete_windows() {
     );
     // No socket (unit context) must not degenerate to zero candidates.
     assert!(
-        recovery_target_cap(Some(RecoveryStage::Initial), false, 0, false)
+        recovery_target_cap(Some(RecoveryStage::Initial), false, active_pool(0))
             .is_some_and(|cap| cap > 0)
+    );
+
+    assert_eq!(
+        recovery_target_cap(Some(RecoveryStage::Initial), false, stable_scatter(3)),
+        Some(RECOVERY_STAGE_INITIAL_MAX_PROBES as usize),
+        "the stable side's one-socket Initial sweep must cover all 96 target ports instead of repeating 32 ports from three sockets"
     );
 }
 

@@ -33,6 +33,41 @@ fn birthday_nat_profile() -> NatProfile {
     }
 }
 
+#[tokio::test]
+async fn random_nat_profile_vetoes_predictive_fresh_mapping_without_disabling_hard_nat_traversal() {
+    let manager = PeerManager::new(test_config());
+    let random = birthday_nat_profile();
+    manager.update_nat_profile(random).await;
+
+    assert!(
+        manager.local_nat_requires_fresh_mapping_punch().await,
+        "a random address/port-dependent NAT still needs fresh sockets for birthday and peer-reflexive traversal"
+    );
+    assert!(
+        !manager.local_nat_allows_fresh_mapping_prediction().await,
+        "prediction_candidate=false must veto a short-batch port prediction"
+    );
+
+    let mut predictable = birthday_nat_profile();
+    predictable.port_delta = Some(1);
+    predictable.prediction_candidate = true;
+    predictable.predicted_endpoints = vec!["203.0.113.10:40008".to_string()];
+    predictable.confidence = 90;
+    manager.update_nat_profile(predictable).await;
+    assert!(manager.local_nat_allows_fresh_mapping_prediction().await);
+
+    let mut low_confidence = birthday_nat_profile();
+    low_confidence.port_delta = Some(1);
+    low_confidence.prediction_candidate = true;
+    low_confidence.predicted_endpoints = vec!["203.0.113.10:40008".to_string()];
+    low_confidence.confidence = p2pnet_nat::MIN_PREDICTION_CONFIDENCE - 1;
+    manager.update_nat_profile(low_confidence).await;
+    assert!(
+        !manager.local_nat_allows_fresh_mapping_prediction().await,
+        "a low-confidence profile must remain speculative"
+    );
+}
+
 fn test_peer(node_id: &str, endpoint: SocketAddr) -> PeerInfo {
     PeerInfo {
         node_id: node_id.to_string(),

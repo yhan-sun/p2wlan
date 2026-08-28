@@ -13,6 +13,14 @@ pub(crate) struct DirectProbeTargetSet {
     pub recovery_epoch: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RecoveryProbeShape {
+    socket_count: usize,
+    remote_port_dependent: bool,
+    stable_side_unique_scatter: bool,
+    remote_allocation_random: bool,
+}
+
 /// Trusted relay-backoff heartbeat targets, separated before the UDP sender
 /// chooses a local socket.  The groups retain the candidate ranking within
 /// each source class while allowing a bounded heartbeat to revisit an
@@ -144,6 +152,14 @@ impl PeerManager {
             conn.retire_speculative_pairs_when_direct_confirmed(generation);
             return None;
         }
+        let stable_side_unique_scatter =
+            conn.should_use_stable_side_unique_scatter(local_nat_profile.as_ref());
+        let recovery_probe_shape = RecoveryProbeShape {
+            socket_count: self.config.network.socket_pool_size,
+            remote_port_dependent: conn.remote_nat_requires_port_scatter(),
+            stable_side_unique_scatter,
+            remote_allocation_random: conn.remote_nat_allocation_is_random(),
+        };
         let (endpoints, birthday_plan) = conn.candidate_probe_endpoints(
             generation,
             &history,
@@ -152,8 +168,7 @@ impl PeerManager {
             recovery_target_cap(
                 recovery_stage,
                 relay_safety_net,
-                self.config.network.socket_pool_size,
-                conn.remote_nat_requires_port_scatter(),
+                recovery_probe_shape,
             ),
         );
         if !endpoints.is_empty() {
@@ -188,7 +203,7 @@ impl PeerManager {
                     &mut remote_scatter_pool,
                     stage,
                     relay_safety_net,
-                    self.config.network.socket_pool_size,
+                    recovery_probe_shape,
                 );
             }
             let preferred_fast_candidates = conn.preferred_fast_candidates(&endpoints);
@@ -634,6 +649,14 @@ impl PeerManager {
             if !conn.online || conn.state == ConnectionState::Direct {
                 continue;
             }
+            let stable_side_unique_scatter =
+                conn.should_use_stable_side_unique_scatter(local_nat_profile.as_ref());
+            let recovery_probe_shape = RecoveryProbeShape {
+                socket_count: self.config.network.socket_pool_size,
+                remote_port_dependent: conn.remote_nat_requires_port_scatter(),
+                stable_side_unique_scatter,
+                remote_allocation_random: conn.remote_nat_allocation_is_random(),
+            };
             let (endpoints, birthday_plan) = conn.candidate_probe_endpoints(
                 generation,
                 &history,
@@ -646,8 +669,7 @@ impl PeerManager {
                 recovery_target_cap(
                     Some(stage),
                     relay_safety_net,
-                    self.config.network.socket_pool_size,
-                    conn.remote_nat_requires_port_scatter(),
+                    recovery_probe_shape,
                 ),
             );
             if endpoints.is_empty() {
@@ -682,7 +704,7 @@ impl PeerManager {
                 &mut remote_scatter_pool,
                 stage,
                 relay_safety_net,
-                self.config.network.socket_pool_size,
+                recovery_probe_shape,
             );
             let preferred_fast_candidates = conn.preferred_fast_candidates(&endpoints);
             sets.push(DirectProbeTargetSet {
@@ -895,8 +917,7 @@ impl PeerManager {
 fn recovery_target_cap(
     stage: Option<RecoveryStage>,
     relay_safety_net: bool,
-    socket_count: usize,
-    remote_port_dependent: bool,
+    shape: RecoveryProbeShape,
 ) -> Option<usize> {
     let stage = stage?;
     // A port-dependent remote's predicted window is destination-specific, so
@@ -910,7 +931,7 @@ fn recovery_target_cap(
     // Direct (field evidence v0.1.116: availability runs always have the
     // relay confirmed within ~100 ms, so a `!relay_safety_net` gate left the
     // stable side permanently capped at 64 unique ports).
-    let effective_stage = if remote_port_dependent
+    let effective_stage = if shape.remote_port_dependent
         && stage >= RecoveryStage::Predicted
         && stage < RecoveryStage::ScatterExtended
     {
@@ -930,16 +951,13 @@ fn recovery_target_cap(
     // half-scanned).  A port-dependent remote makes the local side the
     // asymmetric STABLE role, which sweeps through `StableUniqueScatter`
     // (ONE socket, one datagram per distinct remote port): the fan-out
-    // division must NOT apply there, otherwise a 192-datagram ceiling is
-    // spent as a 64-port window (field evidence v0.1.116, R4/R7/R8: the
-    // stable side covered only 64 unique CGNAT ports per session; at ~0.1%
-    // per-port hit odds that is why 3/10 rounds stayed on relay).
-    let max_candidates = if remote_port_dependent
-        && effective_stage >= RecoveryStage::ScatterExtended
-    {
+    // division must NOT apply there at ANY stage, otherwise the 96-datagram
+    // Initial ceiling becomes only 32 unique ports and the 192-datagram later
+    // ceiling becomes only 64 (field evidence v0.1.116, R4/R7/R8).
+    let max_candidates = if shape.stable_side_unique_scatter {
         max_probes as usize
     } else {
-        (max_probes / socket_count.max(1) as u32).max(1) as usize
+        (max_probes / shape.socket_count.max(1) as u32).max(1) as usize
     };
     Some(max_candidates)
 }
@@ -975,16 +993,19 @@ fn cap_targets_by_recovery_stage(
     remote_scatter_pool: &mut bool,
     stage: RecoveryStage,
     relay_safety_net: bool,
-    socket_count: usize,
+    shape: RecoveryProbeShape,
 ) {
-    let remote_port_dependent = conn.remote_nat_requires_port_scatter();
-    let wide_scatter_allowed = stage >= RecoveryStage::ScatterExtended
+    let remote_port_dependent = shape.remote_port_dependent;
+    let immediate_random_scatter =
+        shape.remote_allocation_random && shape.stable_side_unique_scatter;
+    let wide_scatter_allowed = immediate_random_scatter
+        || stage >= RecoveryStage::ScatterExtended
         || (remote_port_dependent && stage >= RecoveryStage::Predicted);
     if !wide_scatter_allowed {
         *birthday_plan = None;
         *remote_scatter_pool = false;
     }
-    if stage == RecoveryStage::Initial {
+    if stage == RecoveryStage::Initial && !immediate_random_scatter {
         let trusted = endpoints
             .iter()
             .copied()
@@ -1022,14 +1043,12 @@ fn cap_targets_by_recovery_stage(
     // port-dependent remote's stable side sweeps through
     // `StableUniqueScatter` (one socket, one datagram per distinct port), so
     // the fan-out division is skipped there.  Field evidence v0.1.116:
-    // applying the division capped the stable side at 64 unique CGNAT ports
-    // while the session budget allowed 192.
-    let max_candidates = if remote_port_dependent
-        && effective_stage >= RecoveryStage::ScatterExtended
-    {
+    // applying the division capped the stable side at 32/64 unique CGNAT
+    // ports while the Initial/later session budgets allowed 96/192.
+    let max_candidates = if shape.stable_side_unique_scatter {
         max_probes as usize
     } else {
-        (max_probes / socket_count.max(1) as u32).max(1) as usize
+        (max_probes / shape.socket_count.max(1) as u32).max(1) as usize
     };
     if endpoints.len() > max_candidates {
         endpoints.truncate(max_candidates);

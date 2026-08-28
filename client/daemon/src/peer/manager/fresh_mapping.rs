@@ -225,6 +225,34 @@ impl PeerManager {
             })
     }
 
+    /// Whether the current long-lived NAT profile permits publishing a
+    /// fresh-socket port prediction.
+    ///
+    /// Mapping dependence alone only says that a destination-specific socket
+    /// is useful; it does not say that the allocator is predictable.  A
+    /// high-entropy/random profile remains eligible for the separate bounded
+    /// birthday and peer-reflexive lanes, but a short monotonic STUN burst must
+    /// never override the profile and become an authoritative adjacent-port
+    /// window.  Unknown/low-confidence profiles are kept conservative for the
+    /// same reason.  The deterministic NAT harness explicitly opts into the
+    /// predictor so its synthetic sequence remains testable.
+    pub(crate) async fn local_nat_allows_fresh_mapping_prediction(&self) -> bool {
+        if !self.config.network.fresh_mapping_punch_enabled {
+            return false;
+        }
+        if self.fresh_mapping_harness_loopback_enabled().await {
+            return true;
+        }
+        self.local_nat_profile
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|profile| {
+                let capabilities = NatCapabilities::from_profile(profile);
+                capabilities.hard_allocation_is_predictable()
+            })
+    }
+
     /// Allocate the next per-peer punch generation number.
     pub(crate) async fn next_punch_generation(&self, peer_id: &str) -> u64 {
         let mut generations = self.punch_generations.write().await;

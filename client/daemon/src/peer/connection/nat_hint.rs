@@ -57,6 +57,19 @@ pub fn scatter_decision(nat_type: &str) -> bool {
         || hint.filtering == p2pnet_nat::FilteringBehavior::AddressOrPortDependent
 }
 
+/// Whether a structured peer profile explicitly reports high-entropy/random
+/// port allocation.
+///
+/// Unlike `scatter_decision`, this deliberately has no legacy substring
+/// fallback: a bare `symmetric` label does not contain enough evidence to
+/// discard an advertised prediction window.  Only the authenticated
+/// structured `a=random` profile authorizes the immediate birthday lane and
+/// vetoes peer-signaled predicted candidates.
+fn random_allocation_decision(nat_type: &str) -> bool {
+    let hint = p2pnet_nat::parse_nat_hint(nat_type);
+    hint.parsed && hint.allocation == p2pnet_nat::NatAllocation::Random
+}
+
 #[cfg(test)]
 mod nat_hint_tests {
     use super::*;
@@ -188,5 +201,19 @@ mod nat_hint_tests {
                 "corrupted input did not fall back: {label:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_structured_random_allocation_authorizes_random_lane() {
+        assert!(random_allocation_decision(
+            "p2v2:m=address_or_port_dependent;a=random;d=?;c=90;f=unknown;h=unknown"
+        ));
+        assert!(!random_allocation_decision(
+            "p2v2:m=address_or_port_dependent;a=linear;d=2;c=90;f=unknown;h=unknown"
+        ));
+        assert!(!random_allocation_decision("symmetric"));
+        assert!(!random_allocation_decision(
+            "not-a-profile a=random"
+        ));
     }
 }

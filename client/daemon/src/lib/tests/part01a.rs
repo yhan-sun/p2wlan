@@ -754,6 +754,26 @@ fn relay_assisted_punch_starts_slightly_before_advertised_time() {
 }
 
 #[test]
+fn fresh_mapping_exact_resend_brackets_advertised_time() {
+    let punch_at_ms = unix_time_millis() + RELAY_ASSISTED_PUNCH_DELAY.as_millis() as u64;
+    let delay = fresh_mapping_exact_resend_delay(punch_at_ms);
+
+    assert!(delay <= RELAY_ASSISTED_PUNCH_DELAY - FRESH_MAPPING_EXACT_RESEND_LEAD);
+    assert!(
+        delay
+            >= RELAY_ASSISTED_PUNCH_DELAY
+                - FRESH_MAPPING_EXACT_RESEND_LEAD
+                - Duration::from_millis(50)
+    );
+    let final_round_offset = Duration::from_millis(60)
+        + FRESH_MAPPING_EXACT_RESEND_INTERVAL;
+    assert!(
+        final_round_offset > FRESH_MAPPING_EXACT_RESEND_LEAD,
+        "the bounded three-round schedule must send both before and after punch_at"
+    );
+}
+
+#[test]
 fn direct_fast_probe_window_preserves_candidate_order_and_is_bounded() {
     let candidates = (0..32)
         .map(|port| {

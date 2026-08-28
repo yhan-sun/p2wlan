@@ -876,12 +876,12 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                         // socket rollable, so the guard is dropped without
                                         // finalizing instead of leaving an un-advertised
                                         // socket as the peer's long-term path.
-                                        let advertised = if cancellation.is_cancelled()
+                                        let advertised_punch_at_ms = if cancellation.is_cancelled()
                                             || !peers.peer_session_is_current_sync(
                                                 &peer_id,
                                                 peer_session_generation,
                                             ) {
-                                            false
+                                            None
                                         } else if !peers
                                             .try_consume_recovery_http_quota_for_identity(
                                                 &peer_id,
@@ -901,26 +901,42 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                         ),
                                     )
                                     .await;
-                                            false
+                                            None
                                         } else if cancellation.is_cancelled()
                                             || !peers.peer_session_is_current_sync(
                                                 &peer_id,
                                                 peer_session_generation,
                                             )
                                         {
-                                            false
+                                            None
                                         } else {
+                                            let fresh_punch_at_ms =
+                                                relay_assisted_punch_at_ms();
                                             advertise_fresh_mapping_prediction(
                                                 signal,
                                                 &peers,
                                                 &peer_id,
                                                 &*result,
                                                 &cancellation,
+                                                fresh_punch_at_ms,
                                             )
                                             .await
+                                            .then_some(fresh_punch_at_ms)
                                         };
-                                        if advertised {
-                                            if !handoff.finalize().await {
+                                        if let Some(fresh_punch_at_ms) = advertised_punch_at_ms {
+                                            if handoff.finalize().await {
+                                                resend_fresh_mapping_on_exact_socket(
+                                                    &udp,
+                                                    &peers,
+                                                    &peer_id,
+                                                    peer_session_generation,
+                                                    result.socket_index,
+                                                    targets.clone(),
+                                                    fresh_punch_at_ms,
+                                                    &cancellation,
+                                                )
+                                                .await;
+                                            } else {
                                                 peers
                                         .record_direct_event(
                                             &peer_id,
@@ -2193,6 +2209,7 @@ async fn advertise_fresh_mapping_prediction(
     peer_id: &str,
     result: &FreshMappingResult,
     cancellation: &Arc<crate::PunchSessionCancellation>,
+    punch_at_ms: u64,
 ) -> bool {
     if cancellation.is_cancelled() {
         peers
@@ -2218,7 +2235,7 @@ async fn advertise_fresh_mapping_prediction(
         &local_candidate_sources,
     );
 
-    let punch_at_ms = Some(relay_assisted_punch_at_ms());
+    let punch_at_ms = Some(punch_at_ms);
     if cancellation.is_cancelled() {
         peers
             .record_direct_event(
@@ -2369,6 +2386,96 @@ async fn advertise_fresh_mapping_prediction(
         )
         .await;
     true
+}
+
+/// Re-send peer-facing probes from the exact socket that produced the fresh
+/// STUN sequence, aligned with the timestamp signaled to the stable peer.
+///
+/// This is deliberately a tiny target-only burst, not another candidate
+/// sweep.  The exact-index resolver fails closed if the generation was
+/// replaced; cancellation, peer lifecycle, Direct confirmation, network
+/// generation and remote candidate epoch are all re-checked before/during the
+/// send path.
+#[allow(clippy::too_many_arguments)]
+async fn resend_fresh_mapping_on_exact_socket(
+    udp: &UdpTransport,
+    peers: &Arc<PeerManager>,
+    peer_id: &str,
+    peer_session_generation: PeerSessionGeneration,
+    socket_index: usize,
+    targets: Vec<SocketAddr>,
+    punch_at_ms: u64,
+    cancellation: &Arc<crate::PunchSessionCancellation>,
+) {
+    if targets.is_empty()
+        || cancellation.is_cancelled()
+        || peers.is_direct_sync(peer_id)
+        || !peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+    {
+        return;
+    }
+
+    let delay = fresh_mapping_exact_resend_delay(punch_at_ms);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return,
+        _ = sleep(delay) => {}
+    }
+    if cancellation.is_cancelled()
+        || peers.is_direct_sync(peer_id)
+        || !peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+    {
+        return;
+    }
+
+    match udp
+        .punch_candidates_from_dynamic_socket_index(
+            peer_id,
+            socket_index,
+            targets.clone(),
+            FRESH_MAPPING_EXACT_RESEND_INTERVAL,
+            FRESH_MAPPING_EXACT_RESEND_ATTEMPTS,
+        )
+        .await
+    {
+        Ok(report) => {
+            let per_socket_sent = report
+                .per_socket_sent
+                .iter()
+                .map(|(index, count)| format!("{index}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            peers
+                .record_direct_event(
+                    peer_id,
+                    "fresh_mapping_exact_resend_completed",
+                    targets.first().copied(),
+                    Some(targets.len()),
+                    Some(report.packets_sent),
+                    format!(
+                        "punch_at_ms={punch_at_ms} socket_index={socket_index} attempts={} unique_targets={} budget_skipped={} per_socket_actual_datagrams={per_socket_sent}",
+                        FRESH_MAPPING_EXACT_RESEND_ATTEMPTS,
+                        report.unique_target_endpoints,
+                        report.budget_skipped,
+                    ),
+                )
+                .await;
+        }
+        Err(error) => {
+            peers
+                .record_direct_event(
+                    peer_id,
+                    "fresh_mapping_exact_resend_failed",
+                    targets.first().copied(),
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "punch_at_ms={punch_at_ms} socket_index={socket_index} error={error}"
+                    ),
+                )
+                .await;
+        }
+    }
 }
 
 /// Build the signal payload carrying the fresh-mapping prediction window.

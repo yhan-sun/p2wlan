@@ -12,6 +12,11 @@ const DYNAMIC_READER_READY_TIMEOUT: Duration = Duration::from_secs(1);
 const HARD_HARD_BIRTHDAY_WAVE_INTERVAL: Duration = Duration::from_millis(20);
 const HARD_HARD_BIRTHDAY_WAVES: usize = 2;
 
+fn fresh_mapping_model_is_admissible(model: &PortModel) -> bool {
+    model.confidence >= p2pnet_nat::MIN_PREDICTION_CONFIDENCE
+        && !matches!(model.kind, PortModelKind::Unpredictable { .. })
+}
+
 /// Adaptive-prediction learner state for one network generation, scoped by
 /// destination so a stride learned toward STUN observers is not blindly applied
 /// to a real peer (audit P1-B: complex CGNAT may bucket allocation by target;
@@ -1568,6 +1573,25 @@ impl UdpTransport {
         if !self.peers.local_nat_requires_fresh_mapping_punch().await {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat);
         }
+        if !self
+            .peers
+            .local_nat_allows_fresh_mapping_prediction()
+            .await
+        {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "fresh_mapping_rejected",
+                    None,
+                    None,
+                    None,
+                    "long-lived NAT profile rejects predictive fresh mapping; using birthday/peer-reflexive traversal instead",
+                )
+                .await;
+            return FreshMappingOutcome::Rejected(
+                FreshMappingRejection::UnpredictableLocalNatProfile,
+            );
+        }
         if cancellation.is_some_and(|c| c.is_cancelled()) {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded);
         }
@@ -1830,6 +1854,28 @@ impl UdpTransport {
                 return FreshMappingOutcome::Rejected(FreshMappingRejection::UnpredictableSequence);
             }
         };
+
+        if !fresh_mapping_model_is_admissible(&model) {
+            self.peers
+                .record_direct_event(
+                    peer_id,
+                    "fresh_mapping_rejected",
+                    None,
+                    Some(sample_count),
+                    None,
+                    format!(
+                        "fresh mapping model confidence {} is below the prediction admission threshold {}; sequence={:?} deltas={:?}",
+                        model.confidence,
+                        p2pnet_nat::MIN_PREDICTION_CONFIDENCE,
+                        batch.ordered_ports(),
+                        model.deltas,
+                    ),
+                )
+                .await;
+            self.detach_dynamic_socket_by_index(socket_index, "low_confidence_model")
+                .await;
+            return FreshMappingOutcome::Rejected(FreshMappingRejection::LowConfidenceModel);
+        }
 
         let step = match &model.kind {
             PortModelKind::FixedStep { step }

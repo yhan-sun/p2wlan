@@ -1140,6 +1140,25 @@ async fn fresh_mapping_consumed_mapping_hits_successor_window() {
     assert!(result.predicted_ports.contains(&(base + 4)));
 }
 
+#[test]
+fn wide_low_confidence_monotonic_burst_is_not_admitted_for_fresh_signaling() {
+    let model = p2pnet_nat::mapping::build_model(
+        &[60_092, 60_102, 60_119, 60_155],
+        Some("220.163.6.190".parse().unwrap()),
+        1_000,
+    );
+
+    assert!(matches!(
+        model.kind,
+        PortModelKind::MonotonicWindow { direction: 1 }
+    ));
+    assert_eq!(model.confidence, 45);
+    assert!(
+        !fresh_mapping_model_is_admissible(&model),
+        "the exact Air sequence must remain speculative instead of becoming a 96-port authoritative fresh window"
+    );
+}
+
 #[tokio::test]
 async fn fresh_mapping_failed_generation_keeps_previous_socket() {
     let (outcome, peers, transport, nat, _seen) = run_generation_roundtrip(1, false).await;
@@ -1774,6 +1793,37 @@ async fn fresh_mapping_stable_local_nat_skips_generation() {
         FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat)
     ));
     assert!(!transport.has_dynamic_socket_for_peer("peer-b").await);
+}
+
+#[tokio::test]
+async fn fresh_mapping_random_local_profile_skips_predictor_before_socket_allocation() {
+    let (peers, transport, nat) = generation_env().await;
+    let mut random = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown).nat_profile;
+    random.port_delta = None;
+    random.prediction_candidate = false;
+    random.predicted_endpoints.clear();
+    random.birthday_candidate = true;
+    random.confidence = 90;
+    peers.update_nat_profile(random).await;
+
+    let outcome = transport
+        .run_fresh_mapping_generation(
+            "peer-b",
+            &nat.observers,
+            Duration::from_millis(500),
+            &[nat.peer_public],
+            Duration::from_millis(10),
+            2,
+            None,
+        )
+        .await;
+
+    assert!(matches!(
+        outcome,
+        FreshMappingOutcome::Rejected(FreshMappingRejection::UnpredictableLocalNatProfile)
+    ));
+    assert_eq!(transport.dynamic_socket_count().await, 0);
+    assert!(peers.fresh_mapping_for_peer("peer-b").await.is_none());
 }
 
 #[tokio::test]
