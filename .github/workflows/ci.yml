@@ -187,7 +187,7 @@ jobs:
         run: |
           set -euo pipefail
           test "${{ needs.rust.result }}" = "success"
-          test "${{ needs.rust-windows.result }}" = "success"
+          test "${{ needs['rust-windows'].result }}" = "success"
           test "${{ needs.go.result }}" = "success"
-          test "${{ needs.repository-policy.result }}" = "success"
+          test "${{ needs['repository-policy'].result }}" = "success"
           echo "all required CI jobs succeeded"
