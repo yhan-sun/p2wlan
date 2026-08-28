@@ -1,0 +1,125 @@
+name: Windows Lifecycle
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-lifecycle.yml"
+      - "client/daemon/**"
+      - "client/tray/**"
+      - "client/desktop-host/**"
+      - "apps/flutter_client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-lifecycle.yml"
+      - "client/daemon/**"
+      - "client/tray/**"
+      - "client/desktop-host/**"
+      - "apps/flutter_client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    name: Windows Lifecycle Required
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Capture Windows Error Reporting baseline
+        shell: pwsh
+        run: |
+          $baseline = [DateTime]::UtcNow.ToString('o')
+          "P2WLAN_WER_BASELINE=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "WER baseline: $baseline"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter dependencies
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore Flutter-managed source files
+        shell: bash
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Formatting gates
+        shell: bash
+        run: |
+          cargo fmt --all --check
+          cd apps/flutter_client
+          dart format --output=none --set-exit-if-changed test/windows_daemon_lifecycle_integration_test.dart
+
+      - name: Build release daemon
+        run: cargo build -p p2wlan-daemon --release
+
+      - name: Run Rust lifecycle regression
+        env:
+          P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
+        run: cargo test -p p2wlan-daemon --test windows_lifecycle --release -- --test-threads=1
+
+      - name: Run Flutter process lifecycle regression
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
+        run: flutter test test/windows_daemon_lifecycle_integration_test.dart
+
+      - name: Assert no daemon process leaked
+        if: always()
+        shell: pwsh
+        run: |
+          $leaked = @(Get-Process -Name 'p2wlan-daemon' -ErrorAction SilentlyContinue)
+          if ($leaked.Count -gt 0) {
+            $leaked | Format-Table Id, ProcessName, StartTime -AutoSize
+            Stop-Process -Id ($leaked | Select-Object -ExpandProperty Id) -Force -ErrorAction SilentlyContinue
+            throw "p2wlan-daemon process leaked after lifecycle tests"
+          }
+          Write-Host 'No p2wlan-daemon process leaked.'
+
+      - name: Assert no new Windows crash or BEX event
+        if: always()
+        shell: pwsh
+        run: |
+          $start = [DateTime]::Parse($env:P2WLAN_WER_BASELINE).ToLocalTime()
+          $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $start } -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Id -in @(1000, 1001) -and
+              ($_.Message -match '(?i)p2wlan-(daemon|desktop|flutter_client).*\.exe|(?i)BEX64')
+            } |
+            Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message)
+          $events | ConvertTo-Json -Depth 4 | Set-Content -Path windows-lifecycle-events.json -Encoding utf8
+          if ($events.Count -gt 0) {
+            $events | Format-List
+            throw "Windows recorded a P2WLAN crash/BEX event during lifecycle tests"
+          }
+          Write-Host 'No P2WLAN crash or BEX event was recorded.'
+
+      - name: Upload lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-lifecycle-evidence
+          path: windows-lifecycle-events.json
+          if-no-files-found: warn
+          retention-days: 14
