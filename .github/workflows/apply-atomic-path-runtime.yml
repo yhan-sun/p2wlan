@@ -8,6 +8,7 @@ on:
       - .github/workflows/apply-atomic-path-runtime.yml
       - .github/scripts/apply_atomic_path_runtime.py
       - .github/scripts/apply_path_diagnostics.py
+      - .github/scripts/apply_path_lifecycle_fixes.py
       - client/daemon/src/peer/path_state_machine.rs
 
 permissions:
@@ -32,6 +33,7 @@ jobs:
         run: |
           python3 .github/scripts/apply_atomic_path_runtime.py
           python3 .github/scripts/apply_path_diagnostics.py
+          python3 .github/scripts/apply_path_lifecycle_fixes.py
       - name: Format and validate daemon
         shell: bash
         run: |
@@ -40,6 +42,8 @@ jobs:
           cargo fmt --all --check
           cargo clippy -p p2wlan-daemon --all-targets --all-features -- -D warnings
           cargo test -p p2wlan-daemon --lib path_state_machine_tests -- --test-threads=1
+          cargo test -p p2wlan-daemon --lib peer::tests::late_direct_results_cannot_revive_offline_or_rejoined_peer_lifecycle -- --exact --test-threads=1
+          cargo test -p p2wlan-daemon --lib tests::test_relay_probe_ack_mismatch_never_confirms_and_404_revokes -- --exact --test-threads=1
           cargo test -p p2wlan-daemon --lib -- --test-threads=1
           git diff --check
       - name: Commit validated runtime and remove applicator
@@ -51,10 +55,13 @@ jobs:
           git rm .github/workflows/apply-atomic-path-runtime.yml
           git rm .github/scripts/apply_atomic_path_runtime.py
           git rm .github/scripts/apply_path_diagnostics.py
+          git rm .github/scripts/apply_path_lifecycle_fixes.py
           git add client/daemon/src/peer.rs \
                   client/daemon/src/peer/path_state_machine.rs \
                   client/daemon/src/peer/connection/core.rs \
                   client/daemon/src/peer/manager/direct_success.rs \
+                  client/daemon/src/peer/manager/peers.rs \
+                  client/daemon/src/peer/manager/quarantine.rs \
                   client/daemon/src/peer/diagnostics/peer.rs
           git diff --cached --check
           git commit -m "refactor(peer): atomically commit path and per-generation MTU state"
