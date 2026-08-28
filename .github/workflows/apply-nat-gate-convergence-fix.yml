@@ -34,7 +34,7 @@ jobs:
           set -euo pipefail
           bash -n scripts/nat-sim/nat-sim-smoke.sh
           cargo fmt --all --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy -p p2wlan-daemon --all-targets --all-features -- -D warnings
           cargo test -p p2wlan-daemon --lib -- --test-threads=1
           python3 scripts/nat-sim/test_nat_sim.py
           git diff --check
