@@ -8,125 +8,222 @@
  include!("main/runtime.rs");
  include!("main/overrides.rs");
  include!("main/windows_elevation.rs");
---- a/client/daemon/src/main/cli.rs
-+++ b/client/daemon/src/main/cli.rs
-@@ -12,6 +12,28 @@
-     #[arg(long)]
-     build_info: bool,
- 
-+    /// Execute a side-effect-free process lifecycle probe and exit. Hidden
-+    /// because this is a packaging/CI contract rather than a user command.
-+    #[arg(long, hide = true)]
-+    binary_probe: bool,
-+
-+    /// Emit a bounded JSON-lines tray-event sequence and exit. Hidden because
-+    /// it is only consumed by lifecycle integration tests.
-+    #[arg(long, hide = true)]
-+    test_tray_event_source: bool,
-+
-+    /// Base tray event JSON used with --test-tray-event-source.
-+    #[arg(long, hide = true)]
-+    test_tray_event: Option<String>,
-+
-+    /// Number of tray envelopes to emit.
-+    #[arg(long, hide = true, default_value_t = 1)]
-+    test_tray_event_count: usize,
-+
-+    /// Delay between emitted tray envelopes.
-+    #[arg(long, hide = true, default_value_t = 0)]
-+    test_tray_event_delay_ms: u64,
-+
-     /// Generate a new config
-     #[arg(long)]
-     init: bool,
---- a/client/daemon/src/main/validation.rs
-+++ b/client/daemon/src/main/validation.rs
-@@ -1,4 +1,20 @@
- fn validate_cli(cli: &Cli) -> std::result::Result<(), String> {
-+    if cli.binary_probe && cli.test_tray_event_source {
-+        return Err("--binary-probe and --test-tray-event-source cannot be used together".to_string());
-+    }
-+    if cli.test_tray_event.is_some() && !cli.test_tray_event_source {
-+        return Err("--test-tray-event requires --test-tray-event-source".to_string());
-+    }
-+    if cli.test_tray_event_source && cli.test_tray_event.is_none() {
-+        return Err("--test-tray-event-source requires --test-tray-event".to_string());
-+    }
-+    if cli.test_tray_event_count == 0 || cli.test_tray_event_count > 1024 {
-+        return Err("--test-tray-event-count must be between 1 and 1024".to_string());
-+    }
-+    if cli.test_tray_event_delay_ms > 10_000 {
-+        return Err("--test-tray-event-delay-ms must not exceed 10000".to_string());
-+    }
-+
-     if cli.manual && cli.managed {
-         return Err("--manual and --managed cannot be used together".to_string());
-     }
 --- a/client/daemon/src/main/runtime.rs
 +++ b/client/daemon/src/main/runtime.rs
-@@ -9,6 +9,12 @@
-         std::process::exit(1);
-     }
- 
-+    // Lifecycle probes are side-effect free packaging contracts. They must run
-+    // before token/config reads, logging, instance locks, or diagnostics files.
-+    if run_lifecycle_probe(&cli)? {
+@@ -1,8 +1,13 @@
+ #[tokio::main]
+ async fn main() -> p2pnet_daemon::Result<()> {
++    // The lifecycle probes are intentionally parsed before Clap and before any
++    // token/config/logging/instance-lock side effect. They are strict, hidden
++    // packaging contracts rather than production daemon options.
++    if run_lifecycle_probe_from_process_args()? {
 +        return Ok(());
 +    }
 +
-     // Resolve this before any generated config is saved.  The token file keeps
-     // credentials out of `ps`, shell history, and the audited daemon command
-     // line. It is the only supported way to supply a control-plane token (the
+     // Parse arguments BEFORE any side effects (including logging setup)
+     // This guarantees --help and --version exit cleanly without side effects.
+     let cli = Cli::parse();
+-
+     if let Err(e) = validate_cli(&cli) {
+         eprintln!("Configuration Error: {}", e);
+         std::process::exit(1);
 --- /dev/null
 +++ b/client/daemon/src/main/lifecycle_probe.rs
-@@ -0,0 +1,71 @@
-+use std::io::{self, Write};
+@@ -0,0 +1,174 @@
++use std::io;
 +use std::time::Duration;
 +
-+fn run_lifecycle_probe(cli: &Cli) -> p2pnet_daemon::Result<bool> {
-+    if cli.binary_probe {
-+        let payload = serde_json::json!({
-+            "status": "ok",
-+            "protocol_version": 1,
-+            "pid": std::process::id(),
-+        });
-+        println!(
-+            "{}",
-+            serde_json::to_string(&payload).map_err(|error| {
-+                DaemonError::Config(format!("failed to serialize lifecycle probe: {error}"))
-+            })?
-+        );
-+        return Ok(true);
++const BINARY_PROBE_FLAG: &str = "--binary-probe";
++const TRAY_SOURCE_FLAG: &str = "--test-tray-event-source";
++const TRAY_EVENT_FLAG: &str = "--test-tray-event";
++const TRAY_COUNT_FLAG: &str = "--test-tray-event-count";
++const TRAY_DELAY_FLAG: &str = "--test-tray-event-delay-ms";
++
++#[derive(Debug, PartialEq, Eq)]
++enum LifecycleProbeCommand {
++    Binary,
++    Tray {
++        event: String,
++        count: usize,
++        delay_ms: u64,
++    },
++}
++
++fn lifecycle_probe_error(message: impl Into<String>) -> DaemonError {
++    DaemonError::Config(format!("lifecycle probe: {}", message.into()))
++}
++
++fn parse_lifecycle_probe_args(
++    args: &[String],
++) -> p2pnet_daemon::Result<Option<LifecycleProbeCommand>> {
++    let mentions_binary = args.iter().any(|arg| arg == BINARY_PROBE_FLAG);
++    let mentions_tray = args
++        .iter()
++        .any(|arg| arg == TRAY_SOURCE_FLAG || arg.starts_with("--test-tray-event"));
++
++    if !mentions_binary && !mentions_tray {
++        return Ok(None);
 +    }
 +
-+    if !cli.test_tray_event_source {
++    if mentions_binary {
++        if args == [BINARY_PROBE_FLAG] {
++            return Ok(Some(LifecycleProbeCommand::Binary));
++        }
++        return Err(lifecycle_probe_error(
++            "--binary-probe must be the only argument",
++        ));
++    }
++
++    let mut source = false;
++    let mut event = None;
++    let mut count = 1usize;
++    let mut delay_ms = 0u64;
++    let mut index = 0usize;
++
++    while index < args.len() {
++        let argument = &args[index];
++        match argument.as_str() {
++            TRAY_SOURCE_FLAG => {
++                if source {
++                    return Err(lifecycle_probe_error(
++                        "--test-tray-event-source was supplied more than once",
++                    ));
++                }
++                source = true;
++                index += 1;
++            }
++            TRAY_EVENT_FLAG => {
++                let value = args.get(index + 1).ok_or_else(|| {
++                    lifecycle_probe_error("--test-tray-event requires a JSON value")
++                })?;
++                if event.replace(value.clone()).is_some() {
++                    return Err(lifecycle_probe_error(
++                        "--test-tray-event was supplied more than once",
++                    ));
++                }
++                index += 2;
++            }
++            TRAY_COUNT_FLAG => {
++                let value = args.get(index + 1).ok_or_else(|| {
++                    lifecycle_probe_error("--test-tray-event-count requires a value")
++                })?;
++                count = value.parse::<usize>().map_err(|_| {
++                    lifecycle_probe_error("--test-tray-event-count must be an integer")
++                })?;
++                index += 2;
++            }
++            TRAY_DELAY_FLAG => {
++                let value = args.get(index + 1).ok_or_else(|| {
++                    lifecycle_probe_error("--test-tray-event-delay-ms requires a value")
++                })?;
++                delay_ms = value.parse::<u64>().map_err(|_| {
++                    lifecycle_probe_error("--test-tray-event-delay-ms must be an integer")
++                })?;
++                index += 2;
++            }
++            _ => {
++                return Err(lifecycle_probe_error(format!(
++                    "unexpected argument {argument:?}",
++                )));
++            }
++        }
++    }
++
++    if !source {
++        return Err(lifecycle_probe_error(
++            "tray event options require --test-tray-event-source",
++        ));
++    }
++    let event = event.ok_or_else(|| {
++        lifecycle_probe_error("--test-tray-event-source requires --test-tray-event")
++    })?;
++    if !(1..=1024).contains(&count) {
++        return Err(lifecycle_probe_error(
++            "--test-tray-event-count must be between 1 and 1024",
++        ));
++    }
++    if delay_ms > 10_000 {
++        return Err(lifecycle_probe_error(
++            "--test-tray-event-delay-ms must not exceed 10000",
++        ));
++    }
++
++    Ok(Some(LifecycleProbeCommand::Tray {
++        event,
++        count,
++        delay_ms,
++    }))
++}
++
++fn run_lifecycle_probe_from_process_args() -> p2pnet_daemon::Result<bool> {
++    let args = std::env::args_os()
++        .skip(1)
++        .map(|argument| {
++            argument
++                .into_string()
++                .map_err(|_| lifecycle_probe_error("arguments must be valid UTF-8"))
++        })
++        .collect::<p2pnet_daemon::Result<Vec<_>>>()?;
++
++    let Some(command) = parse_lifecycle_probe_args(&args)? else {
 +        return Ok(false);
-+    }
++    };
 +
-+    let raw_event = cli
-+        .test_tray_event
-+        .as_deref()
-+        .ok_or_else(|| DaemonError::Config("missing tray lifecycle event".to_string()))?;
++    match command {
++        LifecycleProbeCommand::Binary => emit_binary_lifecycle_probe()?,
++        LifecycleProbeCommand::Tray {
++            event,
++            count,
++            delay_ms,
++        } => emit_tray_lifecycle_probe(&event, count, delay_ms)?,
++    }
++    Ok(true)
++}
++
++fn emit_binary_lifecycle_probe() -> p2pnet_daemon::Result<()> {
++    let payload = serde_json::json!({
++        "status": "ok",
++        "protocol_version": 1,
++        "pid": std::process::id(),
++    });
++    let stdout = io::stdout();
++    let mut output = stdout.lock();
++    serde_json::to_writer(&mut output, &payload).map_err(|error| {
++        lifecycle_probe_error(format!("failed to serialize binary response: {error}"))
++    })?;
++    std::io::Write::write_all(&mut output, b"\n").map_err(|error| {
++        lifecycle_probe_error(format!("failed to write binary response: {error}"))
++    })?;
++    std::io::Write::flush(&mut output).map_err(|error| {
++        lifecycle_probe_error(format!("failed to flush binary response: {error}"))
++    })
++}
++
++fn emit_tray_lifecycle_probe(
++    raw_event: &str,
++    count: usize,
++    delay_ms: u64,
++) -> p2pnet_daemon::Result<()> {
 +    let base_event: serde_json::Value = serde_json::from_str(raw_event).map_err(|error| {
-+        DaemonError::Config(format!("invalid --test-tray-event JSON: {error}"))
++        lifecycle_probe_error(format!("invalid --test-tray-event JSON: {error}"))
 +    })?;
 +    let base_sequence = base_event
 +        .as_object()
-+        .ok_or_else(|| {
-+            DaemonError::Config("--test-tray-event must be a JSON object".to_string())
-+        })?
++        .ok_or_else(|| lifecycle_probe_error("--test-tray-event must be a JSON object"))?
 +        .get("sequence")
 +        .and_then(serde_json::Value::as_u64)
 +        .ok_or_else(|| {
-+            DaemonError::Config("--test-tray-event.sequence must be an unsigned integer".to_string())
++            lifecycle_probe_error(
++                "--test-tray-event.sequence must be an unsigned integer",
++            )
 +        })?;
 +
 +    let stdout = io::stdout();
 +    let mut output = stdout.lock();
-+    for index in 0..cli.test_tray_event_count {
-+        let sequence = base_sequence.checked_add(index as u64).ok_or_else(|| {
-+            DaemonError::Config("tray lifecycle sequence overflow".to_string())
-+        })?;
++    for index in 0..count {
++        let sequence = base_sequence
++            .checked_add(index as u64)
++            .ok_or_else(|| lifecycle_probe_error("tray event sequence overflow"))?;
 +        let mut event = base_event.clone();
 +        event
 +            .as_object_mut()
@@ -137,17 +234,17 @@
 +            "event": event,
 +        });
 +        serde_json::to_writer(&mut output, &envelope).map_err(|error| {
-+            DaemonError::Config(format!("failed to serialize tray lifecycle event: {error}"))
++            lifecycle_probe_error(format!("failed to serialize tray event: {error}"))
 +        })?;
-+        output.write_all(b"\n").map_err(|error| {
-+            DaemonError::Config(format!("failed to write tray lifecycle event: {error}"))
++        std::io::Write::write_all(&mut output, b"\n").map_err(|error| {
++            lifecycle_probe_error(format!("failed to write tray event: {error}"))
 +        })?;
-+        output.flush().map_err(|error| {
-+            DaemonError::Config(format!("failed to flush tray lifecycle event: {error}"))
++        std::io::Write::flush(&mut output).map_err(|error| {
++            lifecycle_probe_error(format!("failed to flush tray event: {error}"))
 +        })?;
-+        if cli.test_tray_event_delay_ms > 0 && index + 1 < cli.test_tray_event_count {
-+            std::thread::sleep(Duration::from_millis(cli.test_tray_event_delay_ms));
++        if delay_ms > 0 && index + 1 < count {
++            std::thread::sleep(Duration::from_millis(delay_ms));
 +        }
 +    }
-+    Ok(true)
++    Ok(())
 +}
