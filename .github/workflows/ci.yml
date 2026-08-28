@@ -92,7 +92,7 @@ jobs:
           fi
           echo "build identity gate PASS (commit=$HEAD_SHA sha=$BIN_SHA)"
 
-  rust-windows:
+  rust_windows:
     name: Rust Check (Windows)
     runs-on: windows-latest
     steps:
@@ -147,7 +147,7 @@ jobs:
         working-directory: server
         run: go test ./... -count=1
 
-  repository-policy:
+  repository_policy:
     name: React absence and security scan
     runs-on: ubuntu-latest
     steps:
@@ -179,7 +179,7 @@ jobs:
   required:
     name: CI Required
     if: always()
-    needs: [rust, rust-windows, go, repository-policy]
+    needs: [rust, rust_windows, go, repository_policy]
     runs-on: ubuntu-latest
     steps:
       - name: Enforce required job results
@@ -187,7 +187,7 @@ jobs:
         run: |
           set -euo pipefail
           test "${{ needs.rust.result }}" = "success"
-          test "${{ needs['rust-windows'].result }}" = "success"
+          test "${{ needs.rust_windows.result }}" = "success"
           test "${{ needs.go.result }}" = "success"
-          test "${{ needs['repository-policy'].result }}" = "success"
+          test "${{ needs.repository_policy.result }}" = "success"
           echo "all required CI jobs succeeded"
