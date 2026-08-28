@@ -305,11 +305,26 @@ class StatusStore extends ChangeNotifier {
     final appInForeground = state == AppLifecycleState.resumed;
     if (_appInForeground == appInForeground) return;
     _appInForeground = appInForeground;
+    if (!appInForeground) {
+      // A long-poll request belongs to the physical network and app epoch in
+      // which it started. Invalidate it before Android/iOS suspends sockets so
+      // a late Wi-Fi/cellular response cannot mutate the resumed snapshot.
+      _eventLoopGeneration += 1;
+    }
     _schedulePolling();
     if (_autoRefreshEnabled && appInForeground) {
-      unawaited(refresh(silent: true));
+      unawaited(_refreshAfterResume());
     }
     notifyListeners();
+  }
+
+  Future<void> _refreshAfterResume() async {
+    // Revalidate process identity, route/path state and the peer catalog before
+    // opening a new event long poll. This creates an explicit resume boundary
+    // instead of carrying a pre-suspend cursor across a network hand-off.
+    await refresh(silent: true);
+    if (_disposed || !_autoRefreshEnabled || !_appInForeground) return;
+    _ensureEventLoop();
   }
 
   void _schedulePolling() {
@@ -328,6 +343,7 @@ class StatusStore extends ChangeNotifier {
   void _ensureEventLoop() {
     if (!enableEventPolling ||
         !_autoRefreshEnabled ||
+        !_appInForeground ||
         _disposed ||
         _snapshot == null ||
         _eventLoopFuture != null) {
@@ -342,7 +358,10 @@ class StatusStore extends ChangeNotifier {
       loop.whenComplete(() {
         if (identical(_eventLoopFuture, loop)) {
           _eventLoopFuture = null;
-          if (!_disposed && _autoRefreshEnabled && _snapshot != null) {
+          if (!_disposed &&
+              _autoRefreshEnabled &&
+              _appInForeground &&
+              _snapshot != null) {
             scheduleMicrotask(_ensureEventLoop);
           }
         }
@@ -355,6 +374,7 @@ class StatusStore extends ChangeNotifier {
     var processId = _snapshot?.processId;
     while (!_disposed &&
         _autoRefreshEnabled &&
+        _appInForeground &&
         generation == _eventLoopGeneration &&
         url == settingsStore.settings.diagnosticsUrl &&
         _snapshot != null) {
