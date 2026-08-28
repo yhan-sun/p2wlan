@@ -2,9 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust:
@@ -54,15 +62,15 @@ jobs:
             "$hard_hard_binary" "$test_name" --exact --test-threads=1
           done <<< "$hard_hard_tests"
       - name: Linux route gate tests
-        run: "cargo test -p p2wlan-daemon --lib route::tests::"
+        run: cargo test -p p2wlan-daemon --lib route::tests::
       - name: Rust Linux Target Cross-Compile Check
         run: |
           rustup target add x86_64-unknown-linux-gnu
           cargo check --target x86_64-unknown-linux-gnu
       - name: Build Identity Gate
         # The built daemon must report the exact commit CI checked out, and
-        # --version must carry that commit too.  A drift here means /status.version
-        # could no longer prove which build is running.
+        # --version must carry that commit too. A drift here means
+        # /status.version could no longer prove which build is running.
         run: |
           cargo build -p p2wlan-daemon
           HEAD_SHA="$(git rev-parse HEAD)"
@@ -133,13 +141,11 @@ jobs:
         with:
           go-version: '1.22'
       - name: Go Vet
-        run: |
-          cd server
-          go vet ./...
+        working-directory: server
+        run: go vet ./...
       - name: Go Test
-        run: |
-          cd server
-          go test ./... -count=1
+        working-directory: server
+        run: go test ./... -count=1
 
   repository-policy:
     name: React absence and security scan
@@ -169,3 +175,34 @@ jobs:
             echo "unsafe production credential transport found" >&2
             exit 1
           fi
+
+  required:
+    name: CI Required
+    if: ${{ always() }}
+    needs:
+      - rust
+      - rust-windows
+      - go
+      - repository-policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce required job results
+        env:
+          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          jobs = json.loads(os.environ["REQUIRED_RESULTS"])
+          failed = {
+              name: data.get("result", "missing")
+              for name, data in jobs.items()
+              if data.get("result") != "success"
+          }
+          if failed:
+              print("required CI jobs did not succeed:", failed, file=sys.stderr)
+              raise SystemExit(1)
+          print("all required CI jobs succeeded:", sorted(jobs))
+          PY
