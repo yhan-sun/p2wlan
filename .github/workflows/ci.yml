@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -178,31 +178,16 @@ jobs:
 
   required:
     name: CI Required
-    if: ${{ always() }}
-    needs:
-      - rust
-      - rust-windows
-      - go
-      - repository-policy
+    if: always()
+    needs: [rust, rust-windows, go, repository-policy]
     runs-on: ubuntu-latest
     steps:
       - name: Enforce required job results
-        env:
-          REQUIRED_RESULTS: ${{ toJSON(needs) }}
+        shell: bash
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-
-          jobs = json.loads(os.environ["REQUIRED_RESULTS"])
-          failed = {
-              name: data.get("result", "missing")
-              for name, data in jobs.items()
-              if data.get("result") != "success"
-          }
-          if failed:
-              print("required CI jobs did not succeed:", failed, file=sys.stderr)
-              raise SystemExit(1)
-          print("all required CI jobs succeeded:", sorted(jobs))
-          PY
+          set -euo pipefail
+          test "${{ needs.rust.result }}" = "success"
+          test "${{ needs.rust-windows.result }}" = "success"
+          test "${{ needs.go.result }}" = "success"
+          test "${{ needs.repository-policy.result }}" = "success"
+          echo "all required CI jobs succeeded"
