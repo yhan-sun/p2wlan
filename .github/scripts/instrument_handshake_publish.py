@@ -12,6 +12,14 @@ def replace_once(old: str, new: str, label: str) -> None:
     text = text.replace(old, new, 1)
 
 
+def replace_last(old: str, new: str, label: str) -> None:
+    global text
+    index = text.rfind(old)
+    if index < 0:
+        raise SystemExit(f"{label}: match not found")
+    text = text[:index] + new + text[index + len(old):]
+
+
 replace_once(
     """        let emit_guard = self
             .transport
@@ -54,7 +62,7 @@ replace_once(
     "emit and epoch boundaries",
 )
 
-replace_once(
+replace_last(
     """        let status = self.transport.session_status(&peer_info.node_id).await;
         if status.has_active || status.has_pending_responder {
 """,
@@ -73,7 +81,7 @@ replace_once(
         );
         if status.has_active || status.has_pending_responder {
 """,
-    "session status boundary",
+    "publish session status boundary",
 )
 
 replace_once(
