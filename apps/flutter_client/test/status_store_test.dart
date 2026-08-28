@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
@@ -66,62 +67,58 @@ void main() {
     },
   );
 
-  test(
-    'stable peer order puts online peers first and moves reconnected peers to the end',
-    () async {
-      final fixture = await _loadFixture();
-      final stores = await _makeStores(DiagnosticsApi());
-      addTearDown(stores.dispose);
+  test('stable peer order puts online peers first and moves reconnected peers to the end', () async {
+    final fixture = await _loadFixture();
+    final stores = await _makeStores(DiagnosticsApi());
+    addTearDown(stores.dispose);
 
-      final initial = stores.statusStore.stablePeerOrder(fixture.peers);
-      final firstOnline = initial.first;
-      expect(firstOnline.online, isTrue);
+    final initial = stores.statusStore.stablePeerOrder(fixture.peers);
+    final firstOnline = initial.first;
+    expect(firstOnline.online, isTrue);
 
-      final offlineRaw =
-          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
-      final offlinePeers = [
-        for (final item in offlineRaw['peers'] as List<dynamic>)
-          Map<String, dynamic>.from(item as Map),
-      ];
-      final firstOffline = offlinePeers.firstWhere(
-        (item) => item['node_id'] == firstOnline.nodeId,
-      );
-      firstOffline
-        ..['online'] = false
-        ..['state'] = 'unknown'
-        ..['active_path'] = null
-        ..['current_path_selection'] = null;
-      final offlineSnapshot = DiagnosticsSnapshot.fromJson(
-        offlineRaw..['peers'] = offlinePeers,
-      );
-      final whileOffline = stores.statusStore.stablePeerOrder(
-        offlineSnapshot.peers,
-      );
-      expect(whileOffline.last.nodeId, firstOnline.nodeId);
+    final offlineRaw =
+        jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+    final offlinePeers = [
+      for (final item in offlineRaw['peers'] as List<dynamic>)
+        Map<String, dynamic>.from(item as Map),
+    ];
+    final firstOffline = offlinePeers.firstWhere(
+      (item) => item['node_id'] == firstOnline.nodeId,
+    );
+    firstOffline
+      ..['online'] = false
+      ..['state'] = 'unknown'
+      ..['active_path'] = null
+      ..['current_path_selection'] = null;
+    final offlineSnapshot = DiagnosticsSnapshot.fromJson(
+      offlineRaw..['peers'] = offlinePeers,
+    );
+    final whileOffline = stores.statusStore.stablePeerOrder(
+      offlineSnapshot.peers,
+    );
+    expect(whileOffline.last.nodeId, firstOnline.nodeId);
 
-      final restoredRaw =
-          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
-      final restoredPeers = [
-        for (final item in restoredRaw['peers'] as List<dynamic>)
-          Map<String, dynamic>.from(item as Map),
-      ];
-      final restored = stores.statusStore.stablePeerOrder(
-        DiagnosticsSnapshot.fromJson(
-          restoredRaw..['peers'] = restoredPeers,
-        ).peers,
-      );
-      final restoredOnline = restored
-          .where((peer) => peer.online && peer.path != 'offline')
-          .toList();
-      expect(restoredOnline.last.nodeId, firstOnline.nodeId);
-      expect(
-        restored
-            .skipWhile((peer) => peer.online && peer.path != 'offline')
-            .every((peer) => !peer.online || peer.path == 'offline'),
-        isTrue,
-      );
-    },
-  );
+    final restoredRaw =
+        jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+    final restoredPeers = [
+      for (final item in restoredRaw['peers'] as List<dynamic>)
+        Map<String, dynamic>.from(item as Map),
+    ];
+    final restored = stores.statusStore.stablePeerOrder(
+      DiagnosticsSnapshot.fromJson(restoredRaw..['peers'] = restoredPeers)
+          .peers,
+    );
+    final restoredOnline = restored
+        .where((peer) => peer.online && peer.path != 'offline')
+        .toList();
+    expect(restoredOnline.last.nodeId, firstOnline.nodeId);
+    expect(
+      restored
+          .skipWhile((peer) => peer.online && peer.path != 'offline')
+          .every((peer) => !peer.online || peer.path == 'offline'),
+      isTrue,
+    );
+  });
 
   test('automatic refresh stays silent while work is in flight', () async {
     final fixture = await _loadFixture();
@@ -425,6 +422,52 @@ void main() {
   });
 
   test(
+    'mobile lifecycle stops background event polling and revalidates on resume',
+    () async {
+      final fixture = await _loadFixture();
+      final api = _LifecycleDiagnosticsApi(snapshot: fixture);
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      stores.statusStore.setAutoRefresh(enabled: true);
+      await _waitUntil(() => api.eventRequests.length == 1);
+      final statusCountBeforePause = api.statusFetchCount;
+
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.paused);
+      expect(stores.statusStore.appInForeground, isFalse);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(
+        api.eventRequests,
+        hasLength(1),
+        reason: 'backgrounding must not create another long poll',
+      );
+
+      // Resume while the pre-suspend request is still pending. The new event
+      // loop must not wait for that stale network future to reach its timeout.
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.resumed);
+      await _waitUntil(() => api.statusFetchCount > statusCountBeforePause);
+      await _waitUntil(() => api.eventRequests.length == 2);
+      expect(stores.statusStore.appInForeground, isTrue);
+      expect(
+        api.eventProcessIds.last,
+        fixture.processId,
+        reason:
+            'resume must rebuild the event cursor from the refreshed process',
+      );
+
+      // A late completion from the suspended network epoch is ignored and
+      // must not spawn a third request beside the current resumed loop.
+      api.completeEventRequest(0, fixture);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(api.eventRequests, hasLength(2));
+
+      stores.statusStore.setAutoRefresh(enabled: false);
+      api.completeEventRequest(1, fixture);
+    },
+  );
+
+  test(
     'event poll carries process identity and resets on daemon restart',
     () async {
       final fixture = await _loadFixture();
@@ -518,11 +561,9 @@ Future<void> _waitUntil(bool Function() predicate) async {
 }
 
 Future<DiagnosticsSnapshot> _loadFixture() async {
-  final raw =
-      jsonDecode(
-            await File('test/fixtures/status_connected.json').readAsString(),
-          )
-          as Map<String, dynamic>;
+  final raw = jsonDecode(
+    await File('test/fixtures/status_connected.json').readAsString(),
+  ) as Map<String, dynamic>;
   return DiagnosticsSnapshot.fromJson(raw);
 }
 
@@ -564,6 +605,41 @@ class _Stores {
     statusStore.dispose();
     settingsStore.dispose();
     if (directory.existsSync()) directory.deleteSync(recursive: true);
+  }
+}
+
+class _LifecycleDiagnosticsApi extends _SwitchingDiagnosticsApi {
+  _LifecycleDiagnosticsApi({required super.snapshot});
+
+  final eventRequests = <Completer<EventsResponse>>[];
+
+  @override
+  Future<EventsResponse> fetchEvents(
+    String diagnosticsUrl, {
+    int since = 0,
+    int? processId,
+    Duration timeout = const Duration(seconds: 30),
+  }) {
+    eventProcessIds.add(processId);
+    eventCursors.add(since);
+    final request = Completer<EventsResponse>();
+    eventRequests.add(request);
+    return request.future;
+  }
+
+  void completeEventRequest(int index, DiagnosticsSnapshot snapshot) {
+    final request = eventRequests[index];
+    if (request.isCompleted) return;
+    request.complete(
+      EventsResponse(
+        contractVersion: 1,
+        processId: snapshot.processId,
+        revision: snapshot.revision,
+        oldestSeq: snapshot.revision,
+        resetRequired: false,
+        events: const [],
+      ),
+    );
   }
 }
 
