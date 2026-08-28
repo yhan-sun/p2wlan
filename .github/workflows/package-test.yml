@@ -3,14 +3,25 @@ name: Package Test Builds
 on:
   workflow_dispatch:
   push:
-    branches:
-      - fix/hard-hard-birthday-validation
+    branches: [main]
     paths:
       - ".github/workflows/package-test.yml"
       - "apps/flutter_client/**"
       - "client/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "contracts/**"
+      - "scripts/build_android_native.sh"
+      - "scripts/release/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/package-test.yml"
+      - "apps/flutter_client/**"
+      - "client/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "contracts/**"
       - "scripts/build_android_native.sh"
       - "scripts/release/**"
 
@@ -18,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: package-test-${{ github.ref }}
+  group: package-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -95,8 +106,8 @@ jobs:
             --app-info "$app/Contents/Info.plist" \
             --expected-commit "$EXPECTED_COMMIT"
 
-          # Ad-hoc signing is sufficient for a local test DMG. It is not a
-          # notarized distribution build and may require Finder/Open Anyway.
+          # Ad-hoc signing is sufficient for CI packaging. Distribution
+          # notarization remains deliberately outside this task.
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
           ln -s /Applications "$work/Applications"
@@ -163,7 +174,8 @@ jobs:
       - name: Restore Flutter-managed source files
         run: bash scripts/release/hermetic_build.sh restore
 
-      - name: Configure Android release signing
+      - name: Configure stable Android release signing
+        if: github.event_name != 'pull_request'
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -186,10 +198,14 @@ jobs:
           EOF
           chmod 600 apps/flutter_client/android/key.properties
 
-      - name: Build arm64 signed APK
+      - name: Build arm64 APK
         working-directory: apps/flutter_client
         env:
           P2WLAN_ANDROID_ABIS: arm64-v8a
+          # Fork and same-repository PRs intentionally receive no release
+          # signing material. A debug-signed release-mode APK is sufficient to
+          # prove packaging; tagged releases retain stable signing.
+          P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: ${{ github.event_name == 'pull_request' && '1' || '0' }}
         run: |
           bash ../../scripts/release/build_flutter_client.sh apk \
             --release \
@@ -200,7 +216,7 @@ jobs:
       - name: Restore Flutter-managed source files after build
         run: bash scripts/release/hermetic_build.sh restore
 
-      - name: Verify and stage arm64 signed APK
+      - name: Verify and stage arm64 APK
         working-directory: apps/flutter_client
         run: |
           set -euo pipefail
@@ -220,10 +236,10 @@ jobs:
           sha256sum ../../dist-test/p2wlan-android-arm64-release.apk \
             > ../../dist-test/p2wlan-android-arm64-release.apk.sha256
 
-      - name: Upload Android signed test package
+      - name: Upload Android test package
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-android-arm64-signed-test
+          name: p2wlan-android-arm64-test
           path: dist-test/
           if-no-files-found: error
           retention-days: 14

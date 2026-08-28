@@ -2,9 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust:
@@ -61,8 +69,8 @@ jobs:
           cargo check --target x86_64-unknown-linux-gnu
       - name: Build Identity Gate
         # The built daemon must report the exact commit CI checked out, and
-        # --version must carry that commit too.  A drift here means /status.version
-        # could no longer prove which build is running.
+        # --version must carry that commit too. A drift here means
+        # /status.version could no longer prove which build is running.
         run: |
           cargo build -p p2wlan-daemon
           HEAD_SHA="$(git rev-parse HEAD)"
@@ -84,7 +92,7 @@ jobs:
           fi
           echo "build identity gate PASS (commit=$HEAD_SHA sha=$BIN_SHA)"
 
-  rust-windows:
+  rust_windows:
     name: Rust Check (Windows)
     runs-on: windows-latest
     steps:
@@ -133,15 +141,13 @@ jobs:
         with:
           go-version: '1.22'
       - name: Go Vet
-        run: |
-          cd server
-          go vet ./...
+        working-directory: server
+        run: go vet ./...
       - name: Go Test
-        run: |
-          cd server
-          go test ./... -count=1
+        working-directory: server
+        run: go test ./... -count=1
 
-  repository-policy:
+  repository_policy:
     name: React absence and security scan
     runs-on: ubuntu-latest
     steps:
@@ -169,3 +175,19 @@ jobs:
             echo "unsafe production credential transport found" >&2
             exit 1
           fi
+
+  required:
+    name: CI Required
+    if: always()
+    needs: [rust, rust_windows, go, repository_policy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce required job results
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.rust.result }}" = "success"
+          test "${{ needs.rust_windows.result }}" = "success"
+          test "${{ needs.go.result }}" = "success"
+          test "${{ needs.repository_policy.result }}" = "success"
+          echo "all required CI jobs succeeded"
