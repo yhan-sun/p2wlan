@@ -13,7 +13,7 @@ The required profile runs:
 - `direct-baseline`: deterministic direct traversal with no loss or reordering.
 - `relay-blackhole`: relay-only business traffic, proving that the harness does not accidentally count a Direct path.
 
-Each scenario receives its own port block, deterministic seed, log file, evidence directory, and result JSON. Existing evidence is never overwritten.
+Each scenario receives its own port block, deterministic seed, log file, evidence directory, and result JSON. Existing evidence is never overwritten. Each daemon also receives a separate configuration parent and diagnostics credential file; authenticated `/status` collection must use the credential belonging to that exact daemon process.
 
 ## Extended profile
 
