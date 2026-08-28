@@ -62,7 +62,7 @@ jobs:
             "$hard_hard_binary" "$test_name" --exact --test-threads=1
           done <<< "$hard_hard_tests"
       - name: Linux route gate tests
-        run: cargo test -p p2wlan-daemon --lib route::tests::
+        run: "cargo test -p p2wlan-daemon --lib route::tests::"
       - name: Rust Linux Target Cross-Compile Check
         run: |
           rustup target add x86_64-unknown-linux-gnu
