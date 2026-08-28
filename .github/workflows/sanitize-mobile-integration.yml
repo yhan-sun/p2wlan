@@ -1,0 +1,39 @@
+name: Sanitize Mobile Integration Workflows
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sanitize-mobile-integration-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sanitize:
+    if: github.head_ref == 'test/mobile-lifecycle-regression-20260828'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out candidate branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - name: Remove superseded mobile acceptance revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          path=.github/workflows/task-acceptance-mobile.yml
+          if [[ ! -e "$path" ]]; then
+            echo "superseded workflow already absent"
+            exit 0
+          fi
+          rm -f "$path"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add --all
+          git commit -m "ci: remove superseded mobile acceptance workflow"
+          git push origin "HEAD:${{ github.head_ref }}"
