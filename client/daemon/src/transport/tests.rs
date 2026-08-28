@@ -1833,7 +1833,19 @@ mod tests {
         );
         let connection = peers.get_connection("peer-a").await.unwrap();
         assert_eq!(connection.state, ConnectionState::Idle);
-        assert_eq!(connection.relay_server, None);
+        assert_eq!(
+            connection.relay_server.as_deref(),
+            Some("tls://relay.test:443"),
+            "decrypted Relay ingress is retained as health metadata"
+        );
+        assert_eq!(
+            connection.relay_confirmed_generation, None,
+            "an internal rekey confirmation must not confirm Relay delivery"
+        );
+        assert_eq!(
+            connection.active_path(), None,
+            "Relay observation metadata must not activate the Relay path"
+        );
 
         drop(encrypted_tx);
         worker.await.unwrap().unwrap();

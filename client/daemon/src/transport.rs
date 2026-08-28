@@ -3309,7 +3309,7 @@ impl WireGuardTransport {
                                         "ignored direct-validation packet from retired or unpublished UDP transport"
                                     );
                                 }
-                            } else if source.is_some() {
+                            } else if let Some(source) = source {
                                 if internal_rekey_confirmation {
                                     debug!(
                                         "Consumed internal WireGuard rekey confirmation from peer {} as endpoint evidence only; encrypted Direct validation is still required",
@@ -3318,11 +3318,9 @@ impl WireGuardTransport {
                                 }
                                 if should_request_direct_validation_after_decrypt(
                                     owns_direct_packet,
-                                    source,
+                                    Some(source),
                                     direct_validation,
                                 ) {
-                                    let source =
-                                        source.expect("source checked by validation predicate");
                                     let session_guard = self
                                         .acquire_current_session_evidence_guard(
                                             &inbound.peer_id,
@@ -3402,7 +3400,7 @@ impl WireGuardTransport {
                                         );
                                     }
                                     drop(session_guard);
-                                } else if source.is_some() && !owns_direct_packet {
+                                } else if !owns_direct_packet {
                                     debug!(
                                         peer_id = %inbound.peer_id,
                                         packet_owner = ?udp_transport_owner,
