@@ -18,6 +18,7 @@ include!("main/cli.rs");
 include!("main/validation.rs");
 include!("main/instance_lock.rs");
 include!("main/diagnostics_auth.rs");
+include!("main/lifecycle_probe.rs");
 include!("main/runtime.rs");
 include!("main/overrides.rs");
 include!("main/windows_elevation.rs");
