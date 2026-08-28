@@ -1,0 +1,31 @@
+name: Workflow Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Validate changed workflows
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color .github/workflows/ci.yml .github/workflows/package-test.yml .github/workflows/workflow-lint.yml
