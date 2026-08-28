@@ -61,7 +61,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git rm .github/workflows/apply-nat-topology-convergence-fix.yml
-          git rm .github/patches/nat-topology-convergence-fix.patch
+          git rm -f .github/patches/nat-topology-convergence-fix.patch
           git add -A
           git commit -m "fix(nat): converge direct validation and gated overlay traffic"
           git push origin HEAD:test/nat-topology-gate-v4-20260828
