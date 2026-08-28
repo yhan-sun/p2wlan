@@ -5,7 +5,7 @@ on:
     branches:
       - test/nat-topology-gate-v4-20260828
     paths:
-      - ".github/patches/nat-v4.patch"
+      - ".github/patches/nat-v4-ready"
 
 permissions:
   contents: write
@@ -18,11 +18,15 @@ jobs:
         with:
           ref: test/nat-topology-gate-v4-20260828
           fetch-depth: 0
-      - name: Apply reviewed code-only patch
+      - name: Apply reviewed code-only patches
         run: |
           set -euo pipefail
-          git apply --check .github/patches/nat-v4.patch
-          git apply .github/patches/nat-v4.patch
+          for patch in .github/patches/nat-v4-code-*.patch; do
+            git apply --check "$patch"
+          done
+          for patch in .github/patches/nat-v4-code-*.patch; do
+            git apply "$patch"
+          done
           bash -n scripts/nat-sim/nat-sim-smoke.sh
           bash -n scripts/nat-sim/run-ci-topology.sh
           git diff --check
