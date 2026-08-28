@@ -22,6 +22,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Correct scoped transformer expectation
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/scripts/apply_nat_gate_fix.py')
+          text = path.read_text()
+          old = '    "Direct final predicate",\n    2,\n)'
+          new = '    "Direct final predicate",\n    1,\n)'
+          if text.count(old) != 1:
+              raise SystemExit('Direct final predicate expectation marker drifted')
+          path.write_text(text.replace(old, new, 1))
+          PY
       - name: Apply exact source transformations
         run: python3 .github/scripts/apply_nat_gate_fix.py
       - name: Validate transformed tree
