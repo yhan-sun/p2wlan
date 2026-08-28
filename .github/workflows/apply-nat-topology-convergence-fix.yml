@@ -30,6 +30,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          patch = Path('.github/patches/nat-topology-convergence-fix.patch')
+          text = patch.read_text()
+          old = '''+                            } else {
+          +                                if internal_rekey_confirmation {
+          '''
+          new = '''+                            } else if source.is_some() {
+          +                                if internal_rekey_confirmation {
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('expected exactly one malformed direct-ingress branch in staged patch')
+          patch.write_text(text.replace(old, new, 1))
+          PY
           git apply --check .github/patches/nat-topology-convergence-fix.patch
           git apply .github/patches/nat-topology-convergence-fix.patch
           cargo fmt --all
