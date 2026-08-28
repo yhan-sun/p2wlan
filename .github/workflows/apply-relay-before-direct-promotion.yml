@@ -1,0 +1,56 @@
+name: Apply relay-before-Direct promotion ordering
+
+on:
+  push:
+    branches:
+      - test/nat-topology-gate-v4-20260828
+    paths:
+      - .github/workflows/apply-relay-before-direct-promotion.yml
+      - .github/scripts/apply_relay_before_direct_promotion.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-relay-before-direct-promotion
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/nat-topology-gate-v4-20260828
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply exact ordering fix
+        run: python3 .github/scripts/apply_relay_before_direct_promotion.py
+      - name: Validate daemon and deterministic Direct topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all --check
+          cargo clippy -p p2wlan-daemon --all-targets --all-features -- -D warnings
+          cargo test -p p2wlan-daemon --lib -- --test-threads=1
+          python3 scripts/nat-sim/test_nat_sim.py
+          bash scripts/nat-sim/run-ci-topology.sh direct
+          git diff --check
+      - name: Commit validated production change and remove applicator
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-relay-before-direct-promotion.yml
+          git rm .github/scripts/apply_relay_before_direct_promotion.py
+          git add client/daemon/src/peer/manager/direct_success.rs
+          git diff --cached --check
+          git commit -m "fix(path): require RelayPeerConfirmed before Direct promotion"
+          git push origin HEAD:test/nat-topology-gate-v4-20260828
