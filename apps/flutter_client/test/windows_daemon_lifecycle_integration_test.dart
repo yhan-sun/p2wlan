@@ -22,7 +22,8 @@ Future<ProcessResult> _runDaemon(String daemon, List<String> arguments) async {
   expect(
     result.exitCode,
     0,
-    reason: 'daemon lifecycle command failed\n'
+    reason:
+        'daemon lifecycle command failed\n'
         'args=$arguments\nstdout=${result.stdout}\nstderr=${result.stderr}',
   );
   return result;
@@ -38,13 +39,22 @@ void main() {
       final seenPids = <int>{};
       for (var cycle = 0; cycle < 12; cycle++) {
         final result = await _runDaemon(daemon!, const ['--binary-probe']);
-        final payload = jsonDecode(result.stdout as String) as Map<String, dynamic>;
-        expect(payload['status'], 'ok', reason: 'cycle=$cycle payload=$payload');
+        final payload =
+            jsonDecode(result.stdout as String) as Map<String, dynamic>;
+        expect(
+          payload['status'],
+          'ok',
+          reason: 'cycle=$cycle payload=$payload',
+        );
         expect(payload['protocol_version'], 1);
         final pid = payload['pid'] as int?;
         expect(pid, isNotNull);
         expect(pid, greaterThan(0));
-        expect(seenPids.add(pid!), isTrue, reason: 'cycle=$cycle reused pid=$pid');
+        expect(
+          seenPids.add(pid!),
+          isTrue,
+          reason: 'cycle=$cycle reused pid=$pid',
+        );
       }
     },
     skip: !Platform.isWindows,
