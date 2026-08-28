@@ -360,13 +360,48 @@ fn build_overlay_payload(direction: u8, nonce: u64, seq: u32) -> Vec<u8> {
     payload
 }
 
+fn overlay_validation_path_ready(
+    online: bool,
+    state: crate::peer::ConnectionState,
+    active_path: Option<crate::peer::NetworkPath>,
+    overlay_any_path: bool,
+) -> bool {
+    if !online {
+        return false;
+    }
+    match (state, active_path) {
+        (
+            crate::peer::ConnectionState::Direct,
+            Some(crate::peer::NetworkPath::Direct),
+        ) => true,
+        (
+            crate::peer::ConnectionState::Relay,
+            Some(crate::peer::NetworkPath::Relay),
+        ) if overlay_any_path => true,
+        _ => false,
+    }
+}
+
+fn overlay_validation_target_ready(
+    peer: &crate::peer::PeerDiagnostics,
+    overlay_any_path: bool,
+) -> bool {
+    overlay_validation_path_ready(
+        peer.online,
+        peer.state,
+        peer.active_path,
+        overlay_any_path,
+    )
+}
+
 /// Inject one payload per target peer into the production dataplane.
 ///
 /// In the default strict-direct mode only peers in `ConnectionState::Direct`
 /// are targeted, so the evidence always rides a confirmed Direct path.  In
-/// `any_path` mode every online peer is targeted and the outbound path selector
-/// rides Relay until Direct is confirmed — the availability mode's "first
-/// usable business packet" does not depend on a UDP punch succeeding.
+/// `any_path` mode targets peers only after the production state machine owns
+/// a confirmed Relay or Direct active path. This keeps the harness out of the
+/// startup queue while still allowing Relay to provide the availability proof
+/// before a UDP punch succeeds.
 ///
 /// Every sent nonce is recorded in the bounded registry so a later echo can be
 /// matched to THIS daemon's own request (peer + generation + validity).
@@ -385,14 +420,12 @@ async fn send_overlay_payloads(
     let mut sent = 0u64;
     let direct_peers = peers.diagnostics().await;
     for peer in direct_peers {
-        if overlay_any_path {
-            // Target online peers regardless of path; the transport skips
-            // peers without a ready WireGuard session (encrypt_and_emit_outbound
-            // returns `sent=false`), so the path selector makes the choice.
-            if !peer.online {
-                continue;
-            }
-        } else if peer.state != crate::peer::ConnectionState::Direct {
+        // This independent harness must measure loss only after the production
+        // path state machine owns a confirmed path. Injecting synthetic traffic
+        // while the peer is merely online pushes it into the bounded startup
+        // queue and can expire before Relay confirmation; that tests startup
+        // timing rather than the zero-loss Direct/Relay dataplane contract.
+        if !overlay_validation_target_ready(&peer, overlay_any_path) {
             continue;
         }
         let virtual_ip = peer.virtual_ip.clone();
@@ -827,6 +860,48 @@ fn crc32_business_payload(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod overlay_validate_tests {
     use super::*;
+
+    #[test]
+    fn overlay_validation_waits_for_a_confirmed_active_path() {
+        use crate::peer::{ConnectionState, NetworkPath};
+
+        assert!(!overlay_validation_path_ready(
+            true,
+            ConnectionState::Connecting,
+            None,
+            true,
+        ));
+        assert!(!overlay_validation_path_ready(
+            true,
+            ConnectionState::Relay,
+            None,
+            true,
+        ));
+        assert!(overlay_validation_path_ready(
+            true,
+            ConnectionState::Relay,
+            Some(NetworkPath::Relay),
+            true,
+        ));
+        assert!(!overlay_validation_path_ready(
+            true,
+            ConnectionState::Relay,
+            Some(NetworkPath::Relay),
+            false,
+        ));
+        assert!(overlay_validation_path_ready(
+            true,
+            ConnectionState::Direct,
+            Some(NetworkPath::Direct),
+            false,
+        ));
+        assert!(!overlay_validation_path_ready(
+            false,
+            ConnectionState::Direct,
+            Some(NetworkPath::Direct),
+            false,
+        ));
+    }
 
     #[test]
     fn overlay_payload_checksum_round_trip() {
