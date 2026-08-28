@@ -1,0 +1,91 @@
+name: Task Acceptance - NAT v3
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+
+concurrency:
+  group: task-acceptance-nat-v3-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  accept:
+    name: NAT v3 acceptance and merge
+    if: github.head_ref == 'test/nat-topology-gate-v3-20260828'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Wait for the complete acceptance set
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "CI Required"
+            "NAT Topology Required"
+            "Analyze and Test"
+            "Android arm64 Release APK"
+            "Linux x64 Release Bundle"
+            "macOS Release Apps"
+            "Windows x64 Release Bundle"
+            "iOS Compile"
+            "macOS arm64 test DMG"
+            "Android arm64 test APK"
+          )
+
+          for attempt in $(seq 1 120); do
+            checks="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+              --jq '.check_runs | map({name, status, conclusion})')"
+
+            failed=0
+            pending=0
+            for name in "${required[@]}"; do
+              state="$(jq -r --arg name "$name" '
+                [.[] | select(.name == $name)]
+                | if length == 0 then "missing"
+                  elif any(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "stale") then "failed"
+                  elif any(.status != "completed") then "pending"
+                  elif any(.conclusion == "success") then "success"
+                  else "pending" end
+              ' <<<"$checks")"
+              printf '%-36s %s\n' "$name" "$state"
+              case "$state" in
+                failed) failed=1 ;;
+                missing|pending) pending=1 ;;
+              esac
+            done
+
+            if [[ "$failed" -ne 0 ]]; then
+              echo "acceptance failed for $HEAD_SHA" >&2
+              exit 1
+            fi
+            if [[ "$pending" -eq 0 ]]; then
+              echo "complete acceptance set passed for $HEAD_SHA"
+              exit 0
+            fi
+            sleep 30
+          done
+
+          echo "acceptance checks did not converge for $HEAD_SHA" >&2
+          exit 1
+
+      - name: Verify PR still points at the accepted SHA
+        run: |
+          set -euo pipefail
+          current="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')"
+          test "$current" = "$HEAD_SHA"
+
+      - name: Merge accepted NAT topology task
+        run: gh pr merge "$PR" --repo "$REPO" --merge --match-head-commit "$HEAD_SHA"
