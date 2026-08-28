@@ -1,0 +1,518 @@
+--- a/client/daemon/src/lib/daemon/udp_direct.rs
++++ b/client/daemon/src/lib/daemon/udp_direct.rs
+@@ -1,6 +1,9 @@
+ #[derive(Clone)]
+ struct UdpDirectTaskContext {
+     udp_bind: SocketAddr,
++    /// Explicit loopback-only escape hatch for the deterministic NAT simulator.
++    /// Production configurations keep physical-interface pinning enabled.
++    fresh_mapping_harness_loopback: bool,
+     peers: Arc<PeerManager>,
+     control: ControlClient,
+     local_candidates: Arc<RwLock<Vec<String>>>,
+@@ -42,8 +45,25 @@
+     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+ }
+ 
++fn direct_socket_interface_for_bind(
++    environment: &crate::netenv::DirectRouteSnapshot,
++    udp_bind: SocketAddr,
++    fresh_mapping_harness_loopback: bool,
++) -> std::result::Result<Option<String>, String> {
++    // The deterministic simulator exposes its STUN observers on loopback and
++    // launches the daemon with an explicit test-only loopback flag. Pinning
++    // that socket to the physical interface makes loopback unreachable and
++    // turns the simulator into a false UdpBlocked result. Never relax the
++    // production default: both the test flag and a loopback bind are required.
++    if fresh_mapping_harness_loopback && udp_bind.ip().is_loopback() {
++        return Ok(None);
++    }
++    environment.direct_socket_interface()
++}
++
+ async fn run_udp_direct_task(ctx: UdpDirectTaskContext) -> Result<()> {
+     let excluded_interfaces = ctx.excluded_interfaces.clone();
++    let fresh_mapping_harness_loopback = ctx.fresh_mapping_harness_loopback;
+     run_udp_direct_task_with_binder(ctx, move |udp_bind, peers| {
+         let excluded_interfaces = excluded_interfaces.clone();
+         async move {
+@@ -59,10 +79,18 @@
+             // TUN is intentionally excluded from the diagnostic capture flag,
+             // but it must still never become the egress for its public control,
+             // STUN, or peer traffic.
+-            let outbound_interface = environment
+-                .direct_socket_interface()
+-                .map_err(DaemonError::Network)?;
+-            if let Some(interface) = outbound_interface.as_deref() {
++            let outbound_interface = direct_socket_interface_for_bind(
++                &environment,
++                udp_bind,
++                fresh_mapping_harness_loopback,
++            )
++            .map_err(DaemonError::Network)?;
++            if fresh_mapping_harness_loopback && udp_bind.ip().is_loopback() {
++                info!(
++                    bind = %udp_bind,
++                    "Using loopback routing for the explicit NAT simulator harness"
++                );
++            } else if let Some(interface) = outbound_interface.as_deref() {
+                 info!(
+                     interface,
+                     capture_interface = ?environment.capture_iface,
+@@ -210,6 +238,7 @@
+ ) -> Result<()> {
+     let UdpDirectTaskContext {
+         udp_bind: _,
++        fresh_mapping_harness_loopback: _,
+         peers,
+         control,
+         local_candidates,
+@@ -965,6 +994,57 @@
+     use super::*;
+ 
+     #[test]
++    fn nat_harness_loopback_does_not_pin_to_physical_interface() {
++        let environment = crate::netenv::DirectRouteSnapshot {
++            physical_route_interface: Some("eth0".to_string()),
++            ..Default::default()
++        };
++        assert_eq!(
++            direct_socket_interface_for_bind(
++                &environment,
++                "127.0.0.1:0".parse().unwrap(),
++                true,
++            )
++            .unwrap(),
++            None
++        );
++    }
++
++    #[test]
++    fn loopback_without_explicit_harness_flag_keeps_production_pinning() {
++        let environment = crate::netenv::DirectRouteSnapshot {
++            physical_route_interface: Some("eth0".to_string()),
++            ..Default::default()
++        };
++        assert_eq!(
++            direct_socket_interface_for_bind(
++                &environment,
++                "127.0.0.1:0".parse().unwrap(),
++                false,
++            )
++            .unwrap(),
++            Some("eth0".to_string())
++        );
++    }
++
++    #[test]
++    fn harness_flag_cannot_disable_pinning_for_non_loopback_bind() {
++        let environment = crate::netenv::DirectRouteSnapshot {
++            physical_route_interface: Some("eth0".to_string()),
++            ..Default::default()
++        };
++        assert_eq!(
++            direct_socket_interface_for_bind(
++                &environment,
++                "0.0.0.0:0".parse().unwrap(),
++                true,
++            )
++            .unwrap(),
++            Some("eth0".to_string())
++        );
++    }
++
++    #[test]
+     fn route_change_requires_two_matching_nonempty_observations() {
+         let baseline = vec!["default:en0:192.168.1.1".to_string()];
+         let changed = vec!["default:en5:192.168.0.1".to_string()];
+@@ -981,6 +1061,7 @@
+         let (udp_inbound_tx, _udp_inbound_rx) = mpsc::channel(8);
+         UdpDirectTaskContext {
+             udp_bind: "127.0.0.1:0".parse().unwrap(),
++            fresh_mapping_harness_loopback: false,
+             peers: daemon.peers.clone(),
+             control: ControlClient::disabled_for_test(),
+             local_candidates: daemon.local_candidates.clone(),
+--- a/client/daemon/src/lib/daemon/run.rs
++++ b/client/daemon/src/lib/daemon/run.rs
+@@ -488,6 +488,10 @@
+         let local_candidate_sources = self.local_candidate_sources.clone();
+         let udp_direct_context = UdpDirectTaskContext {
+             udp_bind,
++            fresh_mapping_harness_loopback: self
++                .config
++                .network
++                .fresh_mapping_harness_loopback,
+             peers: self.peers.clone(),
+             control: self.control.clone(),
+             local_candidates: self.local_candidates.clone(),
+--- a/scripts/nat-sim/nat-sim-smoke.sh
++++ b/scripts/nat-sim/nat-sim-smoke.sh
+@@ -230,7 +230,7 @@
+ # incomplete schema is an acceptance failure.  In particular, this function
+ # never writes `{}` as a substitute for missing status/metrics evidence.
+ fetch_required_json() {
+-  local url="$1" output="$2" kind="$3"
++  local url="$1" output="$2" kind="$3" token_file="${4:-}"
+   if [[ "$kind" == "status" && "$STATUS_FAILURE_INJECTION" == "1" ]]; then
+     echo "[nat-sim] FAIL reason_code=status_http_500_injected url=$url" >&2
+     return 1
+@@ -241,7 +241,11 @@
+   fi
+   local curl_status=0
+   if [[ "$kind" == "status" ]]; then
+-    DIAGNOSTICS_AUTH_TOKEN_FILE="$ROUND_DIR/p2wlan-daemon.diag-auth" \
++    if [[ -z "$token_file" || ! -s "$token_file" ]]; then
++      echo "[nat-sim] FAIL reason_code=status_auth_token_missing path=${token_file:-missing}" >&2
++      return 1
++    fi
++    DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
+       p2wlan_diagnostics_curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
+   else
+     curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
+@@ -329,7 +333,9 @@
+ for round in $(seq 1 "$ROUNDS"); do
+   round_num=$round
+   ROUND_DIR="$BASE_DIR/round-$round"
+-  mkdir -p "$ROUND_DIR"
++  NODE_A_RUNTIME="$ROUND_DIR/node-a-runtime"
++  NODE_B_RUNTIME="$ROUND_DIR/node-b-runtime"
++  mkdir -p "$ROUND_DIR" "$NODE_A_RUNTIME" "$NODE_B_RUNTIME"
+   NAT_SEED=$((NAT_SEED_BASE + round))
+   ROUND_RUN_ID="${NAT_SIM_RUN_ID}-round-${round}"
+ 
+@@ -456,7 +462,7 @@
+   if [[ "${PREFER_RELAY:-0}" == "1" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-only"; fi
+ 
+   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+-    --config "$ROUND_DIR/node-a.json" \
++    --config "$NODE_A_RUNTIME/config.json" \
+     --control "http://127.0.0.1:$PORT" \
+     --network "$NETWORK_ID" \
+     --token-stdin \
+@@ -479,7 +485,7 @@
+   done
+ 
+   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+-    --config "$ROUND_DIR/node-b.json" \
++    --config "$NODE_B_RUNTIME/config.json" \
+     --control "http://127.0.0.1:$PORT" \
+     --network "$NETWORK_ID" \
+     --token-stdin \
+@@ -555,8 +561,16 @@
+   END_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
+   ELAPSED_MS=$((END_MS - START_MS))
+   STATUS_SCHEMA_OK=1
+-  fetch_required_json "http://127.0.0.1:$DIAG_A_PORT/status" "$ROUND_DIR/node-a.status.json" status || STATUS_SCHEMA_OK=0
+-  fetch_required_json "http://127.0.0.1:$DIAG_B_PORT/status" "$ROUND_DIR/node-b.status.json" status || STATUS_SCHEMA_OK=0
++  fetch_required_json \
++    "http://127.0.0.1:$DIAG_A_PORT/status" \
++    "$ROUND_DIR/node-a.status.json" \
++    status \
++    "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" || STATUS_SCHEMA_OK=0
++  fetch_required_json \
++    "http://127.0.0.1:$DIAG_B_PORT/status" \
++    "$ROUND_DIR/node-b.status.json" \
++    status \
++    "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" || STATUS_SCHEMA_OK=0
+   METRICS_SCHEMA_OK=1
+   fetch_required_json "http://127.0.0.1:$((RELAY_METRICS_PORT))/metrics" "$ROUND_DIR/relay.metrics.json" metrics || METRICS_SCHEMA_OK=0
+ 
+--- a/scripts/nat-sim/run-ci-topology.sh
++++ b/scripts/nat-sim/run-ci-topology.sh
+@@ -0,0 +1,105 @@
++#!/usr/bin/env bash
++# Stable CI entry point for the deterministic NAT simulator.
++set -euo pipefail
++
++ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
++SMOKE="$ROOT_DIR/scripts/nat-sim/nat-sim-smoke.sh"
++PROFILE=${1:-unit}
++RUN_ID=${GITHUB_RUN_ID:-local-$$}
++RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT:-1}
++ARTIFACT_PARENT=${NAT_TOPOLOGY_ARTIFACT_ROOT:-${RUNNER_TEMP:-/tmp}}
++ARTIFACT_DIR="$ARTIFACT_PARENT/p2wlan-nat-topology-${RUN_ID}-${RUN_ATTEMPT}-${PROFILE}"
++LOG_FILE="${ARTIFACT_DIR}.log"
++RUN_NAME="nat-ci-${PROFILE}-${RUN_ID}-${RUN_ATTEMPT}"
++
++mkdir -p "$ARTIFACT_PARENT"
++if [[ -e "$ARTIFACT_DIR" || -e "$LOG_FILE" ]]; then
++  echo "[nat-ci] refusing to reuse artifact path: $ARTIFACT_DIR" >&2
++  exit 2
++fi
++
++run_smoke() {
++  local expected=$1
++  shift
++  local status
++
++  set +e
++  timeout --signal=TERM --kill-after=30s 20m \
++    env \
++      NETWORK_ID=default \
++      ROUNDS=1 \
++      NAT_SEED_BASE=20260828 \
++      NAT_SIM_RUN_ID="$RUN_NAME" \
++      NAT_SIM_ARTIFACT_DIR="$ARTIFACT_DIR" \
++      "$@" \
++      bash "$SMOKE" 2>&1 | tee "$LOG_FILE"
++  status=${PIPESTATUS[0]}
++  set -e
++
++  if [[ "$expected" == success ]]; then
++    if [[ "$status" -ne 0 ]]; then
++      echo "[nat-ci] profile=$PROFILE failed status=$status log=$LOG_FILE artifacts=$ARTIFACT_DIR" >&2
++      return "$status"
++    fi
++    echo "[nat-ci] profile=$PROFILE PASS log=$LOG_FILE artifacts=$ARTIFACT_DIR"
++    return 0
++  fi
++
++  if [[ "$status" -eq 0 ]]; then
++    echo "[nat-ci] profile=$PROFILE unexpectedly succeeded" >&2
++    return 1
++  fi
++  if ! grep -Eq 'reason_code=status_(http_500_injected|unavailable|schema_invalid|auth_token_missing)' "$LOG_FILE"; then
++    echo "[nat-ci] profile=$PROFILE failed without the expected fail-closed reason" >&2
++    return 1
++  fi
++  echo "[nat-ci] profile=$PROFILE PASS expected_failure_status=$status"
++}
++
++case "$PROFILE" in
++  unit)
++    bash -n "$SMOKE"
++    bash -n "$0"
++    python3 -m unittest discover \
++      -s "$ROOT_DIR/scripts/nat-sim" \
++      -p 'test_nat_sim.py' \
++      -v 2>&1 | tee "$LOG_FILE"
++    ;;
++  direct)
++    run_smoke success \
++      MODE=direct \
++      STEP_A=1 STEP_B=1 \
++      CONSUME_A=0 CONSUME_B=0 \
++      LOSS=0 REORDER=0 STRICT_FILTERING=0 \
++      DIRECT_TIMEOUT_S=90 \
++      OVERLAY_TIMEOUT_S=60 \
++      OVERLAY_BURST=32
++    ;;
++  relay)
++    run_smoke success \
++      MODE=relay-only \
++      STEP_A=1 STEP_B=1 \
++      CONSUME_A=0 CONSUME_B=0 \
++      LOSS=0 REORDER=0 STRICT_FILTERING=0 \
++      DIRECT_TIMEOUT_S=60 \
++      OVERLAY_TIMEOUT_S=90 \
++      OVERLAY_BURST=64 \
++      RELAY_COUNT=1
++    ;;
++  fail-closed)
++    run_smoke failure \
++      MODE=relay-only \
++      STEP_A=1 STEP_B=1 \
++      CONSUME_A=0 CONSUME_B=0 \
++      LOSS=0 REORDER=0 STRICT_FILTERING=0 \
++      DIRECT_TIMEOUT_S=60 \
++      OVERLAY_TIMEOUT_S=90 \
++      OVERLAY_BURST=16 \
++      RELAY_COUNT=1 \
++      STATUS_FAILURE_INJECTION=1
++    ;;
++  *)
++    echo "usage: $0 {unit|direct|relay|fail-closed}" >&2
++    exit 2
++    ;;
++esac
+--- a/.github/workflows/nat-topology-gate.yml
++++ b/.github/workflows/nat-topology-gate.yml
+@@ -0,0 +1,163 @@
++name: NAT Topology Gate
++
++on:
++  pull_request:
++    branches: [main]
++    paths:
++      - ".github/workflows/nat-topology-gate.yml"
++      - "scripts/nat-sim/**"
++      - "scripts/diagnostics-auth.sh"
++      - "client/nat/**"
++      - "client/daemon/**"
++      - "client/relay/**"
++      - "server/**"
++      - "contracts/**"
++      - "Cargo.toml"
++      - "Cargo.lock"
++  push:
++    branches: [main]
++    paths:
++      - ".github/workflows/nat-topology-gate.yml"
++      - "scripts/nat-sim/**"
++      - "scripts/diagnostics-auth.sh"
++      - "client/nat/**"
++      - "client/daemon/**"
++      - "client/relay/**"
++      - "server/**"
++      - "contracts/**"
++      - "Cargo.toml"
++      - "Cargo.lock"
++  schedule:
++    - cron: "23 18 * * *"
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++concurrency:
++  group: nat-topology-${{ github.event.pull_request.number || github.ref }}
++  cancel-in-progress: true
++
++env:
++  CARGO_TERM_COLOR: always
++
++jobs:
++  unit:
++    name: NAT simulator unit tests
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v4
++      - name: Run simulator parser and unit tests
++        run: bash scripts/nat-sim/run-ci-topology.sh unit
++      - name: Upload unit evidence
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: nat-topology-unit-${{ github.run_id }}-${{ github.run_attempt }}
++          path: ${{ runner.temp }}/p2wlan-nat-topology-*.log
++          if-no-files-found: error
++          retention-days: 14
++
++  direct:
++    name: Direct cold-start topology
++    needs: unit
++    runs-on: ubuntu-24.04
++    timeout-minutes: 25
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++      - uses: actions/setup-go@v5
++        with:
++          go-version: "1.22"
++      - uses: dtolnay/rust-toolchain@stable
++      - name: Install smoke dependencies
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y jq
++      - name: Run deterministic Direct topology
++        run: bash scripts/nat-sim/run-ci-topology.sh direct
++      - name: Upload Direct evidence
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: nat-topology-direct-${{ github.run_id }}-${{ github.run_attempt }}
++          path: |
++            ${{ runner.temp }}/p2wlan-nat-topology-*.log
++            ${{ runner.temp }}/p2wlan-nat-topology-*/**
++          if-no-files-found: error
++          retention-days: 14
++
++  relay:
++    name: Relay blackhole topology
++    needs: unit
++    runs-on: ubuntu-24.04
++    timeout-minutes: 25
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++      - uses: actions/setup-go@v5
++        with:
++          go-version: "1.22"
++      - uses: dtolnay/rust-toolchain@stable
++      - name: Install smoke dependencies
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y jq
++      - name: Run deterministic Relay topology
++        run: bash scripts/nat-sim/run-ci-topology.sh relay
++      - name: Upload Relay evidence
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: nat-topology-relay-${{ github.run_id }}-${{ github.run_attempt }}
++          path: |
++            ${{ runner.temp }}/p2wlan-nat-topology-*.log
++            ${{ runner.temp }}/p2wlan-nat-topology-*/**
++          if-no-files-found: error
++          retention-days: 14
++
++  fail_closed:
++    name: Observability fail-closed injection
++    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
++    needs: [unit]
++    runs-on: ubuntu-24.04
++    timeout-minutes: 25
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++      - uses: actions/setup-go@v5
++        with:
++          go-version: "1.22"
++      - uses: dtolnay/rust-toolchain@stable
++      - name: Install smoke dependencies
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y jq
++      - name: Prove missing status evidence fails closed
++        run: bash scripts/nat-sim/run-ci-topology.sh fail-closed
++      - name: Upload failure-injection evidence
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: nat-topology-fail-closed-${{ github.run_id }}-${{ github.run_attempt }}
++          path: |
++            ${{ runner.temp }}/p2wlan-nat-topology-*.log
++            ${{ runner.temp }}/p2wlan-nat-topology-*/**
++          if-no-files-found: error
++          retention-days: 14
++
++  required:
++    name: NAT Topology Required
++    if: always()
++    needs: [unit, direct, relay]
++    runs-on: ubuntu-latest
++    steps:
++      - name: Enforce required topology results
++        run: |
++          test "${{ needs.unit.result }}" = "success"
++          test "${{ needs.direct.result }}" = "success"
++          test "${{ needs.relay.result }}" = "success"
++          echo "all required NAT topology profiles succeeded"
+--- a/client/daemon/NAT_TOPOLOGY_CI.md
++++ b/client/daemon/NAT_TOPOLOGY_CI.md
+@@ -0,0 +1,21 @@
++# NAT topology CI contract
++
++The required pull-request gate runs three deterministic profiles: simulator
++unit tests, a cold-start Direct topology through two independent simulated NATs,
++and a Relay-only topology with Direct traffic blackholed. Every profile keeps
++its logs, status snapshots, connection timelines, and NAT trace as an artifact.
++
++The simulator intentionally binds daemon UDP and STUN endpoints to loopback.
++Production direct sockets remain pinned to the physical route interface. The
++existing `fresh_mapping_harness_loopback` flag is the only exception: when it
++is explicitly enabled **and** the UDP bind address is loopback, interface
++pinning is omitted so the process can reach the local simulator. A non-loopback
++bind can never use this exception.
++
++Each daemon gets a separate runtime/config directory. Consequently each
++process publishes a different diagnostics session token, and status evidence
++is fetched with the exact token belonging to that daemon. Missing, empty, or
++unauthenticated status evidence fails closed.
++
++The scheduled/manual profile also injects a status failure and passes only when
++the underlying smoke exits non-zero with a stable fail-closed reason code.
