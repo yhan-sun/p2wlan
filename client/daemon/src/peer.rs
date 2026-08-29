@@ -516,9 +516,9 @@ pub use types::{
 
 mod path_state_machine;
 pub(crate) use path_state_machine::{
-    DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity, PathEpoch, PathEvent,
-    PathRetention, PathStateMachine, PathStateMachineSnapshot, PathTransitionOutcome,
-    RelayConnectionIdentity,
+    ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,
+    PathEpoch, PathEvent, PathRetention, PathStateMachine, PathStateMachineSnapshot,
+    PathTransitionOutcome, PeerPathLifecycle, RelayConnectionIdentity,
 };
 
 include!("peer/connection/core.rs");

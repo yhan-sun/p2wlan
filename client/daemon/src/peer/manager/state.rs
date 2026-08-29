@@ -310,6 +310,13 @@ pub struct PeerManager {
     /// contended connection writer into a false empty roster; the snapshot is
     /// only a fallback while the live lock is unavailable.
     diagnostics_cache: Arc<std::sync::Mutex<Option<Vec<PeerDiagnostics>>>>,
+    /// No-await projection of the typed state machine's committed business
+    /// path. Unlike `diagnostics_cache`, this is updated at the sole path commit
+    /// point and therefore never reports stale readiness under writer pressure.
+    committed_business_paths:
+        Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
+    /// Latest-value notification for committed path/lifecycle/epoch changes.
+    committed_business_path_change_tx: tokio::sync::watch::Sender<u64>,
     /// Virtual IP → node ID mapping for routing.
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
     /// Monotonic local network generation. Incremented when local UDP candidates change.

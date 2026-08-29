@@ -425,6 +425,10 @@ impl PeerManager {
         // so its `transition` keeps the UDP eviction's nonevictable set fresh.
         conn.attach_direct_cache(self.direct_peers.clone());
         conn.attach_direct_pair_cache(self.direct_commit_pair_mirror.clone());
+        conn.attach_committed_business_path_cache(
+            self.committed_business_paths.clone(),
+            self.committed_business_path_change_tx.clone(),
+        );
 
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
@@ -755,6 +759,10 @@ impl PeerManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
             let removed_virtual_ip = conns.remove(node_id).map(|conn| conn.virtual_ip);
+            self.committed_business_paths
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id);
             // PeerLeft is a terminal boundary for the current peer session.
             // Cancel the forced-relay token while the same epoch gate covers
             // removal, so an old ACK cannot race a later re-add of this node

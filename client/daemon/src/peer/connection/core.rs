@@ -89,6 +89,31 @@ pub(crate) struct RelayFirstBusinessState {
     pub(crate) preconfirmation: Option<PendingRelayBusinessEvidence>,
 }
 
+/// No-await, generation-bound projection of one peer's committed business
+/// path. It contains typed state-machine values rather than compatibility
+/// booleans or an independently selected path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedBusinessPathSnapshot {
+    pub(crate) peer_id: String,
+    pub(crate) virtual_ip: String,
+    pub(crate) lifecycle: PeerPathLifecycle,
+    pub(crate) epoch: Option<PathEpoch>,
+    pub(crate) active: ActiveBusinessPath,
+}
+
+impl CommittedBusinessPathSnapshot {
+    pub(crate) fn active_path(&self) -> Option<NetworkPath> {
+        self.active.network_path()
+    }
+
+    pub(crate) fn is_online_in_generation(&self, generation: u64) -> bool {
+        self.lifecycle == PeerPathLifecycle::Online
+            && self
+                .epoch
+                .is_some_and(|epoch| epoch.network_generation == generation)
+    }
+}
+
 /// Information about a connection to a specific peer.
 #[derive(Debug, Clone)]
 pub struct PeerConnection {
@@ -255,6 +280,16 @@ pub struct PeerConnection {
     /// stale Hard↔Hard pair.
     direct_pair_cache:
         Option<Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>>,
+    /// Manager-owned, no-await projection of the committed typed path state.
+    /// The validation harness and future observability consumers read this
+    /// instead of treating a contended diagnostics cache as path authority.
+    committed_business_path_cache: Option<
+        Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
+    >,
+    /// Change stream for the committed-path projection. It is notified only
+    /// after the reducer commit and its infallible side effects have completed
+    /// under the connection writer.
+    committed_business_path_change_tx: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl PeerConnection {
@@ -401,6 +436,8 @@ impl PeerConnection {
             direct_events: Vec::new(),
             direct_cache: None,
             direct_pair_cache: None,
+            committed_business_path_cache: None,
+            committed_business_path_change_tx: None,
         }
     }
 
@@ -541,6 +578,7 @@ impl PeerConnection {
             self.connected_at = Some(Instant::now());
         }
         self.sync_direct_cache();
+        self.sync_committed_business_path_cache();
 
         if previous_state != new_state || previous_active != current_active {
             info!(target: "p2pnet_daemon::peer::connection",
@@ -607,6 +645,46 @@ impl PeerConnection {
     ) {
         self.direct_pair_cache = Some(cache);
         self.sync_direct_cache();
+    }
+
+    fn sync_committed_business_path_cache(&self) {
+        let Some(cache) = &self.committed_business_path_cache else {
+            return;
+        };
+        let path = self.path_state_machine.snapshot().state;
+        let snapshot = CommittedBusinessPathSnapshot {
+            peer_id: self.node_id.clone(),
+            virtual_ip: self.virtual_ip.clone(),
+            lifecycle: path.lifecycle,
+            epoch: path.epoch,
+            active: path.active,
+        };
+        let changed = {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache
+                .insert(self.node_id.clone(), snapshot.clone())
+                .as_ref()
+                != Some(&snapshot)
+        };
+        if changed {
+            if let Some(changes) = &self.committed_business_path_change_tx {
+                changes.send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+            }
+        }
+    }
+
+    /// Attach the manager's typed committed-path mirror and its lossless latest
+    /// value notification stream.
+    pub(crate) fn attach_committed_business_path_cache(
+        &mut self,
+        cache: Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
+        changes: tokio::sync::watch::Sender<u64>,
+    ) {
+        self.committed_business_path_cache = Some(cache);
+        self.committed_business_path_change_tx = Some(changes);
+        self.sync_committed_business_path_cache();
     }
 
     /// Current selected traffic path, if active.

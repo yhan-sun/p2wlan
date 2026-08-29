@@ -27,6 +27,7 @@ impl PeerManager {
         traversal_history_path: Option<PathBuf>,
         traversal_history: TraversalHistory,
     ) -> Self {
+        let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
@@ -35,6 +36,8 @@ impl PeerManager {
             #[cfg(test)]
             hard_hard_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
+            committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            committed_business_path_change_tx,
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),

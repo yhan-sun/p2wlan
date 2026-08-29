@@ -83,6 +83,12 @@ jobs:
       - name: Run initiator publish lock-order test
         run: cargo test -p p2wlan-daemon --lib tests::initiator_publish_releases_epoch_while_connection_writer_is_contended -- --exact --test-threads=1
 
+      - name: Run committed-path wake under diagnostics contention test
+        run: cargo test -p p2wlan-daemon --lib overlay_validate_tests::committed_path_notification_and_snapshot_bypass_stale_diagnostics -- --exact --test-threads=1
+
+      - name: Run strict-Direct echo commit-order test
+        run: cargo test -p p2wlan-daemon --lib overlay_validate_tests::strict_direct_echo_waits_for_local_direct_commit_without_sleep -- --exact --test-threads=1
+
   lifecycle_and_topology_gates:
     name: Existing lifecycle and topology gates
     if: github.event_name == 'pull_request'
