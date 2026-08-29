@@ -17,13 +17,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Package source tree
+      - name: Package reference source trees
         shell: bash
-        run: git archive --format=tar.gz --output=p2wlan-source.tar.gz HEAD
-      - name: Upload source snapshot
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz --output=/tmp/explicit-path-state-machine.tar.gz refs/remotes/origin/refactor/explicit-path-state-machine-20260828
+          git archive --format=tar.gz --output=/tmp/path-state-machine-core.tar.gz refs/remotes/origin/refactor/path-state-machine-core-20260828
+          git archive --format=tar.gz --output=/tmp/atomic-path-mtu-observability.tar.gz refs/remotes/origin/refactor/atomic-path-mtu-observability-20260828
+      - name: Upload reference source snapshots
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-source-${{ github.sha }}
-          path: p2wlan-source.tar.gz
+          name: p2wlan-path-state-reference-${{ github.sha }}
+          path: /tmp/*path*.tar.gz
           if-no-files-found: error
           retention-days: 1
