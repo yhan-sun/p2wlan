@@ -152,8 +152,9 @@ impl PeerManager {
             return false;
         }
         // An exact, decrypted validation ACK is authoritative evidence for
-        // this request/generation/endpoint.  Its RTT is recorded for path
-        // quality and the make-before-break selector can switch immediately.
+        // this request/generation and its authenticated observed endpoint. Its
+        // RTT is recorded for path quality and the make-before-break selector
+        // can switch immediately.
         // Probe-only ACKs still use the slow-candidate quarantine below; an
         // owned encrypted Request -> ACK is stronger evidence and must not be
         // hidden behind an arbitrary relay cooldown.
@@ -195,10 +196,7 @@ impl PeerManager {
                     Some(selected_endpoint_value),
                 )
             });
-            if validation_identity
-                .endpoint
-                .is_some_and(|expected| expected != selected_endpoint_value)
-            {
+            if validation_identity.commit_endpoint() != Some(selected_endpoint_value) {
                 return false;
             }
             if !conn.is_current_remote_endpoint(selected_endpoint_value) {

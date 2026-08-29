@@ -38,13 +38,31 @@ impl PathEpoch {
     }
 }
 
+/// Endpoint evidence carried by a Direct validation identity.
+///
+/// The request target and the authenticated ACK source are deliberately
+/// distinct. A NAT may allocate a peer-reflexive port after the request was
+/// sent, so encrypted/authenticated ACK evidence can legitimately commit an
+/// observed endpoint that differs from the original target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectEndpointEvidence {
+    RequestPending,
+    AuthenticatedAck {
+        observed_endpoint: SocketAddr,
+    },
+    Compatibility {
+        selected_endpoint: Option<SocketAddr>,
+    },
+}
+
 /// Process-local identity of an encrypted Direct validation transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectValidationIdentity {
     pub(crate) epoch: PathEpoch,
     pub(crate) owner_token: Option<u64>,
     pub(crate) request_id: Option<u16>,
-    pub(crate) endpoint: Option<SocketAddr>,
+    request_endpoint: Option<SocketAddr>,
+    endpoint_evidence: DirectEndpointEvidence,
 }
 
 impl DirectValidationIdentity {
@@ -58,7 +76,26 @@ impl DirectValidationIdentity {
             epoch,
             owner_token: Some(owner_token),
             request_id,
-            endpoint,
+            request_endpoint: endpoint,
+            endpoint_evidence: DirectEndpointEvidence::RequestPending,
+        }
+    }
+
+    /// Build commit evidence only after the encrypted ACK expectation has
+    /// authenticated `observed_endpoint` for this exact request identity.
+    pub(crate) const fn authenticated_ack(
+        epoch: PathEpoch,
+        owner_token: u64,
+        request_id: u16,
+        request_endpoint: Option<SocketAddr>,
+        observed_endpoint: SocketAddr,
+    ) -> Self {
+        Self {
+            epoch,
+            owner_token: Some(owner_token),
+            request_id: Some(request_id),
+            request_endpoint,
+            endpoint_evidence: DirectEndpointEvidence::AuthenticatedAck { observed_endpoint },
         }
     }
 
@@ -67,8 +104,40 @@ impl DirectValidationIdentity {
             epoch,
             owner_token: None,
             request_id: None,
-            endpoint,
+            request_endpoint: endpoint,
+            endpoint_evidence: DirectEndpointEvidence::Compatibility {
+                selected_endpoint: endpoint,
+            },
         }
+    }
+
+    pub(crate) const fn request_endpoint(self) -> Option<SocketAddr> {
+        self.request_endpoint
+    }
+
+    pub(crate) const fn commit_endpoint(self) -> Option<SocketAddr> {
+        match self.endpoint_evidence {
+            DirectEndpointEvidence::RequestPending => None,
+            DirectEndpointEvidence::AuthenticatedAck { observed_endpoint } => {
+                Some(observed_endpoint)
+            }
+            DirectEndpointEvidence::Compatibility { selected_endpoint } => selected_endpoint,
+        }
+    }
+
+    fn can_start_validation(self) -> bool {
+        matches!(
+            self.endpoint_evidence,
+            DirectEndpointEvidence::RequestPending
+        )
+    }
+
+    fn can_commit(self) -> bool {
+        matches!(
+            (self.owner_token, self.endpoint_evidence),
+            (Some(_), DirectEndpointEvidence::AuthenticatedAck { .. })
+                | (None, DirectEndpointEvidence::Compatibility { .. })
+        )
     }
 
     fn with_epoch(self, epoch: PathEpoch) -> Self {
@@ -84,6 +153,13 @@ impl DirectValidationIdentity {
             (None, None) => true,
             _ => false,
         }
+    }
+
+    fn same_validation_request(self, other: Self) -> bool {
+        self.epoch == other.epoch
+            && self.owner_token == other.owner_token
+            && self.request_id == other.request_id
+            && self.request_endpoint == other.request_endpoint
     }
 }
 
@@ -983,8 +1059,11 @@ impl PathStateMachine {
         next: &mut PathState,
         validation: DirectValidationIdentity,
     ) -> Result<(), PathTransitionDecision> {
+        if !validation.can_start_validation() {
+            return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
+        }
         if let DirectPathState::Committed(current) = self.state.direct {
-            return if current == validation {
+            return if current.same_validation_request(validation) {
                 Ok(())
             } else {
                 Err(PathTransitionDecision::RejectedDirectValidationIdentity)
@@ -1012,21 +1091,27 @@ impl PathStateMachine {
         next: &mut PathState,
         validation: DirectValidationIdentity,
     ) -> Result<(), PathTransitionDecision> {
+        if !validation.can_commit() {
+            return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
+        }
         match self.state.direct {
             DirectPathState::Validating(current) => {
-                if current != validation {
+                if !current.same_validation_request(validation) {
                     return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
                 }
             }
             DirectPathState::Committed(current) => {
                 let compatibility_replacement =
                     current.owner_token.is_none() && validation.owner_token.is_none();
-                if current != validation && !compatibility_replacement {
+                if current != validation
+                    && !current.same_validation_request(validation)
+                    && !compatibility_replacement
+                {
                     return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
                 }
                 // A second ACK from the same validation owner is duplicate
                 // evidence. Preserve the first atomic commit and its endpoint.
-                if current == validation {
+                if current == validation || current.same_validation_request(validation) {
                     return Ok(());
                 }
             }
@@ -1388,12 +1473,34 @@ mod tests {
         )
     }
 
+    fn authenticated_ack(
+        validation: DirectValidationIdentity,
+        observed_endpoint: SocketAddr,
+    ) -> DirectValidationIdentity {
+        DirectValidationIdentity::authenticated_ack(
+            validation.epoch,
+            validation.owner_token.unwrap(),
+            validation.request_id.unwrap(),
+            validation.request_endpoint(),
+            observed_endpoint,
+        )
+    }
+
+    fn matching_ack(validation: DirectValidationIdentity) -> DirectValidationIdentity {
+        authenticated_ack(validation, validation.request_endpoint().unwrap())
+    }
+
     fn commit_direct(
         machine: &mut PathStateMachine,
         validation: DirectValidationIdentity,
     ) -> PathTransitionOutcome {
         assert!(commit(machine, PathEvent::DirectValidationStarted { validation },).accepted());
-        commit(machine, PathEvent::DirectCommitted { validation })
+        commit(
+            machine,
+            PathEvent::DirectCommitted {
+                validation: matching_ack(validation),
+            },
+        )
     }
 
     #[test]
@@ -1425,7 +1532,7 @@ mod tests {
             let outcome = commit(
                 &mut machine,
                 PathEvent::DirectCommitted {
-                    validation: validation(stale, 1, 2),
+                    validation: matching_ack(validation(stale, 1, 2)),
                 },
             );
             assert_eq!(outcome.decision, expected);
@@ -1446,7 +1553,7 @@ mod tests {
         let stale_owner = commit(
             &mut machine,
             PathEvent::DirectCommitted {
-                validation: validation(current, 21, 2),
+                validation: matching_ack(validation(current, 21, 2)),
             },
         );
         assert_eq!(
@@ -1456,7 +1563,7 @@ mod tests {
         let stale_request = commit(
             &mut machine,
             PathEvent::DirectCommitted {
-                validation: validation(current, 22, 2),
+                validation: matching_ack(validation(current, 22, 2)),
             },
         );
         assert_eq!(
@@ -1466,7 +1573,7 @@ mod tests {
         assert!(commit(
             &mut machine,
             PathEvent::DirectCommitted {
-                validation: current_validation,
+                validation: matching_ack(current_validation),
             },
         )
         .accepted());
@@ -1474,7 +1581,7 @@ mod tests {
             commit(
                 &mut machine,
                 PathEvent::DirectCommitted {
-                    validation: validation(current, 21, 2),
+                    validation: matching_ack(validation(current, 21, 2)),
                 },
             )
             .decision,
@@ -1485,6 +1592,66 @@ mod tests {
                 &mut machine,
                 PathEvent::DirectValidationStarted {
                     validation: validation(current, 23, 4),
+                },
+            )
+            .decision,
+            PathTransitionDecision::RejectedDirectValidationIdentity
+        );
+    }
+
+    #[test]
+    fn authenticated_direct_ack_endpoint_drift_commits_exact_request_identity() {
+        let current = epoch(7, 11, 13);
+        let request_endpoint: SocketAddr = "127.0.0.1:46004".parse().unwrap();
+        let observed_endpoint: SocketAddr = "127.0.0.1:46005".parse().unwrap();
+        let request =
+            DirectValidationIdentity::owned(current, 22, Some(0x4401), Some(request_endpoint));
+        let ack = authenticated_ack(request, observed_endpoint);
+        let mut machine = online_machine(current);
+
+        assert_eq!(
+            commit(
+                &mut machine,
+                PathEvent::DirectCommitted {
+                    validation: request,
+                },
+            )
+            .decision,
+            PathTransitionDecision::RejectedDirectValidationIdentity,
+            "a pending request is not authenticated commit evidence"
+        );
+        assert!(commit(
+            &mut machine,
+            PathEvent::DirectValidationStarted {
+                validation: request,
+            },
+        )
+        .accepted());
+        let committed = commit(&mut machine, PathEvent::DirectCommitted { validation: ack });
+        assert!(committed.accepted());
+        assert!(matches!(
+            committed.snapshot.state.active,
+            ActiveBusinessPath::Direct(identity)
+                if identity.request_endpoint() == Some(request_endpoint)
+                    && identity.commit_endpoint() == Some(observed_endpoint)
+        ));
+
+        let duplicate = commit(&mut machine, PathEvent::DirectCommitted { validation: ack });
+        assert_eq!(duplicate.decision, PathTransitionDecision::Noop);
+        assert_eq!(duplicate.snapshot.revision, committed.snapshot.revision);
+
+        let wrong_request_endpoint = DirectValidationIdentity::authenticated_ack(
+            current,
+            22,
+            0x4401,
+            Some("127.0.0.1:46006".parse().unwrap()),
+            observed_endpoint,
+        );
+        assert_eq!(
+            commit(
+                &mut machine,
+                PathEvent::DirectCommitted {
+                    validation: wrong_request_endpoint,
                 },
             )
             .decision,
@@ -1541,7 +1708,7 @@ mod tests {
         let outcome = commit(
             &mut machine,
             PathEvent::DirectCommitted {
-                validation: validation(first, 9, 1),
+                validation: matching_ack(validation(first, 9, 1)),
             },
         );
         assert_eq!(
@@ -1573,7 +1740,7 @@ mod tests {
         let outcome = commit(
             &mut machine,
             PathEvent::DirectCommitted {
-                validation: in_flight,
+                validation: matching_ack(in_flight),
             },
         );
         assert_eq!(
@@ -1644,17 +1811,22 @@ mod tests {
             let mut machine = online_machine(current);
             let relay = relay(current, "relay.test:443", 71);
             let direct = validation(current, 88, 5);
+            let direct_ack = matching_ack(direct);
             let events = if direct_first {
                 vec![
                     PathEvent::DirectValidationStarted { validation: direct },
-                    PathEvent::DirectCommitted { validation: direct },
+                    PathEvent::DirectCommitted {
+                        validation: direct_ack,
+                    },
                     PathEvent::RelayPeerConfirmed { relay },
                 ]
             } else {
                 vec![
                     PathEvent::RelayPeerConfirmed { relay },
                     PathEvent::DirectValidationStarted { validation: direct },
-                    PathEvent::DirectCommitted { validation: direct },
+                    PathEvent::DirectCommitted {
+                        validation: direct_ack,
+                    },
                 ]
             };
             for event in events {
@@ -1748,7 +1920,7 @@ mod tests {
                 attempt: DirectAttemptNumber(1),
             },
             PathEvent::DirectCommitted {
-                validation: validation(old, 1, 1),
+                validation: matching_ack(validation(old, 1, 1)),
             },
             PathEvent::DirectRetryScheduled {
                 epoch: old,
@@ -1765,7 +1937,7 @@ mod tests {
             commit(
                 &mut machine,
                 PathEvent::DirectCommitted {
-                    validation: validation(old, 1, 1),
+                    validation: matching_ack(validation(old, 1, 1)),
                 },
             )
             .decision,

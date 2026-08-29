@@ -1910,7 +1910,7 @@ impl UdpTransport {
             .owner_token
             .expect("Direct validation send identity has an owner token");
         let endpoint = validation
-            .endpoint
+            .request_endpoint()
             .expect("Direct validation send identity has an endpoint");
         let (socket_index, socket, lease) = self
             .resolve_send_socket_with_lease(peer_id)

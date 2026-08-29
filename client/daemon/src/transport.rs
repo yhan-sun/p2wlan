@@ -4272,15 +4272,16 @@ impl WireGuardTransport {
                         local_endpoint,
                         validation_latency,
                         Some(expectation.remote_candidate_epoch),
-                        Some(crate::peer::DirectValidationIdentity::owned(
+                        Some(crate::peer::DirectValidationIdentity::authenticated_ack(
                             crate::peer::PathEpoch::new(
                                 expectation.generation,
                                 expectation.peer_session_generation,
                                 expectation.remote_candidate_epoch,
                             ),
                             expectation.owner_token,
-                            Some(expectation.request_id),
-                            Some(source),
+                            expectation.request_id,
+                            expectation.endpoint,
+                            source,
                         )),
                     )
                     .await;

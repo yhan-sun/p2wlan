@@ -71,6 +71,9 @@ jobs:
       - name: Run late Direct ACK lifecycle test
         run: cargo test -p p2wlan-daemon --lib transport::tests::old_generation_validation_ack_cannot_promote_or_adopt_affinity -- --exact --test-threads=1
 
+      - name: Run authenticated Direct endpoint drift test
+        run: cargo test -p p2wlan-daemon --lib transport::tests::authenticated_validation_ack_endpoint_drift_promotes_observed_endpoint -- --exact --test-threads=1
+
       - name: Run Relay incarnation test
         run: cargo test -p p2wlan-daemon --lib tests::test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack -- --exact --test-threads=1
 
