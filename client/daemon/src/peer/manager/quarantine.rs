@@ -168,33 +168,59 @@ impl PeerManager {
         // relay, so a future relay path needs a fresh forced-probe
         // confirmation.  Direct stays authoritative.
         {
+            let generation = self.current_network_generation_sync();
+            let peer_session_generation = self.peer_session_generation_any_sync(peer_id);
             let mut conns = self.connections.write().await;
             if let Some(conn) = conns.get_mut(peer_id) {
                 let relay_confirmed = conn.relay_confirmed_at.is_some();
-                // Clear readiness even when no probe ACK ever confirmed it.
-                // Otherwise a transport published immediately before the
-                // quarantine boundary survives as a stale READY incarnation.
-                conn.relay_confirmed_at = None;
-                conn.relay_confirmed_generation = None;
-                conn.relay_confirmed_endpoint = None;
-                conn.relay_confirmed_connection_id = None;
-                conn.relay_first.gate_generation = None;
-                conn.relay_first.gate_started_at = None;
-                conn.relay_first.business_sent_generation = None;
-                conn.relay_first.business_received_generation = None;
-                conn.relay_first.business_exchange_generation = None;
-                conn.relay_first.business_pathcommit_generation = None;
-                conn.relay_first.preconfirmation = None;
-                conn.relay_ready_generation = None;
-                conn.relay_ready_at = None;
-                conn.relay_ready_endpoint = None;
-                conn.relay_ready_connection_id = None;
-                if relay_confirmed {
-                    conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
-                    if conn.state == ConnectionState::Relay {
-                        conn.transition(ConnectionState::FallbackToRelay);
-                    }
-                    self.bump_relay_confirm_seq(peer_id);
+                let Some(peer_session_generation) = peer_session_generation else {
+                    return;
+                };
+                let relay_identity = RelayConnectionIdentity::new(
+                    PathEpoch::new(
+                        generation,
+                        peer_session_generation,
+                        conn.remote_candidate_epoch(),
+                    ),
+                    conn.relay_confirmed_endpoint
+                        .clone()
+                        .or_else(|| conn.relay_ready_endpoint.clone())
+                        .or_else(|| conn.relay_server.clone())
+                        .unwrap_or_else(|| "compatibility-relay".to_string()),
+                    conn.relay_confirmed_connection_id
+                        .or(conn.relay_ready_connection_id),
+                );
+                let outcome = conn.commit_path_transition(
+                    PathEvent::RelayTransportLost {
+                        relay: relay_identity,
+                    },
+                    |conn| {
+                        // Clear readiness even when no probe ACK ever confirmed it.
+                        // Otherwise a transport published immediately before the
+                        // quarantine boundary survives as a stale READY incarnation.
+                        conn.relay_confirmed_at = None;
+                        conn.relay_confirmed_generation = None;
+                        conn.relay_confirmed_endpoint = None;
+                        conn.relay_confirmed_connection_id = None;
+                        conn.relay_first.gate_generation = None;
+                        conn.relay_first.gate_started_at = None;
+                        conn.relay_first.business_sent_generation = None;
+                        conn.relay_first.business_received_generation = None;
+                        conn.relay_first.business_exchange_generation = None;
+                        conn.relay_first.business_pathcommit_generation = None;
+                        conn.relay_first.preconfirmation = None;
+                        conn.relay_ready_generation = None;
+                        conn.relay_ready_at = None;
+                        conn.relay_ready_endpoint = None;
+                        conn.relay_ready_connection_id = None;
+                        if relay_confirmed {
+                            conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
+                            self.bump_relay_confirm_seq(peer_id);
+                        }
+                    },
+                );
+                if !outcome.accepted() {
+                    return;
                 }
             }
         }

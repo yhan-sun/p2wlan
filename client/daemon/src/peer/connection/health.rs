@@ -373,6 +373,31 @@ impl PeerConnection {
     fn mark_network_generation_changed(
         &mut self,
         local_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        reason: impl Into<String>,
+    ) {
+        let epoch = PathEpoch::new(
+            local_generation,
+            peer_session_generation,
+            self.remote_candidate_epoch,
+        );
+        let reason = reason.into();
+        self.commit_path_transition(
+            PathEvent::NetworkGenerationAdvanced {
+                epoch,
+                retained: PathRetention::None,
+            },
+            |conn| {
+                conn.direct_health.record_generation_change(reason.clone());
+                conn.relay_health.record_generation_change(reason.clone());
+                conn.apply_network_generation_changed(local_generation, reason);
+            },
+        );
+    }
+
+    fn apply_network_generation_changed(
+        &mut self,
+        local_generation: u64,
         reason: impl Into<String>,
     ) {
         let reason = reason.into();
@@ -428,9 +453,6 @@ impl PeerConnection {
             self.relay_first.business_pathcommit_generation = None;
             self.relay_first.preconfirmation = None;
             self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
-            if self.state == ConnectionState::Relay {
-                self.transition(ConnectionState::FallbackToRelay);
-            }
         }
         self.candidate_pairs
             .retain(|pair| pair.local_generation.saturating_add(1) >= local_generation);
@@ -476,12 +498,46 @@ impl PeerConnection {
     pub(super) fn mark_remote_transport_handover(
         &mut self,
         local_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
         reason: impl Into<String>,
     ) -> u64 {
+        if self.path_state_machine.current_epoch().is_none() {
+            self.commit_path_transition(
+                PathEvent::PeerOnline {
+                    epoch: PathEpoch::new(
+                        local_generation,
+                        peer_session_generation,
+                        self.remote_candidate_epoch,
+                    ),
+                },
+                |_| {},
+            );
+        }
+        let next_epoch = self.remote_candidate_epoch.wrapping_add(1).max(1);
+        let event = PathEvent::RemoteCandidateEpochAdvanced {
+            epoch: PathEpoch::new(local_generation, peer_session_generation, next_epoch),
+            direct: DirectCandidateContinuity::Invalidate,
+        };
+        let reason = reason.into();
+        let outcome = self.commit_path_transition(event, |conn| {
+            conn.apply_remote_transport_handover(local_generation, next_epoch, reason)
+        });
+        if outcome.accepted() {
+            next_epoch
+        } else {
+            self.remote_candidate_epoch
+        }
+    }
+
+    fn apply_remote_transport_handover(
+        &mut self,
+        local_generation: u64,
+        next_epoch: u64,
+        reason: impl Into<String>,
+    ) {
         let reason = reason.into();
         let peer_id = self.node_id.clone();
         let previous_epoch = self.remote_candidate_epoch;
-        let next_epoch = self.remote_candidate_epoch.wrapping_add(1).max(1);
         self.remote_candidate_epoch = next_epoch;
         // The profile was captured for the previous remote candidate context.
         // It must be published again before it can authorize a new
@@ -504,9 +560,6 @@ impl PeerConnection {
         self.endpoint = None;
         self.direct_reclaim_until = None;
         self.last_path_selection = None;
-        if self.state == ConnectionState::Direct {
-            self.transition(ConnectionState::FallbackToRelay);
-        }
         self.record_direct_event(
             local_generation,
             "remote_candidates_invalidated",
@@ -517,7 +570,6 @@ impl PeerConnection {
                 "remote candidate epoch advanced from {previous_epoch} to {next_epoch}; old Direct evidence fenced: {reason}"
             ),
         );
-        next_epoch
     }
 
     /// Keep an encrypted-confirmed Direct transport across a newer candidate
@@ -556,6 +608,48 @@ impl PeerConnection {
     }
 
     fn mark_candidate_refresh_generation_changed(
+        &mut self,
+        local_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        reason: impl Into<String>,
+    ) -> bool {
+        let retains_direct = self.state == ConnectionState::Direct
+            && self
+                .candidate_pairs
+                .iter()
+                .any(should_retain_confirmed_direct_pair_on_candidate_refresh);
+        let retains_relay = self.relay_confirmed_at.is_some()
+            && self.relay_confirmed_endpoint.is_some();
+        let retained = match (retains_direct, retains_relay) {
+            (false, false) => PathRetention::None,
+            (true, false) => PathRetention::Direct,
+            (false, true) => PathRetention::Relay,
+            (true, true) => PathRetention::DirectAndRelay,
+        };
+        let epoch = PathEpoch::new(
+            local_generation,
+            peer_session_generation,
+            self.remote_candidate_epoch,
+        );
+        let reason = reason.into();
+        let mut retained_confirmed_direct = false;
+        let outcome = self.commit_path_transition(
+            PathEvent::NetworkGenerationAdvanced { epoch, retained },
+            |conn| {
+                retained_confirmed_direct = conn.apply_candidate_refresh_generation_changed(
+                    local_generation,
+                    reason.clone(),
+                );
+                if !retained_confirmed_direct {
+                    conn.direct_health.record_generation_change(reason.clone());
+                }
+                conn.relay_health.record_generation_change(reason);
+            },
+        );
+        outcome.accepted() && retained_confirmed_direct
+    }
+
+    fn apply_candidate_refresh_generation_changed(
         &mut self,
         local_generation: u64,
         reason: impl Into<String>,

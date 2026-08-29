@@ -677,6 +677,26 @@ async fn run_direct_encrypted_validation_session(
         generation,
         "encrypted direct-validation session started"
     );
+    if !peers
+        .mark_direct_validation_started(
+            &peer_id,
+            crate::peer::DirectValidationIdentity::owned(
+                crate::peer::PathEpoch::new(
+                    generation,
+                    initial_target.peer_session_generation,
+                    initial_target.remote_candidate_epoch,
+                ),
+                owner_token,
+                None,
+                Some(initial_target.endpoint),
+            ),
+        )
+        .await
+    {
+        udp.finish_direct_validation_session(&peer_id, owner_token)
+            .await;
+        return;
+    }
     record_validation_event(
         &peers,
         &peer_id,
@@ -907,11 +927,16 @@ async fn run_direct_encrypted_validation_session(
         let prepared = match udp
             .prepare_direct_validation_send(
                 &peer_id,
-                request_id,
-                generation,
-                target.remote_candidate_epoch,
-                owner_token,
-                target.endpoint,
+                crate::peer::DirectValidationIdentity::owned(
+                    crate::peer::PathEpoch::new(
+                        generation,
+                        target.peer_session_generation,
+                        target.remote_candidate_epoch,
+                    ),
+                    owner_token,
+                    Some(request_id),
+                    Some(target.endpoint),
+                ),
             )
             .await
         {

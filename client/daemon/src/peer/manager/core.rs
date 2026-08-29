@@ -556,6 +556,16 @@ impl PeerManager {
             .active_generation(node_id)
     }
 
+    fn peer_session_generation_any_sync(
+        &self,
+        node_id: &str,
+    ) -> Option<PeerSessionGeneration> {
+        self.peer_membership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation(node_id)
+    }
+
     /// Hold the connection writer for deterministic lock-contention tests.
     /// Production code never needs to expose this guard; the test-only helper
     /// makes it possible to prove timing-sensitive paths do not await this
@@ -656,15 +666,19 @@ impl PeerManager {
         let mut relay_confirmation_cancellations = Vec::new();
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
+            let Some(peer_session_generation) =
+                self.peer_session_generation_any_sync(&conn.node_id)
+            else {
+                continue;
+            };
             let had_relay_confirmation = conn.relay_confirmed_at.is_some();
-            conn.direct_health.record_generation_change(reason.clone());
-            conn.relay_health.record_generation_change(reason.clone());
-            conn.mark_network_generation_changed(generation, reason.clone());
+            conn.mark_network_generation_changed(
+                generation,
+                peer_session_generation,
+                reason.clone(),
+            );
             if had_relay_confirmation && conn.relay_confirmed_at.is_none() {
                 relay_confirmation_cancellations.push(conn.node_id.clone());
-            }
-            if conn.state == ConnectionState::Direct {
-                conn.transition(ConnectionState::FallbackToRelay);
             }
             if conn.start_direct_reclaim_window(generation, &reason) {
                 direct_reclaim_count += 1;
@@ -729,23 +743,22 @@ impl PeerManager {
         let mut direct_reclaim_count = 0usize;
         let mut conns = self.connections.write().await;
         for conn in conns.values_mut() {
+            let Some(peer_session_generation) =
+                self.peer_session_generation_any_sync(&conn.node_id)
+            else {
+                continue;
+            };
             let retained_confirmed_direct =
-                conn.mark_candidate_refresh_generation_changed(generation, reason.clone());
+                conn.mark_candidate_refresh_generation_changed(
+                    generation,
+                    peer_session_generation,
+                    reason.clone(),
+                );
             if retained_confirmed_direct {
                 retained_confirmed_direct_count += 1;
-                // Retaining the authenticated Direct pair is intentional, but
-                // relay latency was measured on a transport/network path from
-                // the previous generation. Never carry that sample into path
-                // ranking or the UI after a local candidate/network refresh.
-                conn.relay_health.record_generation_change(reason.clone());
                 continue;
             }
 
-            conn.direct_health.record_generation_change(reason.clone());
-            conn.relay_health.record_generation_change(reason.clone());
-            if conn.state == ConnectionState::Direct {
-                conn.transition(ConnectionState::FallbackToRelay);
-            }
             if conn.start_direct_reclaim_window(generation, &reason) {
                 direct_reclaim_count += 1;
             }

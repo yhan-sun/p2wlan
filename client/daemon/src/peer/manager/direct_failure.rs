@@ -6,6 +6,53 @@ enum DirectFailureCommitOutcome {
 }
 
 impl PeerManager {
+    pub(crate) async fn mark_direct_validation_started(
+        &self,
+        node_id: &str,
+        validation: DirectValidationIdentity,
+    ) -> bool {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if validation.epoch.network_generation != self.current_network_generation_sync()
+            || !self.peer_session_is_current_sync(
+                node_id,
+                validation.epoch.peer_session_generation,
+            )
+        {
+            return false;
+        }
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        conn.commit_path_transition(
+            PathEvent::DirectValidationStarted { validation },
+            |_| {},
+        )
+        .accepted()
+    }
+
+    pub(crate) async fn finish_direct_validation_attempt(
+        &self,
+        node_id: &str,
+        validation: DirectValidationIdentity,
+    ) -> bool {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let mut conns = self.connections.write().await;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return false;
+        };
+        conn.commit_path_transition(
+            PathEvent::DirectAttemptCancelled {
+                epoch: validation.epoch,
+                owner_token: validation.owner_token,
+            },
+            |_| {},
+        )
+        .accepted()
+    }
+
     /// Record a failed direct-path event and enter relay fallback state.
     pub async fn record_direct_failure(&self, node_id: &str, reason: impl Into<String>) {
         self.record_direct_failure_with_code(node_id, REASON_DIRECT_PROBE_FAILED, reason)
@@ -170,42 +217,69 @@ impl PeerManager {
                 );
                 return DirectFailureCommitOutcome::IgnoredConfirmedDirect;
             }
-            conn.direct_health
-                .record_failure(code.clone(), reason.clone());
-            conn.record_direct_event(
-                generation,
-                code.clone(),
-                conn.endpoint,
-                Some(conn.candidate_pairs.len()),
-                None,
-                reason.clone(),
-            );
-            let probed_sources =
-                conn.mark_current_candidate_pairs_failed(generation, code, reason, local_endpoint);
-            if conn.state != ConnectionState::Relay {
-                conn.transition(ConnectionState::FallbackToRelay);
-                let local_endpoint_text = format_log_endpoint(local_endpoint);
-                info!(
-                    event = "direct_path_degraded",
-                    peer_id = %node_id,
-                    local_endpoint = %local_endpoint_text,
-                    remote_endpoint = ?conn.endpoint,
-                    candidate_source = ?conn.endpoint.and_then(|endpoint| {
-                        conn.candidate_pairs
-                            .iter()
-                            .find(|pair| {
-                                pair.local_generation == generation
-                                    && pair.remote_endpoint == endpoint
-                                    && conn.pair_belongs_to_current_remote_epoch(pair)
-                            })
-                            .map(|pair| pair.source)
-                    }),
-                    rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                    reason = %conn.direct_health.last_error.as_deref().unwrap_or("direct path failed"),
-                    "direct_path_degraded peer_id={} reason={}",
-                    node_id,
-                    conn.direct_health.last_error.as_deref().unwrap_or("direct path failed")
+            let was_relay = conn.state == ConnectionState::Relay;
+            let path_event = if conn.state == ConnectionState::Direct {
+                PathEvent::DirectPathFailed {
+                    epoch: PathEpoch::new(
+                        generation,
+                        peer_session_generation,
+                        conn.remote_candidate_epoch(),
+                    ),
+                }
+            } else {
+                PathEvent::DirectProbeFailed {
+                    epoch: PathEpoch::new(
+                        generation,
+                        peer_session_generation,
+                        conn.remote_candidate_epoch(),
+                    ),
+                }
+            };
+            let mut probed_sources = Vec::new();
+            let outcome = conn.commit_path_transition(path_event, |conn| {
+                conn.direct_health
+                    .record_failure(code.clone(), reason.clone());
+                conn.record_direct_event(
+                    generation,
+                    code.clone(),
+                    conn.endpoint,
+                    Some(conn.candidate_pairs.len()),
+                    None,
+                    reason.clone(),
                 );
+                probed_sources = conn.mark_current_candidate_pairs_failed(
+                    generation,
+                    code,
+                    reason,
+                    local_endpoint,
+                );
+                if !was_relay {
+                    let local_endpoint_text = format_log_endpoint(local_endpoint);
+                    info!(
+                        event = "direct_path_degraded",
+                        peer_id = %node_id,
+                        local_endpoint = %local_endpoint_text,
+                        remote_endpoint = ?conn.endpoint,
+                        candidate_source = ?conn.endpoint.and_then(|endpoint| {
+                            conn.candidate_pairs
+                                .iter()
+                                .find(|pair| {
+                                    pair.local_generation == generation
+                                        && pair.remote_endpoint == endpoint
+                                        && conn.pair_belongs_to_current_remote_epoch(pair)
+                                })
+                                .map(|pair| pair.source)
+                        }),
+                        rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                        reason = %conn.direct_health.last_error.as_deref().unwrap_or("direct path failed"),
+                        "direct_path_degraded peer_id={} reason={}",
+                        node_id,
+                        conn.direct_health.last_error.as_deref().unwrap_or("direct path failed")
+                    );
+                }
+            });
+            if !outcome.accepted() {
+                return DirectFailureCommitOutcome::Rejected;
             }
             probed_sources
         };
@@ -334,10 +408,21 @@ impl PeerManager {
             );
 
             if completed_epoch {
-                conn.direct_health
-                    .record_failure(REASON_DIRECT_PROBE_FAILED, reason.clone());
-                if conn.state != ConnectionState::Relay {
-                    conn.transition(ConnectionState::FallbackToRelay);
+                let outcome = conn.commit_path_transition(
+                    PathEvent::DirectProbeFailed {
+                        epoch: PathEpoch::new(
+                            generation,
+                            peer_session_generation,
+                            conn.remote_candidate_epoch(),
+                        ),
+                    },
+                    |conn| {
+                        conn.direct_health
+                            .record_failure(REASON_DIRECT_PROBE_FAILED, reason.clone());
+                    },
+                );
+                if !outcome.accepted() {
+                    return false;
                 }
             }
             probed_sources
@@ -393,34 +478,51 @@ impl PeerManager {
             }
 
             let reason = format!("direct keepalive ACK timeout for {endpoint}");
-            conn.direct_health
-                .record_failure(REASON_DIRECT_KEEPALIVE_TIMEOUT, reason.clone());
-            let peer_id = conn.node_id.clone();
-            let pair = conn.ensure_candidate_pair(endpoint, generation);
-            let source = pair.source;
-            let old_state = pair.state;
-            pair.record_failure(
-                REASON_DIRECT_KEEPALIVE_TIMEOUT,
-                reason.clone(),
-                local_endpoint,
+            let threshold_reached = conn.direct_health.consecutive_failures.saturating_add(1)
+                >= DIRECT_KEEPALIVE_FAILURE_THRESHOLD;
+            let epoch = PathEpoch::new(
+                generation,
+                peer_session_generation,
+                conn.remote_candidate_epoch(),
             );
-            log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
-
-            if conn.direct_health.consecutive_failures >= DIRECT_KEEPALIVE_FAILURE_THRESHOLD {
-                conn.transition(ConnectionState::FallbackToRelay);
-                let local_endpoint_text = format_log_endpoint(local_endpoint);
-                info!(
-                    event = "direct_path_degraded",
-                    peer_id = %node_id,
-                    local_endpoint = %local_endpoint_text,
-                    remote_endpoint = %endpoint,
-                    candidate_source = ?source,
-                    rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                    reason = "direct keepalive failure threshold reached",
-                    "direct_path_degraded peer_id={} remote_endpoint={} reason=direct keepalive failure threshold reached",
-                    node_id,
-                    endpoint
+            let path_event = if threshold_reached {
+                PathEvent::DirectPathFailed { epoch }
+            } else {
+                PathEvent::DirectProbeFailed { epoch }
+            };
+            let mut source = conn.candidate_source_for_endpoint(endpoint);
+            let outcome = conn.commit_path_transition(path_event, |conn| {
+                conn.direct_health
+                    .record_failure(REASON_DIRECT_KEEPALIVE_TIMEOUT, reason.clone());
+                let peer_id = conn.node_id.clone();
+                let pair = conn.ensure_candidate_pair(endpoint, generation);
+                source = pair.source;
+                let old_state = pair.state;
+                pair.record_failure(
+                    REASON_DIRECT_KEEPALIVE_TIMEOUT,
+                    reason.clone(),
+                    local_endpoint,
                 );
+                log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
+
+                if threshold_reached {
+                    let local_endpoint_text = format_log_endpoint(local_endpoint);
+                    info!(
+                        event = "direct_path_degraded",
+                        peer_id = %node_id,
+                        local_endpoint = %local_endpoint_text,
+                        remote_endpoint = %endpoint,
+                        candidate_source = ?source,
+                        rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                        reason = "direct keepalive failure threshold reached",
+                        "direct_path_degraded peer_id={} remote_endpoint={} reason=direct keepalive failure threshold reached",
+                        node_id,
+                        endpoint
+                    );
+                }
+            });
+            if !outcome.accepted() {
+                return false;
             }
             source
         };

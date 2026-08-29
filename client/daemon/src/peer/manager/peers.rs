@@ -287,12 +287,24 @@ impl PeerManager {
             }
             let had_relay_confirmation = conn.relay_confirmed_at.is_some();
             conn.reset_for_peer_session();
-            let published = self
+            let published_generation = self
                 .peer_membership
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .publish(node_id, conn.online, true);
-            if !published {
+            if let Some(peer_session_generation) = published_generation {
+                let epoch = PathEpoch::new(
+                    self.current_network_generation_sync(),
+                    peer_session_generation,
+                    conn.remote_candidate_epoch(),
+                );
+                let event = if conn.online {
+                    PathEvent::PeerOnline { epoch }
+                } else {
+                    PathEvent::PeerLeft { epoch }
+                };
+                conn.commit_path_transition(event, |_| {});
+            } else {
                 warn!(
                     "Peer lifecycle generation exhausted while resetting remote incarnation for {node_id}; authentication disabled"
                 );
@@ -548,7 +560,6 @@ impl PeerManager {
         }
         if !info.online {
             clear_hard_hard_after_lock = true;
-            conn.transition(ConnectionState::Closed);
             conn.relay_server = None;
             cancel_heartbeat_after_lock = true;
             conn.probe_session_id = None;
@@ -556,8 +567,6 @@ impl PeerManager {
             conn.probe_binding_token = None;
             conn.pending_probe_bindings.clear();
             conn.previous_probe_binding = None;
-        } else if conn.state == ConnectionState::Closed {
-            conn.transition(ConnectionState::Idle);
         }
 
         // A relay 404 is authoritative evidence that the peer's registration
@@ -595,12 +604,24 @@ impl PeerManager {
         // Rotate the process-local generation only at a structural, identity,
         // or online lifecycle boundary; metadata and endpoint churn retain it.
         let rotate_peer_session = is_new || public_key_changed || old_online != info.online;
-        let published = self
+        let published_generation = self
             .peer_membership
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .publish(&info.node_id, info.online, rotate_peer_session);
-        if !published {
+        if let Some(peer_session_generation) = published_generation {
+            let epoch = PathEpoch::new(
+                generation,
+                peer_session_generation,
+                conn.remote_candidate_epoch(),
+            );
+            let event = if info.online {
+                PathEvent::PeerOnline { epoch }
+            } else {
+                PathEvent::PeerLeft { epoch }
+            };
+            conn.commit_path_transition(event, |_| {});
+        } else {
             warn!(
                 "Peer lifecycle generation exhausted while publishing {}; authentication disabled",
                 info.node_id
@@ -666,6 +687,21 @@ impl PeerManager {
                         conn.remote_candidate_incarnation_high_water,
                         conn.last_candidate_generation,
                     );
+            }
+            let peer_session_generation = self
+                .peer_membership
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation(node_id);
+            if let (Some(conn), Some(peer_session_generation)) =
+                (conns.get_mut(node_id), peer_session_generation)
+            {
+                let epoch = PathEpoch::new(
+                    self.current_network_generation_sync(),
+                    peer_session_generation,
+                    conn.remote_candidate_epoch(),
+                );
+                conn.commit_path_transition(PathEvent::PeerLeft { epoch }, |_| {});
             }
             // This is the lifecycle linearization point: once the mirror is
             // cleared, no new UDP adoption or control candidate work may treat
@@ -797,6 +833,9 @@ impl PeerManager {
         {
             return false;
         }
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+            return false;
+        };
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
@@ -804,10 +843,22 @@ impl PeerManager {
         if conn.state == ConnectionState::Direct && conn.direct_is_healthy_confirmed() {
             return false;
         }
-        if !matches!(conn.state, ConnectionState::Direct | ConnectionState::Relay) {
-            conn.transition(ConnectionState::HolePunching);
-        }
-        true
+        let epoch = PathEpoch::new(
+            observed_generation,
+            peer_session_generation,
+            conn.remote_candidate_epoch(),
+        );
+        let attempt = DirectAttemptNumber(observed_commit_seq.unwrap_or_default());
+        let event = if attempt.0 == 0 {
+            PathEvent::DirectProbeStarted { epoch, attempt }
+        } else {
+            PathEvent::DirectRetryScheduled { epoch, attempt }
+        };
+        conn.commit_path_transition(
+            event,
+            |_| {},
+        )
+        .accepted()
     }
 
     /// Record a direct traversal timeline event for diagnostics.

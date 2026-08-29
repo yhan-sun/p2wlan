@@ -547,6 +547,7 @@ impl DirectValidationRegistry {
 pub(crate) struct DirectValidationTarget {
     pub(crate) endpoint: SocketAddr,
     pub(crate) generation: u64,
+    pub(crate) peer_session_generation: PeerSessionGeneration,
     pub(crate) remote_candidate_epoch: u64,
     pub(crate) owner_token: u64,
     pub(crate) cancelled: bool,
@@ -590,12 +591,14 @@ pub(crate) enum DirectValidationAckRejectReason {
     ExpectationExpired,
     RequestIdMismatch,
     ExpectationGenerationMismatch,
+    ExpectationPeerSessionMismatch,
     OwnerMismatch,
     EndpointMismatch,
     SocketMismatch,
     SessionMissing,
     TargetCancelled,
     TargetGenerationMismatch,
+    TargetPeerSessionMismatch,
     TargetRemoteCandidateEpochMismatch,
     TargetOwnerMismatch,
 }
@@ -610,12 +613,18 @@ impl DirectValidationAckRejectReason {
             Self::ExpectationGenerationMismatch => {
                 "direct_validation_ack_expectation_generation_mismatch"
             }
+            Self::ExpectationPeerSessionMismatch => {
+                "direct_validation_ack_expectation_peer_session_mismatch"
+            }
             Self::OwnerMismatch => "direct_validation_ack_owner_mismatch",
             Self::EndpointMismatch => "direct_validation_ack_endpoint_mismatch",
             Self::SocketMismatch => "direct_validation_ack_socket_mismatch",
             Self::SessionMissing => "direct_validation_ack_session_missing",
             Self::TargetCancelled => "direct_validation_ack_target_cancelled",
             Self::TargetGenerationMismatch => "direct_validation_ack_target_generation_mismatch",
+            Self::TargetPeerSessionMismatch => {
+                "direct_validation_ack_target_peer_session_mismatch"
+            }
             Self::TargetRemoteCandidateEpochMismatch => {
                 "direct_validation_ack_target_remote_candidate_epoch_mismatch"
             }
@@ -642,6 +651,7 @@ impl DirectValidationAckRejectReason {
 pub(crate) struct DirectValidationExpectation {
     pub(crate) request_id: u16,
     pub(crate) generation: u64,
+    pub(crate) peer_session_generation: PeerSessionGeneration,
     pub(crate) remote_candidate_epoch: u64,
     /// The validation worker that registered this request.  Conditional
     /// cleanup prevents an old worker from deleting a newer worker's slot.
