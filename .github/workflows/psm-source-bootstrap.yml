@@ -19,7 +19,7 @@ jobs:
           fetch-depth: 0
       - name: Package source tree
         shell: bash
-        run: tar --exclude=.git --exclude=target -czf p2wlan-source.tar.gz .
+        run: git archive --format=tar.gz --output=p2wlan-source.tar.gz HEAD
       - name: Upload source snapshot
         uses: actions/upload-artifact@v4
         with:
