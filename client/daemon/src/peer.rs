@@ -288,6 +288,27 @@ impl AuthenticatedProbeVerifyGate {
     }
 }
 
+/// Deterministic one-shot pause inside the real Relay target snapshot.  This
+/// is test-only instrumentation for reproducing the startup ordering in which
+/// Relay probing owns a connection reader while initiator publication needs
+/// the writer; production builds contain neither the field nor the branch.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct RelayProbeSnapshotTestGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl RelayProbeSnapshotTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeBindingStage {
     Staged,
@@ -518,7 +539,8 @@ mod path_state_machine;
 pub(crate) use path_state_machine::{
     ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,
     PathEpoch, PathEvent, PathRetention, PathStateMachine, PathStateMachineSnapshot,
-    PathTransitionOutcome, PeerPathLifecycle, RelayConnectionIdentity,
+    PathTransitionOutcome, PeerPathLifecycle, RelayBusinessObservation, RelayConnectionIdentity,
+    RelayHealthObservationIdentity,
 };
 
 include!("peer/connection/core.rs");

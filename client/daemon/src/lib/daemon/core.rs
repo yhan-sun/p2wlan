@@ -93,6 +93,11 @@ pub struct Daemon {
     /// outbound path can wait event-driven for a relay to come up instead of
     /// polling at a fixed interval.
     relay_available_tx: watch::Sender<bool>,
+    /// Shared event edge for forced Relay probing and encrypted-session
+    /// maintenance. A bounded initiator connection-writer timeout bumps this
+    /// edge after cancelling its reservation, so the failed setup is retried
+    /// by the normal maintenance owner instead of remaining silently lost.
+    path_setup_kick_tx: watch::Sender<u64>,
     /// Android's VpnService establishes the TUN before the Rust daemon starts.
     #[cfg(target_os = "android")]
     android_tun_fd: Option<std::os::fd::RawFd>,
@@ -171,6 +176,7 @@ impl Daemon {
 
         let udp_transport = Arc::new(RwLock::new(None));
         let (relay_available_tx, _relay_available_rx) = tokio::sync::watch::channel(false);
+        let (path_setup_kick_tx, _path_setup_kick_rx) = tokio::sync::watch::channel(0u64);
 
         // Register the punch-session canceller on the peer manager so a
         // stale/404 quarantined peer's in-flight recovery session is
@@ -239,6 +245,7 @@ impl Daemon {
             timeline,
             status_events,
             relay_available_tx,
+            path_setup_kick_tx,
             #[cfg(target_os = "android")]
             android_tun_fd: None,
             #[cfg(target_os = "android")]

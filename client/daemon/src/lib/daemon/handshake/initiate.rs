@@ -442,7 +442,19 @@ impl Daemon {
                     drop(epoch_guard);
                     drop(emit_guard);
 
-                    tokio::select! {
+                    let writer_wait_started = Instant::now();
+                    self.timeline.emit(
+                        "initiator_publish_probe_binding_writer_wait",
+                        None,
+                        Some("connection_writer_contended"),
+                        Some(format!(
+                            "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} timeout_ms={}",
+                            reservation.owner,
+                            INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
+                        )),
+                    );
+
+                    let writer_available = tokio::select! {
                         biased;
                         changed = reservation.cancellation.changed() => {
                             if changed.is_err() || *reservation.cancellation.borrow() {
@@ -452,9 +464,54 @@ impl Daemon {
                                     .cancel_reservation_if_current(&peer_id, reservation.owner);
                                 return Ok(None);
                             }
+                            continue;
                         }
-                        () = self.peers.wait_for_probe_session_binding_writer() => {}
+                        available = self.peers.wait_for_probe_session_binding_writer(
+                            INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT,
+                        ) => available
+                    };
+                    if !writer_available {
+                        let wait_ms = writer_wait_started.elapsed().as_millis();
+                        self.pending_handshakes
+                            .lock()
+                            .await
+                            .cancel_reservation_if_current(&peer_id, reservation.owner);
+                        let next_kick = (*self.path_setup_kick_tx.borrow()).wrapping_add(1);
+                        self.path_setup_kick_tx.send_replace(next_kick);
+                        self.timeline.emit(
+                            "initiator_publish_probe_binding_writer_timeout",
+                            None,
+                            Some(REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT),
+                            Some(format!(
+                                "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} wait_ms={wait_ms} timeout_ms={} reschedule_kick={next_kick}",
+                                reservation.owner,
+                                INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
+                            )),
+                        );
+                        warn!(
+                            event = "initiator_publish_probe_binding_writer_timeout",
+                            reason_code = REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT,
+                            peer_id = %peer_id,
+                            owner = reservation.owner,
+                            network_generation = handshake_generation,
+                            retry = binding_contentions,
+                            wait_ms,
+                            timeout_ms = INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis(),
+                            reschedule_kick = next_kick,
+                            "Probe binding connection writer remained contended; reservation cancelled and path setup rescheduled"
+                        );
+                        return Ok(None);
                     }
+                    self.timeline.emit(
+                        "initiator_publish_probe_binding_writer_available",
+                        None,
+                        None,
+                        Some(format!(
+                            "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} wait_ms={}",
+                            reservation.owner,
+                            writer_wait_started.elapsed().as_millis()
+                        )),
+                    );
                 }
                 Some(ProbeBindingStage::Staged) => {
                     let inserted = {

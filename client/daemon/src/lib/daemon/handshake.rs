@@ -41,6 +41,13 @@ impl HandshakeArbiter {
 const RESPONDER_HANDSHAKE_ARBITER_TIMEOUT: Duration = Duration::from_millis(750);
 const REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT: &str =
     "responder_handshake_arbiter_timeout";
+/// A transient connection snapshot may make the initiator's atomic Probe
+/// binding stage contend. This bound is deliberately shorter than the normal
+/// handshake retry cadence: its purpose is to remove the queued writer and
+/// reschedule, not to hide a wedged connection map behind a longer timeout.
+const INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+const REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT: &str =
+    "initiator_probe_binding_writer_timeout";
 
 /// Correlate one control-plane session without writing the raw session token
 /// to logs. This uses the existing local diagnostic fingerprint only; it is

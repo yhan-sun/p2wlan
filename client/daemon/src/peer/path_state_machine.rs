@@ -6,7 +6,10 @@
 //! with enums instead of another collection of independently mutable flags.
 
 use super::{ConnectionState, NetworkPath, PeerSessionGeneration};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+
+const MAX_ACCEPTED_HEALTH_OBSERVATIONS: usize = 64;
 
 /// The three independent generations that fence every path event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +188,85 @@ pub(crate) struct RelayConnectionIdentity {
     pub(crate) incarnation: RelayConnectionIncarnation,
 }
 
+/// A business packet is an observation in one concrete direction.  Keeping
+/// the direction in the typed event lets a send followed by a receive execute
+/// two distinct side effects even though the first observation already made
+/// Relay the usable path; replaying either direction remains a duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayBusinessObservation {
+    Sent,
+    Received,
+}
+
+/// Identity of one periodic Relay health sample.  The token is allocated at
+/// the relay writer boundary and echoed by the ACK, so retries of the same
+/// encrypted observation retain this identity while a later sample gets a
+/// distinct one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelayHealthObservationIdentity {
+    pub(crate) owner_token: u64,
+    pub(crate) request_id: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathEventReceipt {
+    PeerOnline(PathEpoch),
+    NetworkGenerationAdvanced {
+        epoch: PathEpoch,
+        retained: PathRetention,
+    },
+    RelayPeerConfirmed(RelayConnectionIdentity),
+    RelayBusiness {
+        relay: RelayConnectionIdentity,
+        observation: RelayBusinessObservation,
+    },
+    DirectCommitted(DirectValidationIdentity),
+}
+
+impl PathEventReceipt {
+    fn epoch(&self) -> PathEpoch {
+        match self {
+            Self::PeerOnline(epoch) | Self::NetworkGenerationAdvanced { epoch, .. } => *epoch,
+            Self::RelayPeerConfirmed(relay) | Self::RelayBusiness { relay, .. } => relay.epoch,
+            Self::DirectCommitted(validation) => validation.epoch,
+        }
+    }
+
+    fn is_relay(&self) -> bool {
+        matches!(
+            self,
+            Self::RelayPeerConfirmed(_) | Self::RelayBusiness { .. }
+        )
+    }
+
+    fn remains_current(&self, state: &PathState) -> bool {
+        if state.epoch != Some(self.epoch()) {
+            return false;
+        }
+        match self {
+            Self::PeerOnline(_) | Self::NetworkGenerationAdvanced { .. } => true,
+            Self::RelayPeerConfirmed(receipt) => state
+                .relay
+                .confirmed_identity()
+                .is_some_and(|current| current.same_transport(receipt)),
+            Self::RelayBusiness { relay, .. } => {
+                matches!(&state.relay, RelayPathState::Usable(current) if current.same_transport(relay))
+            }
+            Self::DirectCommitted(receipt) => {
+                matches!(state.direct, DirectPathState::Committed(current) if current == *receipt)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathObservationIdentity {
+    RelayHealth {
+        relay: RelayConnectionIdentity,
+        observation: RelayHealthObservationIdentity,
+    },
+}
+
 impl RelayConnectionIdentity {
     pub(crate) fn new(
         epoch: PathEpoch,
@@ -232,8 +314,7 @@ impl RelayConnectionIdentity {
     }
 }
 
-/// Monotonic retry identity.  Reusing an attempt number is harmless because
-/// duplicate events reduce to a no-op.
+/// Monotonic retry identity used to order one Direct probing/retry cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectAttemptNumber(pub(crate) u64);
 
@@ -293,6 +374,11 @@ pub(crate) enum PathEvent {
     },
     RelayBusinessUsable {
         relay: RelayConnectionIdentity,
+        observation: RelayBusinessObservation,
+    },
+    RelayHealthObserved {
+        relay: RelayConnectionIdentity,
+        observation: RelayHealthObservationIdentity,
     },
     RelayTransportLost {
         relay: RelayConnectionIdentity,
@@ -350,13 +436,51 @@ impl PathEvent {
             | Self::CompatibilityStateRequested { epoch, .. } => Some(*epoch),
             Self::RelayTransportReady { relay }
             | Self::RelayPeerConfirmed { relay }
-            | Self::RelayBusinessUsable { relay }
+            | Self::RelayBusinessUsable { relay, .. }
+            | Self::RelayHealthObserved { relay, .. }
             | Self::RelayTransportLost { relay }
             | Self::RelayPathFailed { relay } => Some(relay.epoch),
             Self::DirectValidationStarted { validation } | Self::DirectCommitted { validation } => {
                 Some(validation.epoch)
             }
             Self::IdentityReset => None,
+        }
+    }
+
+    fn idempotency_receipt(&self) -> Option<PathEventReceipt> {
+        match self {
+            Self::PeerOnline { epoch } => Some(PathEventReceipt::PeerOnline(*epoch)),
+            Self::NetworkGenerationAdvanced { epoch, retained } => {
+                Some(PathEventReceipt::NetworkGenerationAdvanced {
+                    epoch: *epoch,
+                    retained: *retained,
+                })
+            }
+            Self::RelayPeerConfirmed { relay } => {
+                Some(PathEventReceipt::RelayPeerConfirmed(relay.clone()))
+            }
+            Self::RelayBusinessUsable { relay, observation } => {
+                Some(PathEventReceipt::RelayBusiness {
+                    relay: relay.clone(),
+                    observation: *observation,
+                })
+            }
+            Self::DirectCommitted { validation } => {
+                Some(PathEventReceipt::DirectCommitted(*validation))
+            }
+            _ => None,
+        }
+    }
+
+    fn observation_identity(&self) -> Option<PathObservationIdentity> {
+        match self {
+            Self::RelayHealthObserved { relay, observation } => {
+                Some(PathObservationIdentity::RelayHealth {
+                    relay: relay.clone(),
+                    observation: *observation,
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -478,7 +602,8 @@ pub(crate) struct PathState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathTransitionDecision {
     Applied,
-    Noop,
+    AcceptedObservation,
+    Duplicate,
     RejectedNetworkGeneration,
     RejectedPeerSessionGeneration,
     RejectedRemoteCandidateEpoch,
@@ -491,7 +616,14 @@ pub(crate) enum PathTransitionDecision {
 
 impl PathTransitionDecision {
     pub(crate) fn accepted(self) -> bool {
-        matches!(self, Self::Applied | Self::Noop)
+        matches!(
+            self,
+            Self::Applied | Self::AcceptedObservation | Self::Duplicate
+        )
+    }
+
+    pub(crate) fn applies_side_effects(self) -> bool {
+        matches!(self, Self::Applied | Self::AcceptedObservation)
     }
 }
 
@@ -519,6 +651,9 @@ pub(crate) struct PathTransition {
     decision: PathTransitionDecision,
     next: PathState,
     actions: Vec<PathAction>,
+    receipt: Option<PathEventReceipt>,
+    observation: Option<PathObservationIdentity>,
+    clear_relay_receipts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,6 +675,10 @@ impl PathTransitionOutcome {
     pub(crate) fn accepted(&self) -> bool {
         self.decision.accepted()
     }
+
+    pub(crate) fn applies_side_effects(&self) -> bool {
+        self.decision.applies_side_effects()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -547,6 +686,8 @@ pub(crate) struct PathStateMachine {
     state: PathState,
     revision: u64,
     rejected_transitions: u64,
+    accepted_event_receipts: Vec<PathEventReceipt>,
+    accepted_observations: VecDeque<PathObservationIdentity>,
 }
 
 impl PathStateMachine {
@@ -563,6 +704,8 @@ impl PathStateMachine {
             },
             revision: 0,
             rejected_transitions: 0,
+            accepted_event_receipts: Vec::new(),
+            accepted_observations: VecDeque::new(),
         }
     }
 
@@ -587,6 +730,9 @@ impl PathStateMachine {
     pub(crate) fn reduce(&self, event: PathEvent) -> PathTransition {
         let previous = &self.state;
         let mut next = previous.clone();
+        let receipt = event.idempotency_receipt();
+        let observation = event.observation_identity();
+        let clear_relay_receipts = matches!(&event, PathEvent::RelayPathFailed { .. });
 
         let result: Result<(), PathTransitionDecision> = (|| match event {
             PathEvent::IdentityReset => {
@@ -634,9 +780,13 @@ impl PathStateMachine {
                 self.validate_exact_epoch(relay.epoch)?;
                 self.reduce_relay_confirmed(&mut next, relay)
             }
-            PathEvent::RelayBusinessUsable { relay } => {
+            PathEvent::RelayBusinessUsable { relay, .. } => {
                 self.validate_exact_epoch(relay.epoch)?;
                 self.reduce_relay_usable(&mut next, relay)
+            }
+            PathEvent::RelayHealthObserved { relay, .. } => {
+                self.validate_exact_epoch(relay.epoch)?;
+                self.reduce_relay_health_observed(&relay)
             }
             PathEvent::RelayTransportLost { relay } => {
                 self.validate_bound_epoch(relay.epoch)?;
@@ -696,6 +846,9 @@ impl PathStateMachine {
                 decision,
                 next: previous.clone(),
                 actions: Vec::new(),
+                receipt: None,
+                observation: None,
+                clear_relay_receipts: false,
             };
         }
         if !Self::state_is_valid(&next) {
@@ -704,6 +857,27 @@ impl PathStateMachine {
                 decision: PathTransitionDecision::RejectedIllegalTransition,
                 next: previous.clone(),
                 actions: Vec::new(),
+                receipt: None,
+                observation: None,
+                clear_relay_receipts: false,
+            };
+        }
+
+        if receipt
+            .as_ref()
+            .is_some_and(|identity| self.accepted_event_receipts.contains(identity))
+            || observation
+                .as_ref()
+                .is_some_and(|identity| self.accepted_observations.contains(identity))
+        {
+            return PathTransition {
+                base_revision: self.revision,
+                decision: PathTransitionDecision::Duplicate,
+                next: previous.clone(),
+                actions: Vec::new(),
+                receipt: None,
+                observation: None,
+                clear_relay_receipts: false,
             };
         }
 
@@ -711,12 +885,15 @@ impl PathStateMachine {
         PathTransition {
             base_revision: self.revision,
             decision: if next == *previous {
-                PathTransitionDecision::Noop
+                PathTransitionDecision::AcceptedObservation
             } else {
                 PathTransitionDecision::Applied
             },
             next,
             actions,
+            receipt,
+            observation,
+            clear_relay_receipts,
         }
     }
 
@@ -733,13 +910,30 @@ impl PathStateMachine {
         } else {
             Vec::new()
         };
-        if decision.accepted() {
+        if decision.applies_side_effects() {
+            if transition.clear_relay_receipts {
+                self.accepted_event_receipts
+                    .retain(|receipt| !receipt.is_relay());
+            }
             if decision == PathTransitionDecision::Applied {
                 self.state = transition.next;
-                self.revision = self.revision.wrapping_add(1);
+                self.accepted_event_receipts
+                    .retain(|receipt| receipt.remains_current(&self.state));
             }
+            if let Some(receipt) = transition.receipt {
+                self.accepted_event_receipts.push(receipt);
+            }
+            if let Some(observation) = transition.observation {
+                self.accepted_observations.push_back(observation);
+                while self.accepted_observations.len() > MAX_ACCEPTED_HEALTH_OBSERVATIONS {
+                    self.accepted_observations.pop_front();
+                }
+            }
+            self.revision = self.revision.wrapping_add(1);
         } else {
-            self.rejected_transitions = self.rejected_transitions.wrapping_add(1);
+            if !decision.accepted() {
+                self.rejected_transitions = self.rejected_transitions.wrapping_add(1);
+            }
         }
         PathTransitionOutcome {
             decision,
@@ -831,6 +1025,10 @@ impl PathStateMachine {
             (ActiveBusinessPath::Direct(_), DirectPathState::Committed(identity), _) => {
                 ActiveBusinessPath::Direct(*identity)
             }
+            (ActiveBusinessPath::Direct(_), _, relay) => relay
+                .confirmed_identity()
+                .cloned()
+                .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay),
             (ActiveBusinessPath::Relay(_), _, relay) => relay
                 .confirmed_identity()
                 .cloned()
@@ -838,6 +1036,15 @@ impl PathStateMachine {
             _ => ActiveBusinessPath::Unavailable,
         };
         Self::set_projection_after_epoch_change(next, previous_active, epoch);
+        if previous_active == Some(NetworkPath::Direct)
+            && next.active.network_path() == Some(NetworkPath::Relay)
+        {
+            next.recovery = PathRecoveryState::Degraded {
+                epoch,
+                from: NetworkPath::Direct,
+                fallback: Some(NetworkPath::Relay),
+            };
+        }
         Ok(())
     }
 
@@ -974,6 +1181,19 @@ impl PathStateMachine {
         if !matches!(next.active, ActiveBusinessPath::Direct(_)) {
             next.active = ActiveBusinessPath::Relay(relay);
             next.compatibility_state = ConnectionState::Relay;
+        }
+        Ok(())
+    }
+
+    fn reduce_relay_health_observed(
+        &self,
+        relay: &RelayConnectionIdentity,
+    ) -> Result<(), PathTransitionDecision> {
+        let Some(current) = self.state.relay.confirmed_identity() else {
+            return Err(PathTransitionDecision::RejectedIllegalTransition);
+        };
+        if !current.same_transport(relay) {
+            return Err(PathTransitionDecision::RejectedRelayConnectionIdentity);
         }
         Ok(())
     }
@@ -1637,7 +1857,7 @@ mod tests {
         ));
 
         let duplicate = commit(&mut machine, PathEvent::DirectCommitted { validation: ack });
-        assert_eq!(duplicate.decision, PathTransitionDecision::Noop);
+        assert_eq!(duplicate.decision, PathTransitionDecision::Duplicate);
         assert_eq!(duplicate.snapshot.revision, committed.snapshot.revision);
 
         let wrong_request_endpoint = DirectValidationIdentity::authenticated_ack(
@@ -1772,6 +1992,56 @@ mod tests {
             retained.snapshot.state.direct,
             DirectPathState::Committed(identity) if identity.epoch == after
         ));
+    }
+
+    #[test]
+    fn network_generation_relay_only_retention_falls_back_from_direct_to_relay() {
+        let before = epoch(4, 2, 10);
+        let after = epoch(5, 2, 10);
+        let mut machine = online_machine(before);
+        let confirmed_relay = relay(before, "relay.test:443", 51);
+        assert!(commit(
+            &mut machine,
+            PathEvent::RelayPeerConfirmed {
+                relay: confirmed_relay,
+            },
+        )
+        .accepted());
+        commit_direct(&mut machine, validation(before, 8, 4));
+
+        let retained = commit(
+            &mut machine,
+            PathEvent::NetworkGenerationAdvanced {
+                epoch: after,
+                retained: PathRetention::Relay,
+            },
+        );
+
+        assert_eq!(retained.decision, PathTransitionDecision::Applied);
+        assert!(matches!(
+            retained.snapshot.state.active,
+            ActiveBusinessPath::Relay(ref identity) if identity.epoch == after
+        ));
+        assert!(matches!(
+            retained.snapshot.state.relay,
+            RelayPathState::Confirmed(ref identity) if identity.epoch == after
+        ));
+        assert!(matches!(
+            retained.snapshot.state.direct,
+            DirectPathState::Idle
+        ));
+        assert_eq!(
+            retained.snapshot.state.recovery,
+            PathRecoveryState::Degraded {
+                epoch: after,
+                from: NetworkPath::Direct,
+                fallback: Some(NetworkPath::Relay),
+            }
+        );
+        assert_eq!(
+            retained.snapshot.state.compatibility_state,
+            ConnectionState::Relay
+        );
     }
 
     #[test]
@@ -1957,8 +2227,118 @@ mod tests {
             },
         );
         let duplicate = commit(&mut machine, PathEvent::RelayPeerConfirmed { relay });
-        assert_eq!(duplicate.decision, PathTransitionDecision::Noop);
+        assert_eq!(duplicate.decision, PathTransitionDecision::Duplicate);
         assert_eq!(duplicate.snapshot.revision, first.snapshot.revision);
+    }
+
+    #[test]
+    fn observations_are_accepted_once_per_typed_identity_without_state_churn() {
+        let current = epoch(1, 1, 1);
+        let mut machine = online_machine(current);
+        let relay = relay(current, "relay.test:443", 4);
+        assert!(commit(
+            &mut machine,
+            PathEvent::RelayPeerConfirmed {
+                relay: relay.clone(),
+            },
+        )
+        .accepted());
+
+        let sent = commit(
+            &mut machine,
+            PathEvent::RelayBusinessUsable {
+                relay: relay.clone(),
+                observation: RelayBusinessObservation::Sent,
+            },
+        );
+        assert_eq!(sent.decision, PathTransitionDecision::Applied);
+        let sent_revision = sent.snapshot.revision;
+        let duplicate_sent = commit(
+            &mut machine,
+            PathEvent::RelayBusinessUsable {
+                relay: relay.clone(),
+                observation: RelayBusinessObservation::Sent,
+            },
+        );
+        assert_eq!(duplicate_sent.decision, PathTransitionDecision::Duplicate);
+        assert_eq!(duplicate_sent.snapshot.revision, sent_revision);
+
+        let received = commit(
+            &mut machine,
+            PathEvent::RelayBusinessUsable {
+                relay: relay.clone(),
+                observation: RelayBusinessObservation::Received,
+            },
+        );
+        assert_eq!(
+            received.decision,
+            PathTransitionDecision::AcceptedObservation
+        );
+        assert_eq!(received.snapshot.state, sent.snapshot.state);
+        assert_eq!(received.snapshot.revision, sent_revision + 1);
+        let duplicate_received = commit(
+            &mut machine,
+            PathEvent::RelayBusinessUsable {
+                relay: relay.clone(),
+                observation: RelayBusinessObservation::Received,
+            },
+        );
+        assert_eq!(
+            duplicate_received.decision,
+            PathTransitionDecision::Duplicate
+        );
+        assert_eq!(
+            duplicate_received.snapshot.revision,
+            received.snapshot.revision
+        );
+
+        let first_health = RelayHealthObservationIdentity {
+            owner_token: 70,
+            request_id: 8,
+        };
+        let first_sample = commit(
+            &mut machine,
+            PathEvent::RelayHealthObserved {
+                relay: relay.clone(),
+                observation: first_health,
+            },
+        );
+        assert_eq!(
+            first_sample.decision,
+            PathTransitionDecision::AcceptedObservation
+        );
+        assert_eq!(first_sample.snapshot.state, received.snapshot.state);
+        let duplicate_sample = commit(
+            &mut machine,
+            PathEvent::RelayHealthObserved {
+                relay: relay.clone(),
+                observation: first_health,
+            },
+        );
+        assert_eq!(duplicate_sample.decision, PathTransitionDecision::Duplicate);
+        assert_eq!(
+            duplicate_sample.snapshot.revision,
+            first_sample.snapshot.revision
+        );
+
+        let independent_sample = commit(
+            &mut machine,
+            PathEvent::RelayHealthObserved {
+                relay,
+                observation: RelayHealthObservationIdentity {
+                    owner_token: 71,
+                    request_id: 9,
+                },
+            },
+        );
+        assert_eq!(
+            independent_sample.decision,
+            PathTransitionDecision::AcceptedObservation
+        );
+        assert_eq!(
+            independent_sample.snapshot.revision,
+            first_sample.snapshot.revision + 1
+        );
     }
 
     #[test]
