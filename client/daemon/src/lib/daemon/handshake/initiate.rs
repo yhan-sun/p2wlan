@@ -335,12 +335,54 @@ impl Daemon {
         // `emit -> generation -> session/connection`. Acquire emit before the
         // generation gate so a rekey or generation advance cannot deadlock
         // against a live TUN encryption turn.
+        let emit_wait_started = Instant::now();
+        self.timeline.emit(
+            "initiator_publish_emit_lock_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={handshake_generation}",
+                peer_info.node_id, reservation.owner
+            )),
+        );
         let emit_guard = self
             .transport
             .acquire_outbound_emit_guard(&peer_info.node_id)
             .await;
+        self.timeline.emit(
+            "initiator_publish_emit_lock_acquired",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={handshake_generation} wait_ms={}",
+                peer_info.node_id,
+                reservation.owner,
+                emit_wait_started.elapsed().as_millis()
+            )),
+        );
         let epoch_gate = self.peers.network_epoch_gate();
+        let epoch_wait_started = Instant::now();
+        self.timeline.emit(
+            "initiator_publish_epoch_gate_wait",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={handshake_generation}",
+                peer_info.node_id, reservation.owner
+            )),
+        );
         let epoch_guard = epoch_gate.lock().await;
+        self.timeline.emit(
+            "initiator_publish_epoch_gate_acquired",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={handshake_generation} wait_ms={}",
+                peer_info.node_id,
+                reservation.owner,
+                epoch_wait_started.elapsed().as_millis()
+            )),
+        );
         if self.peers.current_network_generation_sync() != handshake_generation
             || !self.peers.peer_session_is_current_sync(
                 &peer_info.node_id,
@@ -354,6 +396,18 @@ impl Daemon {
             return Ok(None);
         }
         let status = self.transport.session_status(&peer_info.node_id).await;
+        self.timeline.emit(
+            "initiator_publish_session_status_ready",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={handshake_generation} has_active={} has_pending_responder={}",
+                peer_info.node_id,
+                reservation.owner,
+                status.has_active,
+                status.has_pending_responder
+            )),
+        );
         if status.has_active || status.has_pending_responder {
             self.pending_handshakes
                 .lock()
@@ -385,6 +439,15 @@ impl Daemon {
         }) else {
             return Ok(None);
         };
+        self.timeline.emit(
+            "initiator_publish_pending_inserted",
+            None,
+            None,
+            Some(format!(
+                "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id}",
+                reservation.owner
+            )),
+        );
         if self
             .peers
             .stage_probe_session_binding(
@@ -415,6 +478,15 @@ impl Daemon {
                 "failed to stage Probe v2 handshake binding for {peer_id}"
             )));
         }
+        self.timeline.emit(
+            "initiator_publish_probe_binding_staged",
+            None,
+            None,
+            Some(format!(
+                "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id}",
+                reservation.owner
+            )),
+        );
         self.timeline.emit(
             "initiator_session_staged",
             None,
