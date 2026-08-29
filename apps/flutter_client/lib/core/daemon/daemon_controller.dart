@@ -48,6 +48,10 @@ class DaemonController {
   static const _readyPoll = Duration(milliseconds: 400);
   static const _macosReadyTimeout = Duration(seconds: 60);
   static const _directReadyTimeout = Duration(seconds: 20);
+  // The daemon runtime gives its task graph ten seconds to drain after a
+  // shutdown signal. The GUI must allow that full budget plus scheduler
+  // margin before it considers the authenticated shutdown failed.
+  static const _gracefulShutdownTimeout = Duration(seconds: 12);
 
   final DiagnosticsApi _diagnosticsApi;
 
@@ -536,20 +540,29 @@ class DaemonController {
       diagnosticsUrl,
     );
     if (shutdownRequested) {
-      final endpointDown = await _waitForHealthDown(
+      // The diagnostics listener can close before the daemon has finished
+      // draining its TUN, UDP, relay and control tasks. Wait for endpoint and
+      // verified process exit concurrently, using the daemon's own shutdown
+      // budget, before escalating to the Windows /F fallback.
+      final endpointDownFuture = _waitForHealthDown(
         diagnosticsUrl,
-        const Duration(seconds: 8),
+        _gracefulShutdownTimeout,
       );
-      final processDown = Platform.isWindows && windowsDaemonPids.isNotEmpty
-          ? await _waitForWindowsDaemonPidsExit(
+      final processDownFuture =
+          Platform.isWindows && windowsDaemonPids.isNotEmpty
+          ? _waitForWindowsDaemonPidsExit(
               windowsDaemonPids,
-              const Duration(seconds: 3),
+              _gracefulShutdownTimeout,
             )
-          : statusPid == null ||
-                await _waitForDaemonPidExit(
-                  statusPid,
-                  const Duration(seconds: 3),
-                );
+          : statusPid == null
+          ? Future<bool>.value(true)
+          : _waitForDaemonPidExit(statusPid, _gracefulShutdownTimeout);
+      final gracefulResults = await Future.wait<bool>([
+        endpointDownFuture,
+        processDownFuture,
+      ]);
+      final endpointDown = gracefulResults[0];
+      final processDown = gracefulResults[1];
       if (endpointDown && processDown) {
         await _removePidMarker();
         return const DaemonCommandResult(
@@ -588,7 +601,11 @@ class DaemonController {
       );
       if (stopped && processDown) {
         await _removePidMarker();
-        return DaemonCommandResult(ok: true, message: 'p2wlan-daemon stopped.');
+        return const DaemonCommandResult(
+          ok: true,
+          message:
+              'p2wlan-daemon stopped after forced process termination fallback.',
+        );
       }
     }
 
