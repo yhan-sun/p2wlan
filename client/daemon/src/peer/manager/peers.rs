@@ -17,6 +17,49 @@ fn prune_probe_session_bindings(conn: &mut PeerConnection, now: Instant) {
     }
 }
 
+fn stage_probe_session_binding_on_connection(
+    conn: &mut PeerConnection,
+    token: String,
+    session_id: Option<String>,
+    ephemeral_shared: Option<[u8; 32]>,
+    promote_on_match: bool,
+) -> ProbeBindingStage {
+    let now = Instant::now();
+    prune_probe_session_bindings(conn, now);
+    if conn.probe_binding_token.as_deref() == Some(token.as_str()) {
+        return ProbeBindingStage::ReplayableDuplicate;
+    }
+    if let Some(pending) = conn.pending_probe_bindings.get_mut(&token) {
+        // An exact cached answer replay gets a fresh delivery window.
+        pending.expires_at = now + PENDING_PROBE_SESSION_BINDING_GRACE;
+        return ProbeBindingStage::ReplayableDuplicate;
+    }
+    if conn
+        .previous_probe_binding
+        .as_ref()
+        .and_then(|previous| previous.binding.token.as_deref())
+        == Some(token.as_str())
+    {
+        return ProbeBindingStage::StaleDuplicate;
+    }
+    if conn.pending_probe_bindings.len() >= MAX_PENDING_PROBE_SESSION_BINDINGS_PER_PEER {
+        return ProbeBindingStage::Busy;
+    }
+    conn.pending_probe_bindings.insert(
+        token.clone(),
+        PendingProbeSessionBinding {
+            binding: ProbeSessionBinding {
+                token: Some(token),
+                session_id: normalize_probe_session_id(session_id),
+                ephemeral_shared,
+            },
+            expires_at: now + PENDING_PROBE_SESSION_BINDING_GRACE,
+            promote_on_match,
+        },
+    );
+    ProbeBindingStage::Staged
+}
+
 fn install_active_probe_binding(
     conn: &mut PeerConnection,
     binding: ProbeSessionBinding,
@@ -1247,40 +1290,51 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return ProbeBindingStage::PeerMissing;
         };
-        let now = Instant::now();
-        prune_probe_session_bindings(conn, now);
-        if conn.probe_binding_token.as_deref() == Some(token.as_str()) {
-            return ProbeBindingStage::ReplayableDuplicate;
+        stage_probe_session_binding_on_connection(
+            conn,
+            token,
+            session_id,
+            ephemeral_shared,
+            promote_on_match,
+        )
+    }
+
+    /// Try to stage a Probe-v2 replacement without waiting for the global
+    /// connection writer. Callers that already own the canonical
+    /// `emit -> network epoch` guards use this to avoid an ABBA cycle with a
+    /// connection mutation that needs either outer guard before it can finish.
+    /// `None` means only that the connection map is currently contended.
+    pub(crate) fn try_stage_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: String,
+        session_id: Option<String>,
+        ephemeral_shared: Option<[u8; 32]>,
+        promote_on_match: bool,
+    ) -> Option<ProbeBindingStage> {
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            return Some(ProbeBindingStage::StaleDuplicate);
         }
-        if let Some(pending) = conn.pending_probe_bindings.get_mut(&token) {
-            // An exact cached answer replay gets a fresh delivery window.
-            pending.expires_at = now + PENDING_PROBE_SESSION_BINDING_GRACE;
-            return ProbeBindingStage::ReplayableDuplicate;
-        }
-        if conn
-            .previous_probe_binding
-            .as_ref()
-            .and_then(|previous| previous.binding.token.as_deref())
-            == Some(token.as_str())
-        {
-            return ProbeBindingStage::StaleDuplicate;
-        }
-        if conn.pending_probe_bindings.len() >= MAX_PENDING_PROBE_SESSION_BINDINGS_PER_PEER {
-            return ProbeBindingStage::Busy;
-        }
-        conn.pending_probe_bindings.insert(
-            token.clone(),
-            PendingProbeSessionBinding {
-                binding: ProbeSessionBinding {
-                    token: Some(token),
-                    session_id: normalize_probe_session_id(session_id),
-                    ephemeral_shared,
-                },
-                expires_at: now + PENDING_PROBE_SESSION_BINDING_GRACE,
-                promote_on_match,
-            },
-        );
-        ProbeBindingStage::Staged
+        let mut conns = self.connections.try_write().ok()?;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return Some(ProbeBindingStage::PeerMissing);
+        };
+        Some(stage_probe_session_binding_on_connection(
+            conn,
+            token,
+            session_id,
+            ephemeral_shared,
+            promote_on_match,
+        ))
+    }
+
+    /// Queue once for connection-writer availability without retaining the
+    /// writer. The initiator calls this only after releasing emit/epoch, then
+    /// re-enters and revalidates the full generation transaction before
+    /// retrying the non-blocking stage.
+    pub(crate) async fn wait_for_probe_session_binding_writer(&self) {
+        drop(self.connections.write().await);
     }
 
     /// Extend a staged responder binding after the control-plane answer

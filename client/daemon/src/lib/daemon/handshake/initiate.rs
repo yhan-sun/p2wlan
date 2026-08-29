@@ -331,174 +331,203 @@ impl Daemon {
         // while awaiting the emit/session actors. Exact reservation, network
         // generation and peer lifecycle checks below form the commit fence.
         drop(handshake_guard);
-        // The outbound worker establishes the canonical lifecycle order
-        // `emit -> generation -> session/connection`. Acquire emit before the
-        // generation gate so a rekey or generation advance cannot deadlock
-        // against a live TUN encryption turn.
-        let emit_wait_started = Instant::now();
-        self.timeline.emit(
-            "initiator_publish_emit_lock_wait",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={handshake_generation}",
-                peer_info.node_id, reservation.owner
-            )),
-        );
-        let emit_guard = self
-            .transport
-            .acquire_outbound_emit_guard(&peer_info.node_id)
-            .await;
-        self.timeline.emit(
-            "initiator_publish_emit_lock_acquired",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={handshake_generation} wait_ms={}",
-                peer_info.node_id,
-                reservation.owner,
-                emit_wait_started.elapsed().as_millis()
-            )),
-        );
-        let epoch_gate = self.peers.network_epoch_gate();
-        let epoch_wait_started = Instant::now();
-        self.timeline.emit(
-            "initiator_publish_epoch_gate_wait",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={handshake_generation}",
-                peer_info.node_id, reservation.owner
-            )),
-        );
-        let epoch_guard = epoch_gate.lock().await;
-        self.timeline.emit(
-            "initiator_publish_epoch_gate_acquired",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={handshake_generation} wait_ms={}",
-                peer_info.node_id,
-                reservation.owner,
-                epoch_wait_started.elapsed().as_millis()
-            )),
-        );
-        if self.peers.current_network_generation_sync() != handshake_generation
-            || !self.peers.peer_session_is_current_sync(
-                &peer_info.node_id,
-                reservation.peer_session_generation,
-            )
-        {
-            self.pending_handshakes
-                .lock()
-                .await
-                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-            return Ok(None);
-        }
-        let status = self.transport.session_status(&peer_info.node_id).await;
-        self.timeline.emit(
-            "initiator_publish_session_status_ready",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={handshake_generation} has_active={} has_pending_responder={}",
-                peer_info.node_id,
-                reservation.owner,
-                status.has_active,
-                status.has_pending_responder
-            )),
-        );
-        if status.has_active || status.has_pending_responder {
-            self.pending_handshakes
-                .lock()
-                .await
-                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-            return Ok(None);
-        }
-
         let peer_id = peer_info.node_id.clone();
         let session_id = new_probe_session_id();
         let (probe_ephemeral, probe_ephemeral_public_key) = new_probe_ephemeral_keypair();
-        let Some((attempt_no, pending_id)) = ({
-            let mut state = self.pending_handshakes.lock().await;
-            state
-                .insert_reserved_if_current_with_generation(
-                    peer_id.clone(),
+        let mut binding_contentions = 0u32;
+        let (attempt_no, pending_id) = loop {
+            // The outbound worker establishes the canonical lifecycle order
+            // `emit -> generation -> session/connection`. The connection
+            // mutation itself is non-blocking while these outer guards are
+            // held; on contention we release both, queue for writer
+            // availability, and revalidate this entire transaction.
+            let emit_wait_started = Instant::now();
+            self.timeline.emit(
+                "initiator_publish_emit_lock_wait",
+                None,
+                None,
+                Some(format!(
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions}",
+                    reservation.owner
+                )),
+            );
+            let emit_guard = self.transport.acquire_outbound_emit_guard(&peer_id).await;
+            self.timeline.emit(
+                "initiator_publish_emit_lock_acquired",
+                None,
+                None,
+                Some(format!(
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} wait_ms={}",
                     reservation.owner,
-                    initiator,
-                    Some(session_id.clone()),
-                    Some(probe_ephemeral),
-                    handshake_generation,
+                    emit_wait_started.elapsed().as_millis()
+                )),
+            );
+            let epoch_gate = self.peers.network_epoch_gate();
+            let epoch_wait_started = Instant::now();
+            self.timeline.emit(
+                "initiator_publish_epoch_gate_wait",
+                None,
+                None,
+                Some(format!(
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions}",
+                    reservation.owner
+                )),
+            );
+            let epoch_guard = epoch_gate.lock().await;
+            self.timeline.emit(
+                "initiator_publish_epoch_gate_acquired",
+                None,
+                None,
+                Some(format!(
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} wait_ms={}",
+                    reservation.owner,
+                    epoch_wait_started.elapsed().as_millis()
+                )),
+            );
+            if *reservation.cancellation.borrow()
+                || reservation.cancellation.has_changed().is_err()
+                || self.peers.current_network_generation_sync() != handshake_generation
+                || !self.peers.peer_session_is_current_sync(
+                    &peer_id,
                     reservation.peer_session_generation,
                 )
-                .map(|pending_id| {
-                    let attempts = state.attempts.entry(peer_id.clone()).or_insert(0);
-                    *attempts = attempts.saturating_add(1);
-                    (*attempts, pending_id)
-                })
-        }) else {
-            return Ok(None);
-        };
-        self.timeline.emit(
-            "initiator_publish_pending_inserted",
-            None,
-            None,
-            Some(format!(
-                "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id}",
-                reservation.owner
-            )),
-        );
-        if self
-            .peers
-            .stage_probe_session_binding(
+            {
+                drop(epoch_guard);
+                drop(emit_guard);
+                self.pending_handshakes
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&peer_id, reservation.owner);
+                return Ok(None);
+            }
+            let status = self.transport.session_status(&peer_id).await;
+            self.timeline.emit(
+                "initiator_publish_session_status_ready",
+                None,
+                None,
+                Some(format!(
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} has_active={} has_pending_responder={}",
+                    reservation.owner, status.has_active, status.has_pending_responder
+                )),
+            );
+            if status.has_active || status.has_pending_responder {
+                drop(epoch_guard);
+                drop(emit_guard);
+                self.pending_handshakes
+                    .lock()
+                    .await
+                    .cancel_reservation_if_current(&peer_id, reservation.owner);
+                return Ok(None);
+            }
+
+            let stage = self.peers.try_stage_probe_session_binding(
                 &peer_id,
                 session_id.clone(),
                 Some(session_id.clone()),
                 None,
                 false,
-            )
-            .await
-            != ProbeBindingStage::Staged
-        {
-            let removed = {
-                let mut state = self.pending_handshakes.lock().await;
-                if state.is_current(&peer_id, pending_id) {
-                    state.remove(&peer_id);
-                    true
-                } else {
-                    false
+            );
+            match stage {
+                None => {
+                    binding_contentions = binding_contentions.saturating_add(1);
+                    self.timeline.emit(
+                        "initiator_publish_probe_binding_contended",
+                        None,
+                        Some("connection_writer_contended"),
+                        Some(format!(
+                            "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions}",
+                            reservation.owner
+                        )),
+                    );
+                    drop(epoch_guard);
+                    drop(emit_guard);
+
+                    tokio::select! {
+                        biased;
+                        changed = reservation.cancellation.changed() => {
+                            if changed.is_err() || *reservation.cancellation.borrow() {
+                                self.pending_handshakes
+                                    .lock()
+                                    .await
+                                    .cancel_reservation_if_current(&peer_id, reservation.owner);
+                                return Ok(None);
+                            }
+                        }
+                        () = self.peers.wait_for_probe_session_binding_writer() => {}
+                    }
                 }
-            };
-            if removed {
-                self.peers
-                    .discard_pending_probe_session_binding(&peer_id, &session_id)
-                    .await;
+                Some(ProbeBindingStage::Staged) => {
+                    let inserted = {
+                        let mut state = self.pending_handshakes.lock().await;
+                        state
+                            .insert_reserved_if_current_with_generation(
+                                peer_id.clone(),
+                                reservation.owner,
+                                initiator,
+                                Some(session_id.clone()),
+                                Some(probe_ephemeral),
+                                handshake_generation,
+                                reservation.peer_session_generation,
+                            )
+                            .map(|pending_id| {
+                                let attempts = state.attempts.entry(peer_id.clone()).or_insert(0);
+                                *attempts = attempts.saturating_add(1);
+                                (*attempts, pending_id)
+                            })
+                    };
+                    let Some((attempt_no, pending_id)) = inserted else {
+                        drop(epoch_guard);
+                        drop(emit_guard);
+                        self.peers
+                            .discard_pending_probe_session_binding(&peer_id, &session_id)
+                            .await;
+                        return Ok(None);
+                    };
+                    self.timeline.emit(
+                        "initiator_publish_probe_binding_staged",
+                        None,
+                        None,
+                        Some(format!(
+                            "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id} retries={binding_contentions}",
+                            reservation.owner
+                        )),
+                    );
+                    self.timeline.emit(
+                        "initiator_publish_pending_inserted",
+                        None,
+                        None,
+                        Some(format!(
+                            "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id}",
+                            reservation.owner
+                        )),
+                    );
+                    self.timeline.emit(
+                        "initiator_session_staged",
+                        None,
+                        None,
+                        Some(format!(
+                            "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id} session_fp={}",
+                            reservation.owner,
+                            handshake_token_fingerprint(Some(&session_id))
+                        )),
+                    );
+                    drop(epoch_guard);
+                    drop(emit_guard);
+                    break (attempt_no, pending_id);
+                }
+                Some(stage) => {
+                    drop(epoch_guard);
+                    drop(emit_guard);
+                    self.pending_handshakes
+                        .lock()
+                        .await
+                        .cancel_reservation_if_current(&peer_id, reservation.owner);
+                    return Err(DaemonError::Peer(format!(
+                        "failed to stage Probe v2 handshake binding for {peer_id}: {stage:?}"
+                    )));
+                }
             }
-            return Err(DaemonError::Peer(format!(
-                "failed to stage Probe v2 handshake binding for {peer_id}"
-            )));
-        }
-        self.timeline.emit(
-            "initiator_publish_probe_binding_staged",
-            None,
-            None,
-            Some(format!(
-                "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id}",
-                reservation.owner
-            )),
-        );
-        self.timeline.emit(
-            "initiator_session_staged",
-            None,
-            None,
-            Some(format!(
-                "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id} session_fp={}",
-                reservation.owner,
-                handshake_token_fingerprint(Some(&session_id))
-            )),
-        );
-        drop(epoch_guard);
-        drop(emit_guard);
+        };
 
         // The pending-id now owns cleanup of the committed initiator. The
         // admission-only arbiter was released before any actor await above, so

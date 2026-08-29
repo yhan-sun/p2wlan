@@ -77,6 +77,9 @@ jobs:
       - name: Run PeerLeft adoption fence test
         run: cargo test -p p2wlan-daemon --lib udp::tests::peer_left_cleanup_linearizes_with_late_ack -- --exact --test-threads=1
 
+      - name: Run initiator publish lock-order test
+        run: cargo test -p p2wlan-daemon --lib tests::initiator_publish_releases_epoch_while_connection_writer_is_contended -- --exact --test-threads=1
+
   lifecycle_and_topology_gates:
     name: Existing lifecycle and topology gates
     if: github.event_name == 'pull_request'

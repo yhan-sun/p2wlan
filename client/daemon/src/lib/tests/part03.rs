@@ -1887,6 +1887,114 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
 }
 
 #[tokio::test]
+async fn initiator_publish_releases_epoch_while_connection_writer_is_contended() {
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Daemon::new(config);
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if local_public < identity.public_key() {
+            break identity;
+        }
+    };
+    let peer_info = control::PeerInfo {
+        node_id: "peer-initiator-connection-contention".to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: String::new(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    };
+    daemon.peers.add_peer(&peer_info).await;
+    daemon.relay_available_tx.send_replace(true);
+
+    let mut reservation = daemon
+        .reserve_event_initiator_handshake(&peer_info.node_id)
+        .await
+        .expect("event initiator reservation must be admitted");
+    let peers = daemon.peers.clone();
+    let pending = daemon.pending_handshakes.clone();
+    let timeline = daemon.timeline.clone();
+    let peer_id = peer_info.node_id.clone();
+
+    // A candidate/connection reader is sufficient to make Probe-binding
+    // staging need the connection writer. The old publish path inserted its
+    // pending initiator and then awaited that writer while retaining both the
+    // emit and network-epoch guards, completing an ABBA cycle with lifecycle
+    // work that needed the epoch before it could release the connection map.
+    let connection_guard = peers.connection_map_for_test().read_owned().await;
+    let worker = tokio::spawn(async move {
+        daemon
+            .run_reserved_initiator_handshake(&peer_info, &mut reservation)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if timeline
+                .snapshot()
+                .events
+                .iter()
+                .any(|event| event.event == "initiator_publish_probe_binding_contended")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initiator must report connection-writer contention");
+
+    assert!(
+        !pending.lock().await.pending.contains_key(&peer_id),
+        "an initiator must not become pending before its Probe binding is staged"
+    );
+    let epoch_gate = peers.network_epoch_gate();
+    let epoch_guard = tokio::time::timeout(Duration::from_millis(250), epoch_gate.lock())
+        .await
+        .expect("connection contention must not retain the network-epoch guard");
+    drop(epoch_guard);
+
+    drop(connection_guard);
+    let _result = tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("initiator must retry after the connection writer becomes available")
+        .expect("initiator task must not panic");
+
+    let snapshot = timeline.snapshot();
+    let staged = snapshot
+        .events
+        .iter()
+        .position(|event| event.event == "initiator_publish_probe_binding_staged")
+        .expect("retry must stage the Probe binding");
+    let inserted = snapshot
+        .events
+        .iter()
+        .position(|event| event.event == "initiator_publish_pending_inserted")
+        .expect("retry must commit the pending initiator");
+    assert!(
+        staged < inserted,
+        "Probe binding staging must precede pending-initiator publication"
+    );
+
+    let session_id = {
+        let mut state = pending.lock().await;
+        let session_id = state.pending_session_ids.get(&peer_id).cloned();
+        state.remove(&peer_id);
+        session_id
+    };
+    if let Some(session_id) = session_id {
+        peers
+            .discard_pending_probe_session_binding(&peer_id, &session_id)
+            .await;
+    }
+}
+
+#[tokio::test]
 async fn committed_initiator_offer_wait_is_cancelled_when_pending_is_removed() {
     let peer_id = "peer-cancelled-initiator-offer";
     let mut state = PendingHandshakeState::default();
