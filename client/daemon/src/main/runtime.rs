@@ -1,5 +1,12 @@
 #[tokio::main]
 async fn main() -> p2pnet_daemon::Result<()> {
+    // The lifecycle probes are intentionally parsed before Clap and before any
+    // token/config/logging/instance-lock side effect. They are strict, hidden
+    // packaging contracts rather than production daemon options.
+    if run_lifecycle_probe_from_process_args()? {
+        return Ok(());
+    }
+
     // Parse arguments BEFORE any side effects (including logging setup)
     // This guarantees --help and --version exit cleanly without side effects.
     let cli = Cli::parse();

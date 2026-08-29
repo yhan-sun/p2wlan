@@ -1,0 +1,162 @@
+name: Mobile Lifecycle
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/mobile-lifecycle.yml"
+      - "scripts/mobile-lifecycle-regression.sh"
+      - "scripts/build_android_native.sh"
+      - "apps/flutter_client/**"
+      - "client/android-native/**"
+      - "client/daemon/**"
+      - "client/tun/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/mobile-lifecycle.yml"
+      - "scripts/mobile-lifecycle-regression.sh"
+      - "scripts/build_android_native.sh"
+      - "apps/flutter_client/**"
+      - "client/android-native/**"
+      - "client/daemon/**"
+      - "client/tun/**"
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle_contract:
+    name: Mobile Lifecycle Required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter dependencies
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Validate runner shell syntax
+        run: bash -n scripts/mobile-lifecycle-regression.sh
+
+      - name: Run lifecycle, background and handoff regressions
+        env:
+          P2WLAN_MOBILE_LIFECYCLE_ROUNDS: "3"
+          P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR: ${{ runner.temp }}/p2wlan-mobile-lifecycle
+        run: bash scripts/mobile-lifecycle-regression.sh
+
+      - name: Upload lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-lifecycle-contract-evidence
+          path: ${{ runner.temp }}/p2wlan-mobile-lifecycle
+          if-no-files-found: error
+          retention-days: 14
+
+  android_modes:
+    name: Android lifecycle package (${{ matrix.name }})
+    if: github.event_name != 'pull_request'
+    needs: lifecycle_contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: async-fd-default
+            tun_mode: async_fd
+            wifi_low_latency: "false"
+          - name: blocking-low-latency
+            tun_mode: dedicated_blocking
+            wifi_low_latency: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Set up Rust Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Configure Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
+          ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -n "$ndk_root"
+          test -d "$ndk_root"
+          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+
+      - name: Flutter dependencies
+        working-directory: apps/flutter_client
+        run: flutter pub get
+
+      - name: Restore Flutter-managed sources
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Build Android lifecycle package
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_ANDROID_ABIS: arm64-v8a
+          P2WLAN_ANDROID_TUN_MODE: ${{ matrix.tun_mode }}
+          P2WLAN_ANDROID_WIFI_LOW_LATENCY: ${{ matrix.wifi_low_latency }}
+          P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: "1"
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh apk
+          --release
+          --target-platform android-arm64
+          --split-per-abi
+          --dart-define=P2WLAN_ANDROID_TUN_MODE=${{ matrix.tun_mode }}
+          --dart-define=P2WLAN_ANDROID_WIFI_LOW_LATENCY=${{ matrix.wifi_low_latency }}
+
+      - name: Verify arm64 package
+        working-directory: apps/flutter_client
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          test -f "$apk"
+          actual_abis="$(unzip -Z1 "$apk" | sed -n 's#^lib/\([^/]*\)/.*#\1#p' | sort -u | paste -sd, -)"
+          test "$actual_abis" = "arm64-v8a"
+          sha256sum "$apk" > "$apk.sha256"
+
+      - name: Upload Android lifecycle package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-lifecycle-${{ matrix.name }}
+          path: |
+            apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 14

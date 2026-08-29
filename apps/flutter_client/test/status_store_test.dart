@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
@@ -425,6 +426,52 @@ void main() {
   });
 
   test(
+    'mobile lifecycle stops background event polling and revalidates on resume',
+    () async {
+      final fixture = await _loadFixture();
+      final api = _LifecycleDiagnosticsApi(snapshot: fixture);
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      stores.statusStore.setAutoRefresh(enabled: true);
+      await _waitUntil(() => api.eventRequests.length == 1);
+      final statusCountBeforePause = api.statusFetchCount;
+
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.paused);
+      expect(stores.statusStore.appInForeground, isFalse);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(
+        api.eventRequests,
+        hasLength(1),
+        reason: 'backgrounding must not create another long poll',
+      );
+
+      // Resume while the pre-suspend request is still pending. The new event
+      // loop must not wait for that stale network future to reach its timeout.
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.resumed);
+      await _waitUntil(() => api.statusFetchCount > statusCountBeforePause);
+      await _waitUntil(() => api.eventRequests.length == 2);
+      expect(stores.statusStore.appInForeground, isTrue);
+      expect(
+        api.eventProcessIds.last,
+        fixture.processId,
+        reason:
+            'resume must rebuild the event cursor from the refreshed process',
+      );
+
+      // A late completion from the suspended network epoch is ignored and
+      // must not spawn a third request beside the current resumed loop.
+      api.completeEventRequest(0, fixture);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(api.eventRequests, hasLength(2));
+
+      stores.statusStore.setAutoRefresh(enabled: false);
+      api.completeEventRequest(1, fixture);
+    },
+  );
+
+  test(
     'event poll carries process identity and resets on daemon restart',
     () async {
       final fixture = await _loadFixture();
@@ -564,6 +611,41 @@ class _Stores {
     statusStore.dispose();
     settingsStore.dispose();
     if (directory.existsSync()) directory.deleteSync(recursive: true);
+  }
+}
+
+class _LifecycleDiagnosticsApi extends _SwitchingDiagnosticsApi {
+  _LifecycleDiagnosticsApi({required super.snapshot});
+
+  final eventRequests = <Completer<EventsResponse>>[];
+
+  @override
+  Future<EventsResponse> fetchEvents(
+    String diagnosticsUrl, {
+    int since = 0,
+    int? processId,
+    Duration timeout = const Duration(seconds: 30),
+  }) {
+    eventProcessIds.add(processId);
+    eventCursors.add(since);
+    final request = Completer<EventsResponse>();
+    eventRequests.add(request);
+    return request.future;
+  }
+
+  void completeEventRequest(int index, DiagnosticsSnapshot snapshot) {
+    final request = eventRequests[index];
+    if (request.isCompleted) return;
+    request.complete(
+      EventsResponse(
+        contractVersion: 1,
+        processId: snapshot.processId,
+        revision: snapshot.revision,
+        oldestSeq: snapshot.revision,
+        resetRequired: false,
+        events: const [],
+      ),
+    );
   }
 }
 
