@@ -286,6 +286,10 @@ impl RemoteIdentityLedger {
 type AuthenticatedProbeVerifyGateSlot =
     Arc<std::sync::Mutex<Option<(String, Arc<AuthenticatedProbeVerifyGate>)>>>;
 
+#[cfg(test)]
+type RelayProbeSnapshotTestGateSlot =
+    Arc<std::sync::Mutex<Option<(String, Arc<RelayProbeSnapshotTestGate>)>>>;
+
 /// Manages all peer connections.
 pub struct PeerManager {
     /// Active peer connections, indexed by node ID.
@@ -303,6 +307,8 @@ pub struct PeerManager {
     peer_membership: Arc<std::sync::Mutex<PeerMembershipState>>,
     #[cfg(test)]
     authenticated_probe_verify_gate: AuthenticatedProbeVerifyGateSlot,
+    #[cfg(test)]
+    relay_probe_snapshot_test_gate: RelayProbeSnapshotTestGateSlot,
     #[cfg(test)]
     hard_hard_cleanup_gate:
         Arc<std::sync::Mutex<Option<HardHardCleanupGateRegistration>>>,

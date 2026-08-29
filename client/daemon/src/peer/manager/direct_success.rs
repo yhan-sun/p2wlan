@@ -424,6 +424,9 @@ impl PeerManager {
             if !outcome.accepted() {
                 return false;
             }
+            if !outcome.applies_side_effects() {
+                return true;
+            }
             pair_success
         };
         // Direct validation is a background upgrade, not permission to tear

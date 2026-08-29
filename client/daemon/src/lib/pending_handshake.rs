@@ -89,11 +89,18 @@ impl PendingPeerReflexive {
 /// incarnation could then clear a newer reservation after `PeerLeft`/rejoin.
 /// The token and cancellation receiver make the reservation linearizable with
 /// lifecycle cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandshakeStartDisposition {
+    Active,
+    ProbeBindingRetryDeferred,
+}
+
 struct HandshakeStartReservation {
     owner: u64,
     network_generation: u64,
     peer_session_generation: PeerSessionGeneration,
     cancellation: tokio::sync::watch::Receiver<bool>,
+    disposition: HandshakeStartDisposition,
 }
 
 /// Owner token for the one responder worker admitted for a peer.
@@ -262,6 +269,7 @@ impl PendingHandshakeState {
             network_generation,
             peer_session_generation,
             cancellation,
+            disposition: HandshakeStartDisposition::Active,
         })
     }
 

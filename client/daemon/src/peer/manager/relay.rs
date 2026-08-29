@@ -1,4 +1,42 @@
 impl PeerManager {
+    #[cfg(test)]
+    pub(crate) fn install_relay_probe_snapshot_gate_for_test(
+        &self,
+        node_id: &str,
+        gate: Arc<RelayProbeSnapshotTestGate>,
+    ) {
+        *self
+            .relay_probe_snapshot_test_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((node_id.to_string(), gate));
+    }
+
+    #[cfg(test)]
+    async fn pause_relay_probe_snapshot_for_test(
+        &self,
+        connections: &HashMap<String, PeerConnection>,
+    ) {
+        let gate = {
+            let mut installed = self
+                .relay_probe_snapshot_test_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if installed
+                .as_ref()
+                .is_some_and(|(peer_id, _)| connections.contains_key(peer_id))
+            {
+                installed.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Whether the peer is direct in a specific generation.
     pub async fn is_direct_for_generation(&self, node_id: &str, generation: u64) -> bool {
         generation == self.current_network_generation().await && self.is_direct(node_id).await
@@ -1344,6 +1382,10 @@ impl PeerManager {
                 generation,
                 ack_connection_id,
                 Some(expectation.peer_session_generation),
+                RelayHealthObservationIdentity {
+                    owner_token: expectation.owner_token,
+                    request_id: expectation.request_id,
+                },
                 relay_rtt,
             )
             .await;
@@ -1362,6 +1404,7 @@ impl PeerManager {
         confirmation_changed || accepted
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn accept_relay_probe_ack_for_current_lifecycle(
         &self,
         node_id: &str,
@@ -1369,6 +1412,7 @@ impl PeerManager {
         generation: u64,
         relay_connection_id: Option<u64>,
         peer_session_generation: Option<PeerSessionGeneration>,
+        observation: RelayHealthObservationIdentity,
         relay_rtt: Option<Duration>,
     ) -> bool {
         let epoch_gate = self.network_epoch_gate();
@@ -1395,10 +1439,23 @@ impl PeerManager {
         if !current {
             return false;
         }
-        if let Some(relay_rtt) = relay_rtt {
-            conn.relay_health.record_success_with_latency(relay_rtt);
-        }
-        true
+        let Some(relay_rtt) = relay_rtt else {
+            return true;
+        };
+        let relay = RelayConnectionIdentity::new(
+            PathEpoch::new(
+                generation,
+                expected_lifecycle,
+                conn.remote_candidate_epoch(),
+            ),
+            relay_endpoint,
+            relay_connection_id,
+        );
+        conn.commit_path_transition(
+            PathEvent::RelayHealthObserved { relay, observation },
+            |conn| conn.relay_health.record_success_with_latency(relay_rtt),
+        )
+        .accepted()
     }
 
     /// Peers that still need a forced-relay probe: online and not yet relay
@@ -1410,10 +1467,10 @@ impl PeerManager {
     /// quarantined/offline.
     pub async fn relay_probe_targets(&self) -> Vec<(String, String, u64)> {
         let generation = self.current_network_generation().await;
-        let candidates: Vec<_> = self
-            .connections
-            .read()
-            .await
+        let connections = self.connections.read().await;
+        #[cfg(test)]
+        self.pause_relay_probe_snapshot_for_test(&connections).await;
+        let candidates: Vec<_> = connections
             .values()
             .filter(|conn| {
                 conn.online
@@ -1422,6 +1479,7 @@ impl PeerManager {
             })
             .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone(), generation))
             .collect();
+        drop(connections);
         let mut targets = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if !self.peer_quarantined(&candidate.0).await {
@@ -1635,6 +1693,7 @@ impl PeerManager {
             let outcome = conn.commit_path_transition(
                 PathEvent::RelayBusinessUsable {
                     relay: relay_identity,
+                    observation: RelayBusinessObservation::Sent,
                 },
                 |conn| {
                     conn.relay_first.business_sent_generation = Some(generation);
@@ -1788,6 +1847,7 @@ impl PeerManager {
                 let outcome = conn.commit_path_transition(
                     PathEvent::RelayBusinessUsable {
                         relay: relay_identity,
+                        observation: RelayBusinessObservation::Received,
                     },
                     |conn| {
                         let first_receive =

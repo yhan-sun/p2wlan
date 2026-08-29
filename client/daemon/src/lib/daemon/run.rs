@@ -339,7 +339,8 @@ impl Daemon {
         // actor when a first business packet starts waiting (or a relay comes
         // up), so the probe fires immediately instead of waiting for the next
         // poll tick.
-        let (relay_probe_kick_tx, relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+        let relay_probe_kick_tx = self.path_setup_kick_tx.clone();
+        let relay_probe_kick_rx = relay_probe_kick_tx.subscribe();
         // The probe loop and handshake maintenance each keep their own watch
         // cursor. A first business packet therefore wakes both paths without
         // making either consumer steal the other's notification.

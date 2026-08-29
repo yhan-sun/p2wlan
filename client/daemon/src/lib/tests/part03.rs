@@ -1920,6 +1920,7 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
     let pending = daemon.pending_handshakes.clone();
     let timeline = daemon.timeline.clone();
     let peer_id = peer_info.node_id.clone();
+    let mut reschedule_rx = daemon.path_setup_kick_tx.subscribe();
 
     // A candidate/connection reader is sufficient to make Probe-binding
     // staging need the connection writer. The old publish path inserted its
@@ -1959,39 +1960,373 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
         .expect("connection contention must not retain the network-epoch guard");
     drop(epoch_guard);
 
-    drop(connection_guard);
-    let _result = tokio::time::timeout(Duration::from_secs(2), worker)
+    let result = tokio::time::timeout(Duration::from_secs(1), worker)
         .await
-        .expect("initiator must retry after the connection writer becomes available")
-        .expect("initiator task must not panic");
+        .expect("contended initiator must leave the cooperative owner immediately")
+        .expect("initiator task must not panic")
+        .expect("connection contention is a non-fatal initiator outcome");
+    assert_eq!(result, None);
 
-    let snapshot = timeline.snapshot();
-    let staged = snapshot
-        .events
-        .iter()
-        .position(|event| event.event == "initiator_publish_probe_binding_staged")
-        .expect("retry must stage the Probe binding");
-    let inserted = snapshot
-        .events
-        .iter()
-        .position(|event| event.event == "initiator_publish_pending_inserted")
-        .expect("retry must commit the pending initiator");
-    assert!(
-        staged < inserted,
-        "Probe binding staging must precede pending-initiator publication"
+    drop(connection_guard);
+    tokio::time::timeout(Duration::from_secs(1), reschedule_rx.changed())
+        .await
+        .expect("writer availability must publish a maintenance reschedule edge")
+        .expect("path-setup reschedule sender must stay live");
+    assert!(timeline.snapshot().events.iter().any(|event| {
+        event.event == "initiator_publish_probe_binding_writer_available"
+            && event
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("reschedule_kick="))
+    }));
+    let state = pending.lock().await;
+    assert!(!state.pending.contains_key(&peer_id));
+    assert!(!state.starting.contains(&peer_id));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_probe_snapshot_contention_detaches_writer_wait_unblocks_readers_and_reschedules_initiator(
+) {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Arc::new(Daemon::new(config));
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if local_public < identity.public_key() {
+            break identity;
+        }
+    };
+    let peer_info = control::PeerInfo {
+        node_id: "peer-relay-snapshot-contention".to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: String::new(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    };
+    daemon.peers.add_peer(&peer_info).await;
+    daemon.relay_available_tx.send_replace(true);
+
+    // Reproduce the production startup actor, not a synthetic lock owner: the
+    // forced-Relay target scan has acquired its real connection snapshot when
+    // the initiator reaches atomic Probe-binding publication.
+    let relay_snapshot_gate = Arc::new(crate::peer::RelayProbeSnapshotTestGate::new());
+    daemon.peers.install_relay_probe_snapshot_gate_for_test(
+        &peer_info.node_id,
+        relay_snapshot_gate.clone(),
+    );
+    let relay_peers = daemon.peers.clone();
+    let relay_targets = tokio::spawn(async move { relay_peers.relay_probe_targets().await });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        relay_snapshot_gate.reached.notified(),
+    )
+    .await
+    .expect("the real relay target snapshot must own the connection reader");
+
+    let mut reschedule_rx = daemon.path_setup_kick_tx.subscribe();
+    let mut reservation = daemon
+        .reserve_event_initiator_handshake(&peer_info.node_id)
+        .await
+        .expect("event initiator reservation must be admitted");
+    let mut worker = Box::pin(
+        daemon.run_reserved_initiator_handshake(&peer_info, &mut reservation),
     );
 
+    // Poll the cooperative slow-work future only until it queues the writer.
+    // The production failure kept the writer and its timeout inside this
+    // future, so its first Pending at this point let a later control-loop
+    // branch wait behind that same writer forever. The fixed future transfers
+    // ownership to an independently scheduled bounded task and is Ready in
+    // the very poll that records contention.
+    let first_result = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let polled = std::future::poll_fn(|context| {
+                Poll::Ready(worker.as_mut().poll(context))
+            })
+            .await;
+            let writer_scheduled = daemon
+                .timeline
+                .snapshot()
+                .events
+                .iter()
+                .any(|event| event.event == "initiator_publish_probe_binding_writer_wait");
+            match polled {
+                Poll::Ready(result) => {
+                    assert!(
+                        writer_scheduled,
+                        "initiator completed before exercising writer contention"
+                    );
+                    break result;
+                }
+                Poll::Pending if writer_scheduled => {
+                    panic!(
+                        "cooperative initiator retained the queued writer waiter and its timeout"
+                    );
+                }
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("initiator must reach writer contention")
+    .expect("connection contention is a non-fatal initiator outcome");
+    assert_eq!(first_result, None);
+    drop(worker);
+    assert_eq!(
+        reservation.disposition,
+        HandshakeStartDisposition::ProbeBindingRetryDeferred
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if daemon.timeline.snapshot().events.iter().any(|event| {
+                event.event == "initiator_publish_probe_binding_writer_wait_started"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached writer waiter must start independently");
+
+    // The writer barrier must own no upper guard while queued.
+    let epoch_gate = daemon.peers.network_epoch_gate();
+    let epoch_guard = tokio::time::timeout(Duration::from_millis(100), epoch_gate.lock())
+        .await
+        .expect("writer wait must not retain the network epoch guard");
+    drop(epoch_guard);
+    let emit_guard = tokio::time::timeout(
+        Duration::from_millis(100),
+        daemon
+            .transport
+            .acquire_outbound_emit_guard(&peer_info.node_id),
+    )
+        .await
+        .expect("writer wait must not retain the outbound emit guard");
+    drop(emit_guard);
+
+    // Tokio queues this real status read behind the waiting writer. The old
+    // unbounded barrier left it there until /status returned 503.
+    let mut status_read = {
+        let queue_deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let status_peers = daemon.peers.clone();
+            let status_peer_id = peer_info.node_id.clone();
+            let mut candidate = tokio::spawn(async move {
+                status_peers.get_connection(&status_peer_id).await
+            });
+            if tokio::time::timeout(Duration::from_millis(10), &mut candidate)
+                .await
+                .is_err()
+            {
+                break candidate;
+            }
+            assert!(
+                Instant::now() < queue_deadline,
+                "the detached connection writer never entered Tokio's fair queue"
+            );
+            tokio::task::yield_now().await;
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), reschedule_rx.changed())
+        .await
+        .expect("bounded writer timeout must publish a maintenance reschedule edge")
+        .expect("path-setup reschedule sender must stay live");
+    // Cancellation of the timed-out writer removes it from the fair queue;
+    // readers can progress even while the original Relay snapshot is still
+    // deliberately alive.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut status_read)
+            .await
+            .expect("status read must resume when the timed-out writer is removed")
+            .expect("status task must not panic")
+            .is_some()
+    );
+    let state = daemon.pending_handshakes.lock().await;
+    assert!(
+        !state.pending.contains_key(&peer_info.node_id),
+        "timed-out publication must not publish a pending initiator"
+    );
+    assert!(
+        !state.starting.contains(&peer_info.node_id),
+        "timed-out publication must cancel its reservation atomically"
+    );
+    drop(state);
+    let timeout_event = daemon
+        .timeline
+        .snapshot()
+        .events
+        .into_iter()
+        .find(|event| event.event == "initiator_publish_probe_binding_writer_timeout")
+        .expect("timeout must have a structured timeline diagnostic");
+    assert_eq!(
+        timeout_event.reason_code.as_deref(),
+        Some(REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT)
+    );
+    assert!(timeout_event
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("timeout_ms=250")
+            && detail.contains("reschedule_kick=")));
+
+    relay_snapshot_gate.release.notify_one();
+    let targets = tokio::time::timeout(Duration::from_secs(1), relay_targets)
+        .await
+        .expect("relay target scan must resume")
+        .expect("relay target task must not panic");
+    assert!(targets
+        .iter()
+        .any(|(peer_id, _, _)| peer_id == &peer_info.node_id));
+
+    // Consume the reschedule edge the same way maintenance does: a fresh
+    // reservation succeeds once the real Relay reader has left the map.
+    let mut retry_reservation = daemon
+        .reserve_event_initiator_handshake(&peer_info.node_id)
+        .await
+        .expect("rescheduled initiator must obtain a fresh reservation");
+    let _retry_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        daemon.run_reserved_initiator_handshake(&peer_info, &mut retry_reservation),
+    )
+    .await
+    .expect("rescheduled initiator must not stall");
+    assert!(daemon.timeline.snapshot().events.iter().any(|event| {
+        event.event == "initiator_publish_probe_binding_staged"
+            && event
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(&peer_info.node_id))
+    }));
+
     let session_id = {
-        let mut state = pending.lock().await;
-        let session_id = state.pending_session_ids.get(&peer_id).cloned();
-        state.remove(&peer_id);
+        let mut state = daemon.pending_handshakes.lock().await;
+        let session_id = state
+            .pending_session_ids
+            .get(&peer_info.node_id)
+            .cloned();
+        state.remove(&peer_info.node_id);
         session_id
     };
     if let Some(session_id) = session_id {
-        peers
-            .discard_pending_probe_session_binding(&peer_id, &session_id)
+        daemon
+            .peers
+            .discard_pending_probe_session_binding(&peer_info.node_id, &session_id)
             .await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_probe_binding_writer_wait_cancels_without_stale_reschedule() {
+    let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
+    let daemon = Arc::new(Daemon::new(config));
+    let peer_identity = NodeIdentity::generate();
+    let peer_info = control::PeerInfo {
+        node_id: "peer-cancelled-detached-writer".to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: String::new(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    };
+    daemon.peers.add_peer(&peer_info).await;
+
+    let reservation = daemon
+        .reserve_event_initiator_handshake(&peer_info.node_id)
+        .await
+        .expect("event initiator reservation must be admitted");
+    let connection_guard = daemon
+        .peers
+        .connection_map_for_test()
+        .read_owned()
+        .await;
+    let reschedule_rx = daemon.path_setup_kick_tx.subscribe();
+    daemon.defer_initiator_probe_binding_writer_retry(
+        peer_info.node_id.clone(),
+        reservation.owner,
+        reservation.network_generation,
+        1,
+        reservation.cancellation.clone(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if daemon.timeline.snapshot().events.iter().any(|event| {
+                event.event == "initiator_publish_probe_binding_writer_wait_started"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached writer waiter must start");
+
+    let mut status_read = {
+        let queue_deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let status_peers = daemon.peers.clone();
+            let status_peer_id = peer_info.node_id.clone();
+            let mut candidate = tokio::spawn(async move {
+                status_peers.get_connection(&status_peer_id).await
+            });
+            if tokio::time::timeout(Duration::from_millis(10), &mut candidate)
+                .await
+                .is_err()
+            {
+                break candidate;
+            }
+            assert!(
+                Instant::now() < queue_deadline,
+                "the detached connection writer never entered Tokio's fair queue"
+            );
+            tokio::task::yield_now().await;
+        }
+    };
+
+    daemon
+        .pending_handshakes
+        .lock()
+        .await
+        .clear_peer(&peer_info.node_id);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if daemon.timeline.snapshot().events.iter().any(|event| {
+                event.event == "initiator_publish_probe_binding_writer_wait_cancelled"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reservation cancellation must wake the detached writer waiter");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut status_read)
+            .await
+            .expect("status read must resume after cancellation removes the writer")
+            .expect("status task must not panic")
+            .is_some()
+    );
+    assert!(
+        matches!(reschedule_rx.has_changed(), Ok(false)),
+        "a cancelled old owner must not publish a path-setup retry"
+    );
+    drop(connection_guard);
 }
 
 #[tokio::test]

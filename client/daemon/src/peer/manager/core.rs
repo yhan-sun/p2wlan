@@ -34,6 +34,8 @@ impl PeerManager {
             #[cfg(test)]
             authenticated_probe_verify_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
+            relay_probe_snapshot_test_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
             hard_hard_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),

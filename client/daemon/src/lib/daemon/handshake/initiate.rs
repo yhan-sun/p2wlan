@@ -84,6 +84,136 @@ impl Daemon {
         Some(reservation)
     }
 
+    /// Transfer a contended Probe-binding publication out of the cooperative
+    /// control-event work set. The control loop contains branches that await
+    /// connection-map readers and writers; keeping the first fair writer
+    /// waiter inside that same loop can therefore prevent both the waiter and
+    /// its timeout from ever being polled. This independently scheduled task
+    /// owns no emit, network-epoch, handshake-arbiter, or connection guard.
+    fn defer_initiator_probe_binding_writer_retry(
+        &self,
+        peer_id: String,
+        owner: u64,
+        network_generation: u64,
+        retry: u32,
+        mut cancellation: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let peers = self.peers.clone();
+        let pending_handshakes = self.pending_handshakes.clone();
+        let path_setup_kick_tx = self.path_setup_kick_tx.clone();
+        let timeline = self.timeline.clone();
+
+        timeline.emit(
+            "initiator_publish_probe_binding_writer_wait",
+            None,
+            Some("connection_writer_contended"),
+            Some(format!(
+                "peer={peer_id} owner={owner} generation={network_generation} retry={retry} timeout_ms={}",
+                INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
+            )),
+        );
+
+        // The task is intrinsically bounded by the writer timeout. Dropping
+        // the JoinHandle deliberately detaches it from the serial control
+        // loop whose cooperative polling is the condition being avoided.
+        tokio::spawn(async move {
+            if *cancellation.borrow() || cancellation.has_changed().is_err() {
+                return;
+            }
+
+            let writer_wait_started = Instant::now();
+            timeline.emit(
+                "initiator_publish_probe_binding_writer_wait_started",
+                None,
+                Some("connection_writer_contended"),
+                Some(format!(
+                    "peer={peer_id} owner={owner} generation={network_generation} retry={retry} timeout_ms={}",
+                    INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
+                )),
+            );
+            let writer_available = tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    let _ = changed;
+                    timeline.emit(
+                        "initiator_publish_probe_binding_writer_wait_cancelled",
+                        None,
+                        Some("initiator_reservation_cancelled"),
+                        Some(format!(
+                            "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={}",
+                            writer_wait_started.elapsed().as_millis()
+                        )),
+                    );
+                    return;
+                }
+                available = peers.wait_for_probe_session_binding_writer(
+                    INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT,
+                ) => available
+            };
+            let wait_ms = writer_wait_started.elapsed().as_millis();
+
+            // Re-check cancellation while obtaining the short reservation
+            // mutex. PeerLeft/network-generation cleanup wins over this old
+            // retry and therefore cannot be followed by a stale kick.
+            let cancelled_current = tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    let _ = changed;
+                    false
+                }
+                mut state = pending_handshakes.lock() => {
+                    state.cancel_reservation_if_current(&peer_id, owner)
+                }
+            };
+            if !cancelled_current {
+                timeline.emit(
+                    "initiator_publish_probe_binding_writer_wait_stale",
+                    None,
+                    Some("initiator_reservation_replaced"),
+                    Some(format!(
+                        "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={wait_ms} writer_available={writer_available}"
+                    )),
+                );
+                return;
+            }
+
+            let next_kick = (*path_setup_kick_tx.borrow()).wrapping_add(1);
+            path_setup_kick_tx.send_replace(next_kick);
+            if writer_available {
+                timeline.emit(
+                    "initiator_publish_probe_binding_writer_available",
+                    None,
+                    None,
+                    Some(format!(
+                        "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={wait_ms} reschedule_kick={next_kick}"
+                    )),
+                );
+            } else {
+                timeline.emit(
+                    "initiator_publish_probe_binding_writer_timeout",
+                    None,
+                    Some(REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT),
+                    Some(format!(
+                        "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={wait_ms} timeout_ms={} reschedule_kick={next_kick}",
+                        INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
+                    )),
+                );
+                warn!(
+                    event = "initiator_publish_probe_binding_writer_timeout",
+                    reason_code = REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT,
+                    peer_id = %peer_id,
+                    owner,
+                    network_generation,
+                    retry,
+                    wait_ms,
+                    timeout_ms = INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis(),
+                    reschedule_kick = next_kick,
+                    "Probe binding connection writer remained contended; reservation cancelled and path setup rescheduled"
+                );
+            }
+        });
+    }
+
     /// Complete an initiator handshake after the control event loop has
     /// atomically admitted a reservation for this peer.
     ///
@@ -334,13 +464,14 @@ impl Daemon {
         let peer_id = peer_info.node_id.clone();
         let session_id = new_probe_session_id();
         let (probe_ephemeral, probe_ephemeral_public_key) = new_probe_ephemeral_keypair();
-        let mut binding_contentions = 0u32;
-        let (attempt_no, pending_id) = loop {
+        let binding_contentions = 0u32;
+        let (attempt_no, pending_id) = {
             // The outbound worker establishes the canonical lifecycle order
             // `emit -> generation -> session/connection`. The connection
             // mutation itself is non-blocking while these outer guards are
-            // held; on contention we release both, queue for writer
-            // availability, and revalidate this entire transaction.
+            // held; on contention we release both and transfer a bounded
+            // writer wait to an independent task. Normal maintenance starts a
+            // fresh transaction after that task publishes its retry edge.
             let emit_wait_started = Instant::now();
             self.timeline.emit(
                 "initiator_publish_emit_lock_wait",
@@ -429,7 +560,7 @@ impl Daemon {
             );
             match stage {
                 None => {
-                    binding_contentions = binding_contentions.saturating_add(1);
+                    let binding_contentions = binding_contentions.saturating_add(1);
                     self.timeline.emit(
                         "initiator_publish_probe_binding_contended",
                         None,
@@ -441,20 +572,16 @@ impl Daemon {
                     );
                     drop(epoch_guard);
                     drop(emit_guard);
-
-                    tokio::select! {
-                        biased;
-                        changed = reservation.cancellation.changed() => {
-                            if changed.is_err() || *reservation.cancellation.borrow() {
-                                self.pending_handshakes
-                                    .lock()
-                                    .await
-                                    .cancel_reservation_if_current(&peer_id, reservation.owner);
-                                return Ok(None);
-                            }
-                        }
-                        () = self.peers.wait_for_probe_session_binding_writer() => {}
-                    }
+                    reservation.disposition =
+                        HandshakeStartDisposition::ProbeBindingRetryDeferred;
+                    self.defer_initiator_probe_binding_writer_retry(
+                        peer_id.clone(),
+                        reservation.owner,
+                        handshake_generation,
+                        binding_contentions,
+                        reservation.cancellation.clone(),
+                    );
+                    return Ok(None);
                 }
                 Some(ProbeBindingStage::Staged) => {
                     let inserted = {
@@ -513,7 +640,7 @@ impl Daemon {
                     );
                     drop(epoch_guard);
                     drop(emit_guard);
-                    break (attempt_no, pending_id);
+                    (attempt_no, pending_id)
                 }
                 Some(stage) => {
                     drop(epoch_guard);
@@ -692,6 +819,9 @@ impl Daemon {
                 self.start_hole_punch_at(&peer_id, Some(punch_at_ms), None, None)
                     .await;
             }
+            Ok(None)
+                if reservation.disposition
+                    == HandshakeStartDisposition::ProbeBindingRetryDeferred => {}
             Ok(None) if !*reservation.cancellation.borrow() => {
                 self.publish_current_candidates_to_peer(&peer_id, "peer event")
                     .await;

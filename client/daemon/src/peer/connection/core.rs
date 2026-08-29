@@ -560,6 +560,18 @@ impl PeerConnection {
             );
             return outcome;
         }
+        if !outcome.applies_side_effects() {
+            debug!(
+                target: "p2pnet_daemon::peer::path_state_machine",
+                event = "path_transition_duplicate",
+                peer_id = %self.node_id,
+                epoch = ?event_epoch,
+                decision = ?outcome.decision,
+                revision = outcome.snapshot.revision,
+                "ignored duplicate path event without executing side effects"
+            );
+            return outcome;
+        }
 
         // Publish the compatibility projection before the closure so legacy
         // selector helpers observe the newly committed path; the connection
