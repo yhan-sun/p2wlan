@@ -1,0 +1,50 @@
+name: PSM Dev Bootstrap
+
+on:
+  push:
+    branches:
+      - refactor/path-state-machine-20260829
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-environment:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Vendor Cargo dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .cargo
+          cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml
+      - name: Package portable Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sysroot="$(rustc --print sysroot)"
+          tar --dereference -C "$(dirname "$sysroot")" -czf /tmp/p2wlan-rust-toolchain.tar.gz "$(basename "$sysroot")"
+          tar -czf /tmp/p2wlan-cargo-vendor.tar.gz .cargo vendor
+      - name: Upload Rust toolchain
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-rust-toolchain-${{ github.sha }}
+          path: /tmp/p2wlan-rust-toolchain.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Upload vendored dependencies
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-cargo-vendor-${{ github.sha }}
+          path: /tmp/p2wlan-cargo-vendor.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
