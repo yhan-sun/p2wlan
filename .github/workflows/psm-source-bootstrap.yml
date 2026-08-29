@@ -1,0 +1,29 @@
+name: PSM Source Bootstrap
+
+on:
+  push:
+    branches:
+      - refactor/path-state-machine-20260829
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Package source tree
+        shell: bash
+        run: tar --exclude=.git --exclude=target -czf p2wlan-source.tar.gz .
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-source-${{ github.sha }}
+          path: p2wlan-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
