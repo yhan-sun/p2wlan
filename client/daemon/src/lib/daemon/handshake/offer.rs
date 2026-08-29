@@ -398,15 +398,62 @@ impl Daemon {
             }
             ResponderHandshakeCacheLookup::Miss => {
                 let identity = self.local_identity()?;
+                let timestamp_floor_wait_started = Instant::now();
+                self.timeline.emit(
+                    "peer_offer_responder_timestamp_floor_wait",
+                    None,
+                    None,
+                    Some(format!(
+                        "peer={from_node_id} generation={} session_fp={}",
+                        expected_network_generation
+                            .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                        handshake_token_fingerprint(Some(&handshake_token))
+                    )),
+                );
                 let timestamp_floor = self
                     .pending_handshakes
                     .lock()
                     .await
                     .responder_timestamp_floor(from_node_id, &expected_peer_public);
+                self.timeline.emit(
+                    "peer_offer_responder_timestamp_floor_acquired",
+                    None,
+                    None,
+                    Some(format!(
+                        "peer={from_node_id} generation={} session_fp={} wait_ms={}",
+                        expected_network_generation
+                            .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                        handshake_token_fingerprint(Some(&handshake_token)),
+                        timestamp_floor_wait_started.elapsed().as_millis()
+                    )),
+                );
                 let mut responder =
                     HandshakeResponder::new_with_timestamp_floor(identity, None, timestamp_floor);
-                let (response, keys) = responder
-                    .consume_initiation_and_respond(&initiation)
+                self.timeline.emit(
+                    "peer_offer_responder_crypto_started",
+                    None,
+                    None,
+                    Some(format!(
+                        "peer={from_node_id} generation={} session_fp={}",
+                        expected_network_generation
+                            .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                        handshake_token_fingerprint(Some(&handshake_token))
+                    )),
+                );
+                let response = responder.consume_initiation_and_respond(&initiation);
+                self.timeline.emit(
+                    "peer_offer_responder_crypto_completed",
+                    None,
+                    response.as_ref().err().map(|_| "wireguard_response_failed"),
+                    Some(format!(
+                        "peer={from_node_id} generation={} session_fp={} ok={}",
+                        expected_network_generation
+                            .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                        handshake_token_fingerprint(Some(&handshake_token)),
+                        response.is_ok()
+                    )),
+                );
+                let (response, keys) = response
                     .map_err(|e| DaemonError::Peer(format!("WireGuard response failed: {e}")))?;
 
                 if responder.initiator_public_key() != Some(&expected_peer_public) {
@@ -419,7 +466,19 @@ impl Daemon {
                         "WireGuard initiation from {from_node_id} did not authenticate a timestamp"
                     ))
                 })?;
-                if !self
+                let timestamp_commit_wait_started = Instant::now();
+                self.timeline.emit(
+                    "peer_offer_responder_timestamp_commit_wait",
+                    None,
+                    None,
+                    Some(format!(
+                        "peer={from_node_id} generation={} session_fp={}",
+                        expected_network_generation
+                            .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                        handshake_token_fingerprint(Some(&handshake_token))
+                    )),
+                );
+                let timestamp_committed = self
                     .pending_handshakes
                     .lock()
                     .await
@@ -427,8 +486,21 @@ impl Daemon {
                         from_node_id,
                         expected_peer_public,
                         authenticated_timestamp,
-                    )
-                {
+                    );
+                self.timeline.emit(
+                    "peer_offer_responder_timestamp_commit_result",
+                    None,
+                    (!timestamp_committed).then_some("replayed_or_out_of_order_initiation"),
+                    Some(format!(
+                        "peer={from_node_id} generation={} session_fp={} committed={} wait_ms={}",
+                        expected_network_generation
+                            .unwrap_or_else(|| self.peers.current_network_generation_sync()),
+                        handshake_token_fingerprint(Some(&handshake_token)),
+                        timestamp_committed,
+                        timestamp_commit_wait_started.elapsed().as_millis()
+                    )),
+                );
+                if !timestamp_committed {
                     return Err(DaemonError::Peer(format!(
                         "refusing replayed WireGuard initiation from {from_node_id}"
                     )));

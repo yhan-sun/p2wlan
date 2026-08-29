@@ -402,6 +402,23 @@ fn is_rekey_confirmation_packet(packet: &[u8]) -> bool {
         && icmp.get(8..) == Some(crate::REKEY_CONFIRMATION_PAYLOAD)
 }
 
+/// Decide whether a successfully decrypted UDP packet should schedule the
+/// owned encrypted Direct request/ACK validation worker.
+///
+/// A rekey confirmation is authenticated endpoint evidence, but never Direct
+/// proof on its own. It therefore follows this path exactly like ordinary
+/// decrypted UDP data: learn/remember the endpoint and ask the bounded
+/// validation worker to prove the reverse direction. Direct-validation packets
+/// are excluded so their request/ACK exchange cannot recursively enqueue more
+/// validation sessions.
+fn should_request_direct_validation_after_decrypt(
+    owns_direct_packet: bool,
+    source: Option<SocketAddr>,
+    direct_validation: Option<DirectValidationToken>,
+) -> bool {
+    owns_direct_packet && source.is_some() && direct_validation.is_none()
+}
+
 /// Kind of a daemon-internal direct-validation packet parsed from a decrypted
 /// WireGuard datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3292,87 +3309,104 @@ impl WireGuardTransport {
                                         "ignored direct-validation packet from retired or unpublished UDP transport"
                                     );
                                 }
-                            } else if internal_rekey_confirmation {
-                                debug!(
-                                "Consumed internal WireGuard rekey confirmation from peer {} without changing path health",
-                                inbound.peer_id
-                            );
                             } else if let Some(source) = source {
-                                let session_guard = self
-                                    .acquire_current_session_evidence_guard(
-                                        &inbound.peer_id,
-                                        inbound.session_instance,
-                                    )
-                                    .await;
-                                let session_current =
-                                    inbound.session_instance.is_none() || session_guard.is_some();
-                                if !session_current {
-                                    peers.emit_timeline(
-                                        "stale_session_evidence",
-                                        Some("direct"),
-                                        Some("session_replaced_or_removed"),
-                                        Some(format!(
-                                            "peer={} session_instance={:?} direct_ingress=stale",
-                                            inbound.peer_id, inbound.session_instance,
-                                        )),
+                                if internal_rekey_confirmation {
+                                    debug!(
+                                        "Consumed internal WireGuard rekey confirmation from peer {} as endpoint evidence only; encrypted Direct validation is still required",
+                                        inbound.peer_id
                                     );
+                                }
+                                if should_request_direct_validation_after_decrypt(
+                                    owns_direct_packet,
+                                    Some(source),
+                                    direct_validation,
+                                ) {
+                                    let session_guard = self
+                                        .acquire_current_session_evidence_guard(
+                                            &inbound.peer_id,
+                                            inbound.session_instance,
+                                        )
+                                        .await;
+                                    let session_current = inbound.session_instance.is_none()
+                                        || session_guard.is_some();
+                                    if !session_current {
+                                        peers.emit_timeline(
+                                            "stale_session_evidence",
+                                            Some("direct"),
+                                            Some("session_replaced_or_removed"),
+                                            Some(format!(
+                                                "peer={} session_instance={:?} direct_ingress=stale",
+                                                inbound.peer_id, inbound.session_instance,
+                                            )),
+                                        );
+                                    } else {
+                                        peers
+                                            .learn_authenticated_endpoint(&inbound.peer_id, source)
+                                            .await;
+                                        // A decrypted UDP payload (including an
+                                        // internal rekey confirmation) is
+                                        // authenticated endpoint evidence, not
+                                        // Direct proof. Feed it into the same
+                                        // owned request/ACK worker as
+                                        // peer-reflexive evidence; do not adopt
+                                        // socket affinity or promote here.
+                                        if let Some(udp) = udp.as_ref() {
+                                            let generation = packet_network_generation
+                                                .unwrap_or_else(|| {
+                                                    peers.current_network_generation_sync()
+                                                });
+                                            let evidence_kind = if internal_rekey_confirmation {
+                                                "rekey confirmation"
+                                            } else {
+                                                "decrypted direct UDP payload"
+                                            };
+                                            peers
+                                                .record_direct_event_for_generation_with_socket(
+                                                    &inbound.peer_id,
+                                                    generation,
+                                                    "direct_validation_ingress_requested",
+                                                    Some(source),
+                                                    socket_index,
+                                                    None,
+                                                    None,
+                                                    format!(
+                                                        "{evidence_kind} requested owned encrypted validation"
+                                                    ),
+                                                )
+                                                .await;
+                                            if let Some(socket_index) = socket_index {
+                                                // Decryption is sufficient to
+                                                // remember the receiving socket
+                                                // for the next owned validation
+                                                // request, but not to promote the
+                                                // path.
+                                                udp.remember_peer_socket(
+                                                    &inbound.peer_id,
+                                                    socket_index,
+                                                    crate::udp::SocketEvidence::Fresh,
+                                                )
+                                                .await;
+                                            }
+                                            udp.enqueue_direct_validation_observation(
+                                                crate::udp::PeerReflexiveObservation {
+                                                    peer_id: inbound.peer_id.clone(),
+                                                    observed_endpoint: source,
+                                                },
+                                            );
+                                        }
+                                        debug!(
+                                            "Authenticated direct UDP endpoint {source} for peer {}; awaiting owned encrypted validation",
+                                            inbound.peer_id
+                                        );
+                                    }
+                                    drop(session_guard);
                                 } else if !owns_direct_packet {
                                     debug!(
                                         peer_id = %inbound.peer_id,
                                         packet_owner = ?udp_transport_owner,
                                         "forwarding decrypted data from retired or unpublished UDP transport without Direct evidence"
                                     );
-                                } else {
-                                    peers
-                                        .learn_authenticated_endpoint(&inbound.peer_id, source)
-                                        .await;
-                                    // A decrypted UDP payload is authenticated
-                                    // endpoint evidence, not a Direct proof.  Feed
-                                    // it into the same owned request/ACK worker as
-                                    // peer-reflexive evidence; do not adopt socket
-                                    // affinity or promote from this path alone.
-                                    if let Some(udp) = udp.as_ref() {
-                                        let generation =
-                                            packet_network_generation.unwrap_or_else(|| {
-                                                peers.current_network_generation_sync()
-                                            });
-                                        peers
-                                        .record_direct_event_for_generation_with_socket(
-                                            &inbound.peer_id,
-                                            generation,
-                                            "direct_validation_ingress_requested",
-                                            Some(source),
-                                            socket_index,
-                                            None,
-                                            None,
-                                            "decrypted direct UDP payload requested owned encrypted validation",
-                                        )
-                                        .await;
-                                        if let Some(socket_index) = socket_index {
-                                            // Decryption is sufficient to remember
-                                            // the receiving socket as evidence for
-                                            // the next owned validation request,
-                                            // but not to promote the path.
-                                            udp.remember_peer_socket(
-                                                &inbound.peer_id,
-                                                socket_index,
-                                                crate::udp::SocketEvidence::Fresh,
-                                            )
-                                            .await;
-                                        }
-                                        udp.enqueue_direct_validation_observation(
-                                            crate::udp::PeerReflexiveObservation {
-                                                peer_id: inbound.peer_id.clone(),
-                                                observed_endpoint: source,
-                                            },
-                                        );
-                                    }
-                                    debug!(
-                                        "Confirmed direct UDP data path from {source} for peer {}",
-                                        inbound.peer_id
-                                    );
                                 }
-                                drop(session_guard);
                             } else if let Some(relay_endpoint) = relay_endpoint.as_deref() {
                                 let session_guard = self
                                     .acquire_current_session_evidence_guard(
