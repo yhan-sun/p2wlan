@@ -112,6 +112,7 @@ impl PeerManager {
             local_endpoint,
             validation_latency,
             None,
+            None,
         )
         .await
     }
@@ -126,6 +127,7 @@ impl PeerManager {
         local_endpoint: Option<SocketAddr>,
         validation_latency: Option<Duration>,
         expected_remote_candidate_epoch: Option<u64>,
+        validation_identity: Option<DirectValidationIdentity>,
     ) -> bool {
         // The lock-free mirror is written while this very gate is held by a
         // generation advance.  Reading it here therefore cannot race an
@@ -141,9 +143,18 @@ impl PeerManager {
         let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
             return false;
         };
+        if validation_identity.is_some_and(|identity| {
+            identity.epoch.network_generation != generation
+                || identity.epoch.peer_session_generation != peer_session_generation
+                || expected_remote_candidate_epoch
+                    .is_some_and(|epoch| identity.epoch.remote_candidate_epoch != epoch)
+        }) {
+            return false;
+        }
         // An exact, decrypted validation ACK is authoritative evidence for
-        // this request/generation/endpoint.  Its RTT is recorded for path
-        // quality and the make-before-break selector can switch immediately.
+        // this request/generation and its authenticated observed endpoint. Its
+        // RTT is recorded for path quality and the make-before-break selector
+        // can switch immediately.
         // Probe-only ACKs still use the slow-candidate quarantine below; an
         // owned encrypted Request -> ACK is stronger evidence and must not be
         // hidden behind an arbitrary relay cooldown.
@@ -175,6 +186,19 @@ impl PeerManager {
             let Some(selected_endpoint_value) = selected_endpoint else {
                 return false;
             };
+            let validation_identity = validation_identity.unwrap_or_else(|| {
+                DirectValidationIdentity::compatibility(
+                    PathEpoch::new(
+                        generation,
+                        peer_session_generation,
+                        conn.remote_candidate_epoch(),
+                    ),
+                    Some(selected_endpoint_value),
+                )
+            });
+            if validation_identity.commit_endpoint() != Some(selected_endpoint_value) {
+                return false;
+            }
             if !conn.is_current_remote_endpoint(selected_endpoint_value) {
                 conn.record_direct_event(
                     generation,
@@ -189,202 +213,216 @@ impl PeerManager {
             let was_direct = conn.state == ConnectionState::Direct;
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
-            // This ACK commit can happen before the live per-peer relay slot
-            // is published.  Keep the topology-level relay expectation for
-            // the selector snapshot intentionally: the selector argument is
-            // a fallback-availability signal here, not proof that relay has
-            // delivered business traffic.  Dataplane callers pass the live
-            // relay availability separately.
-            let relay_expected = self.relay_first_required();
-            if relay_expected && conn.relay_first.gate_generation != Some(generation) {
-                // Direct validation can complete before the relay supervisor
-                // publishes its transport. Arm the gate here as well as at
-                // catalog/peer admission so an inbound peer cannot use this
-                // ACK to become the first business path.
-                conn.relay_first.gate_generation = Some(generation);
-                conn.relay_first.gate_started_at = Some(Instant::now());
-                self.emit_timeline(
-                    "relay_first_gate_armed",
-                    Some("relay"),
-                    Some("direct_ack_raced_relay_startup"),
-                    Some(format!(
-                        "peer={node_id} generation={generation} source=direct_ack"
-                    )),
-                );
-            }
-            let pair_success = Some({
-                conn.endpoint = Some(selected_endpoint_value);
-                if let Some(latency) = validation_latency {
-                    conn.mark_candidate_pair_authoritative_success(
-                        selected_endpoint_value,
-                        generation,
-                        latency,
-                        true,
-                        local_endpoint,
-                    )
-                } else {
-                    conn.mark_candidate_pair_success(
-                        selected_endpoint_value,
-                        generation,
-                        None,
-                        true,
-                        local_endpoint,
-                    )
-                }
-            });
-            let direct_confirmation_changed = !was_direct
-                || previous_endpoint != selected_endpoint
-                || previous_generation != generation;
-            conn.direct_generation = generation;
-            if let Some(latency) = validation_latency {
-                conn.direct_health
-                    .record_success_with_authoritative_latency(latency);
-            } else {
-                conn.direct_health.record_success();
-            }
-            conn.clear_direct_reclaim_window();
-            self.publish_direct_commit_pair(
-                node_id,
-                generation,
-                conn.remote_candidate_epoch(),
-                local_endpoint,
-            );
-            // Publish the Direct-set mirror before waking confirmation
-            // waiters. The pair snapshot and the active-state bit must be
-            // visible together; otherwise a waiter can wake on the sequence
-            // bump between these two writes, observe a non-Direct peer, and
-            // miss the only notification for this commit.
-            conn.transition(ConnectionState::Direct);
-            if direct_confirmation_changed {
-                // The direct-commit sequence is bumped inside the SAME
-                // network-epoch critical section as the state transition, so
-                // an outbound punch loop that gates every UDP send on this
-                // sequence can never miss a promotion that already committed.
-                conn.direct_commit_seq = conn.direct_commit_seq.wrapping_add(1);
-                self.bump_direct_commit_seq(node_id);
-                conn.record_direct_event(
-                    generation,
-                    "direct_confirmed",
-                    selected_endpoint,
-                    selected_endpoint.map(|_| 1),
-                    None,
-                    format!(
-                        "encrypted data path confirmed Direct UDP; direct_commit_seq={}",
-                        conn.direct_commit_seq
-                    ),
-                );
-            }
-            // Keep the persisted selector in lock-step with the Direct
-            // promotion.  The current encrypted-confirmed Direct pair wins
-            // past relay-first business gating; only an explicit current
-            // quality/path failure may retain Relay as fallback.
-            if let Some(endpoint) = selected_endpoint {
-                let policy = self.config.relay.effective_path_policy(true);
-                let mut direct_selection = conn.select_path_for_data_with_policy(
-                    generation,
-                    policy,
-                    relay_expected,
-                );
-                if direct_selection.path == Some(NetworkPath::Direct) {
-                    direct_selection.path = Some(NetworkPath::Direct);
-                    direct_selection.direct_endpoint = Some(endpoint);
-                    direct_selection.direct_confirmed = true;
-                }
-                conn.record_path_selection_event(generation, &direct_selection, local_endpoint);
-                conn.last_path_selection = Some(direct_selection);
-            }
-            if let (Some(endpoint), Some((source, _))) = (selected_endpoint, pair_success) {
-                let direct_type = classify_confirmed_direct_endpoint_with_on_link_host(
-                    endpoint,
-                    source,
-                    conn.is_on_link_host_candidate(endpoint),
-                );
-                let local_endpoint_text = format_log_endpoint(local_endpoint);
-                if direct_confirmation_changed {
-                    info!(
-                        event = "candidate_pair_selected",
-                        peer_id = %node_id,
-                        local_endpoint = %local_endpoint_text,
-                        remote_endpoint = %endpoint,
-                        candidate_source = ?source,
-                        rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                        reason = "encrypted data path confirmed Direct UDP",
-                        "candidate_pair_selected peer_id={} remote_endpoint={} reason=encrypted data path confirmed Direct UDP",
-                        node_id,
-                        endpoint
-                    );
-                }
-                let selection_is_direct = conn
-                    .last_path_selection
-                    .as_ref()
-                    .is_some_and(|selection| selection.path == Some(NetworkPath::Direct));
-                if !was_direct && selection_is_direct {
-                    info!(
-                        event = "direct_path_promoted",
-                        peer_id = %node_id,
-                        local_endpoint = %local_endpoint_text,
-                        remote_endpoint = %endpoint,
-                        candidate_source = ?source,
-                        rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                        reason = "encrypted data path confirmed Direct UDP",
-                        "direct_path_promoted peer_id={} remote_endpoint={} reason=encrypted data path confirmed Direct UDP",
-                        node_id,
-                        endpoint
-                    );
-                }
-                if direct_confirmation_changed && selection_is_direct {
-                    match direct_type {
-                        DirectPathType::PublicUdp => info!(
-                            event = "public_udp_direct_selected",
-                            peer_id = %node_id,
-                            local_endpoint = %local_endpoint_text,
-                            remote_endpoint = %endpoint,
-                            candidate_source = ?source,
-                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                            reason = "encrypted data path confirmed Direct UDP",
-                            "public_udp_direct_selected peer_id={} remote_endpoint={}",
-                            node_id,
-                            endpoint
-                        ),
-                        DirectPathType::PeerReflexive => info!(
-                            event = "peer_reflexive_direct_selected",
-                            peer_id = %node_id,
-                            local_endpoint = %local_endpoint_text,
-                            remote_endpoint = %endpoint,
-                            candidate_source = ?source,
-                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                            reason = "encrypted data path confirmed Direct UDP",
-                            "peer_reflexive_direct_selected peer_id={} remote_endpoint={}",
-                            node_id,
-                            endpoint
-                        ),
-                        DirectPathType::Overlay => info!(
-                            event = "overlay_direct_selected",
-                            peer_id = %node_id,
-                            local_endpoint = %local_endpoint_text,
-                            remote_endpoint = %endpoint,
-                            candidate_source = ?source,
-                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                            reason = "encrypted data path confirmed Direct UDP",
-                            "overlay_direct_selected peer_id={} remote_endpoint={}",
-                            node_id,
-                            endpoint
-                        ),
-                        DirectPathType::Lan => info!(
-                            event = "lan_direct_selected",
-                            peer_id = %node_id,
-                            local_endpoint = %local_endpoint_text,
-                            remote_endpoint = %endpoint,
-                            candidate_source = ?source,
-                            rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
-                            reason = "encrypted data path confirmed Direct UDP",
-                            "lan_direct_selected peer_id={} remote_endpoint={}",
-                            node_id,
-                            endpoint
-                        ),
-                        _ => {}
+            let mut pair_success = None;
+            let outcome = conn.commit_path_transition(
+                PathEvent::DirectCommitted {
+                    validation: validation_identity,
+                },
+                |conn| {
+                    // This ACK commit can happen before the live per-peer relay slot
+                    // is published.  Keep the topology-level relay expectation for
+                    // the selector snapshot intentionally: the selector argument is
+                    // a fallback-availability signal here, not proof that relay has
+                    // delivered business traffic.  Dataplane callers pass the live
+                    // relay availability separately.
+                    let relay_expected = self.relay_first_required();
+                    if relay_expected && conn.relay_first.gate_generation != Some(generation) {
+                        // Direct validation can complete before the relay supervisor
+                        // publishes its transport. Arm the gate here as well as at
+                        // catalog/peer admission so an inbound peer cannot use this
+                        // ACK to become the first business path.
+                        conn.relay_first.gate_generation = Some(generation);
+                        conn.relay_first.gate_started_at = Some(Instant::now());
+                        self.emit_timeline(
+                            "relay_first_gate_armed",
+                            Some("relay"),
+                            Some("direct_ack_raced_relay_startup"),
+                            Some(format!(
+                                "peer={node_id} generation={generation} source=direct_ack"
+                            )),
+                        );
                     }
-                }
+                    pair_success = Some({
+                        conn.endpoint = Some(selected_endpoint_value);
+                        if let Some(latency) = validation_latency {
+                            conn.mark_candidate_pair_authoritative_success(
+                                selected_endpoint_value,
+                                generation,
+                                latency,
+                                true,
+                                local_endpoint,
+                            )
+                        } else {
+                            conn.mark_candidate_pair_success(
+                                selected_endpoint_value,
+                                generation,
+                                None,
+                                true,
+                                local_endpoint,
+                            )
+                        }
+                    });
+                    let direct_confirmation_changed = !was_direct
+                        || previous_endpoint != selected_endpoint
+                        || previous_generation != generation;
+                    conn.direct_generation = generation;
+                    if let Some(latency) = validation_latency {
+                        conn.direct_health
+                            .record_success_with_authoritative_latency(latency);
+                    } else {
+                        conn.direct_health.record_success();
+                    }
+                    conn.clear_direct_reclaim_window();
+                    self.publish_direct_commit_pair(
+                        node_id,
+                        generation,
+                        conn.remote_candidate_epoch(),
+                        local_endpoint,
+                    );
+                    // Publish the Direct-set mirror before waking confirmation
+                    // waiters. The pair snapshot and the active-state bit must be
+                    // visible together; otherwise a waiter can wake on the sequence
+                    // bump between these two writes, observe a non-Direct peer, and
+                    // miss the only notification for this commit.
+                    if direct_confirmation_changed {
+                        // The direct-commit sequence is bumped inside the SAME
+                        // network-epoch critical section as the state transition, so
+                        // an outbound punch loop that gates every UDP send on this
+                        // sequence can never miss a promotion that already committed.
+                        conn.direct_commit_seq = conn.direct_commit_seq.wrapping_add(1);
+                        self.bump_direct_commit_seq(node_id);
+                        conn.record_direct_event(
+                            generation,
+                            "direct_confirmed",
+                            selected_endpoint,
+                            selected_endpoint.map(|_| 1),
+                            None,
+                            format!(
+                                "encrypted data path confirmed Direct UDP; direct_commit_seq={}",
+                                conn.direct_commit_seq
+                            ),
+                        );
+                    }
+                    // Keep the persisted selector in lock-step with the Direct
+                    // promotion.  The current encrypted-confirmed Direct pair wins
+                    // past relay-first business gating; only an explicit current
+                    // quality/path failure may retain Relay as fallback.
+                    if let Some(endpoint) = selected_endpoint {
+                        let policy = self.config.relay.effective_path_policy(true);
+                        let mut direct_selection = conn.select_path_for_data_with_policy(
+                            generation,
+                            policy,
+                            relay_expected,
+                        );
+                        if direct_selection.path == Some(NetworkPath::Direct) {
+                            direct_selection.path = Some(NetworkPath::Direct);
+                            direct_selection.direct_endpoint = Some(endpoint);
+                            direct_selection.direct_confirmed = true;
+                        }
+                        conn.record_path_selection_event(
+                            generation,
+                            &direct_selection,
+                            local_endpoint,
+                        );
+                        conn.last_path_selection = Some(direct_selection);
+                    }
+                    if let (Some(endpoint), Some((source, _))) = (selected_endpoint, pair_success) {
+                        let direct_type = classify_confirmed_direct_endpoint_with_on_link_host(
+                            endpoint,
+                            source,
+                            conn.is_on_link_host_candidate(endpoint),
+                        );
+                        let local_endpoint_text = format_log_endpoint(local_endpoint);
+                        if direct_confirmation_changed {
+                            info!(
+                                event = "candidate_pair_selected",
+                                peer_id = %node_id,
+                                local_endpoint = %local_endpoint_text,
+                                remote_endpoint = %endpoint,
+                                candidate_source = ?source,
+                                rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                                reason = "encrypted data path confirmed Direct UDP",
+                                "candidate_pair_selected peer_id={} remote_endpoint={} reason=encrypted data path confirmed Direct UDP",
+                                node_id,
+                                endpoint
+                            );
+                        }
+                        let selection_is_direct = conn
+                            .last_path_selection
+                            .as_ref()
+                            .is_some_and(|selection| selection.path == Some(NetworkPath::Direct));
+                        if !was_direct && selection_is_direct {
+                            info!(
+                                event = "direct_path_promoted",
+                                peer_id = %node_id,
+                                local_endpoint = %local_endpoint_text,
+                                remote_endpoint = %endpoint,
+                                candidate_source = ?source,
+                                rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                                reason = "encrypted data path confirmed Direct UDP",
+                                "direct_path_promoted peer_id={} remote_endpoint={} reason=encrypted data path confirmed Direct UDP",
+                                node_id,
+                                endpoint
+                            );
+                        }
+                        if direct_confirmation_changed && selection_is_direct {
+                            match direct_type {
+                                DirectPathType::PublicUdp => info!(
+                                    event = "public_udp_direct_selected",
+                                    peer_id = %node_id,
+                                    local_endpoint = %local_endpoint_text,
+                                    remote_endpoint = %endpoint,
+                                    candidate_source = ?source,
+                                    rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                                    reason = "encrypted data path confirmed Direct UDP",
+                                    "public_udp_direct_selected peer_id={} remote_endpoint={}",
+                                    node_id,
+                                    endpoint
+                                ),
+                                DirectPathType::PeerReflexive => info!(
+                                    event = "peer_reflexive_direct_selected",
+                                    peer_id = %node_id,
+                                    local_endpoint = %local_endpoint_text,
+                                    remote_endpoint = %endpoint,
+                                    candidate_source = ?source,
+                                    rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                                    reason = "encrypted data path confirmed Direct UDP",
+                                    "peer_reflexive_direct_selected peer_id={} remote_endpoint={}",
+                                    node_id,
+                                    endpoint
+                                ),
+                                DirectPathType::Overlay => info!(
+                                    event = "overlay_direct_selected",
+                                    peer_id = %node_id,
+                                    local_endpoint = %local_endpoint_text,
+                                    remote_endpoint = %endpoint,
+                                    candidate_source = ?source,
+                                    rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                                    reason = "encrypted data path confirmed Direct UDP",
+                                    "overlay_direct_selected peer_id={} remote_endpoint={}",
+                                    node_id,
+                                    endpoint
+                                ),
+                                DirectPathType::Lan => info!(
+                                    event = "lan_direct_selected",
+                                    peer_id = %node_id,
+                                    local_endpoint = %local_endpoint_text,
+                                    remote_endpoint = %endpoint,
+                                    candidate_source = ?source,
+                                    rtt_ms = ?conn.direct_health.rtt_ewma_ms.or(conn.direct_health.latency_ms),
+                                    reason = "encrypted data path confirmed Direct UDP",
+                                    "lan_direct_selected peer_id={} remote_endpoint={}",
+                                    node_id,
+                                    endpoint
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
+                },
+            );
+            if !outcome.accepted() {
+                return false;
             }
             pair_success
         };
@@ -515,6 +553,9 @@ impl PeerManager {
         if generation != self.current_network_generation().await {
             return false;
         }
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+            return false;
+        };
         let mut record_ack_feedback = false;
         let retain_relay_for_slow_probe;
         let pair_success = {
@@ -522,6 +563,9 @@ impl PeerManager {
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
+            if !self.peer_session_is_current_sync(node_id, peer_session_generation) {
+                return false;
+            }
             if expected_remote_candidate_epoch
                 .is_some_and(|expected| conn.remote_candidate_epoch() != expected)
             {
@@ -544,6 +588,20 @@ impl PeerManager {
                     None,
                     "ignored probe ACK for an old remote candidate epoch",
                 );
+                return false;
+            }
+            let outcome = conn.commit_path_transition(
+                PathEvent::DirectProbeStarted {
+                    epoch: PathEpoch::new(
+                        generation,
+                        peer_session_generation,
+                        conn.remote_candidate_epoch(),
+                    ),
+                    attempt: DirectAttemptNumber(conn.direct_commit_seq),
+                },
+                |_| {},
+            );
+            if !outcome.accepted() {
                 return false;
             }
             let ack_confirmed = latency.is_some();
@@ -698,16 +756,6 @@ impl PeerManager {
                     None,
                     format!("received inbound UDP probe from {endpoint}"),
                 );
-            }
-            if conn.state != ConnectionState::Direct
-                && matches!(
-                    conn.state,
-                    ConnectionState::Idle
-                        | ConnectionState::Connecting
-                        | ConnectionState::FallbackToRelay
-                )
-            {
-                conn.transition(ConnectionState::HolePunching);
             }
             pair_success
         };

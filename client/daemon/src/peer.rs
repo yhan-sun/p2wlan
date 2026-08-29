@@ -174,6 +174,11 @@ pub(crate) enum ProbeKeyRole {
 pub(crate) struct PeerSessionGeneration(u64);
 
 impl PeerSessionGeneration {
+    /// Bootstrap identity used only by an unattached `PeerConnection`.
+    /// Production peers are rebound to a strictly positive generation by
+    /// `PeerMembershipState::publish` before path work is admitted.
+    pub(crate) const UNBOUND: Self = Self(0);
+
     #[cfg(test)]
     pub(crate) const fn for_test(value: u64) -> Self {
         Self(value)
@@ -195,17 +200,22 @@ struct PeerMembershipState {
 impl PeerMembershipState {
     /// Publish a fully initialized peer, rotating its lifecycle identity when
     /// requested.  Exhaustion fails closed instead of reusing a generation.
-    fn publish(&mut self, node_id: &str, online: bool, rotate: bool) -> bool {
+    fn publish(
+        &mut self,
+        node_id: &str,
+        online: bool,
+        rotate: bool,
+    ) -> Option<PeerSessionGeneration> {
         if !rotate {
             if let Some(entry) = self.peers.get_mut(node_id) {
                 entry.online = online;
-                return true;
+                return Some(entry.session_generation);
             }
         }
 
         let Some(next) = self.next_session_generation.checked_add(1) else {
             self.peers.remove(node_id);
-            return false;
+            return None;
         };
         self.next_session_generation = next;
         self.peers.insert(
@@ -215,7 +225,7 @@ impl PeerMembershipState {
                 online,
             },
         );
-        true
+        Some(PeerSessionGeneration(next))
     }
 
     fn remove(&mut self, node_id: &str) {
@@ -230,6 +240,12 @@ impl PeerMembershipState {
         self.peers
             .get(node_id)
             .filter(|entry| entry.online)
+            .map(|entry| entry.session_generation)
+    }
+
+    fn generation(&self, node_id: &str) -> Option<PeerSessionGeneration> {
+        self.peers
+            .get(node_id)
             .map(|entry| entry.session_generation)
     }
 
@@ -496,6 +512,13 @@ pub use types::{
     ActivePathSnapshot, CandidatePair, CandidatePairSource, CandidatePairState, ConnectionState,
     DirectPathType, DirectTraversalEvent, DirectValidationEventMetadata, NetworkPath, PathHealth,
     PathScore, PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
+};
+
+mod path_state_machine;
+pub(crate) use path_state_machine::{
+    ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,
+    PathEpoch, PathEvent, PathRetention, PathStateMachine, PathStateMachineSnapshot,
+    PathTransitionOutcome, PeerPathLifecycle, RelayConnectionIdentity,
 };
 
 include!("peer/connection/core.rs");

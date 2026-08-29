@@ -793,6 +793,7 @@ async fn stale_direct_validation_result_cannot_promote_reused_endpoint_after_rem
             None,
             Some(Duration::from_millis(4)),
             Some(retired_remote_epoch),
+            None,
         )
         .await);
     drop(epoch_guard);

@@ -89,6 +89,31 @@ pub(crate) struct RelayFirstBusinessState {
     pub(crate) preconfirmation: Option<PendingRelayBusinessEvidence>,
 }
 
+/// No-await, generation-bound projection of one peer's committed business
+/// path. It contains typed state-machine values rather than compatibility
+/// booleans or an independently selected path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedBusinessPathSnapshot {
+    pub(crate) peer_id: String,
+    pub(crate) virtual_ip: String,
+    pub(crate) lifecycle: PeerPathLifecycle,
+    pub(crate) epoch: Option<PathEpoch>,
+    pub(crate) active: ActiveBusinessPath,
+}
+
+impl CommittedBusinessPathSnapshot {
+    pub(crate) fn active_path(&self) -> Option<NetworkPath> {
+        self.active.network_path()
+    }
+
+    pub(crate) fn is_online_in_generation(&self, generation: u64) -> bool {
+        self.lifecycle == PeerPathLifecycle::Online
+            && self
+                .epoch
+                .is_some_and(|epoch| epoch.network_generation == generation)
+    }
+}
+
 /// Information about a connection to a specific peer.
 #[derive(Debug, Clone)]
 pub struct PeerConnection {
@@ -139,6 +164,9 @@ pub struct PeerConnection {
     pub remote_relay_rtt_ms: Option<u64>,
     /// Current connection state.
     pub state: ConnectionState,
+    /// Authoritative typed path state. `state` above is updated atomically as
+    /// its compatibility projection by `commit_path_transition`.
+    path_state_machine: PathStateMachine,
     /// When the connection was established.
     pub connected_at: Option<Instant>,
     /// Bytes sent to this peer.
@@ -252,6 +280,16 @@ pub struct PeerConnection {
     /// stale Hard↔Hard pair.
     direct_pair_cache:
         Option<Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>>,
+    /// Manager-owned, no-await projection of the committed typed path state.
+    /// The validation harness and future observability consumers read this
+    /// instead of treating a contended diagnostics cache as path authority.
+    committed_business_path_cache: Option<
+        Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
+    >,
+    /// Change stream for the committed-path projection. It is notified only
+    /// after the reducer commit and its infallible side effects have completed
+    /// under the connection writer.
+    committed_business_path_change_tx: Option<tokio::sync::watch::Sender<u64>>,
 }
 
 impl PeerConnection {
@@ -360,6 +398,7 @@ impl PeerConnection {
             last_seen: 0,
             remote_relay_rtt_ms: None,
             state: ConnectionState::Idle,
+            path_state_machine: PathStateMachine::new(ConnectionState::Idle),
             connected_at: None,
             bytes_sent: 0,
             bytes_received: 0,
@@ -397,50 +436,51 @@ impl PeerConnection {
             direct_events: Vec::new(),
             direct_cache: None,
             direct_pair_cache: None,
+            committed_business_path_cache: None,
+            committed_business_path_change_tx: None,
         }
     }
 
     fn reset_for_identity_change(&mut self) {
-        self.endpoint = self.signaled_endpoint;
-        self.remote_nat_profile = None;
-        self.remote_nat_profile_candidate_epoch = None;
-        self.probe_session_id = None;
-        self.probe_ephemeral_shared = None;
-        self.probe_binding_token = None;
-        self.pending_probe_bindings.clear();
-        self.previous_probe_binding = None;
-        self.candidates.clear();
-        self.signaled_candidates.clear();
-        self.last_candidate_generation = 0;
-        self.remote_candidate_incarnation_high_water = None;
-        self.remote_candidate_epoch = 0;
-        self.last_candidates_expires_at_ms = None;
-        self.candidate_sources.clear();
-        self.state = ConnectionState::Idle;
-        self.connected_at = None;
-        self.relay_server = None;
-        self.direct_health = PathHealth::default();
-        self.relay_health = PathHealth::default();
-        self.direct_generation = 0;
-        self.direct_reclaim_until = None;
-        self.relay_ready_generation = None;
-        self.relay_ready_at = None;
-        self.relay_ready_endpoint = None;
-        self.relay_ready_connection_id = None;
-        self.relay_confirmed_generation = None;
-        self.relay_confirmed_at = None;
-        self.relay_confirmed_endpoint = None;
-        self.relay_confirmed_connection_id = None;
-        self.relay_first = RelayFirstBusinessState::default();
-        self.first_usable_generation = None;
-        self.first_usable_at = None;
-        self.first_usable_path = None;
-        self.candidate_pairs.clear();
-        self.birthday_probe_cursor = 0;
-        self.last_path_selection = None;
-        self.path_events.clear();
-        self.direct_events.clear();
-        self.sync_direct_cache();
+        self.commit_path_transition(PathEvent::IdentityReset, |conn| {
+            conn.endpoint = conn.signaled_endpoint;
+            conn.remote_nat_profile = None;
+            conn.remote_nat_profile_candidate_epoch = None;
+            conn.probe_session_id = None;
+            conn.probe_ephemeral_shared = None;
+            conn.probe_binding_token = None;
+            conn.pending_probe_bindings.clear();
+            conn.previous_probe_binding = None;
+            conn.candidates.clear();
+            conn.signaled_candidates.clear();
+            conn.last_candidate_generation = 0;
+            conn.remote_candidate_incarnation_high_water = None;
+            conn.remote_candidate_epoch = 0;
+            conn.last_candidates_expires_at_ms = None;
+            conn.candidate_sources.clear();
+            conn.relay_server = None;
+            conn.direct_health = PathHealth::default();
+            conn.relay_health = PathHealth::default();
+            conn.direct_generation = 0;
+            conn.direct_reclaim_until = None;
+            conn.relay_ready_generation = None;
+            conn.relay_ready_at = None;
+            conn.relay_ready_endpoint = None;
+            conn.relay_ready_connection_id = None;
+            conn.relay_confirmed_generation = None;
+            conn.relay_confirmed_at = None;
+            conn.relay_confirmed_endpoint = None;
+            conn.relay_confirmed_connection_id = None;
+            conn.relay_first = RelayFirstBusinessState::default();
+            conn.first_usable_generation = None;
+            conn.first_usable_at = None;
+            conn.first_usable_path = None;
+            conn.candidate_pairs.clear();
+            conn.birthday_probe_cursor = 0;
+            conn.last_path_selection = None;
+            conn.path_events.clear();
+            conn.direct_events.clear();
+        });
     }
 
     /// Reset all transport/path state for a new remote daemon session while
@@ -462,23 +502,93 @@ impl PeerConnection {
 
     /// Whether the connection is active (direct or relay).
     pub fn is_active(&self) -> bool {
-        matches!(self.state, ConnectionState::Direct | ConnectionState::Relay)
+        self.path_state_machine.active_path().is_some()
     }
 
     /// Whether the connection is via relay.
     pub fn is_relay(&self) -> bool {
-        self.state == ConnectionState::Relay
+        self.path_state_machine.active_path() == Some(NetworkPath::Relay)
     }
 
     /// Transition to a new state.
     pub fn transition(&mut self, new_state: ConnectionState) {
-        if self.state != new_state {
-            let previous_state = self.state;
+        let epoch = self.path_state_machine.current_epoch().unwrap_or_else(|| {
+            PathEpoch::unbound(self.direct_generation, self.remote_candidate_epoch)
+        });
+        self.commit_path_transition(
+            PathEvent::CompatibilityStateRequested {
+                epoch,
+                state: new_state,
+                direct_endpoint: self.endpoint,
+                relay_endpoint: self
+                    .relay_confirmed_endpoint
+                    .clone()
+                    .or_else(|| self.relay_ready_endpoint.clone())
+                    .or_else(|| self.relay_server.clone()),
+                relay_connection_id: self
+                    .relay_confirmed_connection_id
+                    .or(self.relay_ready_connection_id),
+            },
+            |_| {},
+        );
+    }
+
+    /// The sole commit point for authoritative active-path changes and their
+    /// compatibility/transport side effects. The pure reducer runs first; a
+    /// rejected event therefore executes no side effects, while an accepted
+    /// transition and its infallible mutation closure commit under the same
+    /// `PeerConnection` writer guard.
+    pub(crate) fn commit_path_transition(
+        &mut self,
+        event: PathEvent,
+        apply_side_effects: impl FnOnce(&mut Self),
+    ) -> PathTransitionOutcome {
+        let event_epoch = event.epoch();
+        let previous_active = self.path_state_machine.active_path();
+        let previous_state = self.state;
+        let transition = self.path_state_machine.reduce(event);
+        let outcome = self.path_state_machine.commit(transition);
+        if !outcome.accepted() {
+            debug!(
+                target: "p2pnet_daemon::peer::path_state_machine",
+                event = "path_transition_rejected",
+                peer_id = %self.node_id,
+                epoch = ?event_epoch,
+                decision = ?outcome.decision,
+                revision = outcome.snapshot.revision,
+                "rejected stale or illegal path event"
+            );
+            return outcome;
+        }
+
+        // Publish the compatibility projection before the closure so legacy
+        // selector helpers observe the newly committed path; the connection
+        // writer keeps this transaction externally atomic. A reducer or
+        // revision rejection has already returned without running the closure.
+        let current_active = outcome.snapshot.state.active.network_path();
+        let new_state = outcome.snapshot.state.compatibility_state;
+        self.state = new_state;
+        apply_side_effects(self);
+
+        if previous_active.is_none() && current_active.is_some() {
+            self.connected_at = Some(Instant::now());
+        } else if current_active.is_none() {
+            self.connected_at = None;
+        } else if self.connected_at.is_none() {
+            self.connected_at = Some(Instant::now());
+        }
+        self.sync_direct_cache();
+        self.sync_committed_business_path_cache();
+
+        if previous_state != new_state || previous_active != current_active {
             info!(target: "p2pnet_daemon::peer::connection",
                 event = "peer_connection_state_changed",
                 peer_id = %self.node_id,
                 previous_state = ?previous_state,
                 new_state = ?new_state,
+                previous_active_path = ?previous_active,
+                active_path = ?current_active,
+                path_revision = outcome.snapshot.revision,
                 direct_generation = self.direct_generation,
                 relay_ready_generation = ?self.relay_ready_generation,
                 relay_confirmed_generation = ?self.relay_confirmed_generation,
@@ -490,26 +600,14 @@ impl PeerConnection {
                 previous_state,
                 new_state,
             );
-            info!(
-                "Peer {} state: {} → {}",
-                self.node_id, self.state, new_state
-            );
+            info!("Peer {} state: {} → {}", self.node_id, previous_state, new_state);
         }
-        let was_active = self.is_active();
-        let becomes_active = matches!(new_state, ConnectionState::Direct | ConnectionState::Relay);
-        if becomes_active {
-            // Direct <-> Relay is one continuously usable connection, but the
-            // first active state after any inactive interval begins a new
-            // session clock. This prevents diagnostics from charging outage
-            // time (or a previous connection's lifetime) to a reconnect.
-            if !was_active || self.connected_at.is_none() {
-                self.connected_at = Some(Instant::now());
-            }
-        } else {
-            self.connected_at = None;
-        }
-        self.state = new_state;
-        self.sync_direct_cache();
+        outcome
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn path_state_snapshot(&self) -> PathStateMachineSnapshot {
+        self.path_state_machine.snapshot()
     }
 
     /// Keep the manager's synchronous Direct-set mirror in lockstep with this
@@ -549,13 +647,49 @@ impl PeerConnection {
         self.sync_direct_cache();
     }
 
+    fn sync_committed_business_path_cache(&self) {
+        let Some(cache) = &self.committed_business_path_cache else {
+            return;
+        };
+        let path = self.path_state_machine.snapshot().state;
+        let snapshot = CommittedBusinessPathSnapshot {
+            peer_id: self.node_id.clone(),
+            virtual_ip: self.virtual_ip.clone(),
+            lifecycle: path.lifecycle,
+            epoch: path.epoch,
+            active: path.active,
+        };
+        let changed = {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache
+                .insert(self.node_id.clone(), snapshot.clone())
+                .as_ref()
+                != Some(&snapshot)
+        };
+        if changed {
+            if let Some(changes) = &self.committed_business_path_change_tx {
+                changes.send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+            }
+        }
+    }
+
+    /// Attach the manager's typed committed-path mirror and its lossless latest
+    /// value notification stream.
+    pub(crate) fn attach_committed_business_path_cache(
+        &mut self,
+        cache: Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
+        changes: tokio::sync::watch::Sender<u64>,
+    ) {
+        self.committed_business_path_cache = Some(cache);
+        self.committed_business_path_change_tx = Some(changes);
+        self.sync_committed_business_path_cache();
+    }
+
     /// Current selected traffic path, if active.
     pub fn active_path(&self) -> Option<NetworkPath> {
-        match self.state {
-            ConnectionState::Direct => Some(NetworkPath::Direct),
-            ConnectionState::Relay => Some(NetworkPath::Relay),
-            _ => None,
-        }
+        self.path_state_machine.active_path()
     }
 
     /// Record bytes sent.

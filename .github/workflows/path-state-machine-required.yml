@@ -1,0 +1,185 @@
+name: Path State Machine
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/path-state-machine-required.yml"
+      - ".github/workflows/nat-topology-gate.yml"
+      - ".github/workflows/windows-lifecycle.yml"
+      - ".github/workflows/mobile-lifecycle.yml"
+      - "client/daemon/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: path-state-machine-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust_required:
+    name: Path state machine Rust checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Cargo format
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo workspace tests
+        run: cargo test --workspace
+
+  windows_path_state_machine:
+    name: Path state machine Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run reducer and generation-fence tests
+        run: cargo test -p p2wlan-daemon --lib path_state_machine -- --test-threads=1
+
+      - name: Run late Direct ACK lifecycle test
+        run: cargo test -p p2wlan-daemon --lib transport::tests::old_generation_validation_ack_cannot_promote_or_adopt_affinity -- --exact --test-threads=1
+
+      - name: Run authenticated Direct endpoint drift test
+        run: cargo test -p p2wlan-daemon --lib transport::tests::authenticated_validation_ack_endpoint_drift_promotes_observed_endpoint -- --exact --test-threads=1
+
+      - name: Run Relay incarnation test
+        run: cargo test -p p2wlan-daemon --lib tests::test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack -- --exact --test-threads=1
+
+      - name: Run PeerLeft adoption fence test
+        run: cargo test -p p2wlan-daemon --lib udp::tests::peer_left_cleanup_linearizes_with_late_ack -- --exact --test-threads=1
+
+      - name: Run initiator publish lock-order test
+        run: cargo test -p p2wlan-daemon --lib tests::initiator_publish_releases_epoch_while_connection_writer_is_contended -- --exact --test-threads=1
+
+      - name: Run committed-path wake under diagnostics contention test
+        run: cargo test -p p2wlan-daemon --lib overlay_validate_tests::committed_path_notification_and_snapshot_bypass_stale_diagnostics -- --exact --test-threads=1
+
+      - name: Run strict-Direct echo commit-order test
+        run: cargo test -p p2wlan-daemon --lib overlay_validate_tests::strict_direct_echo_waits_for_local_direct_commit_without_sleep -- --exact --test-threads=1
+
+  lifecycle_and_topology_gates:
+    name: Existing lifecycle and topology gates
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Require same-SHA NAT, Windows, and Mobile gates
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const requiredNames = [
+              'NAT Topology Required',
+              'Windows Lifecycle Required',
+              'Mobile Lifecycle Required',
+            ];
+            // On pull_request, context.sha is the synthetic merge ref. The
+            // independent required workflows publish their checks on the PR's
+            // exact head commit, which is the generation this aggregate must
+            // prove. Non-PR/manual runs retain the ordinary context SHA.
+            const targetSha = context.payload.pull_request?.head?.sha || context.sha;
+            const deadline = Date.now() + 50 * 60 * 1000;
+            let lastSummary = '';
+
+            while (Date.now() < deadline) {
+              const response = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: targetSha,
+                per_page: 100,
+                filter: 'latest',
+              });
+              const latestByName = new Map();
+              for (const run of response.data.check_runs) {
+                if (!requiredNames.includes(run.name)) continue;
+                const prior = latestByName.get(run.name);
+                if (!prior || new Date(run.started_at || 0) > new Date(prior.started_at || 0)) {
+                  latestByName.set(run.name, run);
+                }
+              }
+
+              const summary = requiredNames.map((name) => {
+                const run = latestByName.get(name);
+                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}` : 'missing'}`;
+              }).join(', ');
+              if (summary !== lastSummary) {
+                core.info(`same-SHA gate status: ${summary}`);
+                lastSummary = summary;
+              }
+
+              const failed = requiredNames.filter((name) => {
+                const run = latestByName.get(name);
+                return run && run.status === 'completed' && run.conclusion !== 'success';
+              });
+              if (failed.length > 0) {
+                core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
+                return;
+              }
+              const complete = requiredNames.every((name) => {
+                const run = latestByName.get(name);
+                return run && run.status === 'completed' && run.conclusion === 'success';
+              });
+              if (complete) {
+                core.info(`All existing required gates passed for ${targetSha}.`);
+                return;
+              }
+
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+
+            core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
+
+  required:
+    name: Path State Machine Required
+    if: always()
+    needs:
+      - rust_required
+      - windows_path_state_machine
+      - lifecycle_and_topology_gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce aggregate results
+        env:
+          RUST_RESULT: ${{ needs.rust_required.result }}
+          WINDOWS_RESULT: ${{ needs.windows_path_state_machine.result }}
+          EXTERNAL_RESULT: ${{ needs.lifecycle_and_topology_gates.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$RUST_RESULT" = "success"
+          test "$WINDOWS_RESULT" = "success"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            test "$EXTERNAL_RESULT" = "success"
+          else
+            test "$EXTERNAL_RESULT" = "skipped"
+          fi

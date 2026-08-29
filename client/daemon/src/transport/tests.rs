@@ -3302,6 +3302,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_validation_ack_endpoint_drift_promotes_observed_endpoint() {
+        // Address/port-dependent NAT can move the peer-reflexive source after
+        // the request is sent. Exercise the real decrypt -> ACK expectation ->
+        // path-state commit chain and preserve the request identity separately
+        // from the independently authenticated observed endpoint.
+        let (mut remote_session, local_session) = establish_sessions();
+        let (wg_transport, _encrypted_rx) = WireGuardTransport::new();
+        wg_transport.add_session("peer-a", local_session).await;
+
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let request_endpoint: std::net::SocketAddr =
+            "198.51.100.44:46004".parse().unwrap();
+        let observed_endpoint: std::net::SocketAddr =
+            "198.51.100.44:46005".parse().unwrap();
+        peers
+            .add_peer(&PeerInfo {
+                node_id: "peer-a".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                endpoint: request_endpoint.to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let generation = peers.current_network_generation().await;
+        let owner_token = match udp
+            .begin_or_merge_direct_validation("peer-a", request_endpoint, generation)
+            .await
+        {
+            crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+            _ => panic!("first validation must own the session"),
+        };
+        let peer_session_generation = peers
+            .peer_session_generation_sync("peer-a")
+            .expect("peer lifecycle must be online");
+        let remote_candidate_epoch = peers
+            .current_remote_candidate_epoch("peer-a")
+            .await
+            .expect("peer must have a candidate epoch");
+        let request_id = 0x7A12;
+        assert!(
+            peers
+                .mark_direct_validation_started(
+                    "peer-a",
+                    crate::peer::DirectValidationIdentity::owned(
+                        crate::peer::PathEpoch::new(
+                            generation,
+                            peer_session_generation,
+                            remote_candidate_epoch,
+                        ),
+                        owner_token,
+                        Some(request_id),
+                        Some(request_endpoint),
+                    ),
+                )
+                .await
+        );
+        assert!(
+            udp.expect_direct_validation_ack_owned(
+                "peer-a",
+                request_id,
+                generation,
+                owner_token,
+                request_endpoint,
+            )
+            .await
+        );
+        assert!(
+            peers
+                .learn_authenticated_endpoint("peer-a", observed_endpoint)
+                .await,
+            "the drifted source must already have independent authenticated probe evidence"
+        );
+
+        let ack_packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            request_id,
+            0,
+            &build_direct_validation_payload(
+                DirectValidationKind::Ack,
+                generation,
+                request_id,
+                0,
+                owner_token,
+            ),
+        );
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let worker = tokio::spawn({
+            let transport = wg_transport.clone();
+            let peers = peers.clone();
+            let udp = udp.clone();
+            async move {
+                transport
+                    .run_inbound_with_peers(encrypted_rx, inbound_tx, Some(peers), Some(udp))
+                    .await
+            }
+        });
+        encrypted_tx
+            .send(ReceivedEncryptedPacket {
+                source: Some(observed_endpoint),
+                local_endpoint: udp.local_addr().ok(),
+                relay_endpoint: None,
+                relay_connection_id: None,
+                relay_peer_id: None,
+                socket_index: Some(0),
+                direct_socket: None,
+                udp_transport_owner: None,
+                network_generation: None,
+                profile_sampled: false,
+                udp_received: None,
+                transport_queue_send_started: None,
+                wire_bytes: remote_session.encrypt_to_bytes(&ack_packet).unwrap(),
+            })
+            .await
+            .unwrap();
+        drop(encrypted_tx);
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("inbound worker must process the authenticated drift ACK")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            inbound_rx.recv().await.is_none(),
+            "internal validation packets must not reach the TUN"
+        );
+        let connection = peers.get_connection("peer-a").await.unwrap();
+        assert_eq!(connection.state, ConnectionState::Direct);
+        assert_eq!(connection.active_path(), Some(NetworkPath::Direct));
+        assert_eq!(connection.endpoint, Some(observed_endpoint));
+        assert_eq!(connection.direct_health.success_count, 1);
+    }
+
+    #[tokio::test]
     async fn old_generation_validation_ack_cannot_promote_or_adopt_affinity() {
         // Exercise the real decrypt -> inbound ACK handler path.  This is not
         // a unit test of the expectation map: a token that was valid before a

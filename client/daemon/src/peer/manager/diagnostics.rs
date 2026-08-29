@@ -1,4 +1,27 @@
 impl PeerManager {
+    /// Read exact committed business-path projections without touching the
+    /// contended async connection map or its intentionally stale diagnostics
+    /// fallback cache.
+    pub(crate) fn committed_business_path_snapshots_sync(
+        &self,
+    ) -> Vec<CommittedBusinessPathSnapshot> {
+        self.committed_business_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Subscribe to committed path/lifecycle/epoch changes. Tokio watch keeps
+    /// the latest sequence, so a consumer cannot lose a commit that happens
+    /// before its task is scheduled.
+    pub(crate) fn subscribe_committed_business_path_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        self.committed_business_path_change_tx.subscribe()
+    }
+
     fn cached_diagnostics(&self) -> Vec<PeerDiagnostics> {
         self.diagnostics_cache
             .lock()

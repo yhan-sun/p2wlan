@@ -4272,6 +4272,17 @@ impl WireGuardTransport {
                         local_endpoint,
                         validation_latency,
                         Some(expectation.remote_candidate_epoch),
+                        Some(crate::peer::DirectValidationIdentity::authenticated_ack(
+                            crate::peer::PathEpoch::new(
+                                expectation.generation,
+                                expectation.peer_session_generation,
+                                expectation.remote_candidate_epoch,
+                            ),
+                            expectation.owner_token,
+                            expectation.request_id,
+                            expectation.endpoint,
+                            source,
+                        )),
                     )
                     .await;
                 let affinity_adopted = if promoted {
@@ -4344,10 +4355,10 @@ impl WireGuardTransport {
                 // promotion.  Keep the owner-conditional finish for a peer
                 // disappearing between token consumption and promotion: it
                 // can never erase a newer session installed for the same ID.
+                drop(epoch_guard);
                 let _ = udp
                     .finish_direct_validation_session(peer_id, expectation.owner_token)
                     .await;
-                drop(epoch_guard);
                 drop(adoption_guard);
 
                 if !promoted {

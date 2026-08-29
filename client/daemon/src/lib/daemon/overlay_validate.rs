@@ -84,6 +84,22 @@ struct SentOverlayNonce {
     sent_at: Instant,
 }
 
+/// Strict-Direct requests can arrive just before this endpoint commits its own
+/// Direct state. Preserve the request until that local commit so its echo also
+/// traverses Direct instead of falling back to an otherwise healthy Relay.
+struct PendingOverlayEcho {
+    peer_id: String,
+    virtual_ip: String,
+    generation: u64,
+    nonce: u64,
+    seq: u32,
+    packet: Vec<u8>,
+    queued_at: Instant,
+}
+
+/// The pending set is harness-only and bounded independently of the TUN queue.
+const OVERLAY_PENDING_ECHO_CAP: usize = 256;
+
 /// Post-first-usable burst verification state for one peer.
 struct OverlayBurst {
     /// Armed once first-usable evidence exists for this peer.
@@ -115,13 +131,15 @@ async fn fire_pending_bursts(
     nonce_order: &mut VecDeque<u64>,
     bursts: &mut HashMap<String, OverlayBurst>,
 ) {
+    let generation = peers.current_network_generation_sync();
     let virtual_ips: HashMap<String, String> = peers
-        .diagnostics()
-        .await
+        .committed_business_path_snapshots_sync()
         .into_iter()
-        .map(|peer| (peer.node_id, peer.virtual_ip))
+        .filter(|peer| {
+            peer.is_online_in_generation(generation) && peer.active_path().is_some()
+        })
+        .map(|peer| (peer.peer_id, peer.virtual_ip))
         .collect();
-    let generation = peers.current_network_generation().await;
     let targets: Vec<(String, String)> = bursts
         .iter()
         .filter(|(_, burst)| burst.armed && burst.fired_at.is_none())
@@ -214,6 +232,153 @@ fn settle_overdue_bursts(
     }
 }
 
+fn build_pending_overlay_echo(
+    local_vip: &str,
+    peer_id: String,
+    virtual_ip: String,
+    generation: u64,
+    nonce: u64,
+    seq: u32,
+) -> Option<PendingOverlayEcho> {
+    let payload = build_overlay_payload(OVERLAY_DIRECTION_ECHO, nonce, seq);
+    let packet = build_udp_overlay_packet(local_vip, &virtual_ip, 39287, 39286, &payload)?;
+    Some(PendingOverlayEcho {
+        peer_id,
+        virtual_ip,
+        generation,
+        nonce,
+        seq,
+        packet,
+        queued_at: Instant::now(),
+    })
+}
+
+async fn inject_pending_overlay_echo(
+    controller: &MockTunController,
+    echo: PendingOverlayEcho,
+) {
+    let PendingOverlayEcho {
+        peer_id,
+        virtual_ip,
+        nonce,
+        seq,
+        packet,
+        ..
+    } = echo;
+    let len = packet.len();
+    if controller.inject(packet).await.is_ok() {
+        info!(
+            "{OVERLAY_EVIDENCE_PREFIX}_echo peer={peer_id} dst_ip={virtual_ip} seq={seq} nonce={nonce:#x} len={len}"
+        );
+    }
+}
+
+fn committed_direct_ready_for_echo(
+    peers: &PeerManager,
+    peer_id: &str,
+    generation: u64,
+) -> bool {
+    peers
+        .committed_business_path_snapshots_sync()
+        .into_iter()
+        .any(|peer| {
+            peer.peer_id == peer_id
+                && peer.is_online_in_generation(generation)
+                && peer.active_path() == Some(crate::peer::NetworkPath::Direct)
+        })
+}
+
+async fn flush_pending_overlay_echoes(
+    controller: &MockTunController,
+    peers: &PeerManager,
+    pending: &mut VecDeque<PendingOverlayEcho>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let generation = peers.current_network_generation_sync();
+    let snapshots: HashMap<_, _> = peers
+        .committed_business_path_snapshots_sync()
+        .into_iter()
+        .map(|peer| (peer.peer_id.clone(), peer))
+        .collect();
+    let mut ready = Vec::new();
+    let mut waiting = VecDeque::new();
+    while let Some(echo) = pending.pop_front() {
+        if echo.generation != generation || echo.queued_at.elapsed() > OVERLAY_NONCE_TTL {
+            debug!(
+                event = "overlay_echo_retired",
+                peer = %echo.peer_id,
+                generation = echo.generation,
+                current_generation = generation,
+                "retired a stale pending strict-Direct overlay echo"
+            );
+            continue;
+        }
+        let Some(snapshot) = snapshots.get(&echo.peer_id) else {
+            continue;
+        };
+        if !snapshot.is_online_in_generation(generation) {
+            continue;
+        }
+        if snapshot.active_path() == Some(crate::peer::NetworkPath::Direct) {
+            ready.push(echo);
+        } else {
+            waiting.push_back(echo);
+        }
+    }
+    *pending = waiting;
+    for echo in ready {
+        inject_pending_overlay_echo(controller, echo).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_overlay_send_cycle(
+    controller: &MockTunController,
+    peers: &Arc<PeerManager>,
+    local_vip: &str,
+    overlay_any_path: bool,
+    overlay_burst: usize,
+    next_nonce: &mut u64,
+    next_seq: &mut u32,
+    stats: &mut OverlayStats,
+    sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
+    nonce_order: &mut VecDeque<u64>,
+    bursts: &mut HashMap<String, OverlayBurst>,
+    timeline: &Arc<ConnectionTimeline>,
+) {
+    stats.sent = stats.sent.saturating_add(
+        send_overlay_payloads(
+            controller,
+            peers,
+            local_vip,
+            overlay_any_path,
+            next_nonce,
+            next_seq,
+            stats,
+            sent_nonces,
+            nonce_order,
+        )
+        .await,
+    );
+    if overlay_burst > 0 {
+        fire_pending_bursts(
+            controller,
+            peers,
+            local_vip,
+            overlay_burst,
+            next_nonce,
+            next_seq,
+            sent_nonces,
+            nonce_order,
+            bursts,
+        )
+        .await;
+        settle_overdue_bursts(bursts, timeline);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_overlay_validate_loop(
     controller: MockTunController,
@@ -247,6 +412,15 @@ pub async fn run_overlay_validate_loop(
     // payloads per peer, every echo counted (zero loss / duplicate /
     // reorder through the REAL dataplane + WireGuard pipeline).
     let mut bursts: HashMap<String, OverlayBurst> = HashMap::new();
+    let mut pending_echoes = VecDeque::<PendingOverlayEcho>::new();
+    // The committed path stream is published by the same atomic entry that
+    // changes the active business path. Availability mode uses it immediately
+    // so Relay evidence cannot be delayed by diagnostics lock contention.
+    // Strict-Direct mode keeps its periodic send: one endpoint can commit
+    // Direct slightly before the other, and an immediate request would then be
+    // echoed over the other endpoint's still-active Relay path rather than
+    // proving a bidirectional Direct business exchange.
+    let mut committed_path_changes = peers.subscribe_committed_business_path_changes();
     // First-usable strictness: a bidirectional encrypted overlay business
     // loopback is proven by the FIRST verified echo.  An echo is only ever
     // generated when the peer verified a fresh request of ours (our outbound ->
@@ -280,34 +454,43 @@ pub async fn run_overlay_validate_loop(
     loop {
         tokio::select! {
             _ = send_tick.tick() => {
-                stats.sent = stats.sent.saturating_add(
-                    send_overlay_payloads(
+                flush_pending_overlay_echoes(&controller, &peers, &mut pending_echoes).await;
+                run_overlay_send_cycle(
+                    &controller,
+                    &peers,
+                    &local_vip,
+                    overlay_any_path,
+                    overlay_burst,
+                    &mut next_nonce,
+                    &mut next_seq,
+                    &mut stats,
+                    &mut sent_nonces,
+                    &mut nonce_order,
+                    &mut bursts,
+                    &timeline,
+                ).await;
+            }
+            changed = committed_path_changes.changed() => {
+                if changed.is_err() {
+                    warn!("overlay_validate: committed path feed closed; stopping");
+                    break;
+                }
+                flush_pending_overlay_echoes(&controller, &peers, &mut pending_echoes).await;
+                if overlay_any_path {
+                    run_overlay_send_cycle(
                         &controller,
                         &peers,
                         &local_vip,
                         overlay_any_path,
+                        overlay_burst,
                         &mut next_nonce,
                         &mut next_seq,
                         &mut stats,
                         &mut sent_nonces,
                         &mut nonce_order,
-                    )
-                    .await,
-                );
-                if overlay_burst > 0 {
-                    fire_pending_bursts(
-                        &controller,
-                        &peers,
-                        &local_vip,
-                        overlay_burst,
-                        &mut next_nonce,
-                        &mut next_seq,
-                        &mut sent_nonces,
-                        &mut nonce_order,
                         &mut bursts,
-                    )
-                    .await;
-                    settle_overdue_bursts(&mut bursts, &timeline);
+                        &timeline,
+                    ).await;
                 }
             }
             event = overlay_ingress_rx.recv() => {
@@ -320,12 +503,14 @@ pub async fn run_overlay_validate_loop(
                     &controller,
                     &local_vip,
                     &local_node_id,
+                    overlay_any_path,
                     &mut seen,
                     &mut stats,
                     &peers,
                     &timeline,
                     &sent_nonces,
                     &mut bursts,
+                    &mut pending_echoes,
                 )
                 .await;
             }
@@ -362,34 +547,27 @@ fn build_overlay_payload(direction: u8, nonce: u64, seq: u32) -> Vec<u8> {
 
 fn overlay_validation_path_ready(
     online: bool,
-    state: crate::peer::ConnectionState,
     active_path: Option<crate::peer::NetworkPath>,
     overlay_any_path: bool,
 ) -> bool {
     if !online {
         return false;
     }
-    match (state, active_path) {
-        (
-            crate::peer::ConnectionState::Direct,
-            Some(crate::peer::NetworkPath::Direct),
-        ) => true,
-        (
-            crate::peer::ConnectionState::Relay,
-            Some(crate::peer::NetworkPath::Relay),
-        ) if overlay_any_path => true,
+    match active_path {
+        Some(crate::peer::NetworkPath::Direct) => true,
+        Some(crate::peer::NetworkPath::Relay) if overlay_any_path => true,
         _ => false,
     }
 }
 
 fn overlay_validation_target_ready(
-    peer: &crate::peer::PeerDiagnostics,
+    peer: &crate::peer::CommittedBusinessPathSnapshot,
+    generation: u64,
     overlay_any_path: bool,
 ) -> bool {
     overlay_validation_path_ready(
-        peer.online,
-        peer.state,
-        peer.active_path,
+        peer.is_online_in_generation(generation),
+        peer.active_path(),
         overlay_any_path,
     )
 }
@@ -418,18 +596,19 @@ async fn send_overlay_payloads(
     nonce_order: &mut VecDeque<u64>,
 ) -> u64 {
     let mut sent = 0u64;
-    let direct_peers = peers.diagnostics().await;
-    for peer in direct_peers {
+    let generation = peers.current_network_generation_sync();
+    let committed_peers = peers.committed_business_path_snapshots_sync();
+    for peer in committed_peers {
         // This independent harness must measure loss only after the production
         // path state machine owns a confirmed path. Injecting synthetic traffic
         // while the peer is merely online pushes it into the bounded startup
         // queue and can expire before Relay confirmation; that tests startup
         // timing rather than the zero-loss Direct/Relay dataplane contract.
-        if !overlay_validation_target_ready(&peer, overlay_any_path) {
+        if !overlay_validation_target_ready(&peer, generation, overlay_any_path) {
             continue;
         }
         let virtual_ip = peer.virtual_ip.clone();
-        let peer_id = peer.node_id.clone();
+        let peer_id = peer.peer_id.clone();
         *next_nonce = next_nonce.wrapping_add(1);
         *next_seq = next_seq.wrapping_add(1);
         let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, *next_nonce, *next_seq);
@@ -440,7 +619,6 @@ async fn send_overlay_payloads(
         };
         // Register the outbound nonce BEFORE the send so a fast echo cannot
         // race ahead of the registry insert.
-        let generation = peers.current_network_generation().await;
         sent_nonces.insert(
             *next_nonce,
             SentOverlayNonce {
@@ -495,14 +673,16 @@ async fn handle_overlay_ingress(
     controller: &MockTunController,
     local_vip: &str,
     local_node_id: &str,
+    overlay_any_path: bool,
     seen: &mut VecDeque<(u64, u32)>,
     stats: &mut OverlayStats,
     peers: &Arc<PeerManager>,
     timeline: &Arc<ConnectionTimeline>,
     sent_nonces: &HashMap<u64, SentOverlayNonce>,
     bursts: &mut HashMap<String, OverlayBurst>,
+    pending_echoes: &mut VecDeque<PendingOverlayEcho>,
 ) {
-    let current_generation = peers.current_network_generation().await;
+    let current_generation = peers.current_network_generation_sync();
     if event.connection_generation != current_generation {
         stats.received_invalid = stats.received_invalid.saturating_add(1);
         warn!(
@@ -549,19 +729,42 @@ async fn handle_overlay_ingress(
                 // ONLY a fresh request (direction 0) is echoed; an
                 // echo is never echoed again, so (nonce, seq) ping-
                 // pong is impossible.
-                let payload = build_overlay_payload(OVERLAY_DIRECTION_ECHO, nonce, seq);
-                if let Some(echo) = build_udp_overlay_packet(
+                if let Some(echo) = build_pending_overlay_echo(
                     local_vip,
-                    &virtual_ip,
-                    39287,
-                    39286,
-                    &payload,
+                    peer_id.clone(),
+                    virtual_ip.clone(),
+                    event.connection_generation,
+                    nonce,
+                    seq,
                 ) {
-                    if controller.inject(echo).await.is_ok() {
+                    if overlay_any_path
+                        || committed_direct_ready_for_echo(
+                            peers,
+                            &peer_id,
+                            event.connection_generation,
+                        )
+                    {
+                        inject_pending_overlay_echo(controller, echo).await;
+                    } else {
+                        if pending_echoes.len() >= OVERLAY_PENDING_ECHO_CAP {
+                            if let Some(retired) = pending_echoes.pop_front() {
+                                warn!(
+                                    event = "overlay_echo_capacity_retired",
+                                    peer = %retired.peer_id,
+                                    generation = retired.generation,
+                                    "retired the oldest pending strict-Direct overlay echo at the hard capacity"
+                                );
+                            }
+                        }
                         info!(
-                            "{OVERLAY_EVIDENCE_PREFIX}_echo peer={peer_id} dst_ip={virtual_ip} seq={seq} nonce={nonce:#x} len={}",
-                            payload.len() + 28
+                            event = "overlay_echo_deferred_until_direct_commit",
+                            peer = %peer_id,
+                            generation = event.connection_generation,
+                            seq = seq,
+                            nonce = nonce,
+                            "deferred strict-Direct overlay echo until the local Direct path commits"
                         );
+                        pending_echoes.push_back(echo);
                     }
                 }
             } else if direction == OVERLAY_DIRECTION_ECHO {
@@ -863,44 +1066,184 @@ mod overlay_validate_tests {
 
     #[test]
     fn overlay_validation_waits_for_a_confirmed_active_path() {
-        use crate::peer::{ConnectionState, NetworkPath};
+        use crate::peer::NetworkPath;
 
-        assert!(!overlay_validation_path_ready(
-            true,
-            ConnectionState::Connecting,
-            None,
-            true,
-        ));
-        assert!(!overlay_validation_path_ready(
-            true,
-            ConnectionState::Relay,
-            None,
-            true,
-        ));
+        assert!(!overlay_validation_path_ready(true, None, true));
+        assert!(!overlay_validation_path_ready(true, None, false));
         assert!(overlay_validation_path_ready(
             true,
-            ConnectionState::Relay,
             Some(NetworkPath::Relay),
             true,
         ));
         assert!(!overlay_validation_path_ready(
             true,
-            ConnectionState::Relay,
             Some(NetworkPath::Relay),
             false,
         ));
         assert!(overlay_validation_path_ready(
             true,
-            ConnectionState::Direct,
             Some(NetworkPath::Direct),
             false,
         ));
         assert!(!overlay_validation_path_ready(
             false,
-            ConnectionState::Direct,
             Some(NetworkPath::Direct),
             false,
         ));
+    }
+
+    #[tokio::test]
+    async fn committed_path_notification_and_snapshot_bypass_stale_diagnostics() {
+        use crate::control::PeerInfo;
+        use crate::peer::NetworkPath;
+
+        let manager = PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default")
+                .expect("test config must build"),
+        );
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer-overlay-path".to_string(),
+                public_key: "pk".to_string(),
+                endpoint: "127.0.0.1:45000".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+
+        // Prime the intentionally non-blocking diagnostics fallback before the
+        // path is confirmed. It must not become authority for this harness.
+        let stale_before_confirmation = manager.diagnostics().await;
+        assert_eq!(stale_before_confirmation[0].active_path, None);
+
+        manager
+            .mark_relay_transport_ready("peer-overlay-path", "tcp://relay.test:443", 0)
+            .await;
+        let mut committed_path_changes = manager.subscribe_committed_business_path_changes();
+        assert!(
+            manager
+                .confirm_relay_peer("peer-overlay-path", "tcp://relay.test:443", 0)
+                .await
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            committed_path_changes.changed(),
+        )
+        .await
+        .expect("Relay commit must wake the overlay harness")
+        .expect("committed path stream must remain open");
+
+        let _connection_writer = manager.hold_connections_writer_for_test().await;
+        let stale_under_contention = manager.diagnostics().await;
+        assert_eq!(stale_under_contention[0].active_path, None);
+
+        let generation = manager.current_network_generation_sync();
+        let committed = manager.committed_business_path_snapshots_sync();
+        let peer = committed
+            .iter()
+            .find(|peer| peer.peer_id == "peer-overlay-path")
+            .expect("committed path projection must contain the peer");
+        assert_eq!(peer.active_path(), Some(NetworkPath::Relay));
+        assert!(overlay_validation_target_ready(peer, generation, true));
+        assert_eq!(peer.virtual_ip, "10.20.0.2");
+    }
+
+    #[tokio::test]
+    async fn strict_direct_echo_waits_for_local_direct_commit_without_sleep() {
+        use crate::control::PeerInfo;
+        use crate::peer::NetworkPath;
+
+        let manager = PeerManager::new(
+            Config::generate_default("http://ctrl.test", "default")
+                .expect("test config must build"),
+        );
+        manager
+            .add_peer(&PeerInfo {
+                node_id: "peer-strict-direct-echo".to_string(),
+                public_key: "pk".to_string(),
+                endpoint: "127.0.0.1:45001".to_string(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: "10.20.0.2".to_string(),
+                online: true,
+                ..PeerInfo::default()
+            })
+            .await;
+        manager
+            .mark_relay_transport_ready(
+                "peer-strict-direct-echo",
+                "tcp://relay.test:443",
+                0,
+            )
+            .await;
+        assert!(
+            manager
+                .confirm_relay_peer(
+                    "peer-strict-direct-echo",
+                    "tcp://relay.test:443",
+                    0,
+                )
+                .await
+        );
+
+        let generation = manager.current_network_generation_sync();
+        let (mut tun, controller) =
+            p2pnet_tun::mock::MockTunDevice::new_pair("strict-direct-echo", 1420, "10.20.0.1");
+        let mut pending = VecDeque::from([
+            build_pending_overlay_echo(
+                "10.20.0.1",
+                "peer-strict-direct-echo".to_string(),
+                "10.20.0.2".to_string(),
+                generation,
+                0x1234_5678_9abc_def0,
+                42,
+            )
+            .expect("valid IPv4 addresses must build a pending echo"),
+        ]);
+
+        flush_pending_overlay_echoes(&controller, &manager, &mut pending).await;
+        assert_eq!(
+            pending.len(),
+            1,
+            "a healthy Relay must not release a strict-Direct echo"
+        );
+
+        manager
+            .record_direct_success(
+                "peer-strict-direct-echo",
+                Some("127.0.0.1:45001".parse().unwrap()),
+            )
+            .await;
+        assert!(committed_direct_ready_for_echo(
+            &manager,
+            "peer-strict-direct-echo",
+            generation,
+        ));
+        assert_eq!(
+            manager
+                .committed_business_path_snapshots_sync()
+                .into_iter()
+                .find(|peer| peer.peer_id == "peer-strict-direct-echo")
+                .and_then(|peer| peer.active_path()),
+            Some(NetworkPath::Direct),
+        );
+
+        flush_pending_overlay_echoes(&controller, &manager, &mut pending).await;
+        assert!(pending.is_empty(), "the Direct commit must release the echo");
+
+        let mut packet = [0u8; 512];
+        let received = tokio::time::timeout(Duration::from_secs(1), tun.read(&mut packet))
+            .await
+            .expect("the Direct commit must inject the queued echo")
+            .expect("the mock TUN must stay open");
+        let parsed = p2pnet_tun::Ipv4Packet::new(&packet[..received])
+            .expect("the released echo must remain a valid IPv4 packet");
+        assert_eq!(parsed.src_addr().to_string(), "10.20.0.1");
+        assert_eq!(parsed.dst_addr().to_string(), "10.20.0.2");
+        let payload = &parsed.payload()[8..];
+        assert_eq!(&payload[..OVERLAY_MAGIC.len()], OVERLAY_MAGIC);
+        assert_eq!(payload[OVERLAY_MAGIC.len()], OVERLAY_DIRECTION_ECHO);
     }
 
     #[test]

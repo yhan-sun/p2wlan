@@ -28,7 +28,10 @@ use tracing::{debug, info, trace, warn};
 
 use crate::dataplane::global_dataplane_profiler;
 use crate::error::{DaemonError, Result};
-use crate::peer::{is_public_probe_endpoint, PeerManager, ProbeKeyRole, REASON_DIRECT_SEND_FAILED};
+use crate::peer::{
+    is_public_probe_endpoint, DirectValidationIdentity, PeerManager, PeerSessionGeneration,
+    ProbeKeyRole, REASON_DIRECT_SEND_FAILED,
+};
 use crate::transport::{
     EncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionConfirmation, WireGuardTransport,
 };

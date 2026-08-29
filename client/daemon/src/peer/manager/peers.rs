@@ -17,6 +17,49 @@ fn prune_probe_session_bindings(conn: &mut PeerConnection, now: Instant) {
     }
 }
 
+fn stage_probe_session_binding_on_connection(
+    conn: &mut PeerConnection,
+    token: String,
+    session_id: Option<String>,
+    ephemeral_shared: Option<[u8; 32]>,
+    promote_on_match: bool,
+) -> ProbeBindingStage {
+    let now = Instant::now();
+    prune_probe_session_bindings(conn, now);
+    if conn.probe_binding_token.as_deref() == Some(token.as_str()) {
+        return ProbeBindingStage::ReplayableDuplicate;
+    }
+    if let Some(pending) = conn.pending_probe_bindings.get_mut(&token) {
+        // An exact cached answer replay gets a fresh delivery window.
+        pending.expires_at = now + PENDING_PROBE_SESSION_BINDING_GRACE;
+        return ProbeBindingStage::ReplayableDuplicate;
+    }
+    if conn
+        .previous_probe_binding
+        .as_ref()
+        .and_then(|previous| previous.binding.token.as_deref())
+        == Some(token.as_str())
+    {
+        return ProbeBindingStage::StaleDuplicate;
+    }
+    if conn.pending_probe_bindings.len() >= MAX_PENDING_PROBE_SESSION_BINDINGS_PER_PEER {
+        return ProbeBindingStage::Busy;
+    }
+    conn.pending_probe_bindings.insert(
+        token.clone(),
+        PendingProbeSessionBinding {
+            binding: ProbeSessionBinding {
+                token: Some(token),
+                session_id: normalize_probe_session_id(session_id),
+                ephemeral_shared,
+            },
+            expires_at: now + PENDING_PROBE_SESSION_BINDING_GRACE,
+            promote_on_match,
+        },
+    );
+    ProbeBindingStage::Staged
+}
+
 fn install_active_probe_binding(
     conn: &mut PeerConnection,
     binding: ProbeSessionBinding,
@@ -287,12 +330,24 @@ impl PeerManager {
             }
             let had_relay_confirmation = conn.relay_confirmed_at.is_some();
             conn.reset_for_peer_session();
-            let published = self
+            let published_generation = self
                 .peer_membership
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .publish(node_id, conn.online, true);
-            if !published {
+            if let Some(peer_session_generation) = published_generation {
+                let epoch = PathEpoch::new(
+                    self.current_network_generation_sync(),
+                    peer_session_generation,
+                    conn.remote_candidate_epoch(),
+                );
+                let event = if conn.online {
+                    PathEvent::PeerOnline { epoch }
+                } else {
+                    PathEvent::PeerLeft { epoch }
+                };
+                conn.commit_path_transition(event, |_| {});
+            } else {
                 warn!(
                     "Peer lifecycle generation exhausted while resetting remote incarnation for {node_id}; authentication disabled"
                 );
@@ -370,6 +425,10 @@ impl PeerManager {
         // so its `transition` keeps the UDP eviction's nonevictable set fresh.
         conn.attach_direct_cache(self.direct_peers.clone());
         conn.attach_direct_pair_cache(self.direct_commit_pair_mirror.clone());
+        conn.attach_committed_business_path_cache(
+            self.committed_business_paths.clone(),
+            self.committed_business_path_change_tx.clone(),
+        );
 
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();
@@ -548,7 +607,6 @@ impl PeerManager {
         }
         if !info.online {
             clear_hard_hard_after_lock = true;
-            conn.transition(ConnectionState::Closed);
             conn.relay_server = None;
             cancel_heartbeat_after_lock = true;
             conn.probe_session_id = None;
@@ -556,8 +614,6 @@ impl PeerManager {
             conn.probe_binding_token = None;
             conn.pending_probe_bindings.clear();
             conn.previous_probe_binding = None;
-        } else if conn.state == ConnectionState::Closed {
-            conn.transition(ConnectionState::Idle);
         }
 
         // A relay 404 is authoritative evidence that the peer's registration
@@ -595,12 +651,24 @@ impl PeerManager {
         // Rotate the process-local generation only at a structural, identity,
         // or online lifecycle boundary; metadata and endpoint churn retain it.
         let rotate_peer_session = is_new || public_key_changed || old_online != info.online;
-        let published = self
+        let published_generation = self
             .peer_membership
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .publish(&info.node_id, info.online, rotate_peer_session);
-        if !published {
+        if let Some(peer_session_generation) = published_generation {
+            let epoch = PathEpoch::new(
+                generation,
+                peer_session_generation,
+                conn.remote_candidate_epoch(),
+            );
+            let event = if info.online {
+                PathEvent::PeerOnline { epoch }
+            } else {
+                PathEvent::PeerLeft { epoch }
+            };
+            conn.commit_path_transition(event, |_| {});
+        } else {
             warn!(
                 "Peer lifecycle generation exhausted while publishing {}; authentication disabled",
                 info.node_id
@@ -667,6 +735,21 @@ impl PeerManager {
                         conn.last_candidate_generation,
                     );
             }
+            let peer_session_generation = self
+                .peer_membership
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .generation(node_id);
+            if let (Some(conn), Some(peer_session_generation)) =
+                (conns.get_mut(node_id), peer_session_generation)
+            {
+                let epoch = PathEpoch::new(
+                    self.current_network_generation_sync(),
+                    peer_session_generation,
+                    conn.remote_candidate_epoch(),
+                );
+                conn.commit_path_transition(PathEvent::PeerLeft { epoch }, |_| {});
+            }
             // This is the lifecycle linearization point: once the mirror is
             // cleared, no new UDP adoption or control candidate work may treat
             // the old connection as present, even though physical map cleanup
@@ -676,6 +759,10 @@ impl PeerManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
             let removed_virtual_ip = conns.remove(node_id).map(|conn| conn.virtual_ip);
+            self.committed_business_paths
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(node_id);
             // PeerLeft is a terminal boundary for the current peer session.
             // Cancel the forced-relay token while the same epoch gate covers
             // removal, so an old ACK cannot race a later re-add of this node
@@ -797,6 +884,9 @@ impl PeerManager {
         {
             return false;
         }
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+            return false;
+        };
         let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
@@ -804,10 +894,22 @@ impl PeerManager {
         if conn.state == ConnectionState::Direct && conn.direct_is_healthy_confirmed() {
             return false;
         }
-        if !matches!(conn.state, ConnectionState::Direct | ConnectionState::Relay) {
-            conn.transition(ConnectionState::HolePunching);
-        }
-        true
+        let epoch = PathEpoch::new(
+            observed_generation,
+            peer_session_generation,
+            conn.remote_candidate_epoch(),
+        );
+        let attempt = DirectAttemptNumber(observed_commit_seq.unwrap_or_default());
+        let event = if attempt.0 == 0 {
+            PathEvent::DirectProbeStarted { epoch, attempt }
+        } else {
+            PathEvent::DirectRetryScheduled { epoch, attempt }
+        };
+        conn.commit_path_transition(
+            event,
+            |_| {},
+        )
+        .accepted()
     }
 
     /// Record a direct traversal timeline event for diagnostics.
@@ -1196,40 +1298,51 @@ impl PeerManager {
         let Some(conn) = conns.get_mut(node_id) else {
             return ProbeBindingStage::PeerMissing;
         };
-        let now = Instant::now();
-        prune_probe_session_bindings(conn, now);
-        if conn.probe_binding_token.as_deref() == Some(token.as_str()) {
-            return ProbeBindingStage::ReplayableDuplicate;
+        stage_probe_session_binding_on_connection(
+            conn,
+            token,
+            session_id,
+            ephemeral_shared,
+            promote_on_match,
+        )
+    }
+
+    /// Try to stage a Probe-v2 replacement without waiting for the global
+    /// connection writer. Callers that already own the canonical
+    /// `emit -> network epoch` guards use this to avoid an ABBA cycle with a
+    /// connection mutation that needs either outer guard before it can finish.
+    /// `None` means only that the connection map is currently contended.
+    pub(crate) fn try_stage_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: String,
+        session_id: Option<String>,
+        ephemeral_shared: Option<[u8; 32]>,
+        promote_on_match: bool,
+    ) -> Option<ProbeBindingStage> {
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            return Some(ProbeBindingStage::StaleDuplicate);
         }
-        if let Some(pending) = conn.pending_probe_bindings.get_mut(&token) {
-            // An exact cached answer replay gets a fresh delivery window.
-            pending.expires_at = now + PENDING_PROBE_SESSION_BINDING_GRACE;
-            return ProbeBindingStage::ReplayableDuplicate;
-        }
-        if conn
-            .previous_probe_binding
-            .as_ref()
-            .and_then(|previous| previous.binding.token.as_deref())
-            == Some(token.as_str())
-        {
-            return ProbeBindingStage::StaleDuplicate;
-        }
-        if conn.pending_probe_bindings.len() >= MAX_PENDING_PROBE_SESSION_BINDINGS_PER_PEER {
-            return ProbeBindingStage::Busy;
-        }
-        conn.pending_probe_bindings.insert(
-            token.clone(),
-            PendingProbeSessionBinding {
-                binding: ProbeSessionBinding {
-                    token: Some(token),
-                    session_id: normalize_probe_session_id(session_id),
-                    ephemeral_shared,
-                },
-                expires_at: now + PENDING_PROBE_SESSION_BINDING_GRACE,
-                promote_on_match,
-            },
-        );
-        ProbeBindingStage::Staged
+        let mut conns = self.connections.try_write().ok()?;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return Some(ProbeBindingStage::PeerMissing);
+        };
+        Some(stage_probe_session_binding_on_connection(
+            conn,
+            token,
+            session_id,
+            ephemeral_shared,
+            promote_on_match,
+        ))
+    }
+
+    /// Queue once for connection-writer availability without retaining the
+    /// writer. The initiator calls this only after releasing emit/epoch, then
+    /// re-enters and revalidates the full generation transaction before
+    /// retrying the non-blocking stage.
+    pub(crate) async fn wait_for_probe_session_binding_writer(&self) {
+        drop(self.connections.write().await);
     }
 
     /// Extend a staged responder binding after the control-plane answer

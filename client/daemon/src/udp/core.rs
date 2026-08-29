@@ -1456,6 +1456,19 @@ impl UdpTransport {
             );
             return DirectValidationSessionStart::IgnoredStaleGeneration;
         }
+        let Some(peer_session_generation) =
+            self.peers.peer_session_generation_sync(peer_id)
+        else {
+            debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_admission_rejected",
+                peer_id = %peer_id,
+                remote_endpoint = %endpoint,
+                generation,
+                reason_code = "direct_validation_peer_session_unavailable",
+                "direct validation admission rejected for an offline peer lifecycle"
+            );
+            return DirectValidationSessionStart::IgnoredInactive;
+        };
         let current_remote_candidate_epoch = self
             .peers
             .current_remote_candidate_epoch(peer_id)
@@ -1533,6 +1546,7 @@ impl UdpTransport {
         {
             if !current.cancelled
                 && current.generation == generation
+                && current.peer_session_generation == peer_session_generation
                 && current.remote_candidate_epoch == remote_candidate_epoch
             {
                 let replace_target = self
@@ -1621,6 +1635,7 @@ impl UdpTransport {
         let target = DirectValidationTarget {
             endpoint,
             generation,
+            peer_session_generation,
             remote_candidate_epoch,
             owner_token,
             cancelled: false,
@@ -1690,9 +1705,11 @@ impl UdpTransport {
         // being observed between the two operations and keeps the registry
         // lock order identical to registration and ACK consumption.
         let mut sessions = self.direct_validation.sessions.lock().await;
-        let owned = sessions
-            .get(peer_id)
-            .is_some_and(|session| session.target_tx.borrow().owner_token == owner_token);
+        let owned_target = sessions.get(peer_id).and_then(|session| {
+            let target = *session.target_tx.borrow();
+            (target.owner_token == owner_token).then_some(target)
+        });
+        let owned = owned_target.is_some();
         if owned {
             // Removing the map entry is not enough: the worker owns a clone
             // of the watch receiver and can otherwise keep sending its
@@ -1717,7 +1734,25 @@ impl UdpTransport {
         {
             expectations.remove(peer_id);
         }
+        drop(expectations);
         drop(sessions);
+        if let Some(target) = owned_target {
+            self.peers
+                .finish_direct_validation_attempt(
+                    peer_id,
+                    DirectValidationIdentity::owned(
+                        crate::peer::PathEpoch::new(
+                            target.generation,
+                            target.peer_session_generation,
+                            target.remote_candidate_epoch,
+                        ),
+                        owner_token,
+                        None,
+                        Some(target.endpoint),
+                    ),
+                )
+                .await;
+        }
         owned
     }
 
@@ -1738,6 +1773,10 @@ impl UdpTransport {
             DirectValidationExpectation {
                 request_id,
                 generation,
+                peer_session_generation: self
+                    .peers
+                    .peer_session_generation_sync(peer_id)
+                    .unwrap_or(PeerSessionGeneration::UNBOUND),
                 remote_candidate_epoch: 0,
                 owner_token: 0,
                 endpoint: None,
@@ -1787,11 +1826,16 @@ impl UdpTransport {
             .current_remote_candidate_epoch(peer_id)
             .await
             .unwrap_or(0);
+        let peer_session_generation = self
+            .peers
+            .peer_session_generation_sync(peer_id)
+            .unwrap_or(PeerSessionGeneration::UNBOUND);
         self.register_direct_validation_expectation(
             peer_id,
             DirectValidationExpectation {
                 request_id,
                 generation,
+                peer_session_generation,
                 remote_candidate_epoch,
                 owner_token,
                 endpoint: Some(endpoint),
@@ -1824,6 +1868,7 @@ impl UdpTransport {
             let target = *session.target_tx.borrow();
             !target.cancelled
                 && target.generation == expectation.generation
+                && target.peer_session_generation == expectation.peer_session_generation
                 && target.remote_candidate_epoch == expectation.remote_candidate_epoch
                 && target.owner_token == expectation.owner_token
                 && expectation.endpoint == Some(target.endpoint)
@@ -1853,12 +1898,20 @@ impl UdpTransport {
     pub(crate) async fn prepare_direct_validation_send(
         &self,
         peer_id: &str,
-        request_id: u16,
-        generation: u64,
-        remote_candidate_epoch: u64,
-        owner_token: u64,
-        endpoint: SocketAddr,
+        validation: DirectValidationIdentity,
     ) -> std::result::Result<PreparedDirectValidationSend, DirectValidationSendError> {
+        let request_id = validation
+            .request_id
+            .expect("Direct validation send identity has a request id");
+        let generation = validation.epoch.network_generation;
+        let peer_session_generation = validation.epoch.peer_session_generation;
+        let remote_candidate_epoch = validation.epoch.remote_candidate_epoch;
+        let owner_token = validation
+            .owner_token
+            .expect("Direct validation send identity has an owner token");
+        let endpoint = validation
+            .request_endpoint()
+            .expect("Direct validation send identity has an endpoint");
         let (socket_index, socket, lease) = self
             .resolve_send_socket_with_lease(peer_id)
             .await
@@ -1869,6 +1922,7 @@ impl UdpTransport {
                 DirectValidationExpectation {
                     request_id,
                     generation,
+                    peer_session_generation,
                     remote_candidate_epoch,
                     owner_token,
                     endpoint: Some(endpoint),
@@ -1880,6 +1934,18 @@ impl UdpTransport {
             )
             .await;
         if !registered {
+            return Err(DirectValidationSendError::OwnerRevoked);
+        }
+        // Publish the exact request/endpoint identity before the packet can be
+        // sent. The ACK reducer then requires this full identity rather than
+        // accepting any request that happens to reuse the worker owner token.
+        if !self
+            .peers
+            .mark_direct_validation_started(peer_id, validation)
+            .await
+        {
+            self.clear_direct_validation_expectation_if_owned(peer_id, owner_token)
+                .await;
             return Err(DirectValidationSendError::OwnerRevoked);
         }
         Ok(PreparedDirectValidationSend {
@@ -2007,6 +2073,13 @@ impl UdpTransport {
         if token_generation != current_generation {
             return Err(crate::udp::DirectValidationAckRejectReason::TokenGenerationMismatch);
         }
+        let Some(current_peer_session_generation) =
+            self.peers.peer_session_generation_sync(peer_id)
+        else {
+            return Err(
+                crate::udp::DirectValidationAckRejectReason::ExpectationPeerSessionMismatch,
+            );
+        };
         let sessions = self.direct_validation.sessions.lock().await;
         let mut expectations = self.direct_validation.expectations.lock().await;
         let now = Instant::now();
@@ -2024,6 +2097,11 @@ impl UdpTransport {
             if expectation.generation != token_generation {
                 return Err(
                     crate::udp::DirectValidationAckRejectReason::ExpectationGenerationMismatch,
+                );
+            }
+            if expectation.peer_session_generation != current_peer_session_generation {
+                return Err(
+                    crate::udp::DirectValidationAckRejectReason::ExpectationPeerSessionMismatch,
                 );
             }
             if expectation.owner_token != token_owner {
@@ -2055,6 +2133,9 @@ impl UdpTransport {
         }
         if target.generation != current_generation {
             return Err(crate::udp::DirectValidationAckRejectReason::TargetGenerationMismatch);
+        }
+        if target.peer_session_generation != current_peer_session_generation {
+            return Err(crate::udp::DirectValidationAckRejectReason::TargetPeerSessionMismatch);
         }
         if target.remote_candidate_epoch
             != expectations

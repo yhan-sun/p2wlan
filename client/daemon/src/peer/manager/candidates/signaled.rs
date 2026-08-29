@@ -88,6 +88,9 @@ impl PeerManager {
         let epoch_gate = self.network_epoch_gate();
         let _epoch_guard = epoch_gate.lock().await;
         let generation = self.current_network_generation_sync();
+        let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
+            return CandidateSetApplyResult::PeerMissing;
+        };
         let mut connections = self.connections.write().await;
         let Some(conn) = connections.get_mut(node_id) else {
             return CandidateSetApplyResult::PeerMissing;
@@ -233,6 +236,7 @@ impl PeerManager {
         if remote_transport_handover {
             conn.mark_remote_transport_handover(
                 generation,
+                peer_session_generation,
                 "accepted remote candidate set that replaced the active transport context",
             );
             conn.direct_commit_seq = conn.direct_commit_seq.wrapping_add(1);
