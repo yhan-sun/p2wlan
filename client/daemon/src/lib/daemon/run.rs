@@ -488,6 +488,10 @@ impl Daemon {
         let local_candidate_sources = self.local_candidate_sources.clone();
         let udp_direct_context = UdpDirectTaskContext {
             udp_bind,
+            fresh_mapping_harness_loopback: self
+                .config
+                .network
+                .fresh_mapping_harness_loopback,
             peers: self.peers.clone(),
             control: self.control.clone(),
             local_candidates: self.local_candidates.clone(),

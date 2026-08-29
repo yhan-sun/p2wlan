@@ -100,6 +100,33 @@ mod tests {
     }
 
     #[test]
+    fn decrypted_direct_endpoint_evidence_requests_validation_without_recursing() {
+        let source: SocketAddr = "127.0.0.1:46004".parse().unwrap();
+        assert!(should_request_direct_validation_after_decrypt(
+            true,
+            Some(source),
+            None,
+        ));
+        assert!(!should_request_direct_validation_after_decrypt(
+            false,
+            Some(source),
+            None,
+        ));
+        assert!(!should_request_direct_validation_after_decrypt(true, None, None));
+        assert!(!should_request_direct_validation_after_decrypt(
+            true,
+            Some(source),
+            Some(DirectValidationToken {
+                kind: DirectValidationKind::Request,
+                generation: 7,
+                request_id: 9,
+                sequence: 1,
+                owner_token: 11,
+            }),
+        ));
+    }
+
+    #[test]
     fn wire_counter_extracts_only_wireguard_transport_headers() {
         let message = MessageTransport {
             receiver_index: 0x1122_3344,
@@ -1806,7 +1833,19 @@ mod tests {
         );
         let connection = peers.get_connection("peer-a").await.unwrap();
         assert_eq!(connection.state, ConnectionState::Idle);
-        assert_eq!(connection.relay_server, None);
+        assert_eq!(
+            connection.relay_server.as_deref(),
+            Some("tls://relay.test:443"),
+            "decrypted Relay ingress is retained as health metadata"
+        );
+        assert_eq!(
+            connection.relay_confirmed_generation, None,
+            "an internal rekey confirmation must not confirm Relay delivery"
+        );
+        assert_eq!(
+            connection.active_path(), None,
+            "Relay observation metadata must not activate the Relay path"
+        );
 
         drop(encrypted_tx);
         worker.await.unwrap().unwrap();
