@@ -1338,11 +1338,11 @@ impl PeerManager {
     }
 
     /// Queue once for connection-writer availability without retaining the
-    /// writer. The initiator calls this only after releasing emit/epoch, then
-    /// re-enters and revalidates the full generation transaction before
-    /// retrying the non-blocking stage. Dropping this future on cancellation
-    /// removes its waiter from Tokio's writer-preferred queue; the explicit
-    /// bound prevents this availability barrier from starving later readers.
+    /// writer. The independently scheduled initiator retry task calls this
+    /// only after the cooperative control-loop future has released every
+    /// upper guard and returned. Dropping this future on cancellation removes
+    /// its waiter from Tokio's writer-preferred queue; the explicit bound
+    /// prevents this availability barrier from starving later readers.
     pub(crate) async fn wait_for_probe_session_binding_writer(
         &self,
         max_wait: Duration,
