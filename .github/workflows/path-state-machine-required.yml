@@ -104,6 +104,11 @@ jobs:
               'Windows Lifecycle Required',
               'Mobile Lifecycle Required',
             ];
+            // On pull_request, context.sha is the synthetic merge ref. The
+            // independent required workflows publish their checks on the PR's
+            // exact head commit, which is the generation this aggregate must
+            // prove. Non-PR/manual runs retain the ordinary context SHA.
+            const targetSha = context.payload.pull_request?.head?.sha || context.sha;
             const deadline = Date.now() + 50 * 60 * 1000;
             let lastSummary = '';
 
@@ -111,7 +116,7 @@ jobs:
               const response = await github.rest.checks.listForRef({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                ref: context.sha,
+                ref: targetSha,
                 per_page: 100,
                 filter: 'latest',
               });
@@ -138,7 +143,7 @@ jobs:
                 return run && run.status === 'completed' && run.conclusion !== 'success';
               });
               if (failed.length > 0) {
-                core.setFailed(`Required gate failed for ${context.sha}: ${failed.join(', ')}`);
+                core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
                 return;
               }
               const complete = requiredNames.every((name) => {
@@ -146,14 +151,14 @@ jobs:
                 return run && run.status === 'completed' && run.conclusion === 'success';
               });
               if (complete) {
-                core.info(`All existing required gates passed for ${context.sha}.`);
+                core.info(`All existing required gates passed for ${targetSha}.`);
                 return;
               }
 
               await new Promise((resolve) => setTimeout(resolve, 15000));
             }
 
-            core.setFailed(`Timed out waiting for required gates on ${context.sha}: ${lastSummary}`);
+            core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
 
   required:
     name: Path State Machine Required
