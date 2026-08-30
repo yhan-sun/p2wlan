@@ -115,6 +115,11 @@ pub struct PeerDiagnostics {
     pub direct_events: Vec<DirectTraversalEventDiagnostics>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fresh_mapping: Vec<FreshMappingDiag>,
+    /// Read-only DPLPMTUD snapshot for the exact committed Direct UDP path.
+    /// The discovered size is diagnostic in this phase and is not consumed by
+    /// normal business-packet sizing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dplpmtud: Option<crate::dplpmtud::DplpmtudSnapshot>,
     /// Failure-recovery epoch budget report (probe credit, fresh-mapping
     /// generations, HTTP publishes remaining), when a recovery epoch is
     /// active for the peer.
@@ -549,6 +554,7 @@ impl PeerDiagnostics {
                         .collect()
                 })
                 .unwrap_or_default(),
+            dplpmtud: None,
             recovery: None,
         }
     }

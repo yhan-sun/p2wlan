@@ -763,6 +763,13 @@ impl PeerManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
+            if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
+                runtime.cancel_peer(
+                    node_id,
+                    "peer_left",
+                    tokio::time::Instant::now(),
+                );
+            }
             // PeerLeft is a terminal boundary for the current peer session.
             // Cancel the forced-relay token while the same epoch gate covers
             // removal, so an old ACK cannot race a later re-add of this node

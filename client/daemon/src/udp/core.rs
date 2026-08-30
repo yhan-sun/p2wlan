@@ -145,6 +145,11 @@ pub struct UdpTransport {
     /// clone so a network-generation transition cancels old ownership while
     /// it is still inside the shared epoch gate.
     direct_validation: DirectValidationRegistry,
+    /// DPLPMTUD state, capability receipts and exact-path workers owned by
+    /// this concrete UDP publication.
+    dplpmtud: crate::dplpmtud::DplpmtudRuntime,
+    dplpmtud_worker_ingress: crate::dplpmtud::DplpmtudWorkerIngress,
+    dplpmtud_local_virtual_ip: Option<Ipv4Addr>,
     /// Adaptive-prediction learner state for the current network generation.
     ///
     /// The fresh-mapping generator feeds each batch's observed ports into a
@@ -183,6 +188,8 @@ impl UdpTransport {
         peers
             .register_direct_validation_registry(direct_validation.clone())
             .await;
+        let dplpmtud = crate::dplpmtud::DplpmtudRuntime::new();
+        peers.register_dplpmtud_runtime(dplpmtud.clone()).await;
 
         Ok(Self {
             transport_instance_id: NEXT_UDP_TRANSPORT_INSTANCE.fetch_add(1, Ordering::Relaxed),
@@ -236,6 +243,9 @@ impl UdpTransport {
             local_node_id: None,
             wireguard_transport: None,
             direct_validation,
+            dplpmtud,
+            dplpmtud_worker_ingress: crate::dplpmtud::DplpmtudWorkerIngress::default(),
+            dplpmtud_local_virtual_ip: None,
             learning_cache: Arc::new(Mutex::new(LearningCache::new())),
         })
     }
@@ -249,6 +259,156 @@ impl UdpTransport {
     /// and cache-fencing metadata only; it is never sent on the wire.
     pub(crate) fn transport_instance_id(&self) -> u64 {
         self.transport_instance_id
+    }
+
+    pub(crate) fn with_dplpmtud_local_virtual_ip(mut self, local_virtual_ip: Ipv4Addr) -> Self {
+        self.dplpmtud_local_virtual_ip = Some(local_virtual_ip);
+        self
+    }
+
+    pub(crate) fn dplpmtud_runtime(&self) -> crate::dplpmtud::DplpmtudRuntime {
+        self.dplpmtud.clone()
+    }
+
+    pub(crate) fn dplpmtud_worker_ingress(
+        &self,
+    ) -> crate::dplpmtud::DplpmtudWorkerIngress {
+        self.dplpmtud_worker_ingress.clone()
+    }
+
+    pub(crate) fn mark_peer_dplpmtud_supported(
+        &self,
+        peer_id: &str,
+        peer_session_generation: PeerSessionGeneration,
+    ) -> bool {
+        self.dplpmtud
+            .mark_supported(peer_id, peer_session_generation.value())
+    }
+
+    /// Reconcile DPLPMTUD only from the authoritative committed-path mirror.
+    /// This never selects a path; it starts or cancels a worker for the exact
+    /// Direct state which the Path State Machine already committed.
+    pub(crate) async fn reconcile_dplpmtud_paths(&self) {
+        let now = tokio::time::Instant::now();
+        let snapshots = self.peers.committed_business_path_snapshots_sync();
+        let known_peers = snapshots
+            .iter()
+            .map(|snapshot| snapshot.peer_id.clone())
+            .collect::<HashSet<_>>();
+        self.dplpmtud.retain_known_peers(&known_peers, now);
+
+        let Some(local_virtual_ip) = self.dplpmtud_local_virtual_ip else {
+            return;
+        };
+
+        for snapshot in snapshots {
+            let validation = match snapshot.active {
+                ActiveBusinessPath::Direct(validation)
+                    if snapshot.lifecycle == PeerPathLifecycle::Online => validation,
+                _ => {
+                    self.dplpmtud.cancel_peer(
+                        &snapshot.peer_id,
+                        "active_path_not_direct",
+                        now,
+                    );
+                    continue;
+                }
+            };
+            let Some(epoch) = snapshot.epoch else {
+                self.dplpmtud
+                    .cancel_peer(&snapshot.peer_id, "path_identity_unbound", now);
+                continue;
+            };
+            if validation.epoch != epoch {
+                self.dplpmtud
+                    .cancel_peer(&snapshot.peer_id, "path_epoch_mismatch", now);
+                continue;
+            }
+            let Some(remote_endpoint) = validation.commit_endpoint() else {
+                self.dplpmtud.cancel_peer(
+                    &snapshot.peer_id,
+                    "direct_validation_not_authenticated",
+                    now,
+                );
+                continue;
+            };
+            let Some(pair) = self
+                .peers
+                .direct_commit_pair_snapshot_sync(&snapshot.peer_id)
+            else {
+                self.dplpmtud
+                    .cancel_peer(&snapshot.peer_id, "direct_pair_missing", now);
+                continue;
+            };
+            let Some(local_endpoint) = pair.local_endpoint else {
+                self.dplpmtud
+                    .cancel_peer(&snapshot.peer_id, "local_endpoint_missing", now);
+                continue;
+            };
+            if pair.generation != epoch.network_generation
+                || pair.remote_candidate_epoch != epoch.remote_candidate_epoch
+            {
+                self.dplpmtud
+                    .cancel_peer(&snapshot.peer_id, "direct_pair_stale", now);
+                continue;
+            }
+            let Some((socket_index, socket)) = self.socket_for_peer(Some(&snapshot.peer_id)).await
+            else {
+                self.dplpmtud
+                    .cancel_peer(&snapshot.peer_id, "local_socket_missing", now);
+                continue;
+            };
+            if socket.local_addr().ok() != Some(local_endpoint) {
+                self.dplpmtud
+                    .cancel_peer(&snapshot.peer_id, "local_socket_changed", now);
+                continue;
+            }
+            let Some(identity) = crate::dplpmtud::DplpmtudPathIdentity::from_committed_validation(
+                snapshot.peer_id.clone(),
+                validation,
+                remote_endpoint,
+                local_endpoint,
+                self.transport_instance_id,
+                socket_index,
+            ) else {
+                self.dplpmtud.cancel_peer(
+                    &snapshot.peer_id,
+                    "direct_validation_identity_incomplete",
+                    now,
+                );
+                continue;
+            };
+            let supported = self
+                .dplpmtud
+                .is_supported(&snapshot.peer_id, epoch.peer_session_generation.value());
+            let install = self.dplpmtud.install_path(identity, supported, now);
+            let Some(lease) = install.worker else {
+                continue;
+            };
+            let Ok(peer_virtual_ip) = snapshot.virtual_ip.parse::<Ipv4Addr>() else {
+                self.dplpmtud.cancel_peer(
+                    &snapshot.peer_id,
+                    "peer_virtual_ip_not_ipv4",
+                    now,
+                );
+                continue;
+            };
+            if !self
+                .dplpmtud_worker_ingress
+                .submit(crate::dplpmtud::DplpmtudWorkerStart {
+                    lease,
+                    socket,
+                    local_virtual_ip,
+                    peer_virtual_ip,
+                })
+            {
+                self.dplpmtud.cancel_peer(
+                    &snapshot.peer_id,
+                    "worker_ingress_capacity_exceeded",
+                    now,
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1131,6 +1291,9 @@ impl UdpTransport {
         self.peers
             .cancel_active_direct_validation_for_peer(peer_id)
             .await;
+        self.peers
+            .cancel_active_dplpmtud_for_peer(peer_id, reason)
+            .await;
         if remove_connection {
             // The connection removal runs INSIDE the adoption-lock
             // transaction: an ACK that already passed its peer-existence
@@ -1143,6 +1306,9 @@ impl UdpTransport {
             // as well; `begin_or_merge` also refuses the now-absent peer.
             self.peers
                 .cancel_active_direct_validation_for_peer(peer_id)
+                .await;
+            self.peers
+                .cancel_active_dplpmtud_for_peer(peer_id, reason)
                 .await;
         }
         // Bump the cleanup epoch and drop the peer's pending probes under the

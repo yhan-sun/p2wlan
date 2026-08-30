@@ -1393,6 +1393,17 @@ impl PeerManager {
             );
     }
 
+    pub(crate) fn direct_commit_pair_snapshot_sync(
+        &self,
+        peer_id: &str,
+    ) -> Option<DirectCommitPairSnapshot> {
+        self.direct_commit_pair_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .copied()
+    }
+
     /// Check the latest exact Direct pair without touching the async
     /// connection map.  `is_direct_sync` is checked separately from the pair
     /// snapshot so a transition to Relay/Closed cannot leave a stale exact

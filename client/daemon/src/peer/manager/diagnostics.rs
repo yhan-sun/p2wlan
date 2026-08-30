@@ -143,6 +143,11 @@ impl PeerManager {
             .map(|history| history.clone())
             .unwrap_or_default();
         let recovery_reports = self.recovery_epoch_diagnostics();
+        let dplpmtud_reports = self
+            .current_dplpmtud_runtime()
+            .await
+            .map(|runtime| runtime.snapshots())
+            .unwrap_or_default();
         // `try_read` also fails when a writer is merely queued.  During normal
         // probe/control activity that made `/peers` intermittently return an
         // empty roster even though the control poll had already joined the
@@ -169,6 +174,9 @@ impl PeerManager {
                 .collect(),
             Err(_) => self.cached_diagnostics(),
         };
+        for peer in &mut peers {
+            peer.dplpmtud = dplpmtud_reports.get(&peer.node_id).cloned();
+        }
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         self.cache_diagnostics(&peers);
         peers
@@ -210,6 +218,11 @@ impl PeerManager {
             .map(|history| history.clone())
             .unwrap_or_default();
         let recovery_reports = self.recovery_epoch_diagnostics();
+        let dplpmtud_reports = self
+            .current_dplpmtud_runtime()
+            .await
+            .map(|runtime| runtime.snapshots())
+            .unwrap_or_default();
         let mut peers: Vec<_> = match self.connections.try_read() {
             Ok(connections) => connections
                 .values()
@@ -240,6 +253,9 @@ impl PeerManager {
                 .collect(),
             Err(_) => self.cached_diagnostics(),
         };
+        for peer in &mut peers {
+            peer.dplpmtud = dplpmtud_reports.get(&peer.node_id).cloned();
+        }
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         self.cache_diagnostics(&peers);
         peers
@@ -273,6 +289,10 @@ impl PeerManager {
             .map(|history| history.clone())
             .unwrap_or_default();
         let recovery = self.recovery_epoch_diagnostics().remove(node_id);
+        let dplpmtud = self
+            .current_dplpmtud_runtime()
+            .await
+            .and_then(|runtime| runtime.snapshots().remove(node_id));
         let generation = self.current_network_generation_sync();
         let profile_generation = self.current_local_profile_generation_sync();
         let local_nat_capabilities = self
@@ -306,6 +326,7 @@ impl PeerManager {
             Some(&traversal_history),
             Some(&fresh_mapping_history),
         );
+        diagnostics.dplpmtud = dplpmtud;
         diagnostics.recovery = recovery;
         Some((generation, diagnostics))
     }

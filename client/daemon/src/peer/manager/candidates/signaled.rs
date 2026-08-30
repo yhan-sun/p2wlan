@@ -375,6 +375,8 @@ impl PeerManager {
                 .await;
             self.cancel_direct_validation_for_remote_candidate_change(node_id)
                 .await;
+            self.cancel_dplpmtud_for_remote_candidate_change(node_id)
+                .await;
             if retire_hard_hard {
                 // Candidate handover retires the complete direct transport
                 // context. Control-event ingress applies the candidate set

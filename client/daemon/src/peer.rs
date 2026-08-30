@@ -179,6 +179,10 @@ impl PeerSessionGeneration {
     /// `PeerMembershipState::publish` before path work is admitted.
     pub(crate) const UNBOUND: Self = Self(0);
 
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test(value: u64) -> Self {
         Self(value)

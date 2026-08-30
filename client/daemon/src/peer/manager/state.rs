@@ -352,6 +352,10 @@ pub struct PeerManager {
     /// it while holding `network_epoch_gate` to revoke old validation owners
     /// and their ACK expectations atomically with the new generation.
     direct_validation_registry: Arc<RwLock<Option<crate::udp::DirectValidationRegistry>>>,
+    /// DPLPMTUD registry published by the current UDP transport.  It is kept
+    /// beside the validation registry so lifecycle/generation transitions can
+    /// cancel exact-path probe ownership under the same network epoch fence.
+    dplpmtud_runtime: Arc<RwLock<Option<crate::dplpmtud::DplpmtudRuntime>>>,
     /// Latest local NAT profile used to decide whether bounded birthday probing is suitable.
     local_nat_profile: Arc<RwLock<Option<NatProfile>>>,
     /// Monotonic generation of the local NAT profile itself.  This is a
