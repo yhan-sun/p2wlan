@@ -1760,6 +1760,35 @@ impl DplpmtudRuntime {
     }
 
     #[cfg(test)]
+    fn current_probe_token(
+        &self,
+        peer_id: &str,
+        identity: &DplpmtudPathIdentity,
+    ) -> Option<DplpmtudWireToken> {
+        let registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = registry.entries.get(peer_id)?;
+        if entry.machine.identity() != Some(identity) {
+            return None;
+        }
+        let probe = entry.machine.outstanding.as_ref()?.identity;
+        Some(DplpmtudWireToken {
+            sequence: probe.sequence,
+            nonce: probe.nonce,
+            path_cookie: probe.path_cookie,
+            network_generation: identity.epoch.network_generation,
+            peer_session_generation: identity.epoch.peer_session_generation.value(),
+            remote_candidate_epoch: identity.epoch.remote_candidate_epoch,
+            direct_validation_owner_token: identity.direct_validation_owner_token,
+            direct_validation_request_id: identity.direct_validation_request_id,
+            candidate_udp_datagram_size: probe.candidate_udp_datagram_size,
+            outer_ip_family: identity.outer_ip_family,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn tracked_peer_count(&self) -> usize {
         self.registry
             .lock()
@@ -2821,6 +2850,7 @@ mod tests {
         let mut observed_blackhole_drops = 0;
         let mut observed_timeouts = 0;
         let mut observed_successes = 0;
+        let mut last_success_token = None;
         loop {
             let snapshot = runtime
                 .snapshots()
@@ -2840,6 +2870,7 @@ mod tests {
             let candidate = outstanding.candidate_udp_datagram_size as usize;
             observed_probe_sizes.push(candidate);
             if candidate <= BLACKHOLE_THRESHOLD {
+                last_success_token = runtime.current_probe_token("peer-b", &identity);
                 let expected_successes = observed_successes + 1;
                 yield_until(
                     || {
@@ -2876,7 +2907,7 @@ mod tests {
             }
         }
 
-        let result = runtime.snapshots().remove("peer-b").unwrap();
+        let mut result = runtime.snapshots().remove("peer-b").unwrap();
         assert_eq!(result.state, DplpmtudState::SearchComplete);
         assert!(result.confirmed_udp_datagram_size as usize <= BLACKHOLE_THRESHOLD);
         assert!(
@@ -2899,6 +2930,151 @@ mod tests {
         assert!(a_overlay_rx.try_recv().is_err());
         assert!(b_overlay_rx.try_recv().is_err());
 
+        // Send a second, independently encrypted ACK for the final successful
+        // probe. WireGuard replay protection accepts it as a new envelope,
+        // while the DPLPMTUD receipt identity must classify it as Duplicate
+        // without changing the converged result.
+        let duplicate_token = last_success_token.expect("a successful probe must converge");
+        let duplicate_ack_plaintext = build_ack_inner_packet(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            duplicate_token,
+        );
+        let duplicate_ack_encrypted = wireguard_b
+            .encrypt_outbound(OutboundPacket {
+                peer_id: "peer-a".to_string(),
+                dst_ip: "10.20.0.1".to_string(),
+                packet: duplicate_ack_plaintext,
+                trace: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, peer_b_socket) = udp_b
+            .socket_for_peer(Some("peer-a"))
+            .await
+            .expect("the responder must retain its primary UDP socket");
+        peer_b_socket
+            .send_to(&duplicate_ack_encrypted.wire_bytes, router_endpoint)
+            .await
+            .unwrap();
+        let expected_duplicate_acks = result.duplicate_ack_count + 1;
+        yield_until(
+            || {
+                runtime
+                    .snapshots()
+                    .get("peer-b")
+                    .is_some_and(|value| value.duplicate_ack_count >= expected_duplicate_acks)
+            },
+            "a second encrypted ACK must be classified as a duplicate by production inbound handling",
+        )
+        .await;
+        let after_duplicate = runtime.snapshots().remove("peer-b").unwrap();
+        assert_eq!(after_duplicate.revision, result.revision);
+        assert_eq!(after_duplicate.success_count, result.success_count);
+        assert_eq!(
+            after_duplicate.confirmed_udp_datagram_size,
+            result.confirmed_udp_datagram_size
+        );
+        assert_eq!(
+            after_duplicate.search_upper_udp_datagram_size,
+            result.search_upper_udp_datagram_size
+        );
+        assert_eq!(after_duplicate.duplicate_ack_count, expected_duplicate_acks);
+        result = after_duplicate;
+
+        // A real network-generation transition cancels the old exact path.
+        // Recommit a fresh Direct identity, then deliver an authenticated ACK
+        // carrying the old token through the live UDP reader. The production
+        // ACK handler must count it as stale and leave the new search intact.
+        let old_search_result = result.clone();
+        let next_generation = peers_a
+            .advance_network_generation("dplpmtud production generation fence")
+            .await;
+        yield_until(
+            || runtime.active_worker_count() == 0,
+            "network-generation advance must cancel the old DPLPMTUD worker",
+        )
+        .await;
+        let next_identity = commit_test_direct_path(
+            &peers_a,
+            &udp_a,
+            "peer-b",
+            router_endpoint,
+            endpoint_a,
+            43,
+            47,
+        )
+        .await;
+        assert_eq!(next_identity.epoch.network_generation, next_generation);
+        assert!(runtime.is_supported(
+            "peer-b",
+            next_identity.epoch.peer_session_generation.value()
+        ));
+        yield_until(
+            || {
+                runtime.path_identity("peer-b") == Some(next_identity.clone())
+                    && runtime.active_worker_count() == 1
+            },
+            "a recommitted Direct identity must start exactly one replacement worker",
+        )
+        .await;
+        let old_ack_plaintext = build_ack_inner_packet(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            duplicate_token,
+        );
+        let old_ack_encrypted = wireguard_b
+            .encrypt_outbound(OutboundPacket {
+                peer_id: "peer-a".to_string(),
+                dst_ip: "10.20.0.1".to_string(),
+                packet: old_ack_plaintext,
+                trace: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, peer_b_socket) = udp_b
+            .socket_for_peer(Some("peer-a"))
+            .await
+            .expect("the responder must retain its primary UDP socket");
+        peer_b_socket
+            .send_to(&old_ack_encrypted.wire_bytes, router_endpoint)
+            .await
+            .unwrap();
+        let expected_stale_acks = old_search_result.stale_ack_count + 1;
+        yield_until(
+            || {
+                runtime
+                    .snapshots()
+                    .get("peer-b")
+                    .is_some_and(|value| value.stale_ack_count >= expected_stale_acks)
+            },
+            "an authenticated ACK from the previous network generation must be stale",
+        )
+        .await;
+        let after_stale_generation = runtime.snapshots().remove("peer-b").unwrap();
+        assert_eq!(
+            after_stale_generation.confirmed_udp_datagram_size,
+            DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
+        );
+        assert_eq!(after_stale_generation.duplicate_ack_count, 0);
+        let observed_stale_ack_count = after_stale_generation.stale_ack_count;
+
+        // PeerLeft is exercised through the actual PeerManager lifecycle. It
+        // must withdraw the committed path, cancel the worker and remove the
+        // runtime entry before shutdown is signalled.
+        peers_a.remove_peer("peer-b").await;
+        yield_until(
+            || {
+                runtime.active_worker_count() == 0
+                    && runtime.tracked_peer_count() == 0
+                    && runtime.path_identity("peer-b").is_none()
+            },
+            "PeerLeft must cancel and remove the DPLPMTUD worker entry",
+        )
+        .await;
+
         shutdown_tx.send(true).unwrap();
         scheduler.await.unwrap();
         assert_eq!(runtime.active_worker_count(), 0);
@@ -2915,7 +3091,7 @@ mod tests {
         let _ = b_transport.await;
         let _ = router_task.await;
         println!(
-            "DPLPMTUD_BLACKHOLE threshold={} confirmed={} upper={} probe_count={} timeout_count={} success_count={} dropped_probe_count={} direct_active=true direct_health_failure_count={} relay_fallback_count=0 task_leak={}",
+            "DPLPMTUD_BLACKHOLE threshold={} confirmed={} upper={} probe_count={} timeout_count={} success_count={} dropped_probe_count={} direct_active=true direct_health_failure_count={} relay_fallback_count=0 generation_switch_stale_ack=true peer_left_cancelled=true stale_ack_count={} duplicate_ack_count={} task_leak={}",
             BLACKHOLE_THRESHOLD,
             result.confirmed_udp_datagram_size,
             result.search_upper_udp_datagram_size,
@@ -2924,6 +3100,8 @@ mod tests {
             result.success_count,
             dropped_probe_count.load(AtomicOrdering::Relaxed),
             connection.direct_health.failure_count,
+            observed_stale_ack_count,
+            result.duplicate_ack_count,
             runtime.active_worker_count() != 0,
         );
     }
