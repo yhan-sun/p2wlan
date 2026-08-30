@@ -714,6 +714,12 @@ impl PeerManager {
         let (removed_virtual_ip, removed_relay_expectation) = {
             let epoch_gate = self.network_epoch_gate();
             let _epoch_guard = epoch_gate.lock().await;
+            // Snapshot the current runtime while the epoch fence is held, but
+            // before taking the connection writer.  Cancellation mutates the
+            // DPLPMTUD registry synchronously; awaiting its manager lock
+            // while `conns` is held would invert the diagnostics/transport
+            // lock order and extend the PeerLeft write critical section.
+            let dplpmtud_runtime = self.dplpmtud_runtime.read().await.clone();
             // PeerLeft is an authoritative quarantine lifecycle boundary.
             // Remove both the backoff metadata and the no-await dataplane
             // mirror under the same epoch used for membership removal, before
@@ -763,7 +769,7 @@ impl PeerManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
-            if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
+            if let Some(runtime) = dplpmtud_runtime {
                 runtime.cancel_peer(
                     node_id,
                     "peer_left",

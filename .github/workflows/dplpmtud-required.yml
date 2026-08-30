@@ -161,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
-      - name: Require same-Head Path State Machine and CI gates
+      - name: Require same-Head existing, Flutter, and Package jobs
         uses: actions/github-script@v7
         with:
           script: |
@@ -171,8 +171,17 @@ jobs:
               'Windows Lifecycle Required',
               'Mobile Lifecycle Required',
               'CI Required',
-              'Flutter Client',
-              'Package Test Builds',
+              // Flutter Client publishes one check-run per job rather than a
+              // workflow-level check with the workflow name.
+              'Analyze and Test',
+              'Android arm64 Release APK',
+              'Linux x64 Release Bundle',
+              'macOS Release Apps',
+              'Windows x64 Release Bundle',
+              'iOS Compile',
+              // Package Test Builds likewise publishes its concrete jobs.
+              'macOS arm64 test DMG',
+              'Android arm64 test APK',
             ];
             const targetSha = context.payload.pull_request?.head?.sha || context.sha;
             const deadline = Date.now() + 50 * 60 * 1000;
