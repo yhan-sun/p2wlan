@@ -1087,66 +1087,33 @@ class AppStrings {
   String natTraversalTypeDescription(NatTraversalType type) {
     return switch (type) {
       NatTraversalType.fullCone =>
-        isZh
-            ? '公网 IP:Port 稳定，外部任意地址通常都能从该映射回包，直连成功率最高。'
-            : 'The public IP:port is stable and replies from any external address are usually accepted, so direct paths are easiest.',
+        isZh ? '公网 IP:Port 稳定，外部任意地址通常都能从该映射回包，直连成功率最高。' : 'The public IP:port is stable and replies from any external address are usually accepted, so direct paths are easiest.',
       NatTraversalType.restrictedCone =>
-        isZh
-            ? '公网端口稳定，但只接受已联系过的外部 IP 回包；同步探测通常可以建立直连。'
-            : 'The public port is stable, but replies are accepted only from contacted external IPs; coordinated probing usually works.',
+        isZh ? '公网端口稳定，但只接受已联系过的外部 IP 回包；同步探测通常可以建立直连。' : 'The public port is stable, but replies are accepted only from contacted external IPs; coordinated probing usually works.',
       NatTraversalType.portRestrictedCone =>
-        isZh
-            ? '公网端口稳定，但外部 IP 和端口都必须先被本机联系过；打洞时序更敏感。'
-            : 'The public port is stable, but the remote IP and port must be contacted first; punch timing matters more.',
+        isZh ? '公网端口稳定，但外部 IP 和端口都必须先被本机联系过；打洞时序更敏感。' : 'The public port is stable, but the remote IP and port must be contacted first; punch timing matters more.',
       NatTraversalType.symmetric =>
-        isZh
-            ? '访问不同外部地址会产生不同公网端点，是最难直连的类型，常需要预测端口或回退中继。'
-            : 'Different destinations create different public endpoints, making direct paths hardest and often requiring prediction or relay.',
+        isZh ? '访问不同外部地址会产生不同公网端点，是最难直连的类型，常需要预测端口或回退中继。' : 'Different destinations create different public endpoints, making direct paths hardest and often requiring prediction or relay.',
       NatTraversalType.openInternet =>
-        isZh
-            ? '本机 UDP 端点看起来可被公网直接访问，通常不需要 NAT 打洞。'
-            : 'The local UDP endpoint appears directly reachable from the public network, so NAT punching is usually unnecessary.',
+        isZh ? '本机 UDP 端点看起来可被公网直接访问，通常不需要 NAT 打洞。' : 'The local UDP endpoint appears directly reachable from the public network, so NAT punching is usually unnecessary.',
       NatTraversalType.udpBlocked =>
-        isZh
-            ? 'STUN/UDP 探测没有可用响应，直连可能不可用，建议优先检查防火墙或使用中继。'
-            : 'STUN/UDP probing did not receive usable responses; direct paths may be unavailable, so check firewalls or use relay.',
-      NatTraversalType.unknown =>
-        isZh
-            ? '当前观测不足以精确区分 NAT 类型，可刷新或换网络后再确认。'
-            : 'Current observations are not enough to classify the NAT precisely; refresh or retry on another network.',
+        isZh ? 'STUN/UDP 探测没有可用响应，直连可能不可用，建议优先检查防火墙或使用中继。' : 'STUN/UDP probing did not receive usable responses; direct paths may be unavailable, so check firewalls or use relay.',
+      NatTraversalType.unknown => isZh ? '当前观测不足以精确区分 NAT 类型，可刷新或换网络后再确认。' : 'Current observations are not enough to classify the NAT precisely; refresh or retry on another network.',
     };
   }
 
   String natTraversalTypeAdvice(NatTraversalType type) {
     return switch (type) {
       NatTraversalType.fullCone =>
-        isZh
-            ? '提示：这是最友好的直连环境，P2WLAN 通常可以优先尝试 Direct。'
-            : 'Tip: this is the friendliest direct-path environment, so P2WLAN can usually prefer Direct.',
-      NatTraversalType.restrictedCone =>
-        isZh
-            ? '提示：保持双端在线并让双方同时探测，有助于快速建立直连。'
-            : 'Tip: keep both peers online and probing at the same time to establish Direct quickly.',
+        isZh ? '提示：这是最友好的直连环境，P2WLAN 通常可以优先尝试 Direct。' : 'Tip: this is the friendliest direct-path environment, so P2WLAN can usually prefer Direct.',
+      NatTraversalType.restrictedCone => isZh ? '提示：保持双端在线并让双方同时探测，有助于快速建立直连。' : 'Tip: keep both peers online and probing at the same time to establish Direct quickly.',
       NatTraversalType.portRestrictedCone =>
-        isZh
-            ? '提示：如果直连不稳定，保留中继作为兜底，并尽量避免频繁切换网络。'
-            : 'Tip: keep relay as a fallback if Direct is unstable, and avoid frequent network switching.',
+        isZh ? '提示：如果直连不稳定，保留中继作为兜底，并尽量避免频繁切换网络。' : 'Tip: keep relay as a fallback if Direct is unstable, and avoid frequent network switching.',
       NatTraversalType.symmetric =>
-        isZh
-            ? '提示：这是困难 NAT。P2WLAN 会尝试预测/生日探测，但中继可能更稳定。'
-            : 'Tip: this is a hard NAT. P2WLAN will try prediction/birthday probing, but relay may be more stable.',
-      NatTraversalType.openInternet =>
-        isZh
-            ? '提示：请确认系统防火墙允许 P2WLAN UDP 入站。'
-            : 'Tip: confirm that the system firewall allows inbound P2WLAN UDP.',
-      NatTraversalType.udpBlocked =>
-        isZh
-            ? '提示：检查路由器、系统防火墙或公司网络策略是否阻断 UDP。'
-            : 'Tip: check whether the router, system firewall, or corporate policy blocks UDP.',
-      NatTraversalType.unknown =>
-        isZh
-            ? '提示：保持自动轮询或手动刷新，等待更多 STUN 观测。'
-            : 'Tip: keep auto sync on or refresh manually to collect more STUN observations.',
+        isZh ? '提示：这是困难 NAT。P2WLAN 会尝试预测/生日探测，但中继可能更稳定。' : 'Tip: this is a hard NAT. P2WLAN will try prediction/birthday probing, but relay may be more stable.',
+      NatTraversalType.openInternet => isZh ? '提示：请确认系统防火墙允许 P2WLAN UDP 入站。' : 'Tip: confirm that the system firewall allows inbound P2WLAN UDP.',
+      NatTraversalType.udpBlocked => isZh ? '提示：检查路由器、系统防火墙或公司网络策略是否阻断 UDP。' : 'Tip: check whether the router, system firewall, or corporate policy blocks UDP.',
+      NatTraversalType.unknown => isZh ? '提示：保持自动轮询或手动刷新，等待更多 STUN 观测。' : 'Tip: keep auto sync on or refresh manually to collect more STUN observations.',
     };
   }
 

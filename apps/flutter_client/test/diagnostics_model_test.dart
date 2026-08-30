@@ -10,9 +10,8 @@ void main() {
   final strings = AppStrings.fromCode('en');
 
   Future<DiagnosticsSnapshot> loadFixture() async {
-    final raw = await File(
-      'test/fixtures/status_connected.json',
-    ).readAsString();
+    final raw = await File('test/fixtures/status_connected.json')
+        .readAsString();
     return DiagnosticsSnapshot.fromJson(
       jsonDecode(raw) as Map<String, dynamic>,
     );

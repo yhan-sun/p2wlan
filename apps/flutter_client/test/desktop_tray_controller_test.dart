@@ -54,11 +54,9 @@ void main() {
   });
 
   test('desktop tray online-device submenu excludes offline peers', () async {
-    final raw =
-        jsonDecode(
-              await File('test/fixtures/status_connected.json').readAsString(),
-            )
-            as Map<String, dynamic>;
+    final raw = jsonDecode(
+      await File('test/fixtures/status_connected.json').readAsString(),
+    ) as Map<String, dynamic>;
     final peers = raw['peers'] as List<dynamic>;
     final offline =
         Map<String, dynamic>.from(peers.first as Map<String, dynamic>)

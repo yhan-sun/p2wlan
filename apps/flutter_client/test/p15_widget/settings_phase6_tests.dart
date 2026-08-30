@@ -737,9 +737,8 @@ Future<_Stores> _pumpSettingsShell(
     final unscaledShell = shell;
     shell = Builder(
       builder: (context) => MediaQuery(
-        data: MediaQuery.of(
-          context,
-        ).copyWith(textScaler: TextScaler.linear(textScale)),
+        data: MediaQuery.of(context)
+            .copyWith(textScaler: TextScaler.linear(textScale)),
         child: unscaledShell,
       ),
     );

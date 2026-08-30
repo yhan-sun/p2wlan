@@ -108,9 +108,8 @@ void main() {
         expect(runtime.warn, isTrue);
 
         expect(
-          preflight(
-            state: PermissionPreflightState.elevationRequired,
-          ).needsElevation,
+          preflight(state: PermissionPreflightState.elevationRequired)
+              .needsElevation,
           isTrue,
         );
         expect(preflight(state: PermissionPreflightState.failed).bad, isTrue);

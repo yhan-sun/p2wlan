@@ -7,9 +7,9 @@ import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/shared/widgets/device_type_icon.dart';
 
 void main() {
-  final fixture =
-      jsonDecode(File('test/fixtures/status_connected.json').readAsStringSync())
-          as Map<String, dynamic>;
+  final fixture = jsonDecode(
+    File('test/fixtures/status_connected.json').readAsStringSync(),
+  ) as Map<String, dynamic>;
   final peers = fixture['peers'] as List<dynamic>;
 
   PeerSnapshot peer({String? name, String? platform}) {

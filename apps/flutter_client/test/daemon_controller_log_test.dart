@@ -262,9 +262,8 @@ void main() {
 
   test('classifies UAC cancellation and launch failures', () {
     expect(
-      classifyWindowsLaunchFailure(
-        'The operation was canceled by the user.',
-      ).code,
+      classifyWindowsLaunchFailure('The operation was canceled by the user.')
+          .code,
       DaemonStartupFailureCode.uacCancelled,
     );
     expect(

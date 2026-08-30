@@ -396,9 +396,8 @@ class _StepDot extends StatelessWidget {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
-            style: Theme.of(
-              context,
-            ).textTheme.labelSmall?.copyWith(color: color),
+            style: Theme.of(context).textTheme.labelSmall
+                ?.copyWith(color: color),
           ),
         ),
       ],
@@ -470,9 +469,8 @@ class _StepBody extends StatelessWidget {
         const SizedBox(height: AppTokens.space6),
         Text(
           subtitle,
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-            color: P2WlanColors.of(context).textMuted,
-          ),
+          style: Theme.of(context).textTheme.bodyMedium
+              ?.copyWith(color: P2WlanColors.of(context).textMuted),
         ),
         if (step == OnboardingStep.permission && preflight != null) ...[
           const SizedBox(height: AppTokens.space12),

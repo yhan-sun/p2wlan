@@ -56,9 +56,8 @@ class SettingsStore extends ChangeNotifier {
             }
             effectiveToken = legacyToken;
           }
-          var restoredSettings = (await _migrateSettings(
-            loadedSettings,
-          )).copyWith(authToken: effectiveToken);
+          var restoredSettings = (await _migrateSettings(loadedSettings))
+              .copyWith(authToken: effectiveToken);
           final encryptedAdminPassword = loadedSettings
               .macosAdminPasswordCiphertext
               .trim();
@@ -90,9 +89,8 @@ class SettingsStore extends ChangeNotifier {
           }
         }
       } else {
-        _settings = (await _migrateSettings(
-          _settings,
-        )).copyWith(authToken: (await _tokenRepository.read()) ?? '');
+        _settings = (await _migrateSettings(_settings))
+            .copyWith(authToken: (await _tokenRepository.read()) ?? '');
       }
       _lastError = null;
     } catch (error) {
@@ -346,9 +344,8 @@ class SettingsStore extends ChangeNotifier {
     );
     try {
       await temp.writeAsString(
-        const JsonEncoder.withIndent(
-          '  ',
-        ).convert(_persistedSettings().toJson()),
+        const JsonEncoder.withIndent('  ')
+            .convert(_persistedSettings().toJson()),
         flush: true,
       );
       await _restrictFile(temp);

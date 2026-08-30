@@ -69,9 +69,8 @@ void main() {
   test(
     'authorizes sensitive GETs and retries a startup 401 with a fresh token',
     () async {
-      final fixture = await File(
-        '../../contracts/fixtures/status.json',
-      ).readAsString();
+      final fixture = await File('../../contracts/fixtures/status.json')
+          .readAsString();
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       addTearDown(() => server.close(force: true));
       var statusRequests = 0;
@@ -186,9 +185,8 @@ void main() {
   });
 
   test('retries a structured diagnostics snapshot timeout', () async {
-    final fixture = await File(
-      '../../contracts/fixtures/status.json',
-    ).readAsString();
+    final fixture = await File('../../contracts/fixtures/status.json')
+        .readAsString();
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(() => server.close(force: true));
     var statusRequests = 0;

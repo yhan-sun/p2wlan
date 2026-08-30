@@ -27,7 +27,6 @@ Future<void> _copySummary(BuildContext context, StatusStore statusStore) async {
   final safeSummary = redactSensitive(lines.join('\n'));
   await Clipboard.setData(ClipboardData(text: safeSummary));
   if (!context.mounted) return;
-  ScaffoldMessenger.of(
-    context,
-  ).showSnackBar(SnackBar(content: Text(strings.diagnosticsSummaryCopied)));
+  ScaffoldMessenger.of(context)
+      .showSnackBar(SnackBar(content: Text(strings.diagnosticsSummaryCopied)));
 }

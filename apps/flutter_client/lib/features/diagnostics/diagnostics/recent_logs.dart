@@ -172,18 +172,16 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
       return;
     }
     if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(strings.logsOpened)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(strings.logsOpened)));
   }
 
   Future<void> _copyLogs(String content) async {
     final strings = AppStringsScope.of(context);
     await Clipboard.setData(ClipboardData(text: content));
     if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(strings.logExcerptCopied)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(strings.logExcerptCopied)));
   }
 }
 

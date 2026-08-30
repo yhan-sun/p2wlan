@@ -58,13 +58,13 @@ Get the latest release from [GitHub Releases](https://github.com/yhan-sun/p2wlan
 
 | Platform | Release artifact | Status |
 | --- | --- | --- |
-| macOS Apple Silicon | `p2wlan-flutter-macos-arm64.dmg` | Supported |
-| macOS Intel | `p2wlan-flutter-macos-x64.dmg` | Supported |
+| macOS 12+ Apple Silicon | `p2wlan-flutter-macos-arm64.dmg` | Supported |
+| macOS 12+ Intel | `p2wlan-flutter-macos-x64.dmg` | Supported |
 | Windows x64 | `p2wlan-flutter-windows-x64-setup.exe` | Supported |
 | Linux x64 | Flutter `.tar.gz` / CLI `.tar.gz` | Supported |
 | Linux arm64 | CLI `.tar.gz` | Supported |
-| Android arm64 | `p2wlan-flutter-android-arm64-release.apk` | Preview |
-| iOS arm64 | `p2wlan-flutter-ios-arm64-unsigned.ipa` | Experimental, requires signing |
+| Android 7.0+ (API 24+) arm64 | `p2wlan-flutter-android-arm64-release.apk` | Preview |
+| iOS 15+ arm64 | `p2wlan-flutter-ios-arm64-unsigned.ipa` | Experimental, requires signing |
 
 **2. Sign in**
 
@@ -171,6 +171,10 @@ For production deployment, configure HTTPS/WSS, the database, authentication sec
 - For sensitive production environments, perform your own security assessment before deployment.
 
 ## Developers
+
+Flutter development and releases use Flutter 3.47.2 with Dart 3.13.2. The
+repository-root `.fvmrc` is the version source for local FVM, CI, and release
+workflows.
 
 The repository is organized by responsibility:
 

@@ -251,9 +251,8 @@ class AppSelect<T> extends StatelessWidget {
                 ? Theme.of(context).colorScheme.primary.withValues(alpha: 0.22)
                 : Colors.transparent,
             hoverColor: colors.hoverSurface,
-            splashColor: Theme.of(
-              context,
-            ).colorScheme.primary.withValues(alpha: 0.08),
+            splashColor: Theme.of(context).colorScheme.primary
+                .withValues(alpha: 0.08),
             child: Row(
               children: [
                 if (option.icon != null) ...[

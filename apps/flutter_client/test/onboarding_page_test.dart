@@ -128,11 +128,9 @@ class _ReadyDiagnosticsApi extends _OfflineDiagnosticsApi {
 
   @override
   Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
-    final json =
-        jsonDecode(
-              await File('../../contracts/fixtures/status.json').readAsString(),
-            )
-            as Map<String, dynamic>;
+    final json = jsonDecode(
+      await File('../../contracts/fixtures/status.json').readAsString(),
+    ) as Map<String, dynamic>;
     final path = <String, dynamic>{
       'last_success_age_ms': 1,
       'last_failure_age_ms': null,

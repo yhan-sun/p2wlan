@@ -135,13 +135,9 @@ void _registerNodesTests() {
 
   testWidgets('Nodes shows peer RTT for online relay peers', (tester) async {
     final snapshot = (await tester.runAsync(() async {
-      final raw =
-          jsonDecode(
-                await File(
-                  'test/fixtures/status_connected.json',
-                ).readAsString(),
-              )
-              as Map<String, dynamic>;
+      final raw = jsonDecode(
+        await File('test/fixtures/status_connected.json').readAsString(),
+      ) as Map<String, dynamic>;
       final relaySelection = raw['relay_selection'] as Map<String, dynamic>;
       relaySelection['selected_rtt_ewma_ms'] = 25;
       relaySelection['selected_last_pong_rtt_ms'] = 19;
@@ -200,13 +196,9 @@ void _registerNodesTests() {
     addTearDown(tester.view.resetDevicePixelRatio);
 
     final snapshot = (await tester.runAsync(() async {
-      final raw =
-          jsonDecode(
-                await File(
-                  'test/fixtures/status_connected.json',
-                ).readAsString(),
-              )
-              as Map<String, dynamic>;
+      final raw = jsonDecode(
+        await File('test/fixtures/status_connected.json').readAsString(),
+      ) as Map<String, dynamic>;
       final peers = raw['peers'] as List<dynamic>;
       for (final peer in peers.cast<Map<String, dynamic>>()) {
         final direct = peer['direct'] as Map<String, dynamic>;

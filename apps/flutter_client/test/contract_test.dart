@@ -52,20 +52,18 @@ void main() {
           'stopping',
         ];
         for (final phase in phases) {
-          final raw =
-              jsonDecode(
-                    jsonEncode({
-                      'node_id': 'node-a',
-                      'virtual_ip': '10.20.0.7',
-                      'revision': 1,
-                      'ready_phase': phase,
-                      'peers': <Map<String, dynamic>>[],
-                      'health': <String, dynamic>{},
-                      'stats': <String, dynamic>{},
-                      'relay_selection': <String, dynamic>{},
-                    }),
-                  )
-                  as Map<String, dynamic>;
+          final raw = jsonDecode(
+            jsonEncode({
+              'node_id': 'node-a',
+              'virtual_ip': '10.20.0.7',
+              'revision': 1,
+              'ready_phase': phase,
+              'peers': <Map<String, dynamic>>[],
+              'health': <String, dynamic>{},
+              'stats': <String, dynamic>{},
+              'relay_selection': <String, dynamic>{},
+            }),
+          ) as Map<String, dynamic>;
           expect(DiagnosticsSnapshot.fromJson(raw).readyPhase, phase);
         }
       },
@@ -119,23 +117,20 @@ void main() {
     });
   });
 
-  test(
-    'production PeersPageResponse and PermissionPreflightResponse parse fixtures',
-    () async {
-      final peers = PeersPageResponse.fromJson(
-        await _readFixture('peers_page.json'),
-      );
-      expect(peers.contractVersion, 1);
-      expect(peers.peers, isEmpty);
-      final permission = PermissionPreflightResponse.fromJson(
-        await _readFixture('permission_preflight.json'),
-      );
-      expect(permission.contractVersion, 1);
-      expect(permission.state, 'runtimeVerificationRequired');
-      expect(permission.canCreateTun, isNull);
-      expect(permission.canModifyRoutes, isTrue);
-    },
-  );
+  test('production PeersPageResponse and PermissionPreflightResponse parse fixtures', () async {
+    final peers = PeersPageResponse.fromJson(
+      await _readFixture('peers_page.json'),
+    );
+    expect(peers.contractVersion, 1);
+    expect(peers.peers, isEmpty);
+    final permission = PermissionPreflightResponse.fromJson(
+      await _readFixture('permission_preflight.json'),
+    );
+    expect(permission.contractVersion, 1);
+    expect(permission.state, 'runtimeVerificationRequired');
+    expect(permission.canCreateTun, isNull);
+    expect(permission.canModifyRoutes, isTrue);
+  });
 
   test('unsupported contract versions fail explicitly', () async {
     final json = await _readFixture('routes.json');
