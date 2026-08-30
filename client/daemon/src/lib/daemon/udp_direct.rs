@@ -1052,7 +1052,10 @@ async fn run_dplpmtud_worker(
                 &identity,
                 &plan,
             );
-            let send_result = match plaintext {
+            let send_result: std::result::Result<
+                crate::transport::BoundedEmitOutcome,
+                crate::dplpmtud::DplpmtudProbeSendFailure,
+            > = match plaintext {
                 Ok(plaintext) => {
                     let target_size = plan.probe_identity.candidate_udp_datagram_size.0 as usize;
                     let send_udp = udp.clone();
@@ -1063,7 +1066,7 @@ async fn run_dplpmtud_worker(
                     let send_identity = identity.clone();
                     let remote_endpoint = identity.authenticated_remote_endpoint;
                     transport
-                        .encrypt_and_emit_outbound_with_lock_timeout(
+                        .encrypt_and_emit_outbound_with_lock_timeout_typed(
                             OutboundPacket {
                                 peer_id: peer_id.clone(),
                                 dst_ip: peer_virtual_ip.to_string(),
@@ -1073,10 +1076,12 @@ async fn run_dplpmtud_worker(
                             crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
                             move |encrypted| async move {
                                 if encrypted.wire_bytes.len() != target_size {
-                                    return Err(DaemonError::Network(format!(
+                                    return Err(crate::dplpmtud::DplpmtudProbeSendFailure::from(
+                                        DaemonError::Network(format!(
                                         "DPLPMTUD encrypted datagram size mismatch: built={} expected={target_size}",
                                         encrypted.wire_bytes.len(),
-                                    )));
+                                        )),
+                                    ));
                                 }
                                 if send_udp.inbound_publication_owner() != publication_owner
                                     || !send_peers
@@ -1088,25 +1093,28 @@ async fn run_dplpmtud_worker(
                                         tokio::time::Instant::now(),
                                     )
                                 {
-                                    return Err(DaemonError::Network(
-                                        "DPLPMTUD exact path was cancelled before UDP send"
-                                            .to_string(),
+                                    return Err(crate::dplpmtud::DplpmtudProbeSendFailure::from(
+                                        DaemonError::Network(
+                                            "DPLPMTUD exact path was cancelled before UDP send"
+                                                .to_string(),
+                                        ),
                                     ));
                                 }
                                 send_udp
-                                    .send_encrypted_packet_on_socket(
+                                    .send_encrypted_packet_on_socket_for_dplpmtud(
                                         &send_socket,
                                         send_identity.socket.socket_index,
                                         &encrypted,
                                         remote_endpoint,
                                     )
                                     .await
-                                    .map(|_| ())
                             },
                         )
                         .await
                 }
-                Err(error) => Err(DaemonError::Network(error)),
+                Err(error) => Err(
+                    crate::dplpmtud::DplpmtudProbeSendFailure::from(DaemonError::Network(error)),
+                ),
             };
 
             match send_result {
@@ -1123,18 +1131,48 @@ async fn run_dplpmtud_worker(
                         ),
                     );
                 }
-                Ok(
-                    crate::transport::BoundedEmitOutcome::LockTimeout
-                    | crate::transport::BoundedEmitOutcome::SessionUnavailable,
-                )
-                | Err(_) => {
-                    runtime.finish_probe_send(&plan, Err(()), tokio::time::Instant::now());
+                Ok(crate::transport::BoundedEmitOutcome::LockTimeout) => {
+                    runtime.finish_probe_send(
+                        &plan,
+                        Err(crate::dplpmtud::DplpmtudProbeSendFailure::EmitLockUnavailable),
+                        tokio::time::Instant::now(),
+                    );
                     emit_dplpmtud_timeline(
                         &peers,
                         "dplpmtud_probe_send_failed",
                         &identity,
                         format!(
-                            "sequence={} candidate_udp_datagram_size={}",
+                            "sequence={} candidate_udp_datagram_size={} failure=emit_lock_unavailable",
+                            plan.probe_identity.sequence,
+                            plan.probe_identity.candidate_udp_datagram_size.0,
+                        ),
+                    );
+                }
+                Ok(crate::transport::BoundedEmitOutcome::SessionUnavailable) => {
+                    runtime.finish_probe_send(
+                        &plan,
+                        Err(crate::dplpmtud::DplpmtudProbeSendFailure::SessionUnavailable),
+                        tokio::time::Instant::now(),
+                    );
+                    emit_dplpmtud_timeline(
+                        &peers,
+                        "dplpmtud_probe_send_failed",
+                        &identity,
+                        format!(
+                            "sequence={} candidate_udp_datagram_size={} failure=session_unavailable",
+                            plan.probe_identity.sequence,
+                            plan.probe_identity.candidate_udp_datagram_size.0,
+                        ),
+                    );
+                }
+                Err(failure) => {
+                    runtime.finish_probe_send(&plan, Err(failure), tokio::time::Instant::now());
+                    emit_dplpmtud_timeline(
+                        &peers,
+                        "dplpmtud_probe_send_failed",
+                        &identity,
+                        format!(
+                            "sequence={} candidate_udp_datagram_size={} failure={failure:?}",
                             plan.probe_identity.sequence,
                             plan.probe_identity.candidate_udp_datagram_size.0,
                         ),
@@ -1202,7 +1240,7 @@ async fn run_dplpmtud_worker(
                     if runtime.timeout_probe(&plan, tokio::time::Instant::now())
                         == crate::dplpmtud::DplpmtudTransitionDecision::Applied
                     {
-                        let snapshot = runtime.snapshots().remove(&peer_id);
+                        let snapshot = runtime.snapshot_for_path(&identity);
                         emit_dplpmtud_timeline(
                             &peers,
                             "dplpmtud_probe_timeout",
@@ -1211,7 +1249,10 @@ async fn run_dplpmtud_worker(
                                 "sequence={} candidate_udp_datagram_size={} confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
                                 outstanding.sequence,
                                 outstanding.candidate_udp_datagram_size.0,
-                                snapshot.as_ref().map_or(0, |value| value.confirmed_udp_datagram_size),
+                                snapshot
+                                    .as_ref()
+                                    .and_then(|value| value.confirmed_udp_datagram_size)
+                                    .unwrap_or(0),
                                 snapshot.as_ref().map_or(0, |value| value.search_upper_udp_datagram_size),
                             ),
                         );
@@ -1221,7 +1262,10 @@ async fn run_dplpmtud_worker(
                             &identity,
                             format!(
                                 "confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
-                                snapshot.as_ref().map_or(0, |value| value.confirmed_udp_datagram_size),
+                                snapshot
+                                    .as_ref()
+                                    .and_then(|value| value.confirmed_udp_datagram_size)
+                                    .unwrap_or(0),
                                 snapshot.as_ref().map_or(0, |value| value.search_upper_udp_datagram_size),
                             ),
                         );

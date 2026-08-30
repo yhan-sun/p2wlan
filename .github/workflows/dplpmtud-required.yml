@@ -7,6 +7,7 @@ on:
       - ".github/workflows/dplpmtud-required.yml"
       - ".github/workflows/path-state-machine-required.yml"
       - "client/daemon/**"
+      - "client/netbind/**"
       - "docs/dplpmtud-runtime-foundation.md"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -16,6 +17,7 @@ on:
       - ".github/workflows/dplpmtud-required.yml"
       - ".github/workflows/path-state-machine-required.yml"
       - "client/daemon/**"
+      - "client/netbind/**"
       - "docs/dplpmtud-runtime-foundation.md"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -66,7 +68,8 @@ jobs:
             libxdo-dev \
             librsvg2-dev \
             xdotool \
-            patchelf
+            patchelf \
+            iproute2
 
       - name: Cargo format
         run: cargo fmt --all -- --check
@@ -86,14 +89,24 @@ jobs:
       - name: Diff whitespace check
         run: git diff --check
 
-  dplpmtud_blackhole:
-    name: DPLPMTUD blackhole run ${{ matrix.iteration }}
+  dplpmtud_acceptance:
+    name: DPLPMTUD acceptance ${{ matrix.scenario }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        iteration: [1, 2, 3, 4, 5]
+        include:
+          - scenario: blackhole
+            test: encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak
+          - scenario: base-confirmation
+            test: base_requires_a_positive_probe_before_any_confirmed_budget
+          - scenario: same-identity-downward
+            test: same_identity_current_plpmtu_confirmation_recovers_downward
+          - scenario: no-fragment-emsgsize
+            test: local_emsgsize_shrinks_upper_bound_without_reopening_full_ceiling
+          - scenario: worker-leak
+            test: close_and_peer_left_remove_all_worker_ownership
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,14 +118,29 @@ jobs:
         run: |
           set -euo pipefail
           actual="$(git rev-parse HEAD)"
-          echo "DPLPMTUD_BLACKHOLE_RUN iteration=${{ matrix.iteration }} expected_head=$VALIDATION_SHA actual_head=$actual"
+          echo "DPLPMTUD_ACCEPTANCE_RUN scenario=${{ matrix.scenario }} expected_head=$VALIDATION_SHA actual_head=$actual"
           test "$actual" = "$VALIDATION_SHA"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run deterministic encrypted UDP blackhole chain
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak -- --exact --nocapture --test-threads=1
+      - name: Run acceptance scenario
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::${{ matrix.test }} -- --exact --nocapture --test-threads=1
+
+      - name: Install iproute2 for real IP-layer proof
+        if: matrix.scenario == 'no-fragment-emsgsize'
+        run: sudo apt-get update && sudo apt-get install -y iproute2
+
+      - name: Run privileged Linux netns/veth no-fragment proof
+        if: matrix.scenario == 'no-fragment-emsgsize'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p p2pnet-netbind --test no_fragment_netns --no-run
+          test_binary="$(find target/debug/deps -maxdepth 1 -type f -perm -111 -name 'no_fragment_netns-*' -print -quit)"
+          test -n "$test_binary"
+          test_binary="$PWD/$test_binary"
+          sudo -n env RUST_BACKTRACE=1 "$test_binary" --ignored --nocapture --test-threads=1
 
   dplpmtud_windows:
     name: DPLPMTUD Windows checks
@@ -252,7 +280,7 @@ jobs:
     if: always()
     needs:
       - dplpmtud_linux
-      - dplpmtud_blackhole
+      - dplpmtud_acceptance
       - dplpmtud_windows
       - existing_required_gates
     runs-on: ubuntu-latest
@@ -260,13 +288,13 @@ jobs:
       - name: Enforce aggregate results
         env:
           LINUX_RESULT: ${{ needs.dplpmtud_linux.result }}
-          BLACKHOLE_RESULT: ${{ needs.dplpmtud_blackhole.result }}
+          ACCEPTANCE_RESULT: ${{ needs.dplpmtud_acceptance.result }}
           WINDOWS_RESULT: ${{ needs.dplpmtud_windows.result }}
           EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           test "$LINUX_RESULT" = "success"
-          test "$BLACKHOLE_RESULT" = "success"
+          test "$ACCEPTANCE_RESULT" = "success"
           test "$WINDOWS_RESULT" = "success"
           if [ "$EVENT_NAME" = "pull_request" ]; then
             test "$EXTERNAL_RESULT" = "success"
