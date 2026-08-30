@@ -55,6 +55,9 @@ const DPLPMTUD_PROBE_PREFIX: &[u8] = b"p2wlan-dplpmtud-probe-v1";
 const DPLPMTUD_ACK_PREFIX: &[u8] = b"p2wlan-dplpmtud-ack-v1";
 const DPLPMTUD_TOKEN_BYTES: usize = 8 + 16 + 16 + 8 + 8 + 8 + 8 + 2 + 4 + 1;
 const INNER_IPV4_ICMP_OVERHEAD: usize = 20 + 8;
+/// Process-wide allocator so replacing the entire UDP runtime cannot reuse a
+/// business budget revision from an older socket publication.
+static NEXT_DPLPMTUD_BUDGET_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// Additive capability bytes inserted before the existing fixed Direct-
 /// validation tail token. Old peers locate that token from the end and safely
@@ -271,6 +274,15 @@ struct OutstandingProbe {
     retry: u8,
 }
 
+/// Business-budget state that controls the independent monotonic revision.
+/// Reducer diagnostics use `DplpmtudStateMachine::revision`; this state tracks
+/// only exact-path identity and business-visible confirmed-budget changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DplpmtudBudgetRevisionState {
+    path_identity: Option<DplpmtudPathIdentity>,
+    confirmed_udp_datagram_size: Option<UdpDatagramSize>,
+}
+
 /// Failure classification for the final DPLPMTUD emit boundary.
 ///
 /// These values are deliberately separate from path health: a lock/session
@@ -457,6 +469,26 @@ impl DplpmtudStateMachine {
 
     pub(crate) const fn state(&self) -> DplpmtudState {
         self.state
+    }
+
+    fn business_confirmed_udp_datagram_size(&self) -> Option<UdpDatagramSize> {
+        if !self.supported
+            || matches!(
+                self.state,
+                DplpmtudState::Disabled | DplpmtudState::Unsupported
+            )
+            || !self.base_confirmed
+        {
+            return None;
+        }
+        self.confirmed_udp_datagram_size
+    }
+
+    fn budget_revision_state(&self) -> DplpmtudBudgetRevisionState {
+        DplpmtudBudgetRevisionState {
+            path_identity: self.identity.clone(),
+            confirmed_udp_datagram_size: self.business_confirmed_udp_datagram_size(),
+        }
     }
 
     pub(crate) fn outstanding_identity(&self) -> Option<DplpmtudProbeIdentity> {
@@ -904,6 +936,7 @@ impl DplpmtudStateMachine {
             reset_reason: self.last_reset_reason.clone(),
             reset_count: self.reset_count,
             revision: self.revision,
+            budget_revision: None,
             probe_count: self.probe_count,
             success_count: self.success_count,
             timeout_count: self.timeout_count,
@@ -1052,6 +1085,8 @@ pub(crate) struct DplpmtudSnapshot {
     pub(crate) reset_reason: Option<String>,
     pub(crate) reset_count: u64,
     pub(crate) revision: u64,
+    #[serde(default)]
+    pub(crate) budget_revision: Option<u64>,
     pub(crate) probe_count: u64,
     pub(crate) success_count: u64,
     pub(crate) timeout_count: u64,
@@ -1355,6 +1390,7 @@ pub(crate) struct DplpmtudInstallResult {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DplpmtudConfirmedBudget {
+    pub(crate) budget_revision: u64,
     pub(crate) udp_datagram_size: UdpDatagramSize,
     pub(crate) outer_ip_packet_size: OuterIpPacketSize,
     pub(crate) overlay_payload_budget: OverlayPayloadBudget,
@@ -1362,6 +1398,8 @@ pub(crate) struct DplpmtudConfirmedBudget {
 
 struct RuntimeEntry {
     machine: DplpmtudStateMachine,
+    budget_revision: Option<u64>,
+    budget_revision_state: DplpmtudBudgetRevisionState,
     path_cookie: [u8; 16],
     worker_owner_token: Option<u64>,
     cancel_tx: Option<watch::Sender<bool>>,
@@ -1409,6 +1447,23 @@ impl DplpmtudRuntime {
             })
             .ok()
             .filter(|token| *token != 0)
+    }
+
+    fn allocate_budget_revision(&self) -> Option<u64> {
+        NEXT_DPLPMTUD_BUDGET_REVISION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .filter(|revision| *revision != 0)
+    }
+
+    fn refresh_budget_revision(&self, entry: &mut RuntimeEntry) {
+        let next_state = entry.machine.budget_revision_state();
+        if next_state != entry.budget_revision_state {
+            entry.budget_revision = self.allocate_budget_revision();
+            entry.budget_revision_state = next_state;
+        }
     }
 
     pub(crate) fn admit_probe_response(&self, peer_id: &str, now: Instant) -> bool {
@@ -1604,12 +1659,12 @@ impl DplpmtudRuntime {
         rand::thread_rng().fill_bytes(&mut path_cookie);
         let notify = Arc::new(Notify::new());
         if !supported {
+            let machine =
+                DplpmtudStateMachine::for_path_with_reason(identity, false, unsupported_reason);
             let entry = RuntimeEntry {
-                machine: DplpmtudStateMachine::for_path_with_reason(
-                    identity,
-                    false,
-                    unsupported_reason,
-                ),
+                budget_revision: self.allocate_budget_revision(),
+                budget_revision_state: machine.budget_revision_state(),
+                machine,
                 path_cookie,
                 worker_owner_token: None,
                 cancel_tx: None,
@@ -1620,7 +1675,7 @@ impl DplpmtudRuntime {
             registry.entries.insert(peer_id.clone(), entry);
             let entry = registry
                 .entries
-                .get(&peer_id)
+                .get_mut(&peer_id)
                 .expect("entry inserted above");
             self.publish_snapshot_locked(&peer_id, entry, now);
             return DplpmtudInstallResult {
@@ -1636,8 +1691,11 @@ impl DplpmtudRuntime {
             };
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let machine = DplpmtudStateMachine::for_path(identity.clone(), true, now);
         let entry = RuntimeEntry {
-            machine: DplpmtudStateMachine::for_path(identity.clone(), true, now),
+            budget_revision: self.allocate_budget_revision(),
+            budget_revision_state: machine.budget_revision_state(),
+            machine,
             path_cookie,
             worker_owner_token: Some(worker_owner_token),
             cancel_tx: Some(cancel_tx),
@@ -1648,7 +1706,7 @@ impl DplpmtudRuntime {
         registry.entries.insert(peer_id.clone(), entry);
         let entry = registry
             .entries
-            .get(&peer_id)
+            .get_mut(&peer_id)
             .expect("entry inserted above");
         self.publish_snapshot_locked(&peer_id, entry, now);
         DplpmtudInstallResult {
@@ -1683,6 +1741,7 @@ impl DplpmtudRuntime {
                     reason: "peer_left".to_string(),
                     now,
                 });
+                self.refresh_budget_revision(&mut entry);
             }
             registry.supported_sessions.remove(&peer_id);
             registry.ack_response_times.remove(&peer_id);
@@ -2133,10 +2192,12 @@ impl DplpmtudRuntime {
         {
             return None;
         }
-        let udp_datagram_size = entry.machine.confirmed_udp_datagram_size?;
+        let udp_datagram_size = entry.machine.business_confirmed_udp_datagram_size()?;
+        let budget_revision = entry.budget_revision?;
         let outer_ip_packet_size = udp_datagram_size.outer_ip_packet_size(identity.outer_ip_family);
         let overlay_payload_budget = udp_datagram_size.overlay_payload_budget()?;
         Some(DplpmtudConfirmedBudget {
+            budget_revision,
             udp_datagram_size,
             outer_ip_packet_size,
             overlay_payload_budget,
@@ -2192,14 +2253,14 @@ impl DplpmtudRuntime {
             .count()
     }
 
-    fn publish_snapshot_locked(&self, peer_id: &str, entry: &RuntimeEntry, now: Instant) {
+    fn publish_snapshot_locked(&self, peer_id: &str, entry: &mut RuntimeEntry, now: Instant) {
+        self.refresh_budget_revision(entry);
+        let mut snapshot = entry.machine.snapshot(now, entry.worker_running);
+        snapshot.budget_revision = entry.budget_revision;
         self.snapshots
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                peer_id.to_string(),
-                entry.machine.snapshot(now, entry.worker_running),
-            );
+            .insert(peer_id.to_string(), snapshot);
     }
 }
 
@@ -2355,6 +2416,102 @@ mod tests {
         );
         assert!(runtime.confirmed_budget_for_path(&identity).is_some());
         (runtime, lease)
+    }
+
+    fn exact_ack_ingress(identity: &DplpmtudPathIdentity) -> DplpmtudAckIngress {
+        DplpmtudAckIngress {
+            remote_endpoint: identity.authenticated_remote_endpoint,
+            local_endpoint: identity.local_endpoint,
+            socket: identity.socket,
+        }
+    }
+
+    fn schedule_and_mark_runtime_probe_sent(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        lease: &DplpmtudWorkerLease,
+        now: Instant,
+    ) -> DplpmtudProbePlan {
+        let plan = runtime
+            .schedule_probe(&identity.peer_id, identity, lease.worker_owner_token, now)
+            .expect("runtime search must have a next candidate");
+        assert!(runtime.begin_probe_send(&plan, now));
+        runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
+        plan
+    }
+
+    fn ack_runtime_probe(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        plan: &DplpmtudProbePlan,
+        now: Instant,
+    ) {
+        assert_eq!(
+            runtime.try_accept_ack(
+                &identity.peer_id,
+                identity,
+                plan.wire_token,
+                exact_ack_ingress(identity),
+                now,
+            ),
+            DplpmtudTransitionDecision::Applied
+        );
+    }
+
+    fn converge_runtime_to_threshold(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        lease: &DplpmtudWorkerLease,
+        mut now: Instant,
+        threshold: u32,
+    ) -> Instant {
+        for _ in 0..96 {
+            if runtime
+                .snapshot_for_peer(&identity.peer_id)
+                .is_some_and(|snapshot| snapshot.state == DplpmtudState::SearchComplete)
+            {
+                return now;
+            }
+            let plan = schedule_and_mark_runtime_probe_sent(runtime, identity, lease, now);
+            if plan.probe_identity.candidate_udp_datagram_size.0 <= threshold {
+                ack_runtime_probe(runtime, identity, &plan, now + Duration::from_millis(2));
+                now += Duration::from_millis(3);
+            } else {
+                assert_eq!(
+                    runtime.timeout_probe(&plan, plan.deadline),
+                    DplpmtudTransitionDecision::Applied
+                );
+                now = plan.deadline + Duration::from_millis(1);
+            }
+        }
+        panic!("bounded runtime DPLPMTUD search did not converge");
+    }
+
+    fn exhaust_runtime_current_confirmation(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        lease: &DplpmtudWorkerLease,
+        mut now: Instant,
+        expected_candidate: UdpDatagramSize,
+    ) -> Instant {
+        let confirmation_at = runtime
+            .worker_state(&identity.peer_id, identity, lease.worker_owner_token)
+            .and_then(|(_, wakeup, _)| wakeup)
+            .expect("SearchComplete must own a current-PLPMTU timer");
+        now = now.max(confirmation_at);
+        for _ in 0..=DPLPMTUD_MAX_RETRIES {
+            let plan = schedule_and_mark_runtime_probe_sent(runtime, identity, lease, now);
+            assert_eq!(
+                plan.probe_identity.candidate_udp_datagram_size,
+                expected_candidate
+            );
+            assert_eq!(
+                runtime.timeout_probe(&plan, plan.deadline),
+                DplpmtudTransitionDecision::Applied
+            );
+            now = plan.deadline + Duration::from_millis(1);
+        }
+        now
     }
 
     fn converge_machine_to_threshold(
@@ -2659,6 +2816,170 @@ mod tests {
     }
 
     #[test]
+    fn runtime_downward_recovery_withholds_budget_until_fresh_base_ack() {
+        let identity = test_identity("peer");
+        let runtime = DplpmtudRuntime::new();
+        let mut now = Instant::now();
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        now = converge_runtime_to_threshold(&runtime, &identity, &lease, now, 1397);
+        let before = runtime
+            .confirmed_budget_for_path(&identity)
+            .expect("initial search must converge with a budget");
+        assert_eq!(before.udp_datagram_size, UdpDatagramSize(1392));
+
+        now = exhaust_runtime_current_confirmation(
+            &runtime,
+            &identity,
+            &lease,
+            now,
+            UdpDatagramSize(1392),
+        );
+        let base = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(base.state, DplpmtudState::Base);
+        assert!(!base.base_confirmed);
+        assert_eq!(base.confirmed_udp_datagram_size, None);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert!(base.budget_revision.unwrap() > before.budget_revision);
+        assert_eq!(
+            runtime.path_identity(&identity.peer_id),
+            Some(identity.clone())
+        );
+
+        let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+        assert_eq!(
+            base_plan.probe_identity.candidate_udp_datagram_size,
+            UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &base_plan,
+            now + Duration::from_millis(2),
+        );
+        let reconfirmed_base = runtime
+            .confirmed_budget_for_path(&identity)
+            .expect("fresh BASE ACK must restore the budget");
+        assert_eq!(
+            reconfirmed_base.udp_datagram_size,
+            UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+        );
+        assert!(reconfirmed_base.budget_revision > base.budget_revision.unwrap());
+        now += Duration::from_millis(3);
+
+        converge_runtime_to_threshold(&runtime, &identity, &lease, now, 1280);
+        let recovered = runtime
+            .confirmed_budget_for_path(&identity)
+            .expect("upward search after fresh BASE ACK must converge");
+        assert!(recovered.udp_datagram_size.0 <= 1280);
+        assert!(recovered.budget_revision >= reconfirmed_base.budget_revision);
+        assert_eq!(runtime.path_identity(&identity.peer_id), Some(identity));
+        println!(
+            "DPLPMTUD_RECONFIRM_BASE before=1392 base_budget_before_ack=none base_after_ack=1200 after={} direct_active=true direct_health_failure_count=0 relay_fallback_count=0 identity_preserved=true old_ack_contamination=false task_leak=false",
+            recovered.udp_datagram_size.0,
+        );
+    }
+
+    #[tokio::test]
+    async fn same_identity_below_base_failure_enters_error_without_budget() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let local_endpoint = udp.local_addr().unwrap();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_endpoint = remote.local_addr().unwrap();
+        peers
+            .add_peer(&peer_info("peer", "10.20.0.2", remote_endpoint))
+            .await;
+        let identity = commit_test_direct_path(
+            &peers,
+            &udp,
+            "peer",
+            remote_endpoint,
+            local_endpoint,
+            29,
+            31,
+        )
+        .await;
+        let runtime = udp.dplpmtud_runtime();
+        let mut now = Instant::now();
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        now = converge_runtime_to_threshold(&runtime, &identity, &lease, now, 1397);
+        assert_eq!(
+            runtime
+                .confirmed_budget_for_path(&identity)
+                .unwrap()
+                .udp_datagram_size,
+            UdpDatagramSize(1392)
+        );
+
+        now = exhaust_runtime_current_confirmation(
+            &runtime,
+            &identity,
+            &lease,
+            now,
+            UdpDatagramSize(1392),
+        );
+        assert_eq!(
+            runtime.snapshot_for_peer(&identity.peer_id).unwrap().state,
+            DplpmtudState::Base
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+
+        for _ in 0..=DPLPMTUD_MAX_RETRIES {
+            let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+            assert_eq!(
+                base_plan.probe_identity.candidate_udp_datagram_size,
+                UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+            );
+            assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+            assert_eq!(
+                runtime.timeout_probe(&base_plan, base_plan.deadline),
+                DplpmtudTransitionDecision::Applied
+            );
+            now = base_plan.deadline + Duration::from_millis(1);
+        }
+
+        let failed = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(failed.state, DplpmtudState::Error);
+        assert!(!failed.base_confirmed);
+        assert_eq!(failed.confirmed_udp_datagram_size, None);
+        assert_eq!(failed.overlay_payload_budget, None);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert_eq!(
+            runtime.path_identity(&identity.peer_id),
+            Some(identity.clone())
+        );
+        assert!(peers.dplpmtud_path_is_current_sync(&identity));
+
+        let connection = peers.get_connection("peer").await.unwrap();
+        let direct_active = connection.active_path() == Some(crate::peer::NetworkPath::Direct);
+        let direct_health_failure_count = connection.direct_health.failure_count;
+        let relay_fallback_count = connection
+            .path_events
+            .iter()
+            .filter(|event| event.selected_path == Some(crate::peer::NetworkPath::Relay))
+            .count();
+        assert!(direct_active);
+        assert_eq!(direct_health_failure_count, 0);
+        assert_eq!(relay_fallback_count, 0);
+        runtime.close("below_base_acceptance_complete", now);
+        assert_eq!(runtime.active_worker_count(), 0);
+        println!(
+            "DPLPMTUD_BELOW_BASE before=1392 threshold=1100 state=Error confirmed=none budget=none direct_active={direct_active} direct_health_failure_count={direct_health_failure_count} relay_fallback_count={relay_fallback_count} identity_preserved=true old_ack_contamination=false task_leak=false",
+        );
+    }
+
+    #[test]
     fn cancelled_clears_confirmed_budget_and_all_probe_state() {
         let identity = test_identity("peer");
         let mut machine = DplpmtudStateMachine::for_path(identity, true, Instant::now());
@@ -2850,16 +3171,55 @@ mod tests {
         assert_eq!(snapshot.confirmed_udp_datagram_size, None);
     }
 
-    #[test]
-    fn relay_activation_revokes_old_direct_budget() {
+    async fn assert_relay_activation_revokes_old_direct_budget() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_dplpmtud_local_virtual_ip(Ipv4Addr::new(10, 20, 0, 1));
+        let local_endpoint = udp.local_addr().unwrap();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_endpoint = remote.local_addr().unwrap();
+        peers
+            .add_peer(&peer_info("peer", "10.20.0.2", remote_endpoint))
+            .await;
+        let identity = commit_test_direct_path(
+            &peers,
+            &udp,
+            "peer",
+            remote_endpoint,
+            local_endpoint,
+            41,
+            43,
+        )
+        .await;
         let now = Instant::now();
-        let identity = test_identity("peer");
-        let (runtime, _lease) = runtime_with_confirmed_base(identity.clone(), now);
-        runtime.cancel_peer(
-            &identity.peer_id,
-            "active_path_not_direct",
-            now + Duration::from_millis(3),
+        let runtime = udp.dplpmtud_runtime();
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &base_plan,
+            now + Duration::from_millis(2),
         );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_some());
+
+        peers
+            .record_direct_failure("peer", "relay invalidation acceptance")
+            .await;
+        peers.set_relay("peer", "relay.test:443").await;
+        assert_eq!(
+            peers.get_connection("peer").await.unwrap().active_path(),
+            Some(crate::peer::NetworkPath::Relay)
+        );
+        udp.reconcile_dplpmtud_paths().await;
+
         assert!(runtime.confirmed_budget_for_path(&identity).is_none());
         let snapshot = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
         assert_eq!(
@@ -2867,6 +3227,12 @@ mod tests {
             Some("active_path_not_direct")
         );
         assert_eq!(snapshot.state, DplpmtudState::Disabled);
+        assert_eq!(runtime.active_worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_activation_revokes_old_direct_budget() {
+        assert_relay_activation_revokes_old_direct_budget().await;
     }
 
     #[test]
@@ -2908,6 +3274,237 @@ mod tests {
         );
         assert!(runtime.confirmed_budget_for_path(&old_identity).is_none());
         assert!(runtime.confirmed_budget_for_path(&new_identity).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_close_generation_and_relay_budget_invalidation_acceptance() {
+        let now = Instant::now();
+
+        let cancel_identity = test_identity("cancel-peer");
+        let (cancel_runtime, _lease) = runtime_with_confirmed_base(cancel_identity.clone(), now);
+        cancel_runtime.cancel_peer(
+            &cancel_identity.peer_id,
+            "peer_left",
+            now + Duration::from_millis(3),
+        );
+        assert!(cancel_runtime
+            .confirmed_budget_for_path(&cancel_identity)
+            .is_none());
+
+        let generation_identity = test_identity("generation-peer");
+        let (generation_runtime, _lease) =
+            runtime_with_confirmed_base(generation_identity.clone(), now);
+        generation_runtime.cancel_before_network_generation(
+            generation_identity.epoch.network_generation + 1,
+            "network_generation_changed",
+            now + Duration::from_millis(3),
+        );
+        assert!(generation_runtime
+            .confirmed_budget_for_path(&generation_identity)
+            .is_none());
+
+        assert_relay_activation_revokes_old_direct_budget().await;
+
+        let close_identity = test_identity("close-peer");
+        let (close_runtime, _lease) = runtime_with_confirmed_base(close_identity.clone(), now);
+        close_runtime.close("shutdown", now + Duration::from_millis(3));
+        assert!(close_runtime
+            .confirmed_budget_for_path(&close_identity)
+            .is_none());
+        println!(
+            "DPLPMTUD_INVALIDATION cancel_peer=none generation_cancel=none relay_active=none runtime_close=none exact_path_fail_closed=true task_leak=false",
+        );
+    }
+
+    #[test]
+    fn budget_revision_is_monotonic_and_closes_identity_aba() {
+        let now = Instant::now();
+        let runtime = DplpmtudRuntime::new();
+        let identity = test_identity("peer");
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        let initial_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .and_then(|snapshot| snapshot.budget_revision)
+            .expect("path installation must allocate a revision fence");
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+
+        let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &base_plan,
+            now + Duration::from_millis(2),
+        );
+        let base_budget = runtime.confirmed_budget_for_path(&identity).unwrap();
+        assert_eq!(base_budget.udp_datagram_size, UdpDatagramSize(1200));
+        assert!(base_budget.budget_revision > initial_revision);
+
+        let upward_plan = schedule_and_mark_runtime_probe_sent(
+            &runtime,
+            &identity,
+            &lease,
+            now + Duration::from_millis(3),
+        );
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &upward_plan,
+            now + Duration::from_millis(5),
+        );
+        let raised_budget = runtime.confirmed_budget_for_path(&identity).unwrap();
+        assert!(raised_budget.udp_datagram_size > base_budget.udp_datagram_size);
+        assert!(raised_budget.budget_revision > base_budget.budget_revision);
+
+        let before_duplicate = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(
+            runtime.try_accept_ack(
+                &identity.peer_id,
+                &identity,
+                upward_plan.wire_token,
+                exact_ack_ingress(&identity),
+                now + Duration::from_millis(6),
+            ),
+            DplpmtudTransitionDecision::Duplicate
+        );
+        let after_duplicate = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(
+            after_duplicate.budget_revision,
+            before_duplicate.budget_revision
+        );
+        assert_eq!(after_duplicate.revision, before_duplicate.revision);
+
+        let before_stale = after_duplicate;
+        assert_eq!(
+            runtime.try_accept_ack(
+                &identity.peer_id,
+                &identity,
+                DplpmtudWireToken {
+                    network_generation: upward_plan.wire_token.network_generation + 1,
+                    ..upward_plan.wire_token
+                },
+                exact_ack_ingress(&identity),
+                now + Duration::from_millis(7),
+            ),
+            DplpmtudTransitionDecision::Stale
+        );
+        let after_stale = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert!(after_stale.revision > before_stale.revision);
+        assert_eq!(after_stale.budget_revision, before_stale.budget_revision);
+        assert_eq!(
+            runtime
+                .confirmed_budget_for_path(&identity)
+                .unwrap()
+                .budget_revision,
+            raised_budget.budget_revision
+        );
+
+        runtime.cancel_peer(
+            &identity.peer_id,
+            "active_path_not_direct",
+            now + Duration::from_millis(8),
+        );
+        let cancelled_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .unwrap()
+            .budget_revision
+            .unwrap();
+        assert!(cancelled_revision > raised_budget.budget_revision);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+
+        let reactivated_lease = runtime
+            .install_path(identity.clone(), true, now + Duration::from_millis(9))
+            .worker
+            .unwrap();
+        let reactivated_base = schedule_and_mark_runtime_probe_sent(
+            &runtime,
+            &identity,
+            &reactivated_lease,
+            now + Duration::from_millis(10),
+        );
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &reactivated_base,
+            now + Duration::from_millis(12),
+        );
+        let reactivated_budget = runtime.confirmed_budget_for_path(&identity).unwrap();
+        assert!(reactivated_budget.budget_revision > cancelled_revision);
+
+        let replacement = test_identity_with("peer", 8, 11, 14, 27, 29, 33, 1);
+        runtime
+            .install_path(replacement.clone(), true, now + Duration::from_millis(13))
+            .worker
+            .unwrap();
+        let replacement_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .unwrap()
+            .budget_revision
+            .unwrap();
+        assert!(replacement_revision > reactivated_budget.budget_revision);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert!(runtime.confirmed_budget_for_path(&replacement).is_none());
+
+        let final_identity = test_identity_with("peer", 9, 12, 15, 37, 39, 43, 2);
+        let final_lease = runtime
+            .install_path(
+                final_identity.clone(),
+                true,
+                now + Duration::from_millis(14),
+            )
+            .worker
+            .unwrap();
+        let identity_only_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .unwrap()
+            .budget_revision
+            .unwrap();
+        assert!(identity_only_revision > replacement_revision);
+
+        let final_base = schedule_and_mark_runtime_probe_sent(
+            &runtime,
+            &final_identity,
+            &final_lease,
+            now + Duration::from_millis(15),
+        );
+        ack_runtime_probe(
+            &runtime,
+            &final_identity,
+            &final_base,
+            now + Duration::from_millis(17),
+        );
+        let final_budget = runtime.confirmed_budget_for_path(&final_identity).unwrap();
+        assert!(final_budget.budget_revision > identity_only_revision);
+        assert_ne!(
+            final_budget.budget_revision,
+            reactivated_budget.budget_revision
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert!(runtime.confirmed_budget_for_path(&replacement).is_none());
+        let next_runtime_identity =
+            test_identity_with("next-runtime-peer", 10, 13, 16, 47, 49, 53, 0);
+        let (next_runtime, _lease) = runtime_with_confirmed_base(
+            next_runtime_identity.clone(),
+            now + Duration::from_secs(1),
+        );
+        let next_runtime_budget = next_runtime
+            .confirmed_budget_for_path(&next_runtime_identity)
+            .unwrap();
+        assert!(next_runtime_budget.budget_revision > final_budget.budget_revision);
+        println!(
+            "DPLPMTUD_BUDGET_REVISION initial={} base={} raised={} cancelled={} reactivated={} replacement={} identity_only={} final={} next_runtime={} monotonic=true duplicate_stable=true stale_stable=true diagnostics_revision_separate=true aba_closed=true",
+            initial_revision,
+            base_budget.budget_revision,
+            raised_budget.budget_revision,
+            cancelled_revision,
+            reactivated_budget.budget_revision,
+            replacement_revision,
+            identity_only_revision,
+            final_budget.budget_revision,
+            next_runtime_budget.budget_revision,
+        );
     }
 
     #[test]

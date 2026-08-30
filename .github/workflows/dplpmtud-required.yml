@@ -101,8 +101,14 @@ jobs:
             test: encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak
           - scenario: base-confirmation
             test: base_requires_a_positive_probe_before_any_confirmed_budget
-          - scenario: same-identity-downward
-            test: same_identity_current_plpmtu_confirmation_recovers_downward
+          - scenario: downward-1392-to-1280
+            test: runtime_downward_recovery_withholds_budget_until_fresh_base_ack
+          - scenario: below-base-1392-to-1100
+            test: same_identity_below_base_failure_enters_error_without_budget
+          - scenario: cancel-close-budget
+            test: cancel_close_generation_and_relay_budget_invalidation_acceptance
+          - scenario: budget-revision-aba
+            test: budget_revision_is_monotonic_and_closes_identity_aba
           - scenario: no-fragment-emsgsize
             test: local_emsgsize_shrinks_upper_bound_without_reopening_full_ceiling
           - scenario: worker-leak

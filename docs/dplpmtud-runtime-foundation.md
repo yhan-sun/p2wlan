@@ -253,6 +253,8 @@ Searching + matching ACK                  -> Searching or SearchComplete
 Searching + exhausted timeout             -> narrower Searching or SearchComplete
 SearchComplete + current-PLPMTU timer      -> Searching (re-probe current confirmed size)
 current confirmation failure               -> Base (fresh BASE confirmation required)
+re-confirmed BASE + matching ACK            -> Searching (confirmed=1200 restored)
+re-confirmed BASE + exhausted failures      -> Error (no confirmed budget)
 EMSGSIZE                                    -> shrink upper bound, keep searching
 transient/lock/session failure              -> bounded retry or Error
 SearchComplete + raise timer               -> Searching or renewed SearchComplete
@@ -327,9 +329,12 @@ revoked: `base_confirmed=false`, `confirmed_udp_datagram_size=None`, and
 `pending_candidate_udp_datagram_size=BASE` in state `Base`. The upper bound is
 shrunk using the failed candidate, but upward search cannot resume until a new
 BASE probe is positively ACKed. If that BASE phase exhausts its retries, the
-machine enters `Error` with no budget. Endpoint, generation, candidate epoch,
-and socket identity remain unchanged. A ten-minute raise timer independently
-reopens the upper interval to the family ceiling after a completed search.
+machine enters `Error` with no budget. The exact-path accessor returns `None`
+for the entire BASE re-confirmation interval and throughout the resulting
+below-BASE `Error`. Endpoint, generation, candidate epoch, and socket identity
+remain unchanged, and this state transition has no Direct-health or path-
+selection side effect. A ten-minute raise timer independently reopens the upper
+interval to the family ceiling after a completed search.
 
 The send boundary classifies `TransientSend`, `EmitLockUnavailable`,
 `SessionUnavailable`, and `LocalPacketTooLarge` separately. The first three
@@ -447,6 +452,10 @@ pending probes plus the current-confirmation timer, and preserves a reason in
 the read-only snapshot. A stale worker may still reach its exit path, but
 owner-token comparison prevents it from erasing the replacement. A cancelled
 worker cannot pass `begin_probe_send` and cannot publish an old retry kick.
+Consequently `cancel_peer`, network-generation cancellation, Relay activation,
+UDP-runtime close, and exact-identity replacement all revoke the old business
+budget immediately. Neither an old identity nor an old worker can read a budget
+published by the replacement.
 
 ## 11. Stale and duplicate handling
 
@@ -500,17 +509,29 @@ success/timeout/failure ages, reset reason/count, revision, probe and result
 counters, each send-failure class, stale/duplicate counters, and whether the
 owner worker is live.
 
+The snapshot also publishes a distinct optional `budget_revision`; a confirmed
+`DplpmtudConfirmedBudget` always carries that revision as a `u64`. It is
+allocated monotonically across the process and changes when the business value
+moves from `None` to `Some`, its confirmed UDP size changes, it moves from
+`Some` to `None`, or the complete exact path identity is replaced. A fresh UDP
+runtime therefore cannot reuse a prior runtime's revision, closing the
+identity-replacement ABA case. Duplicate and stale ACK diagnostics do not
+change this revision. Reducer `revision` remains an independent diagnostics
+sequence and may change for a stale-ACK counter even while `budget_revision`
+does not. Allocator exhaustion fails closed by withholding the business budget.
+
 Snapshots are copied into a separate read-optimized map after state commits.
 Status reads do not take or hold the mutable DPLPMTUD registry lock and cannot
 block a worker. A business consumer must use the O(1)
 `confirmed_budget_for_path(exact_identity)` accessor: it performs one per-peer
 registry lookup followed by a complete identity comparison and returns the
-confirmed UDP, outer-packet, and overlay budgets. It returns `None` when the
-runtime is closed, the identity is not the exact current path, the state is
-`Disabled`/`Unsupported`, support is not negotiated, BASE is not positively
-confirmed, or the confirmed value is absent. Control/timeline code may use the
-one-peer `snapshot_for_peer` or exact-path `snapshot_for_path`; the business
-hot path must not call `snapshots()`, which clones the full peer table.
+confirmed UDP, outer-packet, and overlay budgets plus `budget_revision`. It
+returns `None` when the runtime is closed, the identity is not the exact current
+path, the state is `Disabled`/`Unsupported`, support is not negotiated, BASE is
+not positively confirmed, the confirmed value is absent, or a revision cannot
+be allocated. Control/timeline code may use the one-peer `snapshot_for_peer` or
+exact-path `snapshot_for_path`; the business hot path must not call
+`snapshots()`, which clones the full peer table.
 
 ## 13. Verification strategy
 
@@ -554,13 +575,14 @@ sends a 1400-byte UDP datagram with the configured DF profile. It requires
 local `EMSGSIZE`, no receiver packet, and no fragmented ACK. This is the
 IP-layer no-fragment evidence; the userspace blackhole cannot provide it.
 
-The required workflow runs five distinct acceptance categories on the exact
-same PR Head SHA: encrypted blackhole convergence, BASE confirmation,
-same-identity downward recovery, no-fragment plus local EMSGSIZE, and
-worker/task-leak cleanup. Each category prints Direct-active,
-Direct-health-failure, Relay-fallback, old-ACK-contamination, and task-leak
-sentinels. The no-fragment category additionally runs the privileged Linux
-netns/veth test.
+The required workflow runs eight distinct acceptance categories on the exact
+same PR Head SHA: encrypted blackhole convergence, BASE positive confirmation,
+1392-to-1280 same-identity downward recovery, 1392-to-1100 below-BASE failure,
+cancel/close budget invalidation, budget-revision/identity ABA, no-fragment plus
+local EMSGSIZE, and worker/task-leak cleanup. Each category prints or directly
+asserts Direct-active, Direct-health-failure, Relay-fallback,
+old-ACK-contamination, and task-leak evidence. The no-fragment category
+additionally runs the privileged Linux netns/veth test.
 
 ## 14. Phase boundary and next-step API
 
@@ -571,6 +593,7 @@ assumed_base_udp_datagram_size
 base_confirmed
 optional confirmed_udp_datagram_size
 optional overlay_payload_budget
+budget_revision
 outer_ip_family
 exact path identity
 ```
