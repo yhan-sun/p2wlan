@@ -3827,6 +3827,21 @@ impl WireGuardTransport {
                     );
                     return;
                 }
+                if !udp
+                    .dplpmtud_runtime()
+                    .admit_probe_response(peer_id, tokio::time::Instant::now())
+                {
+                    peers.emit_timeline(
+                        "dplpmtud_probe_send_failed",
+                        Some("direct"),
+                        Some("probe_response_rate_limited"),
+                        Some(format!(
+                            "peer={peer_id} sequence={} candidate_udp_datagram_size={}",
+                            token.sequence, token.candidate_udp_datagram_size.0,
+                        )),
+                    );
+                    return;
+                }
                 let Ok(ip) = Ipv4Packet::new(packet) else {
                     return;
                 };

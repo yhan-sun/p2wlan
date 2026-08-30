@@ -382,6 +382,15 @@ impl UdpTransport {
                 .dplpmtud
                 .is_supported(&snapshot.peer_id, epoch.peer_session_generation.value());
             let install = self.dplpmtud.install_path(identity, supported, now);
+            if install.decision != crate::dplpmtud::DplpmtudInstallDecision::Spawned {
+                debug!(
+                    peer_id = %snapshot.peer_id,
+                    decision = ?install.decision,
+                    supported,
+                    "DPLPMTUD path reconciliation did not spawn a worker"
+                );
+                continue;
+            }
             let Some(lease) = install.worker else {
                 continue;
             };

@@ -997,6 +997,7 @@ async fn run_dplpmtud_worker(
     } = start;
     let identity = lease.identity.clone();
     let peer_id = lease.peer_id.clone();
+    let worker_owner_token = lease.worker_owner_token;
     let notify = lease.notify.clone();
     let mut cancel_rx = lease.cancel_rx;
     let publication_owner = udp.inbound_publication_owner();
@@ -1027,7 +1028,12 @@ async fn run_dplpmtud_worker(
             break;
         }
 
-        if let Some(plan) = runtime.schedule_probe(&peer_id, &identity, now) {
+        if let Some(plan) =
+            runtime.schedule_probe(&peer_id, &identity, worker_owner_token, now)
+        {
+            if !runtime.outstanding_is_current(&plan) {
+                continue;
+            }
             emit_dplpmtud_timeline(
                 &peers,
                 "dplpmtud_probe_scheduled",
@@ -1135,7 +1141,9 @@ async fn run_dplpmtud_worker(
             continue;
         }
 
-        let Some((state, wakeup, outstanding)) = runtime.worker_state(&peer_id, &identity) else {
+        let Some((state, wakeup, outstanding)) =
+            runtime.worker_state(&peer_id, &identity, worker_owner_token)
+        else {
             break;
         };
         if matches!(
@@ -1171,6 +1179,7 @@ async fn run_dplpmtud_worker(
                 if let Some(outstanding) = outstanding {
                     let plan = crate::dplpmtud::DplpmtudProbePlan {
                         peer_id: peer_id.clone(),
+                        worker_owner_token,
                         path_identity: identity.clone(),
                         probe_identity: outstanding,
                         wire_token: crate::dplpmtud::DplpmtudWireToken {
@@ -1219,7 +1228,7 @@ async fn run_dplpmtud_worker(
         }
     }
 
-    runtime.finish_worker(&peer_id, &identity);
+    runtime.finish_worker(&peer_id, &identity, worker_owner_token);
     emit_dplpmtud_timeline(
         &peers,
         "dplpmtud_cancelled",
