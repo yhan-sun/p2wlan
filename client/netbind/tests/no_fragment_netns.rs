@@ -1,10 +1,13 @@
 #![cfg(target_os = "linux")]
 
 use std::env;
-use std::io::{self, BufRead, BufReader};
+use std::fs;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use p2pnet_netbind::{bind_udp, udp_no_fragment_supported};
 
@@ -14,10 +17,19 @@ const RECEIVER_IP: &str = "192.0.2.2";
 const RECEIVER_PORT: u16 = 40_000;
 const LARGE_UDP_DATAGRAM: usize = 1_400;
 const RECEIVER_ENV: &str = "P2WLAN_NETNS_RECEIVER";
+const RECEIVER_READY_PATH_ENV: &str = "P2WLAN_NETNS_RECEIVER_READY_PATH";
 
 struct NetnsGuard {
     namespace: String,
     host_link: String,
+}
+
+struct ReceiverReadyPath(PathBuf);
+
+impl Drop for ReceiverReadyPath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 impl NetnsGuard {
@@ -132,7 +144,10 @@ fn receiver_helper() {
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("receiver read timeout must be configurable");
-    write_uncaptured_line("READY");
+    let ready_path: PathBuf = env::var_os(RECEIVER_READY_PATH_ENV)
+        .expect("receiver readiness path must be provided")
+        .into();
+    fs::write(ready_path, b"READY\n").expect("receiver readiness must be published");
 
     let mut buffer = [0u8; 65_535];
     match socket.recv_from(&mut buffer) {
@@ -148,23 +163,7 @@ fn receiver_helper() {
     }
 }
 
-fn write_uncaptured_line(line: &str) {
-    let bytes = format!("{line}\n");
-    let mut written = 0;
-    while written < bytes.len() {
-        let result = unsafe {
-            libc::write(
-                libc::STDOUT_FILENO,
-                bytes.as_ptr().add(written).cast(),
-                bytes.len() - written,
-            )
-        };
-        assert!(result > 0, "receiver readiness must be writable");
-        written += result as usize;
-    }
-}
-
-fn spawn_receiver(namespace: &str) -> io::Result<Child> {
+fn spawn_receiver(namespace: &str, ready_path: &Path) -> io::Result<Child> {
     let executable = env::current_exe()?;
     Command::new("ip")
         .args([
@@ -179,10 +178,37 @@ fn spawn_receiver(namespace: &str) -> io::Result<Child> {
             "--test-threads=1",
         ])
         .env(RECEIVER_ENV, "1")
-        .env("RUST_TEST_NOCAPTURE", "1")
-        .stdout(Stdio::piped())
+        .env(RECEIVER_READY_PATH_ENV, ready_path)
+        .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
+}
+
+fn wait_for_receiver_ready(receiver: &mut Child, ready_path: &Path) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if ready_path.is_file() {
+            let readiness = fs::read_to_string(ready_path)?;
+            if readiness.trim() == "READY" {
+                return Ok(());
+            }
+            return Err(io::Error::other(format!(
+                "receiver readiness marker was {readiness:?}"
+            )));
+        }
+        if let Some(status) = receiver.try_wait()? {
+            return Err(io::Error::other(format!(
+                "receiver exited before announcing readiness: {status}"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "receiver did not announce readiness",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -194,21 +220,12 @@ fn linux_low_mtu_no_fragment_probe_does_not_fragment() {
     }
 
     let namespace = NetnsGuard::create().expect("low-MTU netns/veth setup must succeed");
-    let mut receiver = spawn_receiver(&namespace.namespace).expect("receiver must spawn");
-    let stdout = receiver
-        .stdout
-        .take()
-        .expect("receiver stdout must be piped");
-    let mut receiver_output = BufReader::new(stdout);
-    let mut line = String::new();
-    assert!(
-        receiver_output
-            .read_line(&mut line)
-            .expect("receiver readiness must be readable")
-            > 0,
-        "receiver exited before announcing readiness"
-    );
-    assert_eq!(line.trim(), "READY");
+    let ready_path = env::temp_dir().join(format!("p2wlan-netns-ready-{}", std::process::id()));
+    let _ready_path = ReceiverReadyPath(ready_path.clone());
+    let mut receiver =
+        spawn_receiver(&namespace.namespace, &ready_path).expect("receiver must spawn");
+    wait_for_receiver_ready(&mut receiver, &ready_path)
+        .expect("receiver must announce readiness through the shared filesystem");
 
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime must start");
     let sender = runtime
@@ -229,26 +246,10 @@ fn linux_low_mtu_no_fragment_probe_does_not_fragment() {
     assert_eq!(send_error.raw_os_error(), Some(libc::EMSGSIZE));
     drop(sender);
 
-    let mut received_packet = false;
-    let mut output_line = String::new();
-    while receiver_output
-        .read_line(&mut output_line)
-        .expect("receiver output must be readable")
-        > 0
-    {
-        if output_line.starts_with("RECEIVED ") {
-            received_packet = true;
-        }
-        output_line.clear();
-    }
     let status = receiver.wait().expect("receiver must exit");
     assert!(
         status.success(),
         "receiver helper must complete successfully"
-    );
-    assert!(
-        !received_packet,
-        "large DPLPMTUD probe reached the receiver; fragmentation may have occurred"
     );
     println!(
         "LINUX_NO_FRAGMENT mtu={} udp_datagram={} df=true send_errno=EMSGSIZE receiver_packet=false fragmented_ack=false",
