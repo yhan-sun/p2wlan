@@ -419,6 +419,39 @@ fn should_request_direct_validation_after_decrypt(
     owns_direct_packet && source.is_some() && direct_validation.is_none()
 }
 
+/// Pick the reverse destination for one authenticated DPLPMTUD Probe.
+///
+/// A port-dependent NAT can expose a different source mapping for the Probe
+/// than the endpoint which the peer previously authenticated. Replying to that
+/// transient source would make the ACK originate from another transient
+/// mapping and the initiator would correctly reject it as the wrong exact
+/// path. When this UDP publication still owns an exact current path on the
+/// receiving socket, send the ACK to the session-bound endpoint recorded from
+/// the peer's authenticated Direct-validation Request. This makes the reverse
+/// datagram originate from the responder mapping the initiator already
+/// committed, while preserving strict ACK ingress matching. Without both
+/// bindings, retain the historical reply-to-source behavior; it is safe but
+/// may be rejected fail-closed by the initiator.
+fn dplpmtud_ack_destination(
+    current_path: Option<&crate::dplpmtud::DplpmtudPathIdentity>,
+    authenticated_reverse_endpoint: Option<SocketAddr>,
+    transport_instance_id: u64,
+    probe_source: SocketAddr,
+    local_endpoint: SocketAddr,
+    socket_index: usize,
+) -> SocketAddr {
+    current_path
+        .filter(|identity| {
+            identity.local_endpoint == local_endpoint
+                && identity.socket.transport_instance_id == transport_instance_id
+                && identity.socket.socket_index == socket_index
+                && identity.authenticated_remote_endpoint.is_ipv4() == probe_source.is_ipv4()
+        })
+        .and(authenticated_reverse_endpoint)
+        .filter(|endpoint| endpoint.is_ipv4() == probe_source.is_ipv4())
+        .unwrap_or(probe_source)
+}
+
 /// Kind of a daemon-internal direct-validation packet parsed from a decrypted
 /// WireGuard datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4268,6 +4301,24 @@ impl WireGuardTransport {
                 };
                 let ack_packet =
                     crate::dplpmtud::build_ack_inner_packet(ip.dst_addr(), ip.src_addr(), token);
+                let current_response_path = udp
+                    .dplpmtud_runtime()
+                    .path_identity(peer_id)
+                    .filter(|identity| peers.dplpmtud_path_is_current_sync(identity));
+                let authenticated_reverse_endpoint = udp.dplpmtud_ack_reverse_endpoint(
+                    peer_id,
+                    peer_session_generation,
+                    local_endpoint,
+                    socket_index,
+                );
+                let ack_destination = dplpmtud_ack_destination(
+                    current_response_path.as_ref(),
+                    authenticated_reverse_endpoint,
+                    udp.transport_instance_id(),
+                    source,
+                    local_endpoint,
+                    socket_index,
+                );
                 let publication_owner = udp.inbound_publication_owner();
                 let send_udp = udp.clone();
                 let send_peers = peers.clone();
@@ -4313,7 +4364,7 @@ impl WireGuardTransport {
                                         &receive_socket,
                                         socket_index,
                                         &encrypted,
-                                        source,
+                                        ack_destination,
                                     )
                                     .await
                                     .map(|_| ())
@@ -4322,7 +4373,7 @@ impl WireGuardTransport {
                                     .send_packet_on_socket_index(
                                         &encrypted,
                                         socket_index,
-                                        source,
+                                        ack_destination,
                                     )
                                     .await
                                     .map(|_| ())
@@ -4335,7 +4386,8 @@ impl WireGuardTransport {
                         debug!(
                             event = "dplpmtud_ack_sent",
                             peer_id = %peer_id,
-                            remote_endpoint = %source,
+                            probe_source = %source,
+                            remote_endpoint = %ack_destination,
                             local_endpoint = %local_endpoint,
                             socket_index,
                             sequence = token.sequence,
@@ -4352,7 +4404,7 @@ impl WireGuardTransport {
                             Some("direct"),
                             Some("ack_send_failed"),
                             Some(format!(
-                                "peer={peer_id} sequence={} remote_endpoint={source} local_endpoint={local_endpoint} socket_index={socket_index}",
+                                "peer={peer_id} sequence={} probe_source={source} remote_endpoint={ack_destination} local_endpoint={local_endpoint} socket_index={socket_index}",
                                 token.sequence,
                             )),
                         );
@@ -4646,6 +4698,15 @@ impl WireGuardTransport {
                 // keeps an inbound request from cancelling the local
                 // request/ACK transaction in the R7/R8 cross-over race.
                 let local_generation = peers.current_network_generation_sync();
+
+                let _ = udp.remember_dplpmtud_ack_reverse_route(
+                    peer_id,
+                    local_generation,
+                    peer_session_generation,
+                    source,
+                    local_endpoint,
+                    socket_index,
+                );
 
                 peers
                     .record_direct_validation_event_with_metadata(

@@ -67,8 +67,18 @@ A Probe is answered only after successful WireGuard decryption and only when:
 - outer IP family matches the token;
 - the per-peer response rate limit admits it.
 
-The ACK is encrypted and sent on the exact receiving Direct socket. It mirrors
-the probe token and is compact, so it is never larger than the probe.
+The ACK is encrypted and sent on the exact receiving Direct socket. The UDP
+publication retains at most one session/generation/socket-bound reverse route
+per peer from an authenticated Direct-validation Request. If that route and a
+current exact DPLPMTUD path both still match, the ACK target is the recorded
+Request ingress rather than a transient Probe source mapping. This reproduces
+the responder mapping which the initiator authenticated from the validation
+ACK across address/port-dependent NATs, so the initiator can retain strict
+exact-endpoint ingress matching. The table is bounded to 256 entries and peer
+lifecycle cleanup removes its entry. Without both current bindings, the
+responder keeps the compatible reply-to-source behavior and the initiator may
+reject it fail-closed. The ACK mirrors the probe token and is compact, so it is
+never larger than the probe.
 
 An ACK is committed only after decryption, session-current validation,
 per-peer adoption serialization, the network-epoch gate, current committed

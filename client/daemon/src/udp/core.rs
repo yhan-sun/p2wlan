@@ -59,6 +59,18 @@ pub(crate) enum DirectBusinessUdpSendError {
     Short { sent: usize, expected: usize },
 }
 
+/// Exact reverse target learned from an authenticated Direct-validation
+/// Request. A dependent NAT may need this target to reproduce the public
+/// source mapping which the peer committed from our validation ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DplpmtudAckReverseRoute {
+    network_generation: u64,
+    peer_session_generation: PeerSessionGeneration,
+    remote_endpoint: SocketAddr,
+    local_endpoint: SocketAddr,
+    socket_index: usize,
+}
+
 #[cfg(test)]
 type RemoteIncarnationCleanupGateSlot =
     Arc<std::sync::Mutex<Option<(String, Arc<RemoteIncarnationCleanupGate>)>>>;
@@ -193,6 +205,11 @@ pub struct UdpTransport {
     /// DPLPMTUD state, capability receipts and exact-path workers owned by
     /// this concrete UDP publication.
     dplpmtud: crate::dplpmtud::DplpmtudRuntime,
+    /// One authenticated reverse response route per peer, bounded by the same
+    /// 256-peer ceiling as DPLPMTUD. This belongs to the concrete UDP
+    /// publication and is cleared by peer lifecycle cleanup.
+    dplpmtud_ack_reverse_routes:
+        Arc<StdMutex<HashMap<String, DplpmtudAckReverseRoute>>>,
     dplpmtud_worker_ingress: crate::dplpmtud::DplpmtudWorkerIngress,
     dplpmtud_local_virtual_ip: Option<Ipv4Addr>,
     /// Adaptive-prediction learner state for the current network generation.
@@ -295,6 +312,7 @@ impl UdpTransport {
             wireguard_transport: None,
             direct_validation,
             dplpmtud,
+            dplpmtud_ack_reverse_routes: Arc::new(StdMutex::new(HashMap::new())),
             dplpmtud_worker_ingress: crate::dplpmtud::DplpmtudWorkerIngress::default(),
             dplpmtud_local_virtual_ip: None,
             learning_cache: Arc::new(Mutex::new(LearningCache::new())),
@@ -355,6 +373,76 @@ impl UdpTransport {
                     || (entry.update.budget.is_some()
                         && self.inbound_publication_owner() != 0)
             })
+    }
+
+    /// Bind the peer's authenticated Direct-validation Request ingress to the
+    /// exact receiving socket and local lifecycle. The route is response-only:
+    /// it never selects or promotes a business path.
+    pub(crate) fn remember_dplpmtud_ack_reverse_route(
+        &self,
+        peer_id: &str,
+        network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        remote_endpoint: SocketAddr,
+        local_endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+    ) -> bool {
+        let (Some(local_endpoint), Some(socket_index)) = (local_endpoint, socket_index) else {
+            return false;
+        };
+        if self.peers.current_network_generation_sync() != network_generation
+            || !self
+                .peers
+                .peer_session_is_current_sync(peer_id, peer_session_generation)
+            || local_endpoint.is_ipv4() != remote_endpoint.is_ipv4()
+        {
+            return false;
+        }
+        let mut routes = self
+            .dplpmtud_ack_reverse_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if routes.len() >= crate::dplpmtud::MAX_TRACKED_DPLPMTUD_PEERS
+            && !routes.contains_key(peer_id)
+        {
+            return false;
+        }
+        routes.insert(
+            peer_id.to_string(),
+            DplpmtudAckReverseRoute {
+                network_generation,
+                peer_session_generation,
+                remote_endpoint,
+                local_endpoint,
+                socket_index,
+            },
+        );
+        true
+    }
+
+    /// Read one exact current reverse route without awaiting or touching the
+    /// DPLPMTUD registry. Stale generation/session/socket bindings fail closed.
+    pub(crate) fn dplpmtud_ack_reverse_endpoint(
+        &self,
+        peer_id: &str,
+        peer_session_generation: PeerSessionGeneration,
+        local_endpoint: SocketAddr,
+        socket_index: usize,
+    ) -> Option<SocketAddr> {
+        let route = self
+            .dplpmtud_ack_reverse_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .copied()?;
+        (route.network_generation == self.peers.current_network_generation_sync()
+            && route.peer_session_generation == peer_session_generation
+            && self
+                .peers
+                .peer_session_is_current_sync(peer_id, peer_session_generation)
+            && route.local_endpoint == local_endpoint
+            && route.socket_index == socket_index)
+            .then_some(route.remote_endpoint)
     }
 
     pub(crate) fn peer_requires_direct_business_budget(&self, peer_id: &str) -> bool {
@@ -1681,6 +1769,10 @@ impl UdpTransport {
         reason: &str,
         remove_connection: bool,
     ) {
+        self.dplpmtud_ack_reverse_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(peer_id);
         // Revoke the validation owner before removing peer/socket state.  A
         // worker that was waiting for a handshake or ACK immediately observes
         // cancellation, and its owner-conditional cleanup cannot erase a

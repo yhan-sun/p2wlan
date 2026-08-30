@@ -127,6 +127,71 @@ async fn stale_udp_peerleft_cleanup_cancels_replacement_validation_owner() {
 }
 
 #[tokio::test]
+async fn dplpmtud_ack_reverse_route_is_session_socket_and_lifecycle_bound() {
+    let peers = peer_manager();
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.2", None))
+        .await;
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let generation = peers.current_network_generation_sync();
+    let peer_session_generation = peers
+        .peer_session_generation_sync("peer-b")
+        .expect("the online peer must have a lifecycle generation");
+    let local_endpoint = transport.local_addr().unwrap();
+    let remote_endpoint: SocketAddr = "127.0.0.1:47011".parse().unwrap();
+
+    assert!(transport.remember_dplpmtud_ack_reverse_route(
+        "peer-b",
+        generation,
+        peer_session_generation,
+        remote_endpoint,
+        Some(local_endpoint),
+        Some(0),
+    ));
+    assert_eq!(
+        transport.dplpmtud_ack_reverse_endpoint(
+            "peer-b",
+            peer_session_generation,
+            local_endpoint,
+            0,
+        ),
+        Some(remote_endpoint),
+    );
+    assert_eq!(
+        transport.dplpmtud_ack_reverse_endpoint(
+            "peer-b",
+            peer_session_generation,
+            local_endpoint,
+            1,
+        ),
+        None,
+        "the reverse response route must not cross sockets",
+    );
+    assert!(!transport.remember_dplpmtud_ack_reverse_route(
+        "peer-b",
+        generation,
+        PeerSessionGeneration::for_test(peer_session_generation.value() + 1),
+        remote_endpoint,
+        Some(local_endpoint),
+        Some(0),
+    ));
+
+    transport
+        .cleanup_peer_lifecycle("peer-b", "peer_left", true)
+        .await;
+    assert!(
+        transport
+            .dplpmtud_ack_reverse_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "peer lifecycle cleanup must erase the UDP-publication-owned route",
+    );
+}
+
+#[tokio::test]
 async fn validation_ack_requires_exact_endpoint_and_socket() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
