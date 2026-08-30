@@ -1253,6 +1253,16 @@ impl DplpmtudRuntime {
                         }),
                     };
                 }
+                if existing.machine.state() == DplpmtudState::Unsupported
+                    && !existing.worker_running
+                    && existing.worker_owner_token.is_none()
+                    && existing.cancel_tx.is_none()
+                {
+                    return DplpmtudInstallResult {
+                        decision: DplpmtudInstallDecision::Unsupported,
+                        worker: None,
+                    };
+                }
                 if let Some(cancel_tx) = existing.cancel_tx.take() {
                     let _ = cancel_tx.send(true);
                 }
@@ -1891,6 +1901,34 @@ mod tests {
         let snapshot = machine.snapshot(now, false);
         assert!(!snapshot.supported);
         assert!(snapshot.outstanding_probe.is_none());
+    }
+
+    #[test]
+    fn unsupported_same_identity_replay_is_idempotent() {
+        let now = Instant::now();
+        let runtime = DplpmtudRuntime::new();
+        let identity = test_identity("peer");
+        assert_eq!(
+            runtime.install_path(identity.clone(), false, now).decision,
+            DplpmtudInstallDecision::Unsupported
+        );
+        let first = runtime.snapshots().remove("peer").unwrap();
+
+        assert_eq!(
+            runtime
+                .install_path(identity, false, now + Duration::from_secs(1))
+                .decision,
+            DplpmtudInstallDecision::Unsupported
+        );
+        let second = runtime.snapshots().remove("peer").unwrap();
+        assert_eq!(second.state, DplpmtudState::Unsupported);
+        assert!(!second.live_worker);
+        assert_eq!(second.revision, first.revision);
+        assert_eq!(second.reset_count, first.reset_count);
+        assert_eq!(second.probe_count, first.probe_count);
+        assert_eq!(second.success_count, first.success_count);
+        assert_eq!(second.timeout_count, first.timeout_count);
+        assert_eq!(second.stale_ack_count, first.stale_ack_count);
     }
 
     #[test]
