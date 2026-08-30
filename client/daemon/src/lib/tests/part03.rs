@@ -4908,7 +4908,8 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
 }
 
 #[tokio::test]
-async fn test_network_outbound_uses_relay_when_udp_unavailable() {
+async fn test_network_outbound_relay_ignores_missing_direct_business_budget_when_udp_unavailable()
+{
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
@@ -4929,6 +4930,11 @@ async fn test_network_outbound_uses_relay_when_udp_unavailable() {
             relay_rtt_ms: None,
         })
         .await;
+    let peer_session_generation = peers
+        .peer_session_generation_sync("node-b")
+        .expect("the online peer must have a session generation");
+    peers.mark_dplpmtud_capable_sync("node-b", peer_session_generation);
+    assert!(peers.peer_supports_dplpmtud_sync("node-b", peer_session_generation));
 
     let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
         .await
@@ -4972,8 +4978,8 @@ async fn test_network_outbound_uses_relay_when_udp_unavailable() {
         ConnectionTimeline::new("node-a", 0),
     ));
 
-    // A RAW business packet: the worker encrypts it (counter allocated under
-    // the emit lock, held through the send) because the peer is confirmed.
+    // Direct is managed but has no confirmed budget. Relay remains independent:
+    // the worker encrypts and sends because the Relay path is confirmed.
     let payload = vec![4, 9, 8, 7, 6];
     let packet = Ipv4Packet::build_icmp_echo_request(
         "10.20.0.1".parse().unwrap(),
@@ -7649,7 +7655,11 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
         timeline.clone(),
     ));
 
-    let total = 1100usize;
+    // Keep the overflow count below the independently bounded diagnostic
+    // event ledger. The structural counter remains authoritative; this load
+    // still crosses the exact 256-packet queue cap by 44 entries and lets the
+    // test compare every retained per-drop event byte-for-byte.
+    let total = 300usize;
     let packet_len = Ipv4Packet::build_icmp_echo_request(
         "10.20.0.1".parse().unwrap(),
         "10.20.0.2".parse().unwrap(),
@@ -7679,7 +7689,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
     // Wait for the worker to drain the input and the overflow counters to
     // reach their FINAL value (the first overflow drop lands while later
     // packets are still in flight).
-    let expected_dropped = (total - 1024) as u64;
+    let expected_dropped = (total - 256) as u64;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (dropped, bytes) = loop {
         let stats = peers.outbound_loss_stats().await;
@@ -7700,7 +7710,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
 
     assert_eq!(
         dropped, expected_dropped,
-        "exactly the packets beyond the 1024-per-peer bound must be counted"
+        "exactly the packets beyond the 256-per-peer bound must be counted"
     );
     assert_eq!(
         bytes,

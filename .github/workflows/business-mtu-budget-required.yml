@@ -1,0 +1,270 @@
+name: Business MTU Budget Required
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/business-mtu-budget-required.yml"
+      - "client/daemon/**"
+      - "client/netbind/**"
+      - "docs/dplpmtud-business-budget.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches:
+      - main
+      - fix/dplpmtud-acceptance-20260830
+    paths:
+      - ".github/workflows/business-mtu-budget-required.yml"
+      - "client/daemon/**"
+      - "client/netbind/**"
+      - "docs/dplpmtud-business-budget.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: business-mtu-budget-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  VALIDATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  linux_validation:
+    name: Business MTU Linux checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VALIDATION_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact validation SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "Business MTU validation SHA: $actual"
+          test "$actual" = "$VALIDATION_SHA"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Cargo format
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo workspace tests
+        run: cargo test --workspace
+
+      - name: Diff whitespace check
+        run: git diff --check
+
+  linux_business_e2e:
+    name: Linux business-budget production E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VALIDATION_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact validation SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "Business MTU E2E SHA: $actual"
+          test "$actual" = "$VALIDATION_SHA"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run production-path business-budget E2E
+        run: cargo test -p p2wlan-daemon --lib tests::direct_business_budget_production_path_e2e -- --exact --nocapture --test-threads=1
+
+  windows_business:
+    name: Windows business-budget codec lifecycle race
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VALIDATION_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact validation SHA
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          Write-Host "Business MTU Windows SHA: $actual"
+          if ($actual -ne $env:VALIDATION_SHA) { throw "checked out $actual instead of $env:VALIDATION_SHA" }
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile daemon on Windows
+        run: cargo check -p p2wlan-daemon --all-targets --all-features
+
+      - name: IPv4 and IPv6 feedback codecs
+        run: cargo test -p p2wlan-daemon --lib business_mtu::tests -- --test-threads=1
+
+      - name: Publication lifecycle and registry-independent hot path
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::business_publication_is_explicit_revisioned_and_registry_independent -- --exact --test-threads=1
+
+      - name: Revision drop and path replacement token races
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::old_business_tokens_fail_after_raise_drop_and_path_replacement -- --exact --test-threads=1
+
+      - name: UDP replacement preserves negotiated business capability
+        run: cargo test -p p2wlan-daemon --lib tests::direct_business_capability_survives_udp_replacement_reconcile -- --exact --test-threads=1
+
+      - name: Production lifecycle, EMSGSIZE and encryption-send barrier race
+        run: cargo test -p p2wlan-daemon --lib tests::direct_business_budget_production_path_e2e -- --exact --nocapture --test-threads=1
+
+  existing_required_gates:
+    name: Existing required gates on business-budget PR Head
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Require all existing checks on the exact PR Head
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const requiredNames = [
+              'DPLPMTUD Required',
+              'Path State Machine Required',
+              'NAT Topology Required',
+              'Windows Lifecycle Required',
+              'Mobile Lifecycle Required',
+              'CI Required',
+              // Flutter Client publishes concrete job checks.
+              'Analyze and Test',
+              'Android arm64 Release APK',
+              'Linux x64 Release Bundle',
+              'macOS Release Apps',
+              'Windows x64 Release Bundle',
+              'iOS Compile',
+              // Package Test Builds also publishes concrete job checks.
+              'macOS arm64 test DMG',
+              'Android arm64 test APK',
+            ];
+            const targetSha = context.payload.pull_request?.head?.sha || context.sha;
+            const deadline = Date.now() + 105 * 60 * 1000;
+            let lastSummary = '';
+
+            core.info(`Waiting for all existing required gates on exact PR Head ${targetSha}`);
+            while (Date.now() < deadline) {
+              const checkRuns = [];
+              for (let page = 1; ; page += 1) {
+                const response = await github.rest.checks.listForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: targetSha,
+                  per_page: 100,
+                  page,
+                  filter: 'latest',
+                });
+                checkRuns.push(...response.data.check_runs);
+                if (response.data.check_runs.length < 100) break;
+              }
+              const latestByName = new Map();
+              for (const run of checkRuns) {
+                if (!requiredNames.includes(run.name)) continue;
+                const prior = latestByName.get(run.name);
+                if (!prior || new Date(run.started_at || 0) > new Date(prior.started_at || 0)) {
+                  latestByName.set(run.name, run);
+                }
+              }
+
+              const summary = requiredNames.map((name) => {
+                const run = latestByName.get(name);
+                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}@${run.head_sha}` : 'missing'}`;
+              }).join(', ');
+              if (summary !== lastSummary) {
+                core.info(`same-Head gate status: ${summary}`);
+                lastSummary = summary;
+              }
+
+              const wrongSha = requiredNames.filter((name) => {
+                const run = latestByName.get(name);
+                return run && run.head_sha !== targetSha;
+              });
+              if (wrongSha.length > 0) {
+                core.setFailed(`Required gate resolved to a non-Head SHA for ${targetSha}: ${wrongSha.join(', ')}`);
+                return;
+              }
+
+              const failed = requiredNames.filter((name) => {
+                const run = latestByName.get(name);
+                return run && run.status === 'completed' && run.conclusion !== 'success';
+              });
+              if (failed.length > 0) {
+                core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
+                return;
+              }
+
+              const complete = requiredNames.every((name) => {
+                const run = latestByName.get(name);
+                return run && run.head_sha === targetSha &&
+                  run.status === 'completed' && run.conclusion === 'success';
+              });
+              if (complete) {
+                core.info(`All existing required gates passed on exact PR Head ${targetSha}.`);
+                return;
+              }
+
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+
+            core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
+
+  required:
+    name: Business MTU Budget Required
+    if: always()
+    needs:
+      - linux_validation
+      - linux_business_e2e
+      - windows_business
+      - existing_required_gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce aggregate results
+        env:
+          LINUX_RESULT: ${{ needs.linux_validation.result }}
+          E2E_RESULT: ${{ needs.linux_business_e2e.result }}
+          WINDOWS_RESULT: ${{ needs.windows_business.result }}
+          EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$LINUX_RESULT" = "success"
+          test "$E2E_RESULT" = "success"
+          test "$WINDOWS_RESULT" = "success"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            test "$EXTERNAL_RESULT" = "success"
+          else
+            test "$EXTERNAL_RESULT" = "skipped"
+          fi

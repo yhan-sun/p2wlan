@@ -1728,10 +1728,18 @@ impl UdpTransport {
             .send_to(&packet.wire_bytes, endpoint)
             .await
             .map_err(|e| {
-                DaemonError::Network(format!(
-                    "UDP send to {} for peer {} failed: {}",
-                    endpoint, packet.peer_id, e
-                ))
+                if is_local_packet_too_large(&e) {
+                    DaemonError::UdpPacketTooLarge {
+                        peer_id: packet.peer_id.clone(),
+                        endpoint: endpoint.to_string(),
+                        datagram_size: packet.wire_bytes.len(),
+                    }
+                } else {
+                    DaemonError::Network(format!(
+                        "UDP send to {} for peer {} failed: {}",
+                        endpoint, packet.peer_id, e
+                    ))
+                }
             })?;
 
         if sent != packet.wire_bytes.len() {

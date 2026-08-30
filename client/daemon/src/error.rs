@@ -16,6 +16,18 @@ pub enum DaemonError {
     #[error("network error: {0}")]
     Network(String),
 
+    /// A UDP datagram was synchronously rejected by the local kernel with
+    /// EMSGSIZE/WSAEMSGSIZE. Keeping this typed prevents normal business sends
+    /// from flattening PMTU evidence into an ordinary Direct health failure.
+    #[error(
+        "UDP packet too large for peer {peer_id} at {endpoint}: datagram_size={datagram_size}"
+    )]
+    UdpPacketTooLarge {
+        peer_id: String,
+        endpoint: String,
+        datagram_size: usize,
+    },
+
     /// Peer connection error.
     #[error("peer error: {0}")]
     Peer(String),

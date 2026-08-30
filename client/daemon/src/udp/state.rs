@@ -121,6 +121,25 @@ impl HeartbeatSendGate {
     }
 }
 
+/// Deterministic business-data seam after WireGuard encryption and before the
+/// final path/revision/owner revalidation. It is scoped to one UDP transport
+/// clone, so unrelated tests and peers remain independent.
+#[cfg(test)]
+pub(crate) struct DirectBusinessSendGate {
+    pub(crate) reached: tokio::sync::Barrier,
+    pub(crate) release: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl DirectBusinessSendGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        }
+    }
+}
+
 /// Deterministic seam for production-entry terminal-progress tests. A real
 /// Birthday worker can publish its first sends and then pause before returning
 /// to the scheduler, allowing deadline/cancellation code to snapshot live

@@ -1,4 +1,15 @@
 impl PeerManager {
+    pub(crate) fn committed_business_path_snapshot_sync(
+        &self,
+        peer_id: &str,
+    ) -> Option<CommittedBusinessPathSnapshot> {
+        self.committed_business_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .cloned()
+    }
+
     /// Read exact committed business-path projections without touching the
     /// contended async connection map or its intentionally stale diagnostics
     /// fallback cache.

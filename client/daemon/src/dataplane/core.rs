@@ -40,6 +40,7 @@ pub struct DataPlane<T> {
     peers: Arc<PeerManager>,
     outbound_tx: mpsc::Sender<OutboundPacket>,
     inbound_rx: Option<mpsc::Receiver<InboundPacket>>,
+    local_feedback_rx: Option<tokio::sync::broadcast::Receiver<Vec<u8>>>,
     acl: Option<Arc<RwLock<AclEngine>>>,
     local_node_id: Option<String>,
     overlay_v4: Option<Ipv4Cidr>,
@@ -54,12 +55,14 @@ where
     /// Create a data plane and a receiver for routed outbound packets.
     pub fn new(tun: T, peers: Arc<PeerManager>) -> (Self, mpsc::Receiver<OutboundPacket>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);
+        let local_feedback_rx = peers.subscribe_local_mtu_feedback();
         (
             Self {
                 tun,
                 peers,
                 outbound_tx,
                 inbound_rx: None,
+                local_feedback_rx: Some(local_feedback_rx),
                 acl: None,
                 local_node_id: None,
                 overlay_v4: None,
@@ -84,12 +87,14 @@ where
     ) {
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
+        let local_feedback_rx = peers.subscribe_local_mtu_feedback();
         (
             Self {
                 tun,
                 peers,
                 outbound_tx,
                 inbound_rx: Some(inbound_rx),
+                local_feedback_rx: Some(local_feedback_rx),
                 acl: None,
                 local_node_id: None,
                 overlay_v4: None,
@@ -125,6 +130,10 @@ where
     /// Run the packet pump until the TUN device closes or an unrecoverable error occurs.
     pub async fn run(&mut self) -> Result<()> {
         let mut buf = vec![0u8; 65_535];
+        let mut local_feedback_rx = self
+            .local_feedback_rx
+            .take()
+            .expect("DataPlane::run may only be called once");
 
         if let Some(mut inbound_rx) = self.inbound_rx.take() {
             loop {
@@ -178,13 +187,64 @@ where
                         }
                         self.write_inbound(packet).await?;
                     }
+                    feedback = local_feedback_rx.recv() => {
+                        match feedback {
+                            Ok(packet) => self.write_local_feedback(&packet).await?,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(
+                                    event = "local_mtu_feedback_lagged",
+                                    skipped,
+                                    "local PMTU feedback receiver dropped a bounded backlog"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
                 }
             }
         }
 
         loop {
-            self.read_and_route_once(&mut buf).await?;
+            tokio::select! {
+                result = self.read_and_route_once(&mut buf) => result?,
+                feedback = local_feedback_rx.recv() => {
+                    match feedback {
+                        Ok(packet) => self.write_local_feedback(&packet).await?,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(
+                                event = "local_mtu_feedback_lagged",
+                                skipped,
+                                "local PMTU feedback receiver dropped a bounded backlog"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                    }
+                }
+            }
         }
+    }
+
+    async fn write_local_feedback(&mut self, packet: &[u8]) -> Result<()> {
+        IpPacket::new(packet).map_err(|error| {
+            DaemonError::Network(format!("invalid locally generated MTU feedback: {error}"))
+        })?;
+        let written = self
+            .tun
+            .write(packet)
+            .await
+            .map_err(|error| DaemonError::Network(format!("local MTU feedback TUN write failed: {error}")))?;
+        if written != packet.len() {
+            return Err(DaemonError::Network(format!(
+                "short local MTU feedback TUN write: wrote {written} of {} bytes",
+                packet.len()
+            )));
+        }
+        debug!(
+            event = "local_mtu_feedback_injected",
+            bytes = packet.len(),
+            "injected locally generated PMTU feedback into TUN"
+        );
+        Ok(())
     }
 
     async fn read_and_route_once(&mut self, buf: &mut [u8]) -> Result<()> {
