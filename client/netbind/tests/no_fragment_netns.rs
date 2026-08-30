@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::env;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader};
 use std::net::{IpAddr, SocketAddr};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
@@ -132,16 +132,35 @@ fn receiver_helper() {
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("receiver read timeout must be configurable");
-    println!("READY");
-    io::stdout().flush().expect("receiver readiness must flush");
+    write_uncaptured_line("READY");
 
     let mut buffer = [0u8; 65_535];
     match socket.recv_from(&mut buffer) {
         Ok((size, source)) => {
-            println!("RECEIVED size={size} source={source}");
+            panic!("large probe reached receiver: size={size} source={source}");
         }
-        Err(error) if error.kind() == io::ErrorKind::TimedOut => println!("NO_PACKET"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) => {}
         Err(error) => panic!("receiver failed while waiting for the probe: {error}"),
+    }
+}
+
+fn write_uncaptured_line(line: &str) {
+    let bytes = format!("{line}\n");
+    let mut written = 0;
+    while written < bytes.len() {
+        let result = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                bytes.as_ptr().add(written).cast(),
+                bytes.len() - written,
+            )
+        };
+        assert!(result > 0, "receiver readiness must be writable");
+        written += result as usize;
     }
 }
 
@@ -160,6 +179,7 @@ fn spawn_receiver(namespace: &str) -> io::Result<Child> {
             "--test-threads=1",
         ])
         .env(RECEIVER_ENV, "1")
+        .env("RUST_TEST_NOCAPTURE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
