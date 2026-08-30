@@ -17,9 +17,8 @@ void main() {
   });
 
   test('parses connected /status fixture', () async {
-    final raw = await File(
-      'test/fixtures/status_connected.json',
-    ).readAsString();
+    final raw = await File('test/fixtures/status_connected.json')
+        .readAsString();
     final snapshot = DiagnosticsSnapshot.fromJson(
       jsonDecode(raw) as Map<String, dynamic>,
     );
@@ -163,37 +162,34 @@ void main() {
     );
   });
 
-  test(
-    'peer latency prefers the verified EWMA and relay selection exposes pong latency',
-    () {
-      final peer = PeerSnapshot.fromJson({
-        'node_id': 'direct-peer',
-        'device_name': 'studio',
-        'app_version': '0.1.68',
-        'virtual_ip': '10.20.0.30',
-        'online': true,
-        'state': 'direct',
-        'active_path': 'direct',
-        'direct_type': 'public_udp',
-        'is_relay': false,
-        'direct': {
-          'last_success_age_ms': 100,
-          'latency_ms': 48,
-          'rtt_ewma_ms': 31,
-        },
-        'relay': <String, dynamic>{},
-      });
-      final relaySelection = RelaySelectionSnapshot.fromJson({
-        'selected_connect_latency_ms': 45,
-        'selected_last_pong_rtt_ms': 19,
-        'selected_rtt_ewma_ms': 25,
-      });
+  test('peer latency prefers the verified EWMA and relay selection exposes pong latency', () {
+    final peer = PeerSnapshot.fromJson({
+      'node_id': 'direct-peer',
+      'device_name': 'studio',
+      'app_version': '0.1.68',
+      'virtual_ip': '10.20.0.30',
+      'online': true,
+      'state': 'direct',
+      'active_path': 'direct',
+      'direct_type': 'public_udp',
+      'is_relay': false,
+      'direct': {
+        'last_success_age_ms': 100,
+        'latency_ms': 48,
+        'rtt_ewma_ms': 31,
+      },
+      'relay': <String, dynamic>{},
+    });
+    final relaySelection = RelaySelectionSnapshot.fromJson({
+      'selected_connect_latency_ms': 45,
+      'selected_last_pong_rtt_ms': 19,
+      'selected_rtt_ewma_ms': 25,
+    });
 
-      expect(peer.latencyMs, 31);
-      expect(peer.appVersion, '0.1.68');
-      expect(relaySelection.latencyMs, 25);
-    },
-  );
+    expect(peer.latencyMs, 31);
+    expect(peer.appVersion, '0.1.68');
+    expect(relaySelection.latencyMs, 25);
+  });
 
   test('verified RTT becomes unavailable after the freshness window', () {
     final fresh = PeerSnapshot.fromJson({
@@ -454,8 +450,7 @@ void main() {
     expect(
       notVerified.latencyMs,
       isNull,
-      reason:
-          'relay RTT without encrypted relay confirmation is not usable latency',
+      reason: 'relay RTT without encrypted relay confirmation is not usable latency',
     );
     expect(
       notVerified.probeLatencyMs,

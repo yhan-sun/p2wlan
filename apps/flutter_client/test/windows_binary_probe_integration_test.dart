@@ -99,9 +99,8 @@ void main() {
 
       expect(result.exitCode, 0, reason: result.stderr.toString());
       expect(
-        RegExp(
-          r'^S-\d-\d+(?:-\d+)+$',
-        ).hasMatch(result.stdout.toString().trim()),
+        RegExp(r'^S-\d-\d+(?:-\d+)+$')
+            .hasMatch(result.stdout.toString().trim()),
         isTrue,
         reason: result.stdout.toString(),
       );
@@ -193,106 +192,98 @@ void main() {
     skip: !Platform.isWindows,
   );
 
-  test(
-    'Windows daemon completes three graceful start-stop cycles without force kill',
-    () async {
-      final binaryPath = _resolveWindowsDaemonBinary();
+  test('Windows daemon completes three graceful start-stop cycles without force kill', () async {
+    final binaryPath = _resolveWindowsDaemonBinary();
+    expect(
+      binaryPath,
+      isNotNull,
+      reason:
+          'Set P2WLAN_DAEMON_BIN or build a Windows release daemon before '
+          'running this integration test.',
+    );
+
+    final root = await _createTempRoot();
+    addTearDown(() => _deleteTempRoot(root));
+
+    for (var cycle = 0; cycle < 3; cycle++) {
+      final cycleDir = Directory(
+        '${root.path}${Platform.pathSeparator}cycle-$cycle',
+      );
+      await cycleDir.create(recursive: true);
+      final config = File(
+        '${cycleDir.path}${Platform.pathSeparator}p2wlan-config.json',
+      );
+      final log = File(
+        '${cycleDir.path}${Platform.pathSeparator}p2wlan-daemon.log',
+      );
+      final auth = File(
+        '${cycleDir.path}${Platform.pathSeparator}p2wlan-daemon.diag-auth',
+      );
+      final port = await _reserveTcpPort();
+      final diagnosticsUrl = 'http://127.0.0.1:$port/status';
+
+      final process = await Process.start(
+        binaryPath!,
+        [
+          '--config',
+          config.path,
+          '--control',
+          'http://127.0.0.1:9',
+          '--network',
+          'default',
+          '--diagnostics-bind',
+          '127.0.0.1:$port',
+          '--log-file',
+          log.path,
+          '--udp-bind',
+          '127.0.0.1:0',
+          '--interface',
+          'p2wlan-lifecycle-$cycle',
+          '--manual',
+        ],
+        environment: {'P2WLAN_DISABLE_TUN': '1', 'RUST_LOG': 'info'},
+      );
+      var exited = false;
+      addTearDown(() async {
+        if (!exited) {
+          process.kill(ProcessSignal.sigkill);
+          try {
+            await process.exitCode.timeout(const Duration(seconds: 5));
+          } catch (_) {}
+        }
+      });
+      final stdoutFuture = process.stdout.transform(utf8.decoder).join();
+      final stderrFuture = process.stderr.transform(utf8.decoder).join();
+
+      await _waitForWindowsDaemonHealth(port);
+      await _waitForNonEmptyFile(auth);
+
+      final api = DiagnosticsApi(
+        authTokenReader: () async => (await auth.readAsString()).trim(),
+      );
+      final controller = DaemonController(diagnosticsApi: api);
+      final stopped = await controller.stop(diagnosticsUrl);
+      api.close();
+
+      expect(stopped.ok, isTrue, reason: stopped.message);
       expect(
-        binaryPath,
-        isNotNull,
-        reason:
-            'Set P2WLAN_DAEMON_BIN or build a Windows release daemon before '
-            'running this integration test.',
+        stopped.message,
+        isNot(contains('forced process termination')),
+        reason: 'normal UI stop must not use taskkill /F',
       );
 
-      final root = await _createTempRoot();
-      addTearDown(() => _deleteTempRoot(root));
-
-      for (var cycle = 0; cycle < 3; cycle++) {
-        final cycleDir = Directory(
-          '${root.path}${Platform.pathSeparator}cycle-$cycle',
-        );
-        await cycleDir.create(recursive: true);
-        final config = File(
-          '${cycleDir.path}${Platform.pathSeparator}p2wlan-config.json',
-        );
-        final log = File(
-          '${cycleDir.path}${Platform.pathSeparator}p2wlan-daemon.log',
-        );
-        final auth = File(
-          '${cycleDir.path}${Platform.pathSeparator}p2wlan-daemon.diag-auth',
-        );
-        final port = await _reserveTcpPort();
-        final diagnosticsUrl = 'http://127.0.0.1:$port/status';
-
-        final process = await Process.start(
-          binaryPath!,
-          [
-            '--config',
-            config.path,
-            '--control',
-            'http://127.0.0.1:9',
-            '--network',
-            'default',
-            '--diagnostics-bind',
-            '127.0.0.1:$port',
-            '--log-file',
-            log.path,
-            '--udp-bind',
-            '127.0.0.1:0',
-            '--interface',
-            'p2wlan-lifecycle-$cycle',
-            '--manual',
-          ],
-          environment: {'P2WLAN_DISABLE_TUN': '1', 'RUST_LOG': 'info'},
-        );
-        var exited = false;
-        addTearDown(() async {
-          if (!exited) {
-            process.kill(ProcessSignal.sigkill);
-            try {
-              await process.exitCode.timeout(const Duration(seconds: 5));
-            } catch (_) {}
-          }
-        });
-        final stdoutFuture = process.stdout.transform(utf8.decoder).join();
-        final stderrFuture = process.stderr.transform(utf8.decoder).join();
-
-        await _waitForWindowsDaemonHealth(port);
-        await _waitForNonEmptyFile(auth);
-
-        final api = DiagnosticsApi(
-          authTokenReader: () async => (await auth.readAsString()).trim(),
-        );
-        final controller = DaemonController(diagnosticsApi: api);
-        final stopped = await controller.stop(diagnosticsUrl);
-        api.close();
-
-        expect(stopped.ok, isTrue, reason: stopped.message);
-        expect(
-          stopped.message,
-          isNot(contains('forced process termination')),
-          reason: 'normal UI stop must not use taskkill /F',
-        );
-
-        final exitCode = await process.exitCode.timeout(
-          const Duration(seconds: 15),
-        );
-        exited = true;
-        final stdout = await stdoutFuture;
-        final stderr = await stderrFuture;
-        expect(
-          exitCode,
-          0,
-          reason: 'cycle=$cycle stdout=$stdout stderr=$stderr',
-        );
-        expect(await auth.exists(), isFalse);
-        expect(await log.exists(), isTrue);
-        expect(await log.readAsString(), contains('Shutdown complete.'));
-      }
-    },
-    skip: !Platform.isWindows,
-  );
+      final exitCode = await process.exitCode.timeout(
+        const Duration(seconds: 15),
+      );
+      exited = true;
+      final stdout = await stdoutFuture;
+      final stderr = await stderrFuture;
+      expect(exitCode, 0, reason: 'cycle=$cycle stdout=$stdout stderr=$stderr');
+      expect(await auth.exists(), isFalse);
+      expect(await log.exists(), isTrue);
+      expect(await log.readAsString(), contains('Shutdown complete.'));
+    }
+  }, skip: !Platform.isWindows);
 }
 
 Future<Directory> _createTempRoot() {

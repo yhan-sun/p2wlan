@@ -58,13 +58,13 @@ P2WLAN 是一个开源、P2P 优先、可自托管的虚拟局域网。每台设
 
 | 平台 | Release 文件 | 状态 |
 | --- | --- | --- |
-| macOS Apple Silicon | `p2wlan-flutter-macos-arm64.dmg` | 支持 |
-| macOS Intel | `p2wlan-flutter-macos-x64.dmg` | 支持 |
+| macOS 12+ Apple Silicon | `p2wlan-flutter-macos-arm64.dmg` | 支持 |
+| macOS 12+ Intel | `p2wlan-flutter-macos-x64.dmg` | 支持 |
 | Windows x64 | `p2wlan-flutter-windows-x64-setup.exe` | 支持 |
 | Linux x64 | Flutter `.tar.gz` / CLI `.tar.gz` | 支持 |
 | Linux arm64 | CLI `.tar.gz` | 支持 |
-| Android arm64 | `p2wlan-flutter-android-arm64-release.apk` | Preview |
-| iOS arm64 | `p2wlan-flutter-ios-arm64-unsigned.ipa` | 实验性，需签名 |
+| Android 7.0+ (API 24+) arm64 | `p2wlan-flutter-android-arm64-release.apk` | Preview |
+| iOS 15+ arm64 | `p2wlan-flutter-ios-arm64-unsigned.ipa` | 实验性，需签名 |
 
 **2. 登录**
 
@@ -171,6 +171,9 @@ go build -o p2wlan-relay ./relay
 - 高敏感生产环境请在部署前自行完成安全评估。
 
 ## 开发者
+
+Flutter 开发和发布统一使用 Flutter 3.47.2（Dart 3.13.2）。仓库根目录的 `.fvmrc`
+是本地 FVM、CI 和发布流水线的版本来源。
 
 仓库结构保持按职责拆分：
 

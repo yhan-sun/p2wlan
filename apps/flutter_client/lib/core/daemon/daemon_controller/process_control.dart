@@ -206,9 +206,9 @@ Future<DaemonBinaryProbe> probeDaemonBinary(
 }
 
 String _sanitizeProbeOutput(String value) {
-  final compact = redactSensitive(
-    value,
-  ).replaceAll(RegExp(r'[\r\n]+'), ' ').trim();
+  final compact = redactSensitive(value)
+      .replaceAll(RegExp(r'[\r\n]+'), ' ')
+      .trim();
   if (compact.isEmpty) return '<empty>';
   const maxLength = 2048;
   if (compact.length <= maxLength) return compact;

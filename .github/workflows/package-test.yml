@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
     paths:
+      - ".fvmrc"
       - ".github/workflows/package-test.yml"
       - "apps/flutter_client/**"
       - "client/**"
@@ -16,6 +17,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - ".fvmrc"
       - ".github/workflows/package-test.yml"
       - "apps/flutter_client/**"
       - "client/**"
@@ -46,6 +48,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version-file: .fvmrc
           architecture: arm64
           cache: true
 
@@ -150,6 +153,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version-file: .fvmrc
           cache: true
 
       - name: Set up Rust Android target

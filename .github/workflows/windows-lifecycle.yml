@@ -4,6 +4,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - ".fvmrc"
       - ".github/workflows/path-state-machine-required.yml"
       - ".github/workflows/windows-lifecycle.yml"
       - "client/daemon/**"
@@ -15,6 +16,7 @@ on:
   push:
     branches: [main]
     paths:
+      - ".fvmrc"
       - ".github/workflows/windows-lifecycle.yml"
       - "client/daemon/**"
       - "client/tray/**"
@@ -55,6 +57,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version-file: .fvmrc
           cache: true
 
       - name: Flutter dependencies

@@ -26,8 +26,7 @@ String redactSensitive(String input) {
       r'-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----',
       caseSensitive: false,
     ),
-    (_) =>
-        '-----BEGIN ***PRIVATE KEY***-----<redacted>-----END ***PRIVATE KEY***-----',
+    (_) => '-----BEGIN ***PRIVATE KEY***-----<redacted>-----END ***PRIVATE KEY***-----',
   );
 
   // 2. Bearer tokens: `Bearer abc.def-123` -> `Bearer <redacted>`.

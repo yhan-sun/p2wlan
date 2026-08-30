@@ -14,26 +14,20 @@ void main() {
     expect(defaultControlServer, 'http://47.109.40.237:18080');
   });
 
-  test(
-    'JWT expiry guard identifies expired tokens without rejecting opaque tokens',
-    () {
-      final now = DateTime.utc(2026, 8, 21, 16);
-      String tokenFor(int exp) {
-        final payload = base64Url
-            .encode(utf8.encode(jsonEncode({'exp': exp})))
-            .replaceAll('=', '');
-        return 'header.$payload.signature';
-      }
+  test('JWT expiry guard identifies expired tokens without rejecting opaque tokens', () {
+    final now = DateTime.utc(2026, 8, 21, 16);
+    String tokenFor(int exp) {
+      final payload = base64Url
+          .encode(utf8.encode(jsonEncode({'exp': exp})))
+          .replaceAll('=', '');
+      return 'header.$payload.signature';
+    }
 
-      final nowSeconds = now.millisecondsSinceEpoch ~/ 1000;
-      expect(
-        isAuthTokenExpired(tokenFor(nowSeconds + 3600), now: now),
-        isFalse,
-      );
-      expect(isAuthTokenExpired(tokenFor(nowSeconds - 3600), now: now), isTrue);
-      expect(isAuthTokenExpired('custom-deployment-token', now: now), isFalse);
-    },
-  );
+    final nowSeconds = now.millisecondsSinceEpoch ~/ 1000;
+    expect(isAuthTokenExpired(tokenFor(nowSeconds + 3600), now: now), isFalse);
+    expect(isAuthTokenExpired(tokenFor(nowSeconds - 3600), now: now), isTrue);
+    expect(isAuthTokenExpired('custom-deployment-token', now: now), isFalse);
+  });
 
   test('settings load migrates the old placeholder control host', () async {
     final tempDir = await Directory.systemTemp.createTemp(
@@ -274,9 +268,9 @@ void main() {
         buffer.addAll(chunk);
         return buffer;
       });
-      final payload =
-          jsonDecode(utf8.decode(GZipCodec().decode(compressed)))
-              as Map<String, dynamic>;
+      final payload = jsonDecode(
+        utf8.decode(GZipCodec().decode(compressed)),
+      ) as Map<String, dynamic>;
       final files = payload['files'] as List<dynamic>;
       expect(
         (files.single as Map<String, dynamic>)['content'],
@@ -312,9 +306,9 @@ void main() {
       request.headers.value(HttpHeaders.authorizationHeader),
       'Bearer token-123',
     );
-    final payload =
-        jsonDecode(await utf8.decoder.bind(request).join())
-            as Map<String, dynamic>;
+    final payload = jsonDecode(
+      await utf8.decoder.bind(request).join(),
+    ) as Map<String, dynamic>;
     expect(payload['device_name'], 'Studio Mac');
     expect(payload['virtual_ip'], '10.20.0.88');
     request.response.headers.contentType = ContentType.json;

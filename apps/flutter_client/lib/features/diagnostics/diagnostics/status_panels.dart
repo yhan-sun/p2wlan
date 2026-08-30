@@ -14,9 +14,7 @@ class _ProtocolMtuPanel extends StatelessWidget {
       return AppPanel(
         title: strings.protocolAndMtu,
         child: Text(
-          strings.isZh
-              ? '当前快照未上报协议边界或 MTU 策略。'
-              : 'The current snapshot has no protocol boundary or MTU policy data.',
+          strings.isZh ? '当前快照未上报协议边界或 MTU 策略。' : 'The current snapshot has no protocol boundary or MTU policy data.',
           style: TextStyle(fontSize: 13, color: themeTextSecondary(context)),
         ),
       );

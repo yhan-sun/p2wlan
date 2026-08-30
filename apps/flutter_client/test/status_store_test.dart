@@ -67,62 +67,58 @@ void main() {
     },
   );
 
-  test(
-    'stable peer order puts online peers first and moves reconnected peers to the end',
-    () async {
-      final fixture = await _loadFixture();
-      final stores = await _makeStores(DiagnosticsApi());
-      addTearDown(stores.dispose);
+  test('stable peer order puts online peers first and moves reconnected peers to the end', () async {
+    final fixture = await _loadFixture();
+    final stores = await _makeStores(DiagnosticsApi());
+    addTearDown(stores.dispose);
 
-      final initial = stores.statusStore.stablePeerOrder(fixture.peers);
-      final firstOnline = initial.first;
-      expect(firstOnline.online, isTrue);
+    final initial = stores.statusStore.stablePeerOrder(fixture.peers);
+    final firstOnline = initial.first;
+    expect(firstOnline.online, isTrue);
 
-      final offlineRaw =
-          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
-      final offlinePeers = [
-        for (final item in offlineRaw['peers'] as List<dynamic>)
-          Map<String, dynamic>.from(item as Map),
-      ];
-      final firstOffline = offlinePeers.firstWhere(
-        (item) => item['node_id'] == firstOnline.nodeId,
-      );
-      firstOffline
-        ..['online'] = false
-        ..['state'] = 'unknown'
-        ..['active_path'] = null
-        ..['current_path_selection'] = null;
-      final offlineSnapshot = DiagnosticsSnapshot.fromJson(
-        offlineRaw..['peers'] = offlinePeers,
-      );
-      final whileOffline = stores.statusStore.stablePeerOrder(
-        offlineSnapshot.peers,
-      );
-      expect(whileOffline.last.nodeId, firstOnline.nodeId);
+    final offlineRaw =
+        jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+    final offlinePeers = [
+      for (final item in offlineRaw['peers'] as List<dynamic>)
+        Map<String, dynamic>.from(item as Map),
+    ];
+    final firstOffline = offlinePeers.firstWhere(
+      (item) => item['node_id'] == firstOnline.nodeId,
+    );
+    firstOffline
+      ..['online'] = false
+      ..['state'] = 'unknown'
+      ..['active_path'] = null
+      ..['current_path_selection'] = null;
+    final offlineSnapshot = DiagnosticsSnapshot.fromJson(
+      offlineRaw..['peers'] = offlinePeers,
+    );
+    final whileOffline = stores.statusStore.stablePeerOrder(
+      offlineSnapshot.peers,
+    );
+    expect(whileOffline.last.nodeId, firstOnline.nodeId);
 
-      final restoredRaw =
-          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
-      final restoredPeers = [
-        for (final item in restoredRaw['peers'] as List<dynamic>)
-          Map<String, dynamic>.from(item as Map),
-      ];
-      final restored = stores.statusStore.stablePeerOrder(
-        DiagnosticsSnapshot.fromJson(
-          restoredRaw..['peers'] = restoredPeers,
-        ).peers,
-      );
-      final restoredOnline = restored
-          .where((peer) => peer.online && peer.path != 'offline')
-          .toList();
-      expect(restoredOnline.last.nodeId, firstOnline.nodeId);
-      expect(
-        restored
-            .skipWhile((peer) => peer.online && peer.path != 'offline')
-            .every((peer) => !peer.online || peer.path == 'offline'),
-        isTrue,
-      );
-    },
-  );
+    final restoredRaw =
+        jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+    final restoredPeers = [
+      for (final item in restoredRaw['peers'] as List<dynamic>)
+        Map<String, dynamic>.from(item as Map),
+    ];
+    final restored = stores.statusStore.stablePeerOrder(
+      DiagnosticsSnapshot.fromJson(restoredRaw..['peers'] = restoredPeers)
+          .peers,
+    );
+    final restoredOnline = restored
+        .where((peer) => peer.online && peer.path != 'offline')
+        .toList();
+    expect(restoredOnline.last.nodeId, firstOnline.nodeId);
+    expect(
+      restored
+          .skipWhile((peer) => peer.online && peer.path != 'offline')
+          .every((peer) => !peer.online || peer.path == 'offline'),
+      isTrue,
+    );
+  });
 
   test('automatic refresh stays silent while work is in flight', () async {
     final fixture = await _loadFixture();
@@ -565,11 +561,9 @@ Future<void> _waitUntil(bool Function() predicate) async {
 }
 
 Future<DiagnosticsSnapshot> _loadFixture() async {
-  final raw =
-      jsonDecode(
-            await File('test/fixtures/status_connected.json').readAsString(),
-          )
-          as Map<String, dynamic>;
+  final raw = jsonDecode(
+    await File('test/fixtures/status_connected.json').readAsString(),
+  ) as Map<String, dynamic>;
   return DiagnosticsSnapshot.fromJson(raw);
 }
 

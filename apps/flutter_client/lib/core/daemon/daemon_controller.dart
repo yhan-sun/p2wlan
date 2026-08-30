@@ -37,11 +37,11 @@ class DaemonCommandResult {
 
 class DaemonController {
   DaemonController({
-    required DiagnosticsApi diagnosticsApi,
+    required this._diagnosticsApi,
     this.readMacosAdminPassword,
     this.saveMacosAdminPassword,
     this.clearMacosAdminPassword,
-  }) : _diagnosticsApi = diagnosticsApi;
+  });
 
   static const daemonBinaryName = 'p2wlan-daemon';
   static const envDaemonBin = 'P2WLAN_DAEMON_BIN';
@@ -109,8 +109,7 @@ class DaemonController {
         startupTrace,
         stage: 1,
         code: DaemonStartupFailureCode.daemonBinaryLoadFailed,
-        message:
-            'Could not find p2wlan-daemon. Build it with cargo or set P2WLAN_DAEMON_BIN.',
+        message: 'Could not find p2wlan-daemon. Build it with cargo or set P2WLAN_DAEMON_BIN.',
       );
     }
     await startupTrace?.stageOk(1, 'resolve_daemon');
@@ -603,8 +602,7 @@ class DaemonController {
         await _removePidMarker();
         return const DaemonCommandResult(
           ok: true,
-          message:
-              'p2wlan-daemon stopped after forced process termination fallback.',
+          message: 'p2wlan-daemon stopped after forced process termination fallback.',
         );
       }
     }

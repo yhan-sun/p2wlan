@@ -67,9 +67,8 @@ String diagnosticsAuthTokenPath() {
 Future<String?> readDiagnosticsAuthToken() async {
   if (Platform.isAndroid) {
     try {
-      final value = await const MethodChannel(
-        'p2wlan/android_vpn',
-      ).invokeMethod<String>('diagnosticsAuthToken');
+      final value = await const MethodChannel('p2wlan/android_vpn')
+          .invokeMethod<String>('diagnosticsAuthToken');
       final token = value?.trim();
       return token == null || token.isEmpty ? null : token;
     } catch (_) {
