@@ -1083,7 +1083,10 @@ async fn run_dplpmtud_worker(
                                         .dplpmtud_path_is_current_sync(&send_identity)
                                     || send_socket.local_addr().ok()
                                         != Some(send_identity.local_endpoint)
-                                    || !send_runtime.begin_probe_send(&send_plan)
+                                    || !send_runtime.begin_probe_send(
+                                        &send_plan,
+                                        tokio::time::Instant::now(),
+                                    )
                                 {
                                     return Err(DaemonError::Network(
                                         "DPLPMTUD exact path was cancelled before UDP send"

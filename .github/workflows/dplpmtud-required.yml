@@ -1,4 +1,4 @@
-name: DPLPMTUD
+name: DPLPMTUD Required
 
 on:
   push:
@@ -167,7 +167,12 @@ jobs:
           script: |
             const requiredNames = [
               'Path State Machine Required',
+              'NAT Topology Required',
+              'Windows Lifecycle Required',
+              'Mobile Lifecycle Required',
               'CI Required',
+              'Flutter Client',
+              'Package Test Builds',
             ];
             const targetSha = context.payload.pull_request?.head?.sha || context.sha;
             const deadline = Date.now() + 50 * 60 * 1000;

@@ -378,10 +378,51 @@ impl UdpTransport {
                 );
                 continue;
             };
+            let previous_identity = self.dplpmtud.path_identity(&snapshot.peer_id);
+            let previous_snapshot = self
+                .dplpmtud
+                .snapshots()
+                .get(&snapshot.peer_id)
+                .cloned();
+            if previous_identity.as_ref().is_some_and(|previous| previous != &identity) {
+                self.peers.emit_timeline(
+                    "dplpmtud_reset",
+                    Some("direct"),
+                    Some("path_identity_changed"),
+                    Some(format!(
+                        "peer={} previous_identity={:?} next_identity={:?}",
+                        snapshot.peer_id, previous_identity, identity,
+                    )),
+                );
+            }
             let supported = self
                 .dplpmtud
                 .is_supported(&snapshot.peer_id, epoch.peer_session_generation.value());
+            let identity_summary = identity.summary();
             let install = self.dplpmtud.install_path(identity, supported, now);
+            if !supported
+                && install.decision == crate::dplpmtud::DplpmtudInstallDecision::Unsupported
+                && !previous_snapshot.is_some_and(|previous| {
+                    previous.state == crate::dplpmtud::DplpmtudState::Unsupported
+                        && previous.path_identity.as_ref() == Some(&identity_summary)
+                })
+            {
+                self.peers.emit_timeline(
+                    "dplpmtud_unsupported",
+                    Some("direct"),
+                    Some("capability_not_negotiated"),
+                    Some(format!(
+                        "peer={} path_identity={:?} confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
+                        snapshot.peer_id,
+                        identity_summary,
+                        crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
+                        identity_summary
+                            .outer_ip_family
+                            .ceiling_udp_datagram_size()
+                            .0,
+                    )),
+                );
+            }
             if install.decision != crate::dplpmtud::DplpmtudInstallDecision::Spawned {
                 debug!(
                     peer_id = %snapshot.peer_id,

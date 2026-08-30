@@ -1528,8 +1528,9 @@ impl DplpmtudRuntime {
     }
 
     /// Linearization point immediately before a worker attempts the kernel
-    /// send. Cancellation that wins first prevents the send.
-    pub(crate) fn begin_probe_send(&self, plan: &DplpmtudProbePlan) -> bool {
+    /// send. Marking the probe sent here, before socket I/O, prevents a fast
+    /// authenticated ACK from racing ahead of the send bookkeeping.
+    pub(crate) fn begin_probe_send(&self, plan: &DplpmtudProbePlan, now: Instant) -> bool {
         let mut registry = self
             .registry
             .lock()
@@ -1545,11 +1546,20 @@ impl DplpmtudRuntime {
             || entry.machine.identity() != Some(&plan.path_identity)
             || entry.machine.outstanding_identity() != Some(plan.probe_identity)
             || entry.send_in_progress
-            || Instant::now() >= plan.deadline
+            || now >= plan.deadline
+        {
+            return false;
+        }
+        if entry.machine.apply(DplpmtudEvent::ProbeSent {
+            probe: plan.probe_identity,
+            now,
+        }) != DplpmtudTransitionDecision::Applied
         {
             return false;
         }
         entry.send_in_progress = true;
+        entry.notify.notify_waiters();
+        self.publish_snapshot_locked(&plan.peer_id, entry, now);
         true
     }
 
@@ -1573,12 +1583,7 @@ impl DplpmtudRuntime {
         }
         entry.send_in_progress = false;
         match result {
-            Ok(()) => {
-                let _ = entry.machine.apply(DplpmtudEvent::ProbeSent {
-                    probe: plan.probe_identity,
-                    now,
-                });
-            }
+            Ok(()) => {}
             Err(()) => {
                 let _ = entry.machine.apply(DplpmtudEvent::ProbeSendFailed {
                     probe: plan.probe_identity,
@@ -1629,6 +1634,9 @@ impl DplpmtudRuntime {
         let Ok(mut registry) = self.registry.try_lock() else {
             return DplpmtudTransitionDecision::Busy;
         };
+        if registry.closed {
+            return DplpmtudTransitionDecision::Stale;
+        }
         let Some(entry) = registry.entries.get_mut(peer_id) else {
             return DplpmtudTransitionDecision::Stale;
         };
@@ -1641,7 +1649,9 @@ impl DplpmtudRuntime {
         let exact_ingress = ingress.remote_endpoint == current_path.authenticated_remote_endpoint
             && ingress.local_endpoint == current_path.local_endpoint
             && ingress.socket == current_path.socket;
-        let decision = if entry.machine.identity() != Some(current_path)
+        let worker_is_current = entry.worker_running && entry.worker_owner_token.is_some();
+        let decision = if !worker_is_current
+            || entry.machine.identity() != Some(current_path)
             || !exact_wire_identity
             || !exact_ingress
         {
@@ -1780,11 +1790,16 @@ pub(crate) struct DplpmtudAckIngress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::control::PeerInfo;
     use crate::dataplane::OutboundPacket;
-    use crate::peer::PeerSessionGeneration;
+    use crate::peer::{PeerManager, PeerSessionGeneration};
     use crate::transport::{DirectValidationKind, WireGuardTransport};
+    use crate::udp::UdpTransport;
     use p2pnet_crypto::NodeIdentity;
     use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
 
     fn test_identity(peer_id: &str) -> DplpmtudPathIdentity {
@@ -2023,7 +2038,7 @@ mod tests {
         let plan = runtime
             .schedule_probe("peer", &identity, lease.worker_owner_token, now)
             .expect("probe must schedule");
-        assert!(runtime.begin_probe_send(&plan));
+        assert!(runtime.begin_probe_send(&plan, now));
         runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
         let exact_ingress = DplpmtudAckIngress {
             remote_endpoint: identity.authenticated_remote_endpoint,
@@ -2145,7 +2160,7 @@ mod tests {
         let plan = runtime
             .schedule_probe("peer", &identity, lease.worker_owner_token, now)
             .unwrap();
-        assert!(runtime.begin_probe_send(&plan));
+        assert!(runtime.begin_probe_send(&plan, now));
         runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
         assert_eq!(
             runtime.try_accept_ack(
@@ -2165,6 +2180,54 @@ mod tests {
         assert_eq!(
             runtime.timeout_probe(&plan, plan.deadline + Duration::from_millis(1)),
             DplpmtudTransitionDecision::Applied
+        );
+    }
+
+    #[test]
+    fn ack_after_worker_cancellation_is_stale() {
+        let now = Instant::now();
+        let runtime = DplpmtudRuntime::new();
+        let identity = test_identity("peer");
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        let plan = runtime
+            .schedule_probe("peer", &identity, lease.worker_owner_token, now)
+            .unwrap();
+        assert!(runtime.begin_probe_send(&plan, now));
+        runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
+        runtime.cancel_peer("peer", "peer_left", now + Duration::from_millis(2));
+        assert_eq!(
+            runtime.try_accept_ack(
+                "peer",
+                &identity,
+                plan.wire_token,
+                DplpmtudAckIngress {
+                    remote_endpoint: identity.authenticated_remote_endpoint,
+                    local_endpoint: identity.local_endpoint,
+                    socket: identity.socket,
+                },
+                now + Duration::from_millis(3),
+            ),
+            DplpmtudTransitionDecision::Stale
+        );
+        assert_eq!(runtime.snapshots().remove("peer").unwrap().success_count, 0);
+
+        runtime.close("shutdown", now + Duration::from_millis(4));
+        assert_eq!(
+            runtime.try_accept_ack(
+                "peer",
+                &identity,
+                plan.wire_token,
+                DplpmtudAckIngress {
+                    remote_endpoint: identity.authenticated_remote_endpoint,
+                    local_endpoint: identity.local_endpoint,
+                    socket: identity.socket,
+                },
+                now + Duration::from_millis(5),
+            ),
+            DplpmtudTransitionDecision::Stale
         );
     }
 
@@ -2225,7 +2288,7 @@ mod tests {
         let old_plan = runtime
             .schedule_probe("peer", &first_identity, first.worker_owner_token, now)
             .unwrap();
-        assert!(runtime.begin_probe_send(&old_plan));
+        assert!(runtime.begin_probe_send(&old_plan, now));
         runtime.finish_probe_send(&old_plan, Ok(()), now + Duration::from_millis(1));
         assert_eq!(
             runtime.try_accept_ack(
@@ -2252,7 +2315,7 @@ mod tests {
             DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
         );
         assert_eq!(snapshot.state, DplpmtudState::Base);
-        assert!(!runtime.begin_probe_send(&old_plan));
+        assert!(!runtime.begin_probe_send(&old_plan, now + Duration::from_millis(4)));
         runtime.finish_worker("peer", &first_identity, first.worker_owner_token);
         assert_eq!(runtime.active_worker_count(), 1);
         assert!(runtime
@@ -2484,8 +2547,354 @@ mod tests {
         (buffer, source)
     }
 
-    #[tokio::test]
+    async fn yield_until(mut predicate: impl FnMut() -> bool, message: &str) {
+        for _ in 0..100_000 {
+            if predicate() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{message}");
+    }
+
+    fn peer_info(node_id: &str, virtual_ip: &str, endpoint: SocketAddr) -> PeerInfo {
+        PeerInfo {
+            node_id: node_id.to_string(),
+            virtual_ip: virtual_ip.to_string(),
+            endpoint: endpoint.to_string(),
+            online: true,
+            ..PeerInfo::default()
+        }
+    }
+
+    async fn commit_test_direct_path(
+        peers: &Arc<PeerManager>,
+        udp: &UdpTransport,
+        peer_id: &str,
+        remote_endpoint: SocketAddr,
+        local_endpoint: SocketAddr,
+        owner_token: u64,
+        request_id: u16,
+    ) -> DplpmtudPathIdentity {
+        let generation = peers.current_network_generation_sync();
+        let peer_session_generation = peers
+            .peer_session_generation_sync(peer_id)
+            .expect("test peer must be online");
+        let remote_candidate_epoch = peers
+            .current_remote_candidate_epoch(peer_id)
+            .await
+            .expect("test peer must have a candidate epoch");
+        let epoch = PathEpoch::new(generation, peer_session_generation, remote_candidate_epoch);
+        assert!(
+            peers
+                .mark_direct_validation_started(
+                    peer_id,
+                    crate::peer::DirectValidationIdentity::owned(
+                        epoch,
+                        owner_token,
+                        Some(request_id),
+                        Some(remote_endpoint),
+                    ),
+                )
+                .await
+        );
+        let committed = crate::peer::DirectValidationIdentity::authenticated_ack(
+            epoch,
+            owner_token,
+            request_id,
+            Some(remote_endpoint),
+            remote_endpoint,
+        );
+        let epoch_gate = peers.network_epoch_gate();
+        let epoch_guard = epoch_gate.lock().await;
+        assert!(peers
+            .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch_for_remote_epoch(
+                &epoch_guard,
+                peer_id,
+                Some(remote_endpoint),
+                generation,
+                Some(local_endpoint),
+                None,
+                Some(remote_candidate_epoch),
+                Some(committed),
+            )
+            .await);
+        drop(epoch_guard);
+        let identity = DplpmtudPathIdentity::from_committed_validation(
+            peer_id,
+            committed,
+            remote_endpoint,
+            local_endpoint,
+            udp.transport_instance_id(),
+            0,
+        )
+        .expect("test Direct identity must contain owner, request and matching IP family");
+        assert!(peers.dplpmtud_path_is_current_sync(&identity));
+        identity
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak() {
+        const BLACKHOLE_THRESHOLD: usize = 1397;
+        let peers_a = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let peers_b = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let udp_a = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_a.clone())
+            .await
+            .unwrap();
+        let udp_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
+            .await
+            .unwrap();
+        let endpoint_a = udp_a.local_addr().unwrap();
+        let endpoint_b = udp_b.local_addr().unwrap();
+        let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let router_endpoint = router.local_addr().unwrap();
+        peers_a
+            .add_peer(&peer_info("peer-b", "10.20.0.2", router_endpoint))
+            .await;
+        peers_b
+            .add_peer(&peer_info("peer-a", "10.20.0.1", endpoint_a))
+            .await;
+
+        // DPLPMTUD is deliberately background measurement for an already
+        // authoritative Direct path. This fixture commits that prerequisite
+        // through the same PeerManager state-machine path used by production;
+        // only Probe delivery, ACK authentication, bounds changes and the
+        // blackhole outcome are exercised by the assertions below.
+        let identity = commit_test_direct_path(
+            &peers_a,
+            &udp_a,
+            "peer-b",
+            router_endpoint,
+            endpoint_a,
+            17,
+            19,
+        )
+        .await;
+        let runtime = udp_a.dplpmtud_runtime();
+        let peer_session_generation = identity.epoch.peer_session_generation.value();
+        assert!(runtime.mark_supported("peer-b", peer_session_generation));
+
+        let (session_a, session_b) = establish_sessions();
+        let (wireguard_a, _) = WireGuardTransport::new();
+        let (wireguard_b, _) = WireGuardTransport::new();
+        let _ = wireguard_a.add_session("peer-b", session_a).await;
+        let _ = wireguard_b.add_session("peer-a", session_b).await;
+
+        let (a_encrypted_tx, a_encrypted_rx) = mpsc::channel(64);
+        let (b_encrypted_tx, b_encrypted_rx) = mpsc::channel(64);
+        let a_reader_tx = a_encrypted_tx.clone();
+        let b_reader_tx = b_encrypted_tx.clone();
+        let udp_a = udp_a
+            .with_dplpmtud_local_virtual_ip(Ipv4Addr::new(10, 20, 0, 1))
+            .with_inbound_channel(a_encrypted_tx);
+        let udp_b = udp_b.with_inbound_channel(b_encrypted_tx);
+        // The live daemon uses a publication watch, rather than a static
+        // transport option.  Keep the same owner check in this E2E test so a
+        // queued datagram from a withdrawn UDP publication cannot become
+        // DPLPMTUD evidence.
+        udp_a.set_inbound_publication_owner(101);
+        udp_b.set_inbound_publication_owner(202);
+        let (udp_a_watch_tx, udp_a_watch_rx) = watch::channel(Some(udp_a.clone()));
+        let (udp_b_watch_tx, udp_b_watch_rx) = watch::channel(Some(udp_b.clone()));
+        let (a_overlay_tx, mut a_overlay_rx) = mpsc::channel(8);
+        let (b_overlay_tx, mut b_overlay_rx) = mpsc::channel(8);
+
+        let a_reader = tokio::spawn({
+            let udp = udp_a.clone();
+            async move { udp.run_inbound(a_reader_tx).await }
+        });
+        let b_reader = tokio::spawn({
+            let udp = udp_b.clone();
+            async move { udp.run_inbound(b_reader_tx).await }
+        });
+        let a_transport = tokio::spawn({
+            let wireguard = wireguard_a.clone();
+            let peers = peers_a.clone();
+            async move {
+                wireguard
+                    .run_inbound_with_peers_live_udp(
+                        a_encrypted_rx,
+                        a_overlay_tx,
+                        Some(peers),
+                        udp_a_watch_rx,
+                    )
+                    .await
+            }
+        });
+        let b_transport = tokio::spawn({
+            let wireguard = wireguard_b.clone();
+            let peers = peers_b.clone();
+            async move {
+                wireguard
+                    .run_inbound_with_peers_live_udp(
+                        b_encrypted_rx,
+                        b_overlay_tx,
+                        Some(peers),
+                        udp_b_watch_rx,
+                    )
+                    .await
+            }
+        });
+
+        let dropped_probe_count = Arc::new(AtomicUsize::new(0));
+        let router_task = tokio::spawn({
+            let dropped_probe_count = dropped_probe_count.clone();
+            async move {
+                let mut buffer = vec![0u8; 65_535];
+                loop {
+                    let (size, source) = router.recv_from(&mut buffer).await.unwrap();
+                    if source == endpoint_a {
+                        if size <= BLACKHOLE_THRESHOLD {
+                            router.send_to(&buffer[..size], endpoint_b).await.unwrap();
+                        } else {
+                            dropped_probe_count.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                    } else if source == endpoint_b {
+                        router.send_to(&buffer[..size], endpoint_a).await.unwrap();
+                    }
+                }
+            }
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let scheduler = tokio::spawn(crate::run_dplpmtud_scheduler_until_cancelled(
+            udp_a.clone(),
+            peers_a.clone(),
+            wireguard_a.clone(),
+            shutdown_rx,
+        ));
+
+        yield_until(
+            || {
+                runtime
+                    .snapshots()
+                    .get("peer-b")
+                    .is_some_and(|snapshot| snapshot.outstanding_probe.is_some())
+            },
+            "DPLPMTUD scheduler must submit its first production probe",
+        )
+        .await;
+
+        let mut observed_probe_sizes = Vec::new();
+        let mut observed_blackhole_drops = 0;
+        let mut observed_timeouts = 0;
+        let mut observed_successes = 0;
+        loop {
+            let snapshot = runtime
+                .snapshots()
+                .remove("peer-b")
+                .expect("DPLPMTUD path snapshot must remain published");
+            if snapshot.state == DplpmtudState::SearchComplete {
+                break;
+            }
+            let Some(outstanding) = snapshot.outstanding_probe else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if outstanding.sent_age_ms.is_none() {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let candidate = outstanding.candidate_udp_datagram_size as usize;
+            observed_probe_sizes.push(candidate);
+            if candidate <= BLACKHOLE_THRESHOLD {
+                let expected_successes = observed_successes + 1;
+                yield_until(
+                    || {
+                        runtime
+                            .snapshots()
+                            .get("peer-b")
+                            .is_some_and(|value| value.success_count >= expected_successes)
+                    },
+                    "an allowed encrypted Probe must return through the production ACK path",
+                )
+                .await;
+                observed_successes = expected_successes;
+            } else {
+                let expected_drops = observed_blackhole_drops + 1;
+                yield_until(
+                    || dropped_probe_count.load(AtomicOrdering::Relaxed) >= expected_drops,
+                    "the controllable blackhole must receive every disallowed Probe",
+                )
+                .await;
+                observed_blackhole_drops = expected_drops;
+                let expected_timeouts = observed_timeouts + 1;
+                tokio::time::advance(DPLPMTUD_PROBE_TIMEOUT + Duration::from_millis(1)).await;
+                yield_until(
+                    || {
+                        runtime
+                            .snapshots()
+                            .get("peer-b")
+                            .is_some_and(|value| value.timeout_count >= expected_timeouts)
+                    },
+                    "a blackholed Probe must be retired by the bounded timeout path",
+                )
+                .await;
+                observed_timeouts = expected_timeouts;
+            }
+        }
+
+        let result = runtime.snapshots().remove("peer-b").unwrap();
+        assert_eq!(result.state, DplpmtudState::SearchComplete);
+        assert!(result.confirmed_udp_datagram_size as usize <= BLACKHOLE_THRESHOLD);
+        assert!(
+            BLACKHOLE_THRESHOLD - result.confirmed_udp_datagram_size as usize
+                <= DPLPMTUD_SEARCH_GRANULARITY as usize
+        );
+        assert!(observed_probe_sizes
+            .iter()
+            .any(|size| *size <= BLACKHOLE_THRESHOLD));
+        assert!(observed_probe_sizes
+            .iter()
+            .any(|size| *size > BLACKHOLE_THRESHOLD));
+        let connection = peers_a.get_connection("peer-b").await.unwrap();
+        assert_eq!(
+            connection.active_path(),
+            Some(crate::peer::NetworkPath::Direct)
+        );
+        assert_eq!(connection.direct_health.failure_count, 0);
+        assert_eq!(connection.relay_health.failure_count, 0);
+        assert!(a_overlay_rx.try_recv().is_err());
+        assert!(b_overlay_rx.try_recv().is_err());
+
+        shutdown_tx.send(true).unwrap();
+        scheduler.await.unwrap();
+        assert_eq!(runtime.active_worker_count(), 0);
+        drop(udp_a_watch_tx);
+        drop(udp_b_watch_tx);
+        a_reader.abort();
+        b_reader.abort();
+        a_transport.abort();
+        b_transport.abort();
+        router_task.abort();
+        let _ = a_reader.await;
+        let _ = b_reader.await;
+        let _ = a_transport.await;
+        let _ = b_transport.await;
+        let _ = router_task.await;
+        println!(
+            "DPLPMTUD_BLACKHOLE threshold={} confirmed={} upper={} probe_count={} timeout_count={} success_count={} dropped_probe_count={} direct_active=true direct_health_failure_count={} relay_fallback_count=0 task_leak={}",
+            BLACKHOLE_THRESHOLD,
+            result.confirmed_udp_datagram_size,
+            result.search_upper_udp_datagram_size,
+            result.probe_count,
+            result.timeout_count,
+            result.success_count,
+            dropped_probe_count.load(AtomicOrdering::Relaxed),
+            connection.direct_health.failure_count,
+            runtime.active_worker_count() != 0,
+        );
+    }
+
+    #[tokio::test]
+    // Keep the reducer-only blackhole model as a narrow state-machine
+    // regression. The acceptance test above is the production-path test used
+    // by CI; this supplemental test intentionally does not stand in for it.
+    async fn reducer_blackhole_state_machine_regression() {
         const BLACKHOLE_THRESHOLD: usize = 1397;
         let socket_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2564,7 +2973,7 @@ mod tests {
             generation_probe_size,
             generation_plan.probe_identity.candidate_udp_datagram_size.0 as usize
         );
-        assert!(runtime.begin_probe_send(&generation_plan));
+        assert!(runtime.begin_probe_send(&generation_plan, logical_now));
         socket_a
             .send_to(&generation_encrypted.wire_bytes, endpoint_b)
             .await
@@ -2694,7 +3103,7 @@ mod tests {
                 probe_size,
                 plan.probe_identity.candidate_udp_datagram_size.0 as usize
             );
-            assert!(runtime.begin_probe_send(&plan));
+            assert!(runtime.begin_probe_send(&plan, logical_now));
             let allowed = probe_size <= BLACKHOLE_THRESHOLD;
             let target = if allowed { endpoint_b } else { sink_endpoint };
             assert_eq!(
@@ -2903,7 +3312,7 @@ mod tests {
             logical_now + Duration::from_millis(1),
         );
         assert!(*peer_left_lease.cancel_rx.borrow());
-        assert!(!runtime.begin_probe_send(&peer_left_plan));
+        assert!(!runtime.begin_probe_send(&peer_left_plan, logical_now + Duration::from_millis(1),));
         assert_eq!(
             runtime.timeout_probe(&peer_left_plan, peer_left_plan.deadline),
             DplpmtudTransitionDecision::Noop

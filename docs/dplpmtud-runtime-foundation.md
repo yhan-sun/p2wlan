@@ -43,9 +43,10 @@ The DPLPMTUD worker is owned by the Direct UDP scheduler in
 4. releases DPLPMTUD state locks;
 5. takes the existing per-peer WireGuard emit-order lock through encryption and
    the UDP handoff;
-6. revalidates the path identity and worker owner before the actual send;
-7. commits either `ProbeSent` or `ProbeSendFailed` only if the same expectation
-   still owns the slot;
+6. revalidates the path identity and worker owner, then marks `ProbeSent` at
+   the send linearization point immediately before the actual socket send;
+7. commits `ProbeSendFailed` only if the same expectation still owns the slot
+   when the handoff reports an error;
 8. waits on the worker notification, cancellation watch, probe deadline, raise
    timer, or the worker hard deadline.
 
@@ -280,9 +281,10 @@ Every worker also has a one-hour intrinsic hard lifetime.
 ## 8. Timer and task ownership
 
 A bounded scheduler owns DPLPMTUD workers in a `JoinSet`. Reconciliation is
-triggered by UDP publication/path notifications and a bounded periodic tick;
-it does not put a long-lived timer into a serial control branch that must poll
-other work to make progress.
+triggered by committed-path notifications and worker completion; each worker
+owns its bounded probe, raise, and hard-lifetime deadlines. The scheduler does
+not put a long-lived timer into a serial control branch that must poll other
+work to make progress.
 
 For each exact peer/path there is at most one owner token and one worker. The
 worker owns:
@@ -313,10 +315,11 @@ short DPLPMTUD registry transaction: schedule expectation
 release registry
 WireGuard per-peer emit lock
 short session lock / encrypt
-exact-path + owner + expectation recheck (`begin_probe_send`)
+exact-path + owner + expectation recheck and `ProbeSent` linearization
+(`begin_probe_send`)
 UDP handoff on the bound socket
 release emit lock
-short DPLPMTUD registry transaction: finish send
+short DPLPMTUD registry transaction: finish send outcome
 ```
 
 The `begin_probe_send` recheck includes the worker owner, exact identity,
