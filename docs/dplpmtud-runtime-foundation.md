@@ -252,7 +252,7 @@ BASE + exhausted timeout/send failures    -> Error (no confirmed budget)
 Searching + matching ACK                  -> Searching or SearchComplete
 Searching + exhausted timeout             -> narrower Searching or SearchComplete
 SearchComplete + current-PLPMTU timer      -> Searching (re-probe current confirmed size)
-current confirmation failure               -> safe BASE + upward Searching
+current confirmation failure               -> Base (fresh BASE confirmation required)
 EMSGSIZE                                    -> shrink upper bound, keep searching
 transient/lock/session failure              -> bounded retry or Error
 SearchComplete + raise timer               -> Searching or renewed SearchComplete
@@ -322,12 +322,14 @@ confirmed Direct path.
 
 After SearchComplete, a current-PLPMTU confirmation timer re-probes the
 currently confirmed size. A successful confirmation re-arms that timer. After
-three consecutive confirmation failures, the result is conservatively reduced
-to the positively validated BASE (or to Error with no budget if BASE itself is
-not validated), the upper bound is shrunk, and upward search resumes without
-changing endpoint, generation, candidate epoch, or socket identity. A
-ten-minute raise timer independently reopens the upper interval to the family
-ceiling after a completed search.
+three consecutive confirmation failures, the historical confirmed value is
+revoked: `base_confirmed=false`, `confirmed_udp_datagram_size=None`, and
+`pending_candidate_udp_datagram_size=BASE` in state `Base`. The upper bound is
+shrunk using the failed candidate, but upward search cannot resume until a new
+BASE probe is positively ACKed. If that BASE phase exhausts its retries, the
+machine enters `Error` with no budget. Endpoint, generation, candidate epoch,
+and socket identity remain unchanged. A ten-minute raise timer independently
+reopens the upper interval to the family ceiling after a completed search.
 
 The send boundary classifies `TransientSend`, `EmitLockUnavailable`,
 `SessionUnavailable`, and `LocalPacketTooLarge` separately. The first three
@@ -439,11 +441,12 @@ The current entry is cancelled/reset for, among other reasons:
 A repeated notification for the same exact identity is idempotent: it does not
 reset state, create a second worker, or schedule a second outstanding probe.
 
-Cancellation sets the watch, disables the machine, clears outstanding work,
-and preserves a reason in the read-only snapshot. A stale worker may still
-reach its exit path, but owner-token comparison prevents it from erasing the
-replacement. A cancelled worker cannot pass `begin_probe_send` and cannot
-publish an old retry kick.
+Cancellation sets the watch, disables the machine, immediately revokes
+`base_confirmed` and `confirmed_udp_datagram_size`, clears outstanding and
+pending probes plus the current-confirmation timer, and preserves a reason in
+the read-only snapshot. A stale worker may still reach its exit path, but
+owner-token comparison prevents it from erasing the replacement. A cancelled
+worker cannot pass `begin_probe_send` and cannot publish an old retry kick.
 
 ## 11. Stale and duplicate handling
 
@@ -502,11 +505,12 @@ Status reads do not take or hold the mutable DPLPMTUD registry lock and cannot
 block a worker. A business consumer must use the O(1)
 `confirmed_budget_for_path(exact_identity)` accessor: it performs one per-peer
 registry lookup followed by a complete identity comparison and returns the
-confirmed UDP, outer-packet, and overlay budgets. It returns `None` before
-positive BASE confirmation or after identity mismatch. Control/timeline code
-may use the one-peer `snapshot_for_peer` or exact-path `snapshot_for_path`; the
-business hot path must not call
-`snapshots()`, which clones the full peer table.
+confirmed UDP, outer-packet, and overlay budgets. It returns `None` when the
+runtime is closed, the identity is not the exact current path, the state is
+`Disabled`/`Unsupported`, support is not negotiated, BASE is not positively
+confirmed, or the confirmed value is absent. Control/timeline code may use the
+one-peer `snapshot_for_peer` or exact-path `snapshot_for_path`; the business
+hot path must not call `snapshots()`, which clones the full peer table.
 
 ## 13. Verification strategy
 
@@ -537,8 +541,9 @@ requires a positive BASE success, requires a success below and failure above
 the threshold, bounds the result to one 8-byte step, then lowers the same
 userspace threshold to 1280 without changing endpoint, generation, candidate
 epoch, or socket identity. The current-PLPMTU confirmation fails, the result
-falls to safe BASE, and upward search reconverges to no more than 1280. The
-test verifies duplicate no-op behavior, switches generation while an
+enters `Base` without a confirmed value, positively re-confirms BASE, and
+upward search reconverges to no more than 1280. The test verifies duplicate
+no-op behavior, switches generation while an
 authenticated ACK is in flight, performs PeerLeft with an outstanding probe
 before send linearization, asserts Direct remains active with zero Direct
 health failures and zero Relay fallbacks, and returns worker ownership to the
