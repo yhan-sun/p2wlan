@@ -1,0 +1,275 @@
+name: DPLPMTUD Required
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/dplpmtud-required.yml"
+      - ".github/workflows/path-state-machine-required.yml"
+      - "client/daemon/**"
+      - "docs/dplpmtud-runtime-foundation.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/dplpmtud-required.yml"
+      - ".github/workflows/path-state-machine-required.yml"
+      - "client/daemon/**"
+      - "docs/dplpmtud-runtime-foundation.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: dplpmtud-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  VALIDATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  dplpmtud_linux:
+    name: DPLPMTUD Linux checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VALIDATION_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact validation SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "DPLPMTUD validation SHA: $actual"
+          test "$actual" = "$VALIDATION_SHA"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Cargo format
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: DPLPMTUD reducer, lifecycle, compatibility, and codec tests
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests -- --test-threads=1
+
+      - name: Encrypted UDP blackhole test with evidence
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak -- --exact --nocapture --test-threads=1
+
+      - name: Cargo workspace tests
+        run: cargo test --workspace
+
+      - name: Diff whitespace check
+        run: git diff --check
+
+  dplpmtud_blackhole:
+    name: DPLPMTUD blackhole run ${{ matrix.iteration }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        iteration: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VALIDATION_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact validation SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "DPLPMTUD_BLACKHOLE_RUN iteration=${{ matrix.iteration }} expected_head=$VALIDATION_SHA actual_head=$actual"
+          test "$actual" = "$VALIDATION_SHA"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run deterministic encrypted UDP blackhole chain
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak -- --exact --nocapture --test-threads=1
+
+  dplpmtud_windows:
+    name: DPLPMTUD Windows checks
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.VALIDATION_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact validation SHA
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          Write-Host "DPLPMTUD validation SHA: $actual"
+          if ($actual -ne $env:VALIDATION_SHA) { throw "checked out $actual instead of $env:VALIDATION_SHA" }
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile daemon on Windows
+        run: cargo check -p p2wlan-daemon --all-targets --all-features
+
+      - name: Reducer search and timeout lifecycle
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::timeout_retries_then_only_narrows_search_bounds -- --exact --test-threads=1
+
+      - name: Owner and path replacement cancellation
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::worker_owner_token_closes_same_identity_exit_aba -- --exact --test-threads=1
+
+      - name: PeerLeft and shutdown cleanup
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::close_and_peer_left_remove_all_worker_ownership -- --exact --test-threads=1
+
+      - name: Capability compatibility
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::capability_extension_is_additive_and_legacy_packets_remain_decodable -- --exact --test-threads=1
+
+      - name: Packet codec and exact datagram budget
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::codec_round_trip_uses_exact_udp_datagram_budget_and_compact_ack -- --exact --test-threads=1
+
+      - name: IPv4 and IPv6 budget separation
+        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::ipv4_and_ipv6_budget_layers_are_never_mixed -- --exact --test-threads=1
+
+  existing_required_gates:
+    name: Existing required gates on PR Head
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Require same-Head existing, Flutter, and Package jobs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const requiredNames = [
+              'Path State Machine Required',
+              'NAT Topology Required',
+              'Windows Lifecycle Required',
+              'Mobile Lifecycle Required',
+              'CI Required',
+              // Flutter Client publishes one check-run per job rather than a
+              // workflow-level check with the workflow name.
+              'Analyze and Test',
+              'Android arm64 Release APK',
+              'Linux x64 Release Bundle',
+              'macOS Release Apps',
+              'Windows x64 Release Bundle',
+              'iOS Compile',
+              // Package Test Builds likewise publishes its concrete jobs.
+              'macOS arm64 test DMG',
+              'Android arm64 test APK',
+            ];
+            const targetSha = context.payload.pull_request?.head?.sha || context.sha;
+            const deadline = Date.now() + 50 * 60 * 1000;
+            let lastSummary = '';
+
+            core.info(`Waiting for required checks on exact PR Head ${targetSha}`);
+            while (Date.now() < deadline) {
+              const response = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: targetSha,
+                per_page: 100,
+                filter: 'latest',
+              });
+              const latestByName = new Map();
+              for (const run of response.data.check_runs) {
+                if (!requiredNames.includes(run.name)) continue;
+                const prior = latestByName.get(run.name);
+                if (!prior || new Date(run.started_at || 0) > new Date(prior.started_at || 0)) {
+                  latestByName.set(run.name, run);
+                }
+              }
+
+              const summary = requiredNames.map((name) => {
+                const run = latestByName.get(name);
+                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}@${run.head_sha}` : 'missing'}`;
+              }).join(', ');
+              if (summary !== lastSummary) {
+                core.info(`same-Head gate status: ${summary}`);
+                lastSummary = summary;
+              }
+
+              const wrongSha = requiredNames.filter((name) => {
+                const run = latestByName.get(name);
+                return run && run.head_sha !== targetSha;
+              });
+              if (wrongSha.length > 0) {
+                core.setFailed(`Required gate resolved to a non-Head SHA for ${targetSha}: ${wrongSha.join(', ')}`);
+                return;
+              }
+
+              const failed = requiredNames.filter((name) => {
+                const run = latestByName.get(name);
+                return run && run.status === 'completed' && run.conclusion !== 'success';
+              });
+              if (failed.length > 0) {
+                core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
+                return;
+              }
+
+              const complete = requiredNames.every((name) => {
+                const run = latestByName.get(name);
+                return run && run.head_sha === targetSha &&
+                  run.status === 'completed' && run.conclusion === 'success';
+              });
+              if (complete) {
+                core.info(`All existing required gates passed on exact PR Head ${targetSha}.`);
+                return;
+              }
+
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+
+            core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
+
+  required:
+    name: DPLPMTUD Required
+    if: always()
+    needs:
+      - dplpmtud_linux
+      - dplpmtud_blackhole
+      - dplpmtud_windows
+      - existing_required_gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce aggregate results
+        env:
+          LINUX_RESULT: ${{ needs.dplpmtud_linux.result }}
+          BLACKHOLE_RESULT: ${{ needs.dplpmtud_blackhole.result }}
+          WINDOWS_RESULT: ${{ needs.dplpmtud_windows.result }}
+          EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$LINUX_RESULT" = "success"
+          test "$BLACKHOLE_RESULT" = "success"
+          test "$WINDOWS_RESULT" = "success"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            test "$EXTERNAL_RESULT" = "success"
+          else
+            test "$EXTERNAL_RESULT" = "skipped"
+          fi

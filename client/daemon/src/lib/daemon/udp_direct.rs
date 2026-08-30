@@ -286,6 +286,13 @@ async fn run_udp_direct_instance(
     } else {
         udp
     };
+    let dplpmtud_local_virtual_ip = direct_validation_local_ip
+        .parse::<Ipv4Addr>()
+        .map_err(|error| {
+            DaemonError::Network(format!(
+                "invalid local virtual IPv4 address for DPLPMTUD: {direct_validation_local_ip}: {error}"
+            ))
+        })?;
     let peer_reflexive_ingress = PeerReflexiveIngress::new();
     // Every source of direct-validation evidence feeds this bounded
     // per-peer reachability-ranked ingress. The scheduler is the only place
@@ -296,7 +303,8 @@ async fn run_udp_direct_instance(
         .with_local_node_id(local_node_id.clone())
         .with_wireguard_transport(direct_validation_transport.clone())
         .with_inbound_channel(udp_inbound_tx.clone())
-        .with_peer_reflexive_observer(peer_reflexive_ingress.clone());
+        .with_peer_reflexive_observer(peer_reflexive_ingress.clone())
+        .with_dplpmtud_local_virtual_ip(dplpmtud_local_virtual_ip);
     // Matched ACKs enter the same scheduler as peer-reflexive
     // observations. The ingress is synchronous/nonblocking for the
     // UDP reader and retains the highest-ranked queued endpoint, with newest
@@ -327,6 +335,12 @@ async fn run_udp_direct_instance(
             direct_validation_worker_permits,
             lease.shutdown_receiver(),
         ));
+    let dplpmtud_scheduler_worker = tokio::spawn(run_dplpmtud_scheduler_until_cancelled(
+        udp.clone(),
+        peers.clone(),
+        direct_validation_transport.clone(),
+        lease.shutdown_receiver(),
+    ));
     let peer_reflexive_worker = tokio::spawn(run_peer_reflexive_signal_loop_until_cancelled(
         peer_reflexive_ingress,
         control.clone(),
@@ -753,6 +767,10 @@ async fn run_udp_direct_instance(
     // superseded worker gets `false` here and therefore cannot erase the
     // replacement published by a newer owner.
     udp.cancel_all_direct_validation_sessions().await;
+    udp.dplpmtud_runtime().close(
+        "udp_transport_withdrawn",
+        tokio::time::Instant::now(),
+    );
     udp.cancel_all_relay_backoff_heartbeats();
     let withdrew_current = udp_transport_publication
         .clear_if_owner(lease.owner())
@@ -787,6 +805,7 @@ async fn run_udp_direct_instance(
         }
     }
     stop_direct_validation_scheduler_worker(validation_scheduler_worker).await;
+    stop_dplpmtud_scheduler_worker(dplpmtud_scheduler_worker).await;
     stop_peer_reflexive_signal_worker(peer_reflexive_worker).await;
     outcome
 }
@@ -935,6 +954,348 @@ async fn wait_for_udp_direct_stop(
     tokio::select! {
         _ = wait_for_udp_direct_shutdown(daemon_shutdown_rx) => {},
         _ = wait_for_udp_direct_shutdown(instance_shutdown_rx) => {},
+    }
+}
+
+fn emit_dplpmtud_timeline(
+    peers: &PeerManager,
+    event: &'static str,
+    identity: &crate::dplpmtud::DplpmtudPathIdentity,
+    detail: impl Into<String>,
+) {
+    peers.emit_timeline(
+        event,
+        Some("direct"),
+        None,
+        Some(format!(
+            "peer={} network_generation={} peer_session_generation={} remote_candidate_epoch={} local_endpoint={} remote_endpoint={} transport_instance_id={} socket_index={} {}",
+            identity.peer_id,
+            identity.epoch.network_generation,
+            identity.epoch.peer_session_generation.value(),
+            identity.epoch.remote_candidate_epoch,
+            identity.local_endpoint,
+            identity.authenticated_remote_endpoint,
+            identity.socket.transport_instance_id,
+            identity.socket.socket_index,
+            detail.into(),
+        )),
+    );
+}
+
+async fn run_dplpmtud_worker(
+    start: crate::dplpmtud::DplpmtudWorkerStart,
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+) {
+    let runtime = udp.dplpmtud_runtime();
+    let crate::dplpmtud::DplpmtudWorkerStart {
+        lease,
+        socket,
+        local_virtual_ip,
+        peer_virtual_ip,
+    } = start;
+    let identity = lease.identity.clone();
+    let peer_id = lease.peer_id.clone();
+    let worker_owner_token = lease.worker_owner_token;
+    let notify = lease.notify.clone();
+    let mut cancel_rx = lease.cancel_rx;
+    let publication_owner = udp.inbound_publication_owner();
+    let hard_deadline =
+        tokio::time::Instant::now() + crate::dplpmtud::DPLPMTUD_WORKER_MAX_LIFETIME;
+
+    emit_dplpmtud_timeline(
+        &peers,
+        "dplpmtud_started",
+        &identity,
+        format!(
+            "outer_ip_family={:?} base_udp_datagram_size={}",
+            identity.outer_ip_family,
+            crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
+        ),
+    );
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if *cancel_rx.borrow()
+            || now >= hard_deadline
+            || publication_owner == 0
+            || udp.inbound_publication_owner() != publication_owner
+            || udp.transport_instance_id() != identity.socket.transport_instance_id
+            || socket.local_addr().ok() != Some(identity.local_endpoint)
+            || !peers.dplpmtud_path_is_current_sync(&identity)
+        {
+            break;
+        }
+
+        if let Some(plan) =
+            runtime.schedule_probe(&peer_id, &identity, worker_owner_token, now)
+        {
+            if !runtime.outstanding_is_current(&plan) {
+                continue;
+            }
+            emit_dplpmtud_timeline(
+                &peers,
+                "dplpmtud_probe_scheduled",
+                &identity,
+                format!(
+                    "sequence={} candidate_udp_datagram_size={} deadline_ms={}",
+                    plan.probe_identity.sequence,
+                    plan.probe_identity.candidate_udp_datagram_size.0,
+                    crate::dplpmtud::DPLPMTUD_PROBE_TIMEOUT.as_millis(),
+                ),
+            );
+
+            let plaintext = crate::dplpmtud::build_encrypted_probe_plaintext(
+                local_virtual_ip,
+                peer_virtual_ip,
+                &identity,
+                &plan,
+            );
+            let send_result = match plaintext {
+                Ok(plaintext) => {
+                    let target_size = plan.probe_identity.candidate_udp_datagram_size.0 as usize;
+                    let send_udp = udp.clone();
+                    let send_socket = socket.clone();
+                    let send_runtime = runtime.clone();
+                    let send_plan = plan.clone();
+                    let send_peers = peers.clone();
+                    let send_identity = identity.clone();
+                    let remote_endpoint = identity.authenticated_remote_endpoint;
+                    transport
+                        .encrypt_and_emit_outbound_with_lock_timeout(
+                            OutboundPacket {
+                                peer_id: peer_id.clone(),
+                                dst_ip: peer_virtual_ip.to_string(),
+                                packet: plaintext,
+                                trace: None,
+                            },
+                            crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
+                            move |encrypted| async move {
+                                if encrypted.wire_bytes.len() != target_size {
+                                    return Err(DaemonError::Network(format!(
+                                        "DPLPMTUD encrypted datagram size mismatch: built={} expected={target_size}",
+                                        encrypted.wire_bytes.len(),
+                                    )));
+                                }
+                                if send_udp.inbound_publication_owner() != publication_owner
+                                    || !send_peers
+                                        .dplpmtud_path_is_current_sync(&send_identity)
+                                    || send_socket.local_addr().ok()
+                                        != Some(send_identity.local_endpoint)
+                                    || !send_runtime.begin_probe_send(
+                                        &send_plan,
+                                        tokio::time::Instant::now(),
+                                    )
+                                {
+                                    return Err(DaemonError::Network(
+                                        "DPLPMTUD exact path was cancelled before UDP send"
+                                            .to_string(),
+                                    ));
+                                }
+                                send_udp
+                                    .send_encrypted_packet_on_socket(
+                                        &send_socket,
+                                        send_identity.socket.socket_index,
+                                        &encrypted,
+                                        remote_endpoint,
+                                    )
+                                    .await
+                                    .map(|_| ())
+                            },
+                        )
+                        .await
+                }
+                Err(error) => Err(DaemonError::Network(error)),
+            };
+
+            match send_result {
+                Ok(crate::transport::BoundedEmitOutcome::Sent) => {
+                    runtime.finish_probe_send(&plan, Ok(()), tokio::time::Instant::now());
+                    emit_dplpmtud_timeline(
+                        &peers,
+                        "dplpmtud_probe_sent",
+                        &identity,
+                        format!(
+                            "sequence={} candidate_udp_datagram_size={}",
+                            plan.probe_identity.sequence,
+                            plan.probe_identity.candidate_udp_datagram_size.0,
+                        ),
+                    );
+                }
+                Ok(
+                    crate::transport::BoundedEmitOutcome::LockTimeout
+                    | crate::transport::BoundedEmitOutcome::SessionUnavailable,
+                )
+                | Err(_) => {
+                    runtime.finish_probe_send(&plan, Err(()), tokio::time::Instant::now());
+                    emit_dplpmtud_timeline(
+                        &peers,
+                        "dplpmtud_probe_send_failed",
+                        &identity,
+                        format!(
+                            "sequence={} candidate_udp_datagram_size={}",
+                            plan.probe_identity.sequence,
+                            plan.probe_identity.candidate_udp_datagram_size.0,
+                        ),
+                    );
+                }
+            }
+            continue;
+        }
+
+        let Some((state, wakeup, outstanding)) =
+            runtime.worker_state(&peer_id, &identity, worker_owner_token)
+        else {
+            break;
+        };
+        if matches!(
+            state,
+            crate::dplpmtud::DplpmtudState::Disabled
+                | crate::dplpmtud::DplpmtudState::Unsupported
+        ) {
+            break;
+        }
+
+        let wait_until = wakeup.unwrap_or(hard_deadline).min(hard_deadline);
+        if state == crate::dplpmtud::DplpmtudState::SearchComplete {
+            emit_dplpmtud_timeline(
+                &peers,
+                "dplpmtud_raise_timer_started",
+                &identity,
+                format!(
+                    "raise_in_ms={}",
+                    wait_until
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis()
+                ),
+            );
+        }
+        tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow_and_update() {
+                    break;
+                }
+            }
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep_until(wait_until) => {
+                if let Some(outstanding) = outstanding {
+                    let plan = crate::dplpmtud::DplpmtudProbePlan {
+                        peer_id: peer_id.clone(),
+                        worker_owner_token,
+                        path_identity: identity.clone(),
+                        probe_identity: outstanding,
+                        wire_token: crate::dplpmtud::DplpmtudWireToken {
+                            sequence: outstanding.sequence,
+                            nonce: outstanding.nonce,
+                            path_cookie: outstanding.path_cookie,
+                            network_generation: identity.epoch.network_generation,
+                            peer_session_generation: identity.epoch.peer_session_generation.value(),
+                            remote_candidate_epoch: identity.epoch.remote_candidate_epoch,
+                            direct_validation_owner_token: identity.direct_validation_owner_token,
+                            direct_validation_request_id: identity.direct_validation_request_id,
+                            candidate_udp_datagram_size: outstanding.candidate_udp_datagram_size,
+                            outer_ip_family: identity.outer_ip_family,
+                        },
+                        deadline: wait_until,
+                    };
+                    if runtime.timeout_probe(&plan, tokio::time::Instant::now())
+                        == crate::dplpmtud::DplpmtudTransitionDecision::Applied
+                    {
+                        let snapshot = runtime.snapshots().remove(&peer_id);
+                        emit_dplpmtud_timeline(
+                            &peers,
+                            "dplpmtud_probe_timeout",
+                            &identity,
+                            format!(
+                                "sequence={} candidate_udp_datagram_size={} confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
+                                outstanding.sequence,
+                                outstanding.candidate_udp_datagram_size.0,
+                                snapshot.as_ref().map_or(0, |value| value.confirmed_udp_datagram_size),
+                                snapshot.as_ref().map_or(0, |value| value.search_upper_udp_datagram_size),
+                            ),
+                        );
+                        emit_dplpmtud_timeline(
+                            &peers,
+                            "dplpmtud_search_bounds_updated",
+                            &identity,
+                            format!(
+                                "confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
+                                snapshot.as_ref().map_or(0, |value| value.confirmed_udp_datagram_size),
+                                snapshot.as_ref().map_or(0, |value| value.search_upper_udp_datagram_size),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    runtime.finish_worker(&peer_id, &identity, worker_owner_token);
+    emit_dplpmtud_timeline(
+        &peers,
+        "dplpmtud_cancelled",
+        &identity,
+        "worker exited after cancellation, lifecycle change, publication replacement, or intrinsic deadline",
+    );
+}
+
+async fn run_dplpmtud_scheduler_until_cancelled(
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let ingress = udp.dplpmtud_worker_ingress();
+    let mut path_changes = peers.subscribe_committed_business_path_changes();
+    let mut workers = tokio::task::JoinSet::new();
+    udp.reconcile_dplpmtud_paths().await;
+
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            break;
+        }
+        tokio::select! {
+            start = ingress.next() => {
+                let worker_udp = udp.clone();
+                let worker_peers = peers.clone();
+                let worker_transport = transport.clone();
+                workers.spawn(async move {
+                    run_dplpmtud_worker(start, worker_udp, worker_peers, worker_transport).await;
+                });
+            }
+            changed = path_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                udp.reconcile_dplpmtud_paths().await;
+            }
+            joined = workers.join_next(), if !workers.is_empty() => {
+                if let Some(Err(error)) = joined {
+                    debug!(?error, "DPLPMTUD worker stopped unexpectedly");
+                }
+                udp.reconcile_dplpmtud_paths().await;
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow_and_update() {
+                    break;
+                }
+            }
+        }
+    }
+
+    udp.dplpmtud_runtime().close(
+        "udp_transport_scheduler_stopped",
+        tokio::time::Instant::now(),
+    );
+    workers.abort_all();
+    while workers.join_next().await.is_some() {}
+}
+
+async fn stop_dplpmtud_scheduler_worker(mut worker: tokio::task::JoinHandle<()>) {
+    if timeout(Duration::from_secs(1), &mut worker).await.is_err() {
+        worker.abort();
+        let _ = worker.await;
     }
 }
 

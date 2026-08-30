@@ -45,6 +45,7 @@ impl PeerManager {
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             network_epoch_gate: Arc::new(tokio::sync::Mutex::new(())),
             direct_validation_registry: Arc::new(RwLock::new(None)),
+            dplpmtud_runtime: Arc::new(RwLock::new(None)),
             local_nat_profile: Arc::new(RwLock::new(None)),
             local_profile_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             local_interface_networks: Arc::new(RwLock::new(Vec::new())),
@@ -518,6 +519,93 @@ impl PeerManager {
         }
     }
 
+    /// Publish the DPLPMTUD runtime owned by the active UDP transport.
+    /// Replacing a transport closes every old worker before the new handle is
+    /// visible, so a rebound socket cannot reuse a stale Probe/ACK identity.
+    pub(crate) async fn register_dplpmtud_runtime(
+        &self,
+        runtime: crate::dplpmtud::DplpmtudRuntime,
+    ) {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        let previous = self.dplpmtud_runtime.write().await.replace(runtime);
+        if let Some(previous) = previous {
+            previous.close(
+                "udp_transport_replaced",
+                tokio::time::Instant::now(),
+            );
+        }
+    }
+
+    pub(crate) async fn current_dplpmtud_runtime(
+        &self,
+    ) -> Option<crate::dplpmtud::DplpmtudRuntime> {
+        self.dplpmtud_runtime.read().await.clone()
+    }
+
+    /// Cancel the current exact-path worker at a peer lifecycle boundary.
+    pub(crate) async fn cancel_active_dplpmtud_for_peer(
+        &self,
+        peer_id: &str,
+        reason: &str,
+    ) {
+        let epoch_gate = self.network_epoch_gate();
+        let _epoch_guard = epoch_gate.lock().await;
+        if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
+            runtime.cancel_peer(peer_id, reason, tokio::time::Instant::now());
+        }
+    }
+
+    /// Candidate publication already owns `network_epoch_gate`; do not acquire
+    /// it again here.
+    pub(crate) async fn cancel_dplpmtud_for_remote_candidate_change(
+        &self,
+        peer_id: &str,
+    ) {
+        if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
+            runtime.cancel_peer(
+                peer_id,
+                "remote_candidate_generation_changed",
+                tokio::time::Instant::now(),
+            );
+        }
+    }
+
+    /// Exact no-await fence used immediately before a Probe send and while an
+    /// ACK is consumed.  The state-machine snapshot is the active-path
+    /// authority; the Direct-pair mirror additionally binds the local socket
+    /// endpoint committed by the encrypted validation transaction.
+    pub(crate) fn dplpmtud_path_is_current_sync(
+        &self,
+        identity: &crate::dplpmtud::DplpmtudPathIdentity,
+    ) -> bool {
+        let committed = self
+            .committed_business_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&identity.peer_id)
+            .cloned();
+        let Some(committed) = committed else {
+            return false;
+        };
+        if !identity.matches_committed_path(
+            committed.lifecycle,
+            committed.epoch,
+            &committed.active,
+        ) {
+            return false;
+        }
+        self.direct_commit_pair_mirror
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&identity.peer_id)
+            .is_some_and(|pair| {
+                pair.generation == identity.epoch.network_generation
+                    && pair.remote_candidate_epoch == identity.epoch.remote_candidate_epoch
+                    && pair.local_endpoint == Some(identity.local_endpoint)
+            })
+    }
+
     /// Whether a peer connection currently exists, readable without awaiting
     /// or contending on the async connection map.
     ///
@@ -666,6 +754,13 @@ impl PeerManager {
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry.cancel_before_generation(generation).await;
         }
+        if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
+            runtime.cancel_before_network_generation(
+                generation,
+                "network_generation_advanced",
+                tokio::time::Instant::now(),
+            );
+        }
 
         let mut direct_reclaim_count = 0usize;
         let mut relay_confirmation_cancellations = Vec::new();
@@ -742,6 +837,13 @@ impl PeerManager {
         };
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry.cancel_before_generation(generation).await;
+        }
+        if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
+            runtime.cancel_before_network_generation(
+                generation,
+                "candidate_refresh_generation_advanced",
+                tokio::time::Instant::now(),
+            );
         }
 
         let mut retained_confirmed_direct_count = 0usize;
