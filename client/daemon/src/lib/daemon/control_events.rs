@@ -82,6 +82,9 @@ fn responder_offer_error_is_retryable(error: &DaemonError) -> bool {
             error,
             DaemonError::Network(reason)
                 if reason == REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT
+                    || reason == REASON_RESPONDER_SESSION_STAGE_TIMEOUT
+                    || reason == REASON_RESPONDER_PROBE_BINDING_CONTENDED
+                    || reason == REASON_RESPONDER_COMMIT_CONTENDED
         )
 }
 
@@ -90,6 +93,15 @@ fn responder_offer_error_reason_code(error: &DaemonError) -> &'static str {
         DaemonError::ControlPlane(_) => "control_plane_error",
         DaemonError::Network(reason) if reason == REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT => {
             REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT
+        }
+        DaemonError::Network(reason) if reason == REASON_RESPONDER_SESSION_STAGE_TIMEOUT => {
+            REASON_RESPONDER_SESSION_STAGE_TIMEOUT
+        }
+        DaemonError::Network(reason) if reason == REASON_RESPONDER_PROBE_BINDING_CONTENDED => {
+            REASON_RESPONDER_PROBE_BINDING_CONTENDED
+        }
+        DaemonError::Network(reason) if reason == REASON_RESPONDER_COMMIT_CONTENDED => {
+            REASON_RESPONDER_COMMIT_CONTENDED
         }
         _ => "responder_offer_error",
     }

@@ -390,10 +390,24 @@ impl Daemon {
         let handshake_token = session_id
             .clone()
             .unwrap_or_else(|| format!("legacy-wg-{}", initiation.sender_index));
+        let responder_network_generation = expected_network_generation
+            .unwrap_or_else(|| self.peers.current_network_generation_sync());
+        let responder_peer_session_generation = expected_peer_session_generation
+            .or_else(|| self.peers.peer_session_generation_sync(from_node_id))
+            .ok_or_else(|| {
+                DaemonError::Peer(format!(
+                    "refusing WireGuard offer from {from_node_id}: peer lifecycle is not registered"
+                ))
+            })?;
+        let responder_lifecycle = ResponderHandshakeLifecycle {
+            network_generation: responder_network_generation,
+            peer_session_generation: responder_peer_session_generation,
+        };
         let cached = {
             self.pending_handshakes.lock().responder_cache_lookup(
                 from_node_id,
                 &handshake_token,
+                responder_lifecycle,
                 handshake_init,
                 modern_probe_public_key.as_deref(),
                 &expected_peer_public,
@@ -403,6 +417,7 @@ impl Daemon {
             ResponderHandshakeCacheLookup::Hit(_) => "hit",
             ResponderHandshakeCacheLookup::Miss => "miss",
             ResponderHandshakeCacheLookup::FingerprintMismatch => "fingerprint_mismatch",
+            ResponderHandshakeCacheLookup::StaleLifecycle => "stale_lifecycle",
         };
         self.timeline.emit(
             "peer_offer_responder_cache_lookup",
@@ -434,6 +449,11 @@ impl Daemon {
             ResponderHandshakeCacheLookup::FingerprintMismatch => {
                 return Err(DaemonError::Peer(format!(
                     "refusing WireGuard offer from {from_node_id}: reused session token has different handshake or Probe key material"
+                )));
+            }
+            ResponderHandshakeCacheLookup::StaleLifecycle => {
+                return Err(DaemonError::Peer(format!(
+                    "refusing WireGuard offer from {from_node_id}: cached responder transaction belongs to a retired lifecycle"
                 )));
             }
             ResponderHandshakeCacheLookup::Miss => {
@@ -557,6 +577,7 @@ impl Daemon {
                     };
                 let response_bytes = response.to_bytes();
                 let cache_entry = CachedResponderHandshake {
+                    lifecycle: responder_lifecycle,
                     handshake_init: handshake_init.to_vec(),
                     initiator_static_public_key: expected_peer_public,
                     request_probe_ephemeral_public_key: modern_probe_public_key.clone(),
@@ -591,6 +612,22 @@ impl Daemon {
         {
             return Ok(());
         }
+
+        // Commit the exact authenticated response before any try-only
+        // transport/connection mutation. A connection writer can be
+        // temporarily unavailable after the Noise timestamp is consumed;
+        // retaining these exact bytes and keys makes that outcome retryable
+        // instead of turning the next copy into a replay rejection. The cache
+        // carries both local lifecycle generations, so a stale retry cannot
+        // cross a handover or same-node leave/rejoin.
+        if let Some(cache_entry) = cache_entry_to_commit {
+            self.pending_handshakes.lock().cache_responder_handshake(
+                from_node_id,
+                &handshake_token,
+                cache_entry,
+            );
+        }
+
         let superseded_initiator_token = {
             let mut state = self.pending_handshakes.lock();
             let token = state.session_id(from_node_id).map(str::to_string);
@@ -600,9 +637,20 @@ impl Daemon {
             token
         };
         if let Some(token) = superseded_initiator_token {
-            self.peers
-                .discard_pending_probe_session_binding(from_node_id, &token)
-                .await;
+            let cleanup = self
+                .peers
+                .try_discard_pending_probe_session_binding(from_node_id, &token);
+            self.timeline.emit(
+                "peer_offer_superseded_probe_binding_cleanup",
+                None,
+                cleanup
+                    .is_none()
+                    .then_some("connection_writer_contended"),
+                Some(format!(
+                    "peer={from_node_id} generation={responder_network_generation} cleaned={} queued_writer=false",
+                    cleanup.unwrap_or(false)
+                )),
+            );
         }
 
         // Stage the responder key and its Probe binding as short per-peer
@@ -629,31 +677,44 @@ impl Daemon {
                     self.peers.current_network_generation_sync()
                 )),
             );
+            if !cached_replay {
+                self.pending_handshakes
+                    .lock()
+                    .discard_responder_handshake_cache(from_node_id, &handshake_token);
+            }
             return Ok(());
         }
         let responder_transport_session = TransportSession::new(keys.clone());
-        let initial_stage = self
-            .transport
-            .stage_responder_session(
+        let initial_stage = tokio::time::timeout(
+            RESPONDER_SESSION_STAGE_TIMEOUT,
+            self.transport.stage_responder_session(
                 from_node_id.to_string(),
                 handshake_token.clone(),
                 responder_transport_session,
-            )
-            .await;
+            ),
+        )
+        .await
+        .map_err(|_| {
+            DaemonError::Network(REASON_RESPONDER_SESSION_STAGE_TIMEOUT.to_string())
+        })?;
         let (had_active, responder_staged_new) = match initial_stage {
             ResponderSessionStage::Staged { had_active } => (had_active, true),
             ResponderSessionStage::ReplayableDuplicate { had_active } if cached_replay => {
                 (had_active, false)
             }
             ResponderSessionStage::StaleDuplicate if cached_replay => {
-                match self
-                    .transport
-                    .restage_cached_responder_session(
+                match tokio::time::timeout(
+                    RESPONDER_SESSION_STAGE_TIMEOUT,
+                    self.transport.restage_cached_responder_session(
                         from_node_id.to_string(),
                         handshake_token.clone(),
                         TransportSession::new(keys.clone()),
-                    )
-                    .await
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    DaemonError::Network(REASON_RESPONDER_SESSION_STAGE_TIMEOUT.to_string())
+                })?
                 {
                     ResponderSessionStage::Staged { had_active } => (had_active, true),
                     ResponderSessionStage::ReplayableDuplicate { had_active } => {
@@ -669,6 +730,11 @@ impl Daemon {
             ResponderSessionStage::ReplayableDuplicate { .. }
             | ResponderSessionStage::StaleDuplicate
             | ResponderSessionStage::Busy => {
+                if !cached_replay {
+                    self.pending_handshakes
+                        .lock()
+                        .discard_responder_handshake_cache(from_node_id, &handshake_token);
+                }
                 return Err(DaemonError::Peer(format!(
                     "refusing duplicate WireGuard offer token from {from_node_id}; exact cached answer is unavailable"
                 )));
@@ -676,27 +742,44 @@ impl Daemon {
         };
         let staged_probe_binding = session_id.is_some() || probe_ephemeral_shared.is_some();
         if staged_probe_binding {
-            match self
-                .peers
-                .stage_probe_session_binding(
-                    from_node_id,
-                    handshake_token.clone(),
-                    session_id.clone(),
-                    probe_ephemeral_shared,
-                    true,
-                )
-                .await
-            {
-                ProbeBindingStage::Staged => {}
-                ProbeBindingStage::ReplayableDuplicate if cached_replay => {}
-                ProbeBindingStage::StaleDuplicate
-                | ProbeBindingStage::Busy
-                | ProbeBindingStage::ReplayableDuplicate
-                | ProbeBindingStage::PeerMissing => {
+            match self.peers.try_stage_probe_session_binding(
+                from_node_id,
+                handshake_token.clone(),
+                session_id.clone(),
+                probe_ephemeral_shared,
+                true,
+            ) {
+                None => {
+                    self.timeline.emit(
+                        "peer_offer_responder_probe_binding_contended",
+                        None,
+                        Some(REASON_RESPONDER_PROBE_BINDING_CONTENDED),
+                        Some(format!(
+                            "peer={from_node_id} generation={responder_network_generation} session_fp={} queued_writer=false exact_response_retained=true",
+                            handshake_token_fingerprint(Some(&handshake_token))
+                        )),
+                    );
+                    return Err(DaemonError::Network(
+                        REASON_RESPONDER_PROBE_BINDING_CONTENDED.to_string(),
+                    ));
+                }
+                Some(ProbeBindingStage::Staged) => {}
+                Some(ProbeBindingStage::ReplayableDuplicate) if cached_replay => {}
+                Some(
+                    ProbeBindingStage::StaleDuplicate
+                    | ProbeBindingStage::Busy
+                    | ProbeBindingStage::ReplayableDuplicate
+                    | ProbeBindingStage::PeerMissing,
+                ) => {
                     if responder_staged_new {
                         self.transport
                             .discard_responder_session(from_node_id, &handshake_token)
                             .await;
+                    }
+                    if !cached_replay {
+                        self.pending_handshakes
+                            .lock()
+                            .discard_responder_handshake_cache(from_node_id, &handshake_token);
                     }
                     return Err(DaemonError::Peer(format!(
                         "failed to stage Probe v2 responder binding for {from_node_id}"
@@ -746,18 +829,6 @@ impl Daemon {
                     .await;
             }
             return Ok(());
-        }
-
-        // Publish newly generated responder bytes only after both transport
-        // layers and the generation check accepted the offer. In particular,
-        // an old-generation offer must not leave a cache entry that can be
-        // replayed into a later session.
-        if let Some(cache_entry) = cache_entry_to_commit {
-            self.pending_handshakes.lock().cache_responder_handshake(
-                from_node_id,
-                &handshake_token,
-                cache_entry,
-            );
         }
 
         // All state required to replay/validate the response is now staged.
@@ -986,10 +1057,22 @@ impl Daemon {
                 self.peers.current_network_generation_sync()
             )),
         );
-        let emit_guard = self
+        let Some(emit_guard) = self
             .transport
-            .acquire_outbound_emit_guard(from_node_id)
-            .await;
+            .try_acquire_outbound_emit_guard(from_node_id)
+        else {
+            self.timeline.emit(
+                "peer_answer_commit_contended",
+                None,
+                Some(REASON_RESPONDER_COMMIT_CONTENDED),
+                Some(format!(
+                    "peer={from_node_id} generation={responder_network_generation} phase=emit queued=false exact_response_retained=true"
+                )),
+            );
+            return Err(DaemonError::Network(
+                REASON_RESPONDER_COMMIT_CONTENDED.to_string(),
+            ));
+        };
         self.timeline.emit(
             "peer_answer_commit_emit_lock_acquired",
             None,
@@ -1001,7 +1084,20 @@ impl Daemon {
             )),
         );
         let epoch_gate = self.peers.network_epoch_gate();
-        let epoch_guard = epoch_gate.lock().await;
+        let Ok(epoch_guard) = epoch_gate.try_lock() else {
+            drop(emit_guard);
+            self.timeline.emit(
+                "peer_answer_commit_contended",
+                None,
+                Some(REASON_RESPONDER_COMMIT_CONTENDED),
+                Some(format!(
+                    "peer={from_node_id} generation={responder_network_generation} phase=network_epoch queued=false exact_response_retained=true"
+                )),
+            );
+            return Err(DaemonError::Network(
+                REASON_RESPONDER_COMMIT_CONTENDED.to_string(),
+            ));
+        };
         if expected_network_generation
             .is_some_and(|generation| self.peers.current_network_generation_sync() != generation)
             || expected_peer_session_generation.is_some_and(|expected| {
@@ -1044,10 +1140,24 @@ impl Daemon {
                 handshake_token_fingerprint(Some(&handshake_token))
             )),
         );
-        let commit = self
+        let Some(commit) = self
             .transport
-            .commit_responder_session_locked(from_node_id, &handshake_token)
-            .await;
+            .try_commit_responder_session_locked(from_node_id, &handshake_token)
+        else {
+            drop(epoch_guard);
+            drop(emit_guard);
+            self.timeline.emit(
+                "peer_answer_commit_contended",
+                None,
+                Some(REASON_RESPONDER_COMMIT_CONTENDED),
+                Some(format!(
+                    "peer={from_node_id} generation={responder_network_generation} phase=transport_sessions queued=false exact_response_retained=true"
+                )),
+            );
+            return Err(DaemonError::Network(
+                REASON_RESPONDER_COMMIT_CONTENDED.to_string(),
+            ));
+        };
         drop(epoch_guard);
         drop(emit_guard);
         if commit == ResponderSessionCommit::ActivatedInitial {

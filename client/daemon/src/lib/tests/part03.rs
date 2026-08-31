@@ -2221,6 +2221,236 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initiator_publish_epoch_contention_releases_emit_and_retries_exact_offer() {
+    let mut control_capture = start_handshake_control_capture().await;
+    let mut config =
+        Config::generate_default(&control_capture.base_url, "initiator-epoch-contention").unwrap();
+    config.control.auth_token = "initiator-epoch-contention-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    let daemon = Arc::new(Daemon::new(config));
+    timeout(Duration::from_secs(2), control_capture.wait_registered())
+        .await
+        .expect("daemon registration must complete before epoch contention");
+
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let remote_identity = loop {
+        let identity = NodeIdentity::generate();
+        if local_public < identity.public_key() {
+            break identity;
+        }
+    };
+    let peer_info = control::PeerInfo {
+        node_id: "peer-initiator-epoch-contention".to_string(),
+        public_key: hex::encode(remote_identity.public_key()),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    daemon.peers.add_peer(&peer_info).await;
+    daemon.relay_available_tx.send_replace(true);
+
+    let epoch_gate = daemon.peers.network_epoch_gate();
+    let epoch_guard = epoch_gate.lock().await;
+    let mut reservation = daemon
+        .reserve_event_initiator_handshake(&peer_info.node_id)
+        .expect("event initiator reservation must be admitted");
+    let reservation_owner = reservation.owner;
+    let worker = {
+        let daemon = daemon.clone();
+        let peer_info = peer_info.clone();
+        tokio::spawn(async move {
+            daemon
+                .run_reserved_initiator_handshake(&peer_info, &mut reservation)
+                .await
+        })
+    };
+    let first = timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("epoch contention must not block the initiator worker")
+        .expect("initiator worker panicked")
+        .expect("epoch contention is a non-fatal publish outcome");
+    assert_eq!(first, None);
+
+    let emit_guard = daemon
+        .transport
+        .try_acquire_outbound_emit_guard(&peer_info.node_id)
+        .expect("publish retained the emit guard while the epoch was contended");
+    drop(emit_guard);
+    {
+        let state = daemon.pending_handshakes.lock();
+        assert!(state.starting_prepared.contains_key(&peer_info.node_id));
+        let retry = state
+            .initiator_retries
+            .get(&peer_info.node_id)
+            .expect("exact prepared publish retry was not retained");
+        assert_eq!(retry.identity.reservation_owner, reservation_owner);
+        assert_eq!(retry.identity.phase, InitiatorRetryPhase::Publish);
+    }
+    assert!(daemon.timeline.snapshot().events.iter().any(|event| {
+        event.event == "initiator_publish_epoch_gate_contended"
+            && event
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("queued=false"))
+    }));
+
+    drop(epoch_guard);
+    let (identity, mut retry_reservation) = daemon
+        .pending_handshakes
+        .lock()
+        .claim_ready_initiator_retry(Instant::now())
+        .expect("exact epoch-contention retry must be ready");
+    assert_eq!(identity.reservation_owner, reservation_owner);
+    let published = timeout(
+        Duration::from_secs(2),
+        daemon.run_reserved_initiator_handshake(&peer_info, &mut retry_reservation),
+    )
+    .await
+    .expect("exact publish retry stalled after epoch release")
+    .expect("exact publish retry failed");
+    assert!(published.is_some());
+    timeout(
+        Duration::from_secs(1),
+        control_capture.wait_for_signal_count(1),
+    )
+    .await
+    .expect("mock control did not receive the retried Offer");
+    let offers = control_capture
+        .signal_bodies()
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .filter(|body| body.get("type").and_then(serde_json::Value::as_str) == Some("peer_offer"))
+        .count();
+    assert_eq!(offers, 1, "the exact reservation may publish one Offer");
+
+    let session_id = {
+        let mut state = daemon.pending_handshakes.lock();
+        let session_id = state.pending_session_ids.get(&peer_info.node_id).cloned();
+        state.clear_peer(&peer_info.node_id);
+        session_id
+    };
+    if let Some(session_id) = session_id {
+        daemon
+            .peers
+            .discard_pending_probe_session_binding(&peer_info.node_id, &session_id)
+            .await;
+    }
+    control_capture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responder_probe_binding_contention_retains_exact_answer_without_queued_writer() {
+    let mut control_capture = start_handshake_control_capture().await;
+    let mut config =
+        Config::generate_default(&control_capture.base_url, "responder-binding-contention")
+            .unwrap();
+    config.control.auth_token = "responder-binding-contention-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    let daemon = Arc::new(Daemon::new(config));
+    timeout(Duration::from_secs(2), control_capture.wait_registered())
+        .await
+        .expect("daemon registration must complete before responder contention");
+
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let remote_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "peer-responder-binding-contention";
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: hex::encode(remote_identity.public_key()),
+            virtual_ip: "10.20.0.3".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    daemon.relay_available_tx.send_replace(true);
+
+    let mut remote_initiator = HandshakeInitiator::new(remote_identity, local_public, None);
+    let initiation = remote_initiator.create_initiation().unwrap().to_bytes();
+    let session_id = "responder-binding-contention-session".to_string();
+    let request_probe_public_key = hex::encode(DhKeyPair::generate().public_key());
+    let connection_guard = daemon
+        .peers
+        .connection_map_for_test()
+        .read_owned()
+        .await;
+
+    let first_error = timeout(
+        Duration::from_secs(1),
+        daemon.handle_peer_offer(
+            peer_id,
+            &[],
+            &initiation,
+            None,
+            None,
+            Some(session_id.clone()),
+            Some(request_probe_public_key.clone()),
+        ),
+    )
+    .await
+    .expect("responder queued behind the held connection reader")
+    .expect_err("connection contention must be a typed retry outcome");
+    assert!(matches!(
+        first_error,
+        DaemonError::Network(ref reason)
+            if reason == REASON_RESPONDER_PROBE_BINDING_CONTENDED
+    ));
+    assert!(
+        timeout(Duration::from_millis(100), daemon.peers.get_connection(peer_id))
+            .await
+            .expect("responder contention queued a writer and blocked a later reader")
+            .is_some()
+    );
+    assert!(
+        daemon
+            .pending_handshakes
+            .lock()
+            .responder_cache
+            .contains_key(&(peer_id.to_string(), session_id.clone())),
+        "the authenticated exact Answer must be retained before try-write contention"
+    );
+    assert!(daemon.transport.session_status(peer_id).await.has_pending_responder);
+
+    drop(connection_guard);
+    timeout(
+        Duration::from_secs(2),
+        daemon.handle_peer_offer(
+            peer_id,
+            &[],
+            &initiation,
+            None,
+            None,
+            Some(session_id),
+            Some(request_probe_public_key),
+        ),
+    )
+    .await
+    .expect("exact cached responder retry stalled after reader release")
+    .expect("exact cached responder retry failed");
+    timeout(
+        Duration::from_secs(1),
+        control_capture.wait_for_signal_count(1),
+    )
+    .await
+    .expect("mock control did not receive the retained exact Answer");
+    let answers = control_capture
+        .signal_bodies()
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .filter(|body| body.get("type").and_then(serde_json::Value::as_str) == Some("peer_answer"))
+        .count();
+    assert_eq!(answers, 1, "contention retry may publish one exact Answer");
+    assert!(daemon.transport.has_session(peer_id).await);
+    control_capture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_probe_snapshot_contention_preserves_exact_publish_retry_without_queued_writer() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
     let daemon = Arc::new(Daemon::new(config));
@@ -3601,6 +3831,10 @@ fn responder_handshake_cache_replays_exact_answer_and_rejects_token_reuse() {
         "peer-cache",
         "session-cache",
         CachedResponderHandshake {
+            lifecycle: ResponderHandshakeLifecycle {
+                network_generation: 0,
+                peer_session_generation: PeerSessionGeneration::for_test(1),
+            },
             handshake_init: initiation_bytes.clone(),
             initiator_static_public_key: initiator_public,
             request_probe_ephemeral_public_key: Some(differently_cased_probe_public_key),
@@ -3615,6 +3849,10 @@ fn responder_handshake_cache_replays_exact_answer_and_rejects_token_reuse() {
     let ResponderHandshakeCacheLookup::Hit(cached) = state.responder_cache_lookup(
         "peer-cache",
         "session-cache",
+        ResponderHandshakeLifecycle {
+            network_generation: 0,
+            peer_session_generation: PeerSessionGeneration::for_test(1),
+        },
         &initiation_bytes,
         Some(&request_probe_public_key),
         &initiator_public,
@@ -3633,6 +3871,10 @@ fn responder_handshake_cache_replays_exact_answer_and_rejects_token_reuse() {
         state.responder_cache_lookup(
             "peer-cache",
             "session-cache",
+            ResponderHandshakeLifecycle {
+                network_generation: 0,
+                peer_session_generation: PeerSessionGeneration::for_test(1),
+            },
             &mismatched,
             Some(&request_probe_public_key),
             &initiator_public,
@@ -3644,6 +3886,10 @@ fn responder_handshake_cache_replays_exact_answer_and_rejects_token_reuse() {
         state.responder_cache_lookup(
             "peer-cache",
             "session-cache",
+            ResponderHandshakeLifecycle {
+                network_generation: 0,
+                peer_session_generation: PeerSessionGeneration::for_test(1),
+            },
             &initiation.to_bytes(),
             Some(&hex::encode([0xcdu8; 32])),
             &initiator_public,
@@ -3655,12 +3901,53 @@ fn responder_handshake_cache_replays_exact_answer_and_rejects_token_reuse() {
         state.responder_cache_lookup(
             "peer-cache",
             "session-cache",
+            ResponderHandshakeLifecycle {
+                network_generation: 0,
+                peer_session_generation: PeerSessionGeneration::for_test(1),
+            },
             &initiation.to_bytes(),
             Some(&request_probe_public_key),
             &[0xee; 32],
         ),
         ResponderHandshakeCacheLookup::FingerprintMismatch
     ));
+
+    assert!(matches!(
+        state.responder_cache_lookup(
+            "peer-cache",
+            "session-cache",
+            ResponderHandshakeLifecycle {
+                network_generation: 1,
+                peer_session_generation: PeerSessionGeneration::for_test(1),
+            },
+            &initiation.to_bytes(),
+            Some(&request_probe_public_key),
+            &initiator_public,
+        ),
+        ResponderHandshakeCacheLookup::StaleLifecycle
+    ));
+    assert!(!state
+        .responder_cache
+        .contains_key(&("peer-cache".to_string(), "session-cache".to_string())));
+
+    state.cache_responder_handshake("peer-cache", "session-cache", (*cached).clone());
+    assert!(matches!(
+        state.responder_cache_lookup(
+            "peer-cache",
+            "session-cache",
+            ResponderHandshakeLifecycle {
+                network_generation: 0,
+                peer_session_generation: PeerSessionGeneration::for_test(2),
+            },
+            &initiation.to_bytes(),
+            Some(&request_probe_public_key),
+            &initiator_public,
+        ),
+        ResponderHandshakeCacheLookup::StaleLifecycle
+    ));
+    assert!(!state
+        .responder_cache
+        .contains_key(&("peer-cache".to_string(), "session-cache".to_string())));
 }
 
 #[test]
@@ -3723,6 +4010,10 @@ async fn responder_cache_rejects_offer_after_peer_static_key_rotation() {
             peer_id,
             token,
             CachedResponderHandshake {
+                lifecycle: ResponderHandshakeLifecycle {
+                    network_generation: 0,
+                    peer_session_generation: PeerSessionGeneration::for_test(1),
+                },
                 handshake_init: initiation_bytes.clone(),
                 initiator_static_public_key: old_public,
                 request_probe_ephemeral_public_key: Some(request_probe_public_key.clone()),
@@ -3843,6 +4134,10 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
             peer_id,
             token,
             CachedResponderHandshake {
+                lifecycle: ResponderHandshakeLifecycle {
+                    network_generation: 0,
+                    peer_session_generation: PeerSessionGeneration::for_test(1),
+                },
                 handshake_init: offer_bytes.clone(),
                 initiator_static_public_key: offer_public,
                 request_probe_ephemeral_public_key: Some(request_probe_public_key.clone()),
@@ -4877,7 +5172,7 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
         tokio::task::yield_now().await;
     }
     assert!(daemon.peers.try_all_connections().is_none());
-    let contended_status = timeout(Duration::from_millis(250), fetch_status(diag_address))
+    let contended_status = timeout(Duration::from_secs(1), fetch_status(diag_address))
         .await
         .expect("/status waited behind the fairly queued connection writer");
     assert!(contended_status.starts_with("HTTP/1.1 200 OK"));

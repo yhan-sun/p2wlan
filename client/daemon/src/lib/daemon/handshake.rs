@@ -387,6 +387,11 @@ impl HandshakeArbiter {
 /// offer when this bound is hit.
 const RESPONDER_HANDSHAKE_ARBITER_TIMEOUT: Duration = Duration::from_millis(750);
 const REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT: &str = "responder_handshake_arbiter_timeout";
+const RESPONDER_SESSION_STAGE_TIMEOUT: Duration = Duration::from_millis(750);
+const REASON_RESPONDER_SESSION_STAGE_TIMEOUT: &str = "responder_session_stage_timeout";
+const REASON_RESPONDER_PROBE_BINDING_CONTENDED: &str =
+    "responder_probe_binding_connections_contended";
+const REASON_RESPONDER_COMMIT_CONTENDED: &str = "responder_answer_commit_contended";
 const INITIATOR_ANSWER_HANDSHAKE_ARBITER_TIMEOUT: Duration = Duration::from_millis(100);
 /// Correlate one control-plane session without writing the raw session token
 /// to logs. This uses the existing local diagnostic fingerprint only; it is

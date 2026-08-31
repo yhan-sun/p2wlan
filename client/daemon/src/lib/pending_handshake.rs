@@ -1,5 +1,15 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResponderHandshakeLifecycle {
+    network_generation: u64,
+    peer_session_generation: PeerSessionGeneration,
+}
+
 #[derive(Clone)]
 struct CachedResponderHandshake {
+    /// Exact local lifecycle which authenticated and prepared this response.
+    /// A token replay after a network handover or same-node leave/rejoin must
+    /// not reuse receive keys from the retired responder transaction.
+    lifecycle: ResponderHandshakeLifecycle,
     handshake_init: Vec<u8>,
     /// Static Noise/WireGuard public key authenticated by this initiation.
     /// Cache replay is valid only while the node ID still maps to this key.
@@ -19,6 +29,7 @@ enum ResponderHandshakeCacheLookup {
     Miss,
     Hit(Box<CachedResponderHandshake>),
     FingerprintMismatch,
+    StaleLifecycle,
 }
 
 /// A peer offer admitted to the single responder worker for that peer.
@@ -970,6 +981,7 @@ impl PendingHandshakeState {
         &mut self,
         peer_id: &str,
         token: &str,
+        lifecycle: ResponderHandshakeLifecycle,
         handshake_init: &[u8],
         request_probe_ephemeral_public_key: Option<&str>,
         expected_initiator_static_public_key: &[u8; 32],
@@ -981,6 +993,10 @@ impl PendingHandshakeState {
         let Some(cached) = self.responder_cache.get(&key) else {
             return ResponderHandshakeCacheLookup::Miss;
         };
+        if cached.lifecycle != lifecycle {
+            self.responder_cache.remove(&key);
+            return ResponderHandshakeCacheLookup::StaleLifecycle;
+        }
         let request_probe_ephemeral_public_key =
             normalize_probe_ephemeral_public_key(request_probe_ephemeral_public_key);
         if cached.handshake_init != handshake_init
@@ -1003,6 +1019,11 @@ impl PendingHandshakeState {
         );
         self.responder_cache
             .insert((peer_id.to_string(), token.to_string()), cached);
+    }
+
+    fn discard_responder_handshake_cache(&mut self, peer_id: &str, token: &str) {
+        self.responder_cache
+            .remove(&(peer_id.to_string(), token.to_string()));
     }
 
     fn responder_timestamp_floor(

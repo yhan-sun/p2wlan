@@ -198,6 +198,31 @@ impl Daemon {
         true
     }
 
+    /// Put an exact prepared initiation back under its reservation before
+    /// publishing the retry edge. Every publish-side contention path uses
+    /// this helper so taking the prepared value out of the short state turn
+    /// can never create a lost wake or regenerate Noise/Probe key material.
+    fn retain_prepared_initiator_publish_retry(
+        &self,
+        peer_id: &str,
+        reservation: &mut HandshakeStartReservation,
+        prepared: PreparedInitiatorHandshake,
+        reason_code: &'static str,
+    ) {
+        if self
+            .pending_handshakes
+            .lock()
+            .store_prepared_if_current(peer_id, reservation, prepared)
+        {
+            self.schedule_initiator_retry(
+                peer_id,
+                reservation,
+                InitiatorRetryPhase::Publish,
+                reason_code,
+            );
+        }
+    }
+
     /// Complete an initiator handshake after the control event loop has
     /// atomically admitted a reservation for this peer.
     ///
@@ -487,54 +512,102 @@ impl Daemon {
             probe_ephemeral,
             probe_ephemeral_public_key,
         } = prepared;
-        let binding_contentions = 0u32;
+        let publish_attempt = reservation.retry_attempt;
         let (attempt_no, pending_id) = {
             // The outbound worker establishes the canonical lifecycle order
-            // `emit -> generation -> session/connection`. The connection
-            // mutation itself is non-blocking while these outer guards are
-            // held; contention restores the exact prepared initiation into
-            // the bounded retry ledger before waking its supervised owner.
-            let emit_wait_started = Instant::now();
+            // `emit -> generation -> session/connection`. Every acquisition
+            // after the short emit-registry lookup is try-only. Contention
+            // restores the exact prepared initiation before waking the
+            // supervised retry owner, so the emit fence can never be held
+            // while waiting for epoch/session/connection state.
             self.timeline.emit(
                 "initiator_publish_emit_lock_wait",
                 None,
                 None,
                 Some(format!(
-                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions}",
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} wait_budget_us=0",
                     reservation.owner
                 )),
             );
-            let emit_guard = self.transport.acquire_outbound_emit_guard(&peer_id).await;
+            let Some(emit_guard) = self.transport.try_acquire_outbound_emit_guard(&peer_id) else {
+                self.timeline.emit(
+                    "initiator_publish_emit_lock_contended",
+                    None,
+                    Some("emit_guard_contended"),
+                    Some(format!(
+                        "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} queued=false",
+                        reservation.owner
+                    )),
+                );
+                self.retain_prepared_initiator_publish_retry(
+                    &peer_id,
+                    reservation,
+                    PreparedInitiatorHandshake {
+                        initiator,
+                        initiation_bytes,
+                        candidates,
+                        candidate_sources,
+                        session_id,
+                        probe_ephemeral,
+                        probe_ephemeral_public_key,
+                    },
+                    "emit_guard_contended",
+                );
+                return Ok(None);
+            };
             self.timeline.emit(
                 "initiator_publish_emit_lock_acquired",
                 None,
                 None,
                 Some(format!(
-                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} wait_ms={}",
-                    reservation.owner,
-                    emit_wait_started.elapsed().as_millis()
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} wait_us=0",
+                    reservation.owner
                 )),
             );
             let epoch_gate = self.peers.network_epoch_gate();
-            let epoch_wait_started = Instant::now();
             self.timeline.emit(
                 "initiator_publish_epoch_gate_wait",
                 None,
                 None,
                 Some(format!(
-                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions}",
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} wait_budget_us=0",
                     reservation.owner
                 )),
             );
-            let epoch_guard = epoch_gate.lock().await;
+            let Ok(epoch_guard) = epoch_gate.try_lock() else {
+                self.timeline.emit(
+                    "initiator_publish_epoch_gate_contended",
+                    None,
+                    Some("network_epoch_contended"),
+                    Some(format!(
+                        "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} queued=false",
+                        reservation.owner
+                    )),
+                );
+                drop(emit_guard);
+                self.retain_prepared_initiator_publish_retry(
+                    &peer_id,
+                    reservation,
+                    PreparedInitiatorHandshake {
+                        initiator,
+                        initiation_bytes,
+                        candidates,
+                        candidate_sources,
+                        session_id,
+                        probe_ephemeral,
+                        probe_ephemeral_public_key,
+                    },
+                    "network_epoch_contended",
+                );
+                return Ok(None);
+            };
             self.timeline.emit(
                 "initiator_publish_epoch_gate_acquired",
                 None,
                 None,
                 Some(format!(
-                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} wait_ms={}",
-                    reservation.owner,
-                    epoch_wait_started.elapsed().as_millis()
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} wait_us=0",
+                    reservation.owner
                 )),
             );
             if *reservation.cancellation.borrow()
@@ -551,13 +624,40 @@ impl Daemon {
                     .cancel_reservation_if_current(&peer_id, reservation.owner);
                 return Ok(None);
             }
-            let status = self.transport.session_status(&peer_id).await;
+            let Some(status) = self.transport.try_session_status(&peer_id) else {
+                self.timeline.emit(
+                    "initiator_publish_session_status_contended",
+                    None,
+                    Some("transport_sessions_contended"),
+                    Some(format!(
+                        "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} queued=false",
+                        reservation.owner
+                    )),
+                );
+                drop(epoch_guard);
+                drop(emit_guard);
+                self.retain_prepared_initiator_publish_retry(
+                    &peer_id,
+                    reservation,
+                    PreparedInitiatorHandshake {
+                        initiator,
+                        initiation_bytes,
+                        candidates,
+                        candidate_sources,
+                        session_id,
+                        probe_ephemeral,
+                        probe_ephemeral_public_key,
+                    },
+                    "transport_sessions_contended",
+                );
+                return Ok(None);
+            };
             self.timeline.emit(
                 "initiator_publish_session_status_ready",
                 None,
                 None,
                 Some(format!(
-                    "peer={peer_id} owner={} generation={handshake_generation} retry={binding_contentions} has_active={} has_pending_responder={}",
+                    "peer={peer_id} owner={} generation={handshake_generation} retry={publish_attempt} has_active={} has_pending_responder={}",
                     reservation.owner, status.has_active, status.has_pending_responder
                 )),
             );
@@ -579,7 +679,7 @@ impl Daemon {
             );
             match stage {
                 None => {
-                    let binding_contentions = binding_contentions.saturating_add(1);
+                    let binding_contentions = publish_attempt.saturating_add(1);
                     self.timeline.emit(
                         "initiator_publish_probe_binding_contended",
                         None,
@@ -591,30 +691,23 @@ impl Daemon {
                     );
                     drop(epoch_guard);
                     drop(emit_guard);
-                    let prepared = PreparedInitiatorHandshake {
-                        initiator,
-                        initiation_bytes,
-                        candidates,
-                        candidate_sources,
-                        session_id,
-                        probe_ephemeral,
-                        probe_ephemeral_public_key,
-                    };
-                    if self.pending_handshakes.lock().store_prepared_if_current(
+                    self.retain_prepared_initiator_publish_retry(
                         &peer_id,
                         reservation,
-                        prepared,
-                    ) {
-                        self.schedule_initiator_retry(
-                            &peer_id,
-                            reservation,
-                            InitiatorRetryPhase::Publish,
-                            "connection_writer_contended",
-                        );
-                    }
+                        PreparedInitiatorHandshake {
+                            initiator,
+                            initiation_bytes,
+                            candidates,
+                            candidate_sources,
+                            session_id,
+                            probe_ephemeral,
+                            probe_ephemeral_public_key,
+                        },
+                        "connection_writer_contended",
+                    );
                     return Ok(None);
                 }
-                Some(ProbeBindingStage::Staged) => {
+                Some(ProbeBindingStage::Staged | ProbeBindingStage::ReplayableDuplicate) => {
                     let mut initiator = Some(initiator);
                     let mut probe_ephemeral = Some(probe_ephemeral);
                     let insert_transaction = self.pending_handshakes.try_with(|state| {
@@ -637,38 +730,27 @@ impl Daemon {
                     let Some(inserted) = insert_transaction else {
                         drop(epoch_guard);
                         drop(emit_guard);
-                        self.peers
-                            .discard_pending_probe_session_binding(&peer_id, &session_id)
-                            .await;
-                        let prepared = PreparedInitiatorHandshake {
-                            initiator: initiator.take().expect("unconsumed initiator"),
-                            initiation_bytes,
-                            candidates,
-                            candidate_sources,
-                            session_id,
-                            probe_ephemeral: probe_ephemeral.take().expect("unconsumed Probe key"),
-                            probe_ephemeral_public_key,
-                        };
-                        if self.pending_handshakes.lock().store_prepared_if_current(
+                        self.retain_prepared_initiator_publish_retry(
                             &peer_id,
                             reservation,
-                            prepared,
-                        ) {
-                            self.schedule_initiator_retry(
-                                &peer_id,
-                                reservation,
-                                InitiatorRetryPhase::Publish,
-                                "pending_state_contended",
-                            );
-                        }
+                            PreparedInitiatorHandshake {
+                                initiator: initiator.take().expect("unconsumed initiator"),
+                                initiation_bytes,
+                                candidates,
+                                candidate_sources,
+                                session_id,
+                                probe_ephemeral: probe_ephemeral
+                                    .take()
+                                    .expect("unconsumed Probe key"),
+                                probe_ephemeral_public_key,
+                            },
+                            "pending_state_contended",
+                        );
                         return Ok(None);
                     };
                     let Some((attempt_no, pending_id)) = inserted else {
                         drop(epoch_guard);
                         drop(emit_guard);
-                        self.peers
-                            .discard_pending_probe_session_binding(&peer_id, &session_id)
-                            .await;
                         return Ok(None);
                     };
                     self.timeline.emit(
@@ -676,7 +758,7 @@ impl Daemon {
                         None,
                         None,
                         Some(format!(
-                            "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id} retries={binding_contentions}",
+                            "peer={peer_id} owner={} generation={handshake_generation} pending_id={pending_id} retries={publish_attempt}",
                             reservation.owner
                         )),
                     );

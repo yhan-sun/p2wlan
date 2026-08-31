@@ -1452,8 +1452,33 @@ impl WireGuardTransport {
         peer_id: &str,
         token: &str,
     ) -> ResponderSessionCommit {
-        let now = Instant::now();
         let mut sessions = self.sessions.lock().await;
+        Self::commit_responder_session_in(&mut sessions, peer_id, token, Instant::now())
+    }
+
+    /// Try-only responder commit used while the handshake owns both the peer
+    /// emit fence and the network epoch. A busy session actor is a typed retry
+    /// outcome; it must never become an `emit -> epoch -> sessions` waiter.
+    pub(crate) fn try_commit_responder_session_locked(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> Option<ResponderSessionCommit> {
+        let mut sessions = self.sessions.try_lock().ok()?;
+        Some(Self::commit_responder_session_in(
+            &mut sessions,
+            peer_id,
+            token,
+            Instant::now(),
+        ))
+    }
+
+    fn commit_responder_session_in(
+        sessions: &mut HashMap<String, PeerTransportSessions>,
+        peer_id: &str,
+        token: &str,
+        now: Instant,
+    ) -> ResponderSessionCommit {
         let Some(existing) = sessions.get_mut(peer_id) else {
             return ResponderSessionCommit::Missing;
         };
@@ -1940,6 +1965,21 @@ impl WireGuardTransport {
         status
     }
 
+    /// Read the active/pending session state without joining the session
+    /// mutex wait queue. Handshake publication calls this while it owns the
+    /// per-peer emit fence; returning `None` lets the exact prepared
+    /// transaction retry after releasing that fence instead of creating an
+    /// `emit -> sessions` wait edge.
+    pub(crate) fn try_session_status(&self, peer_id: &str) -> Option<TransportSessionStatus> {
+        let now = Instant::now();
+        let mut sessions = self.sessions.try_lock().ok()?;
+        let Some(existing) = sessions.get_mut(peer_id) else {
+            return Some(TransportSessionStatus::default());
+        };
+        existing.prepare_active(now);
+        Some(existing.status())
+    }
+
     /// Return whether a peer's session needs rekey.
     pub async fn session_needs_rekey(&self, peer_id: &str) -> bool {
         self.session_status(peer_id).await.needs_rekey
@@ -2012,6 +2052,17 @@ impl WireGuardTransport {
     /// `emit -> epoch -> sessions`.
     pub(crate) async fn acquire_outbound_emit_guard(&self, peer_id: &str) -> OwnedMutexGuard<()> {
         self.outbound_emit_lock(peer_id).await.lock_owned().await
+    }
+
+    /// Try to enter the per-peer counter-ordering boundary without waiting
+    /// behind either the lock registry or business/control emission. Any
+    /// contention is reported to the caller so it can retain exact work in
+    /// its bounded ledger.
+    pub(crate) fn try_acquire_outbound_emit_guard(
+        &self,
+        peer_id: &str,
+    ) -> Option<OwnedMutexGuard<()>> {
+        self.try_outbound_emit_lock(peer_id)?.try_lock_owned().ok()
     }
 
     /// Encrypt while the caller already owns the peer's emit guard.  Keeping
@@ -2148,6 +2199,18 @@ impl WireGuardTransport {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
         lock
+    }
+
+    fn try_outbound_emit_lock(&self, peer_id: &str) -> Option<Arc<Mutex<()>>> {
+        let mut locks = self.outbound_emit_locks.try_lock().ok()?;
+        if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
+            return Some(lock);
+        }
+
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
+        Some(lock)
     }
 
     async fn outbound_ingress_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {

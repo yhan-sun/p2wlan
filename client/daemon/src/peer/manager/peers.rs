@@ -1295,6 +1295,7 @@ impl PeerManager {
     /// responder marks its staged key promotable by authenticated inbound
     /// traffic; an initiator waits for the matching answer and installs it
     /// explicitly.
+    #[cfg(test)]
     pub(crate) async fn stage_probe_session_binding(
         &self,
         node_id: &str,
@@ -1421,6 +1422,27 @@ impl PeerManager {
         }
         conn.pending_probe_bindings.remove(token);
         true
+    }
+
+    /// Roll back an unpublished Probe-v2 replacement without entering the
+    /// fair connection-writer queue. `None` means the caller must leave the
+    /// exact token to its bounded TTL or retry the cleanup from an owning
+    /// lifecycle worker; it must not turn cleanup into a global reader gate.
+    pub(crate) fn try_discard_pending_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> Option<bool> {
+        let mut conns = self.connections.try_write().ok()?;
+        let Some(conn) = conns.get_mut(node_id) else {
+            return Some(true);
+        };
+        prune_probe_session_bindings(conn, Instant::now());
+        if conn.probe_binding_token.as_deref() == Some(token) {
+            return Some(false);
+        }
+        conn.pending_probe_bindings.remove(token);
+        Some(true)
     }
 
     /// Promote a responder's staged Probe-v2 binding after a packet validates
