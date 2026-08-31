@@ -2,6 +2,12 @@
 // Peer Manager
 // ============================================================
 
+type NetworkGenerationHandshakeCancellation = (usize, usize, Vec<(String, String)>);
+type NetworkGenerationHandshakeCancelHook =
+    Arc<dyn Fn(u64) -> NetworkGenerationHandshakeCancellation + Send + Sync>;
+type NetworkGenerationHandshakeCancelHookSlot =
+    Arc<std::sync::Mutex<Option<NetworkGenerationHandshakeCancelHook>>>;
+
 /// The local, non-wire identity fence for one Hard↔Hard rendezvous.
 ///
 /// The session id alone is not sufficient: a late response from an older
@@ -334,6 +340,10 @@ pub struct PeerManager {
     /// advances between the read and the lock would let a stale entry pass the
     /// check).
     network_generation_sync: Arc<std::sync::atomic::AtomicU64>,
+    /// Nonblocking daemon hook that cancels exact handshake reservations from
+    /// older generations in the same generation-advance transaction.  The
+    /// hook performs only a short synchronous pending-state mutation.
+    network_generation_handshake_cancel_hook: NetworkGenerationHandshakeCancelHookSlot,
     /// Shared network-epoch gate serializing every generation advance against
     /// every UDP socket-state mutation that stamps, commits, finalizes or
     /// adopts socket ownership for a generation.

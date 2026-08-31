@@ -21,7 +21,7 @@ pub struct Daemon {
     /// business packets).
     outbound_rx: Option<mpsc::Receiver<OutboundPacket>>,
     /// In-flight initiator handshakes keyed by responder node ID (shared so timeout tasks can clean up).
-    pending_handshakes: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
+    pending_handshakes: Arc<PendingHandshakeStore>,
     /// Serializes offer, answer, and maintenance mutations for one peer.
     handshake_arbiter: HandshakeArbiter,
     #[cfg(test)]
@@ -100,10 +100,13 @@ pub struct Daemon {
     /// polling at a fixed interval.
     relay_available_tx: watch::Sender<bool>,
     /// Shared event edge for forced Relay probing and encrypted-session
-    /// maintenance. A bounded initiator connection-writer timeout bumps this
-    /// edge after cancelling its reservation, so the failed setup is retried
-    /// by the normal maintenance owner instead of remaining silently lost.
+    /// maintenance. Relay availability and authenticated data-plane activity
+    /// bump this edge so a missing encrypted session is reconsidered promptly.
     path_setup_kick_tx: watch::Sender<u64>,
+    /// Commit-before-wake edge for exact initiator preparation/publication
+    /// retries.  The serial control owner consumes it; maintenance periodically
+    /// republishes the current revision as a lost-wakeup backstop.
+    handshake_retry_kick_tx: watch::Sender<u64>,
     /// Android's VpnService establishes the TUN before the Rust daemon starts.
     #[cfg(target_os = "android")]
     android_tun_fd: Option<std::os::fd::RawFd>,
@@ -183,6 +186,8 @@ impl Daemon {
         let udp_transport = Arc::new(RwLock::new(None));
         let (relay_available_tx, _relay_available_rx) = tokio::sync::watch::channel(false);
         let (path_setup_kick_tx, _path_setup_kick_rx) = tokio::sync::watch::channel(0u64);
+        let (handshake_retry_kick_tx, _handshake_retry_kick_rx) =
+            tokio::sync::watch::channel(0u64);
 
         // Register the punch-session canceller on the peer manager so a
         // stale/404 quarantined peer's in-flight recovery session is
@@ -190,6 +195,7 @@ impl Daemon {
         // the same deduplicator the daemon hands to the punch tasks).
         let punch_attempts = PunchAttemptDeduplicator::default();
         let peers = Arc::new(PeerManager::new(config.clone()));
+        let pending_handshakes = Arc::new(PendingHandshakeStore::default());
         peers.set_timeline(timeline.clone());
         transport.set_outbound_loss_context(&peers, timeline.clone());
         // Share ONE outbound-loss counter map between the peer manager (worker
@@ -207,6 +213,31 @@ impl Daemon {
                 punch_attempts.cancel(peer_id);
             }));
         }
+        {
+            let pending_handshakes = pending_handshakes.clone();
+            let timeline = timeline.clone();
+            peers.set_network_generation_handshake_cancel_hook(Arc::new(move |generation| {
+                let (cancelled_reservations, cancelled_pending, stale_probe_bindings) =
+                    pending_handshakes
+                    .lock()
+                    .cancel_before_network_generation(generation);
+                if cancelled_reservations > 0 || cancelled_pending > 0 {
+                    timeline.emit(
+                        "handshake_reservations_cancelled_for_generation",
+                        None,
+                        Some("network_generation_advanced"),
+                        Some(format!(
+                            "generation={generation} cancelled_reservations={cancelled_reservations} cancelled_pending={cancelled_pending}"
+                        )),
+                    );
+                }
+                (
+                    cancelled_reservations,
+                    cancelled_pending,
+                    stale_probe_bindings,
+                )
+            }));
+        }
 
         Self {
             config: Arc::new(config.clone()),
@@ -215,8 +246,8 @@ impl Daemon {
             peers,
             transport,
             outbound_rx: Some(outbound_rx),
-            pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
-            handshake_arbiter: HandshakeArbiter::default(),
+            pending_handshakes,
+            handshake_arbiter: HandshakeArbiter::new(timeline.clone()),
             #[cfg(test)]
             responder_post_answer_test_gate: Arc::new(std::sync::Mutex::new(None)),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
@@ -254,6 +285,7 @@ impl Daemon {
             status_events,
             relay_available_tx,
             path_setup_kick_tx,
+            handshake_retry_kick_tx,
             #[cfg(target_os = "android")]
             android_tun_fd: None,
             #[cfg(target_os = "android")]

@@ -43,6 +43,7 @@ impl PeerManager {
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            network_generation_handshake_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
             network_epoch_gate: Arc::new(tokio::sync::Mutex::new(())),
             direct_validation_registry: Arc::new(RwLock::new(None)),
             dplpmtud_runtime: Arc::new(RwLock::new(None)),
@@ -761,6 +762,8 @@ impl PeerManager {
                 .store(*generation, std::sync::atomic::Ordering::Release);
             *generation
         };
+        let stale_handshake_probe_bindings =
+            self.cancel_handshakes_before_network_generation(generation);
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry.cancel_before_generation(generation).await;
         }
@@ -775,6 +778,11 @@ impl PeerManager {
         let mut direct_reclaim_count = 0usize;
         let mut relay_confirmation_cancellations = Vec::new();
         let mut conns = self.connections.write().await;
+        for (peer_id, token) in stale_handshake_probe_bindings {
+            if let Some(conn) = conns.get_mut(&peer_id) {
+                conn.pending_probe_bindings.remove(&token);
+            }
+        }
         for conn in conns.values_mut() {
             let Some(peer_session_generation) =
                 self.peer_session_generation_any_sync(&conn.node_id)
@@ -821,6 +829,33 @@ impl PeerManager {
         generation
     }
 
+    /// Install the daemon-owned short transaction that retires handshake
+    /// reservations when the local network generation advances.
+    pub(crate) fn set_network_generation_handshake_cancel_hook(
+        &self,
+        hook: NetworkGenerationHandshakeCancelHook,
+    ) {
+        *self
+            .network_generation_handshake_cancel_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    fn cancel_handshakes_before_network_generation(
+        &self,
+        generation: u64,
+    ) -> Vec<(String, String)> {
+        let hook = self
+            .network_generation_handshake_cancel_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        hook.map_or_else(Vec::new, |cancel_stale_handshakes| {
+            let (_, _, stale_probe_bindings) = cancel_stale_handshakes(generation);
+            stale_probe_bindings
+        })
+    }
+
     /// Advance local generation after a candidate refresh.
     ///
     /// Unlike a true interface transition, a periodic candidate refresh may
@@ -845,6 +880,8 @@ impl PeerManager {
                 .store(*generation, std::sync::atomic::Ordering::Release);
             *generation
         };
+        let stale_handshake_probe_bindings =
+            self.cancel_handshakes_before_network_generation(generation);
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry.cancel_before_generation(generation).await;
         }
@@ -859,6 +896,11 @@ impl PeerManager {
         let mut retained_confirmed_direct_count = 0usize;
         let mut direct_reclaim_count = 0usize;
         let mut conns = self.connections.write().await;
+        for (peer_id, token) in stale_handshake_probe_bindings {
+            if let Some(conn) = conns.get_mut(&peer_id) {
+                conn.pending_probe_bindings.remove(&token);
+            }
+        }
         for conn in conns.values_mut() {
             let Some(peer_session_generation) =
                 self.peer_session_generation_any_sync(&conn.node_id)

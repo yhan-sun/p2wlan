@@ -33,6 +33,152 @@ async fn part03_outbound_transport(
     (transport, outbound_rx, remote_session)
 }
 
+struct HandshakeControlCapture {
+    base_url: String,
+    registered_rx: watch::Receiver<bool>,
+    signal_revision_rx: watch::Receiver<u64>,
+    signal_bodies: Arc<std::sync::Mutex<Vec<String>>>,
+    shutdown_tx: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HandshakeControlCapture {
+    async fn wait_registered(&mut self) {
+        while !*self.registered_rx.borrow() {
+            self.registered_rx
+                .changed()
+                .await
+                .expect("handshake control capture stopped before registration");
+        }
+    }
+
+    async fn wait_for_signal_count(&mut self, expected: usize) {
+        while self
+            .signal_bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            < expected
+        {
+            self.signal_revision_rx
+                .changed()
+                .await
+                .expect("handshake control capture stopped before signal delivery");
+        }
+    }
+
+    fn signal_bodies(&self) -> Vec<String> {
+        self.signal_bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn stop(self) {
+        self.shutdown_tx.send_replace(true);
+        self.task
+            .await
+            .expect("handshake control capture task panicked");
+    }
+}
+
+async fn start_handshake_control_capture() -> HandshakeControlCapture {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (registered_tx, registered_rx) = watch::channel(false);
+    let (signal_revision_tx, signal_revision_rx) = watch::channel(0u64);
+    let signal_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let server_bodies = signal_bodies.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let Ok((mut stream, _)) = accepted else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    break None;
+                };
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(position) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                {
+                    break Some(position + 4);
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).into_owned();
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = String::from_utf8_lossy(
+                &request[header_end..request.len().min(header_end + content_length)],
+            )
+            .into_owned();
+            let response_body = if head.contains("/api/v1/devices") {
+                registered_tx.send_replace(true);
+                r#"{"success":true,"node_id":"node-local","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#
+            } else if head.starts_with("POST") && head.contains("/api/v1/signals") {
+                let revision = {
+                    let mut bodies = server_bodies
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    bodies.push(body);
+                    bodies.len() as u64
+                };
+                signal_revision_tx.send_replace(revision);
+                r#"{"success":true,"protocol_version":1}"#
+            } else {
+                r#"{"signals":[],"server_time_ms":0}"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    HandshakeControlCapture {
+        base_url,
+        registered_rx,
+        signal_revision_rx,
+        signal_bodies,
+        shutdown_tx,
+        task,
+    }
+}
+
 #[tokio::test]
 async fn relay_supervisor_reconnects_after_stream_closes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -333,7 +479,7 @@ async fn initiator_rekey_keeps_peer_in_direct_state() {
         .consume_initiation_and_respond(&initiation)
         .unwrap();
     {
-        let mut state = daemon.pending_handshakes.lock().await;
+        let mut state = daemon.pending_handshakes.lock();
         state.insert(peer_id.to_string(), initiator, None, None);
     }
 
@@ -414,7 +560,6 @@ async fn peer_answer_from_new_remote_incarnation_rebinds_pending_initiator() {
     daemon
         .pending_handshakes
         .lock()
-        .await
         .insert_with_generation(
             peer_id.to_string(),
             initiator,
@@ -437,7 +582,7 @@ async fn peer_answer_from_new_remote_incarnation_rebinds_pending_initiator() {
     let new_peer_session_generation = daemon.peers.peer_session_generation_sync(peer_id).unwrap();
     assert_ne!(new_peer_session_generation, old_peer_session_generation);
     {
-        let pending = daemon.pending_handshakes.lock().await;
+        let pending = daemon.pending_handshakes.lock();
         assert!(pending.pending.contains_key(peer_id));
         assert_eq!(
             pending.peer_session_generation(peer_id),
@@ -557,10 +702,21 @@ async fn responder_remote_incarnation_reset_does_not_self_lock_lifecycle_arbiter
 
     let lifecycle_guard = timeout(
         Duration::from_millis(500),
-        daemon.handshake_arbiter.acquire(peer_id),
+        daemon.handshake_arbiter.acquire_with_timeout(
+            HandshakeLeaseIdentity::new(
+                peer_id,
+                HandshakeOwnerKind::Cleanup,
+                None,
+                daemon.peers.current_network_generation_sync(),
+                daemon.peers.peer_session_generation_sync(peer_id),
+                "test_reset_probe",
+            ),
+            Duration::from_millis(100),
+        ),
     )
     .await
-    .expect("responder reset retained an unpolled lifecycle-arbiter owner");
+    .expect("responder reset retained an unpolled lifecycle-arbiter owner")
+    .expect("lifecycle mutation turn remained contended");
     drop(lifecycle_guard);
     assert!(timeout(Duration::from_millis(500), &mut reset)
         .await
@@ -700,7 +856,7 @@ async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
     let initiation = initiator.create_initiation().unwrap();
 
     {
-        let mut state = daemon.pending_handshakes.lock().await;
+        let mut state = daemon.pending_handshakes.lock();
         state.insert(peer_id.to_string(), initiator, None, None);
         state.attempts.insert(peer_id.to_string(), 1);
     }
@@ -716,7 +872,7 @@ async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
         .await
         .unwrap();
 
-    let state = daemon.pending_handshakes.lock().await;
+    let state = daemon.pending_handshakes.lock();
     assert!(state.pending.contains_key(peer_id));
     assert_eq!(state.attempts.get(peer_id), Some(&1));
 }
@@ -753,24 +909,34 @@ async fn wireguard_answer_from_previous_network_generation_cannot_install_sessio
         .consume_initiation_and_respond(&initiation)
         .unwrap();
 
+    let (pending_cancellation_tx, mut pending_cancellation) = watch::channel(false);
     {
-        let mut state = daemon.pending_handshakes.lock().await;
+        let mut state = daemon.pending_handshakes.lock();
         state.insert_with_generation(
             peer_id.to_string(),
             initiator,
             None,
             None,
-            None,
+            Some(pending_cancellation_tx),
             0,
-            PeerSessionGeneration::for_test(1),
+            daemon.peers.peer_session_generation_sync(peer_id).unwrap(),
         );
     }
     assert_eq!(
         daemon
             .peers
             .advance_network_generation("late handshake answer test")
-            .await,
+        .await,
         1
+    );
+    assert!(*pending_cancellation.borrow_and_update());
+    assert!(
+        !daemon
+            .pending_handshakes
+            .lock()
+            .pending
+            .contains_key(peer_id),
+        "the generation transaction must synchronously cancel the old pending owner"
     );
 
     daemon
@@ -779,13 +945,12 @@ async fn wireguard_answer_from_previous_network_generation_cannot_install_sessio
         .unwrap();
 
     assert!(
-        daemon
+        !daemon
             .pending_handshakes
             .lock()
-            .await
             .pending
             .contains_key(peer_id),
-        "a stale answer must not consume the pending transaction"
+        "a stale answer must not recreate the cancelled pending transaction"
     );
     assert!(
         !daemon.transport.has_session(peer_id).await,
@@ -817,7 +982,6 @@ async fn responder_offer_from_previous_network_generation_cannot_stage_session()
     let (reservation, offer) = daemon
         .pending_handshakes
         .lock()
-        .await
         .enqueue_responder_work(offer)
         .expect("the offer must acquire a responder worker");
 
@@ -889,7 +1053,7 @@ async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() 
         .unwrap();
     let session_id = "modern-session".to_string();
     {
-        let mut state = daemon.pending_handshakes.lock().await;
+        let mut state = daemon.pending_handshakes.lock();
         state.insert(
             peer_id.to_string(),
             new_initiator,
@@ -910,7 +1074,7 @@ async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() 
             .await
             .unwrap();
 
-        let state = daemon.pending_handshakes.lock().await;
+        let state = daemon.pending_handshakes.lock();
         assert!(state.pending.contains_key(peer_id));
         assert!(state.pending_probe_ephemeral.contains_key(peer_id));
         assert_eq!(state.attempts.get(peer_id), Some(&2));
@@ -1006,7 +1170,6 @@ async fn modern_offer_rejects_missing_or_malformed_probe_ephemeral_key() {
     assert!(daemon
         .pending_handshakes
         .lock()
-        .await
         .responder_cache
         .is_empty());
     let status = daemon.transport.session_status(peer_id).await;
@@ -1085,6 +1248,47 @@ fn handshake_reservation_commit_requires_exact_peer_lifecycle() {
         "a failed stale commit must not consume or rewrite the live reservation"
     );
     assert!(!state.pending.contains_key(peer_id));
+}
+
+#[test]
+fn stale_handshake_pending_owner_cannot_remove_replacement_transaction() {
+    let mut state = PendingHandshakeState::default();
+    let peer_id = "peer-pending-owner-replacement";
+    let remote_identity = NodeIdentity::generate();
+    let old_reservation = state.reserve_start_with_owner(peer_id).unwrap();
+    let old_pending_id = state
+        .insert_reserved_if_current(
+            peer_id.to_string(),
+            old_reservation.owner,
+            HandshakeInitiator::new(
+                NodeIdentity::generate(),
+                remote_identity.public_key(),
+                None,
+            ),
+            Some("old-pending-token".to_string()),
+            None,
+        )
+        .unwrap();
+    state.remove(peer_id);
+
+    let replacement_reservation = state.reserve_start_with_owner(peer_id).unwrap();
+    let replacement_pending_id = state
+        .insert_reserved_if_current(
+            peer_id.to_string(),
+            replacement_reservation.owner,
+            HandshakeInitiator::new(
+                NodeIdentity::generate(),
+                remote_identity.public_key(),
+                None,
+            ),
+            Some("replacement-pending-token".to_string()),
+            None,
+        )
+        .unwrap();
+
+    assert!(!state.remove_if_current(peer_id, old_pending_id));
+    assert!(state.is_current(peer_id, replacement_pending_id));
+    assert_eq!(state.session_id(peer_id), Some("replacement-pending-token"));
 }
 
 #[test]
@@ -1342,7 +1546,6 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
     let (reservation, offer) = daemon
         .pending_handshakes
         .lock()
-        .await
         .enqueue_responder_work(offer)
         .expect("unknown offer must acquire one deferred owner");
 
@@ -1377,7 +1580,6 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
     assert!(!daemon
         .pending_handshakes
         .lock()
-        .await
         .responder_workers
         .contains_key(peer_id));
 }
@@ -1522,11 +1724,12 @@ async fn last_seen_only_peer_update_refreshes_diagnostics_without_handshake_rese
     // worker. The fixed branch returns immediately after `add_peer`.
     sleep(Duration::from_millis(25)).await;
 
-    let state = pending.lock().await;
-    assert!(!state.starting.contains(peer_id));
-    assert!(!state.pending.contains_key(peer_id));
-    assert!(!state.attempts.contains_key(peer_id));
-    drop(state);
+    {
+        let state = pending.lock();
+        assert!(!state.starting.contains(peer_id));
+        assert!(!state.pending.contains_key(peer_id));
+        assert!(!state.attempts.contains_key(peer_id));
+    }
     assert_eq!(
         peers.peer_session_generation_sync(peer_id),
         Some(lifecycle),
@@ -1579,7 +1782,6 @@ async fn control_event_loop_processes_peer_answer_while_peer_reflexive_work_wait
     daemon
         .pending_handshakes
         .lock()
-        .await
         .insert(peer_id.to_string(), initiator, None, None);
 
     let candidate_refresh_lock = daemon.candidate_refresh_lock.clone();
@@ -1851,7 +2053,6 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
     let candidate_guard = candidate_refresh_lock.lock().await;
     let mut reservation = daemon
         .reserve_event_initiator_handshake(&peer_info.node_id)
-        .await
         .expect("event initiator reservation must be admitted");
     let mut worker =
         Box::pin(daemon.run_reserved_initiator_handshake(&peer_info, &mut reservation));
@@ -1866,18 +2067,24 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
         }
     })
     .await;
-    let guard = tokio::time::timeout(
-        Duration::from_millis(100),
-        daemon.handshake_arbiter.acquire(&peer_info.node_id),
-    )
-    .await
-    .expect("arbiter must be free while candidate gathering waits");
+    let guard = daemon
+        .handshake_arbiter
+        .try_acquire(HandshakeLeaseIdentity::new(
+            &peer_info.node_id,
+            HandshakeOwnerKind::Responder,
+            None,
+            daemon.peers.current_network_generation_sync(),
+            daemon
+                .peers
+                .peer_session_generation_sync(&peer_info.node_id),
+            "candidate_wait_probe",
+        ))
+        .expect("arbiter must be free while candidate gathering waits");
     drop(guard);
 
     daemon
         .pending_handshakes
         .lock()
-        .await
         .clear_peer(&peer_info.node_id);
     drop(candidate_guard);
     tokio::time::timeout(Duration::from_secs(1), &mut worker)
@@ -1889,7 +2096,7 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
 #[tokio::test]
 async fn initiator_publish_releases_epoch_while_connection_writer_is_contended() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
-    let daemon = Daemon::new(config);
+    let daemon = Arc::new(Daemon::new(config));
     let local_public = daemon.local_identity().unwrap().public_key();
     let peer_identity = loop {
         let identity = NodeIdentity::generate();
@@ -1914,13 +2121,13 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
 
     let mut reservation = daemon
         .reserve_event_initiator_handshake(&peer_info.node_id)
-        .await
         .expect("event initiator reservation must be admitted");
     let peers = daemon.peers.clone();
     let pending = daemon.pending_handshakes.clone();
     let timeline = daemon.timeline.clone();
     let peer_id = peer_info.node_id.clone();
-    let mut reschedule_rx = daemon.path_setup_kick_tx.subscribe();
+    let mut retry_rx = daemon.handshake_retry_kick_tx.subscribe();
+    let reservation_owner = reservation.owner;
 
     // A candidate/connection reader is sufficient to make Probe-binding
     // staging need the connection writer. The old publish path inserted its
@@ -1928,9 +2135,11 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
     // emit and network-epoch guards, completing an ABBA cycle with lifecycle
     // work that needed the epoch before it could release the connection map.
     let connection_guard = peers.connection_map_for_test().read_owned().await;
+    let worker_daemon = daemon.clone();
+    let worker_peer = peer_info.clone();
     let worker = tokio::spawn(async move {
-        daemon
-            .run_reserved_initiator_handshake(&peer_info, &mut reservation)
+        worker_daemon
+            .run_reserved_initiator_handshake(&worker_peer, &mut reservation)
             .await
     });
 
@@ -1951,7 +2160,7 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
     .expect("initiator must report connection-writer contention");
 
     assert!(
-        !pending.lock().await.pending.contains_key(&peer_id),
+        !pending.lock().pending.contains_key(&peer_id),
         "an initiator must not become pending before its Probe binding is staged"
     );
     let epoch_gate = peers.network_epoch_gate();
@@ -1967,29 +2176,52 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
         .expect("connection contention is a non-fatal initiator outcome");
     assert_eq!(result, None);
 
+    {
+        let state = pending.lock();
+        assert!(state.starting.contains(&peer_id));
+        assert!(state.starting_prepared.contains_key(&peer_id));
+        assert!(state.initiator_retries.contains_key(&peer_id));
+    }
+
     drop(connection_guard);
-    tokio::time::timeout(Duration::from_secs(1), reschedule_rx.changed())
+    tokio::time::timeout(Duration::from_secs(1), retry_rx.changed())
         .await
-        .expect("writer availability must publish a maintenance reschedule edge")
-        .expect("path-setup reschedule sender must stay live");
+        .expect("contention must publish an exact retry edge")
+        .expect("handshake retry sender must stay live");
     assert!(timeline.snapshot().events.iter().any(|event| {
-        event.event == "initiator_publish_probe_binding_writer_available"
+        event.event == "initiator_handshake_retry_scheduled"
             && event
                 .detail
                 .as_deref()
-                .is_some_and(|detail| detail.contains("reschedule_kick="))
+                .is_some_and(|detail| detail.contains("phase=publish"))
     }));
-    let state = pending.lock().await;
-    assert!(!state.pending.contains_key(&peer_id));
-    assert!(!state.starting.contains(&peer_id));
+    let (identity, mut retry_reservation) = pending
+        .lock()
+        .claim_ready_initiator_retry(Instant::now())
+        .expect("exact retry must be ready after contention");
+    assert_eq!(identity.reservation_owner, reservation_owner);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        daemon.run_reserved_initiator_handshake(&peer_info, &mut retry_reservation),
+    )
+    .await
+    .expect("exact prepared initiation retry must not stall");
+    let session_id = {
+        let mut state = pending.lock();
+        let session_id = state.pending_session_ids.get(&peer_id).cloned();
+        state.clear_peer(&peer_id);
+        session_id
+    };
+    if let Some(session_id) = session_id {
+        daemon
+            .peers
+            .discard_pending_probe_session_binding(&peer_id, &session_id)
+            .await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_probe_snapshot_contention_detaches_writer_wait_unblocks_readers_and_reschedules_initiator(
-) {
-    use std::future::Future;
-    use std::task::Poll;
-
+async fn relay_probe_snapshot_contention_preserves_exact_publish_retry_without_queued_writer() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
     let daemon = Arc::new(Daemon::new(config));
     let local_public = daemon.local_identity().unwrap().public_key();
@@ -2014,9 +2246,6 @@ async fn relay_probe_snapshot_contention_detaches_writer_wait_unblocks_readers_a
     daemon.peers.add_peer(&peer_info).await;
     daemon.relay_available_tx.send_replace(true);
 
-    // Reproduce the production startup actor, not a synthetic lock owner: the
-    // forced-Relay target scan has acquired its real connection snapshot when
-    // the initiator reaches atomic Probe-binding publication.
     let relay_snapshot_gate = Arc::new(crate::peer::RelayProbeSnapshotTestGate::new());
     daemon.peers.install_relay_probe_snapshot_gate_for_test(
         &peer_info.node_id,
@@ -2031,190 +2260,99 @@ async fn relay_probe_snapshot_contention_detaches_writer_wait_unblocks_readers_a
     .await
     .expect("the real relay target snapshot must own the connection reader");
 
-    let mut reschedule_rx = daemon.path_setup_kick_tx.subscribe();
+    let mut retry_rx = daemon.handshake_retry_kick_tx.subscribe();
     let mut reservation = daemon
         .reserve_event_initiator_handshake(&peer_info.node_id)
-        .await
         .expect("event initiator reservation must be admitted");
-    let mut worker = Box::pin(
+    let reservation_owner = reservation.owner;
+    let cancellation_generation = reservation.cancellation_generation;
+    let first_result = tokio::time::timeout(
+        Duration::from_secs(1),
         daemon.run_reserved_initiator_handshake(&peer_info, &mut reservation),
-    );
-
-    // Poll the cooperative slow-work future only until it queues the writer.
-    // The production failure kept the writer and its timeout inside this
-    // future, so its first Pending at this point let a later control-loop
-    // branch wait behind that same writer forever. The fixed future transfers
-    // ownership to an independently scheduled bounded task and is Ready in
-    // the very poll that records contention.
-    let first_result = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let polled = std::future::poll_fn(|context| {
-                Poll::Ready(worker.as_mut().poll(context))
-            })
-            .await;
-            let writer_scheduled = daemon
-                .timeline
-                .snapshot()
-                .events
-                .iter()
-                .any(|event| event.event == "initiator_publish_probe_binding_writer_wait");
-            match polled {
-                Poll::Ready(result) => {
-                    assert!(
-                        writer_scheduled,
-                        "initiator completed before exercising writer contention"
-                    );
-                    break result;
-                }
-                Poll::Pending if writer_scheduled => {
-                    panic!(
-                        "cooperative initiator retained the queued writer waiter and its timeout"
-                    );
-                }
-                Poll::Pending => tokio::task::yield_now().await,
-            }
-        }
-    })
+    )
     .await
-    .expect("initiator must reach writer contention")
+    .expect("initiator must return immediately on connection contention")
     .expect("connection contention is a non-fatal initiator outcome");
     assert_eq!(first_result, None);
-    drop(worker);
     assert_eq!(
         reservation.disposition,
-        HandshakeStartDisposition::ProbeBindingRetryDeferred
+        HandshakeStartDisposition::RetryScheduled
     );
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if daemon.timeline.snapshot().events.iter().any(|event| {
-                event.event == "initiator_publish_probe_binding_writer_wait_started"
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached writer waiter must start independently");
-
-    // The writer barrier must own no upper guard while queued.
-    let epoch_gate = daemon.peers.network_epoch_gate();
-    let epoch_guard = tokio::time::timeout(Duration::from_millis(100), epoch_gate.lock())
-        .await
-        .expect("writer wait must not retain the network epoch guard");
-    drop(epoch_guard);
-    let emit_guard = tokio::time::timeout(
+    // A try-write must never enter Tokio's writer queue.  A later reader can
+    // therefore complete while the original Relay snapshot is still held.
+    assert!(tokio::time::timeout(
         Duration::from_millis(100),
-        daemon
-            .transport
-            .acquire_outbound_emit_guard(&peer_info.node_id),
+        daemon.peers.get_connection(&peer_info.node_id),
     )
-        .await
-        .expect("writer wait must not retain the outbound emit guard");
-    drop(emit_guard);
+    .await
+    .expect("connection contention queued a writer and blocked a later reader")
+    .is_some());
 
-    // Tokio queues this real status read behind the waiting writer. The old
-    // unbounded barrier left it there until /status returned 503.
-    let mut status_read = {
-        let queue_deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            let status_peers = daemon.peers.clone();
-            let status_peer_id = peer_info.node_id.clone();
-            let mut candidate = tokio::spawn(async move {
-                status_peers.get_connection(&status_peer_id).await
-            });
-            if tokio::time::timeout(Duration::from_millis(10), &mut candidate)
-                .await
-                .is_err()
-            {
-                break candidate;
-            }
-            assert!(
-                Instant::now() < queue_deadline,
-                "the detached connection writer never entered Tokio's fair queue"
-            );
-            tokio::task::yield_now().await;
-        }
-    };
-
-    tokio::time::timeout(Duration::from_secs(1), reschedule_rx.changed())
+    {
+        let state = daemon.pending_handshakes.lock();
+        assert!(!state.pending.contains_key(&peer_info.node_id));
+        assert!(state.starting.contains(&peer_info.node_id));
+        assert!(state.starting_prepared.contains_key(&peer_info.node_id));
+        assert_eq!(state.initiator_retries.len(), 1);
+        let retry = state
+            .initiator_retries
+            .get(&peer_info.node_id)
+            .expect("exact publish retry must be retained");
+        assert_eq!(retry.identity.reservation_owner, reservation_owner);
+        assert_eq!(
+            retry.identity.cancellation_generation,
+            cancellation_generation
+        );
+        assert_eq!(retry.identity.phase, InitiatorRetryPhase::Publish);
+    }
+    tokio::time::timeout(Duration::from_secs(1), retry_rx.changed())
         .await
-        .expect("bounded writer timeout must publish a maintenance reschedule edge")
-        .expect("path-setup reschedule sender must stay live");
-    // Cancellation of the timed-out writer removes it from the fair queue;
-    // readers can progress even while the original Relay snapshot is still
-    // deliberately alive.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut status_read)
-            .await
-            .expect("status read must resume when the timed-out writer is removed")
-            .expect("status task must not panic")
-            .is_some()
-    );
-    let state = daemon.pending_handshakes.lock().await;
-    assert!(
-        !state.pending.contains_key(&peer_info.node_id),
-        "timed-out publication must not publish a pending initiator"
-    );
-    assert!(
-        !state.starting.contains(&peer_info.node_id),
-        "timed-out publication must cancel its reservation atomically"
-    );
-    drop(state);
-    let timeout_event = daemon
-        .timeline
-        .snapshot()
-        .events
-        .into_iter()
-        .find(|event| event.event == "initiator_publish_probe_binding_writer_timeout")
-        .expect("timeout must have a structured timeline diagnostic");
-    assert_eq!(
-        timeout_event.reason_code.as_deref(),
-        Some(REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT)
-    );
-    assert!(timeout_event
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail.contains("timeout_ms=250")
-            && detail.contains("reschedule_kick=")));
+        .expect("exact retry wake must be published after the state commit")
+        .expect("retry coordinator must stay live");
 
     relay_snapshot_gate.release.notify_one();
-    let targets = tokio::time::timeout(Duration::from_secs(1), relay_targets)
+    tokio::time::timeout(Duration::from_secs(1), relay_targets)
         .await
         .expect("relay target scan must resume")
         .expect("relay target task must not panic");
-    assert!(targets
-        .iter()
-        .any(|(peer_id, _, _)| peer_id == &peer_info.node_id));
 
-    // Consume the reschedule edge the same way maintenance does: a fresh
-    // reservation succeeds once the real Relay reader has left the map.
-    let mut retry_reservation = daemon
-        .reserve_event_initiator_handshake(&peer_info.node_id)
-        .await
-        .expect("rescheduled initiator must obtain a fresh reservation");
+    let (retry_identity, mut retry_reservation) = daemon
+        .pending_handshakes
+        .lock()
+        .claim_ready_initiator_retry(Instant::now())
+        .expect("the exact retry must be claimable");
+    assert_eq!(retry_identity.reservation_owner, reservation_owner);
+    assert_eq!(
+        retry_identity.cancellation_generation,
+        cancellation_generation
+    );
     let _retry_result = tokio::time::timeout(
         Duration::from_secs(2),
         daemon.run_reserved_initiator_handshake(&peer_info, &mut retry_reservation),
     )
     .await
-    .expect("rescheduled initiator must not stall");
-    assert!(daemon.timeline.snapshot().events.iter().any(|event| {
-        event.event == "initiator_publish_probe_binding_staged"
-            && event
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains(&peer_info.node_id))
-    }));
+    .expect("exact prepared publication retry must not stall");
+
+    let staged_count = daemon
+        .timeline
+        .snapshot()
+        .events
+        .iter()
+        .filter(|event| {
+            event.event == "initiator_session_staged"
+                && event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains(&peer_info.node_id))
+        })
+        .count();
+    assert_eq!(staged_count, 1, "the exact owner may stage only one Offer");
 
     let session_id = {
-        let mut state = daemon.pending_handshakes.lock().await;
-        let session_id = state
-            .pending_session_ids
-            .get(&peer_info.node_id)
-            .cloned();
-        state.remove(&peer_info.node_id);
+        let mut state = daemon.pending_handshakes.lock();
+        let session_id = state.pending_session_ids.get(&peer_info.node_id).cloned();
+        state.clear_peer(&peer_info.node_id);
         session_id
     };
     if let Some(session_id) = session_id {
@@ -2224,14 +2362,13 @@ async fn relay_probe_snapshot_contention_detaches_writer_wait_unblocks_readers_a
             .await;
     }
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn detached_probe_binding_writer_wait_cancels_without_stale_reschedule() {
+#[tokio::test]
+async fn exact_handshake_retry_cancellation_is_merged_and_stale_wake_is_harmless() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
-    let daemon = Arc::new(Daemon::new(config));
+    let daemon = Daemon::new(config);
     let peer_identity = NodeIdentity::generate();
     let peer_info = control::PeerInfo {
-        node_id: "peer-cancelled-detached-writer".to_string(),
+        node_id: "peer-cancelled-exact-retry".to_string(),
         device_name: String::new(),
         app_version: String::new(),
         public_key: hex::encode(peer_identity.public_key()),
@@ -2244,91 +2381,60 @@ async fn detached_probe_binding_writer_wait_cancels_without_stale_reschedule() {
     };
     daemon.peers.add_peer(&peer_info).await;
 
-    let reservation = daemon
+    let mut retry_rx = daemon.handshake_retry_kick_tx.subscribe();
+    let mut reservation = daemon
         .reserve_event_initiator_handshake(&peer_info.node_id)
-        .await
         .expect("event initiator reservation must be admitted");
-    let connection_guard = daemon
-        .peers
-        .connection_map_for_test()
-        .read_owned()
-        .await;
-    let reschedule_rx = daemon.path_setup_kick_tx.subscribe();
-    daemon.defer_initiator_probe_binding_writer_retry(
-        peer_info.node_id.clone(),
-        reservation.owner,
-        reservation.network_generation,
-        1,
-        reservation.cancellation.clone(),
-    );
+    let mut cancellation = reservation.cancellation.clone();
+    assert!(daemon.schedule_initiator_retry(
+        &peer_info.node_id,
+        &mut reservation,
+        InitiatorRetryPhase::Preparation,
+        "test_contention",
+    ));
+    assert!(daemon.schedule_initiator_retry(
+        &peer_info.node_id,
+        &mut reservation,
+        InitiatorRetryPhase::Preparation,
+        "duplicate_test_contention",
+    ));
+    tokio::time::timeout(Duration::from_secs(1), retry_rx.changed())
+        .await
+        .expect("commit-before-wake retry edge was lost")
+        .expect("retry coordinator must stay live");
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if daemon.timeline.snapshot().events.iter().any(|event| {
-                event.event == "initiator_publish_probe_binding_writer_wait_started"
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached writer waiter must start");
-
-    let mut status_read = {
-        let queue_deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            let status_peers = daemon.peers.clone();
-            let status_peer_id = peer_info.node_id.clone();
-            let mut candidate = tokio::spawn(async move {
-                status_peers.get_connection(&status_peer_id).await
-            });
-            if tokio::time::timeout(Duration::from_millis(10), &mut candidate)
-                .await
-                .is_err()
-            {
-                break candidate;
-            }
-            assert!(
-                Instant::now() < queue_deadline,
-                "the detached connection writer never entered Tokio's fair queue"
-            );
-            tokio::task::yield_now().await;
-        }
+    let retry_revision = {
+        let state = daemon.pending_handshakes.lock();
+        assert_eq!(state.initiator_retries.len(), 1);
+        let retry = state
+            .initiator_retries
+            .get(&peer_info.node_id)
+            .expect("newest exact retry must remain");
+        assert_eq!(retry.identity.reservation_owner, reservation.owner);
+        assert_eq!(retry.identity.attempt, 2);
+        state.retry_revision()
     };
 
+    daemon.clear_peer_handshake_lifecycle(&peer_info.node_id, "test_peer_left");
+    assert!(*cancellation.borrow_and_update());
+    {
+        let state = daemon.pending_handshakes.lock();
+        assert!(!state.starting.contains(&peer_info.node_id));
+        assert!(!state.starting_prepared.contains_key(&peer_info.node_id));
+        assert!(!state.initiator_retries.contains_key(&peer_info.node_id));
+    }
+
+    // A coalesced/late watch value is only a hint.  The authoritative ledger
+    // is empty after cancellation, so it cannot resurrect the retired owner.
     daemon
+        .handshake_retry_kick_tx
+        .send_replace(retry_revision);
+    assert!(daemon
         .pending_handshakes
         .lock()
-        .await
-        .clear_peer(&peer_info.node_id);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if daemon.timeline.snapshot().events.iter().any(|event| {
-                event.event == "initiator_publish_probe_binding_writer_wait_cancelled"
-            }) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("reservation cancellation must wake the detached writer waiter");
-
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut status_read)
-            .await
-            .expect("status read must resume after cancellation removes the writer")
-            .expect("status task must not panic")
-            .is_some()
-    );
-    assert!(
-        matches!(reschedule_rx.has_changed(), Ok(false)),
-        "a cancelled old owner must not publish a path-setup retry"
-    );
-    drop(connection_guard);
+        .claim_ready_initiator_retry(Instant::now())
+        .is_none());
 }
-
 #[tokio::test]
 async fn committed_initiator_offer_wait_is_cancelled_when_pending_is_removed() {
     let peer_id = "peer-cancelled-initiator-offer";
@@ -2381,6 +2487,997 @@ async fn committed_initiator_offer_wait_is_cancelled_when_pending_is_removed() {
     assert!(outcome.is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn handshake_arbiter_telemetry_pairs_holder_release_timeout_and_cancellation() {
+    use std::task::Poll;
+
+    let timeline = ConnectionTimeline::new("arbiter-telemetry", 0);
+    let arbiter = HandshakeArbiter::new(timeline.clone());
+    let peer_id = "peer-arbiter-telemetry";
+    let owner = arbiter
+        .try_acquire(HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::MaintenanceInitiator,
+            Some(77),
+            9,
+            Some(PeerSessionGeneration::for_test(11)),
+            "maintenance_snapshot_commit",
+        ))
+        .expect("maintenance mutation turn must be acquired");
+    let holder = arbiter
+        .current_holder(peer_id)
+        .expect("current holder metadata must be visible without an async lock");
+    assert_eq!(
+        holder.identity.owner_kind,
+        HandshakeOwnerKind::MaintenanceInitiator
+    );
+    assert_eq!(holder.identity.phase, "maintenance_snapshot_commit");
+    assert_eq!(holder.identity.reservation_owner, Some(77));
+    assert_eq!(holder.identity.network_generation, 9);
+    assert_eq!(
+        holder.identity.peer_session_generation,
+        Some(PeerSessionGeneration::for_test(11))
+    );
+    assert!(holder.held_for < Duration::from_secs(1));
+
+    let contention = match arbiter.try_acquire(HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::EventInitiatorPrepare,
+            Some(78),
+            9,
+            Some(PeerSessionGeneration::for_test(11)),
+            "preparation",
+        )) {
+        Ok(_) => panic!("the maintenance holder unexpectedly admitted a second turn"),
+        Err(contention) => contention,
+    };
+    assert_eq!(
+        contention.holder.unwrap().identity,
+        holder.identity,
+        "contention diagnostics must identify the actual maintenance holder"
+    );
+
+    let mut timed = Box::pin(arbiter.acquire_with_timeout(
+        HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::Responder,
+            None,
+            9,
+            Some(PeerSessionGeneration::for_test(11)),
+            "responder_admission",
+        ),
+        Duration::from_millis(10),
+    ));
+    std::future::poll_fn(|context| match std::future::Future::poll(timed.as_mut(), context) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("bounded waiter completed before paused time advanced"),
+    })
+    .await;
+    tokio::time::advance(Duration::from_millis(11)).await;
+    assert!(timed.await.is_none());
+
+    let mut cancelled = Box::pin(arbiter.acquire_with_timeout(
+        HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::Cleanup,
+            None,
+            9,
+            Some(PeerSessionGeneration::for_test(11)),
+            "peer_left",
+        ),
+        Duration::from_secs(1),
+    ));
+    std::future::poll_fn(|context| {
+        match std::future::Future::poll(cancelled.as_mut(), context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("cancellation waiter unexpectedly acquired the turn"),
+        }
+    })
+    .await;
+    drop(cancelled);
+    drop(owner);
+    assert!(arbiter.current_holder(peer_id).is_none());
+
+    let events = timeline.snapshot().events;
+    let count = |name: &str| events.iter().filter(|event| event.event == name).count();
+    assert_eq!(count("handshake_arbiter_wait_started"), 4);
+    assert_eq!(count("handshake_arbiter_acquired"), 1);
+    assert_eq!(count("handshake_arbiter_contended"), 1);
+    assert_eq!(count("handshake_arbiter_timeout"), 1);
+    assert_eq!(count("handshake_arbiter_cancelled"), 1);
+    assert_eq!(count("handshake_arbiter_released"), 1);
+    assert!(events.iter().any(|event| {
+        event.event == "handshake_arbiter_released"
+            && event.detail.as_deref().is_some_and(|detail| {
+                detail.contains("owner_kind=maintenance_initiator")
+                    && detail.contains("phase=maintenance_snapshot_commit")
+                    && detail.contains("reservation_owner=77")
+                    && detail.contains("held_us=")
+            })
+    }));
+    let diagnostic_text = events
+        .iter()
+        .filter_map(|event| event.detail.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "do-not-log-private-key",
+        "do-not-log-session-secret",
+        "do-not-log-raw-handshake-token",
+    ] {
+        assert!(!diagnostic_text.contains(forbidden));
+    }
+}
+
+#[tokio::test]
+async fn peer_scoped_handshake_arbiter_contention_does_not_block_another_peer_session() {
+    let arbiter = HandshakeArbiter::default();
+    let peer_a = "peer-arbiter-a";
+    let peer_b = "peer-arbiter-b";
+    let peer_a_owner = arbiter
+        .try_acquire(HandshakeLeaseIdentity::new(
+            peer_a,
+            HandshakeOwnerKind::MaintenanceInitiator,
+            Some(1),
+            0,
+            Some(PeerSessionGeneration::for_test(1)),
+            "maintenance_reserve",
+        ))
+        .unwrap();
+    let peer_b_turn = arbiter
+        .try_acquire(HandshakeLeaseIdentity::new(
+            peer_b,
+            HandshakeOwnerKind::Responder,
+            None,
+            0,
+            Some(PeerSessionGeneration::for_test(1)),
+            "responder_admission",
+        ))
+        .expect("peer A's turn must not serialize peer B");
+    drop(peer_b_turn);
+
+    let (transport, _outbound_rx) = WireGuardTransport::new();
+    let (peer_b_session, _) = part03_establish_sessions();
+    transport.add_session(peer_b, peer_b_session).await;
+    assert!(transport.has_session(peer_b).await);
+    assert_eq!(
+        arbiter.current_holder(peer_a).unwrap().identity.owner_kind,
+        HandshakeOwnerKind::MaintenanceInitiator
+    );
+    drop(peer_a_owner);
+}
+
+#[test]
+fn exact_handshake_retry_has_strict_ttl_and_all_lifecycle_cancellations_are_terminal() {
+    fn reserve_retry(
+        state: &mut PendingHandshakeState,
+        peer_id: &str,
+        network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        now: Instant,
+    ) -> (HandshakeStartReservation, watch::Receiver<bool>) {
+        let reservation = state
+            .reserve_start_with_owner_at_generation(
+                peer_id,
+                network_generation,
+                peer_session_generation,
+            )
+            .expect("test lifecycle must reserve an initiator");
+        let cancellation = reservation.cancellation.clone();
+        state
+            .schedule_initiator_retry(
+                peer_id,
+                &reservation,
+                InitiatorRetryPhase::Preparation,
+                now,
+            )
+            .expect("test lifecycle must retain one exact retry");
+        (reservation, cancellation)
+    }
+
+    let now = Instant::now();
+    let peer_generation = PeerSessionGeneration::for_test(1);
+    let mut ttl_state = PendingHandshakeState::default();
+    let (ttl_reservation, mut ttl_cancellation) =
+        reserve_retry(&mut ttl_state, "peer-retry-ttl", 4, peer_generation, now);
+    let original_expiry = ttl_state
+        .initiator_retries
+        .get("peer-retry-ttl")
+        .unwrap()
+        .expires_at;
+    ttl_state
+        .schedule_initiator_retry(
+            "peer-retry-ttl",
+            &ttl_reservation,
+            InitiatorRetryPhase::Preparation,
+            now + Duration::from_millis(1),
+        )
+        .expect("duplicate retry must merge before TTL");
+    assert_eq!(
+        ttl_state
+            .initiator_retries
+            .get("peer-retry-ttl")
+            .unwrap()
+            .expires_at,
+        original_expiry,
+        "duplicate kicks must not extend the strict phase TTL"
+    );
+    let (claimed_identity, claimed_reservation) = ttl_state
+        .claim_ready_initiator_retry(now + Duration::from_millis(12))
+        .expect("the merged retry must become ready deterministically");
+    assert_eq!(claimed_identity.attempt, 2);
+    let (rescheduled_identity, _) = ttl_state
+        .schedule_initiator_retry(
+            "peer-retry-ttl",
+            &claimed_reservation,
+            InitiatorRetryPhase::Preparation,
+            now + Duration::from_millis(12),
+        )
+        .expect("claimed contention must preserve its retry lineage");
+    assert_eq!(rescheduled_identity.attempt, 3);
+    assert_eq!(
+        ttl_state
+            .initiator_retries
+            .get("peer-retry-ttl")
+            .unwrap()
+            .expires_at,
+        original_expiry,
+        "claim and reschedule must not reset the strict phase TTL"
+    );
+    assert!(ttl_state
+        .claim_ready_initiator_retry(original_expiry)
+        .is_none());
+    assert!(*ttl_cancellation.borrow_and_update());
+    assert!(!ttl_state.starting.contains("peer-retry-ttl"));
+    assert!(!ttl_state
+        .initiator_retries
+        .contains_key("peer-retry-ttl"));
+
+    let mut full_lane_expiry = PendingHandshakeState::default();
+    let (_, mut full_lane_cancellation) = reserve_retry(
+        &mut full_lane_expiry,
+        "peer-full-lane-expiry",
+        4,
+        peer_generation,
+        now,
+    );
+    full_lane_expiry.expire_initiator_retries(now + INITIATOR_RETRY_TTL);
+    assert!(*full_lane_cancellation.borrow_and_update());
+    assert!(full_lane_expiry.initiator_retries.is_empty());
+    assert!(!full_lane_expiry.starting.contains("peer-full-lane-expiry"));
+
+    let mut peer_left = PendingHandshakeState::default();
+    let (_, mut peer_left_cancel) =
+        reserve_retry(&mut peer_left, "peer-left-retry", 1, peer_generation, now);
+    peer_left.clear_peer("peer-left-retry");
+    assert!(*peer_left_cancel.borrow_and_update());
+    assert!(peer_left.initiator_retries.is_empty());
+
+    let mut offline = PendingHandshakeState::default();
+    let (_, mut offline_cancel) =
+        reserve_retry(&mut offline, "peer-offline-retry", 1, peer_generation, now);
+    offline.clear_peer("peer-offline-retry");
+    assert!(*offline_cancel.borrow_and_update());
+    assert!(offline.initiator_retries.is_empty());
+
+    let mut generation = PendingHandshakeState::default();
+    let (_, mut generation_cancel) =
+        reserve_retry(&mut generation, "peer-generation-retry", 1, peer_generation, now);
+    let replacement = generation
+        .reserve_start_with_owner_at_generation(
+            "peer-generation-retry",
+            2,
+            peer_generation,
+        )
+        .expect("a new network generation must replace the stale retry owner");
+    assert!(*generation_cancel.borrow_and_update());
+    assert_eq!(generation.initiator_retries.len(), 0);
+    generation.cancel_reservation_if_current("peer-generation-retry", replacement.owner);
+
+    let mut rejoin = PendingHandshakeState::default();
+    let (_, mut rejoin_cancel) =
+        reserve_retry(&mut rejoin, "peer-rejoin-retry", 1, peer_generation, now);
+    rejoin.clear_peer("peer-rejoin-retry");
+    let replacement_generation = PeerSessionGeneration::for_test(2);
+    let replacement = rejoin
+        .reserve_start_with_owner_at_generation(
+            "peer-rejoin-retry",
+            1,
+            replacement_generation,
+        )
+        .expect("same-node rejoin must create a new exact lifecycle owner");
+    assert!(*rejoin_cancel.borrow_and_update());
+    assert_eq!(
+        replacement.peer_session_generation,
+        replacement_generation
+    );
+    rejoin.cancel_reservation_if_current("peer-rejoin-retry", replacement.owner);
+
+    let mut responder = PendingHandshakeState::default();
+    let (reservation, mut responder_cancel) = reserve_retry(
+        &mut responder,
+        "peer-responder-retry",
+        1,
+        peer_generation,
+        now,
+    );
+    assert!(responder.cancel_reservation_if_current(
+        "peer-responder-retry",
+        reservation.owner
+    ));
+    assert!(*responder_cancel.borrow_and_update());
+    assert!(responder.initiator_retries.is_empty());
+
+    let mut bounded = PendingHandshakeState::default();
+    for index in 0..MAX_PENDING_INITIATOR_RETRIES {
+        let peer_id = format!("bounded-retry-{index}");
+        let reservation = bounded
+            .reserve_start_with_owner_at_generation(&peer_id, 1, peer_generation)
+            .unwrap();
+        assert!(bounded
+            .schedule_initiator_retry(
+                &peer_id,
+                &reservation,
+                InitiatorRetryPhase::Preparation,
+                now,
+            )
+            .is_some());
+    }
+    let overflow_peer = "bounded-retry-overflow";
+    let overflow = bounded
+        .reserve_start_with_owner_at_generation(overflow_peer, 1, peer_generation)
+        .unwrap();
+    assert!(bounded
+        .schedule_initiator_retry(
+            overflow_peer,
+            &overflow,
+            InitiatorRetryPhase::Preparation,
+            now,
+        )
+        .is_none());
+    assert_eq!(
+        bounded.initiator_retries.len(),
+        MAX_PENDING_INITIATOR_RETRIES
+    );
+}
+
+#[tokio::test]
+async fn network_generation_advance_synchronously_cancels_exact_handshake_retry_and_pending_offer()
+{
+    let daemon = Daemon::new(
+        Config::generate_default("http://127.0.0.1:1", "generation-cancel-network").unwrap(),
+    );
+    let peer_id = "peer-generation-hook-cancel";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: hex::encode(peer_identity.public_key()),
+            virtual_ip: "10.20.0.9".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    let mut reservation = daemon
+        .pending_handshakes
+        .lock()
+        .reserve_start_with_owner_at_generation(
+            peer_id,
+            0,
+            daemon.peers.peer_session_generation_sync(peer_id).unwrap(),
+        )
+        .unwrap();
+    let mut cancellation = reservation.cancellation.clone();
+    assert!(daemon.schedule_initiator_retry(
+        peer_id,
+        &mut reservation,
+        InitiatorRetryPhase::Preparation,
+        "test_generation_advance",
+    ));
+
+    let pending_peer_id = "peer-generation-hook-pending";
+    let pending_peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: pending_peer_id.to_string(),
+            public_key: hex::encode(pending_peer_identity.public_key()),
+            virtual_ip: "10.20.0.10".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    let pending_peer_session = daemon
+        .peers
+        .peer_session_generation_sync(pending_peer_id)
+        .unwrap();
+    let pending_token = "generation-bound-pending-token".to_string();
+    let (pending_id, mut pending_cancellation) = {
+        let mut state = daemon.pending_handshakes.lock();
+        let pending_reservation = state
+            .reserve_start_with_owner_at_generation(pending_peer_id, 0, pending_peer_session)
+            .unwrap();
+        let cancellation = pending_reservation.cancellation.clone();
+        let initiator = HandshakeInitiator::new(
+            daemon.local_identity().unwrap(),
+            pending_peer_identity.public_key(),
+            None,
+        );
+        let pending_id = state
+            .insert_reserved_if_current_with_generation(
+                pending_peer_id.to_string(),
+                pending_reservation.owner,
+                initiator,
+                Some(pending_token.clone()),
+                None,
+                0,
+                pending_peer_session,
+            )
+            .unwrap();
+        (pending_id, cancellation)
+    };
+    assert_eq!(
+        daemon
+            .peers
+            .stage_probe_session_binding(
+                pending_peer_id,
+                pending_token.clone(),
+                Some(pending_token.clone()),
+                None,
+                false,
+            )
+            .await,
+        ProbeBindingStage::Staged
+    );
+    assert!(daemon
+        .pending_handshakes
+        .lock()
+        .is_current(pending_peer_id, pending_id));
+
+    assert_eq!(
+        daemon
+            .peers
+            .advance_network_generation("test exact handshake retry cancellation")
+            .await,
+        1
+    );
+    assert!(*cancellation.borrow_and_update());
+    assert!(*pending_cancellation.borrow_and_update());
+    {
+        let state = daemon.pending_handshakes.lock();
+        assert!(!state.starting.contains(peer_id));
+        assert!(!state.initiator_retries.contains_key(peer_id));
+        assert!(!state.pending.contains_key(pending_peer_id));
+    }
+    assert_eq!(
+        daemon
+            .peers
+            .try_confirm_pending_probe_session_binding(pending_peer_id, &pending_token),
+        PendingProbeBindingCommitOutcome::Missing,
+        "the generation transaction must remove the exact staged Probe binding"
+    );
+
+    // Candidate refresh is a second network-generation transition, not a
+    // weaker lifecycle. It must execute the same synchronous handshake fence.
+    let current_generation = daemon.peers.current_network_generation_sync();
+    let peer_session = daemon.peers.peer_session_generation_sync(peer_id).unwrap();
+    let mut refresh_reservation = daemon
+        .pending_handshakes
+        .lock()
+        .reserve_start_with_owner_at_generation(peer_id, current_generation, peer_session)
+        .unwrap();
+    let mut refresh_cancellation = refresh_reservation.cancellation.clone();
+    assert!(daemon.schedule_initiator_retry(
+        peer_id,
+        &mut refresh_reservation,
+        InitiatorRetryPhase::Preparation,
+        "test_candidate_refresh_generation_advance",
+    ));
+
+    let pending_peer_session = daemon
+        .peers
+        .peer_session_generation_sync(pending_peer_id)
+        .unwrap();
+    let refresh_pending_token = "candidate-refresh-bound-pending-token".to_string();
+    let mut refresh_pending_cancellation = {
+        let mut state = daemon.pending_handshakes.lock();
+        let reservation = state
+            .reserve_start_with_owner_at_generation(
+                pending_peer_id,
+                current_generation,
+                pending_peer_session,
+            )
+            .unwrap();
+        let cancellation = reservation.cancellation.clone();
+        state
+            .insert_reserved_if_current_with_generation(
+                pending_peer_id.to_string(),
+                reservation.owner,
+                HandshakeInitiator::new(
+                    daemon.local_identity().unwrap(),
+                    pending_peer_identity.public_key(),
+                    None,
+                ),
+                Some(refresh_pending_token.clone()),
+                None,
+                current_generation,
+                pending_peer_session,
+            )
+            .unwrap();
+        cancellation
+    };
+    assert_eq!(
+        daemon
+            .peers
+            .stage_probe_session_binding(
+                pending_peer_id,
+                refresh_pending_token.clone(),
+                Some(refresh_pending_token.clone()),
+                None,
+                false,
+            )
+            .await,
+        ProbeBindingStage::Staged
+    );
+
+    assert_eq!(
+        daemon
+            .peers
+            .advance_candidate_refresh_generation(
+                "test candidate-refresh handshake cancellation",
+            )
+            .await,
+        current_generation + 1
+    );
+    assert!(*refresh_cancellation.borrow_and_update());
+    assert!(*refresh_pending_cancellation.borrow_and_update());
+    {
+        let state = daemon.pending_handshakes.lock();
+        assert!(!state.starting.contains(peer_id));
+        assert!(!state.initiator_retries.contains_key(peer_id));
+        assert!(!state.pending.contains_key(pending_peer_id));
+    }
+    assert_eq!(
+        daemon.peers.try_confirm_pending_probe_session_binding(
+            pending_peer_id,
+            &refresh_pending_token,
+        ),
+        PendingProbeBindingCommitOutcome::Missing,
+        "candidate refresh must remove the exact staged Probe binding"
+    );
+}
+
+#[test]
+fn handshake_lifecycle_model_checks_first_1000_deterministic_interleavings() {
+    fn next_permutation(values: &mut [u8]) -> bool {
+        let Some(pivot) = (0..values.len().saturating_sub(1))
+            .rev()
+            .find(|&index| values[index] < values[index + 1])
+        else {
+            return false;
+        };
+        let swap = (pivot + 1..values.len())
+            .rev()
+            .find(|&index| values[pivot] < values[index])
+            .unwrap();
+        values.swap(pivot, swap);
+        values[pivot + 1..].reverse();
+        true
+    }
+
+    const MAINTENANCE_SNAPSHOT: u8 = 0;
+    const EVENT_RESERVE: u8 = 1;
+    const MAINTENANCE_RESERVE: u8 = 2;
+    const EVENT_PREPARE: u8 = 3;
+    const RESPONDER_OFFER: u8 = 4;
+    const PUBLISH: u8 = 5;
+    const GENERATION_ADVANCE: u8 = 6;
+
+    let peer_id = "peer-interleaving-model";
+    let peer_generation = PeerSessionGeneration::for_test(1);
+    let mut order = [0, 1, 2, 3, 4, 5, 6];
+    let mut checked = 0usize;
+    loop {
+        let mut state = PendingHandshakeState::default();
+        let mut network_generation = 1u64;
+        let mut event_owner: Option<HandshakeStartReservation> = None;
+        let mut prepared_owner: Option<(u64, u64, u64)> = None;
+        let mut responder_session = false;
+        let mut valid_offers = 0usize;
+        let stale_owner_commits = 0usize;
+
+        for action in order {
+            match action {
+                MAINTENANCE_SNAPSHOT => {
+                    // Snapshot-only work has no mutation ownership.
+                }
+                EVENT_RESERVE if !responder_session => {
+                    if let Some(reservation) = state
+                        .reserve_start_with_owner_at_generation_and_kind(
+                            peer_id,
+                            network_generation,
+                            peer_generation,
+                            HandshakeOwnerKind::EventInitiatorReserve,
+                        )
+                    {
+                        event_owner = Some(reservation);
+                    }
+                }
+                MAINTENANCE_RESERVE if !responder_session => {
+                    let _ = state.reserve_start_with_owner_at_generation_and_kind(
+                        peer_id,
+                        network_generation,
+                        peer_generation,
+                        HandshakeOwnerKind::MaintenanceInitiator,
+                    );
+                }
+                EVENT_PREPARE => {
+                    if let Some(reservation) = event_owner.as_ref().filter(|reservation| {
+                        state.starting_reservation_is_current(peer_id, reservation)
+                    }) {
+                        prepared_owner = Some((
+                            reservation.owner,
+                            reservation.network_generation,
+                            reservation.cancellation_generation,
+                        ));
+                    }
+                }
+                RESPONDER_OFFER => {
+                    state.cancel_reservation(peer_id);
+                    responder_session = true;
+                }
+                PUBLISH => {
+                    if let (Some(reservation), Some(prepared)) =
+                        (event_owner.as_ref(), prepared_owner)
+                    {
+                        let current = state.starting_reservation_is_current(peer_id, reservation)
+                            && prepared
+                                == (
+                                    reservation.owner,
+                                    network_generation,
+                                    reservation.cancellation_generation,
+                                )
+                            && !responder_session;
+                        if current {
+                            valid_offers += 1;
+                            state.cancel_reservation(peer_id);
+                        }
+                    }
+                }
+                GENERATION_ADVANCE => {
+                    network_generation = network_generation.saturating_add(1);
+                    state.clear_peer(peer_id);
+                    prepared_owner = None;
+                }
+                _ => {}
+            }
+            assert!(state.starting.len() <= 1);
+            assert!(state.initiator_retries.len() <= 1);
+            assert!(valid_offers <= 1);
+            assert_eq!(stale_owner_commits, 0);
+        }
+        state.clear_peer(peer_id);
+        assert!(state.starting.is_empty());
+        assert!(state.initiator_retries.is_empty());
+        checked += 1;
+        if checked == 1000 || !next_permutation(&mut order) {
+            break;
+        }
+    }
+    assert_eq!(checked, 1000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_snapshot_race_yields_to_event_single_offer_and_one_session() {
+    let mut control_capture = start_handshake_control_capture().await;
+    let mut config =
+        Config::generate_default(&control_capture.base_url, "handshake-race-network").unwrap();
+    config.control.auth_token = "handshake-race-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    let daemon = Arc::new(Daemon::new(config));
+    timeout(Duration::from_secs(2), control_capture.wait_registered())
+        .await
+        .expect("daemon registration must not stall the deterministic race");
+
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let remote_identity = loop {
+        let identity = NodeIdentity::generate();
+        if local_public < identity.public_key() {
+            break identity;
+        }
+    };
+    let peer_info = control::PeerInfo {
+        node_id: "peer-maintenance-event-race".to_string(),
+        public_key: hex::encode(remote_identity.public_key()),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    daemon.peers.add_peer(&peer_info).await;
+    daemon.relay_available_tx.send_replace(true);
+    let network_generation = daemon.peers.current_network_generation_sync();
+    let peer_session_generation = daemon
+        .peers
+        .peer_session_generation_sync(&peer_info.node_id)
+        .unwrap();
+
+    // Pause maintenance after its actor/control snapshots and immediately
+    // before its zero-wait mutation turn: this is the exact boundary where the
+    // old implementation held the arbiter across session/control awaits.
+    let snapshot_ready = Arc::new(tokio::sync::Barrier::new(2));
+    let allow_reserve = Arc::new(tokio::sync::Barrier::new(2));
+    let maintenance = tokio::spawn({
+        let transport = daemon.transport.clone();
+        let pending = daemon.pending_handshakes.clone();
+        let arbiter = daemon.handshake_arbiter.clone();
+        let peer_id = peer_info.node_id.clone();
+        let snapshot_ready = snapshot_ready.clone();
+        let allow_reserve = allow_reserve.clone();
+        async move {
+            let status = transport.session_status(&peer_id).await;
+            assert!(!status.has_active);
+            snapshot_ready.wait().await;
+            allow_reserve.wait().await;
+            try_reserve_maintenance_initiator(
+                &pending,
+                &arbiter,
+                &peer_id,
+                network_generation,
+                peer_session_generation,
+            )
+        }
+    });
+    snapshot_ready.wait().await;
+    assert!(
+        daemon
+            .handshake_arbiter
+            .current_holder(&peer_info.node_id)
+            .is_none(),
+        "maintenance snapshots must not own a mutation turn"
+    );
+    let mut event_reservation = daemon
+        .reserve_event_initiator_handshake(&peer_info.node_id)
+        .expect("PeerJoined must reserve while maintenance is paused at its old await boundary");
+    let event_owner = event_reservation.owner;
+    allow_reserve.wait().await;
+    let maintenance_outcome = timeout(Duration::from_secs(1), maintenance)
+        .await
+        .expect("maintenance zero-wait admission did not terminate")
+        .expect("maintenance snapshot task panicked");
+    assert!(matches!(
+        maintenance_outcome,
+        MaintenanceInitiatorReservationOutcome::Busy
+    ));
+
+    let punch_at = timeout(
+        Duration::from_secs(2),
+        daemon.run_reserved_initiator_handshake(&peer_info, &mut event_reservation),
+    )
+    .await
+    .expect("event preparation/publish must not wait on the retired maintenance producer")
+    .expect("event initiator failed")
+    .expect("event initiator did not publish its one Offer");
+    assert!(punch_at > 0);
+    timeout(
+        Duration::from_secs(1),
+        control_capture.wait_for_signal_count(1),
+    )
+    .await
+    .expect("mock control did not receive the event Offer");
+    let bodies = control_capture.signal_bodies();
+    let offers = bodies
+        .iter()
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .filter(|body| body.get("type").and_then(serde_json::Value::as_str) == Some("peer_offer"))
+        .collect::<Vec<_>>();
+    assert_eq!(offers.len(), 1, "the lifecycle may publish one valid Offer");
+    let offer = &offers[0];
+    let initiation = hex::decode(
+        offer
+            .get("handshake")
+            .and_then(serde_json::Value::as_str)
+            .expect("captured Offer omitted its WireGuard initiation"),
+    )
+    .unwrap();
+    let session_id = offer
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("captured Offer omitted its exact session id")
+        .to_string();
+    let initiation = MessageInitiation::from_bytes(&initiation).unwrap();
+    let mut remote_responder = HandshakeResponder::new(remote_identity, None);
+    let (response, _) = remote_responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    let remote_probe_public = hex::encode(DhKeyPair::generate().public_key());
+    assert!(
+        daemon
+            .handle_peer_answer(
+                &peer_info.node_id,
+                &response.to_bytes(),
+                Some(session_id),
+                Some(remote_probe_public),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(daemon.transport.has_session(&peer_info.node_id).await);
+    {
+        let state = daemon.pending_handshakes.lock();
+        assert!(!state.pending.contains_key(&peer_info.node_id));
+        assert!(!state.starting.contains(&peer_info.node_id));
+        assert!(!state.initiator_retries.contains_key(&peer_info.node_id));
+    }
+    let staged = daemon
+        .timeline
+        .snapshot()
+        .events
+        .iter()
+        .filter(|event| {
+            event.event == "initiator_session_staged"
+                && event.detail.as_deref().is_some_and(|detail| {
+                    detail.contains(&format!("owner={event_owner}"))
+                })
+        })
+        .count();
+    assert_eq!(staged, 1);
+    control_capture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responder_preempts_contended_initiator_retry_with_bounded_turn_and_no_stale_offer() {
+    let mut control_capture = start_handshake_control_capture().await;
+    let mut config =
+        Config::generate_default(&control_capture.base_url, "responder-preemption-network")
+            .unwrap();
+    config.control.auth_token = "responder-preemption-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    let daemon = Arc::new(Daemon::new(config));
+    timeout(Duration::from_secs(2), control_capture.wait_registered())
+        .await
+        .expect("daemon registration must complete before responder preemption");
+
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let remote_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "peer-responder-preempts-initiator";
+    let peer_info = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        public_key: hex::encode(remote_identity.public_key()),
+        virtual_ip: "10.20.0.3".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    daemon.peers.add_peer(&peer_info).await;
+    daemon.relay_available_tx.send_replace(true);
+    let network_generation = daemon.peers.current_network_generation_sync();
+    let peer_session_generation = daemon
+        .peers
+        .peer_session_generation_sync(peer_id)
+        .unwrap();
+    let mut stale_reservation = daemon
+        .pending_handshakes
+        .lock()
+        .reserve_start_with_owner_at_generation(peer_id, network_generation, peer_session_generation)
+        .expect("stale event initiator must own the setup transaction");
+    let stale_owner = stale_reservation.owner;
+    let mut stale_cancellation = stale_reservation.cancellation.clone();
+
+    let blocking_turn = daemon
+        .handshake_arbiter
+        .try_acquire(HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::EventInitiatorPrepare,
+            Some(stale_owner),
+            network_generation,
+            Some(peer_session_generation),
+            "preparation",
+        ))
+        .unwrap();
+    let preparation_result = timeout(
+        Duration::from_millis(100),
+        daemon.run_reserved_initiator_handshake(&peer_info, &mut stale_reservation),
+    )
+    .await
+    .expect("preparation contention must return without waiting for the held turn")
+    .expect("preparation contention is non-fatal");
+    assert_eq!(preparation_result, None);
+    assert_eq!(
+        stale_reservation.disposition,
+        HandshakeStartDisposition::RetryScheduled
+    );
+    assert_eq!(
+        daemon
+            .pending_handshakes
+            .lock()
+            .initiator_retries
+            .get(peer_id)
+            .unwrap()
+            .identity
+            .phase,
+        InitiatorRetryPhase::Preparation
+    );
+    let mut remote_initiator = HandshakeInitiator::new(remote_identity, local_public, None);
+    let initiation = remote_initiator.create_initiation().unwrap().to_bytes();
+    let responder = {
+        let daemon = daemon.clone();
+        let peer_id = peer_id.to_string();
+        tokio::spawn(async move {
+            daemon
+                .handle_peer_offer(&peer_id, &[], &initiation, None, None, None, None)
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if daemon.timeline.snapshot().events.iter().any(|event| {
+                event.event == "handshake_arbiter_wait_started"
+                    && event.detail.as_deref().is_some_and(|detail| {
+                        detail.contains(peer_id)
+                            && detail.contains("owner_kind=responder")
+                            && detail.contains("holder_kind=event_initiator_prepare")
+                            && detail.contains(&format!(
+                                "holder_reservation_owner={stale_owner}"
+                            ))
+                    })
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("responder did not expose the exact contending initiator holder");
+    drop(blocking_turn);
+    timeout(Duration::from_secs(2), responder)
+        .await
+        .expect("responder exceeded its bounded mutation-turn/control budget")
+        .expect("responder task panicked")
+        .expect("legal responder offer failed");
+    assert!(*stale_cancellation.borrow_and_update());
+    assert!(daemon.transport.has_session(peer_id).await);
+    {
+        let state = daemon.pending_handshakes.lock();
+        assert!(!state.starting.contains(peer_id));
+        assert!(!state.initiator_retries.contains_key(peer_id));
+        assert!(!state.pending.contains_key(peer_id));
+    }
+    timeout(
+        Duration::from_secs(1),
+        control_capture.wait_for_signal_count(1),
+    )
+    .await
+    .expect("responder answer was not delivered");
+    let bodies = control_capture.signal_bodies();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .filter(|body| {
+                body.get("type").and_then(serde_json::Value::as_str) == Some("peer_answer")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        bodies
+            .iter()
+            .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .filter(|body| {
+                body.get("type").and_then(serde_json::Value::as_str) == Some("peer_offer")
+            })
+            .count(),
+        0,
+        "the cancelled initiator retry must not publish a stale Offer"
+    );
+    control_capture.stop().await;
+}
+
 #[test]
 fn handshake_role_is_deterministic_from_decoded_static_public_keys() {
     let lower = [0x11; 32];
@@ -2400,22 +3497,62 @@ fn handshake_role_is_deterministic_from_decoded_static_public_keys() {
 #[tokio::test]
 async fn handshake_arbiter_prunes_dead_peer_locks_on_churn() {
     let arbiter = HandshakeArbiter::default();
-    let first = arbiter.acquire("peer-old").await;
+    let first = arbiter
+        .try_acquire(HandshakeLeaseIdentity::new(
+            "peer-old",
+            HandshakeOwnerKind::MaintenanceInitiator,
+            None,
+            1,
+            Some(PeerSessionGeneration::for_test(1)),
+            "test_owner",
+        ))
+        .unwrap();
     drop(first);
-    let second = arbiter.acquire("peer-new").await;
+    let second = arbiter
+        .try_acquire(HandshakeLeaseIdentity::new(
+            "peer-new",
+            HandshakeOwnerKind::MaintenanceInitiator,
+            None,
+            1,
+            Some(PeerSessionGeneration::for_test(1)),
+            "test_owner",
+        ))
+        .unwrap();
     drop(second);
 
-    assert!(!arbiter.peer_locks.lock().await.contains_key("peer-old"));
+    assert!(!arbiter
+        .peer_locks
+        .lock()
+        .unwrap()
+        .contains_key("peer-old"));
 }
 
 #[tokio::test]
 async fn handshake_arbiter_wait_is_bounded_and_recovers_after_owner_release() {
     let arbiter = HandshakeArbiter::default();
-    let owner = arbiter.acquire("peer-lock-timeout").await;
+    let owner_identity = HandshakeLeaseIdentity::new(
+        "peer-lock-timeout",
+        HandshakeOwnerKind::MaintenanceInitiator,
+        Some(7),
+        3,
+        Some(PeerSessionGeneration::for_test(4)),
+        "maintenance_reserve",
+    );
+    let owner = arbiter.try_acquire(owner_identity).unwrap();
 
     assert!(
         arbiter
-            .acquire_with_timeout("peer-lock-timeout", Duration::from_millis(10))
+            .acquire_with_timeout(
+                HandshakeLeaseIdentity::new(
+                    "peer-lock-timeout",
+                    HandshakeOwnerKind::Responder,
+                    None,
+                    3,
+                    Some(PeerSessionGeneration::for_test(4)),
+                    "responder_admission",
+                ),
+                Duration::from_millis(10),
+            )
             .await
             .is_none(),
         "a responder must not wait forever behind a stale handshake owner"
@@ -2424,7 +3561,17 @@ async fn handshake_arbiter_wait_is_bounded_and_recovers_after_owner_release() {
     drop(owner);
     assert!(
         arbiter
-            .acquire_with_timeout("peer-lock-timeout", Duration::from_millis(100))
+            .acquire_with_timeout(
+                HandshakeLeaseIdentity::new(
+                    "peer-lock-timeout",
+                    HandshakeOwnerKind::Responder,
+                    None,
+                    3,
+                    Some(PeerSessionGeneration::for_test(4)),
+                    "responder_admission",
+                ),
+                Duration::from_millis(100),
+            )
             .await
             .is_some(),
         "the same peer must recover immediately after the owner releases"
@@ -2572,7 +3719,6 @@ async fn responder_cache_rejects_offer_after_peer_static_key_rotation() {
     daemon
         .pending_handshakes
         .lock()
-        .await
         .cache_responder_handshake(
             peer_id,
             token,
@@ -2693,7 +3839,6 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
     daemon
         .pending_handshakes
         .lock()
-        .await
         .cache_responder_handshake(
             peer_id,
             token,
@@ -2740,7 +3885,6 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
         assert!(!daemon
             .pending_handshakes
             .lock()
-            .await
             .responder_cache
             .contains_key(&(peer_id.to_string(), token.to_string())));
     }
@@ -6007,7 +7151,6 @@ async fn peer_answer_from_new_remote_incarnation_preserves_pending_initiator() {
     daemon
         .pending_handshakes
         .lock()
-        .await
         .insert_with_generation(
             peer_id.to_string(),
             initiator,
@@ -6032,7 +7175,6 @@ async fn peer_answer_from_new_remote_incarnation_preserves_pending_initiator() {
     assert!(daemon
         .pending_handshakes
         .lock()
-        .await
         .pending
         .contains_key(peer_id));
     assert!(!daemon.transport.has_session(peer_id).await);
@@ -6119,7 +7261,7 @@ async fn stale_sender_known_offer_cannot_reset_current_identity_or_apply_candida
     let original_session_generation = daemon.peers.peer_session_generation_sync(peer_id).unwrap();
     let (active_session, _) = part03_establish_sessions();
     daemon.transport.add_session(peer_id, active_session).await;
-    daemon.pending_handshakes.lock().await.insert(
+    daemon.pending_handshakes.lock().insert(
         peer_id.to_string(),
         HandshakeInitiator::new(
             daemon.local_identity().unwrap(),
@@ -6188,7 +7330,7 @@ async fn stale_sender_known_offer_cannot_reset_current_identity_or_apply_candida
         peers.get_connection(peer_id).await.unwrap().candidates,
         vec![baseline_candidate]
     );
-    assert!(pending.lock().await.pending.contains_key(peer_id));
+    assert!(pending.lock().pending.contains_key(peer_id));
 
     let _ = shutdown.send(true);
     timeout(Duration::from_secs(1), loop_task)
@@ -6256,7 +7398,6 @@ async fn stale_sender_answer_cannot_reset_or_consume_current_initiator() {
     daemon
         .pending_handshakes
         .lock()
-        .await
         .insert(peer_id.to_string(), initiator, None, None);
 
     let peers = daemon.peers.clone();
@@ -6315,7 +7456,7 @@ async fn stale_sender_answer_cannot_reset_or_consume_current_initiator() {
         peers.get_connection(peer_id).await.unwrap().candidates,
         vec![baseline_candidate]
     );
-    assert!(pending.lock().await.pending.contains_key(peer_id));
+    assert!(pending.lock().pending.contains_key(peer_id));
 
     let _ = shutdown.send(true);
     timeout(Duration::from_secs(1), loop_task)
@@ -6366,7 +7507,7 @@ async fn stale_sender_deferred_offer_releases_owner_without_mutating_peer() {
     let original_session_generation = daemon.peers.peer_session_generation_sync(peer_id).unwrap();
     let (active_session, _) = part03_establish_sessions();
     daemon.transport.add_session(peer_id, active_session).await;
-    daemon.pending_handshakes.lock().await.insert(
+    daemon.pending_handshakes.lock().insert(
         peer_id.to_string(),
         HandshakeInitiator::new(
             daemon.local_identity().unwrap(),
@@ -6395,7 +7536,6 @@ async fn stale_sender_deferred_offer_releases_owner_without_mutating_peer() {
     let (reservation, offer) = daemon
         .pending_handshakes
         .lock()
-        .await
         .enqueue_responder_work(offer)
         .expect("the deferred offer must acquire an owner");
 
@@ -6420,7 +7560,7 @@ async fn stale_sender_deferred_offer_releases_owner_without_mutating_peer() {
             .candidates,
         vec![baseline_candidate]
     );
-    let pending = daemon.pending_handshakes.lock().await;
+    let pending = daemon.pending_handshakes.lock();
     assert!(pending.pending.contains_key(peer_id));
     assert!(!pending.responder_workers.contains_key(peer_id));
 }

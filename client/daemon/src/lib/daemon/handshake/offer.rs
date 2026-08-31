@@ -8,8 +8,7 @@ impl Daemon {
         *self
             .responder_post_answer_test_gate
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((peer_id.to_string(), gate));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((peer_id.to_string(), gate));
     }
 
     #[cfg(test)]
@@ -42,7 +41,7 @@ impl Daemon {
         &self,
         from_node_id: &str,
         cancellation: Option<&mut tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    ) -> Result<Option<HandshakeLease>> {
         let wait_started = Instant::now();
         let generation = self.peers.current_network_generation_sync();
         self.timeline.emit(
@@ -53,6 +52,14 @@ impl Daemon {
                 "peer={from_node_id} generation={generation} wait_budget_ms={}",
                 RESPONDER_HANDSHAKE_ARBITER_TIMEOUT.as_millis()
             )),
+        );
+        let identity = HandshakeLeaseIdentity::new(
+            from_node_id,
+            HandshakeOwnerKind::Responder,
+            None,
+            generation,
+            self.peers.peer_session_generation_sync(from_node_id),
+            "responder_admission",
         );
         let guard = match cancellation {
             Some(cancellation) => {
@@ -72,14 +79,14 @@ impl Daemon {
                         return Ok(None);
                     }
                     guard = self.handshake_arbiter.acquire_with_timeout(
-                        from_node_id,
+                        identity.clone(),
                         RESPONDER_HANDSHAKE_ARBITER_TIMEOUT,
                     ) => guard,
                 }
             }
             None => {
                 self.handshake_arbiter
-                    .acquire_with_timeout(from_node_id, RESPONDER_HANDSHAKE_ARBITER_TIMEOUT)
+                    .acquire_with_timeout(identity, RESPONDER_HANDSHAKE_ARBITER_TIMEOUT)
                     .await
             }
         };
@@ -241,7 +248,6 @@ impl Daemon {
             let current = self
                 .pending_handshakes
                 .lock()
-                .await
                 .responder_work_is_current(from_node_id, owner);
             if !current {
                 return Ok(());
@@ -283,7 +289,6 @@ impl Daemon {
             let current = self
                 .pending_handshakes
                 .lock()
-                .await
                 .responder_work_is_current(from_node_id, owner);
             if !current {
                 return Ok(());
@@ -386,7 +391,7 @@ impl Daemon {
             .clone()
             .unwrap_or_else(|| format!("legacy-wg-{}", initiation.sender_index));
         let cached = {
-            self.pending_handshakes.lock().await.responder_cache_lookup(
+            self.pending_handshakes.lock().responder_cache_lookup(
                 from_node_id,
                 &handshake_token,
                 handshake_init,
@@ -448,7 +453,6 @@ impl Daemon {
                 let timestamp_floor = self
                     .pending_handshakes
                     .lock()
-                    .await
                     .responder_timestamp_floor(from_node_id, &expected_peer_public);
                 self.timeline.emit(
                     "peer_offer_responder_timestamp_floor_acquired",
@@ -513,11 +517,8 @@ impl Daemon {
                         handshake_token_fingerprint(Some(&handshake_token))
                     )),
                 );
-                let timestamp_committed = self
-                    .pending_handshakes
-                    .lock()
-                    .await
-                    .commit_responder_timestamp(
+                let timestamp_committed =
+                    self.pending_handshakes.lock().commit_responder_timestamp(
                         from_node_id,
                         expected_peer_public,
                         authenticated_timestamp,
@@ -591,7 +592,7 @@ impl Daemon {
             return Ok(());
         }
         let superseded_initiator_token = {
-            let mut state = self.pending_handshakes.lock().await;
+            let mut state = self.pending_handshakes.lock();
             let token = state.session_id(from_node_id).map(str::to_string);
             state.remove(from_node_id);
             state.cancel_reservation(from_node_id);
@@ -752,10 +753,11 @@ impl Daemon {
         // an old-generation offer must not leave a cache entry that can be
         // replayed into a later session.
         if let Some(cache_entry) = cache_entry_to_commit {
-            self.pending_handshakes
-                .lock()
-                .await
-                .cache_responder_handshake(from_node_id, &handshake_token, cache_entry);
+            self.pending_handshakes.lock().cache_responder_handshake(
+                from_node_id,
+                &handshake_token,
+                cache_entry,
+            );
         }
 
         // All state required to replay/validate the response is now staged.
@@ -880,7 +882,6 @@ impl Daemon {
             let current = self
                 .pending_handshakes
                 .lock()
-                .await
                 .responder_work_is_current(from_node_id, owner);
             if !current {
                 return Ok(());
@@ -935,10 +936,7 @@ impl Daemon {
             let connection_refresh_started = Instant::now();
             let outcome = self
                 .peers
-                .try_refresh_pending_probe_session_binding_grace(
-                    from_node_id,
-                    &handshake_token,
-                );
+                .try_refresh_pending_probe_session_binding_grace(from_node_id, &handshake_token);
             self.timeline.emit(
                 "peer_answer_probe_binding_grace_result",
                 None,

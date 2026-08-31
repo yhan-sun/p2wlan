@@ -167,11 +167,53 @@ enum RemoteIncarnationResetWork {
 }
 
 impl Daemon {
+    fn clear_peer_handshake_lifecycle(&self, peer_id: &str, phase: &'static str) {
+        let identity = HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::Cleanup,
+            None,
+            self.peers.current_network_generation_sync(),
+            self.peers.peer_session_generation_sync(peer_id),
+            phase,
+        );
+        let lease = self.handshake_arbiter.try_acquire(identity);
+        match lease {
+            Ok(lease) => {
+                let cleared = self
+                    .pending_handshakes
+                    .try_with(|state| state.clear_peer(peer_id))
+                    .is_some();
+                drop(lease);
+                if !cleared {
+                    // Authoritative lifecycle cancellation may briefly wait
+                    // for another short pending-state transaction, but never
+                    // while owning the handshake mutation turn.
+                    self.pending_handshakes.lock().clear_peer(peer_id);
+                }
+            }
+            Err(contention) => {
+                self.pending_handshakes.lock().clear_peer(peer_id);
+                let holder = contention
+                    .holder
+                    .as_ref()
+                    .map(HandshakeHolderSnapshot::detail)
+                    .unwrap_or_else(|| "holder_kind=unknown holder_phase=unknown".to_string());
+                self.timeline.emit(
+                    "handshake_cleanup_turn_contended",
+                    None,
+                    Some("arbiter_contended"),
+                    Some(format!("peer={peer_id} phase={phase} {holder}")),
+                );
+            }
+        }
+    }
+
     /// A same-node remote restart is identified by the encoded candidate
     /// generation carried in its offer. Keep this narrow: endpoint metadata is
     /// also changed by ordinary NAT churn and is not safe as a lifecycle
-    /// signal. The arbiter covers the short state boundary; UDP cleanup then
-    /// invalidates late probes and dynamic socket adoption.
+    /// signal. PeerManager's claimed-incarnation transaction and the exact
+    /// peer-session generation provide the boundary; the handshake arbiter is
+    /// intentionally absent because this cleanup crosses actor awaits.
     #[cfg(test)]
     async fn reset_peer_for_remote_incarnation_if_needed(
         &self,
@@ -205,7 +247,6 @@ impl Daemon {
             // a lifecycle branch could wait for that arbiter and stop polling
             // its owner forever. Run the complete claim/cleanup/commit turn in
             // an independently scheduled task so the owner keeps progressing.
-            let handshake_arbiter = self.handshake_arbiter.clone();
             let transport = self.transport.clone();
             let punch_attempts = self.punch_attempts.clone();
             let udp_transport = self.udp_transport.clone();
@@ -216,7 +257,6 @@ impl Daemon {
             let peer_id_for_error = peer_id.clone();
             let sender_public_key = sender_public_key.map(str::to_string);
             return match tokio::spawn(async move {
-                let handshake_guard = handshake_arbiter.acquire(&peer_id).await;
                 let claim = peers
                     .claim_remote_candidate_incarnation_for_identity(
                         &peer_id,
@@ -226,7 +266,6 @@ impl Daemon {
                     .await;
                 let (old_incarnation, claimed_incarnation) = match claim {
                     crate::peer::RemoteCandidateIncarnationClaim::IdentityMismatch => {
-                        drop(handshake_guard);
                         peers
                             .record_direct_event(
                                 &peer_id,
@@ -250,7 +289,6 @@ impl Daemon {
                         return None;
                     }
                     crate::peer::RemoteCandidateIncarnationClaim::NoReset => {
-                        drop(handshake_guard);
                         return Some(false);
                     }
                     crate::peer::RemoteCandidateIncarnationClaim::Reset {
@@ -306,11 +344,9 @@ impl Daemon {
                 if changed {
                     pending_handshakes
                         .lock()
-                        .await
                         .clear_peer_except_responder_owner(&peer_id);
                 }
                 drop(udp_slot);
-                drop(handshake_guard);
                 Some(changed)
             })
             .await
@@ -325,7 +361,6 @@ impl Daemon {
             };
         }
 
-        let handshake_guard = self.handshake_arbiter.acquire(peer_id).await;
         let claim = self
             .peers
             .claim_remote_candidate_incarnation_for_identity(
@@ -336,7 +371,6 @@ impl Daemon {
             .await;
         let (old_incarnation, claimed_incarnation) = match claim {
             crate::peer::RemoteCandidateIncarnationClaim::IdentityMismatch => {
-                drop(handshake_guard);
                 self.peers
                     .record_direct_event(
                         peer_id,
@@ -360,7 +394,6 @@ impl Daemon {
                 return None;
             }
             crate::peer::RemoteCandidateIncarnationClaim::NoReset => {
-                drop(handshake_guard);
                 return Some(false);
             }
             crate::peer::RemoteCandidateIncarnationClaim::Reset {
@@ -415,7 +448,7 @@ impl Daemon {
                 .await
         };
         if changed {
-            let mut pending = self.pending_handshakes.lock().await;
+            let mut pending = self.pending_handshakes.lock();
             match pending_work {
                 RemoteIncarnationResetWork::ClearAll => pending.clear_peer(peer_id),
                 RemoteIncarnationResetWork::PreserveInitiator => {
@@ -440,7 +473,6 @@ impl Daemon {
             }
         }
         drop(udp_slot);
-        drop(handshake_guard);
         Some(changed)
     }
 
@@ -1223,7 +1255,6 @@ impl Daemon {
             let Some(next) = self
                 .pending_handshakes
                 .lock()
-                .await
                 .finish_peer_reflexive_work(&peer_id, reservation.owner)
             else {
                 return;
@@ -1494,7 +1525,6 @@ impl Daemon {
                 let Some(next) = self
                     .pending_handshakes
                     .lock()
-                    .await
                     .finish_responder_work(&peer_id, reservation.owner)
                 else {
                     offer.complete_delivery(control::SignalApplyOutcome::Retry);
@@ -1511,7 +1541,6 @@ impl Daemon {
             if let Some(newest) = self
                 .pending_handshakes
                 .lock()
-                .await
                 .take_queued_responder_work(&peer_id, reservation.owner)
             {
                 offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
@@ -1537,7 +1566,6 @@ impl Daemon {
                     let Some(next) = self
                         .pending_handshakes
                         .lock()
-                        .await
                         .finish_responder_work(&peer_id, reservation.owner)
                     else {
                         return;
@@ -1553,7 +1581,6 @@ impl Daemon {
                 let Some(next) = self
                     .pending_handshakes
                     .lock()
-                    .await
                     .finish_responder_work(&peer_id, reservation.owner)
                 else {
                     return;
@@ -1653,7 +1680,6 @@ impl Daemon {
             let Some(next) = self
                 .pending_handshakes
                 .lock()
-                .await
                 .finish_responder_work(&peer_id, reservation.owner)
             else {
                 return;
@@ -2009,7 +2035,7 @@ impl Daemon {
     /// after the global slow-work cap. This drain is newest-wins per peer,
     /// checks the current online state before starting, and leaves the
     /// per-peer reservation as the single-flight boundary for duplicates.
-    async fn drain_deferred_initiator_handshakes<'a>(
+    fn drain_deferred_initiator_handshakes<'a>(
         &'a self,
         slow_work: &mut FuturesUnordered<ControlEventWork<'a>>,
         deferred: &mut InitiatorQueue<control::PeerInfo>,
@@ -2027,22 +2053,8 @@ impl Daemon {
             };
             scanned = scanned.saturating_add(1);
             let peer_id = peer_info.node_id.clone();
-            let current_online = self
-                .peers
-                .get_connection(&peer_id)
-                .await
-                .is_some_and(|peer| peer.online);
+            let current_online = self.peers.peer_session_generation_sync(&peer_id).is_some();
             if !current_online {
-                self.peers
-                    .record_direct_event(
-                        &peer_id,
-                        "initiator_handshake_deferred_dropped",
-                        None,
-                        None,
-                        None,
-                        "reason_code=peer_offline_or_removed deferred control handshake was not started",
-                    )
-                    .await;
                 self.timeline.emit(
                     "initiator_handshake_deferred_dropped",
                     None,
@@ -2056,7 +2068,10 @@ impl Daemon {
                 continue;
             }
 
-            let Some(reservation) = self.reserve_event_initiator_handshake(&peer_id).await else {
+            let Some(reservation) = self
+                .reserve_event_initiator_handshake(&peer_id)
+                .into_reservation()
+            else {
                 // An existing pending handshake or starting worker owns this
                 // peer. Keep the newest roster update for the next completion
                 // pass; dropping it here would make endpoint/incarnation
@@ -2074,6 +2089,111 @@ impl Daemon {
             slow_work.push(Box::pin(async move {
                 daemon
                     .run_event_initiator_handshake(peer_info, reservation)
+                    .await;
+            }));
+        }
+    }
+
+    /// Validate one already-claimed retry inside the bounded slow-work lane.
+    /// In particular, the control roster snapshot may wait on its own actor;
+    /// it must never stall the serial control receiver which owns ledger
+    /// admission and wake processing.
+    async fn run_claimed_initiator_retry(
+        &self,
+        identity: HandshakeRetryIdentity,
+        mut reservation: HandshakeStartReservation,
+    ) {
+        let lifecycle_current = self.peers.current_network_generation_sync()
+            == identity.network_generation
+            && self
+                .peers
+                .peer_session_is_current_sync(&identity.peer_id, identity.peer_session_generation);
+        if !lifecycle_current {
+            self.pending_handshakes
+                .lock()
+                .cancel_reservation_if_current(&identity.peer_id, identity.reservation_owner);
+            self.timeline.emit(
+                "initiator_handshake_retry_cancelled",
+                None,
+                Some("stale_lifecycle"),
+                Some(format!(
+                    "peer={} owner={} generation={} peer_session_generation={} phase={} attempt={} cancellation_generation={}",
+                    identity.peer_id,
+                    identity.reservation_owner,
+                    identity.network_generation,
+                    identity.peer_session_generation.value(),
+                    identity.phase.as_str(),
+                    identity.attempt,
+                    identity.cancellation_generation,
+                )),
+            );
+            return;
+        }
+
+        let peer_info = self.control.peers().await.get(&identity.peer_id).cloned();
+        let Some(peer_info) = peer_info else {
+            if !self.schedule_initiator_retry(
+                &identity.peer_id,
+                &mut reservation,
+                identity.phase,
+                "control_snapshot_unavailable",
+            ) {
+                self.pending_handshakes
+                    .lock()
+                    .cancel_reservation_if_current(&identity.peer_id, identity.reservation_owner);
+            }
+            return;
+        };
+        if !peer_info.online || !self.should_start_initiator_handshake(&peer_info) {
+            self.pending_handshakes
+                .lock()
+                .cancel_reservation_if_current(&identity.peer_id, identity.reservation_owner);
+            return;
+        }
+
+        self.timeline.emit(
+            "initiator_handshake_retry_admitted",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={} peer_session_generation={} phase={} attempt={} cancellation_generation={}",
+                identity.peer_id,
+                identity.reservation_owner,
+                identity.network_generation,
+                identity.peer_session_generation.value(),
+                identity.phase.as_str(),
+                identity.attempt,
+                identity.cancellation_generation,
+            )),
+        );
+        self.run_event_initiator_handshake(peer_info, reservation)
+            .await;
+    }
+
+    /// Drain exact preparation/publication retries from the authoritative
+    /// per-peer ledger. Records are removed only when this supervised owner
+    /// claims them; a repeated watch kick merely causes another bounded scan.
+    /// This coordinator performs no await: all roster/session/control work is
+    /// polled as part of the existing bounded slow-work lane.
+    fn drain_initiator_retry_ledger<'a>(
+        &'a self,
+        slow_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+    ) {
+        self.pending_handshakes
+            .lock()
+            .expire_initiator_retries(Instant::now());
+        while slow_work.len() < MAX_CONTROL_EVENT_SLOW_WORK {
+            let claimed = self
+                .pending_handshakes
+                .lock()
+                .claim_ready_initiator_retry(Instant::now());
+            let Some((identity, reservation)) = claimed else {
+                break;
+            };
+            let daemon = self;
+            slow_work.push(Box::pin(async move {
+                daemon
+                    .run_claimed_initiator_retry(identity, reservation)
                     .await;
             }));
         }
@@ -2100,6 +2220,9 @@ impl Daemon {
         let mut responder_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mut task_shutdown_rx = self.task_manager.shutdown_rx();
+        let mut handshake_retry_kick_rx = self.handshake_retry_kick_tx.subscribe();
+        let mut handshake_retry_tick = tokio::time::interval(Duration::from_millis(25));
+        handshake_retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -2118,12 +2241,12 @@ impl Daemon {
                         // Completion frees a bounded slot. Admit the oldest still
                         // live deferred peer immediately instead of waiting for a
                         // later control poll.
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
                                 &mut deferred_initiators,
-                            )
-                            .await;
+                            );
                     }
                     _ = responder_work.next(), if !responder_work.is_empty() => {
                         // Responder workers own their per-peer pending state and
@@ -2131,12 +2254,32 @@ impl Daemon {
                         // completion can also free a pending initiator's
                         // reservation, so retry deferred roster work here even
                         // when the general slow-work lane is otherwise idle.
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
                                 &mut deferred_initiators,
-                            )
-                            .await;
+                            );
+                    }
+                    changed = handshake_retry_kick_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        handshake_retry_kick_rx.borrow_and_update();
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            );
+                    }
+                    _ = handshake_retry_tick.tick() => {
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            );
                     }
                     event = control_rx.recv() => {
                         let Some(event) = event else {
@@ -2319,7 +2462,7 @@ impl Daemon {
                             } else if should_start_initiator {
                                 if let Some(reservation) = self
                                     .reserve_event_initiator_handshake(&peer_info.node_id)
-                                    .await
+                                    .into_reservation()
                                 {
                                     debug!(
                                         "PeerJoined handshake reserved: peer={} elapsed_ms={}",
@@ -2379,13 +2522,11 @@ impl Daemon {
 
                     ControlEvent::PeerUpdated(peer_info) => {
                         // Public-key/offline publication and old-session removal
-                        // are one handshake lifecycle boundary. Offer/answer
-                        // workers re-check the server-bound sender key while they
-                        // own this same arbiter, so they can observe wholly before
-                        // or wholly after the update, never between `add_peer` and
-                        // the retired session cleanup.
-                        let peer_update_handshake_guard =
-                            self.handshake_arbiter.acquire(&peer_info.node_id).await;
+                        // are fenced by PeerSessionGeneration and exact pending
+                        // ownership.  This branch intentionally does not own the
+                        // handshake arbiter across connection/session/UDP actor
+                        // awaits; old work is cancelled synchronously in the
+                        // pending store before it can publish into the new life.
                         let previous = self.peers.get_connection(&peer_info.node_id).await;
                         let previous_peer_session_generation = self
                             .peers
@@ -2415,6 +2556,10 @@ impl Daemon {
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
+                            self.clear_peer_handshake_lifecycle(
+                                &peer_info.node_id,
+                                "peer_offline",
+                            );
                             self.transport
                                 .remove_session_with_reason(
                                     &peer_info.node_id,
@@ -2422,11 +2567,6 @@ impl Daemon {
                                     "control_events.peer_updated_offline",
                                 )
                                 .await;
-                            self.pending_handshakes
-                                .lock()
-                                .await
-                                .clear_peer(&peer_info.node_id);
-                            drop(peer_update_handshake_guard);
                             if previous_peer_session_generation.is_none() {
                                 self.punch_attempts.cancel(&peer_info.node_id);
                             }
@@ -2468,6 +2608,10 @@ impl Daemon {
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
+                            self.clear_peer_handshake_lifecycle(
+                                &peer_info.node_id,
+                                "public_key_changed",
+                            );
                             self.transport
                                 .remove_session_with_reason(
                                     &peer_info.node_id,
@@ -2475,11 +2619,6 @@ impl Daemon {
                                     "control_events.peer_updated_public_key",
                                 )
                                 .await;
-                            self.pending_handshakes
-                                .lock()
-                                .await
-                                .clear_peer(&peer_info.node_id);
-                            drop(peer_update_handshake_guard);
                             info!(
                                 "Peer {} public key changed; discarded the old WireGuard session",
                                 peer_info.node_id
@@ -2504,7 +2643,6 @@ impl Daemon {
                                 .await;
                             }
                         } else {
-                            drop(peer_update_handshake_guard);
                             if update.endpoint_changed {
                                 // Endpoint metadata changes are normal NAT/candidate
                                 // churn. They must not tear down a confirmed relay or
@@ -2592,7 +2730,7 @@ impl Daemon {
                         } else if should_start_initiator {
                             if let Some(reservation) = self
                                 .reserve_event_initiator_handshake(&peer_info.node_id)
-                                .await
+                                .into_reservation()
                             {
                                 let peer_info = peer_info.clone();
                                 slow_work.push(Box::pin(async move {
@@ -2639,20 +2777,17 @@ impl Daemon {
                                 self.dns.unregister(&previous.virtual_ip).await;
                             }
                         }
-                        {
-                            // PeerLeft shares the same short state boundary as
-                            // offer staging. It never holds the arbiter across the
-                            // subsequent UDP lifecycle cleanup.
-                            let _handshake_guard = self.handshake_arbiter.acquire(&node_id).await;
-                            self.transport
-                                .remove_session_with_reason(
-                                    &node_id,
-                                    "peer_left",
-                                    "control_events.peer_left",
-                                )
-                                .await;
-                            self.pending_handshakes.lock().await.clear_peer(&node_id);
-                        }
+                        // Cancel the exact reservation/retry first.  This is a
+                        // short in-memory transaction; the subsequent session
+                        // and UDP actor cleanup owns no handshake arbiter lease.
+                        self.clear_peer_handshake_lifecycle(&node_id, "peer_left");
+                        self.transport
+                            .remove_session_with_reason(
+                                &node_id,
+                                "peer_left",
+                                "control_events.peer_left",
+                            )
+                            .await;
                         // Keep the slot read guard through the selected cleanup.
                         // A UDP task cannot publish between observing `None` and
                         // structural removal (or replace a `Some` transport while
@@ -2754,7 +2889,7 @@ impl Daemon {
                                 )
                                 .await;
                             let admitted = {
-                                let mut state = self.pending_handshakes.lock().await;
+                                let mut state = self.pending_handshakes.lock();
                                 state.enqueue_responder_work(PendingPeerOffer {
                                     from_node_id: from_node_id.clone(),
                                     candidates: candidates.clone(),
@@ -2816,7 +2951,7 @@ impl Daemon {
                         // for the same peer is coalesced by the same owner.
                         if handshake_init.is_empty() {
                             let admitted = {
-                                let mut state = self.pending_handshakes.lock().await;
+                                let mut state = self.pending_handshakes.lock();
                                 state.enqueue_responder_work(PendingPeerOffer {
                                     from_node_id: from_node_id.clone(),
                                     candidates: candidates.clone(),
@@ -2912,7 +3047,7 @@ impl Daemon {
                         // acknowledged locally and then wait behind that work.
                         if !handshake_init.is_empty() {
                             let admitted = {
-                                let mut state = self.pending_handshakes.lock().await;
+                                let mut state = self.pending_handshakes.lock();
                                 state.enqueue_responder_work(PendingPeerOffer {
                                     from_node_id: from_node_id.clone(),
                                     candidates: candidates.clone(),
@@ -2985,7 +3120,6 @@ impl Daemon {
                                         let Some(next) = daemon
                                             .pending_handshakes
                                             .lock()
-                                            .await
                                             .finish_responder_work(&peer_id, reservation.owner)
                                         else {
                                             break;
@@ -3390,7 +3524,7 @@ impl Daemon {
                             delivery_receipt,
                         };
                         let admitted = {
-                            let mut state = self.pending_handshakes.lock().await;
+                            let mut state = self.pending_handshakes.lock();
                             if !state.has_peer_reflexive_worker(&from_node_id)
                                 && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
                             {
@@ -3470,12 +3604,12 @@ impl Daemon {
                         // in either cooperative lane. Revisit the newest
                         // deferred roster edge before waiting for another
                         // unrelated event.
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
                                 &mut deferred_initiators,
-                            )
-                            .await;
+                            );
                     }
                 }
         }

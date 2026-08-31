@@ -35,183 +35,167 @@ where
     }
 }
 
+enum EventInitiatorReservationOutcome {
+    Reserved(HandshakeStartReservation),
+    Busy,
+    Contended,
+    RejectedLifecycle,
+}
+
+impl EventInitiatorReservationOutcome {
+    fn into_reservation(self) -> Option<HandshakeStartReservation> {
+        match self {
+            Self::Reserved(reservation) => Some(reservation),
+            Self::Busy | Self::Contended | Self::RejectedLifecycle => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn expect(self, message: &str) -> HandshakeStartReservation {
+        match self {
+            Self::Reserved(reservation) => reservation,
+            Self::Busy => panic!("{message}: reservation busy"),
+            Self::Contended => panic!("{message}: arbiter contended"),
+            Self::RejectedLifecycle => panic!("{message}: lifecycle rejected"),
+        }
+    }
+}
+
 impl Daemon {
     /// Fast admission used by the serial control event loop before it puts
     /// potentially slow initiator work into its bounded work set.
-    async fn reserve_event_initiator_handshake(
-        &self,
-        peer_id: &str,
-    ) -> Option<HandshakeStartReservation> {
-        // Serialize replacement cleanup with offer/answer processing.  Without
-        // this short arbiter boundary a new-generation trigger could remove a
-        // stale pending initiator while the responder path was simultaneously
-        // staging its Probe binding for the same peer.
-        let _handshake_guard = self.handshake_arbiter.acquire(peer_id).await;
+    fn reserve_event_initiator_handshake(&self, peer_id: &str) -> EventInitiatorReservationOutcome {
         let network_generation = self.peers.current_network_generation_sync();
-        let peer_session_generation = self.peers.peer_session_generation_sync(peer_id)?;
-        let stale_session_id = self
-            .pending_handshakes
-            .lock()
-            .await
-            .remove_stale_pending_for_generation(
+        let Some(peer_session_generation) = self.peers.peer_session_generation_sync(peer_id) else {
+            return EventInitiatorReservationOutcome::RejectedLifecycle;
+        };
+        let identity = HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::EventInitiatorReserve,
+            None,
+            network_generation,
+            Some(peer_session_generation),
+            "reserve",
+        );
+        let handshake_guard = match self.handshake_arbiter.try_acquire(identity) {
+            Ok(handshake_guard) => handshake_guard,
+            Err(contention) => {
+                let holder = contention
+                    .holder
+                    .as_ref()
+                    .map(HandshakeHolderSnapshot::detail)
+                    .unwrap_or_else(|| "holder_kind=unknown holder_phase=unknown".to_string());
+                self.timeline.emit(
+                    "initiator_reservation_contended",
+                    None,
+                    Some("arbiter_contended"),
+                    Some(format!(
+                        "peer={peer_id} generation={network_generation} peer_session_generation={} {holder}",
+                        peer_session_generation.value()
+                    )),
+                );
+                return EventInitiatorReservationOutcome::Contended;
+            }
+        };
+        let transaction = self.pending_handshakes.try_with(|state| {
+            let stale_session_id = state.remove_stale_pending_for_generation(
                 peer_id,
                 network_generation,
                 peer_session_generation,
             );
-        if let Some(session_id) = stale_session_id {
-            self.peers
-                .discard_pending_probe_session_binding(peer_id, &session_id)
-                .await;
-        }
-        let mut state = self.pending_handshakes.lock().await;
-        let reservation = state.reserve_start_with_owner_at_generation(
-            peer_id,
-            network_generation,
-            peer_session_generation,
-        )?;
-        if state.attempts.get(peer_id).copied().unwrap_or(0) >= MAX_HANDSHAKE_ATTEMPTS {
-            state.attempts.remove(peer_id);
-        }
+            let reservation = state.reserve_start_with_owner_at_generation_and_kind(
+                peer_id,
+                network_generation,
+                peer_session_generation,
+                HandshakeOwnerKind::EventInitiatorReserve,
+            );
+            if reservation.is_some()
+                && state.attempts.get(peer_id).copied().unwrap_or(0) >= MAX_HANDSHAKE_ATTEMPTS
+            {
+                state.attempts.remove(peer_id);
+            }
+            (stale_session_id, reservation)
+        });
+        let Some((stale_session_id, reservation)) = transaction else {
+            drop(handshake_guard);
+            return EventInitiatorReservationOutcome::Contended;
+        };
+        drop(handshake_guard);
+        let Some(mut reservation) = reservation else {
+            return EventInitiatorReservationOutcome::Busy;
+        };
+        reservation.stale_session_id = stale_session_id;
         self.timeline.emit(
             "initiator_handshake_reserved",
             None,
             None,
             Some(format!(
-                "peer={peer_id} owner={} generation={network_generation}",
-                reservation.owner
+                "peer={peer_id} owner={} owner_kind={} generation={network_generation}",
+                reservation.owner,
+                reservation.owner_kind.as_str(),
             )),
         );
-        Some(reservation)
+        EventInitiatorReservationOutcome::Reserved(reservation)
     }
 
-    /// Transfer a contended Probe-binding publication out of the cooperative
-    /// control-event work set. The control loop contains branches that await
-    /// connection-map readers and writers; keeping the first fair writer
-    /// waiter inside that same loop can therefore prevent both the waiter and
-    /// its timeout from ever being polled. This independently scheduled task
-    /// owns no emit, network-epoch, handshake-arbiter, or connection guard.
-    fn defer_initiator_probe_binding_writer_retry(
+    /// Commit one exact retry identity before publishing its wake edge.  The
+    /// per-peer map coalesces duplicate contention, the reservation remains
+    /// the cross-await owner, and the supervised control loop plus maintenance
+    /// scan jointly provide progress without detached tasks.
+    fn schedule_initiator_retry(
         &self,
-        peer_id: String,
-        owner: u64,
-        network_generation: u64,
-        retry: u32,
-        mut cancellation: tokio::sync::watch::Receiver<bool>,
-    ) {
-        let peers = self.peers.clone();
-        let pending_handshakes = self.pending_handshakes.clone();
-        let path_setup_kick_tx = self.path_setup_kick_tx.clone();
-        let timeline = self.timeline.clone();
-
-        timeline.emit(
-            "initiator_publish_probe_binding_writer_wait",
-            None,
-            Some("connection_writer_contended"),
-            Some(format!(
-                "peer={peer_id} owner={owner} generation={network_generation} retry={retry} timeout_ms={}",
-                INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
-            )),
+        peer_id: &str,
+        reservation: &mut HandshakeStartReservation,
+        phase: InitiatorRetryPhase,
+        reason_code: &'static str,
+    ) -> bool {
+        let scheduled = self.pending_handshakes.lock().schedule_initiator_retry(
+            peer_id,
+            reservation,
+            phase,
+            Instant::now(),
         );
-
-        // The task is intrinsically bounded by the writer timeout. Dropping
-        // the JoinHandle deliberately detaches it from the serial control
-        // loop whose cooperative polling is the condition being avoided.
-        tokio::spawn(async move {
-            if *cancellation.borrow() || cancellation.has_changed().is_err() {
-                return;
-            }
-
-            let writer_wait_started = Instant::now();
-            timeline.emit(
-                "initiator_publish_probe_binding_writer_wait_started",
+        let Some((identity, revision)) = scheduled else {
+            // Capacity, TTL, or an ownership mismatch cannot leave a prepared
+            // reservation with no progress edge.  Cancel only the exact owner;
+            // a replacement lifecycle remains untouched.
+            let cancelled = self
+                .pending_handshakes
+                .lock()
+                .cancel_reservation_if_current(peer_id, reservation.owner);
+            self.timeline.emit(
+                "initiator_handshake_retry_rejected",
                 None,
-                Some("connection_writer_contended"),
+                Some("retry_not_admitted"),
                 Some(format!(
-                    "peer={peer_id} owner={owner} generation={network_generation} retry={retry} timeout_ms={}",
-                    INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
+                    "peer={peer_id} owner={} generation={} peer_session_generation={} phase={} cancellation_generation={} cancelled_exact_owner={cancelled}",
+                    reservation.owner,
+                    reservation.network_generation,
+                    reservation.peer_session_generation.value(),
+                    phase.as_str(),
+                    reservation.cancellation_generation,
                 )),
             );
-            let writer_available = tokio::select! {
-                biased;
-                changed = cancellation.changed() => {
-                    let _ = changed;
-                    timeline.emit(
-                        "initiator_publish_probe_binding_writer_wait_cancelled",
-                        None,
-                        Some("initiator_reservation_cancelled"),
-                        Some(format!(
-                            "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={}",
-                            writer_wait_started.elapsed().as_millis()
-                        )),
-                    );
-                    return;
-                }
-                available = peers.wait_for_probe_session_binding_writer(
-                    INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT,
-                ) => available
-            };
-            let wait_ms = writer_wait_started.elapsed().as_millis();
-
-            // Re-check cancellation while obtaining the short reservation
-            // mutex. PeerLeft/network-generation cleanup wins over this old
-            // retry and therefore cannot be followed by a stale kick.
-            let cancelled_current = tokio::select! {
-                biased;
-                changed = cancellation.changed() => {
-                    let _ = changed;
-                    false
-                }
-                mut state = pending_handshakes.lock() => {
-                    state.cancel_reservation_if_current(&peer_id, owner)
-                }
-            };
-            if !cancelled_current {
-                timeline.emit(
-                    "initiator_publish_probe_binding_writer_wait_stale",
-                    None,
-                    Some("initiator_reservation_replaced"),
-                    Some(format!(
-                        "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={wait_ms} writer_available={writer_available}"
-                    )),
-                );
-                return;
-            }
-
-            let next_kick = (*path_setup_kick_tx.borrow()).wrapping_add(1);
-            path_setup_kick_tx.send_replace(next_kick);
-            if writer_available {
-                timeline.emit(
-                    "initiator_publish_probe_binding_writer_available",
-                    None,
-                    None,
-                    Some(format!(
-                        "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={wait_ms} reschedule_kick={next_kick}"
-                    )),
-                );
-            } else {
-                timeline.emit(
-                    "initiator_publish_probe_binding_writer_timeout",
-                    None,
-                    Some(REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT),
-                    Some(format!(
-                        "peer={peer_id} owner={owner} generation={network_generation} retry={retry} wait_ms={wait_ms} timeout_ms={} reschedule_kick={next_kick}",
-                        INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis()
-                    )),
-                );
-                warn!(
-                    event = "initiator_publish_probe_binding_writer_timeout",
-                    reason_code = REASON_INITIATOR_PROBE_BINDING_WRITER_TIMEOUT,
-                    peer_id = %peer_id,
-                    owner,
-                    network_generation,
-                    retry,
-                    wait_ms,
-                    timeout_ms = INITIATOR_PROBE_BINDING_WRITER_WAIT_TIMEOUT.as_millis(),
-                    reschedule_kick = next_kick,
-                    "Probe binding connection writer remained contended; reservation cancelled and path setup rescheduled"
-                );
-            }
-        });
+            return false;
+        };
+        reservation.disposition = HandshakeStartDisposition::RetryScheduled;
+        self.timeline.emit(
+            "initiator_handshake_retry_scheduled",
+            None,
+            Some(reason_code),
+            Some(format!(
+                "peer={} owner={} generation={} peer_session_generation={} phase={} attempt={} cancellation_generation={} retry_revision={revision}",
+                identity.peer_id,
+                identity.reservation_owner,
+                identity.network_generation,
+                identity.peer_session_generation.value(),
+                identity.phase.as_str(),
+                identity.attempt,
+                identity.cancellation_generation,
+            )),
+        );
+        self.handshake_retry_kick_tx.send_replace(revision);
+        true
     }
 
     /// Complete an initiator handshake after the control event loop has
@@ -226,6 +210,11 @@ impl Daemon {
         peer_info: &control::PeerInfo,
         reservation: &mut HandshakeStartReservation,
     ) -> Result<Option<u64>> {
+        if let Some(stale_session_id) = reservation.stale_session_id.take() {
+            self.peers
+                .discard_pending_probe_session_binding(&peer_info.node_id, &stale_session_id)
+                .await;
+        }
         if *reservation.cancellation.borrow() {
             return Ok(None);
         }
@@ -243,165 +232,116 @@ impl Daemon {
         {
             self.pending_handshakes
                 .lock()
-                .await
                 .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
             return Ok(None);
         }
-        let lock_wait_started = Instant::now();
-        self.timeline.emit(
-            "initiator_handshake_lock_wait",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={} phase=preparation",
-                peer_info.node_id, reservation.owner, handshake_generation
-            )),
-        );
-        let handshake_guard = self.handshake_arbiter.acquire(&peer_info.node_id).await;
-        self.timeline.emit(
-            "initiator_handshake_lock_acquired",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={} phase=preparation wait_ms={}",
-                peer_info.node_id,
-                reservation.owner,
+        let peer_id = peer_info.node_id.clone();
+        let prepared_already = self
+            .pending_handshakes
+            .lock()
+            .has_prepared_for_reservation(&peer_id, reservation);
+        if !prepared_already {
+            let identity = HandshakeLeaseIdentity::new(
+                &peer_id,
+                HandshakeOwnerKind::EventInitiatorPrepare,
+                Some(reservation.owner),
                 handshake_generation,
-                lock_wait_started.elapsed().as_millis()
-            )),
-        );
-        if !self.peers.peer_session_is_current_sync(
-            &peer_info.node_id,
-            reservation.peer_session_generation,
-        ) {
+                Some(reservation.peer_session_generation),
+                "preparation",
+            );
+            let Ok(handshake_guard) = self.handshake_arbiter.try_acquire(identity) else {
+                self.schedule_initiator_retry(
+                    &peer_id,
+                    reservation,
+                    InitiatorRetryPhase::Preparation,
+                    "arbiter_contended",
+                );
+                return Ok(None);
+            };
+            let current = self
+                .pending_handshakes
+                .try_with(|state| state.starting_reservation_is_current(&peer_id, reservation));
             drop(handshake_guard);
-            self.pending_handshakes
-                .lock()
-                .await
-                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-            return Ok(None);
-        }
-        // This worker is cooperatively polled by the serial control loop. The
-        // arbiter is an admission boundary only: keeping it across the actor
-        // status await would self-deadlock if PeerLeft/offline entered the
-        // serial branch, waited for this guard, and thereby stopped polling the
-        // worker which owns it. The reservation/lifecycle stamp is revalidated
-        // at the later publish transaction.
-        drop(handshake_guard);
-        let status = self.transport.session_status(&peer_info.node_id).await;
-        if status.has_active || status.has_pending_responder {
-            self.pending_handshakes
-                .lock()
-                .await
-                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-            return Ok(None);
-        }
-
-        let identity = match self.local_identity() {
-            Ok(identity) => identity,
-            Err(error) => {
-                self.pending_handshakes
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-                return Err(error);
-            }
-        };
-        let peer_public = match decode_x25519_key(&peer_info.public_key, "peer public key") {
-            Ok(peer_public) => peer_public,
-            Err(error) => {
-                self.pending_handshakes
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-                return Err(error);
-            }
-        };
-        if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
-            self.pending_handshakes
-                .lock()
-                .await
-                .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-            return Ok(None);
-        }
-
-        let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
-        let initiation = match initiator.create_initiation() {
-            Ok(initiation) => initiation,
-            Err(error) => {
-                self.pending_handshakes
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
-                return Err(DaemonError::Peer(format!(
-                    "WireGuard initiation failed: {error}"
-                )));
-            }
-        };
-        let initiation_bytes = initiation.to_bytes();
-
-        // Candidate gathering may wait on a live STUN fan-out. Keep the owner
-        // reservation; the arbiter was already released before actor I/O.
-        // Host candidates are published before that gather completes, so a
-        // provisional non-empty snapshot must not immediately win the first
-        // offer. Give the full startup snapshot a bounded opportunity while
-        // preserving the relay-first fast path.
-        let (candidates, candidate_sources) = {
-            let initial_snapshot = self.initial_candidate_set_if_ready().await;
-            let mut relay_available = self.relay_available_tx.subscribe();
-            let relay_is_available = *relay_available.borrow();
-            if let Some(initial_snapshot) = initial_snapshot {
-                if let Some(snapshot) = relay_first_candidate_shortcut(
-                    initial_snapshot.0,
-                    initial_snapshot.1,
-                    relay_is_available,
-                ) {
-                    if snapshot.0.is_empty() {
-                        self.peers
-                            .record_direct_event(
-                                &peer_info.node_id,
-                                "relay_first_empty_candidate_offer",
-                                None,
-                                Some(0),
-                                None,
-                                "relay transport is available; encrypted handshake is not gated on STUN candidates",
-                            )
-                            .await;
-                    }
-                    snapshot
-                } else {
-                    self.wait_for_local_candidate_set().await
+            match current {
+                Some(true) => {}
+                Some(false) => return Ok(None),
+                None => {
+                    self.schedule_initiator_retry(
+                        &peer_id,
+                        reservation,
+                        InitiatorRetryPhase::Preparation,
+                        "pending_state_contended",
+                    );
+                    return Ok(None);
                 }
-            } else if relay_is_available {
-                // The relay is already usable, so do not hold the encrypted
-                // session behind a slow first STUN gather. The full candidate
-                // snapshot is still published independently by UDP startup.
-                self.peers
-                    .record_direct_event(
-                        &peer_info.node_id,
-                        "relay_first_empty_candidate_offer",
-                        None,
-                        Some(0),
-                        None,
-                        "relay transport is available before the initial UDP candidate snapshot; encrypted handshake is not gated on STUN candidates",
-                    )
-                    .await;
-                (Vec::new(), HashMap::new())
-            } else {
-                // Once the relay transport is up, an empty candidate list is
-                // intentional: the control-plane handshake still establishes
-                // the encrypted session, and the forced relay probe can then
-                // prove the relay path.  Waiting for STUN here recreated the
-                // old "relay TCP is ready but the first business packet waits
-                // for candidate gathering" failure.  Direct candidates are
-                // refreshed and signaled independently after this point.
-                // Relay selection and candidate gathering run in parallel.
-                // Whichever becomes usable first wins; a cancellation is
-                // fail-closed and releases the reservation immediately.
-                tokio::select! {
-                    biased;
-                    changed = relay_available.changed() => {
-                        if changed.is_ok() && *relay_available.borrow() {
+            }
+
+            // Every actor/control/candidate await below is owned by the exact
+            // reservation, never by the mutation-turn lease.
+            let status = self.transport.session_status(&peer_info.node_id).await;
+            if status.has_active || status.has_pending_responder {
+                self.pending_handshakes
+                    .lock()
+                    .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+                return Ok(None);
+            }
+
+            let identity = match self.local_identity() {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.pending_handshakes
+                        .lock()
+                        .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+                    return Err(error);
+                }
+            };
+            let peer_public = match decode_x25519_key(&peer_info.public_key, "peer public key") {
+                Ok(peer_public) => peer_public,
+                Err(error) => {
+                    self.pending_handshakes
+                        .lock()
+                        .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+                    return Err(error);
+                }
+            };
+            if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
+                self.pending_handshakes
+                    .lock()
+                    .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+                return Ok(None);
+            }
+
+            let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
+            let initiation = match initiator.create_initiation() {
+                Ok(initiation) => initiation,
+                Err(error) => {
+                    self.pending_handshakes
+                        .lock()
+                        .cancel_reservation_if_current(&peer_info.node_id, reservation.owner);
+                    return Err(DaemonError::Peer(format!(
+                        "WireGuard initiation failed: {error}"
+                    )));
+                }
+            };
+            let initiation_bytes = initiation.to_bytes();
+
+            // Candidate gathering may wait on a live STUN fan-out. Keep the owner
+            // reservation; the arbiter was already released before actor I/O.
+            // Host candidates are published before that gather completes, so a
+            // provisional non-empty snapshot must not immediately win the first
+            // offer. Give the full startup snapshot a bounded opportunity while
+            // preserving the relay-first fast path.
+            let (candidates, candidate_sources) = {
+                let initial_snapshot = self.initial_candidate_set_if_ready().await;
+                let mut relay_available = self.relay_available_tx.subscribe();
+                let relay_is_available = *relay_available.borrow();
+                if let Some(initial_snapshot) = initial_snapshot {
+                    if let Some(snapshot) = relay_first_candidate_shortcut(
+                        initial_snapshot.0,
+                        initial_snapshot.1,
+                        relay_is_available,
+                    ) {
+                        if snapshot.0.is_empty() {
                             self.peers
                                 .record_direct_event(
                                     &peer_info.node_id,
@@ -409,69 +349,151 @@ impl Daemon {
                                     None,
                                     Some(0),
                                     None,
-                                    "relay became available before STUN candidates; encrypted handshake is not gated on candidates",
+                                    "relay transport is available; encrypted handshake is not gated on STUN candidates",
                                 )
                                 .await;
-                            (Vec::new(), HashMap::new())
-                        } else {
-                            self.wait_for_initial_candidate_set().await
                         }
+                        snapshot
+                    } else {
+                        self.wait_for_local_candidate_set().await
                     }
-                    candidates = self.wait_for_initial_candidate_set() => candidates,
-                    changed = reservation.cancellation.changed() => {
-                        if changed.is_err() || *reservation.cancellation.borrow() {
+                } else if relay_is_available {
+                    // The relay is already usable, so do not hold the encrypted
+                    // session behind a slow first STUN gather. The full candidate
+                    // snapshot is still published independently by UDP startup.
+                    self.peers
+                        .record_direct_event(
+                            &peer_info.node_id,
+                            "relay_first_empty_candidate_offer",
+                            None,
+                            Some(0),
+                            None,
+                            "relay transport is available before the initial UDP candidate snapshot; encrypted handshake is not gated on STUN candidates",
+                        )
+                        .await;
+                    (Vec::new(), HashMap::new())
+                } else {
+                    // Once the relay transport is up, an empty candidate list is
+                    // intentional: the control-plane handshake still establishes
+                    // the encrypted session, and the forced relay probe can then
+                    // prove the relay path.  Waiting for STUN here recreated the
+                    // old "relay TCP is ready but the first business packet waits
+                    // for candidate gathering" failure.  Direct candidates are
+                    // refreshed and signaled independently after this point.
+                    // Relay selection and candidate gathering run in parallel.
+                    // Whichever becomes usable first wins; a cancellation is
+                    // fail-closed and releases the reservation immediately.
+                    tokio::select! {
+                        biased;
+                        changed = relay_available.changed() => {
+                            if changed.is_ok() && *relay_available.borrow() {
+                                self.peers
+                                    .record_direct_event(
+                                        &peer_info.node_id,
+                                        "relay_first_empty_candidate_offer",
+                                        None,
+                                        Some(0),
+                                        None,
+                                        "relay became available before STUN candidates; encrypted handshake is not gated on candidates",
+                                    )
+                                    .await;
+                                (Vec::new(), HashMap::new())
+                            } else {
+                                self.wait_for_initial_candidate_set().await
+                            }
+                        }
+                        candidates = self.wait_for_initial_candidate_set() => candidates,
+                        changed = reservation.cancellation.changed() => {
+                            if changed.is_err() || *reservation.cancellation.borrow() {
+                                return Ok(None);
+                            }
                             return Ok(None);
                         }
-                        return Ok(None);
                     }
                 }
+            };
+            if *reservation.cancellation.borrow() {
+                return Ok(None);
             }
-        };
-        if *reservation.cancellation.borrow() {
-            return Ok(None);
+
+            let session_id = new_probe_session_id();
+            let (probe_ephemeral, probe_ephemeral_public_key) = new_probe_ephemeral_keypair();
+            let prepared = PreparedInitiatorHandshake {
+                initiator,
+                initiation_bytes,
+                candidates,
+                candidate_sources,
+                session_id,
+                probe_ephemeral,
+                probe_ephemeral_public_key,
+            };
+            if !self.pending_handshakes.lock().store_prepared_if_current(
+                &peer_id,
+                reservation,
+                prepared,
+            ) {
+                return Ok(None);
+            }
         }
 
         // Re-enter the short mutation boundary.  A responder may have won
         // while gathering candidates; only the owner that is still current may
         // turn its reservation into a pending initiator transaction.
-        let lock_wait_started = Instant::now();
-        self.timeline.emit(
-            "initiator_handshake_lock_wait",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={} phase=publish",
-                peer_info.node_id, reservation.owner, handshake_generation
-            )),
+        let identity = HandshakeLeaseIdentity::new(
+            &peer_id,
+            HandshakeOwnerKind::EventInitiatorPublish,
+            Some(reservation.owner),
+            handshake_generation,
+            Some(reservation.peer_session_generation),
+            "publish",
         );
-        let handshake_guard = self.handshake_arbiter.acquire(&peer_info.node_id).await;
-        self.timeline.emit(
-            "initiator_handshake_lock_acquired",
-            None,
-            None,
-            Some(format!(
-                "peer={} owner={} generation={} phase=publish wait_ms={}",
-                peer_info.node_id,
-                reservation.owner,
-                handshake_generation,
-                lock_wait_started.elapsed().as_millis()
-            )),
-        );
-        // As above, never let a cooperatively-polled worker own the arbiter
-        // while awaiting the emit/session actors. Exact reservation, network
-        // generation and peer lifecycle checks below form the commit fence.
+        let Ok(handshake_guard) = self.handshake_arbiter.try_acquire(identity) else {
+            self.schedule_initiator_retry(
+                &peer_id,
+                reservation,
+                InitiatorRetryPhase::Publish,
+                "arbiter_contended",
+            );
+            return Ok(None);
+        };
+        let prepared = self
+            .pending_handshakes
+            .try_with(|state| state.take_prepared_if_current(&peer_id, reservation));
         drop(handshake_guard);
-        let peer_id = peer_info.node_id.clone();
-        let session_id = new_probe_session_id();
-        let (probe_ephemeral, probe_ephemeral_public_key) = new_probe_ephemeral_keypair();
+        let prepared = match prepared {
+            Some(Some(prepared)) => prepared,
+            Some(None) => {
+                self.pending_handshakes
+                    .lock()
+                    .cancel_reservation_if_current(&peer_id, reservation.owner);
+                return Ok(None);
+            }
+            None => {
+                self.schedule_initiator_retry(
+                    &peer_id,
+                    reservation,
+                    InitiatorRetryPhase::Publish,
+                    "pending_state_contended",
+                );
+                return Ok(None);
+            }
+        };
+        let PreparedInitiatorHandshake {
+            initiator,
+            initiation_bytes,
+            candidates,
+            candidate_sources,
+            session_id,
+            probe_ephemeral,
+            probe_ephemeral_public_key,
+        } = prepared;
         let binding_contentions = 0u32;
         let (attempt_no, pending_id) = {
             // The outbound worker establishes the canonical lifecycle order
             // `emit -> generation -> session/connection`. The connection
             // mutation itself is non-blocking while these outer guards are
-            // held; on contention we release both and transfer a bounded
-            // writer wait to an independent task. Normal maintenance starts a
-            // fresh transaction after that task publishes its retry edge.
+            // held; contention restores the exact prepared initiation into
+            // the bounded retry ledger before waking its supervised owner.
             let emit_wait_started = Instant::now();
             self.timeline.emit(
                 "initiator_publish_emit_lock_wait",
@@ -518,16 +540,14 @@ impl Daemon {
             if *reservation.cancellation.borrow()
                 || reservation.cancellation.has_changed().is_err()
                 || self.peers.current_network_generation_sync() != handshake_generation
-                || !self.peers.peer_session_is_current_sync(
-                    &peer_id,
-                    reservation.peer_session_generation,
-                )
+                || !self
+                    .peers
+                    .peer_session_is_current_sync(&peer_id, reservation.peer_session_generation)
             {
                 drop(epoch_guard);
                 drop(emit_guard);
                 self.pending_handshakes
                     .lock()
-                    .await
                     .cancel_reservation_if_current(&peer_id, reservation.owner);
                 return Ok(None);
             }
@@ -546,7 +566,6 @@ impl Daemon {
                 drop(emit_guard);
                 self.pending_handshakes
                     .lock()
-                    .await
                     .cancel_reservation_if_current(&peer_id, reservation.owner);
                 return Ok(None);
             }
@@ -572,27 +591,40 @@ impl Daemon {
                     );
                     drop(epoch_guard);
                     drop(emit_guard);
-                    reservation.disposition =
-                        HandshakeStartDisposition::ProbeBindingRetryDeferred;
-                    self.defer_initiator_probe_binding_writer_retry(
-                        peer_id.clone(),
-                        reservation.owner,
-                        handshake_generation,
-                        binding_contentions,
-                        reservation.cancellation.clone(),
-                    );
+                    let prepared = PreparedInitiatorHandshake {
+                        initiator,
+                        initiation_bytes,
+                        candidates,
+                        candidate_sources,
+                        session_id,
+                        probe_ephemeral,
+                        probe_ephemeral_public_key,
+                    };
+                    if self.pending_handshakes.lock().store_prepared_if_current(
+                        &peer_id,
+                        reservation,
+                        prepared,
+                    ) {
+                        self.schedule_initiator_retry(
+                            &peer_id,
+                            reservation,
+                            InitiatorRetryPhase::Publish,
+                            "connection_writer_contended",
+                        );
+                    }
                     return Ok(None);
                 }
                 Some(ProbeBindingStage::Staged) => {
-                    let inserted = {
-                        let mut state = self.pending_handshakes.lock().await;
+                    let mut initiator = Some(initiator);
+                    let mut probe_ephemeral = Some(probe_ephemeral);
+                    let insert_transaction = self.pending_handshakes.try_with(|state| {
                         state
                             .insert_reserved_if_current_with_generation(
                                 peer_id.clone(),
                                 reservation.owner,
-                                initiator,
+                                initiator.take().expect("prepared initiator"),
                                 Some(session_id.clone()),
-                                Some(probe_ephemeral),
+                                probe_ephemeral.take(),
                                 handshake_generation,
                                 reservation.peer_session_generation,
                             )
@@ -601,6 +633,35 @@ impl Daemon {
                                 *attempts = attempts.saturating_add(1);
                                 (*attempts, pending_id)
                             })
+                    });
+                    let Some(inserted) = insert_transaction else {
+                        drop(epoch_guard);
+                        drop(emit_guard);
+                        self.peers
+                            .discard_pending_probe_session_binding(&peer_id, &session_id)
+                            .await;
+                        let prepared = PreparedInitiatorHandshake {
+                            initiator: initiator.take().expect("unconsumed initiator"),
+                            initiation_bytes,
+                            candidates,
+                            candidate_sources,
+                            session_id,
+                            probe_ephemeral: probe_ephemeral.take().expect("unconsumed Probe key"),
+                            probe_ephemeral_public_key,
+                        };
+                        if self.pending_handshakes.lock().store_prepared_if_current(
+                            &peer_id,
+                            reservation,
+                            prepared,
+                        ) {
+                            self.schedule_initiator_retry(
+                                &peer_id,
+                                reservation,
+                                InitiatorRetryPhase::Publish,
+                                "pending_state_contended",
+                            );
+                        }
+                        return Ok(None);
                     };
                     let Some((attempt_no, pending_id)) = inserted else {
                         drop(epoch_guard);
@@ -647,7 +708,6 @@ impl Daemon {
                     drop(emit_guard);
                     self.pending_handshakes
                         .lock()
-                        .await
                         .cancel_reservation_if_current(&peer_id, reservation.owner);
                     return Err(DaemonError::Peer(format!(
                         "failed to stage Probe v2 handshake binding for {peer_id}: {stage:?}"
@@ -685,6 +745,9 @@ impl Daemon {
                     handshake_token_fingerprint(Some(&session_id))
                 )),
             );
+            self.peers
+                .discard_pending_probe_session_binding(&peer_id, &session_id)
+                .await;
             return Ok(None);
         };
 
@@ -745,7 +808,7 @@ impl Daemon {
             // old timer must not publish a failure into the replacement
             // lifecycle (same-node ABA).
             let removed = {
-                let mut state = pending.lock().await;
+                let mut state = pending.lock();
                 if state.is_current(&timeout_peer, pending_id)
                     && state.peer_session_generation(&timeout_peer)
                         == Some(timeout_peer_session_generation)
@@ -763,14 +826,10 @@ impl Daemon {
                 return;
             }
 
-            if peers.peer_session_is_current_sync(
-                &timeout_peer,
-                timeout_peer_session_generation,
-            ) && !transport.has_session(&timeout_peer).await
-                && peers.peer_session_is_current_sync(
-                    &timeout_peer,
-                    timeout_peer_session_generation,
-                )
+            if peers.peer_session_is_current_sync(&timeout_peer, timeout_peer_session_generation)
+                && !transport.has_session(&timeout_peer).await
+                && peers
+                    .peer_session_is_current_sync(&timeout_peer, timeout_peer_session_generation)
             {
                 warn!("Handshake timeout for peer {timeout_peer}");
                 let failed = peers
@@ -819,9 +878,7 @@ impl Daemon {
                 self.start_hole_punch_at(&peer_id, Some(punch_at_ms), None, None)
                     .await;
             }
-            Ok(None)
-                if reservation.disposition
-                    == HandshakeStartDisposition::ProbeBindingRetryDeferred => {}
+            Ok(None) if reservation.disposition == HandshakeStartDisposition::RetryScheduled => {}
             Ok(None) if !*reservation.cancellation.borrow() => {
                 self.publish_current_candidates_to_peer(&peer_id, "peer event")
                     .await;
