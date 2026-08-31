@@ -20,9 +20,7 @@ impl UdpTransport {
         {
             return false;
         }
-        wireguard
-            .acknowledge_promoted_responder_token(peer_id, token)
-            .await;
+        wireguard.acknowledge_promoted_responder_token(peer_id, token);
         true
     }
 
@@ -53,9 +51,7 @@ impl UdpTransport {
         {
             return false;
         }
-        wireguard
-            .acknowledge_promoted_responder_token(peer_id, token)
-            .await;
+        wireguard.acknowledge_promoted_responder_token(peer_id, token);
         true
     }
 

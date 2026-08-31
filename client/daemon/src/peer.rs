@@ -58,6 +58,12 @@ pub const DIRECT_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(1);
 /// running during this window; if the relay peer ACK does not arrive, a
 /// genuinely encrypted-confirmed Direct path is the bounded fallback.
 pub(crate) const RELAY_FIRST_CONFIRMATION_GRACE: Duration = Duration::from_secs(3);
+/// A decrypted Relay business packet has already crossed WireGuard's replay
+/// window, so lock contention cannot be allowed to discard its evidence.  The
+/// ledger is deliberately short-lived and process-bounded: later authenticated
+/// frames retry the exact lifecycle transaction, while stale entries expire.
+const PENDING_RELAY_BUSINESS_EVIDENCE_TTL: Duration = Duration::from_secs(3);
+const MAX_PENDING_RELAY_BUSINESS_EVIDENCE: usize = 1024;
 const DIRECT_RETRY_BACKOFF_MAX_EXPONENT: u32 = 3;
 const DIRECT_TO_RELAY_HYSTERESIS_MARGIN: i32 = 15;
 const DIRECT_CONFIRMED_MIN_SCORE: i32 = 60;
@@ -333,6 +339,45 @@ pub(crate) enum RelayReadyCommitOutcome {
     ContendedEpoch,
     ContendedConnections,
     Rejected,
+}
+
+/// Result of atomically committing authenticated Relay business evidence from
+/// the serial WireGuard inbound actor.  Contention outcomes retain the exact
+/// packet evidence in the bounded manager ledger and never join an async lock
+/// queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayBusinessEvidenceCommitOutcome {
+    Committed,
+    AlreadyCurrent,
+    PendingConfirmation,
+    ContendedEpoch,
+    ContendedConnections,
+    RejectedLifecycle,
+}
+
+/// Result of committing a matched path-commit ACK without queuing behind the
+/// network epoch or connection map.  The expectation is consumed only for the
+/// two successful outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathCommitCommitOutcome {
+    Committed,
+    AlreadyCurrent,
+    ContendedEpoch,
+    ContendedConnections,
+    RejectedLifecycle,
+}
+
+/// Exact authenticated Relay business evidence retained across a contended
+/// connection transaction.  There is at most one newest-wins entry per peer.
+#[derive(Debug, Clone)]
+struct PendingRelayBusinessEvidence {
+    peer_id: String,
+    network_generation: u64,
+    peer_session_generation: PeerSessionGeneration,
+    wireguard_session_instance: u64,
+    relay_endpoint: String,
+    relay_connection_id: Option<u64>,
+    received_at: Instant,
 }
 
 /// Result of mutating a staged responder Probe-v2 binding without joining

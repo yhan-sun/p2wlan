@@ -76,6 +76,7 @@ impl PeerManager {
             relay_confirm_seq_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_confirm_notify: Arc::new(Notify::new()),
             relay_probe_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_relay_business_evidence: Arc::new(std::sync::Mutex::new(HashMap::new())),
             path_commit_expectations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             quarantined_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             quarantine_deadline_mirror: Arc::new(std::sync::Mutex::new(HashMap::new())),

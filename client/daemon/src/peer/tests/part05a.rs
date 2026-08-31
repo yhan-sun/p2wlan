@@ -507,7 +507,9 @@ async fn direct_business_cannot_be_first_usable_before_relay_receive() {
             generation,
         )
         .await);
-    assert!(manager
+    // Relay business received + first-usable are one atomic connection
+    // transaction now; the compatibility call is therefore idempotent.
+    assert!(!manager
         .record_verified_first_usable(
             "peer1",
             generation,
@@ -515,6 +517,63 @@ async fn direct_business_cannot_be_first_usable_before_relay_receive() {
             "relay:tcp://relay.test:18081",
         )
         .await);
+}
+
+#[test]
+fn relay_business_pending_ledger_is_newest_wins_ttl_and_capacity_bounded() {
+    let manager = PeerManager::new(test_config());
+    let base = Instant::now();
+    let evidence = |peer_id: String, received_at: Instant| PendingRelayBusinessEvidence {
+        peer_id,
+        network_generation: 1,
+        peer_session_generation: PeerSessionGeneration(1),
+        wireguard_session_instance: 7,
+        relay_endpoint: "tcp://relay.test:18081".to_string(),
+        relay_connection_id: Some(11),
+        received_at,
+    };
+
+    let expired_at = base
+        .checked_sub(PENDING_RELAY_BUSINESS_EVIDENCE_TTL + Duration::from_millis(1))
+        .expect("test instant is representable");
+    assert!(!manager.retain_pending_relay_business_evidence(evidence(
+        "expired".to_string(),
+        expired_at,
+    )));
+    assert_eq!(manager.pending_relay_business_evidence_len(), 0);
+
+    for index in 0..=MAX_PENDING_RELAY_BUSINESS_EVIDENCE {
+        assert!(manager.retain_pending_relay_business_evidence(evidence(
+            format!("peer-{index}"),
+            base + Duration::from_nanos(index as u64),
+        )));
+    }
+    assert_eq!(
+        manager.pending_relay_business_evidence_len(),
+        MAX_PENDING_RELAY_BUSINESS_EVIDENCE
+    );
+    assert!(!manager.pending_relay_business_evidence_present("peer-0"));
+    let newest_peer = format!("peer-{MAX_PENDING_RELAY_BUSINESS_EVIDENCE}");
+    assert!(manager.pending_relay_business_evidence_present(&newest_peer));
+
+    let current_received_at = base
+        + Duration::from_nanos(MAX_PENDING_RELAY_BUSINESS_EVIDENCE as u64);
+    assert!(!manager.retain_pending_relay_business_evidence(evidence(
+        newest_peer.clone(),
+        base,
+    )));
+    let retained = manager
+        .pending_relay_business_evidence_for_lifecycle(
+            &newest_peer,
+            1,
+            PeerSessionGeneration(1),
+            7,
+            "tcp://relay.test:18081",
+            Some(11),
+            Instant::now(),
+        )
+        .expect("newest entry remains retained");
+    assert_eq!(retained.received_at, current_received_at);
 }
 
 #[tokio::test]
@@ -540,8 +599,9 @@ async fn relay_receive_before_local_send_completes_after_local_send() {
         .await);
 
     // The inbound relay packet arrived before this daemon had sent its own
-    // first relay business packet. It is valid same-generation receive
-    // evidence, but Direct remains gated until this daemon also sends one.
+    // first relay business packet. Its receive marker and Relay first-usable
+    // evidence commit atomically, while Direct remains gated until this daemon
+    // also sends one.
     assert!(!manager
         .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
         .await);
@@ -556,9 +616,11 @@ async fn relay_receive_before_local_send_completes_after_local_send() {
     // two-direction gate without requiring an unrelated later TUN packet.
     let selection = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert!(manager
+    assert!(!manager
         .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
         .await);
+    let connection = manager.get_connection("peer1").await.unwrap();
+    assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
 }
 
 #[tokio::test]
@@ -673,7 +735,9 @@ async fn encrypted_business_ingress_can_confirm_relay_before_probe_ack() {
             Some(17),
         )
         .await);
-    assert!(manager
+    // The typed Relay business transaction records first-usable atomically
+    // with the receive marker.
+    assert!(!manager
         .record_verified_first_usable(
             "peer1",
             generation,

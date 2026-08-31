@@ -495,6 +495,11 @@ pub struct PeerManager {
     /// is verified before RelayPeerConfirmed is set.
     relay_probe_expectations:
         Arc<std::sync::Mutex<HashMap<String, crate::relay_probe::RelayProbeExpectation>>>,
+    /// Authenticated Relay business evidence which could not immediately take
+    /// the epoch/connection transaction. One newest-wins entry per peer, with
+    /// a strict TTL and global capacity bound.
+    pending_relay_business_evidence:
+        Arc<std::sync::Mutex<HashMap<String, PendingRelayBusinessEvidence>>>,
     /// Bounded per-peer path-commit expectations: the token the local daemon
     /// sent in a synthetic path-commit request, against which a relay-ingress
     /// ACK is verified before the relay-first business gate is closed for
