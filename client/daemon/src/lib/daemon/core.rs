@@ -1,3 +1,7 @@
+#[cfg(test)]
+type ResponderPostAnswerTestGateSlot =
+    Arc<std::sync::Mutex<Option<(String, Arc<ResponderPostAnswerTestGate>)>>>;
+
 /// The main daemon orchestrator.
 ///
 /// Holds all subsystems and coordinates their lifecycle.
@@ -20,6 +24,8 @@ pub struct Daemon {
     pending_handshakes: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
     /// Serializes offer, answer, and maintenance mutations for one peer.
     handshake_arbiter: HandshakeArbiter,
+    #[cfg(test)]
+    responder_post_answer_test_gate: ResponderPostAnswerTestGateSlot,
     /// Local UDP candidate endpoints advertised in signaling messages.
     local_candidates: Arc<RwLock<Vec<String>>>,
     /// Local-only source metadata keyed by candidate endpoint string.
@@ -211,6 +217,8 @@ impl Daemon {
             outbound_rx: Some(outbound_rx),
             pending_handshakes: Arc::new(tokio::sync::Mutex::new(PendingHandshakeState::default())),
             handshake_arbiter: HandshakeArbiter::default(),
+            #[cfg(test)]
+            responder_post_answer_test_gate: Arc::new(std::sync::Mutex::new(None)),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
             local_network_identity: Arc::new(RwLock::new(Vec::new())),

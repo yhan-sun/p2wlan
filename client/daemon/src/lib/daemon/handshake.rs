@@ -58,6 +58,26 @@ fn handshake_token_fingerprint(token: Option<&str>) -> String {
         .unwrap_or_else(|| "legacy".to_string())
 }
 
+/// Deterministic pause after responder transport-grace refresh and before the
+/// non-queuing Probe-binding connection transaction. Tests use this exact
+/// production boundary to inject startup contention without timing sleeps.
+#[cfg(test)]
+#[derive(Debug)]
+struct ResponderPostAnswerTestGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl ResponderPostAnswerTestGate {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Barrier::new(2),
+        }
+    }
+}
+
 fn local_is_designated_handshake_initiator(
     local_public_key: &[u8; 32],
     peer_public_key: &[u8; 32],

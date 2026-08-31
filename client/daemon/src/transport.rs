@@ -21,7 +21,7 @@ use crate::dataplane::{
     global_dataplane_profiler, DataplaneRxTrace, InboundPacket, OutboundPacket,
 };
 use crate::error::{DaemonError, Result};
-use crate::peer::{PeerManager, PeerSessionGeneration};
+use crate::peer::{PeerManager, PeerSessionGeneration, PendingProbeBindingCommitOutcome};
 use crate::relay::RelayTransport;
 
 /// Stable, non-reversible diagnostic fingerprint for an opaque encrypted
@@ -1309,16 +1309,59 @@ impl WireGuardTransport {
     /// answer delivery attempt completes. Signaling latency must not consume
     /// the authenticated adoption window.
     pub async fn refresh_responder_session_grace(&self, peer_id: &str, token: &str) -> bool {
+        let started = Instant::now();
+        info!(
+            event = "responder_session_grace_refresh_started",
+            peer_id = %peer_id,
+            "responder post-answer WireGuard grace refresh started"
+        );
+        let ingress_wait_started = Instant::now();
         let ingress_lock = self.outbound_ingress_lock(peer_id).await;
         let _ingress_guard = ingress_lock.lock().await;
+        let ingress_wait_us = ingress_wait_started.elapsed().as_micros() as u64;
+        info!(
+            event = "responder_session_grace_outbound_ingress_acquired",
+            peer_id = %peer_id,
+            wait_us = ingress_wait_us,
+            "responder post-answer outbound ingress lock acquired"
+        );
+        let sessions_wait_started = Instant::now();
         let mut sessions = self.sessions.lock().await;
+        let sessions_wait_us = sessions_wait_started.elapsed().as_micros() as u64;
         let Some(existing) = sessions.get_mut(peer_id) else {
+            info!(
+                event = "responder_session_grace_refresh_finished",
+                peer_id = %peer_id,
+                outcome = "peer_missing",
+                ingress_wait_us,
+                sessions_wait_us,
+                total_us = started.elapsed().as_micros() as u64,
+                "responder post-answer WireGuard grace refresh finished"
+            );
             return false;
         };
         let Some(pending) = existing.pending.get_mut(token) else {
+            info!(
+                event = "responder_session_grace_refresh_finished",
+                peer_id = %peer_id,
+                outcome = "pending_session_missing",
+                ingress_wait_us,
+                sessions_wait_us,
+                total_us = started.elapsed().as_micros() as u64,
+                "responder post-answer WireGuard grace refresh finished"
+            );
             return false;
         };
         pending.expires_at = Instant::now() + PENDING_RESPONDER_SESSION_GRACE;
+        info!(
+            event = "responder_session_grace_refresh_finished",
+            peer_id = %peer_id,
+            outcome = "refreshed",
+            ingress_wait_us,
+            sessions_wait_us,
+            total_us = started.elapsed().as_micros() as u64,
+            "responder post-answer WireGuard grace refresh finished"
+        );
         true
     }
 
@@ -2557,6 +2600,12 @@ impl WireGuardTransport {
             self.remember_promoted_responder_token(&peer_id, token)
                 .await;
             if promoted_now {
+                info!(
+                    event = "wireguard_responder_session_promoted",
+                    peer_id = %peer_id,
+                    session_instance,
+                    "authenticated inbound packet promoted the staged responder session"
+                );
                 self.flush_pending_outbound_for_peer(&peer_id).await;
             }
             return Ok(Some(InboundPacket {
@@ -2881,6 +2930,27 @@ impl WireGuardTransport {
                         network_generation = ?packet_network_generation,
                         "WireGuard authenticated and decrypted the envelope before lifecycle/path evidence gates"
                     );
+                    if let (Some(relay_endpoint), Some(feed)) =
+                        (relay_endpoint.as_deref(), evidence.as_ref())
+                    {
+                        if let Some(timeline) = feed.timeline.as_ref() {
+                            let generation = packet_network_generation.unwrap_or_default();
+                            let scope = format!("peer:{}:{generation}", inbound.peer_id);
+                            timeline.emit_first_scoped(
+                                &scope,
+                                "relay_inbound_authenticated",
+                                Some("relay"),
+                                None,
+                                Some(format!(
+                                    "peer={} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} session_instance={:?} decrypt_us={} encrypted_queue_depth={}",
+                                    inbound.peer_id,
+                                    inbound.session_instance,
+                                    decrypt_completed.duration_since(decrypt_started).as_micros(),
+                                    encrypted_rx.len(),
+                                )),
+                            );
+                        }
+                    }
                     if let (Some(packet_generation), Some(peer_manager)) =
                         (packet_network_generation, peers.as_ref())
                     {
@@ -3031,14 +3101,12 @@ impl WireGuardTransport {
                         let session_current =
                             inbound.session_instance.is_none() || session_guard.is_some();
                         if session_current {
-                            peer_manager
-                                .mark_relay_transport_ready_with_transport(
-                                    &inbound.peer_id,
-                                    relay_endpoint,
-                                    generation,
-                                    relay_connection_id,
-                                )
-                                .await;
+                            let _ = peer_manager.try_mark_relay_transport_ready_with_transport(
+                                &inbound.peer_id,
+                                relay_endpoint,
+                                generation,
+                                relay_connection_id,
+                            );
                         }
                         let business_ingress_session_current = session_current;
                         drop(session_guard);
@@ -3081,7 +3149,46 @@ impl WireGuardTransport {
                     let direct_validation_dplpmtud_capability = direct_validation.is_some()
                         && crate::dplpmtud::direct_validation_supports_dplpmtud(&inbound.packet);
                     let dplpmtud = crate::dplpmtud::parse_control_packet(&inbound.packet);
+                    if relay_endpoint.is_some() {
+                        if let Some(feed) = evidence.as_ref() {
+                            if let Some(timeline) = feed.timeline.as_ref() {
+                                let generation = packet_network_generation.unwrap_or_default();
+                                let scope = format!("peer:{}:{generation}", inbound.peer_id);
+                                timeline.emit_first_scoped(
+                                    &scope,
+                                    "relay_probe_classification_started",
+                                    Some("relay"),
+                                    None,
+                                    Some(format!(
+                                        "peer={} generation={generation} relay_connection_id={relay_connection_id:?} postdecrypt_us={}",
+                                        inbound.peer_id,
+                                        decrypt_completed.elapsed().as_micros(),
+                                    )),
+                                );
+                            }
+                        }
+                    }
                     let relay_probe = crate::relay_probe::parse_relay_probe_token(&inbound.packet);
+                    if let (Some(token), Some(feed)) = (relay_probe, evidence.as_ref()) {
+                        if let Some(timeline) = feed.timeline.as_ref() {
+                            let scope = format!("peer:{}:{}", inbound.peer_id, token.generation);
+                            timeline.emit_first_scoped(
+                                &scope,
+                                "relay_probe_classified",
+                                Some("relay"),
+                                Some(match token.kind {
+                                    crate::relay_probe::RelayProbeKind::Request => "request",
+                                    crate::relay_probe::RelayProbeKind::Ack => "ack",
+                                }),
+                                Some(format!(
+                                    "peer={} generation={} relay_connection_id={relay_connection_id:?} postdecrypt_us={}",
+                                    inbound.peer_id,
+                                    token.generation,
+                                    decrypt_completed.elapsed().as_micros(),
+                                )),
+                            );
+                        }
+                    }
                     let path_commit = crate::path_commit::parse_path_commit_token(&inbound.packet);
                     if session_evidence_eligible {
                         if let Some(peers) = peers.as_ref() {
@@ -3231,22 +3338,45 @@ impl WireGuardTransport {
                                     .pending_promoted_responder_tokens(&inbound.peer_id)
                                     .await;
                                 for token in promoted_tokens {
-                                    if peers
-                                        .confirm_pending_probe_session_binding(
-                                            &inbound.peer_id,
-                                            &token,
-                                        )
-                                        .await
-                                    {
-                                        self.acknowledge_promoted_responder_token(
-                                            &inbound.peer_id,
-                                            &token,
-                                        )
-                                        .await;
-                                        debug!(
-                                        "Promoted Probe v2 binding for peer {} after WireGuard rekey confirmation",
-                                        inbound.peer_id
-                                    );
+                                    let generation = packet_network_generation
+                                        .unwrap_or_else(|| peers.current_network_generation_sync());
+                                    match peers.try_confirm_pending_probe_session_binding(
+                                        &inbound.peer_id,
+                                        &token,
+                                    ) {
+                                        PendingProbeBindingCommitOutcome::Committed
+                                        | PendingProbeBindingCommitOutcome::AlreadyCurrent => {
+                                            self.acknowledge_promoted_responder_token(
+                                                &inbound.peer_id,
+                                                &token,
+                                            )
+                                            .await;
+                                            peers.emit_timeline_first(
+                                                &inbound.peer_id,
+                                                generation,
+                                                "responder_probe_binding_promoted",
+                                                relay_endpoint.as_ref().map(|_| "relay"),
+                                                None,
+                                                Some(format!(
+                                                    "peer={} generation={generation} session_instance={:?}",
+                                                    inbound.peer_id, inbound.session_instance
+                                                )),
+                                            );
+                                        }
+                                        PendingProbeBindingCommitOutcome::ContendedConnections => {
+                                            peers.emit_timeline_first(
+                                                &inbound.peer_id,
+                                                generation,
+                                                "responder_probe_binding_connections_contended",
+                                                relay_endpoint.as_ref().map(|_| "relay"),
+                                                Some("fair_rwlock_writer_unavailable"),
+                                                Some(format!(
+                                                    "peer={} generation={generation} session_instance={:?} queued_writer=false retry=next_authenticated_frame",
+                                                    inbound.peer_id, inbound.session_instance
+                                                )),
+                                            );
+                                        }
+                                        PendingProbeBindingCommitOutcome::Missing => {}
                                     }
                                 }
                             } else {
@@ -3776,6 +3906,29 @@ impl WireGuardTransport {
                                 .saturating_sub(inbound_tx.capacity())
                                 as u64,
                         );
+                    }
+                    if let (Some(relay_endpoint), Some(feed)) =
+                        (relay_endpoint.as_deref(), evidence.as_ref())
+                    {
+                        if let Some(timeline) = feed.timeline.as_ref() {
+                            let generation = packet_network_generation.unwrap_or_default();
+                            let scope = format!("peer:{}:{generation}", inbound.peer_id);
+                            timeline.emit_first_scoped(
+                                &scope,
+                                "relay_inbound_queue_handoff",
+                                Some("relay"),
+                                None,
+                                Some(format!(
+                                    "peer={} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} session_instance={:?} postdecrypt_us={} inbound_queue_depth={}",
+                                    inbound.peer_id,
+                                    inbound.session_instance,
+                                    validation_completed.duration_since(decrypt_completed).as_micros(),
+                                    inbound_tx
+                                        .max_capacity()
+                                        .saturating_sub(inbound_tx.capacity()),
+                                )),
+                            );
+                        }
                     }
                     inbound_tx.send(inbound).await.map_err(|_| {
                         DaemonError::Network("inbound packet channel closed".to_string())
@@ -4967,6 +5120,18 @@ impl WireGuardTransport {
         }
         match token.kind {
             crate::relay_probe::RelayProbeKind::Request => {
+                let ack_started = Instant::now();
+                peers.emit_timeline_first(
+                    peer_id,
+                    token.generation,
+                    "relay_probe_ack_encrypt_started",
+                    Some("relay"),
+                    None,
+                    Some(format!(
+                        "peer={peer_id} generation={} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?}",
+                        token.generation
+                    )),
+                );
                 // Without a live relay transport there is nothing to answer
                 // over; drop silently (the initiator retries its probe).
                 let Some(relay_transport) = relay_transport else {
@@ -5019,7 +5184,7 @@ impl WireGuardTransport {
                     .await
                 {
                     Ok(true) => {
-                        info!(
+                        debug!(
                             event = "relay_probe_ack_sent",
                             peer_id = %peer_id,
                             relay_endpoint = %relay_endpoint,
@@ -5027,15 +5192,51 @@ impl WireGuardTransport {
                             "relay_probe_ack_sent peer_id={peer_id} relay_endpoint={relay_endpoint} request_id={}",
                             token.request_id,
                         );
+                        peers.emit_timeline_first(
+                            peer_id,
+                            token.generation,
+                            "relay_probe_ack_sent",
+                            Some("relay"),
+                            None,
+                            Some(format!(
+                                "peer={peer_id} generation={} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} encrypt_and_send_us={}",
+                                token.generation,
+                                ack_started.elapsed().as_micros()
+                            )),
+                        );
                     }
                     Ok(false) => {
                         debug!(
                             "Could not answer relay probe from {peer_id}: WireGuard session is no longer ready"
                         );
+                        peers.emit_timeline_first(
+                            peer_id,
+                            token.generation,
+                            "relay_probe_ack_send_deferred",
+                            Some("relay"),
+                            Some("session_or_emit_unavailable"),
+                            Some(format!(
+                                "peer={peer_id} generation={} relay_connection_id={relay_connection_id:?} elapsed_us={}",
+                                token.generation,
+                                ack_started.elapsed().as_micros()
+                            )),
+                        );
                     }
                     Err(err) => {
                         debug!(
                             "Failed to answer relay probe from {peer_id} over {relay_endpoint}: {err}"
+                        );
+                        peers.emit_timeline_first(
+                            peer_id,
+                            token.generation,
+                            "relay_probe_ack_send_failed",
+                            Some("relay"),
+                            Some("relay_send_error"),
+                            Some(format!(
+                                "peer={peer_id} generation={} relay_connection_id={relay_connection_id:?} elapsed_us={}",
+                                token.generation,
+                                ack_started.elapsed().as_micros()
+                            )),
                         );
                     }
                 }

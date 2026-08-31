@@ -1,4 +1,39 @@
 impl Daemon {
+    #[cfg(test)]
+    fn install_responder_post_answer_gate_for_test(
+        &self,
+        peer_id: &str,
+        gate: Arc<ResponderPostAnswerTestGate>,
+    ) {
+        *self
+            .responder_post_answer_test_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((peer_id.to_string(), gate));
+    }
+
+    #[cfg(test)]
+    async fn pause_responder_post_answer_for_test(&self, peer_id: &str) {
+        let gate = {
+            let mut installed = self
+                .responder_post_answer_test_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if installed
+                .as_ref()
+                .is_some_and(|(installed_peer, _)| installed_peer == peer_id)
+            {
+                installed.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.wait().await;
+        }
+    }
+
     /// Acquire the responder's short mutation turn with both cancellation and
     /// a hard lock-wait bound.  A control signal is already acknowledged when
     /// it enters the responder worker, so an unbounded arbiter wait would turn
@@ -864,17 +899,63 @@ impl Daemon {
             return Ok(());
         }
         drop(handshake_guard);
+        self.timeline.emit(
+            "peer_answer_post_delivery_responder_lock_released",
+            None,
+            None,
+            Some(format!(
+                "peer={from_node_id} generation={} session_fp={}",
+                self.peers.current_network_generation_sync(),
+                handshake_token_fingerprint(Some(&handshake_token))
+            )),
+        );
         // Refresh both pending slots after the HTTP attempt. This separates
         // potentially slow control-plane delivery from the wide direct
         // adoption window; an ambiguous error intentionally leaves both
         // staged so a retry can still authenticate the exact token.
-        self.transport
+        let transport_grace_started = Instant::now();
+        let transport_grace_refreshed = self
+            .transport
             .refresh_responder_session_grace(from_node_id, &handshake_token)
             .await;
+        self.timeline.emit(
+            "peer_answer_responder_session_grace_result",
+            None,
+            (!transport_grace_refreshed).then_some("pending_session_missing"),
+            Some(format!(
+                "peer={from_node_id} generation={} refreshed={transport_grace_refreshed} elapsed_us={}",
+                self.peers.current_network_generation_sync(),
+                transport_grace_started.elapsed().as_micros()
+            )),
+        );
+        #[cfg(test)]
+        self.pause_responder_post_answer_for_test(from_node_id)
+            .await;
         if staged_probe_binding {
-            self.peers
-                .refresh_pending_probe_session_binding_grace(from_node_id, &handshake_token)
-                .await;
+            let connection_refresh_started = Instant::now();
+            let outcome = self
+                .peers
+                .try_refresh_pending_probe_session_binding_grace(
+                    from_node_id,
+                    &handshake_token,
+                );
+            self.timeline.emit(
+                "peer_answer_probe_binding_grace_result",
+                None,
+                match outcome {
+                    PendingProbeBindingCommitOutcome::ContendedConnections => {
+                        Some("fair_rwlock_writer_unavailable")
+                    }
+                    PendingProbeBindingCommitOutcome::Missing => Some("pending_binding_missing"),
+                    PendingProbeBindingCommitOutcome::Committed
+                    | PendingProbeBindingCommitOutcome::AlreadyCurrent => None,
+                },
+                Some(format!(
+                    "peer={from_node_id} generation={} outcome={outcome:?} connections_wait_us={} queued_writer=false",
+                    self.peers.current_network_generation_sync(),
+                    connection_refresh_started.elapsed().as_micros()
+                )),
+            );
         }
         // A transport error is delivery-ambiguous: the control server or peer
         // may already have received the answer. The `?` intentionally leaves

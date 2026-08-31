@@ -1370,20 +1370,29 @@ impl PeerManager {
     /// Extend a staged responder binding after the control-plane answer
     /// delivery attempt completes. This keeps signaling latency separate from
     /// the authenticated adoption window.
-    pub(crate) async fn refresh_pending_probe_session_binding_grace(
+    /// Refresh a responder binding without joining the connection writer
+    /// queue.  The original staging grace remains valid on contention; later
+    /// authenticated ingress is the authoritative promotion trigger.
+    pub(crate) fn try_refresh_pending_probe_session_binding_grace(
         &self,
         node_id: &str,
         token: &str,
-    ) -> bool {
-        let mut conns = self.connections.write().await;
+    ) -> PendingProbeBindingCommitOutcome {
+        let Ok(mut conns) = self.connections.try_write() else {
+            return PendingProbeBindingCommitOutcome::ContendedConnections;
+        };
         let Some(conn) = conns.get_mut(node_id) else {
-            return false;
+            return PendingProbeBindingCommitOutcome::Missing;
         };
         let Some(pending) = conn.pending_probe_bindings.get_mut(token) else {
-            return false;
+            return if conn.probe_binding_token.as_deref() == Some(token) {
+                PendingProbeBindingCommitOutcome::AlreadyCurrent
+            } else {
+                PendingProbeBindingCommitOutcome::Missing
+            };
         };
         pending.expires_at = Instant::now() + PENDING_PROBE_SESSION_BINDING_GRACE;
-        true
+        PendingProbeBindingCommitOutcome::Committed
     }
 
     /// Install an answer-confirmed Probe-v2 binding for outbound traffic while
@@ -1433,28 +1442,51 @@ impl PeerManager {
 
     /// Promote a responder's staged Probe-v2 binding after a packet validates
     /// under that exact key and token.
-    pub(crate) async fn confirm_pending_probe_session_binding(
+    /// Promote the responder binding at an authenticated WireGuard boundary
+    /// without parking the serial inbound actor behind a connection reader.
+    /// On contention the promoted transport token remains in its bounded
+    /// queue and the next authenticated packet retries the same transaction.
+    pub(crate) fn try_confirm_pending_probe_session_binding(
         &self,
         node_id: &str,
         token: &str,
-    ) -> bool {
-        let mut conns = self.connections.write().await;
+    ) -> PendingProbeBindingCommitOutcome {
+        let Ok(mut conns) = self.connections.try_write() else {
+            return PendingProbeBindingCommitOutcome::ContendedConnections;
+        };
         let Some(conn) = conns.get_mut(node_id) else {
-            return false;
+            return PendingProbeBindingCommitOutcome::Missing;
         };
         let should_promote = conn
             .pending_probe_bindings
             .get(token)
             .is_some_and(|pending| pending.promote_on_match);
         if !should_promote {
-            return conn.probe_binding_token.as_deref() == Some(token);
+            return if conn.probe_binding_token.as_deref() == Some(token) {
+                PendingProbeBindingCommitOutcome::AlreadyCurrent
+            } else {
+                PendingProbeBindingCommitOutcome::Missing
+            };
         }
         let pending = conn
             .pending_probe_bindings
             .remove(token)
             .expect("pending Probe binding checked above");
         install_active_probe_binding(conn, pending.binding, true);
-        true
+        PendingProbeBindingCommitOutcome::Committed
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn confirm_pending_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> bool {
+        matches!(
+            self.try_confirm_pending_probe_session_binding(node_id, token),
+            PendingProbeBindingCommitOutcome::Committed
+                | PendingProbeBindingCommitOutcome::AlreadyCurrent
+        )
     }
 
     /// Bridge a Probe-v2 adoption check with its matching WireGuard responder

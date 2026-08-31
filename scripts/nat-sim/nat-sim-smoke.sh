@@ -302,6 +302,99 @@ PY
   fi
 }
 
+# Sample the authenticated status endpoint without writing credentials or a
+# response body. `000` means no HTTP response; callers tolerate it only before
+# the daemon's first 200 during startup. Once the endpoint is live, every
+# sample through the Relay burst must remain 200.
+status_http_code() {
+  local url="$1" token_file="$2" code
+  code=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
+    p2wlan_diagnostics_curl \
+      -sS --connect-timeout 0.2 --max-time 2 \
+      -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
+  if ! [[ "$code" =~ ^[0-9]{3}$ ]]; then
+    code=000
+  fi
+  printf '%s\n' "$code"
+}
+
+record_relay_status_code() {
+  local side="$1" code="$2"
+  printf 'side=%s code=%s at_ms=%s\n' \
+    "$side" "$code" "$(python3 -c 'import time; print(int(time.time()*1000))')" \
+    >>"$ROUND_DIR/status-http-samples.log"
+  case "$side" in
+    a)
+      A_STATUS_SAMPLE_COUNT=$((A_STATUS_SAMPLE_COUNT + 1))
+      if [[ "$code" == 200 ]]; then
+        A_STATUS_SEEN_200=1
+        A_STATUS_200_COUNT=$((A_STATUS_200_COUNT + 1))
+      elif [[ "$code" != 000 || "$A_STATUS_SEEN_200" -eq 1 ]]; then
+        A_STATUS_ALWAYS_200=0
+      fi
+      ;;
+    b)
+      B_STATUS_SAMPLE_COUNT=$((B_STATUS_SAMPLE_COUNT + 1))
+      if [[ "$code" == 200 ]]; then
+        B_STATUS_SEEN_200=1
+        B_STATUS_200_COUNT=$((B_STATUS_200_COUNT + 1))
+      elif [[ "$code" != 000 || "$B_STATUS_SEEN_200" -eq 1 ]]; then
+        B_STATUS_ALWAYS_200=0
+      fi
+      ;;
+  esac
+}
+
+# Sample both daemons concurrently so observability cannot lengthen the
+# topology deadline by one client timeout per endpoint. Hidden scratch files
+# carry the two subshell results back to this shell; only the final bounded
+# code/timestamp stream is retained as acceptance evidence.
+sample_relay_status_pair() {
+  local a_url="$1" a_token_file="$2" b_url="$3" b_token_file="$4"
+  local a_code_file="$ROUND_DIR/.status-a-code"
+  local b_code_file="$ROUND_DIR/.status-b-code"
+  local a_pid b_pid a_code b_code
+
+  status_http_code "$a_url" "$a_token_file" >"$a_code_file" &
+  a_pid=$!
+  status_http_code "$b_url" "$b_token_file" >"$b_code_file" &
+  b_pid=$!
+  wait "$a_pid"
+  wait "$b_pid"
+  IFS= read -r a_code <"$a_code_file" || a_code=000
+  IFS= read -r b_code <"$b_code_file" || b_code=000
+  rm -f "$a_code_file" "$b_code_file"
+
+  record_relay_status_code a "${a_code:-000}"
+  record_relay_status_code b "${b_code:-000}"
+}
+
+# A topology run introduces no one-shot Relay owner tasks. Every supervised
+# critical task present in the final status must still be running, unfinished,
+# and error-free; this turns a silent task exit into a Relay acceptance failure.
+node_task_health_ok() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        status = json.load(handle)
+    health = status["health"]
+    tasks = health["critical_tasks"]
+    critical = [task for task in tasks if task.get("critical") is True]
+    ok = bool(critical) and all(
+        task.get("running") is True
+        and task.get("finished") is False
+        and task.get("error") is None
+        for task in critical
+    )
+except Exception:
+    ok = False
+print(1 if ok else 0)
+PY
+}
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" 2>/dev/null || true
@@ -314,6 +407,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[nat-sim] mode=$MODE isolated network id: $NETWORK_ID"
+echo "[nat-sim] exact_head_sha=${NAT_TOPOLOGY_HEAD_SHA:-unknown} replica=${NAT_TOPOLOGY_REPLICA:-1}"
 echo "[nat-sim] traversal flags: strict_filtering=$STRICT_FILTERING fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
 echo "[nat-sim] building control server, relay and daemon..."
 (
@@ -509,7 +603,21 @@ for round in $(seq 1 "$ROUNDS"); do
     # When OVERLAY_BURST is set, the round additionally waits for the burst to
     # complete on both sides.
     overlay_ok=0
-    for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 4))); do
+    A_STATUS_SEEN_200=0
+    B_STATUS_SEEN_200=0
+    A_STATUS_ALWAYS_200=1
+    B_STATUS_ALWAYS_200=1
+    A_STATUS_SAMPLE_COUNT=0
+    B_STATUS_SAMPLE_COUNT=0
+    A_STATUS_200_COUNT=0
+    B_STATUS_200_COUNT=0
+    OVERLAY_DEADLINE=$((SECONDS + OVERLAY_TIMEOUT_S))
+    while [[ "$SECONDS" -lt "$OVERLAY_DEADLINE" ]]; do
+      sample_relay_status_pair \
+        "http://127.0.0.1:$DIAG_A_PORT/status" \
+        "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" \
+        "http://127.0.0.1:$DIAG_B_PORT/status" \
+        "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth"
       A_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
       B_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
       A_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
@@ -699,6 +807,8 @@ except Exception:
     B_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
     A_BURST_BAD=$(grep -c 'overlay_burst_incomplete' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
     B_BURST_BAD=$(grep -c 'overlay_burst_incomplete' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    A_TASKS_OK=$(node_task_health_ok "$ROUND_DIR/node-a.status.json")
+    B_TASKS_OK=$(node_task_health_ok "$ROUND_DIR/node-b.status.json")
     BURST_OK=1
     if [[ "$OVERLAY_BURST" -gt 0 ]]; then
       [[ "$A_BURST" -ge 1 && "$B_BURST" -ge 1 && "$A_BURST_BAD" -eq 0 && "$B_BURST_BAD" -eq 0 ]] || BURST_OK=0
@@ -712,10 +822,13 @@ except Exception:
           && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \
           && "$A_REPLAY" -eq 0 && "$B_REPLAY" -eq 0 \
           && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 \
+          && "$A_STATUS_SEEN_200" -eq 1 && "$B_STATUS_SEEN_200" -eq 1 \
+          && "$A_STATUS_ALWAYS_200" -eq 1 && "$B_STATUS_ALWAYS_200" -eq 1 \
+          && "$A_TASKS_OK" -eq 1 && "$B_TASKS_OK" -eq 1 \
           && "$BURST_OK" -eq 1 ]]; then
-      echo "[nat-sim] ROUND $round: PASS relay_first_evidence overlay_ok=1 a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
+      echo "[nat-sim] ROUND $round: PASS relay_first_evidence overlay_ok=1 a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT task_leak_a=$((1 - A_TASKS_OK)) task_leak_b=$((1 - B_TASKS_OK)) elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
     else
-      echo "[nat-sim] ROUND $round: FAIL relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= 3000ms, zero drops/replay/invalid, burst complete)"
+      echo "[nat-sim] ROUND $round: FAIL relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT status_always_200_a=$A_STATUS_ALWAYS_200 status_always_200_b=$B_STATUS_ALWAYS_200 task_health_a=$A_TASKS_OK task_health_b=$B_TASKS_OK elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= 3000ms, zero drops/replay/invalid, burst complete, status always HTTP 200, no supervised task exit)"
       overall=1
     fi
   else

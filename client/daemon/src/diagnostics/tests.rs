@@ -314,6 +314,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let cached = cache.as_ref().expect("validated peer capture is cached");
+            assert_eq!(cached.network_generation, snapshot.network_generation);
             assert_eq!(cached.capture_revision, snapshot.captured_revision);
             assert_eq!(cached.captured_at_ms, snapshot.captured_at_ms);
             assert_eq!(cached.peers.len(), snapshot.peers.len());
@@ -323,6 +324,64 @@ mod tests {
                     >= snapshot.peer_snapshot_age_ms as u128
             );
         }
+
+        // Reproduce the fair-RwLock status outage deterministically: retain a
+        // reader, queue a writer behind it, then issue /status. Tokio blocks
+        // new readers behind the queued writer; /status must use the validated
+        // cache and remain HTTP 200 without waiting for either owner.
+        let connection_reader = context_probe
+            .peers
+            .hold_connections_reader_for_test()
+            .await;
+        let queued_writer_manager = context_probe.peers.clone();
+        let writer_started = Arc::new(tokio::sync::Notify::new());
+        let writer_started_task = writer_started.clone();
+        let queued_writer = tokio::spawn(async move {
+            writer_started_task.notify_one();
+            let _writer = queued_writer_manager
+                .hold_connections_writer_for_test()
+                .await;
+        });
+        writer_started.notified().await;
+        for _ in 0..64 {
+            if context_probe.peers.try_all_connections().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            context_probe.peers.try_all_connections().is_none(),
+            "the writer must be fairly queued before the status request"
+        );
+
+        let mut contended_status = TcpStream::connect(addr).await.unwrap();
+        contended_status
+            .write_all(
+                b"GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer diag-test-token\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut contended_response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            contended_status.read_to_string(&mut contended_response),
+        )
+        .await
+        .expect("/status must not wait behind a fairly queued writer")
+        .unwrap();
+        assert!(contended_response.starts_with("HTTP/1.1 200 OK"));
+        let contended_body = contended_response.split("\r\n\r\n").nth(1).unwrap();
+        let contended_snapshot: DiagnosticsSnapshot =
+            serde_json::from_str(contended_body).unwrap();
+        assert!(contended_snapshot.peer_snapshot_stale);
+        assert_eq!(contended_snapshot.peers.len(), snapshot.peers.len());
+        assert_eq!(
+            contended_snapshot.peer_snapshot_shape,
+            snapshot.peer_snapshot_shape
+        );
+
+        drop(connection_reader);
+        queued_writer.await.unwrap();
         assert_eq!(
             snapshot.protocol.handshake,
             "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"

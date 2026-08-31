@@ -71,7 +71,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         revision: stable_peers.capture_revision,
         captured_revision: stable_peers.capture_revision,
         captured_at_ms: stable_peers.captured_at_ms,
-        peer_snapshot_stale: false,
+        peer_snapshot_stale: stable_peers.stale,
         peer_snapshot_age_ms,
         peer_snapshot_shape: stable_peers.shape,
         ready_phase: derive_ready_phase(
@@ -120,27 +120,41 @@ struct StablePeerSnapshot {
     captured_at_ms: u64,
     captured_at: std::time::Instant,
     shape: String,
+    stale: bool,
 }
 
-/// Build a peer array without using PeerManager's best-effort full-diagnostics
-/// cache. Each peer-scoped read is live-only (`try_read` returns None under
-/// contention), and the event revision plus a second connection-state shape
-/// are checked before accepting the capture. The outer `/status` timeout turns
-/// sustained contention into a 503 rather than old peers carrying a new
-/// revision.
+/// Build a peer array using only non-queuing connection-map reads.  A fully
+/// validated capture is preferred; when Tokio's writer-preferred `RwLock`
+/// rejects a reader (an active or queued writer can do so), return the last
+/// internally consistent capture as explicitly stale instead of putting
+/// `/status` behind the same writer and eventually returning HTTP 503.
 async fn capture_stable_peer_snapshot(
     context: &DiagnosticsContext,
     relay_connected: bool,
     direct_retry_after: Duration,
     udp_local_endpoint: Option<std::net::SocketAddr>,
 ) -> StablePeerSnapshot {
-    loop {
+    const MAX_CAPTURE_ATTEMPTS: usize = 8;
+
+    for attempt in 0..MAX_CAPTURE_ATTEMPTS {
         let revision_before = context.status_events.current_seq();
         let generation_before = context.peers.current_network_generation_sync();
-        let mut node_ids: Vec<_> = context
-            .peers
-            .all_connections()
-            .await
+        let Some(connections_before) = context.peers.try_all_connections() else {
+            emit_status_connection_map_contention(
+                context,
+                generation_before,
+                "initial_read",
+                attempt,
+            );
+            return cached_or_best_effort_peer_snapshot(
+                context,
+                relay_connected,
+                direct_retry_after,
+                udp_local_endpoint,
+            )
+            .await;
+        };
+        let mut node_ids: Vec<_> = connections_before
             .into_iter()
             .map(|connection| connection.node_id)
             .collect();
@@ -168,12 +182,32 @@ async fn capture_stable_peer_snapshot(
             }
         }
         if retry {
+            emit_status_connection_map_contention(
+                context,
+                generation_before,
+                "peer_diagnostic_read",
+                attempt,
+            );
             tokio::task::yield_now().await;
             continue;
         }
         peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
 
-        let live_after = context.peers.all_connections().await;
+        let Some(live_after) = context.peers.try_all_connections() else {
+            emit_status_connection_map_contention(
+                context,
+                generation_before,
+                "validation_read",
+                attempt,
+            );
+            return cached_or_best_effort_peer_snapshot(
+                context,
+                relay_connected,
+                direct_retry_after,
+                udp_local_endpoint,
+            )
+            .await;
+        };
         let revision_after = context.status_events.current_seq();
         let generation_after = context.peers.current_network_generation_sync();
         if revision_before != revision_after
@@ -188,6 +222,7 @@ async fn capture_stable_peer_snapshot(
         let shape = peer_snapshot_shape(&peers);
         let cached = CachedPeerSnapshot {
             peers: peers.clone(),
+            network_generation: generation_after,
             capture_revision: revision_after,
             captured_at: std::time::Instant::now(),
             captured_at_ms,
@@ -210,7 +245,92 @@ async fn capture_stable_peer_snapshot(
             captured_at_ms,
             captured_at,
             shape,
+            stale: false,
         };
+    }
+
+    let generation = context.peers.current_network_generation_sync();
+    emit_status_connection_map_contention(
+        context,
+        generation,
+        "coherency_retry_exhausted",
+        MAX_CAPTURE_ATTEMPTS,
+    );
+    cached_or_best_effort_peer_snapshot(
+        context,
+        relay_connected,
+        direct_retry_after,
+        udp_local_endpoint,
+    )
+    .await
+}
+
+fn emit_status_connection_map_contention(
+    context: &DiagnosticsContext,
+    generation: u64,
+    phase: &'static str,
+    attempt: usize,
+) {
+    context.timeline.emit_first_scoped(
+        &format!("status:{generation}"),
+        "status_connection_map_read_contended",
+        None,
+        Some("writer_active_or_fairly_queued"),
+        Some(format!(
+            "generation={generation} phase={phase} attempt={attempt} wait_us=0 nonblocking_read=true fair_rwlock_queued_writer_possible=true fallback=validated_cache"
+        )),
+    );
+}
+
+async fn cached_or_best_effort_peer_snapshot(
+    context: &DiagnosticsContext,
+    relay_connected: bool,
+    direct_retry_after: Duration,
+    udp_local_endpoint: Option<std::net::SocketAddr>,
+) -> StablePeerSnapshot {
+    let cached = context
+        .peer_snapshot_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(cached) = cached {
+        return StablePeerSnapshot {
+            cached_peer_count: cached.peers.len(),
+            peers: cached.peers,
+            network_generation: cached.network_generation,
+            capture_revision: cached.capture_revision,
+            captured_at_ms: cached.captured_at_ms,
+            captured_at: cached.captured_at,
+            shape: cached.shape,
+            stale: true,
+        };
+    }
+
+    // The first status request can race startup before a validated capture
+    // exists.  PeerManager's diagnostics path is itself non-queuing and uses
+    // its bounded last-good cache; an empty array is preferable to blocking
+    // the health endpoint, and is explicitly marked stale.
+    let peers = context
+        .peers
+        .diagnostics_with_path_selection(
+            context.config.relay.prefer_direct,
+            relay_connected,
+            direct_retry_after,
+            udp_local_endpoint,
+        )
+        .await;
+    let captured_at = std::time::Instant::now();
+    let captured_at_ms = context.timeline.uptime_ms();
+    let shape = peer_snapshot_shape(&peers);
+    StablePeerSnapshot {
+        cached_peer_count: peers.len(),
+        peers,
+        network_generation: context.peers.current_network_generation_sync(),
+        capture_revision: context.status_events.current_seq(),
+        captured_at_ms,
+        captured_at,
+        shape,
+        stale: true,
     }
 }
 

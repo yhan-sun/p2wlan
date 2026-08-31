@@ -3351,6 +3351,694 @@ async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_first_packet_liveness_crosses_responder_status_and_writer_contention() {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn fetch_status(address: SocketAddr) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer relay-liveness-test\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let registered = Arc::new(AtomicBool::new(false));
+    let answer_delivered = Arc::new(AtomicBool::new(false));
+    let answer_payload = Arc::new(std::sync::Mutex::new(None::<String>));
+    let server = {
+        let registered = registered.clone();
+        let answer_delivered = answer_delivered.clone();
+        let answer_payload = answer_payload.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let registered = registered.clone();
+                let answer_delivered = answer_delivered.clone();
+                let answer_payload = answer_payload.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(position) = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                        {
+                            break position + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let body = String::from_utf8_lossy(
+                        &request[header_end..request.len().min(header_end + content_length)],
+                    );
+                    let (status_body, registration) = if head.contains("/api/v1/devices") {
+                        (
+                            r#"{"success":true,"node_id":"node-local","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#,
+                            true,
+                        )
+                    } else if head.contains("/api/v1/signals") && head.starts_with("POST") {
+                        if body.contains("\"type\":\"peer_answer\"") {
+                            answer_delivered.store(true, AtomicOrdering::SeqCst);
+                            *answer_payload
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(body.into_owned());
+                        }
+                        (r#"{"success":true,"protocol_version":1}"#, false)
+                    } else {
+                        (r#"{"signals":[],"server_time_ms":0}"#, false)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        status_body.len(),
+                        status_body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    if registration {
+                        registered.store(true, AtomicOrdering::SeqCst);
+                    }
+                });
+            }
+        })
+    };
+
+    let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    let daemon = Arc::new(Daemon::new(config));
+    timeout(Duration::from_secs(3), async {
+        while !registered.load(AtomicOrdering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon did not register with mock control");
+
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let remote_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "node-remote";
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: hex::encode(remote_identity.public_key()),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    daemon.relay_available_tx.send_replace(true);
+
+    let relay_server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = relay_server.addr.to_string();
+    let (local_relay, local_relay_rx) = RelayTransport::connect(
+        &relay_endpoint,
+        "node-local",
+        daemon.peers.clone(),
+    )
+    .await
+    .unwrap();
+    let local_relay_connection_id = local_relay.connection_id();
+    let relay_slot = Arc::new(RwLock::new(Some(local_relay.clone())));
+    let (remote_relay, mut remote_relay_rx) =
+        p2pnet_relay::RelayClient::connect(&relay_endpoint, peer_id)
+            .await
+            .unwrap();
+    let remote_peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    remote_peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-local".to_string(),
+            public_key: hex::encode(local_public),
+            virtual_ip: "10.20.0.1".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+
+    // Serve the real diagnostics endpoint against this daemon state and prime
+    // its validated snapshot before introducing a fair-queue writer.
+    let diag_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let diag_address = diag_probe.local_addr().unwrap();
+    drop(diag_probe);
+    let (diag_shutdown_tx, diag_shutdown_rx) = tokio::sync::watch::channel(false);
+    let diagnostics_context = DiagnosticsContext::new(
+        daemon.config.clone(),
+        daemon.peers.clone(),
+        daemon.udp_transport.clone(),
+        daemon.candidate_snapshot.clone(),
+        daemon.nat_profile.clone(),
+        daemon.gateway_mapping_diagnostics.clone(),
+        relay_slot.clone(),
+        daemon.relay_selection.clone(),
+        daemon.health.clone(),
+        daemon.task_manager.clone(),
+        daemon.route_manager.clone(),
+        diag_shutdown_tx.clone(),
+        daemon.timeline.clone(),
+        daemon.status_events.clone(),
+        None,
+        Some("relay-liveness-test".to_string()),
+    );
+    let (diag_ready_tx, diag_ready_rx) = tokio::sync::oneshot::channel();
+    let diagnostics_worker = tokio::spawn(run_diagnostics_server_with_retry_ready(
+        diag_address.to_string(),
+        diagnostics_context,
+        diag_shutdown_rx,
+        Some(diag_ready_tx),
+    ));
+    timeout(Duration::from_secs(1), diag_ready_rx)
+        .await
+        .expect("diagnostics listener did not bind")
+        .expect("diagnostics listener dropped readiness");
+    let initial_status = fetch_status(diag_address).await;
+    assert!(initial_status.starts_with("HTTP/1.1 200 OK"));
+
+    let mut remote_initiator =
+        HandshakeInitiator::new(remote_identity, local_public, None);
+    let initiation = remote_initiator.create_initiation().unwrap().to_bytes();
+    let session_id = "post-answer-contention-owner".to_string();
+    let probe_public = hex::encode(DhKeyPair::generate().public_key());
+    let gate = Arc::new(ResponderPostAnswerTestGate::new());
+    daemon.install_responder_post_answer_gate_for_test(peer_id, gate.clone());
+
+    let offer_worker = tokio::spawn({
+        let daemon = daemon.clone();
+        let peer_id = peer_id.to_string();
+        let session_id = session_id.clone();
+        async move {
+            daemon
+                .handle_peer_offer(
+                    &peer_id,
+                    &[],
+                    &initiation,
+                    None,
+                    None,
+                    Some(session_id),
+                    Some(probe_public),
+                )
+                .await
+        }
+    });
+
+    timeout(Duration::from_secs(3), gate.reached.notified())
+        .await
+        .expect("responder did not reach the post-answer grace boundary");
+    assert!(
+        answer_delivered.load(AtomicOrdering::SeqCst),
+        "the controlled pause must occur only after answer delivery succeeded"
+    );
+    let status = daemon.transport.session_status(peer_id).await;
+    assert!(status.has_pending_responder);
+    assert!(!status.has_active);
+
+    let answer_json = answer_payload
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .expect("mock control did not retain the delivered answer");
+    let answer_json: serde_json::Value = serde_json::from_str(&answer_json).unwrap();
+    let response_wire = hex::decode(
+        answer_json
+            .get("handshake")
+            .and_then(serde_json::Value::as_str)
+            .expect("answer did not contain the WireGuard response"),
+    )
+    .unwrap();
+    let response = MessageResponse::from_bytes(&response_wire).unwrap();
+    let mut remote_session =
+        TransportSession::new(remote_initiator.consume_response(&response).unwrap());
+
+    let (encrypted_tx, encrypted_rx) = mpsc::channel(8);
+    let relay_reader = tokio::spawn(local_relay.clone().run_inbound(
+        local_relay_rx,
+        encrypted_tx,
+        None,
+    ));
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let (_udp_tx, udp_updates) = watch::channel(None);
+    let inbound_worker = tokio::spawn({
+        let transport = daemon.transport.clone();
+        let peers = daemon.peers.clone();
+        let evidence = InboundEvidenceFeed {
+            relay_transport: relay_slot.clone(),
+            timeline: Some(daemon.timeline.clone()),
+            overlay_ingress_tx: None,
+        };
+        async move {
+            transport
+                .run_inbound_with_peers_live_udp_and_relay(
+                    encrypted_rx,
+                    inbound_tx,
+                    Some(peers),
+                    udp_updates,
+                    Some(evidence),
+                )
+                .await
+        }
+    });
+    let build_probe = |kind, generation, request_id, owner_token| {
+        Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            request_id,
+            1,
+            &crate::relay_probe::build_relay_probe_payload(
+                kind,
+                generation,
+                request_id,
+                owner_token,
+            ),
+        )
+    };
+
+    // The Answer has been delivered but its responder owner is paused. Hold a
+    // production connection snapshot and send the first encrypted Probe over
+    // an actual relay client/server/reader chain. The pending receive key must
+    // promote and ACK even though every connection transaction contends.
+    let connection_reader = daemon.peers.connection_map_for_test().read_owned().await;
+    let first_request = build_probe(crate::relay_probe::RelayProbeKind::Request, 0, 1, 0x11);
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&first_request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_ack = timeout(Duration::from_secs(1), remote_relay_rx.recv())
+        .await
+        .expect("first Relay Probe ACK stalled behind the connection reader")
+        .expect("remote relay registration closed");
+    let first_ack_wire = match first_ack {
+        p2pnet_relay::RelayMessage::Data { from_node, data } => {
+            assert_eq!(from_node, "node-local");
+            data
+        }
+        other => panic!("expected encrypted Relay Probe ACK, got {other:?}"),
+    };
+    let first_ack_packet = remote_session
+        .decrypt_from_bytes(&first_ack_wire)
+        .expect("first Relay Probe ACK did not use the promoted responder key");
+    let first_ack_token = crate::relay_probe::parse_relay_probe_token(&first_ack_packet)
+        .expect("first Relay response was not a typed Probe ACK");
+    assert_eq!(
+        first_ack_token.kind,
+        crate::relay_probe::RelayProbeKind::Ack
+    );
+    let status = daemon.transport.session_status(peer_id).await;
+    assert!(status.has_active, "first Probe did not promote pending session");
+    assert!(!status.has_pending_responder);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let events = daemon.timeline.snapshot().events;
+            if events
+                .iter()
+                .any(|event| event.event == "relay_probe_ack_sent")
+                && events.iter().any(|event| {
+                    event.event == "relay_ready_connections_contended"
+                        && event.reason_code.as_deref()
+                            == Some("fair_rwlock_writer_unavailable")
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first Relay Probe did not finish its non-queuing ACK path");
+    assert!(
+        daemon.peers.try_all_connections().is_some(),
+        "first-packet handling queued a connection writer"
+    );
+
+    // Add a real queued writer behind the retained reader. Tokio's fair RwLock
+    // now rejects every new reader; /status must serve its validated cache as
+    // HTTP 200, and the responder must still reach its session commit after
+    // its controlled gate is released.
+    let writer_started = Arc::new(tokio::sync::Notify::new());
+    let queued_writer = tokio::spawn({
+        let peers = daemon.peers.clone();
+        let writer_started = writer_started.clone();
+        async move {
+            writer_started.notify_one();
+            let _writer = peers.hold_connections_writer_for_test().await;
+        }
+    });
+    writer_started.notified().await;
+    for _ in 0..64 {
+        if daemon.peers.try_all_connections().is_none() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(daemon.peers.try_all_connections().is_none());
+    let contended_status = timeout(Duration::from_millis(250), fetch_status(diag_address))
+        .await
+        .expect("/status waited behind the fairly queued connection writer");
+    assert!(contended_status.starts_with("HTTP/1.1 200 OK"));
+    let contended_status_json: serde_json::Value = serde_json::from_str(
+        contended_status
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("status response had no body"),
+    )
+    .unwrap();
+    assert_eq!(
+        contended_status_json
+            .get("peer_snapshot_stale")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    gate.release.wait().await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let events = daemon.timeline.snapshot().events;
+            let contended = events.iter().any(|event| {
+                event.event == "peer_answer_probe_binding_grace_result"
+                    && event.reason_code.as_deref()
+                        == Some("fair_rwlock_writer_unavailable")
+            });
+            let committed = events
+                .iter()
+                .any(|event| event.event == "peer_answer_commit_result");
+            if contended && committed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("responder commit stalled behind connection contention");
+    let status = daemon.transport.session_status(peer_id).await;
+    assert!(status.has_active);
+    assert!(!status.has_pending_responder);
+
+    drop(connection_reader);
+    timeout(Duration::from_secs(1), queued_writer)
+        .await
+        .expect("connection writer remained queued after reader release")
+        .expect("connection writer task panicked");
+    timeout(Duration::from_secs(1), offer_worker)
+        .await
+        .expect("responder did not finish after controlled reader release")
+        .expect("responder task panicked")
+        .expect("responder failed");
+    let events = daemon.timeline.snapshot().events;
+    assert!(events
+        .iter()
+        .any(|event| event.event == "peer_answer_control_accepted"));
+    assert!(events
+        .iter()
+        .any(|event| event.event == "peer_answer_committed"));
+
+    // A later independently encrypted Probe retries the contended ready and
+    // Probe-binding transactions after the reader exits.
+    let second_request = build_probe(crate::relay_probe::RelayProbeKind::Request, 0, 2, 0x22);
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&second_request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_ack = timeout(Duration::from_secs(1), remote_relay_rx.recv())
+        .await
+        .expect("retry Relay Probe did not receive an ACK")
+        .expect("remote relay registration closed during retry");
+    match second_ack {
+        p2pnet_relay::RelayMessage::Data { data, .. } => {
+            remote_session
+                .decrypt_from_bytes(&data)
+                .expect("retry Relay Probe ACK did not decrypt");
+        }
+        other => panic!("expected retry Relay Probe ACK, got {other:?}"),
+    }
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let connection = daemon.peers.get_connection(peer_id).await.unwrap();
+            if connection.relay_ready_connection_id == Some(local_relay_connection_id)
+                && daemon.peers.probe_key_for_peer(peer_id).await.is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry Probe did not commit ready and Probe binding");
+    let local_connection = daemon.peers.get_connection(peer_id).await.unwrap();
+    assert_eq!(
+        local_connection.relay_ready_connection_id,
+        Some(local_relay_connection_id)
+    );
+    assert!(daemon.peers.probe_key_for_peer(peer_id).await.is_some());
+
+    // The first real ACK confirms the opposite endpoint, and a matching ACK
+    // delivered back through the same local Relay incarnation confirms this
+    // endpoint. Both selectors must remain Relay (never Direct).
+    let remote_connection_id = 0x7001;
+    remote_peers
+        .mark_relay_transport_ready_with_transport(
+            "node-local",
+            &relay_endpoint,
+            0,
+            Some(remote_connection_id),
+        )
+        .await;
+    remote_peers.register_relay_probe_expectation_for_transport(
+        "node-local",
+        0,
+        1,
+        0x11,
+        &relay_endpoint,
+        remote_connection_id,
+    );
+    assert!(
+        remote_peers
+            .consume_relay_probe_ack_with_transport(
+                "node-local",
+                first_ack_token,
+                &relay_endpoint,
+                Some(remote_connection_id),
+            )
+            .await
+    );
+    assert!(
+        daemon
+            .peers
+            .register_relay_probe_expectation_for_transport(
+            peer_id,
+            0,
+            3,
+            0x33,
+            &relay_endpoint,
+            local_relay_connection_id,
+        )
+    );
+    let local_ack = build_probe(crate::relay_probe::RelayProbeKind::Ack, 0, 3, 0x33);
+    let local_confirmation = timeout(Duration::from_secs(1), async {
+        // Contention is retryable, not rejection: production's forced Probe
+        // loop emits independently encrypted ACKs. Exercise that exact rule
+        // without sleeping until one short transaction wins the map.
+        for _ in 0..32 {
+            if daemon.peers.is_relay_peer_confirmed(peer_id).await {
+                return;
+            }
+            remote_relay
+                .send_data(
+                    "node-local",
+                    &remote_session.encrypt_to_bytes(&local_ack).unwrap(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..64 {
+                if daemon.peers.is_relay_peer_confirmed(peer_id).await {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        loop {
+            if daemon.peers.is_relay_peer_confirmed(peer_id).await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        local_confirmation.is_ok(),
+        "matching Relay ACK did not confirm the local endpoint; events={:?} connection={:?} expectation_present={}",
+        daemon
+            .timeline
+            .snapshot()
+            .events
+            .iter()
+            .map(|event| (
+                event.event.as_str(),
+                event.reason_code.as_deref(),
+                event.detail.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        daemon.peers.get_connection(peer_id).await,
+        daemon.peers.relay_probe_expectation_present(peer_id),
+    );
+    assert!(daemon.peers.is_relay_peer_confirmed(peer_id).await);
+    assert!(remote_peers.is_relay_peer_confirmed("node-local").await);
+    assert!(!daemon.peers.is_direct(peer_id).await);
+    assert!(!remote_peers.is_direct("node-local").await);
+    assert_eq!(
+        daemon
+            .peers
+            .get_connection(peer_id)
+            .await
+            .unwrap()
+            .active_path(),
+        Some(NetworkPath::Relay)
+    );
+    assert_eq!(
+        remote_peers
+            .get_connection("node-local")
+            .await
+            .unwrap()
+            .active_path(),
+        Some(NetworkPath::Relay)
+    );
+
+    // A normal business packet follows the same real Relay reader and reaches
+    // the inbound business queue; control Probe frames never leak there.
+    let business_packet = Ipv4Packet::build_icmp_echo_request(
+        Ipv4Addr::new(10, 20, 0, 2),
+        Ipv4Addr::new(10, 20, 0, 1),
+        9,
+        1,
+        b"relay-business-after-confirmation",
+    );
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&business_packet).unwrap(),
+        )
+        .await
+        .unwrap();
+    let business_ingress = timeout(Duration::from_secs(1), inbound_rx.recv())
+        .await
+        .expect("business Relay frame accumulated in the inbound actor")
+        .expect("business inbound queue closed");
+    assert_eq!(business_ingress.peer_id, peer_id);
+    assert_eq!(business_ingress.packet, business_packet);
+    assert!(inbound_rx.try_recv().is_err(), "control Probe leaked to TUN");
+
+    // Generation retirement revokes the current proof. A subsequently
+    // decrypted old-generation request is drained and answered idempotently,
+    // but cannot recreate RelayPeerConfirmed in the new generation.
+    assert_eq!(
+        daemon
+            .peers
+            .advance_network_generation("relay first-packet stale-event fence")
+            .await,
+        1
+    );
+    let stale_request = build_probe(crate::relay_probe::RelayProbeKind::Request, 0, 4, 0x44);
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&stale_request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let stale_response = timeout(Duration::from_secs(1), remote_relay_rx.recv())
+        .await
+        .expect("old-generation request accumulated in the inbound actor")
+        .expect("remote relay registration closed during stale-event fence");
+    let stale_response = match stale_response {
+        p2pnet_relay::RelayMessage::Data { data, .. } => remote_session
+            .decrypt_from_bytes(&data)
+            .expect("old-generation idempotent ACK did not decrypt"),
+        other => panic!("expected old-generation idempotent ACK, got {other:?}"),
+    };
+    let stale_response = crate::relay_probe::parse_relay_probe_token(&stale_response)
+        .expect("old-generation response was not a Probe ACK");
+    assert_eq!(stale_response.kind, crate::relay_probe::RelayProbeKind::Ack);
+    assert_eq!(stale_response.generation, 0);
+    assert!(
+        !daemon.peers.is_relay_peer_confirmed(peer_id).await,
+        "old-generation request recreated RelayPeerConfirmed"
+    );
+
+    let final_status = timeout(Duration::from_millis(250), fetch_status(diag_address))
+        .await
+        .expect("/status did not recover after connection contention");
+    assert!(final_status.starts_with("HTTP/1.1 200 OK"));
+    let session_status = daemon.transport.session_status(peer_id).await;
+    assert!(session_status.has_active);
+    assert!(!session_status.has_pending_responder);
+
+    remote_relay.close().await.unwrap();
+    local_relay.abort_writer();
+    let _ = timeout(Duration::from_secs(1), relay_reader)
+        .await
+        .expect("Relay reader task leaked")
+        .expect("Relay reader task panicked");
+    timeout(Duration::from_secs(1), inbound_worker)
+        .await
+        .expect("WireGuard inbound actor leaked")
+        .expect("WireGuard inbound actor panicked")
+        .expect("WireGuard inbound actor failed");
+    diag_shutdown_tx.send_replace(true);
+    timeout(Duration::from_secs(1), diagnostics_worker)
+        .await
+        .expect("diagnostics task leaked")
+        .expect("diagnostics task panicked")
+        .expect("diagnostics task failed");
+
+    server.abort();
+    let _ = server.await;
+    relay_server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_delivers() {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();

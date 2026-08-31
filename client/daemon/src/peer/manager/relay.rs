@@ -80,7 +80,25 @@ impl PeerManager {
     /// packet, writer completion, or unsolicited business frame cannot make
     /// an unconfirmed relay appear as the active path.
     pub(crate) async fn record_relay_observation(&self, node_id: &str, relay_server: &str) {
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+        // This method runs after an authenticated Relay frame on the single
+        // WireGuard inbound actor.  Observation is advisory and retried by
+        // every later frame, so it must never enqueue a writer behind an
+        // unrelated connection-map reader and stop the actor.
+        let Ok(mut connections) = self.connections.try_write() else {
+            let generation = self.current_network_generation_sync();
+            self.emit_timeline_first(
+                node_id,
+                generation,
+                "relay_observation_connections_contended",
+                Some("relay"),
+                Some("fair_rwlock_writer_unavailable"),
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={relay_server} wait_us=0 queued_writer=false retry=next_authenticated_frame"
+                )),
+            );
+            return;
+        };
+        if let Some(conn) = connections.get_mut(node_id) {
             conn.relay_server = Some(relay_server.to_string());
             // Untimed ingress is useful liveness evidence, but it must not
             // refresh the timestamp used to schedule a real RTT probe.
@@ -204,14 +222,85 @@ impl PeerManager {
         generation: u64,
         relay_connection_id: Option<u64>,
     ) {
+        let _ = self.try_mark_relay_transport_ready_with_transport(
+            node_id,
+            relay_endpoint,
+            generation,
+            relay_connection_id,
+        );
+    }
+
+    /// Attempt the exact relay-ready transaction without ever joining either
+    /// the epoch mutex or writer-preferred connection-map wait queue.
+    ///
+    /// The forced-relay probe loop and authenticated ingress both retry this
+    /// idempotent transaction.  Returning typed contention is therefore safer
+    /// than parking the process-wide serial inbound actor while it owns the
+    /// per-peer WireGuard evidence guard.
+    pub(crate) fn try_mark_relay_transport_ready_with_transport(
+        &self,
+        node_id: &str,
+        relay_endpoint: &str,
+        generation: u64,
+        relay_connection_id: Option<u64>,
+    ) -> RelayReadyCommitOutcome {
+        let started = Instant::now();
+        let finish = |outcome: RelayReadyCommitOutcome, connections_wait_us: Option<u128>| {
+            self.emit_timeline_first(
+                node_id,
+                generation,
+                "relay_ready_commit_finished",
+                Some("relay"),
+                match outcome {
+                    RelayReadyCommitOutcome::ContendedEpoch => Some("network_epoch_busy"),
+                    RelayReadyCommitOutcome::ContendedConnections => {
+                        Some("fair_rwlock_writer_unavailable")
+                    }
+                    RelayReadyCommitOutcome::Rejected => Some("lifecycle_rejected"),
+                    RelayReadyCommitOutcome::Committed
+                    | RelayReadyCommitOutcome::AlreadyCurrent => None,
+                },
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} outcome={outcome:?} total_us={} connections_wait_us={}",
+                    started.elapsed().as_micros(),
+                    connections_wait_us
+                        .map(|wait| wait.to_string())
+                        .unwrap_or_else(|| "not_attempted".to_string())
+                )),
+            );
+            outcome
+        };
+        self.emit_timeline_first(
+            node_id,
+            generation,
+            "relay_ready_commit_started",
+            Some("relay"),
+            None,
+            Some(format!(
+                "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?}"
+            )),
+        );
         // READY is part of the same per-generation path state as the
         // confirmation and first-business markers.  Hold the epoch gate from
         // the generation check through the connection write so a network
         // advance cannot clear the state between those two operations.
         let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let Ok(_epoch_guard) = epoch_gate.try_lock() else {
+            self.emit_timeline_first(
+                node_id,
+                generation,
+                "relay_ready_epoch_contended",
+                Some("relay"),
+                Some("network_epoch_busy"),
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} wait_us={} retry=next_probe_or_authenticated_frame",
+                    started.elapsed().as_micros()
+                )),
+            );
+            return finish(RelayReadyCommitOutcome::ContendedEpoch, None);
+        };
         let current_generation = self.current_network_generation_sync();
-        if generation != current_generation || self.peer_quarantined(node_id).await {
+        if generation != current_generation || self.peer_quarantined_sync(node_id) {
             self.emit_timeline(
                 "relay_transport_ready_rejected",
                 Some("relay"),
@@ -220,14 +309,35 @@ impl PeerManager {
                     "peer={node_id} generation={generation} current_generation={current_generation} relay_endpoint={relay_endpoint}"
                 )),
             );
-            return;
+            return finish(RelayReadyCommitOutcome::Rejected, None);
         }
         let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
-            return;
+            return finish(RelayReadyCommitOutcome::Rejected, None);
         };
         let now = Instant::now();
         let mut invalidated_confirmation = None;
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+        let connection_wait_started = Instant::now();
+        let Ok(mut connections) = self.connections.try_write() else {
+            let connections_wait_us = connection_wait_started.elapsed().as_micros();
+            self.emit_timeline_first(
+                node_id,
+                generation,
+                "relay_ready_connections_contended",
+                Some("relay"),
+                Some("fair_rwlock_writer_unavailable"),
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} wait_us={} queued_writer=false retry=next_probe_or_authenticated_frame",
+                    connection_wait_started.elapsed().as_micros()
+                )),
+            );
+            return finish(
+                RelayReadyCommitOutcome::ContendedConnections,
+                Some(connections_wait_us),
+            );
+        };
+        let connections_wait_us = connection_wait_started.elapsed().as_micros();
+        let mut commit_outcome = RelayReadyCommitOutcome::AlreadyCurrent;
+        if let Some(conn) = connections.get_mut(node_id) {
             // Re-check quarantine after acquiring the connection lock. The
             // first check above only avoids needless work; quarantine can be
             // committed while this task is waiting for the lock.
@@ -235,7 +345,10 @@ impl PeerManager {
                 || conn.state == ConnectionState::Closed
                 || self.peer_quarantined_sync(node_id)
             {
-                return;
+                return finish(
+                    RelayReadyCommitOutcome::Rejected,
+                    Some(connections_wait_us),
+                );
             }
             let endpoint_changed = conn.relay_ready_endpoint.as_deref() != Some(relay_endpoint);
             let transport_replaced = relay_connection_id.is_some_and(|new_id| {
@@ -333,10 +446,20 @@ impl PeerManager {
                     },
                 );
                 if !outcome.accepted() {
-                    return;
+                    return finish(
+                        RelayReadyCommitOutcome::Rejected,
+                        Some(connections_wait_us),
+                    );
                 }
+                commit_outcome = RelayReadyCommitOutcome::Committed;
             }
+        } else {
+            return finish(
+                RelayReadyCommitOutcome::Rejected,
+                Some(connections_wait_us),
+            );
         }
+        drop(connections);
         if let Some((previous_endpoint, previous_generation, previous_connection_id)) =
             invalidated_confirmation
         {
@@ -350,6 +473,7 @@ impl PeerManager {
                 )),
             );
         }
+        finish(commit_outcome, Some(connections_wait_us))
     }
 
     /// Confirm the relay path to a peer after a matching forced-relay probe ACK
@@ -476,7 +600,19 @@ impl PeerManager {
         // RelayPeerConfirmed in the new generation.
         let (confirmation_changed, preconfirmation_business_received) = {
             let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
+            let Ok(_epoch_guard) = epoch_gate.try_lock() else {
+                self.emit_timeline_first(
+                    node_id,
+                    generation,
+                    "relay_confirmation_epoch_contended",
+                    Some("relay"),
+                    Some("network_epoch_busy"),
+                    Some(format!(
+                        "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} queued_waiter=false retry=next_probe_or_business_frame"
+                    )),
+                );
+                return false;
+            };
             let current_generation = self.current_network_generation_sync();
             if generation != current_generation {
                 self.emit_timeline(
@@ -505,7 +641,7 @@ impl PeerManager {
             // Quarantine is authoritative isolation after a sustained relay
             // `peer_not_found`.  Check it immediately before taking the
             // connection lock so a late ACK cannot re-admit the stale peer.
-            if self.peer_quarantined(node_id).await {
+            if self.peer_quarantined_sync(node_id) {
                 self.emit_timeline(
                     "relay_peer_confirmation_rejected",
                     Some("relay"),
@@ -518,7 +654,19 @@ impl PeerManager {
             }
             let now = Instant::now();
             let result = {
-                let mut conns = self.connections.write().await;
+                let Ok(mut conns) = self.connections.try_write() else {
+                    self.emit_timeline_first(
+                        node_id,
+                        generation,
+                        "relay_confirmation_connections_contended",
+                        Some("relay"),
+                        Some("fair_rwlock_writer_unavailable"),
+                        Some(format!(
+                            "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} queued_writer=false retry=next_probe_or_business_frame"
+                        )),
+                    );
+                    return false;
+                };
                 let Some(conn) = conns.get_mut(node_id) else {
                     return false;
                 };
@@ -1251,10 +1399,10 @@ impl PeerManager {
         ack_ingress: &str,
         ack_connection_id: Option<u64>,
     ) -> bool {
-        // Remove any outstanding expectation before returning.  A late ACK
-        // must not revive a peer that was quarantined after the relay stopped
-        // registering it, even if its token is otherwise syntactically valid.
-        if self.peer_quarantined(node_id).await {
+        // Quarantine is mirrored synchronously.  The serial inbound actor
+        // must not await manager state before deciding whether this ACK can
+        // enter the lifecycle commit.
+        if self.peer_quarantined_sync(node_id) {
             let removed = self
                 .relay_probe_expectations
                 .lock()
@@ -1276,20 +1424,11 @@ impl PeerManager {
         }
         let now = Instant::now();
         let expectation = {
-            let mut expectations = self
+            let expectations = self
                 .relay_probe_expectations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let expectation = expectations.get(node_id).cloned();
-            // A consumed (matched) expectation is removed so duplicate or late
-            // ACKs are no-ops.
-            if expectation.as_ref().is_some_and(|expectation| {
-                expectation.accepts(&token, now, ack_ingress)
-                    && expectation.accepts_connection(ack_connection_id)
-            }) {
-                expectations.remove(node_id);
-            }
-            expectation
+            expectations.get(node_id).cloned()
         };
         let Some(expectation) = expectation else {
             debug!(
@@ -1389,6 +1528,25 @@ impl PeerManager {
                 relay_rtt,
             )
             .await;
+        if confirmation_changed || accepted {
+            // Consume only after the lifecycle-bound commit succeeded.  A
+            // contended try-write keeps the exact expectation available for
+            // the next independently encrypted probe ACK instead of losing
+            // the sole proof to local lock scheduling.
+            let mut expectations = self
+                .relay_probe_expectations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if expectations.get(node_id).is_some_and(|current| {
+                current.generation == expectation.generation
+                    && current.request_id == expectation.request_id
+                    && current.owner_token == expectation.owner_token
+                    && current.relay_connection_id == expectation.relay_connection_id
+                    && current.peer_session_generation == expectation.peer_session_generation
+            }) {
+                expectations.remove(node_id);
+            }
+        }
         info!(
             event = "relay_probe_ack_consumed",
             peer_id = %node_id,
@@ -1416,7 +1574,9 @@ impl PeerManager {
         relay_rtt: Option<Duration>,
     ) -> bool {
         let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let Ok(_epoch_guard) = epoch_gate.try_lock() else {
+            return false;
+        };
         if generation != self.current_network_generation_sync() {
             return false;
         }
@@ -1426,7 +1586,9 @@ impl PeerManager {
         if !self.peer_session_is_current_sync(node_id, expected_lifecycle) {
             return false;
         }
-        let mut conns = self.connections.write().await;
+        let Ok(mut conns) = self.connections.try_write() else {
+            return false;
+        };
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
@@ -2158,7 +2320,27 @@ impl PeerManager {
 
     /// Record that a relay path was attempted without treating TCP write success as delivery.
     pub async fn record_relay_attempt(&self, node_id: &str, relay_server: &str) {
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+        // Writer completion is on the serial WireGuard inbound actor when it
+        // emits a Probe ACK.  This field is advisory and every later relay
+        // write retries it, so never queue a connection-map writer after the
+        // ciphertext has already crossed the relay writer boundary.  Doing so
+        // would make a retained diagnostics reader stop the entire inbound
+        // actor even though the peer has received the ACK.
+        let Ok(mut connections) = self.connections.try_write() else {
+            let generation = self.current_network_generation_sync();
+            self.emit_timeline_first(
+                node_id,
+                generation,
+                "relay_attempt_connections_contended",
+                Some("relay"),
+                Some("fair_rwlock_writer_unavailable"),
+                Some(format!(
+                    "peer={node_id} generation={generation} relay_endpoint={relay_server} wait_us=0 queued_writer=false write_already_completed=true retry=next_relay_write"
+                )),
+            );
+            return;
+        };
+        if let Some(conn) = connections.get_mut(node_id) {
             conn.relay_server = Some(relay_server.to_string());
         }
     }

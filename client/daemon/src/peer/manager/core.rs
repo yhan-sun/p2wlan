@@ -670,6 +670,15 @@ impl PeerManager {
         self.connections.write().await
     }
 
+    /// Hold a connection reader while a second task queues a writer.  This
+    /// models Tokio's fair RwLock admission rule without timing sleeps.
+    #[cfg(test)]
+    pub(crate) async fn hold_connections_reader_for_test(
+        &self,
+    ) -> tokio::sync::OwnedRwLockReadGuard<HashMap<String, PeerConnection>> {
+        self.connections.clone().read_owned().await
+    }
+
     #[cfg(test)]
     pub(crate) fn install_authenticated_probe_verify_gate_for_test(
         &self,

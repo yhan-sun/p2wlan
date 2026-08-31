@@ -67,6 +67,16 @@ impl PeerManager {
         self.connections.read().await.values().cloned().collect()
     }
 
+    /// Snapshot every connection without joining Tokio's writer-preferred
+    /// wait queue.  `/status` uses this so a queued lifecycle writer cannot
+    /// place every later diagnostics reader behind it indefinitely.
+    pub(crate) fn try_all_connections(&self) -> Option<Vec<PeerConnection>> {
+        self.connections
+            .try_read()
+            .ok()
+            .map(|connections| connections.values().cloned().collect())
+    }
+
     /// Return peers that need an active relay data-plane confirmation.
     pub async fn relay_validation_targets(
         &self,

@@ -322,6 +322,29 @@ pub(crate) enum ProbeBindingStage {
     PeerMissing,
 }
 
+/// Result of a relay-ready commit attempted from the serial WireGuard
+/// ingress actor.  Contention is deliberately distinct from rejection: the
+/// relay probe loop or a later authenticated frame may retry a contended
+/// transaction, while a rejected lifecycle must never be resurrected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayReadyCommitOutcome {
+    Committed,
+    AlreadyCurrent,
+    ContendedEpoch,
+    ContendedConnections,
+    Rejected,
+}
+
+/// Result of mutating a staged responder Probe-v2 binding without joining
+/// the writer-preferred connection-map wait queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingProbeBindingCommitOutcome {
+    Committed,
+    AlreadyCurrent,
+    ContendedConnections,
+    Missing,
+}
+
 /// Outcome of applying a versioned candidate signal from the control plane.
 ///
 /// Callers use this to avoid starting a synchronized punch for a signal whose
