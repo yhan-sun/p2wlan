@@ -403,6 +403,17 @@ pub enum CandidateSetApplyResult {
     PeerMissing,
 }
 
+/// Non-queuing candidate-set transaction used by bounded control workers.
+/// The worker retains the exact newest-wins payload on contention instead of
+/// joining the writer-preferred connection-map queue while owning the network
+/// epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateSetTryApplyOutcome {
+    Completed(CandidateSetApplyResult),
+    ContendedEpoch,
+    ContendedConnections,
+}
+
 /// Admission result for the identity-bound remote-incarnation preflight.
 ///
 /// A signal whose server-bound sender key no longer matches the peer's current

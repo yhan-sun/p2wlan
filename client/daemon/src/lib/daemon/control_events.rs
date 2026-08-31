@@ -1861,15 +1861,97 @@ impl Daemon {
                 .await;
             let (_fresh_verdict, candidate_apply_result, fresh_punch) =
                 if ingress == OfferIngressVerdict::Apply {
-                    self.fresh_prediction_transaction(
-                        &peer_id,
-                        &offer.candidates,
-                        &offer.candidate_sources,
-                        offer.candidate_generation,
-                        offer.candidates_expires_at_ms,
-                        offer.sender_public_key.as_deref(),
-                    )
-                    .await
+                    if matches!(
+                        fresh_prediction_from_sources(&offer.candidate_sources),
+                        Ok(None)
+                    ) {
+                        // Ordinary candidate revisions are the common cold-start
+                        // path. Never hold the epoch while queueing a connection
+                        // writer: the bounded candidate owner already retains the
+                        // exact payload and can retry without blocking RelayReady,
+                        // confirmation, status, or the responder receipt.
+                        let mut apply_retry_attempt = 0u8;
+                        let apply_result = loop {
+                            match self
+                                .peers
+                                .try_add_candidates_with_metadata_for_identity(
+                                    &peer_id,
+                                    &offer.candidates,
+                                    &offer.candidate_sources,
+                                    offer.candidate_generation,
+                                    offer.candidates_expires_at_ms,
+                                    offer.sender_public_key.as_deref(),
+                                )
+                                .await
+                            {
+                                crate::peer::CandidateSetTryApplyOutcome::Completed(result) => {
+                                    break result;
+                                }
+                                outcome @ (crate::peer::CandidateSetTryApplyOutcome::ContendedEpoch
+                                | crate::peer::CandidateSetTryApplyOutcome::ContendedConnections) => {
+                                    if let Some(newest) = self
+                                        .pending_handshakes
+                                        .lock()
+                                        .take_queued_candidate_offer_work(
+                                            &peer_id,
+                                            reservation.owner,
+                                        )
+                                    {
+                                        offer = newest;
+                                        continue 'work;
+                                    }
+                                    apply_retry_attempt = apply_retry_attempt.saturating_add(1);
+                                    let delay =
+                                        responder_offer_retry_delay(apply_retry_attempt);
+                                    let reason_code = match outcome {
+                                        crate::peer::CandidateSetTryApplyOutcome::ContendedEpoch => {
+                                            "candidate_epoch_busy"
+                                        }
+                                        crate::peer::CandidateSetTryApplyOutcome::ContendedConnections => {
+                                            "candidate_connections_busy"
+                                        }
+                                        crate::peer::CandidateSetTryApplyOutcome::Completed(_) => {
+                                            unreachable!()
+                                        }
+                                    };
+                                    self.timeline.emit(
+                                        "peer_offer_candidate_retry",
+                                        None,
+                                        Some(reason_code),
+                                        Some(format!(
+                                            "peer={} owner={} retry_attempt={} delay_ms={}",
+                                            peer_id,
+                                            reservation.owner,
+                                            apply_retry_attempt,
+                                            delay.as_millis()
+                                        )),
+                                    );
+                                    tokio::select! {
+                                        _ = sleep(delay) => {}
+                                        changed = reservation.cancellation.changed() => {
+                                            let _ = changed;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        (
+                            FreshSignalVerdict::None,
+                            apply_result,
+                            FreshPunchDecision::None,
+                        )
+                    } else {
+                        self.fresh_prediction_transaction(
+                            &peer_id,
+                            &offer.candidates,
+                            &offer.candidate_sources,
+                            offer.candidate_generation,
+                            offer.candidates_expires_at_ms,
+                            offer.sender_public_key.as_deref(),
+                        )
+                        .await
+                    }
                 } else {
                     self.peers
                         .record_direct_event(

@@ -554,8 +554,21 @@ impl PeerManager {
     ) -> bool {
         let sender_public_key = sender_public_key.map(str::trim);
         let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
-        let connections = self.connections.read().await;
+        let (_epoch_guard, connections) = loop {
+            let epoch_guard = epoch_gate.lock().await;
+            match self.connections.try_read() {
+                Ok(connections) => break (epoch_guard, connections),
+                Err(_) => {
+                    // A queued writer makes Tokio reject new readers. Never
+                    // wait behind it while retaining the lifecycle epoch: an
+                    // older connection reader may itself be finishing an
+                    // epoch-fenced transaction. Wait for a reader turn with
+                    // no epoch ownership, then retry in canonical order.
+                    drop(epoch_guard);
+                    drop(self.connections.read().await);
+                }
+            }
+        };
         if sender_public_key.is_some_and(|public_key| {
             public_key.is_empty()
                 || connections

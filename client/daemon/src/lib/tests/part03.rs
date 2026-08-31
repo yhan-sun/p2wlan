@@ -2094,6 +2094,72 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_candidate_apply_releases_epoch_before_waiting_for_writer_turn() {
+    let config = Config::generate_default("http://127.0.0.1:1", "candidate-lock-order").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-candidate-lock-order";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: hex::encode(peer_identity.public_key()),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+
+    let peers = daemon.peers.clone();
+    let reader = peers.connection_map_for_test().read_owned().await;
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let worker_start = start.clone();
+    let worker_peers = peers.clone();
+    let sender_public_key = hex::encode(peer_identity.public_key());
+    let worker = tokio::spawn(async move {
+        worker_start.wait().await;
+        worker_peers
+            .add_candidates_with_metadata_for_identity(
+                peer_id,
+                &["198.51.100.81:48100".to_string()],
+                &HashMap::from([(
+                    "198.51.100.81:48100".to_string(),
+                    "stun".to_string(),
+                )]),
+                1,
+                None,
+                Some(&sender_public_key),
+            )
+            .await
+    });
+    start.wait().await;
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers.connection_map_for_test().try_read().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocking candidate apply never entered the fair writer queue");
+    assert!(
+        peers.network_epoch_gate().try_lock().is_ok(),
+        "candidate apply queued the connection writer while retaining the epoch"
+    );
+
+    drop(reader);
+    assert_eq!(
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("candidate apply did not finish after the reader released")
+            .expect("candidate apply task panicked"),
+        CandidateSetApplyResult::Applied
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_offer() {
     fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
         0x4000_0000_0000_0000 | (incarnation << 21) | counter
@@ -2161,6 +2227,35 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
     .await
     .expect("peer lifecycle must be published before the contention edge");
 
+    // Publish the remote incarnation first so the two delivered offers take
+    // the synchronous same-incarnation fast path. The contention below then
+    // occurs at candidate apply itself, not at incarnation preflight.
+    let initial_incarnation = timeout(Duration::from_secs(1), async {
+        loop {
+            let outcome = peers.try_claim_remote_candidate_incarnation_for_identity(
+                peer_id,
+                encoded_generation(733, 1),
+                Some(&hex::encode(remote_identity.public_key())),
+            );
+            if !matches!(
+                outcome,
+                crate::peer::RemoteCandidateIncarnationTryClaim::ContendedEpoch
+                    | crate::peer::RemoteCandidateIncarnationTryClaim::ContendedConnections
+            ) {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer-join lifecycle transaction did not release its canonical locks");
+    assert_eq!(
+        initial_incarnation,
+        crate::peer::RemoteCandidateIncarnationTryClaim::Committed(
+            crate::peer::RemoteCandidateIncarnationClaim::NoReset,
+        )
+    );
+
     // A read guard makes candidate mutation need the connection writer. The
     // candidate owner must use try-write, retain the exact payload locally,
     // and ACK its durable row without joining Tokio's fair writer queue.
@@ -2180,7 +2275,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
                     "198.51.100.80:48000".to_string(),
                     "stun".to_string(),
                 )]),
-                candidate_generation: encoded_generation(733, 1),
+                candidate_generation: encoded_generation(733, 2),
                 candidates_expires_at_ms: None,
                 handshake_init: Vec::new(),
                 punch_at_ms: None,
@@ -2200,6 +2295,10 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
         peers.connection_map_for_test().try_read().is_ok(),
         "candidate admission queued a connection writer behind the held reader"
     );
+    assert!(
+        peers.network_epoch_gate().try_lock().is_ok(),
+        "candidate apply retained the network epoch after try-write contention"
+    );
 
     let responder_receipt = control::SignalDeliveryReceipt::pending();
     control
@@ -2216,7 +2315,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
                     "198.51.100.80:48000".to_string(),
                     "stun".to_string(),
                 )]),
-                candidate_generation: encoded_generation(733, 2),
+                candidate_generation: encoded_generation(733, 3),
                 candidates_expires_at_ms: None,
                 handshake_init: initiation,
                 punch_at_ms: None,
@@ -2285,6 +2384,35 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
         "candidate contention may produce only one exact Answer"
     );
     assert!(transport.has_session(peer_id).await);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let candidate_committed = peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|connection| {
+                    connection
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate == "198.51.100.80:48000")
+                });
+            let candidate_owner_finished = !pending
+                .lock()
+                .candidate_offer_workers
+                .contains_key(peer_id);
+            if candidate_committed && candidate_owner_finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "candidate owner must retry, finish its handover transaction, and release the epoch",
+    );
+    assert!(
+        peers.network_epoch_gate().try_lock().is_ok(),
+        "candidate follow-up leaked the network epoch guard"
+    );
 
     let _ = shutdown.send(true);
     timeout(Duration::from_secs(1), loop_task)
