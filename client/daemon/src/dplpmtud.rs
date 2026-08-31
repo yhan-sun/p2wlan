@@ -2338,6 +2338,37 @@ impl DplpmtudRuntime {
         })
     }
 
+    /// Test seam for publishing one internally consistent confirmed business
+    /// budget without driving the upward-probe timer. Unlike the conservative
+    /// ciphertext-defense seam above, this updates both UDP and overlay sizes.
+    #[cfg(test)]
+    pub(crate) fn force_coherent_business_budget_for_test(
+        &self,
+        peer_id: &str,
+        udp_datagram_size: UdpDatagramSize,
+    ) -> bool {
+        let Some(overlay_payload_budget) = udp_datagram_size.overlay_payload_budget() else {
+            return false;
+        };
+        self.with_business_publication_gate(|| {
+            let current = self.business_publications.borrow().clone();
+            let mut next = (*current).clone();
+            let Some(entry) = next.get_mut(peer_id) else {
+                return false;
+            };
+            let Some(publication) = entry.update.budget.as_mut() else {
+                return false;
+            };
+            publication.udp_datagram_size = udp_datagram_size;
+            publication.overlay_payload_budget = overlay_payload_budget;
+            self.business_publications.send_replace(Arc::new(next));
+            if let Some(notifier) = self.business_change_notifier.as_ref() {
+                notifier.send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+            }
+            true
+        })
+    }
+
     /// Serialize UDP publication-owner stores with the final business send.
     /// This gate is deliberately independent from `registry`; holding the
     /// registry in a test or worker cannot delay a confirmed business send.

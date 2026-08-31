@@ -12,6 +12,7 @@ use tokio::time::{Duration, Instant};
 pub(crate) const LOCAL_MTU_FEEDBACK_RATE_PER_PEER: usize = 8;
 pub(crate) const LOCAL_MTU_FEEDBACK_WINDOW: Duration = Duration::from_secs(1);
 pub(crate) const MAX_LOCAL_MTU_FEEDBACK_PEERS: usize = 256;
+pub(crate) const IPV6_MINIMUM_MTU: u32 = 1280;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalMtuFeedbackKind {
@@ -23,6 +24,7 @@ pub(crate) enum LocalMtuFeedbackKind {
 pub(crate) enum LocalMtuFeedbackSuppression {
     Malformed,
     RecursiveIcmpError,
+    Ipv6PacketTooBigBelowMinimumMtu,
     InvalidAddress,
     RateLimited,
     NoTunConsumer,
@@ -179,9 +181,16 @@ fn build_ipv6_feedback(
     if matches!(packet.next_header(), 0 | 43 | 44 | 50 | 51 | 60) {
         return Err(LocalMtuFeedbackSuppression::Malformed);
     }
+    if matches!(
+        kind,
+        LocalMtuFeedbackKind::PacketTooBig { inner_ip_mtu }
+            if inner_ip_mtu < IPV6_MINIMUM_MTU
+    ) {
+        return Err(LocalMtuFeedbackSuppression::Ipv6PacketTooBigBelowMinimumMtu);
+    }
 
     // Keep the generated ICMPv6 error within IPv6's 1280-byte minimum MTU.
-    let quoted_len = total_len.min(1280usize.saturating_sub(40 + 8));
+    let quoted_len = total_len.min(IPV6_MINIMUM_MTU as usize - (40 + 8));
     let payload_len = 8usize.saturating_add(quoted_len);
     let payload_len_u16 =
         u16::try_from(payload_len).map_err(|_| LocalMtuFeedbackSuppression::Malformed)?;
@@ -225,7 +234,7 @@ fn valid_ipv6_feedback_pair(source: Ipv6Addr, destination: Ipv6Addr) -> bool {
         && !destination.is_multicast()
 }
 
-fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, icmp: &[u8]) -> u16 {
+pub(crate) fn icmpv6_checksum(source: Ipv6Addr, destination: Ipv6Addr, icmp: &[u8]) -> u16 {
     let mut pseudo = Vec::with_capacity(40 + icmp.len());
     pseudo.extend_from_slice(&source.octets());
     pseudo.extend_from_slice(&destination.octets());
@@ -302,7 +311,28 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_packet_too_big_has_valid_checksum_quote_and_exact_inner_mtu() {
+    fn ipv6_packet_too_big_below_minimum_is_suppressed_without_clamping() {
+        let source: Ipv6Addr = "fd00::1".parse().unwrap();
+        let destination: Ipv6Addr = "fd00::2".parse().unwrap();
+        let mut original = vec![0u8; 48];
+        original[0] = 0x60;
+        original[4..6].copy_from_slice(&8u16.to_be_bytes());
+        original[6] = 17;
+        original[7] = 64;
+        original[8..24].copy_from_slice(&source.octets());
+        original[24..40].copy_from_slice(&destination.octets());
+
+        assert_eq!(
+            build_local_mtu_feedback(
+                &original,
+                LocalMtuFeedbackKind::PacketTooBig { inner_ip_mtu: 1168 },
+            ),
+            Err(LocalMtuFeedbackSuppression::Ipv6PacketTooBigBelowMinimumMtu)
+        );
+    }
+
+    #[test]
+    fn ipv6_packet_too_big_has_valid_checksum_quote_and_minimum_inner_mtu() {
         let source: Ipv6Addr = "fd00::1".parse().unwrap();
         let destination: Ipv6Addr = "fd00::2".parse().unwrap();
         let mut original = vec![0u8; 48];
@@ -316,7 +346,9 @@ mod tests {
 
         let feedback = build_local_mtu_feedback(
             &original,
-            LocalMtuFeedbackKind::PacketTooBig { inner_ip_mtu: 1168 },
+            LocalMtuFeedbackKind::PacketTooBig {
+                inner_ip_mtu: IPV6_MINIMUM_MTU,
+            },
         )
         .unwrap();
         let ip = p2pnet_tun::Ipv6Packet::new(&feedback).unwrap();
@@ -326,7 +358,7 @@ mod tests {
         assert_eq!(&ip.payload()[..2], &[2, 0]);
         assert_eq!(
             u32::from_be_bytes(ip.payload()[4..8].try_into().unwrap()),
-            1168
+            IPV6_MINIMUM_MTU
         );
         assert_eq!(&ip.payload()[8..], original.as_slice());
         assert_eq!(
@@ -336,7 +368,9 @@ mod tests {
         assert_eq!(
             build_local_mtu_feedback(
                 &feedback,
-                LocalMtuFeedbackKind::PacketTooBig { inner_ip_mtu: 1000 },
+                LocalMtuFeedbackKind::PacketTooBig {
+                    inner_ip_mtu: IPV6_MINIMUM_MTU,
+                },
             ),
             Err(LocalMtuFeedbackSuppression::RecursiveIcmpError)
         );

@@ -130,6 +130,15 @@ pub(crate) struct DirectBusinessSendGate {
     pub(crate) release: tokio::sync::Barrier,
 }
 
+/// Test-only per-peer fault rule for the exact Direct business syscall seam.
+/// The watch counter lets a test wait for a precise number of injected
+/// `WouldBlock` results without sleeps or socket-buffer heuristics.
+#[cfg(test)]
+struct DirectBusinessWouldBlockInjection {
+    remaining: usize,
+    attempts_tx: watch::Sender<usize>,
+}
+
 #[cfg(test)]
 impl DirectBusinessSendGate {
     pub(crate) fn new() -> Self {

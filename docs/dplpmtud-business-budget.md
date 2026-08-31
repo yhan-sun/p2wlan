@@ -38,12 +38,15 @@ The three relevant sizes are distinct:
    IP headers are accounted separately by DPLPMTUD.
 
 For the BASE publication, confirmed UDP datagram size 1200 produces an overlay
-payload budget of 1168. A complete 1168-byte inner packet is admissible and its
-actual WireGuard datagram must be at most 1200 bytes. The pre-encryption overlay
-check is only the first fence: the implementation always checks
-`wire_bytes.len()` against the confirmed UDP datagram size after encryption.
-The real ciphertext check is authoritative and protects against padding or a
-future codec-overhead change.
+payload budget of 1168. A complete 1168-byte **IPv4** inner packet is admissible
+and its actual WireGuard datagram must be at most 1200 bytes. The current project
+does not have a complete IPv6 TUN business data plane, and an IPv6 inner budget
+below IPv6's 1280-byte minimum cannot be advertised safely; such IPv6 packets
+fail closed before encryption with `ipv6_budget_below_minimum_mtu`. The
+pre-encryption overlay check is only the first fence: the implementation always
+checks `wire_bytes.len()` against the confirmed UDP datagram size after
+encryption. The real ciphertext check is authoritative and protects against
+padding or a future codec-overhead change.
 
 ## Publication model and ownership
 
@@ -107,18 +110,29 @@ Token capture also leases the exact socket and records its endpoint and socket
 index. The sender then:
 
 1. validates that the plaintext is one complete IP packet;
-2. rejects it if the complete inner length exceeds the overlay budget;
-3. encrypts while preserving per-peer WireGuard counter order;
-4. rejects it if the actual ciphertext exceeds the UDP datagram budget;
-5. re-reads the committed path under the network epoch fence;
-6. revalidates the exact path identity, budget revision, `Some` publication,
+2. rejects inner IPv6 fail-closed when the confirmed inner budget is below
+   1280, without generating an invalid Packet Too Big;
+3. rejects it if the complete inner length exceeds the overlay budget;
+4. encrypts while preserving per-peer WireGuard counter order;
+5. rejects it if the actual ciphertext exceeds the UDP datagram budget;
+6. re-reads the committed path under the network epoch fence;
+7. revalidates the exact path identity, budget revision, `Some` publication,
    publication owner, transport instance, local socket, and endpoint;
-7. calls nonblocking `try_send_to` on the captured socket and endpoint.
+8. calls nonblocking `try_send_to` on the captured socket and endpoint.
 
 The sender never resolves a replacement endpoint after encryption and never
 applies a newer budget to an older token. A stale token returns the original
 plaintext to routing at most once, with a fresh WireGuard counter. A second
 stale result is a typed terminal drop, preventing an ABA retry loop.
+
+A local `WouldBlock` at the final nonblocking syscall is an independent
+`RetryableLocalBackpressure` outcome. It preserves the token publication and
+the packet's stale-reroute counter, changes neither Direct nor Relay health,
+and never enters Relay fallback. The plaintext is returned to the front of the
+same peer FIFO using the existing 50 ms retry pacing. Its original 3-second
+delivery deadline remains authoritative; sustained pressure terminates as
+`direct_business_local_backpressure_deadline_expired`. Because each peer owns
+an independent flush task, one blocked socket/peer does not stop another peer.
 
 ## Pending policy
 
@@ -138,8 +152,10 @@ Budget and committed-path `watch` notifications wake the actor. Each packet is
 revalidated independently as it flushes. Per-peer flush tasks prevent one
 pending peer from blocking another peer. Queue overflow drops the oldest entry
 and records a typed `outbound_queue_full` loss. TTL expiry records
-`outbound_delivery_deadline_expired`. Peer removal, generation replacement,
-Relay activation, and worker shutdown clear or reroute the queue immediately;
+`outbound_delivery_deadline_expired`, or the more specific
+`direct_business_local_backpressure_deadline_expired` when the head packet is
+waiting on a local `WouldBlock`. Peer removal, generation replacement, Relay
+activation, and worker shutdown clear or reroute the queue immediately;
 shutdown and PeerLeft do not leave a queue or worker owner behind.
 
 ## Oversize and local feedback
@@ -153,16 +169,19 @@ injection lane:
 - IPv4: ICMP Destination Unreachable, Fragmentation Needed (type 3/code 4),
   with the supported complete-inner-packet MTU and the original IPv4 header
   plus the first eight payload bytes;
-- IPv6: ICMPv6 Packet Too Big (type 2/code 0), with the supported complete
-  inner MTU and as much of the original packet as fits within 1280 bytes;
+- IPv6 codec only: ICMPv6 Packet Too Big (type 2/code 0) is allowed only when
+  the supported complete-inner MTU is at least 1280, with as much of the
+  original packet as fits within 1280 bytes;
 - queue overflow/expiry: protocol-correct host-unreachable feedback where an
   IP source can be identified.
 
 Both outer and ICMP checksums are generated as required. Malformed/non-IP
 input, fragmented IPv4 input, invalid source/destination addresses, and ICMP
-error responses are suppressed fail-closed. IPv6 extension-header traversal
-is deliberately not implemented: packets beginning with an extension header
-are suppressed rather than risking recursive feedback. Feedback is bounded to
+error responses are suppressed fail-closed. An IPv6 Packet Too Big request
+below 1280 is also suppressed; 1168 is never copied into the field and is never
+clamped upward to 1280. IPv6 extension-header traversal is deliberately not
+implemented: packets beginning with an extension header are suppressed rather
+than risking recursive feedback. Feedback is bounded to
 8 packets per peer per second, tracks at most 256 peers, and uses a bounded
 256-entry broadcast channel. A daemon-generated ICMP error is injected toward
 the local host and is never sent back through the business outbound path.
@@ -194,7 +213,9 @@ only across token/owner validation and the nonblocking socket syscall.
 DPLPMTUD reducer mutations take the registry mutex and then briefly publish
 under the publication gate; they never wait for the network epoch gate.
 `EMSGSIZE` reducer invalidation happens after the socket operation releases the
-publication gate.
+publication gate. `WouldBlock` releases both gates as a definite no-handoff and
+retries only through the per-peer plaintext queue; it performs no reducer or
+health transition.
 
 The business-send linearization point is the `try_send_to` operation inside
 both the network epoch fence and publication gate. If path replacement or
@@ -221,6 +242,9 @@ or route one large packet around Direct.
 
 This phase does not implement overlay fragmentation, overlay reassembly,
 dynamic global TUN MTU changes, a new Direct/Relay selection policy, or UI.
-It does not traverse IPv6 extension-header chains for recursive-error
-classification. DPLPMTUD continues to describe one exact Direct UDP path; it
-is not a shared or cross-peer MTU cache.
+It does not claim a complete IPv6 TUN business data plane or low-MTU IPv6
+business support. It only retains a standards-valid IPv6 PTB codec for budgets
+at or above 1280 and fails closed below that floor. It does not traverse IPv6
+extension-header chains for recursive-error classification. DPLPMTUD continues
+to describe one exact Direct UDP path; it is not a shared or cross-peer MTU
+cache.

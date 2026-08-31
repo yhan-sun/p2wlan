@@ -64,10 +64,10 @@ const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// A packet that has reached a usable-path actor may not remain in retry
 /// limbo. This is a loss boundary, not an attempt to hide a slow relay by
 /// increasing its timeout.
-const OUTBOUND_DELIVERY_DEADLINE: Duration = Duration::from_secs(3);
+pub(crate) const OUTBOUND_DELIVERY_DEADLINE: Duration = Duration::from_secs(3);
 /// Cadence of the outbound maintenance ticker (deadline expiry, peer
 /// offline / generation-change cancellation, paced retries).
-const OUTBOUND_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const OUTBOUND_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 /// Per-peer pending queue bounds.  A not-yet-usable peer cannot build
 /// unbounded memory pressure while it waits for a path.
 // A 256-packet overlay burst exactly fills this business queue. Control and
@@ -120,9 +120,13 @@ pub(crate) const REASON_DIRECT_BUDGET_STALE: &str = "direct_business_budget_stal
 pub(crate) const REASON_DIRECT_BUDGET_OVERSIZE: &str = "direct_business_budget_oversize";
 pub(crate) const REASON_DIRECT_CIPHERTEXT_OVERSIZE: &str = "direct_business_ciphertext_oversize";
 pub(crate) const REASON_DIRECT_BUSINESS_EMSGSIZE: &str = "direct_business_emsgsize";
+pub(crate) const REASON_DIRECT_LOCAL_BACKPRESSURE: &str = "direct_business_local_backpressure";
+pub(crate) const REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE: &str =
+    "direct_business_local_backpressure_deadline_expired";
 pub(crate) const REASON_DIRECT_BUDGET_REROUTE_EXHAUSTED: &str =
     "direct_business_budget_reroute_exhausted";
 pub(crate) const REASON_DIRECT_BUSINESS_MALFORMED: &str = "direct_business_malformed_ip";
+pub(crate) const REASON_IPV6_BUDGET_BELOW_MINIMUM_MTU: &str = "ipv6_budget_below_minimum_mtu";
 
 /// Outcome of handing one business packet to the network.
 enum SendOutcome {
@@ -135,6 +139,12 @@ enum SendOutcome {
     /// the ciphertext after releasing the emit lock.
     Terminal(TerminalSendFailure),
     DirectBudgetStale {
+        reason: String,
+    },
+    /// The exact nonblocking socket accepted no bytes because its local send
+    /// queue is temporarily full. This is neither path/budget staleness nor a
+    /// Direct-health signal, and it must never enter Relay fallback.
+    RetryableLocalBackpressure {
         reason: String,
     },
     LocalMtuFailure {
@@ -249,6 +259,7 @@ enum PendingPacket {
     Plain {
         packet: OutboundPacket,
         direct_budget_reroutes: u8,
+        local_backpressure_retries: u32,
     },
 }
 
@@ -257,6 +268,7 @@ impl PendingPacket {
         Self::Plain {
             packet,
             direct_budget_reroutes: 0,
+            local_backpressure_retries: 0,
         }
     }
 
@@ -275,6 +287,15 @@ impl PendingPacket {
     fn raw_packet(&self) -> &[u8] {
         match self {
             Self::Plain { packet, .. } => &packet.packet,
+        }
+    }
+
+    fn experienced_local_backpressure(&self) -> bool {
+        match self {
+            Self::Plain {
+                local_backpressure_retries,
+                ..
+            } => *local_backpressure_retries > 0,
         }
     }
 }
@@ -361,6 +382,18 @@ impl PeerPendingQueue {
     fn push_front(&mut self, packet: PendingPacket) {
         self.bytes = self.bytes.saturating_add(packet.stored_bytes());
         self.queue.push_front(packet);
+    }
+
+    fn delivery_deadline_reason(&self) -> &'static str {
+        if self
+            .queue
+            .front()
+            .is_some_and(PendingPacket::experienced_local_backpressure)
+        {
+            REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE
+        } else {
+            REASON_OUTBOUND_DELIVERY_DEADLINE
+        }
     }
 }
 
@@ -1425,6 +1458,10 @@ enum EncryptSendOutcome {
         reason_code: &'static str,
         reason: String,
     },
+    RetryableLocalBackpressure {
+        packet: OutboundPacket,
+        reason: String,
+    },
     Terminal {
         packet: OutboundPacket,
         reason_code: &'static str,
@@ -1548,6 +1585,18 @@ async fn encrypt_then_send(
                                 };
                             };
                             let overlay_budget = prepared.token.max_overlay_payload_size.0 as usize;
+                            if retry_packet.packet[0] >> 4 == 6
+                                && overlay_budget < crate::business_mtu::IPV6_MINIMUM_MTU as usize
+                            {
+                                return EncryptSendOutcome::Terminal {
+                                    packet: retry_packet,
+                                    reason_code: REASON_IPV6_BUDGET_BELOW_MINIMUM_MTU,
+                                    reason: format!(
+                                        "inner IPv6 business traffic requires an advertised MTU of at least {}; confirmed inner budget is {overlay_budget}; no UDP handoff or invalid Packet Too Big was produced",
+                                        crate::business_mtu::IPV6_MINIMUM_MTU,
+                                    ),
+                                };
+                            }
                             if inner_len > overlay_budget {
                                 let feedback = peers.emit_local_mtu_feedback(
                                     &retry_packet.peer_id,
@@ -1753,6 +1802,7 @@ async fn encrypt_then_send(
         let outcome_label = match &outcome {
             SendOutcome::Sent => "sent",
             SendOutcome::Retryable(_) => "retryable",
+            SendOutcome::RetryableLocalBackpressure { .. } => "local_backpressure",
             SendOutcome::Terminal(_) | SendOutcome::LocalMtuFailure { .. } => "terminal",
             SendOutcome::DirectBudgetStale { .. } => "stale_budget",
         };
@@ -1791,6 +1841,12 @@ async fn encrypt_then_send(
             reason_code: REASON_DIRECT_BUDGET_STALE,
             reason,
         },
+        SendOutcome::RetryableLocalBackpressure { reason } => {
+            EncryptSendOutcome::RetryableLocalBackpressure {
+                packet: retry_packet,
+                reason,
+            }
+        }
         SendOutcome::LocalMtuFailure {
             reason_code,
             reason,
@@ -1832,7 +1888,7 @@ async fn start_ready_peer_flushes(
     flushing_peers: &mut HashSet<String>,
 ) {
     let now = Instant::now();
-    let delivery_expired: Vec<String> = pending
+    let delivery_expired: Vec<(String, &'static str)> = pending
         .iter()
         .filter(|(_, entry)| {
             !entry.queue.is_empty()
@@ -1840,16 +1896,10 @@ async fn start_ready_peer_flushes(
                     .delivery_deadline
                     .is_some_and(|deadline| now >= deadline)
         })
-        .map(|(peer_id, _)| peer_id.clone())
+        .map(|(peer_id, entry)| (peer_id.clone(), entry.delivery_deadline_reason()))
         .collect();
-    for peer_id in delivery_expired {
-        drop_pending_queue(
-            peers,
-            pending.remove(&peer_id),
-            REASON_OUTBOUND_DELIVERY_DEADLINE,
-            timeline,
-        )
-        .await;
+    for (peer_id, reason_code) in delivery_expired {
+        drop_pending_queue(peers, pending.remove(&peer_id), reason_code, timeline).await;
     }
 
     let (ready_ids, budget_pending_ids): (Vec<String>, Vec<String>) = {
@@ -1984,6 +2034,7 @@ async fn flush_one_peer(
                 .delivery_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
+            let reason_code = queue.delivery_deadline_reason();
             if flushed > 0 {
                 let remaining = queue.queue.len();
                 let relay_confirm_seq = peers.relay_confirm_seq_sync(&peer_id);
@@ -1997,13 +2048,7 @@ async fn flush_one_peer(
                     )),
                 );
             }
-            drop_pending_queue(
-                &peers,
-                Some(queue),
-                REASON_OUTBOUND_DELIVERY_DEADLINE,
-                &timeline,
-            )
-            .await;
+            drop_pending_queue(&peers, Some(queue), reason_code, &timeline).await;
             return (peer_id, PeerPendingQueue::new());
         }
         let Some(front) = queue.pop_front() else {
@@ -2042,6 +2087,7 @@ async fn flush_one_peer(
         let PendingPacket::Plain {
             packet,
             direct_budget_reroutes,
+            local_backpressure_retries,
         } = front;
         match encrypt_then_send(
             packet,
@@ -2060,6 +2106,7 @@ async fn flush_one_peer(
                 queue.push_front(PendingPacket::Plain {
                     packet,
                     direct_budget_reroutes,
+                    local_backpressure_retries,
                 });
                 queue
                     .delivery_deadline
@@ -2111,11 +2158,38 @@ async fn flush_one_peer(
                     } else {
                         direct_budget_reroutes
                     },
+                    local_backpressure_retries,
                     reason_code,
                     reason,
                     &timeline,
                 )
                 .await;
+                break;
+            }
+            EncryptSendOutcome::RetryableLocalBackpressure { packet, reason } => {
+                let next_backpressure_retries = local_backpressure_retries.saturating_add(1);
+                record_retry_and_repark(
+                    &transport,
+                    &peers,
+                    &peer_id,
+                    &mut queue,
+                    packet,
+                    direct_budget_reroutes,
+                    next_backpressure_retries,
+                    REASON_DIRECT_LOCAL_BACKPRESSURE,
+                    reason,
+                    &timeline,
+                )
+                .await;
+                timeline.emit(
+                    "direct_business_local_backpressure",
+                    Some("direct"),
+                    Some(REASON_DIRECT_LOCAL_BACKPRESSURE),
+                    Some(format!(
+                        "peer={peer_id} direct_budget_reroutes={direct_budget_reroutes} local_backpressure_retries={next_backpressure_retries} retry_after_ms={}",
+                        OUTBOUND_RETRY_DELAY.as_millis(),
+                    )),
+                );
                 break;
             }
             EncryptSendOutcome::Terminal {
@@ -2225,6 +2299,7 @@ async fn record_retry_and_repark(
     entry: &mut PeerPendingQueue,
     packet: OutboundPacket,
     direct_budget_reroutes: u8,
+    local_backpressure_retries: u32,
     reason_code: &'static str,
     reason: String,
     timeline: &ConnectionTimeline,
@@ -2249,6 +2324,7 @@ async fn record_retry_and_repark(
     entry.push_front(PendingPacket::Plain {
         packet,
         direct_budget_reroutes,
+        local_backpressure_retries,
     });
     entry.retry_after = Some(Instant::now() + OUTBOUND_RETRY_DELAY);
     entry
@@ -2263,6 +2339,8 @@ async fn record_retry_and_repark(
         queue_depth = entry.queue.len(),
         queue_bytes = entry.bytes,
         retry_after_ms = OUTBOUND_RETRY_DELAY.as_millis() as u64,
+        direct_budget_reroutes,
+        local_backpressure_retries,
         "send failed before transport handoff; packet returned to the FIFO as plaintext with a fresh-counter retry"
     );
     timeline.emit(
@@ -2493,6 +2571,7 @@ async fn drop_pending_queue(
     if matches!(
         reason_code,
         REASON_OUTBOUND_DELIVERY_DEADLINE
+            | REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE
             | REASON_RELAY_STARTUP_WAIT_EXPIRED
             | REASON_DIRECT_ONLY_NO_RELAY
     ) {
@@ -2795,9 +2874,11 @@ async fn send_encrypted_packet_once(
                     reason: "Direct budget/path/publication changed at UDP linearization"
                         .to_string(),
                 },
-                Err(DirectBusinessUdpSendError::WouldBlock) => SendOutcome::DirectBudgetStale {
-                    reason: "exact UDP socket would block before handoff".to_string(),
-                },
+                Err(DirectBusinessUdpSendError::WouldBlock) => {
+                    SendOutcome::RetryableLocalBackpressure {
+                        reason: "exact UDP socket would block before handoff".to_string(),
+                    }
+                }
                 Err(DirectBusinessUdpSendError::LocalPacketTooLarge) => {
                     let invalidated = plan.udp.invalidate_direct_business_budget(token);
                     SendOutcome::LocalMtuFailure {

@@ -188,6 +188,11 @@ pub struct UdpTransport {
     /// Inject one typed local EMSGSIZE at the exact business syscall boundary.
     #[cfg(test)]
     direct_business_emsgsize_once: Arc<AtomicBool>,
+    /// Deterministic per-peer `WouldBlock` injection at the same exact syscall
+    /// boundary. Production builds contain neither the map nor its branch.
+    #[cfg(test)]
+    direct_business_would_block:
+        Arc<StdMutex<HashMap<String, DirectBusinessWouldBlockInjection>>>,
     authenticated_punch_replay: AuthPunchReplayState,
     authenticated_punch_rate: AuthPunchRateState,
     outbound_probe_budget: OutboundProbeBudgetState,
@@ -304,6 +309,8 @@ impl UdpTransport {
             direct_business_send_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             direct_business_emsgsize_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            direct_business_would_block: Arc::new(StdMutex::new(HashMap::new())),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
             authenticated_punch_rate: Arc::new(Mutex::new(HashMap::new())),
             outbound_probe_budget: Arc::new(Mutex::new(HashMap::new())),
@@ -618,6 +625,12 @@ impl UdpTransport {
                 {
                     return Err(DirectBusinessUdpSendError::LocalPacketTooLarge);
                 }
+                #[cfg(test)]
+                if self.injected_direct_business_would_block_for_test(
+                    &prepared.token.path_identity.peer_id,
+                ) {
+                    return Err(DirectBusinessUdpSendError::WouldBlock);
+                }
                 prepared
                     .socket
                     .try_send_to(&packet.wire_bytes, prepared.endpoint)
@@ -681,6 +694,49 @@ impl UdpTransport {
     pub(crate) fn inject_direct_business_emsgsize_once_for_test(&self) {
         self.direct_business_emsgsize_once
             .store(true, Ordering::Release);
+    }
+
+    /// Inject exactly `attempts` local-backpressure results for one peer and
+    /// return an observable attempt counter. The peer key is part of the exact
+    /// immutable send token, so a blocked Peer A cannot affect Peer B.
+    #[cfg(test)]
+    pub(crate) fn inject_direct_business_would_block_for_test(
+        &self,
+        peer_id: &str,
+        attempts: usize,
+    ) -> watch::Receiver<usize> {
+        assert!(attempts > 0, "WouldBlock injection must contain an attempt");
+        let (attempts_tx, attempts_rx) = watch::channel(0usize);
+        self.direct_business_would_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                peer_id.to_string(),
+                DirectBusinessWouldBlockInjection {
+                    remaining: attempts,
+                    attempts_tx,
+                },
+            );
+        attempts_rx
+    }
+
+    #[cfg(test)]
+    fn injected_direct_business_would_block_for_test(&self, peer_id: &str) -> bool {
+        let mut injections = self
+            .direct_business_would_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(injection) = injections.get_mut(peer_id) else {
+            return false;
+        };
+        if injection.remaining == 0 {
+            return false;
+        }
+        injection.remaining = injection.remaining.saturating_sub(1);
+        injection
+            .attempts_tx
+            .send_modify(|attempts| *attempts = attempts.saturating_add(1));
+        true
     }
 
     /// Reconcile DPLPMTUD only from the authoritative committed-path mirror.

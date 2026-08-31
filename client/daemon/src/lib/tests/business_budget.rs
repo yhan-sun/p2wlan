@@ -222,6 +222,69 @@ async fn business_budget_yield_until(mut predicate: impl FnMut() -> bool, failur
     .unwrap_or_else(|_| panic!("{failure}"));
 }
 
+async fn business_budget_wait_for_would_block_attempts(
+    attempts: &mut watch::Receiver<usize>,
+    expected: usize,
+) {
+    timeout(Duration::from_secs(2), async {
+        while *attempts.borrow_and_update() < expected {
+            attempts
+                .changed()
+                .await
+                .expect("WouldBlock injection sender must remain alive");
+        }
+    })
+    .await
+    .expect("Direct business send never reached the deterministic WouldBlock seam");
+}
+
+async fn business_budget_install_confirmed_direct(
+    peers: &Arc<PeerManager>,
+    udp: &UdpTransport,
+    peer_id: &str,
+    remote_endpoint: SocketAddr,
+    validation_owner: u64,
+    request_id: u16,
+) -> (
+    crate::dplpmtud::DplpmtudPathIdentity,
+    crate::dplpmtud::DplpmtudWorkerLease,
+) {
+    let identity = business_budget_commit_direct(
+        peers,
+        udp,
+        peer_id,
+        remote_endpoint,
+        validation_owner,
+        request_id,
+    )
+    .await;
+    let peer_session_generation = peers
+        .peer_session_generation_sync(peer_id)
+        .expect("managed business peer must have a session generation");
+    assert!(udp.mark_peer_dplpmtud_supported(peer_id, peer_session_generation));
+    let runtime = udp.dplpmtud_runtime();
+    let lease = runtime
+        .install_path(identity.clone(), true, tokio::time::Instant::now())
+        .worker
+        .expect("managed Direct peer must own a DPLPMTUD worker lease");
+    business_budget_confirm_base(&runtime, &identity, &lease, tokio::time::Instant::now());
+    (identity, lease)
+}
+
+fn business_budget_ipv6_packet(total_len: usize, next_header: u8) -> Vec<u8> {
+    assert!((40..=40 + u16::MAX as usize).contains(&total_len));
+    let source: Ipv6Addr = "fd00::1".parse().unwrap();
+    let destination: Ipv6Addr = "fd00::2".parse().unwrap();
+    let mut packet = vec![0x5a; total_len];
+    packet[0..4].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+    packet[4..6].copy_from_slice(&u16::try_from(total_len - 40).unwrap().to_be_bytes());
+    packet[6] = next_header;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+    packet
+}
+
 #[tokio::test]
 async fn direct_business_capability_survives_udp_replacement_reconcile() {
     let peers = Arc::new(PeerManager::new(
@@ -750,4 +813,428 @@ async fn direct_business_budget_production_path_e2e() {
     println!(
         "BUSINESS_BUDGET_E2E udp=1200 overlay=1168 pending_fifo=true oversize_zero_send=true ciphertext_zero_send=true revoke_race_zero_send=true path_race_zero_send=true emsgsize_recovery=true direct_active=true direct_health_failure_count=0 relay_fallback_count=0 task_leak=false"
     );
+}
+
+#[tokio::test]
+async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated() {
+    const UDP_OWNER: u64 = 601;
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let receiver_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint_a = receiver_a.local_addr().unwrap();
+    let endpoint_b = receiver_b.local_addr().unwrap();
+    peers
+        .add_peer(&business_budget_peer("peer-a", "10.20.0.2", endpoint_a))
+        .await;
+    peers
+        .add_peer(&business_budget_peer("peer-b", "10.20.0.3", endpoint_b))
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    udp.set_inbound_publication_owner(UDP_OWNER);
+    let (_identity_a, _lease_a) = business_budget_install_confirmed_direct(
+        &peers, &udp, "peer-a", endpoint_a, 101, 103,
+    )
+    .await;
+    let (_identity_b, _lease_b) = business_budget_install_confirmed_direct(
+        &peers, &udp, "peer-b", endpoint_b, 105, 107,
+    )
+    .await;
+    let runtime = udp.dplpmtud_runtime();
+    let budget_a_before = runtime
+        .direct_business_budget_entry("peer-a")
+        .expect("Peer A must have a confirmed business publication");
+
+    let (transport, outbound_rx) = WireGuardTransport::new();
+    let outbound_loss = Arc::new(tokio::sync::Mutex::new(
+        crate::peer::OutboundLossCounters::default(),
+    ));
+    peers.set_outbound_loss_sink(outbound_loss.clone());
+    transport.set_outbound_loss_sink(Some(outbound_loss));
+    let (session_a, _remote_a) = part03_establish_sessions();
+    let (session_b, _remote_b) = part03_establish_sessions();
+    transport.add_session("peer-a", session_a).await;
+    transport.add_session("peer-b", session_b).await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let (_relay_available_tx, relay_available_rx) = watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        Arc::new(RwLock::new(Some(udp.clone()))),
+        Arc::new(RwLock::new(None)),
+        relay_available_rx,
+        RelayStartupWait { timeout: None },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    // One deterministic local-backpressure result must preserve the token and
+    // retry metadata, then succeed through the exact same Direct endpoint.
+    let mut once = udp.inject_direct_business_would_block_for_test("peer-a", 1);
+    dataplane_tx
+        .send(OutboundPacket {
+            peer_id: "peer-a".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: business_budget_ipv4_packet(256, 21),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    business_budget_wait_for_would_block_attempts(&mut once, 1).await;
+    let mut wire = vec![0u8; 2048];
+    let (sent, _) = timeout(Duration::from_secs(2), receiver_a.recv_from(&mut wire))
+        .await
+        .expect("Peer A must retry after one WouldBlock")
+        .unwrap();
+    assert!(sent > 0);
+    business_budget_yield_until(
+        || {
+            timeline.snapshot().events.iter().any(|event| {
+                event.event == "direct_business_local_backpressure"
+                    && event.reason_code.as_deref()
+                        == Some(
+                            crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE,
+                        )
+                    && event
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("direct_budget_reroutes=0"))
+            })
+        },
+        "WouldBlock was not exposed as independent local backpressure with zero stale reroutes",
+    )
+    .await;
+    assert_eq!(
+        runtime.direct_business_budget_entry("peer-a"),
+        Some(budget_a_before.clone()),
+        "WouldBlock must not revoke or revise the confirmed budget"
+    );
+    assert!(!timeline.snapshot().events.iter().any(|event| {
+        event.reason_code.as_deref()
+            == Some(crate::network_outbound::REASON_DIRECT_BUDGET_STALE)
+    }));
+
+    // Keep Peer A under deterministic backpressure. Peer B must still reach
+    // its independent UDP socket before Peer A's delivery deadline expires.
+    let local_backpressure_events_before = timeline
+        .snapshot()
+        .events
+        .iter()
+        .filter(|event| {
+            event.event == "direct_business_local_backpressure"
+                && event.reason_code.as_deref()
+                    == Some(crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE)
+        })
+        .count();
+    let mut until_deadline =
+        udp.inject_direct_business_would_block_for_test("peer-a", 1024);
+    dataplane_tx
+        .send(OutboundPacket {
+            peer_id: "peer-a".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: business_budget_ipv4_packet(256, 22),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    business_budget_wait_for_would_block_attempts(&mut until_deadline, 1).await;
+    business_budget_yield_until(
+        || {
+            timeline
+                .snapshot()
+                .events
+                .iter()
+                .filter(|event| {
+                    event.reason_code.as_deref()
+                        == Some(
+                            crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE,
+                        )
+                })
+                .count()
+                > local_backpressure_events_before
+        },
+        "continuous WouldBlock did not return Peer A to its paced plaintext FIFO",
+    )
+    .await;
+    dataplane_tx
+        .send(OutboundPacket {
+            peer_id: "peer-b".to_string(),
+            dst_ip: "10.20.0.3".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                "10.20.0.1".parse().unwrap(),
+                "10.20.0.3".parse().unwrap(),
+                0x2b2b,
+                23,
+                &[0x5a; 64],
+            ),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let (peer_b_sent, _) = timeout(Duration::from_secs(2), receiver_b.recv_from(&mut wire))
+        .await
+        .expect("Peer B must not wait for Peer A's blocked socket")
+        .unwrap();
+    assert!(peer_b_sent > 0);
+
+    // Wait on the configured production loss boundary (not an arbitrary test
+    // sleep). The remaining Peer A packet receives a backpressure-specific
+    // typed drop instead of consuming stale reroute credit.
+    timeout(
+        crate::network_outbound::OUTBOUND_DELIVERY_DEADLINE
+            + crate::network_outbound::OUTBOUND_MAINTENANCE_INTERVAL * 4,
+        async {
+            loop {
+                if timeline.snapshot().events.iter().any(|event| {
+                    event.reason_code.as_deref()
+                        == Some(
+                            crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE,
+                        )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("continuous WouldBlock did not terminate at the delivery deadline");
+    let stats = peers.outbound_loss_stats().await;
+    assert_eq!(
+        stats
+            .drops
+            .get(crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE)
+            .map(|counter| counter.packets),
+        Some(1)
+    );
+    let snapshot = timeline.snapshot();
+    let backpressure_events: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.event == "direct_business_local_backpressure"
+                && event.reason_code.as_deref()
+                    == Some(crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE)
+        })
+        .collect();
+    assert!(!backpressure_events.is_empty());
+    assert!(backpressure_events.iter().all(|event| {
+        event
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("direct_budget_reroutes=0"))
+    }));
+    assert!(!snapshot.events.iter().any(|event| {
+        matches!(
+            event.reason_code.as_deref(),
+            Some(
+                crate::network_outbound::REASON_DIRECT_BUDGET_STALE
+                    | crate::network_outbound::REASON_DIRECT_BUDGET_REROUTE_EXHAUSTED
+            )
+        )
+    }));
+    assert_eq!(
+        runtime.direct_business_budget_entry("peer-a"),
+        Some(budget_a_before),
+        "deadline-bounded local backpressure must not revoke the budget"
+    );
+    assert_eq!(
+        receiver_a.try_recv_from(&mut wire).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the continuously blocked packet must produce zero UDP sends"
+    );
+    for peer_id in ["peer-a", "peer-b"] {
+        let connection = peers.get_connection(peer_id).await.unwrap();
+        assert_eq!(connection.active_path(), Some(peer::NetworkPath::Direct));
+        assert_eq!(connection.direct_health.failure_count, 0);
+        assert_eq!(connection.relay_health.failure_count, 0);
+        runtime.cancel_peer(
+            peer_id,
+            "would_block_test_complete",
+            tokio::time::Instant::now(),
+        );
+    }
+    assert_eq!(runtime.active_worker_count(), 0);
+
+    worker.abort();
+    forwarder.abort();
+    let _ = worker.await;
+    let _ = forwarder.await;
+}
+
+#[tokio::test]
+async fn direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb() {
+    const UDP_OWNER: u64 = 701;
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = receiver.local_addr().unwrap();
+    peers
+        .add_peer(&business_budget_peer("peer-v6", "10.20.0.2", endpoint))
+        .await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    udp.set_inbound_publication_owner(UDP_OWNER);
+    let (_identity, _lease) = business_budget_install_confirmed_direct(
+        &peers, &udp, "peer-v6", endpoint, 111, 113,
+    )
+    .await;
+    let runtime = udp.dplpmtud_runtime();
+    assert_eq!(
+        runtime
+            .direct_business_budget_entry("peer-v6")
+            .and_then(|entry| entry.update.budget)
+            .map(|publication| publication.overlay_payload_budget.0),
+        Some(1168)
+    );
+
+    let (transport, outbound_rx) = WireGuardTransport::new();
+    let outbound_loss = Arc::new(tokio::sync::Mutex::new(
+        crate::peer::OutboundLossCounters::default(),
+    ));
+    peers.set_outbound_loss_sink(outbound_loss.clone());
+    transport.set_outbound_loss_sink(Some(outbound_loss));
+    let (session, _remote) = part03_establish_sessions();
+    transport.add_session("peer-v6", session).await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+    let timeline = ConnectionTimeline::new("node-v6", 0);
+    let (_relay_available_tx, relay_available_rx) = watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        Arc::new(RwLock::new(Some(udp.clone()))),
+        Arc::new(RwLock::new(None)),
+        relay_available_rx,
+        RelayStartupWait { timeout: None },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+    let mut feedback_rx = peers.subscribe_local_mtu_feedback();
+
+    // BASE's 1168-byte inner budget cannot be represented by a valid ICMPv6
+    // PTB. Fail closed before encryption/socket handoff and publish no feedback
+    // instead of clamping the advertised field to 1280.
+    dataplane_tx
+        .send(OutboundPacket {
+            peer_id: "peer-v6".to_string(),
+            dst_ip: "fd00::2".to_string(),
+            packet: business_budget_ipv6_packet(256, 17),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    business_budget_yield_until(
+        || {
+            timeline.snapshot().events.iter().any(|event| {
+                event.reason_code.as_deref()
+                    == Some(crate::network_outbound::REASON_IPV6_BUDGET_BELOW_MINIMUM_MTU)
+            })
+        },
+        "IPv6 traffic under a 1168-byte budget did not fail closed with the stable reason",
+    )
+    .await;
+    assert!(matches!(
+        feedback_rx.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let mut wire = vec![0u8; 2048];
+    assert_eq!(
+        receiver.try_recv_from(&mut wire).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        peers
+            .outbound_loss_stats()
+            .await
+            .drops
+            .get(crate::network_outbound::REASON_IPV6_BUDGET_BELOW_MINIMUM_MTU)
+            .map(|counter| counter.packets),
+        Some(1)
+    );
+
+    // At an internally coherent 1280-byte inner budget, an oversize IPv6
+    // packet may receive a standards-valid PTB. Verify the field, pseudo-header
+    // checksum, bounded quote, recursive suppression and zero UDP handoff.
+    assert!(runtime.force_coherent_business_budget_for_test(
+        "peer-v6",
+        crate::dplpmtud::UdpDatagramSize(1312),
+    ));
+    let oversize = business_budget_ipv6_packet(1281, 17);
+    dataplane_tx
+        .send(OutboundPacket {
+            peer_id: "peer-v6".to_string(),
+            dst_ip: "fd00::2".to_string(),
+            packet: oversize.clone(),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let feedback = timeout(Duration::from_secs(2), feedback_rx.recv())
+        .await
+        .expect("valid IPv6 PTB was not published")
+        .unwrap();
+    let ip = p2pnet_tun::Ipv6Packet::new(&feedback).unwrap();
+    assert_eq!(ip.src_addr(), "fd00::2".parse::<Ipv6Addr>().unwrap());
+    assert_eq!(ip.dst_addr(), "fd00::1".parse::<Ipv6Addr>().unwrap());
+    assert_eq!(ip.next_header(), 58);
+    assert_eq!(&ip.payload()[..2], &[2, 0]);
+    assert_eq!(
+        u32::from_be_bytes(ip.payload()[4..8].try_into().unwrap()),
+        crate::business_mtu::IPV6_MINIMUM_MTU
+    );
+    assert_eq!(
+        crate::business_mtu::icmpv6_checksum(ip.src_addr(), ip.dst_addr(), ip.payload()),
+        0
+    );
+    let quoted_len = crate::business_mtu::IPV6_MINIMUM_MTU as usize - 48;
+    assert_eq!(&ip.payload()[8..], &oversize[..quoted_len]);
+    assert_eq!(
+        crate::business_mtu::build_local_mtu_feedback(
+            &feedback,
+            crate::business_mtu::LocalMtuFeedbackKind::PacketTooBig {
+                inner_ip_mtu: crate::business_mtu::IPV6_MINIMUM_MTU,
+            },
+        ),
+        Err(crate::business_mtu::LocalMtuFeedbackSuppression::RecursiveIcmpError)
+    );
+    assert_eq!(
+        receiver.try_recv_from(&mut wire).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let connection = peers.get_connection("peer-v6").await.unwrap();
+    assert_eq!(connection.active_path(), Some(peer::NetworkPath::Direct));
+    assert_eq!(connection.direct_health.failure_count, 0);
+    assert_eq!(connection.relay_health.failure_count, 0);
+
+    runtime.cancel_peer(
+        "peer-v6",
+        "ipv6_budget_floor_test_complete",
+        tokio::time::Instant::now(),
+    );
+    assert_eq!(runtime.active_worker_count(), 0);
+    worker.abort();
+    forwarder.abort();
+    let _ = worker.await;
+    let _ = forwarder.await;
 }

@@ -79,13 +79,23 @@ jobs:
       - name: Cargo workspace tests
         run: cargo test --workspace
 
+      - name: Deterministic Direct UDP WouldBlock semantics
+        run: cargo test -p p2wlan-daemon --lib tests::direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated -- --exact --nocapture --test-threads=1
+
+      - name: IPv6 minimum-MTU fail-closed semantics
+        run: cargo test -p p2wlan-daemon --lib tests::direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb -- --exact --nocapture --test-threads=1
+
       - name: Diff whitespace check
         run: git diff --check
 
   linux_business_e2e:
-    name: Linux business-budget production E2E
+    name: Linux business-budget production E2E (${{ matrix.iteration }}/5)
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    strategy:
+      fail-fast: true
+      matrix:
+        iteration: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,13 +107,13 @@ jobs:
         run: |
           set -euo pipefail
           actual="$(git rev-parse HEAD)"
-          echo "Business MTU E2E SHA: $actual"
+          echo "Business MTU E2E iteration ${{ matrix.iteration }}/5 SHA: $actual"
           test "$actual" = "$VALIDATION_SHA"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run production-path business-budget E2E
+      - name: Run production-path business-budget E2E (${{ matrix.iteration }}/5)
         run: cargo test -p p2wlan-daemon --lib tests::direct_business_budget_production_path_e2e -- --exact --nocapture --test-threads=1
 
   windows_business:
