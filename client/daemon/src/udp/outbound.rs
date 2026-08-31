@@ -1754,6 +1754,42 @@ impl UdpTransport {
         Ok(sent)
     }
 
+    /// Send a DPLPMTUD probe on its already-resolved exact socket while
+    /// preserving the local `EMSGSIZE` distinction.  Normal business sends
+    /// intentionally continue to use `send_encrypted_packet_on_socket` and
+    /// retain their existing error surface.
+    pub(crate) async fn send_encrypted_packet_on_socket_for_dplpmtud(
+        &self,
+        socket: &Arc<UdpSocket>,
+        socket_index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+    ) -> std::result::Result<(), crate::dplpmtud::DplpmtudProbeSendFailure> {
+        let sent = socket
+            .send_to(&packet.wire_bytes, endpoint)
+            .await
+            .map_err(|error| {
+                if is_local_packet_too_large(&error) {
+                    crate::dplpmtud::DplpmtudProbeSendFailure::LocalPacketTooLarge
+                } else {
+                    crate::dplpmtud::DplpmtudProbeSendFailure::TransientSend
+                }
+            })?;
+
+        if sent != packet.wire_bytes.len() {
+            return Err(crate::dplpmtud::DplpmtudProbeSendFailure::TransientSend);
+        }
+
+        self.update_socket_diagnostics(socket_index, |metrics| metrics.encrypted_packets_sent += 1)
+            .await;
+
+        debug!(
+            "Sent {} DPLPMTUD encrypted bytes to peer {} at {} (dst={})",
+            sent, packet.peer_id, endpoint, packet.dst_ip
+        );
+        Ok(())
+    }
+
     /// Consume encrypted packets until the channel closes.
     pub async fn run_outbound(self, mut encrypted_rx: mpsc::Receiver<EncryptedPeerPacket>) {
         while let Some(packet) = encrypted_rx.recv().await {
@@ -1883,6 +1919,18 @@ impl UdpTransport {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn is_local_packet_too_large(error: &std::io::Error) -> bool {
+    // WSAEMSGSIZE (10040). Keep this numeric fallback local to the typed
+    // DPLPMTUD boundary so the ordinary UDP error path is unchanged.
+    error.raw_os_error() == Some(10040)
+}
+
+#[cfg(not(windows))]
+fn is_local_packet_too_large(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EMSGSIZE)
 }
 
 fn nat_maintainer_initial_delay(

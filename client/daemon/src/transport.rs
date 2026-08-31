@@ -1591,6 +1591,24 @@ impl WireGuardTransport {
         F: FnOnce(EncryptedPeerPacket) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        self.encrypt_and_emit_outbound_with_lock_timeout_typed(packet, lock_timeout, emit)
+            .await
+    }
+
+    /// Typed-error variant used by DPLPMTUD so the final socket handoff can
+    /// preserve `EMSGSIZE` without widening the ordinary control-send error
+    /// surface.
+    pub(crate) async fn encrypt_and_emit_outbound_with_lock_timeout_typed<F, Fut, E>(
+        &self,
+        packet: OutboundPacket,
+        lock_timeout: Duration,
+        emit: F,
+    ) -> std::result::Result<BoundedEmitOutcome, E>
+    where
+        F: FnOnce(EncryptedPeerPacket) -> Fut,
+        Fut: Future<Output = std::result::Result<(), E>>,
+        E: From<DaemonError>,
+    {
         let peer_id = packet.peer_id.clone();
         let emit_lock = self.outbound_emit_lock(&peer_id).await;
         let lock_wait_started = Instant::now();
@@ -4021,7 +4039,7 @@ impl WireGuardTransport {
                 drop(epoch_guard);
                 drop(adoption_guard);
 
-                let snapshot = runtime.snapshots().remove(peer_id);
+                let snapshot = runtime.snapshot_for_path(&current_path);
                 match decision {
                     crate::dplpmtud::DplpmtudTransitionDecision::Applied => {
                         peers.emit_timeline(
@@ -4032,7 +4050,10 @@ impl WireGuardTransport {
                                 "peer={peer_id} sequence={} candidate_udp_datagram_size={} confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
                                 token.sequence,
                                 token.candidate_udp_datagram_size.0,
-                                snapshot.as_ref().map_or(0, |value| value.confirmed_udp_datagram_size),
+                                snapshot
+                                    .as_ref()
+                                    .and_then(|value| value.confirmed_udp_datagram_size)
+                                    .unwrap_or(0),
                                 snapshot.as_ref().map_or(0, |value| value.search_upper_udp_datagram_size),
                             )),
                         );
@@ -4042,7 +4063,10 @@ impl WireGuardTransport {
                             None,
                             Some(format!(
                                 "peer={peer_id} confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
-                                snapshot.as_ref().map_or(0, |value| value.confirmed_udp_datagram_size),
+                                snapshot
+                                    .as_ref()
+                                    .and_then(|value| value.confirmed_udp_datagram_size)
+                                    .unwrap_or(0),
                                 snapshot.as_ref().map_or(0, |value| value.search_upper_udp_datagram_size),
                             )),
                         );
@@ -4057,7 +4081,8 @@ impl WireGuardTransport {
                                     "peer={peer_id} confirmed_udp_datagram_size={}",
                                     snapshot
                                         .as_ref()
-                                        .map_or(0, |value| value.confirmed_udp_datagram_size),
+                                        .and_then(|value| value.confirmed_udp_datagram_size)
+                                        .unwrap_or(0),
                                 )),
                             );
                         }

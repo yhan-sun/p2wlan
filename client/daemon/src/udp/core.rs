@@ -379,11 +379,7 @@ impl UdpTransport {
                 continue;
             };
             let previous_identity = self.dplpmtud.path_identity(&snapshot.peer_id);
-            let previous_snapshot = self
-                .dplpmtud
-                .snapshots()
-                .get(&snapshot.peer_id)
-                .cloned();
+            let previous_snapshot = self.dplpmtud.snapshot_for_peer(&snapshot.peer_id);
             if previous_identity.as_ref().is_some_and(|previous| previous != &identity) {
                 self.peers.emit_timeline(
                     "dplpmtud_reset",
@@ -395,11 +391,26 @@ impl UdpTransport {
                     )),
                 );
             }
-            let supported = self
+            let protocol_supported = self
                 .dplpmtud
                 .is_supported(&snapshot.peer_id, epoch.peer_session_generation.value());
+            let no_fragment_supported = p2pnet_netbind::udp_no_fragment_supported(
+                &socket,
+                remote_endpoint.ip(),
+            );
+            let supported = protocol_supported && no_fragment_supported;
+            let unsupported_reason = if !protocol_supported {
+                "capability_not_negotiated"
+            } else {
+                "no_fragment_probe_unsupported"
+            };
             let identity_summary = identity.summary();
-            let install = self.dplpmtud.install_path(identity, supported, now);
+            let install = self.dplpmtud.install_path_with_reason(
+                identity,
+                supported,
+                unsupported_reason,
+                now,
+            );
             if !supported
                 && install.decision == crate::dplpmtud::DplpmtudInstallDecision::Unsupported
                 && !previous_snapshot.is_some_and(|previous| {
@@ -410,12 +421,13 @@ impl UdpTransport {
                 self.peers.emit_timeline(
                     "dplpmtud_unsupported",
                     Some("direct"),
-                    Some("capability_not_negotiated"),
+                    Some(unsupported_reason),
                     Some(format!(
-                        "peer={} path_identity={:?} confirmed_udp_datagram_size={} search_upper_udp_datagram_size={}",
+                        "peer={} path_identity={:?} protocol_supported={} no_fragment_supported={} confirmed_udp_datagram_size=none search_upper_udp_datagram_size={}",
                         snapshot.peer_id,
                         identity_summary,
-                        crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
+                        protocol_supported,
+                        no_fragment_supported,
                         identity_summary
                             .outer_ip_family
                             .ceiling_udp_datagram_size()

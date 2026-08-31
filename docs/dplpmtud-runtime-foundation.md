@@ -3,7 +3,7 @@
 ## 1. Scope and baseline
 
 This document records the Phase 2A implementation on top of
-`a7f2e71281fb40917dc89249377df384878f0fe7`. The phase adds a bounded,
+`96ac640122ec1a10110f55c9b2484a3ed3f4e628`. The phase adds a bounded,
 authenticated Datagram Packetization Layer Path MTU Discovery (DPLPMTUD)
 control loop for an already committed Direct UDP path.
 
@@ -23,7 +23,9 @@ This phase deliberately does **not**:
 
 The only output intended for the next phase is the read-only confirmed UDP
 size and derived overlay payload budget attached to the exact current Direct
-path identity.
+path identity. A conservative BASE value is an assumption only; no confirmed
+value or business-usable budget exists until a matching 1200-byte BASE Probe
+has been sent and positively ACKed.
 
 ## 2. Audited current data path
 
@@ -103,6 +105,34 @@ ceilings preserve an Ethernet-sized 1500-byte outer packet:
 The code does not infer outer-family overhead from a virtual/inner IPv4 packet.
 It binds the DPLPMTUD identity and wire token to the real Direct endpoint's
 outer IP family.
+
+### 2.4 No-fragment Probe contract and socket ownership
+
+DPLPMTUD never relies on an operating-system default and never toggles a
+shared socket option around one send. `p2pnet-netbind::bind_udp` configures and
+reads back the profile once while the socket constructor owns the socket. The
+returned socket, including every pool and fresh-punch socket, retains that
+profile for its lifetime. At exact Direct reconciliation,
+`udp_no_fragment_supported` performs a read-only check on the exact socket and
+remote IP family. A failed or unverifiable check makes that path
+`Unsupported`; it cannot produce a confirmed result. Ordinary business sends
+do not change size or call the DPLPMTUD budget accessor.
+
+The platform strategies are:
+
+| Platform | IPv4 | IPv6 | Owner and verification |
+| --- | --- | --- | --- |
+| Linux | `IP_MTU_DISCOVER=IP_PMTUDISC_PROBE` (DF) | `IPV6_MTU_DISCOVER=IPV6_PMTUDISC_PROBE` plus `IPV6_DONTFRAG=1` | UDP socket constructor sets and gets both options |
+| Android | `IP_MTU_DISCOVER=IP_PMTUDISC_PROBE` (DF) | `IPV6_MTU_DISCOVER=IPV6_PMTUDISC_PROBE` plus `IPV6_DONTFRAG=1` | protected UDP socket constructor sets and gets both options |
+| macOS | `IP_DONTFRAG=1` | `IPV6_DONTFRAG=1` | UDP socket constructor sets and gets the family option |
+| Windows | `IP_DONTFRAGMENT=1` | `IPV6_DONTFRAG=1` | Winsock UDP socket constructor sets and gets the family option |
+
+The shared publication socket is therefore permanently no-fragment capable
+or DPLPMTUD is disabled for that exact path. There is no temporary option
+mutation and no race with ordinary datagrams. The real IP-layer proof is the
+Linux low-MTU netns/veth test in
+`client/netbind/tests/no_fragment_netns.rs`; the userspace blackhole remains a
+convergence test only and is not DF evidence.
 
 ## 3. Capability compatibility
 
@@ -188,11 +218,12 @@ cookie, complete path epoch, Direct-validation owner/request, candidate size,
 and outer family prevent two probes or two path incarnations from being
 confused.
 
-For a Probe, padding is placed between the prefix and token. The builder solves
+For a Probe, padding is placed after the token. The builder solves
 for the exact plaintext size so that after WireGuard's 32-byte overhead the
 actual `send_to` datagram length is exactly `candidate_udp_datagram_size`.
-The parser locates the fixed token at the end and accepts the variable padding
-only after a complete authenticated packet was received.
+The parser reads the fixed token immediately after the prefix and accepts the
+zero-filled variable padding only after a complete authenticated packet was
+received.
 
 The ACK contains the ACK prefix and the exact mirrored token without probe
 padding. It therefore cannot amplify the request.
@@ -215,21 +246,30 @@ State summary:
 ```text
 Direct committed + unsupported capability -> Unsupported
 Direct committed + supported capability   -> Base
-Base + StartSearch                         -> Searching
+Base + StartSearch                         -> Searching (first candidate is BASE=1200)
+BASE + matching ACK                        -> Searching or SearchComplete
+BASE + exhausted timeout/send failures    -> Error (no confirmed budget)
 Searching + matching ACK                  -> Searching or SearchComplete
 Searching + exhausted timeout             -> narrower Searching or SearchComplete
+SearchComplete + current-PLPMTU timer      -> Searching (re-probe current confirmed size)
+current confirmation failure               -> Base (fresh BASE confirmation required)
+re-confirmed BASE + matching ACK            -> Searching (confirmed=1200 restored)
+re-confirmed BASE + exhausted failures      -> Error (no confirmed budget)
+EMSGSIZE                                    -> shrink upper bound, keep searching
+transient/lock/session failure              -> bounded retry or Error
 SearchComplete + raise timer               -> Searching or renewed SearchComplete
-send failure                               -> Error
-Error + retry timer                        -> Searching or SearchComplete
+Error + retry timer                        -> Base (retry BASE) or upward Searching
 identity/lifecycle cancellation            -> Disabled
 new identity                               -> new Base or Unsupported machine
 ```
 
 The machine records the exact identity, conservative base, confirmed lower
 bound, search upper bound, pending candidate, at most one outstanding probe,
-sequence/nonce/path cookie, deadline, retry, fixed granularity, raise deadline,
-last success/timeout/failure, reset reason/count, revision, and diagnostic
-counters.
+sequence/nonce/path cookie, deadline, retry, fixed granularity, current-PLPMTU
+confirmation deadline, raise deadline, last success/timeout/failure, reset
+reason/count, revision, and diagnostic counters. `base_confirmed=false` and
+`confirmed_udp_datagram_size=None` are the initial state even though the
+assumed base is 1200.
 
 Reducer state changes and network side effects are separate. `reduce` produces
 a transition; `commit` applies only accepted state changes. Duplicate ACKs are
@@ -244,7 +284,15 @@ current phase has a conservative base and fixed internal ceiling, and because
 the required result is a bounded safe datagram size rather than continuous
 congestion adaptation.
 
-For confirmed lower bound `L`, upper bound `U`, and granularity `G=8`:
+The first search is a positive BASE phase. For every supported path the first
+candidate is exactly 1200. Only its matching authenticated ACK sets
+`base_confirmed=true` and creates a confirmed lower bound. If BASE exhausts
+its retries, the machine enters `Error`, clears the pending candidate, and
+exposes no confirmed or overlay budget. The retry timer schedules BASE again;
+it does not jump directly to the full ceiling.
+
+After BASE confirmation, for confirmed lower bound `L`, upper bound `U`, and
+granularity `G=8`:
 
 1. choose an aligned midpoint strictly greater than `L` and no greater than
    `U`;
@@ -274,9 +322,28 @@ A timeout narrows only this search interval. The DPLPMTUD API has no operation
 that records Direct failure, degrades Direct, selects Relay, or ends an already
 confirmed Direct path.
 
-After SearchComplete, a ten-minute raise timer reopens the upper interval to
-the family ceiling. A send failure enters Error with a five-second retry timer.
-Every worker also has a one-hour intrinsic hard lifetime.
+After SearchComplete, a current-PLPMTU confirmation timer re-probes the
+currently confirmed size. A successful confirmation re-arms that timer. After
+three consecutive confirmation failures, the historical confirmed value is
+revoked: `base_confirmed=false`, `confirmed_udp_datagram_size=None`, and
+`pending_candidate_udp_datagram_size=BASE` in state `Base`. The upper bound is
+shrunk using the failed candidate, but upward search cannot resume until a new
+BASE probe is positively ACKed. If that BASE phase exhausts its retries, the
+machine enters `Error` with no budget. The exact-path accessor returns `None`
+for the entire BASE re-confirmation interval and throughout the resulting
+below-BASE `Error`. Endpoint, generation, candidate epoch, and socket identity
+remain unchanged, and this state transition has no Direct-health or path-
+selection side effect. A ten-minute raise timer independently reopens the upper
+interval to the family ceiling after a completed search.
+
+The send boundary classifies `TransientSend`, `EmitLockUnavailable`,
+`SessionUnavailable`, and `LocalPacketTooLarge` separately. The first three
+are bounded local retries/errors and never narrow the path from an assumed
+network fact. `LocalPacketTooLarge` (`EMSGSIZE`) immediately shrinks the upper
+bound to below the rejected candidate (or enters BASE Error if BASE was never
+validated); it never enters Error and then reopens the full ceiling to repeat
+the same local oversize. Every worker also has a one-hour intrinsic hard
+lifetime.
 
 ## 8. Timer and task ownership
 
@@ -317,10 +384,20 @@ WireGuard per-peer emit lock
 short session lock / encrypt
 exact-path + owner + expectation recheck and `ProbeSent` linearization
 (`begin_probe_send`)
-UDP handoff on the bound socket
+UDP handoff on the bound socket whose constructor owns the permanent
+no-fragment profile
 release emit lock
 short DPLPMTUD registry transaction: finish send outcome
 ```
+
+Probe planning is a short registry transaction that completes before the
+worker waits for the per-peer emit lock. During the actual handoff the order
+is per-peer emit lock -> short session/encrypt operation -> exact-path/owner
+recheck -> DPLPMTUD registry `begin_probe_send` linearization -> socket
+handoff -> DPLPMTUD registry `finish_probe_send` outcome. No registry lock is
+held while awaiting the emit lock or socket I/O, and no socket-option lock is
+acquired by the worker: the socket owner configured the options before
+publication and the worker only reads the capability during reconciliation.
 
 The `begin_probe_send` recheck includes the worker owner, exact identity,
 outstanding identity, no concurrent send, and a live deadline. Cancellation or
@@ -369,11 +446,16 @@ The current entry is cancelled/reset for, among other reasons:
 A repeated notification for the same exact identity is idempotent: it does not
 reset state, create a second worker, or schedule a second outstanding probe.
 
-Cancellation sets the watch, disables the machine, clears outstanding work,
-and preserves a reason in the read-only snapshot. A stale worker may still
-reach its exit path, but owner-token comparison prevents it from erasing the
-replacement. A cancelled worker cannot pass `begin_probe_send` and cannot
-publish an old retry kick.
+Cancellation sets the watch, disables the machine, immediately revokes
+`base_confirmed` and `confirmed_udp_datagram_size`, clears outstanding and
+pending probes plus the current-confirmation timer, and preserves a reason in
+the read-only snapshot. A stale worker may still reach its exit path, but
+owner-token comparison prevents it from erasing the replacement. A cancelled
+worker cannot pass `begin_probe_send` and cannot publish an old retry kick.
+Consequently `cancel_peer`, network-generation cancellation, Relay activation,
+UDP-runtime close, and exact-identity replacement all revoke the old business
+budget immediately. Neither an old identity nor an old worker can read a budget
+published by the replacement.
 
 ## 11. Stale and duplicate handling
 
@@ -420,15 +502,36 @@ Events carry the available peer, path epoch, endpoints, socket publication,
 sequence, candidate datagram size, bounds, and reason/decision details.
 
 Peer diagnostics and status expose a read-only `DplpmtudSnapshot` containing:
-state, capability support, path identity summary, base/confirmed/upper UDP
-sizes, derived outer packet size and overlay budget, outstanding probe,
-relative success/timeout/failure ages, reset reason/count, revision, probe and
-result counters, stale/duplicate counters, and whether the owner worker is
-live.
+state, capability support, exact path identity summary, assumed base,
+`base_confirmed`, optional confirmed/upper UDP sizes, derived outer packet size
+and overlay budget, current-PLPMTU timer, outstanding probe, relative
+success/timeout/failure ages, reset reason/count, revision, probe and result
+counters, each send-failure class, stale/duplicate counters, and whether the
+owner worker is live.
+
+The snapshot also publishes a distinct optional `budget_revision`; a confirmed
+`DplpmtudConfirmedBudget` always carries that revision as a `u64`. It is
+allocated monotonically across the process and changes when the business value
+moves from `None` to `Some`, its confirmed UDP size changes, it moves from
+`Some` to `None`, or the complete exact path identity is replaced. A fresh UDP
+runtime therefore cannot reuse a prior runtime's revision, closing the
+identity-replacement ABA case. Duplicate and stale ACK diagnostics do not
+change this revision. Reducer `revision` remains an independent diagnostics
+sequence and may change for a stale-ACK counter even while `budget_revision`
+does not. Allocator exhaustion fails closed by withholding the business budget.
 
 Snapshots are copied into a separate read-optimized map after state commits.
 Status reads do not take or hold the mutable DPLPMTUD registry lock and cannot
-block a worker.
+block a worker. A business consumer must use the O(1)
+`confirmed_budget_for_path(exact_identity)` accessor: it performs one per-peer
+registry lookup followed by a complete identity comparison and returns the
+confirmed UDP, outer-packet, and overlay budgets plus `budget_revision`. It
+returns `None` when the runtime is closed, the identity is not the exact current
+path, the state is `Disabled`/`Unsupported`, support is not negotiated, BASE is
+not positively confirmed, the confirmed value is absent, or a revision cannot
+be allocated. Control/timeline code may use the one-peer `snapshot_for_peer` or
+exact-path `snapshot_for_path`; the business hot path must not call
+`snapshots()`, which clones the full peer table.
 
 ## 13. Verification strategy
 
@@ -439,7 +542,7 @@ dimension, deadline rejection, owner-token ABA, path replacement, bounded
 containers/rate limiting, PeerLeft/shutdown cleanup, additive capability
 compatibility, exact datagram padding, and IPv4/IPv6 separation.
 
-The deterministic Linux blackhole test runs the real chain:
+The deterministic userspace blackhole test runs the real chain:
 
 ```text
 scheduler/runtime plan
@@ -455,31 +558,49 @@ scheduler/runtime plan
 
 Datagrams at or below 1397 bytes are delivered; larger datagrams are silently
 sent to a sink and timed out. The test observes actual encrypted UDP lengths,
-requires a success below and failure above the threshold, bounds the result to
-one 8-byte step, verifies duplicate no-op behavior, switches generation while
-an authenticated ACK is in flight, performs PeerLeft with an outstanding probe
+requires a positive BASE success, requires a success below and failure above
+the threshold, bounds the result to one 8-byte step, then lowers the same
+userspace threshold to 1280 without changing endpoint, generation, candidate
+epoch, or socket identity. The current-PLPMTU confirmation fails, the result
+enters `Base` without a confirmed value, positively re-confirms BASE, and
+upward search reconverges to no more than 1280. The test verifies duplicate
+no-op behavior, switches generation while an
+authenticated ACK is in flight, performs PeerLeft with an outstanding probe
 before send linearization, asserts Direct remains active with zero Direct
 health failures and zero Relay fallbacks, and returns worker ownership to the
 baseline without sleeps.
 
-The required workflow repeats that same blackhole test five times on the exact
-PR Head SHA and prints threshold, confirmed/upper bounds, probe/timeout counts,
-Direct/fallback sentinels, stale/duplicate counts, generation/PeerLeft results,
-and task-leak status.
+The separate ignored Linux netns/veth test sets both ends to MTU 1200 and
+sends a 1400-byte UDP datagram with the configured DF profile. It requires
+local `EMSGSIZE`, no receiver packet, and no fragmented ACK. This is the
+IP-layer no-fragment evidence; the userspace blackhole cannot provide it.
+
+The required workflow runs eight distinct acceptance categories on the exact
+same PR Head SHA: encrypted blackhole convergence, BASE positive confirmation,
+1392-to-1280 same-identity downward recovery, 1392-to-1100 below-BASE failure,
+cancel/close budget invalidation, budget-revision/identity ABA, no-fragment plus
+local EMSGSIZE, and worker/task-leak cleanup. Each category prints or directly
+asserts Direct-active, Direct-health-failure, Relay-fallback,
+old-ACK-contamination, and task-leak evidence. The no-fragment category
+additionally runs the privileged Linux netns/veth test.
 
 ## 14. Phase boundary and next-step API
 
 Phase 2A exposes only a read-only snapshot of:
 
 ```text
-confirmed_udp_datagram_size
-overlay_payload_budget
+assumed_base_udp_datagram_size
+base_confirmed
+optional confirmed_udp_datagram_size
+optional overlay_payload_budget
+budget_revision
 outer_ip_family
 exact path identity
 ```
 
 No normal packet producer consumes those values in this phase. A later phase
-may define a single, generation-bound API for business-packet sizing or
-fragmentation policy. That consumer must revalidate the same exact path
-identity and must not treat a DPLPMTUD timeout as path health or path-selection
-evidence.
+may use `confirmed_budget_for_path` as its single, generation-bound
+read-only input for business-packet sizing or fragmentation policy. That
+consumer must revalidate the same exact path identity and must not treat a
+DPLPMTUD timeout as path health or path-selection evidence. This PR does not
+change ordinary business packet sizes.

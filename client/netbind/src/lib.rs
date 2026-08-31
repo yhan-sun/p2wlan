@@ -16,6 +16,28 @@ use std::sync::{Mutex, OnceLock};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
+/// The no-fragment properties that were actually installed on one UDP
+/// socket.  DPLPMTUD treats a missing property as an unsupported capability;
+/// ordinary UDP traffic remains usable and keeps the platform default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UdpNoFragmentCapabilities {
+    /// IPv4 datagrams use a socket-level DF setting.
+    pub ipv4: bool,
+    /// IPv6 datagrams cannot be source-fragmented by this socket.
+    pub ipv6: bool,
+}
+
+impl UdpNoFragmentCapabilities {
+    /// Return whether the socket is safe for a probe to this destination
+    /// family.
+    pub const fn supports(self, destination: IpAddr) -> bool {
+        match destination {
+            IpAddr::V4(_) => self.ipv4,
+            IpAddr::V6(_) => self.ipv6,
+        }
+    }
+}
+
 /// The kernel route selected for one concrete destination.
 ///
 /// This is deliberately a read-only, destination-scoped result. Callers may
@@ -160,8 +182,358 @@ pub async fn bind_udp(addr: SocketAddr, interface: Option<&str>) -> io::Result<U
     }
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
+    // Configure the profile once, while the socket constructor still owns
+    // the socket.  The returned Tokio socket is never temporarily toggled
+    // between business sends and probes.
+    configure_udp_no_fragment_socket(&socket, addr.is_ipv4());
     let socket: std::net::UdpSocket = socket.into();
     UdpSocket::from_std(socket)
+}
+
+/// Read the no-fragment profile from a live Tokio UDP socket.
+///
+/// This is intentionally a read-only operation.  It is used at exact Direct
+/// path reconciliation time so DPLPMTUD can fail closed if a platform,
+/// socket family, or socket replacement does not provide the profile that was
+/// configured by the socket owner.
+pub fn udp_no_fragment_capabilities(socket: &UdpSocket) -> UdpNoFragmentCapabilities {
+    let Ok(local_addr) = socket.local_addr() else {
+        return UdpNoFragmentCapabilities::default();
+    };
+    read_udp_no_fragment_socket(socket, local_addr.ip().is_ipv4())
+}
+
+/// Return whether this exact socket can send a no-fragment probe to the
+/// destination family.
+pub fn udp_no_fragment_supported(socket: &UdpSocket, destination: IpAddr) -> bool {
+    udp_no_fragment_capabilities(socket).supports(destination)
+}
+
+fn configure_udp_no_fragment_socket(
+    socket: &Socket,
+    ipv4_socket: bool,
+) -> UdpNoFragmentCapabilities {
+    read_or_configure_udp_no_fragment_socket(socket, ipv4_socket, true)
+}
+
+fn read_udp_no_fragment_socket(socket: &UdpSocket, ipv4_socket: bool) -> UdpNoFragmentCapabilities {
+    read_or_configure_udp_no_fragment_socket(socket, ipv4_socket, false)
+}
+
+fn read_or_configure_udp_no_fragment_socket<S: UdpSocketRaw>(
+    socket: &S,
+    ipv4_socket: bool,
+    configure: bool,
+) -> UdpNoFragmentCapabilities {
+    if ipv4_socket {
+        UdpNoFragmentCapabilities {
+            ipv4: if configure {
+                configure_ipv4_no_fragment(socket)
+            } else {
+                read_ipv4_no_fragment(socket)
+            },
+            ipv6: false,
+        }
+    } else {
+        UdpNoFragmentCapabilities {
+            ipv4: false,
+            ipv6: if configure {
+                configure_ipv6_no_fragment(socket)
+            } else {
+                read_ipv6_no_fragment(socket)
+            },
+        }
+    }
+}
+
+/// The small raw-socket interface keeps the platform implementations below
+/// explicit and makes it impossible for a probe path to mutate an option
+/// through this read-only API.
+#[cfg(unix)]
+trait UdpSocketRaw: std::os::fd::AsRawFd {}
+
+#[cfg(windows)]
+trait UdpSocketRaw: std::os::windows::io::AsRawSocket {}
+
+#[cfg(not(any(unix, windows)))]
+trait UdpSocketRaw {}
+
+impl UdpSocketRaw for Socket {}
+
+impl UdpSocketRaw for UdpSocket {}
+
+#[cfg(unix)]
+fn configure_ipv4_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return set_and_verify_unix_option(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_PROBE,
+        );
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    {
+        return set_and_verify_unix_option(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_DONTFRAG,
+            1,
+        );
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(not(unix))]
+fn configure_ipv4_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
+    #[cfg(windows)]
+    {
+        return set_and_verify_windows_option(
+            _socket,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IP,
+            windows_sys::Win32::Networking::WinSock::IP_DONTFRAGMENT,
+            1,
+        );
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(unix)]
+fn read_ipv4_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return read_unix_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
+            == Some(libc::IP_PMTUDISC_PROBE);
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    {
+        return read_unix_option(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_DONTFRAG)
+            .is_some_and(|value| value != 0);
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(not(unix))]
+fn read_ipv4_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
+    #[cfg(windows)]
+    {
+        return read_windows_option(
+            _socket,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IP,
+            windows_sys::Win32::Networking::WinSock::IP_DONTFRAGMENT,
+        )
+        .is_some_and(|value| value != 0);
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(unix)]
+fn configure_ipv6_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let pmtudisc = set_and_verify_unix_option(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_PROBE,
+        );
+        let dontfrag = set_and_verify_unix_option(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_DONTFRAG,
+            1,
+        );
+        return pmtudisc && dontfrag;
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    {
+        return set_and_verify_unix_option(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_DONTFRAG,
+            1,
+        );
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(not(unix))]
+fn configure_ipv6_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
+    #[cfg(windows)]
+    {
+        return set_and_verify_windows_option(
+            _socket,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
+            windows_sys::Win32::Networking::WinSock::IPV6_DONTFRAG,
+            1,
+        );
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(unix)]
+fn read_ipv6_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let pmtudisc = read_unix_option(
+            socket.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+        ) == Some(libc::IPV6_PMTUDISC_PROBE);
+        let dontfrag =
+            read_unix_option(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG)
+                .is_some_and(|value| value != 0);
+        return pmtudisc && dontfrag;
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    {
+        return read_unix_option(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG)
+            .is_some_and(|value| value != 0);
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(not(unix))]
+fn read_ipv6_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
+    #[cfg(windows)]
+    {
+        return read_windows_option(
+            _socket,
+            windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
+            windows_sys::Win32::Networking::WinSock::IPV6_DONTFRAG,
+        )
+        .is_some_and(|value| value != 0);
+    }
+
+    #[allow(unreachable_code)]
+    false
+}
+
+#[cfg(unix)]
+fn set_and_verify_unix_option(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    option: libc::c_int,
+    value: libc::c_int,
+) -> bool {
+    let value_bytes = value.to_ne_bytes();
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            option,
+            value_bytes.as_ptr().cast(),
+            value_bytes.len() as libc::socklen_t,
+        )
+    };
+    result == 0 && read_unix_option(fd, level, option) == Some(value)
+}
+
+#[cfg(unix)]
+fn read_unix_option(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    option: libc::c_int,
+) -> Option<libc::c_int> {
+    let mut value = 0i32;
+    let mut value_len = std::mem::size_of_val(&value) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            option,
+            (&mut value as *mut i32).cast(),
+            &mut value_len,
+        )
+    };
+    (result == 0).then_some(value)
+}
+
+#[cfg(windows)]
+fn set_and_verify_windows_option<S: UdpSocketRaw>(
+    socket: &S,
+    level: i32,
+    option: i32,
+    value: i32,
+) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, WSAGetLastError, SOCKET_ERROR};
+
+    let value_bytes = value.to_ne_bytes();
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as _,
+            level,
+            option,
+            value_bytes.as_ptr(),
+            value_bytes.len() as i32,
+        )
+    };
+    if result == SOCKET_ERROR {
+        let _ = unsafe { WSAGetLastError() };
+        return false;
+    }
+    read_windows_option(socket, level, option) == Some(value)
+}
+
+#[cfg(windows)]
+fn read_windows_option<S: UdpSocketRaw>(socket: &S, level: i32, option: i32) -> Option<i32> {
+    use windows_sys::Win32::Networking::WinSock::{getsockopt, SOCKET_ERROR};
+
+    let mut value = 0i32;
+    let mut value_len = std::mem::size_of_val(&value) as i32;
+    let result = unsafe {
+        getsockopt(
+            socket.as_raw_socket() as _,
+            level,
+            option,
+            (&mut value as *mut i32).cast(),
+            &mut value_len,
+        )
+    };
+    (result != SOCKET_ERROR).then_some(value)
 }
 
 /// Connect to a resolved TCP endpoint, optionally pinned to `interface`.
@@ -352,6 +724,49 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_no_fragment_profile_is_installed_once_and_read_back() {
+        let ipv4 = bind_udp("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let ipv4_profile = udp_no_fragment_capabilities(&ipv4);
+        assert_eq!(ipv4_profile, udp_no_fragment_capabilities(&ipv4));
+
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            windows
+        ))]
+        assert!(
+            ipv4_profile.ipv4,
+            "IPv4 no-fragment profile was not verified"
+        );
+
+        let ipv6 = bind_udp("[::1]:0".parse().unwrap(), None).await.unwrap();
+        let ipv6_profile = udp_no_fragment_capabilities(&ipv6);
+        assert_eq!(ipv6_profile, udp_no_fragment_capabilities(&ipv6));
+
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            windows
+        ))]
+        assert!(
+            ipv6_profile.ipv6,
+            "IPv6 no-fragment profile was not verified"
+        );
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub(crate) const DPLPMTUD_SEARCH_GRANULARITY: u32 = 8;
 pub(crate) const DPLPMTUD_MAX_RETRIES: u8 = 2;
 pub(crate) const DPLPMTUD_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const DPLPMTUD_RAISE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub(crate) const DPLPMTUD_CURRENT_PLPMTU_CONFIRMATION_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const DPLPMTUD_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const DPLPMTUD_WORKER_MAX_LIFETIME: Duration = Duration::from_secs(60 * 60);
 pub(crate) const MAX_TRACKED_DPLPMTUD_PEERS: usize = 256;
@@ -54,6 +55,9 @@ const DPLPMTUD_PROBE_PREFIX: &[u8] = b"p2wlan-dplpmtud-probe-v1";
 const DPLPMTUD_ACK_PREFIX: &[u8] = b"p2wlan-dplpmtud-ack-v1";
 const DPLPMTUD_TOKEN_BYTES: usize = 8 + 16 + 16 + 8 + 8 + 8 + 8 + 2 + 4 + 1;
 const INNER_IPV4_ICMP_OVERHEAD: usize = 20 + 8;
+/// Process-wide allocator so replacing the entire UDP runtime cannot reuse a
+/// business budget revision from an older socket publication.
+static NEXT_DPLPMTUD_BUDGET_REVISION: AtomicU64 = AtomicU64::new(1);
 
 /// Additive capability bytes inserted before the existing fixed Direct-
 /// validation tail token. Old peers locate that token from the end and safely
@@ -270,6 +274,36 @@ struct OutstandingProbe {
     retry: u8,
 }
 
+/// Business-budget state that controls the independent monotonic revision.
+/// Reducer diagnostics use `DplpmtudStateMachine::revision`; this state tracks
+/// only exact-path identity and business-visible confirmed-budget changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DplpmtudBudgetRevisionState {
+    path_identity: Option<DplpmtudPathIdentity>,
+    confirmed_udp_datagram_size: Option<UdpDatagramSize>,
+}
+
+/// Failure classification for the final DPLPMTUD emit boundary.
+///
+/// These values are deliberately separate from path health: a lock/session
+/// miss is local scheduling pressure, a transient send error is an I/O retry,
+/// and only `LocalPacketTooLarge` is evidence that can shrink the local
+/// search ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DplpmtudProbeSendFailure {
+    TransientSend,
+    EmitLockUnavailable,
+    SessionUnavailable,
+    LocalPacketTooLarge,
+}
+
+impl From<crate::error::DaemonError> for DplpmtudProbeSendFailure {
+    fn from(_error: crate::error::DaemonError) -> Self {
+        Self::TransientSend
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DplpmtudEvent {
     StartSearch {
@@ -295,6 +329,10 @@ pub(crate) enum DplpmtudEvent {
     },
     ProbeSendFailed {
         probe: DplpmtudProbeIdentity,
+        failure: DplpmtudProbeSendFailure,
+        now: Instant,
+    },
+    CurrentPlpmtuConfirmationTimerExpired {
         now: Instant,
     },
     RaiseTimerExpired {
@@ -331,10 +369,15 @@ pub(crate) struct DplpmtudStateMachine {
     identity: Option<DplpmtudPathIdentity>,
     state: DplpmtudState,
     supported: bool,
+    /// Conservative starting point.  This is never a usable budget until a
+    /// BASE probe is positively ACKed.
     base_udp_datagram_size: UdpDatagramSize,
-    confirmed_udp_datagram_size: UdpDatagramSize,
+    base_confirmed: bool,
+    confirmed_udp_datagram_size: Option<UdpDatagramSize>,
     search_upper_udp_datagram_size: UdpDatagramSize,
     pending_candidate_udp_datagram_size: Option<UdpDatagramSize>,
+    current_plpmtu_confirmation_pending: bool,
+    current_plpmtu_confirmation_at: Option<Instant>,
     outstanding: Option<OutstandingProbe>,
     retry_count: u8,
     next_sequence: u64,
@@ -343,6 +386,11 @@ pub(crate) struct DplpmtudStateMachine {
     success_count: u64,
     timeout_count: u64,
     send_failure_count: u64,
+    transient_send_failure_count: u64,
+    emit_lock_unavailable_count: u64,
+    session_unavailable_count: u64,
+    local_packet_too_large_count: u64,
+    last_send_failure_kind: Option<DplpmtudProbeSendFailure>,
     stale_ack_count: u64,
     duplicate_ack_count: u64,
     last_success_at: Option<Instant>,
@@ -356,11 +404,25 @@ pub(crate) struct DplpmtudStateMachine {
 
 impl DplpmtudStateMachine {
     pub(crate) fn for_path(identity: DplpmtudPathIdentity, supported: bool, _now: Instant) -> Self {
+        Self::for_path_with_reason(
+            identity,
+            supported,
+            if supported {
+                "direct_committed"
+            } else {
+                "dplpmtud_capability_not_negotiated"
+            },
+        )
+    }
+
+    fn for_path_with_reason(
+        identity: DplpmtudPathIdentity,
+        supported: bool,
+        reset_reason: &str,
+    ) -> Self {
         let base = UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE);
         let upper = identity.outer_ip_family.ceiling_udp_datagram_size();
-        let pending = supported
-            .then(|| next_search_candidate(base, upper))
-            .flatten();
+        let pending = supported.then_some(base);
         Self {
             identity: Some(identity),
             state: if supported {
@@ -370,9 +432,12 @@ impl DplpmtudStateMachine {
             },
             supported,
             base_udp_datagram_size: base,
-            confirmed_udp_datagram_size: base,
+            base_confirmed: false,
+            confirmed_udp_datagram_size: None,
             search_upper_udp_datagram_size: upper,
             pending_candidate_udp_datagram_size: pending,
+            current_plpmtu_confirmation_pending: false,
+            current_plpmtu_confirmation_at: None,
             outstanding: None,
             retry_count: 0,
             next_sequence: 1,
@@ -381,20 +446,18 @@ impl DplpmtudStateMachine {
             success_count: 0,
             timeout_count: 0,
             send_failure_count: 0,
+            transient_send_failure_count: 0,
+            emit_lock_unavailable_count: 0,
+            session_unavailable_count: 0,
+            local_packet_too_large_count: 0,
+            last_send_failure_kind: None,
             stale_ack_count: 0,
             duplicate_ack_count: 0,
             last_success_at: None,
             last_timeout_at: None,
             last_failure_at: None,
             raise_at: None,
-            last_reset_reason: Some(
-                if supported {
-                    "direct_committed"
-                } else {
-                    "dplpmtud_capability_not_negotiated"
-                }
-                .to_string(),
-            ),
+            last_reset_reason: Some(reset_reason.to_string()),
             reset_count: 1,
             consumed_receipts: VecDeque::new(),
         }
@@ -408,14 +471,39 @@ impl DplpmtudStateMachine {
         self.state
     }
 
+    fn business_confirmed_udp_datagram_size(&self) -> Option<UdpDatagramSize> {
+        if !self.supported
+            || matches!(
+                self.state,
+                DplpmtudState::Disabled | DplpmtudState::Unsupported
+            )
+            || !self.base_confirmed
+        {
+            return None;
+        }
+        self.confirmed_udp_datagram_size
+    }
+
+    fn budget_revision_state(&self) -> DplpmtudBudgetRevisionState {
+        DplpmtudBudgetRevisionState {
+            path_identity: self.identity.clone(),
+            confirmed_udp_datagram_size: self.business_confirmed_udp_datagram_size(),
+        }
+    }
+
     pub(crate) fn outstanding_identity(&self) -> Option<DplpmtudProbeIdentity> {
         self.outstanding.map(|outstanding| outstanding.identity)
     }
 
     pub(crate) fn next_wakeup(&self) -> Option<Instant> {
-        self.outstanding
-            .map(|outstanding| outstanding.deadline)
-            .or(self.raise_at)
+        [
+            self.outstanding.map(|outstanding| outstanding.deadline),
+            self.current_plpmtu_confirmation_at,
+            self.raise_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub(crate) fn next_probe_components(&self) -> Option<(u64, UdpDatagramSize, u8)> {
@@ -498,22 +586,59 @@ impl DplpmtudStateMachine {
                     } else {
                         next.outstanding = None;
                         next.retry_count = 0;
-                        next.confirmed_udp_datagram_size = next
+                        let is_current_confirmation = self.current_plpmtu_confirmation_pending;
+                        if is_current_confirmation {
+                            if self.confirmed_udp_datagram_size
+                                != Some(probe.candidate_udp_datagram_size)
+                            {
+                                next.stale_ack_count = next.stale_ack_count.saturating_add(1);
+                                return DplpmtudTransition {
+                                    decision: DplpmtudTransitionDecision::Stale,
+                                    next,
+                                };
+                            }
+                        } else if probe.candidate_udp_datagram_size == self.base_udp_datagram_size {
+                            next.base_confirmed = true;
+                            next.confirmed_udp_datagram_size = Some(self.base_udp_datagram_size);
+                        } else if self
                             .confirmed_udp_datagram_size
-                            .max(probe.candidate_udp_datagram_size);
+                            .is_some_and(|confirmed| probe.candidate_udp_datagram_size >= confirmed)
+                        {
+                            next.confirmed_udp_datagram_size =
+                                Some(probe.candidate_udp_datagram_size);
+                        } else {
+                            next.stale_ack_count = next.stale_ack_count.saturating_add(1);
+                            return DplpmtudTransition {
+                                decision: DplpmtudTransitionDecision::Stale,
+                                next,
+                            };
+                        }
                         next.success_count = next.success_count.saturating_add(1);
                         next.last_success_at = Some(now);
                         push_consumed_receipt(&mut next.consumed_receipts, probe);
-                        next.pending_candidate_udp_datagram_size = next_search_candidate(
-                            next.confirmed_udp_datagram_size,
-                            next.search_upper_udp_datagram_size,
-                        );
-                        if next.pending_candidate_udp_datagram_size.is_none() {
+                        if is_current_confirmation {
+                            next.current_plpmtu_confirmation_pending = false;
+                            next.current_plpmtu_confirmation_at =
+                                Some(now + DPLPMTUD_CURRENT_PLPMTU_CONFIRMATION_INTERVAL);
+                            next.pending_candidate_udp_datagram_size = None;
                             next.state = DplpmtudState::SearchComplete;
-                            next.raise_at = Some(now + DPLPMTUD_RAISE_INTERVAL);
                         } else {
-                            next.state = DplpmtudState::Searching;
-                            next.raise_at = None;
+                            let confirmed = next
+                                .confirmed_udp_datagram_size
+                                .expect("BASE must be positively confirmed before search");
+                            next.pending_candidate_udp_datagram_size = next_search_candidate(
+                                confirmed,
+                                next.search_upper_udp_datagram_size,
+                            );
+                            if next.pending_candidate_udp_datagram_size.is_none() {
+                                next.state = DplpmtudState::SearchComplete;
+                                next.current_plpmtu_confirmation_at =
+                                    Some(now + DPLPMTUD_CURRENT_PLPMTU_CONFIRMATION_INTERVAL);
+                                next.raise_at = Some(now + DPLPMTUD_RAISE_INTERVAL);
+                            } else {
+                                next.state = DplpmtudState::Searching;
+                                next.raise_at = None;
+                            }
                         }
                         DplpmtudTransitionDecision::Applied
                     }
@@ -545,37 +670,122 @@ impl DplpmtudStateMachine {
                         next.state = DplpmtudState::Searching;
                     } else {
                         next.retry_count = 0;
-                        let failed_upper = probe
-                            .candidate_udp_datagram_size
-                            .0
-                            .saturating_sub(DPLPMTUD_SEARCH_GRANULARITY)
-                            .max(next.confirmed_udp_datagram_size.0);
-                        next.search_upper_udp_datagram_size = UdpDatagramSize(
-                            next.search_upper_udp_datagram_size.0.min(failed_upper),
-                        );
-                        next.pending_candidate_udp_datagram_size = next_search_candidate(
-                            next.confirmed_udp_datagram_size,
-                            next.search_upper_udp_datagram_size,
-                        );
-                        if next.pending_candidate_udp_datagram_size.is_none() {
-                            next.state = DplpmtudState::SearchComplete;
-                            next.raise_at = Some(now + DPLPMTUD_RAISE_INTERVAL);
+                        if self.current_plpmtu_confirmation_pending {
+                            lower_after_current_confirmation_failure(&mut next, probe, now);
+                        } else if probe.candidate_udp_datagram_size == self.base_udp_datagram_size
+                            && !self.base_confirmed
+                        {
+                            enter_base_error(&mut next, now);
                         } else {
-                            next.state = DplpmtudState::Searching;
+                            let Some(confirmed) = self.confirmed_udp_datagram_size else {
+                                enter_base_error(&mut next, now);
+                                return DplpmtudTransition {
+                                    decision: DplpmtudTransitionDecision::Applied,
+                                    next,
+                                };
+                            };
+                            lower_after_failed_search_candidate(
+                                &mut next,
+                                confirmed,
+                                probe.candidate_udp_datagram_size,
+                                now,
+                            );
                         }
                     }
                     DplpmtudTransitionDecision::Applied
                 }
             }
-            DplpmtudEvent::ProbeSendFailed { probe, now } => {
+            DplpmtudEvent::ProbeSendFailed {
+                probe,
+                failure,
+                now,
+            } => {
                 if self.outstanding.map(|value| value.identity) != Some(probe) {
                     DplpmtudTransitionDecision::Noop
                 } else {
                     next.outstanding = None;
                     next.send_failure_count = next.send_failure_count.saturating_add(1);
                     next.last_failure_at = Some(now);
-                    next.state = DplpmtudState::Error;
-                    next.raise_at = Some(now + DPLPMTUD_ERROR_RETRY_INTERVAL);
+                    next.last_send_failure_kind = Some(failure);
+                    match failure {
+                        DplpmtudProbeSendFailure::LocalPacketTooLarge => {
+                            next.local_packet_too_large_count =
+                                next.local_packet_too_large_count.saturating_add(1);
+                            if self.current_plpmtu_confirmation_pending {
+                                lower_after_current_confirmation_failure(&mut next, probe, now);
+                            } else if probe.candidate_udp_datagram_size
+                                == self.base_udp_datagram_size
+                                && !self.base_confirmed
+                            {
+                                enter_base_error(&mut next, now);
+                            } else if let Some(confirmed) = self.confirmed_udp_datagram_size {
+                                lower_after_failed_search_candidate(
+                                    &mut next,
+                                    confirmed,
+                                    probe.candidate_udp_datagram_size,
+                                    now,
+                                );
+                            } else {
+                                enter_base_error(&mut next, now);
+                            }
+                        }
+                        DplpmtudProbeSendFailure::TransientSend
+                        | DplpmtudProbeSendFailure::EmitLockUnavailable
+                        | DplpmtudProbeSendFailure::SessionUnavailable => {
+                            match failure {
+                                DplpmtudProbeSendFailure::TransientSend => {
+                                    next.transient_send_failure_count =
+                                        next.transient_send_failure_count.saturating_add(1);
+                                }
+                                DplpmtudProbeSendFailure::EmitLockUnavailable => {
+                                    next.emit_lock_unavailable_count =
+                                        next.emit_lock_unavailable_count.saturating_add(1);
+                                }
+                                DplpmtudProbeSendFailure::SessionUnavailable => {
+                                    next.session_unavailable_count =
+                                        next.session_unavailable_count.saturating_add(1);
+                                }
+                                DplpmtudProbeSendFailure::LocalPacketTooLarge => {}
+                            }
+                            if self.current_plpmtu_confirmation_pending
+                                && self.retry_count >= DPLPMTUD_MAX_RETRIES
+                            {
+                                lower_after_current_confirmation_failure(&mut next, probe, now);
+                            } else if self.retry_count < DPLPMTUD_MAX_RETRIES {
+                                next.retry_count = self.retry_count.saturating_add(1);
+                                next.pending_candidate_udp_datagram_size =
+                                    Some(probe.candidate_udp_datagram_size);
+                                next.state = DplpmtudState::Searching;
+                            } else if probe.candidate_udp_datagram_size
+                                == self.base_udp_datagram_size
+                                && !self.base_confirmed
+                            {
+                                enter_base_error(&mut next, now);
+                            } else {
+                                next.state = DplpmtudState::Error;
+                                next.pending_candidate_udp_datagram_size = None;
+                                next.raise_at = Some(now + DPLPMTUD_ERROR_RETRY_INTERVAL);
+                            }
+                        }
+                    }
+                    DplpmtudTransitionDecision::Applied
+                }
+            }
+            DplpmtudEvent::CurrentPlpmtuConfirmationTimerExpired { now } => {
+                if self.state != DplpmtudState::SearchComplete
+                    || self
+                        .current_plpmtu_confirmation_at
+                        .is_none_or(|deadline| now < deadline)
+                    || self.confirmed_udp_datagram_size.is_none()
+                    || self.current_plpmtu_confirmation_pending
+                {
+                    DplpmtudTransitionDecision::Noop
+                } else {
+                    next.pending_candidate_udp_datagram_size = self.confirmed_udp_datagram_size;
+                    next.current_plpmtu_confirmation_at = None;
+                    next.current_plpmtu_confirmation_pending = true;
+                    next.retry_count = 0;
+                    next.state = DplpmtudState::Searching;
                     DplpmtudTransitionDecision::Applied
                 }
             }
@@ -592,15 +802,23 @@ impl DplpmtudStateMachine {
                         .as_ref()
                         .map(|identity| identity.outer_ip_family.ceiling_udp_datagram_size())
                         .unwrap_or(next.search_upper_udp_datagram_size);
-                    next.pending_candidate_udp_datagram_size = next_search_candidate(
-                        next.confirmed_udp_datagram_size,
-                        next.search_upper_udp_datagram_size,
-                    );
+                    next.current_plpmtu_confirmation_pending = false;
+                    next.current_plpmtu_confirmation_at = None;
+                    next.pending_candidate_udp_datagram_size = next
+                        .confirmed_udp_datagram_size
+                        .map(|confirmed| {
+                            next_search_candidate(confirmed, next.search_upper_udp_datagram_size)
+                        })
+                        .unwrap_or(Some(next.base_udp_datagram_size));
                     next.retry_count = 0;
                     next.raise_at = None;
-                    next.state = if next.pending_candidate_udp_datagram_size.is_some() {
+                    next.state = if next.confirmed_udp_datagram_size.is_none() {
+                        DplpmtudState::Base
+                    } else if next.pending_candidate_udp_datagram_size.is_some() {
                         DplpmtudState::Searching
                     } else {
+                        next.current_plpmtu_confirmation_at =
+                            Some(now + DPLPMTUD_CURRENT_PLPMTU_CONFIRMATION_INTERVAL);
                         next.raise_at = Some(now + DPLPMTUD_RAISE_INTERVAL);
                         DplpmtudState::SearchComplete
                     };
@@ -614,13 +832,24 @@ impl DplpmtudStateMachine {
             DplpmtudEvent::Cancelled { reason, now: _ } => {
                 if self.state == DplpmtudState::Disabled
                     && self.last_reset_reason.as_deref() == Some(reason.as_str())
+                    && !self.base_confirmed
+                    && self.confirmed_udp_datagram_size.is_none()
+                    && self.outstanding.is_none()
+                    && self.pending_candidate_udp_datagram_size.is_none()
+                    && !self.current_plpmtu_confirmation_pending
+                    && self.current_plpmtu_confirmation_at.is_none()
+                    && self.raise_at.is_none()
                 {
                     DplpmtudTransitionDecision::Noop
                 } else {
                     next.state = DplpmtudState::Disabled;
                     next.supported = false;
+                    next.base_confirmed = false;
+                    next.confirmed_udp_datagram_size = None;
                     next.outstanding = None;
                     next.pending_candidate_udp_datagram_size = None;
+                    next.current_plpmtu_confirmation_pending = false;
+                    next.current_plpmtu_confirmation_at = None;
                     next.raise_at = None;
                     next.last_reset_reason = Some(reason);
                     next.reset_count = next.reset_count.saturating_add(1);
@@ -679,18 +908,21 @@ impl DplpmtudStateMachine {
             state: self.state,
             supported: self.supported,
             path_identity: self.identity.as_ref().map(DplpmtudPathIdentity::summary),
-            base_udp_datagram_size: self.base_udp_datagram_size.0,
-            confirmed_udp_datagram_size: self.confirmed_udp_datagram_size.0,
+            assumed_base_udp_datagram_size: self.base_udp_datagram_size.0,
+            base_confirmed: self.base_confirmed,
+            confirmed_udp_datagram_size: self.confirmed_udp_datagram_size.map(|value| value.0),
             search_upper_udp_datagram_size: self.search_upper_udp_datagram_size.0,
-            confirmed_outer_ip_packet_size: family.map(|family| {
-                self.confirmed_udp_datagram_size
-                    .outer_ip_packet_size(family)
-                    .0
-            }),
+            confirmed_outer_ip_packet_size: self
+                .confirmed_udp_datagram_size
+                .and_then(|size| family.map(|family| size.outer_ip_packet_size(family).0)),
             overlay_payload_budget: self
                 .confirmed_udp_datagram_size
-                .overlay_payload_budget()
+                .and_then(UdpDatagramSize::overlay_payload_budget)
                 .map(|value| value.0),
+            current_plpmtu_confirmation_pending: self.current_plpmtu_confirmation_pending,
+            current_plpmtu_confirmation_remaining_ms: self
+                .current_plpmtu_confirmation_at
+                .map(|at| duration_ms(at.saturating_duration_since(now))),
             outstanding_probe,
             last_success_age_ms: self
                 .last_success_at
@@ -704,15 +936,89 @@ impl DplpmtudStateMachine {
             reset_reason: self.last_reset_reason.clone(),
             reset_count: self.reset_count,
             revision: self.revision,
+            budget_revision: None,
             probe_count: self.probe_count,
             success_count: self.success_count,
             timeout_count: self.timeout_count,
             send_failure_count: self.send_failure_count,
+            transient_send_failure_count: self.transient_send_failure_count,
+            emit_lock_unavailable_count: self.emit_lock_unavailable_count,
+            session_unavailable_count: self.session_unavailable_count,
+            local_packet_too_large_count: self.local_packet_too_large_count,
+            last_send_failure_kind: self.last_send_failure_kind,
             stale_ack_count: self.stale_ack_count,
             duplicate_ack_count: self.duplicate_ack_count,
             live_worker,
         }
     }
+}
+
+fn enter_base_error(next: &mut DplpmtudStateMachine, now: Instant) {
+    next.base_confirmed = false;
+    next.confirmed_udp_datagram_size = None;
+    next.pending_candidate_udp_datagram_size = None;
+    next.current_plpmtu_confirmation_pending = false;
+    next.current_plpmtu_confirmation_at = None;
+    next.state = DplpmtudState::Error;
+    next.raise_at = Some(now + DPLPMTUD_ERROR_RETRY_INTERVAL);
+}
+
+fn lower_after_failed_search_candidate(
+    next: &mut DplpmtudStateMachine,
+    confirmed: UdpDatagramSize,
+    failed_candidate: UdpDatagramSize,
+    now: Instant,
+) {
+    let failed_upper = failed_candidate
+        .0
+        .saturating_sub(DPLPMTUD_SEARCH_GRANULARITY)
+        .max(confirmed.0);
+    next.search_upper_udp_datagram_size =
+        UdpDatagramSize(next.search_upper_udp_datagram_size.0.min(failed_upper));
+    next.pending_candidate_udp_datagram_size =
+        next_search_candidate(confirmed, next.search_upper_udp_datagram_size);
+    next.current_plpmtu_confirmation_pending = false;
+    next.current_plpmtu_confirmation_at = None;
+    if next.pending_candidate_udp_datagram_size.is_none() {
+        next.state = DplpmtudState::SearchComplete;
+        next.current_plpmtu_confirmation_at =
+            Some(now + DPLPMTUD_CURRENT_PLPMTU_CONFIRMATION_INTERVAL);
+        next.raise_at = Some(now + DPLPMTUD_RAISE_INTERVAL);
+    } else {
+        next.state = DplpmtudState::Searching;
+        next.raise_at = None;
+    }
+}
+
+fn lower_after_current_confirmation_failure(
+    next: &mut DplpmtudStateMachine,
+    probe: DplpmtudProbeIdentity,
+    _now: Instant,
+) {
+    let safe_base = next.base_udp_datagram_size;
+    next.current_plpmtu_confirmation_pending = false;
+    next.current_plpmtu_confirmation_at = None;
+    next.search_upper_udp_datagram_size = UdpDatagramSize(
+        next.search_upper_udp_datagram_size
+            .0
+            .min(
+                probe
+                    .candidate_udp_datagram_size
+                    .0
+                    .saturating_sub(DPLPMTUD_SEARCH_GRANULARITY),
+            )
+            .max(safe_base.0),
+    );
+    // A current-PLPMTU confirmation failure invalidates the historical
+    // confirmed value.  BASE is only usable again after a fresh positive
+    // BASE ACK; never expose the assumed BASE as a replacement confirmation.
+    next.base_confirmed = false;
+    next.confirmed_udp_datagram_size = None;
+    next.outstanding = None;
+    next.pending_candidate_udp_datagram_size = Some(safe_base);
+    next.retry_count = 0;
+    next.raise_at = None;
+    next.state = DplpmtudState::Base;
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -764,11 +1070,14 @@ pub(crate) struct DplpmtudSnapshot {
     pub(crate) state: DplpmtudState,
     pub(crate) supported: bool,
     pub(crate) path_identity: Option<DplpmtudPathIdentitySnapshot>,
-    pub(crate) base_udp_datagram_size: u32,
-    pub(crate) confirmed_udp_datagram_size: u32,
+    pub(crate) assumed_base_udp_datagram_size: u32,
+    pub(crate) base_confirmed: bool,
+    pub(crate) confirmed_udp_datagram_size: Option<u32>,
     pub(crate) search_upper_udp_datagram_size: u32,
     pub(crate) confirmed_outer_ip_packet_size: Option<u32>,
     pub(crate) overlay_payload_budget: Option<u32>,
+    pub(crate) current_plpmtu_confirmation_pending: bool,
+    pub(crate) current_plpmtu_confirmation_remaining_ms: Option<u64>,
     pub(crate) outstanding_probe: Option<DplpmtudOutstandingSnapshot>,
     pub(crate) last_success_age_ms: Option<u64>,
     pub(crate) last_timeout_age_ms: Option<u64>,
@@ -776,10 +1085,17 @@ pub(crate) struct DplpmtudSnapshot {
     pub(crate) reset_reason: Option<String>,
     pub(crate) reset_count: u64,
     pub(crate) revision: u64,
+    #[serde(default)]
+    pub(crate) budget_revision: Option<u64>,
     pub(crate) probe_count: u64,
     pub(crate) success_count: u64,
     pub(crate) timeout_count: u64,
     pub(crate) send_failure_count: u64,
+    pub(crate) transient_send_failure_count: u64,
+    pub(crate) emit_lock_unavailable_count: u64,
+    pub(crate) session_unavailable_count: u64,
+    pub(crate) local_packet_too_large_count: u64,
+    pub(crate) last_send_failure_kind: Option<DplpmtudProbeSendFailure>,
     pub(crate) stale_ack_count: u64,
     pub(crate) duplicate_ack_count: u64,
     pub(crate) live_worker: bool,
@@ -1068,8 +1384,22 @@ pub(crate) struct DplpmtudInstallResult {
     pub(crate) worker: Option<DplpmtudWorkerLease>,
 }
 
+/// Read-only budget returned for one exact committed path.  The lookup is
+/// keyed by peer in the runtime registry and then fenced by the complete path
+/// identity; it never clones the all-peer diagnostics table.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DplpmtudConfirmedBudget {
+    pub(crate) budget_revision: u64,
+    pub(crate) udp_datagram_size: UdpDatagramSize,
+    pub(crate) outer_ip_packet_size: OuterIpPacketSize,
+    pub(crate) overlay_payload_budget: OverlayPayloadBudget,
+}
+
 struct RuntimeEntry {
     machine: DplpmtudStateMachine,
+    budget_revision: Option<u64>,
+    budget_revision_state: DplpmtudBudgetRevisionState,
     path_cookie: [u8; 16],
     worker_owner_token: Option<u64>,
     cancel_tx: Option<watch::Sender<bool>>,
@@ -1117,6 +1447,23 @@ impl DplpmtudRuntime {
             })
             .ok()
             .filter(|token| *token != 0)
+    }
+
+    fn allocate_budget_revision(&self) -> Option<u64> {
+        NEXT_DPLPMTUD_BUDGET_REVISION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .filter(|revision| *revision != 0)
+    }
+
+    fn refresh_budget_revision(&self, entry: &mut RuntimeEntry) {
+        let next_state = entry.machine.budget_revision_state();
+        if next_state != entry.budget_revision_state {
+            entry.budget_revision = self.allocate_budget_revision();
+            entry.budget_revision_state = next_state;
+        }
     }
 
     pub(crate) fn admit_probe_response(&self, peer_id: &str, now: Instant) -> bool {
@@ -1179,10 +1526,30 @@ impl DplpmtudRuntime {
             .is_some_and(|generation| *generation == peer_session_generation)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn install_path(
         &self,
         identity: DplpmtudPathIdentity,
         supported: bool,
+        now: Instant,
+    ) -> DplpmtudInstallResult {
+        self.install_path_with_reason(
+            identity,
+            supported,
+            if supported {
+                "direct_committed"
+            } else {
+                "dplpmtud_capability_not_negotiated"
+            },
+            now,
+        )
+    }
+
+    pub(crate) fn install_path_with_reason(
+        &self,
+        identity: DplpmtudPathIdentity,
+        supported: bool,
+        unsupported_reason: &str,
         now: Instant,
     ) -> DplpmtudInstallResult {
         let peer_id = identity.peer_id.clone();
@@ -1232,8 +1599,11 @@ impl DplpmtudRuntime {
                         DplpmtudState::Disabled | DplpmtudState::Unsupported
                     ) {
                         rand::thread_rng().fill_bytes(&mut existing.path_cookie);
-                        existing.machine =
-                            DplpmtudStateMachine::for_path(identity.clone(), true, now);
+                        existing.machine = DplpmtudStateMachine::for_path_with_reason(
+                            identity.clone(),
+                            true,
+                            "direct_committed",
+                        );
                     }
                     let (cancel_tx, cancel_rx) = watch::channel(false);
                     existing.worker_owner_token = Some(worker_owner_token);
@@ -1269,7 +1639,8 @@ impl DplpmtudRuntime {
                 existing.worker_owner_token = None;
                 existing.worker_running = false;
                 existing.send_in_progress = false;
-                existing.machine = DplpmtudStateMachine::for_path(identity, false, now);
+                existing.machine =
+                    DplpmtudStateMachine::for_path_with_reason(identity, false, unsupported_reason);
                 self.publish_snapshot_locked(&peer_id, existing, now);
                 return DplpmtudInstallResult {
                     decision: DplpmtudInstallDecision::Unsupported,
@@ -1288,8 +1659,12 @@ impl DplpmtudRuntime {
         rand::thread_rng().fill_bytes(&mut path_cookie);
         let notify = Arc::new(Notify::new());
         if !supported {
+            let machine =
+                DplpmtudStateMachine::for_path_with_reason(identity, false, unsupported_reason);
             let entry = RuntimeEntry {
-                machine: DplpmtudStateMachine::for_path(identity, false, now),
+                budget_revision: self.allocate_budget_revision(),
+                budget_revision_state: machine.budget_revision_state(),
+                machine,
                 path_cookie,
                 worker_owner_token: None,
                 cancel_tx: None,
@@ -1300,7 +1675,7 @@ impl DplpmtudRuntime {
             registry.entries.insert(peer_id.clone(), entry);
             let entry = registry
                 .entries
-                .get(&peer_id)
+                .get_mut(&peer_id)
                 .expect("entry inserted above");
             self.publish_snapshot_locked(&peer_id, entry, now);
             return DplpmtudInstallResult {
@@ -1316,8 +1691,11 @@ impl DplpmtudRuntime {
             };
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let machine = DplpmtudStateMachine::for_path(identity.clone(), true, now);
         let entry = RuntimeEntry {
-            machine: DplpmtudStateMachine::for_path(identity.clone(), true, now),
+            budget_revision: self.allocate_budget_revision(),
+            budget_revision_state: machine.budget_revision_state(),
+            machine,
             path_cookie,
             worker_owner_token: Some(worker_owner_token),
             cancel_tx: Some(cancel_tx),
@@ -1328,7 +1706,7 @@ impl DplpmtudRuntime {
         registry.entries.insert(peer_id.clone(), entry);
         let entry = registry
             .entries
-            .get(&peer_id)
+            .get_mut(&peer_id)
             .expect("entry inserted above");
         self.publish_snapshot_locked(&peer_id, entry, now);
         DplpmtudInstallResult {
@@ -1363,6 +1741,7 @@ impl DplpmtudRuntime {
                     reason: "peer_left".to_string(),
                     now,
                 });
+                self.refresh_budget_revision(&mut entry);
             }
             registry.supported_sessions.remove(&peer_id);
             registry.ack_response_times.remove(&peer_id);
@@ -1483,6 +1862,11 @@ impl DplpmtudRuntime {
         if entry.machine.state() == DplpmtudState::Base {
             let _ = entry.machine.apply(DplpmtudEvent::StartSearch { now });
         }
+        if entry.machine.state() == DplpmtudState::SearchComplete {
+            let _ = entry
+                .machine
+                .apply(DplpmtudEvent::CurrentPlpmtuConfirmationTimerExpired { now });
+        }
         if matches!(
             entry.machine.state(),
             DplpmtudState::SearchComplete | DplpmtudState::Error
@@ -1576,7 +1960,7 @@ impl DplpmtudRuntime {
     pub(crate) fn finish_probe_send(
         &self,
         plan: &DplpmtudProbePlan,
-        result: Result<(), ()>,
+        result: Result<(), DplpmtudProbeSendFailure>,
         now: Instant,
     ) {
         let mut registry = self
@@ -1594,9 +1978,10 @@ impl DplpmtudRuntime {
         entry.send_in_progress = false;
         match result {
             Ok(()) => {}
-            Err(()) => {
+            Err(failure) => {
                 let _ = entry.machine.apply(DplpmtudEvent::ProbeSendFailed {
                     probe: plan.probe_identity,
+                    failure,
                     now,
                 });
             }
@@ -1759,6 +2144,66 @@ impl DplpmtudRuntime {
             .clone()
     }
 
+    /// Read one peer's diagnostics without cloning the all-peer table.
+    pub(crate) fn snapshot_for_peer(&self, peer_id: &str) -> Option<DplpmtudSnapshot> {
+        self.snapshots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .cloned()
+    }
+
+    /// Read one exact path's diagnostics without cloning the all-peer table.
+    /// This is for control/timeline reporting; business packetization uses
+    /// [`Self::confirmed_budget_for_path`] instead.
+    pub(crate) fn snapshot_for_path(
+        &self,
+        identity: &DplpmtudPathIdentity,
+    ) -> Option<DplpmtudSnapshot> {
+        let expected = identity.summary();
+        let snapshot = self.snapshot_for_peer(&identity.peer_id)?;
+        (snapshot.path_identity.as_ref() == Some(&expected)).then_some(snapshot)
+    }
+
+    /// O(1) per-peer confirmed-budget read for the business consumer.  The
+    /// exact identity check prevents a budget from a replaced endpoint,
+    /// generation, candidate epoch, or socket publication from being reused.
+    /// Business hot paths must use this accessor rather than `snapshots()`.
+    #[allow(dead_code)]
+    pub(crate) fn confirmed_budget_for_path(
+        &self,
+        identity: &DplpmtudPathIdentity,
+    ) -> Option<DplpmtudConfirmedBudget> {
+        let registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.closed {
+            return None;
+        }
+        let entry = registry.entries.get(&identity.peer_id)?;
+        if entry.machine.identity() != Some(identity)
+            || !entry.machine.supported
+            || matches!(
+                entry.machine.state(),
+                DplpmtudState::Disabled | DplpmtudState::Unsupported
+            )
+            || !entry.machine.base_confirmed
+        {
+            return None;
+        }
+        let udp_datagram_size = entry.machine.business_confirmed_udp_datagram_size()?;
+        let budget_revision = entry.budget_revision?;
+        let outer_ip_packet_size = udp_datagram_size.outer_ip_packet_size(identity.outer_ip_family);
+        let overlay_payload_budget = udp_datagram_size.overlay_payload_budget()?;
+        Some(DplpmtudConfirmedBudget {
+            budget_revision,
+            udp_datagram_size,
+            outer_ip_packet_size,
+            overlay_payload_budget,
+        })
+    }
+
     #[cfg(test)]
     fn current_probe_token(
         &self,
@@ -1808,14 +2253,14 @@ impl DplpmtudRuntime {
             .count()
     }
 
-    fn publish_snapshot_locked(&self, peer_id: &str, entry: &RuntimeEntry, now: Instant) {
+    fn publish_snapshot_locked(&self, peer_id: &str, entry: &mut RuntimeEntry, now: Instant) {
+        self.refresh_budget_revision(entry);
+        let mut snapshot = entry.machine.snapshot(now, entry.worker_running);
+        snapshot.budget_revision = entry.budget_revision;
         self.snapshots
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                peer_id.to_string(),
-                entry.machine.snapshot(now, entry.worker_running),
-            );
+            .insert(peer_id.to_string(), snapshot);
     }
 }
 
@@ -1921,6 +2366,187 @@ mod tests {
         (probe, deadline)
     }
 
+    fn positively_confirm_base(machine: &mut DplpmtudStateMachine, now: Instant) -> Instant {
+        let (probe, _) = schedule_and_mark_sent(machine, now);
+        assert_eq!(
+            probe.candidate_udp_datagram_size.0,
+            DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
+        );
+        assert_eq!(
+            machine.apply(DplpmtudEvent::ProbeAcked {
+                probe,
+                now: now + Duration::from_millis(2),
+            }),
+            DplpmtudTransitionDecision::Applied
+        );
+        now + Duration::from_millis(3)
+    }
+
+    fn runtime_with_confirmed_base(
+        identity: DplpmtudPathIdentity,
+        now: Instant,
+    ) -> (DplpmtudRuntime, DplpmtudWorkerLease) {
+        let runtime = DplpmtudRuntime::new();
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .expect("supported path must own one worker");
+        let plan = runtime
+            .schedule_probe(&identity.peer_id, &identity, lease.worker_owner_token, now)
+            .expect("BASE must be the first runtime probe");
+        assert_eq!(
+            plan.probe_identity.candidate_udp_datagram_size,
+            UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+        );
+        assert!(runtime.begin_probe_send(&plan, now));
+        runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
+        assert_eq!(
+            runtime.try_accept_ack(
+                &identity.peer_id,
+                &identity,
+                plan.wire_token,
+                DplpmtudAckIngress {
+                    remote_endpoint: identity.authenticated_remote_endpoint,
+                    local_endpoint: identity.local_endpoint,
+                    socket: identity.socket,
+                },
+                now + Duration::from_millis(2),
+            ),
+            DplpmtudTransitionDecision::Applied
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_some());
+        (runtime, lease)
+    }
+
+    fn exact_ack_ingress(identity: &DplpmtudPathIdentity) -> DplpmtudAckIngress {
+        DplpmtudAckIngress {
+            remote_endpoint: identity.authenticated_remote_endpoint,
+            local_endpoint: identity.local_endpoint,
+            socket: identity.socket,
+        }
+    }
+
+    fn schedule_and_mark_runtime_probe_sent(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        lease: &DplpmtudWorkerLease,
+        now: Instant,
+    ) -> DplpmtudProbePlan {
+        let plan = runtime
+            .schedule_probe(&identity.peer_id, identity, lease.worker_owner_token, now)
+            .expect("runtime search must have a next candidate");
+        assert!(runtime.begin_probe_send(&plan, now));
+        runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
+        plan
+    }
+
+    fn ack_runtime_probe(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        plan: &DplpmtudProbePlan,
+        now: Instant,
+    ) {
+        assert_eq!(
+            runtime.try_accept_ack(
+                &identity.peer_id,
+                identity,
+                plan.wire_token,
+                exact_ack_ingress(identity),
+                now,
+            ),
+            DplpmtudTransitionDecision::Applied
+        );
+    }
+
+    fn converge_runtime_to_threshold(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        lease: &DplpmtudWorkerLease,
+        mut now: Instant,
+        threshold: u32,
+    ) -> Instant {
+        for _ in 0..96 {
+            if runtime
+                .snapshot_for_peer(&identity.peer_id)
+                .is_some_and(|snapshot| snapshot.state == DplpmtudState::SearchComplete)
+            {
+                return now;
+            }
+            let plan = schedule_and_mark_runtime_probe_sent(runtime, identity, lease, now);
+            if plan.probe_identity.candidate_udp_datagram_size.0 <= threshold {
+                ack_runtime_probe(runtime, identity, &plan, now + Duration::from_millis(2));
+                now += Duration::from_millis(3);
+            } else {
+                assert_eq!(
+                    runtime.timeout_probe(&plan, plan.deadline),
+                    DplpmtudTransitionDecision::Applied
+                );
+                now = plan.deadline + Duration::from_millis(1);
+            }
+        }
+        panic!("bounded runtime DPLPMTUD search did not converge");
+    }
+
+    fn exhaust_runtime_current_confirmation(
+        runtime: &DplpmtudRuntime,
+        identity: &DplpmtudPathIdentity,
+        lease: &DplpmtudWorkerLease,
+        mut now: Instant,
+        expected_candidate: UdpDatagramSize,
+    ) -> Instant {
+        let confirmation_at = runtime
+            .worker_state(&identity.peer_id, identity, lease.worker_owner_token)
+            .and_then(|(_, wakeup, _)| wakeup)
+            .expect("SearchComplete must own a current-PLPMTU timer");
+        now = now.max(confirmation_at);
+        for _ in 0..=DPLPMTUD_MAX_RETRIES {
+            let plan = schedule_and_mark_runtime_probe_sent(runtime, identity, lease, now);
+            assert_eq!(
+                plan.probe_identity.candidate_udp_datagram_size,
+                expected_candidate
+            );
+            assert_eq!(
+                runtime.timeout_probe(&plan, plan.deadline),
+                DplpmtudTransitionDecision::Applied
+            );
+            now = plan.deadline + Duration::from_millis(1);
+        }
+        now
+    }
+
+    fn converge_machine_to_threshold(
+        machine: &mut DplpmtudStateMachine,
+        mut now: Instant,
+        threshold: u32,
+    ) -> Instant {
+        for _ in 0..96 {
+            if machine.state() == DplpmtudState::SearchComplete {
+                return now;
+            }
+            let (probe, deadline) = schedule_and_mark_sent(machine, now);
+            if probe.candidate_udp_datagram_size.0 <= threshold {
+                assert_eq!(
+                    machine.apply(DplpmtudEvent::ProbeAcked {
+                        probe,
+                        now: now + Duration::from_millis(2),
+                    }),
+                    DplpmtudTransitionDecision::Applied
+                );
+                now += Duration::from_millis(3);
+            } else {
+                assert_eq!(
+                    machine.apply(DplpmtudEvent::ProbeTimedOut {
+                        probe,
+                        now: deadline,
+                    }),
+                    DplpmtudTransitionDecision::Applied
+                );
+                now = deadline + Duration::from_millis(1);
+            }
+        }
+        panic!("bounded DPLPMTUD search did not converge");
+    }
+
     #[test]
     fn unsupported_peer_stays_fail_closed_without_a_probe() {
         let now = Instant::now();
@@ -1930,6 +2556,58 @@ mod tests {
         let snapshot = machine.snapshot(now, false);
         assert!(!snapshot.supported);
         assert!(snapshot.outstanding_probe.is_none());
+    }
+
+    #[test]
+    fn base_requires_a_positive_probe_before_any_confirmed_budget() {
+        let mut now = Instant::now();
+        let mut machine = DplpmtudStateMachine::for_path(test_identity("peer"), true, now);
+        let initial = machine.snapshot(now, false);
+        assert_eq!(
+            initial.assumed_base_udp_datagram_size,
+            DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
+        );
+        assert!(!initial.base_confirmed);
+        assert_eq!(initial.confirmed_udp_datagram_size, None);
+        assert_eq!(initial.overlay_payload_budget, None);
+
+        for _ in 0..=DPLPMTUD_MAX_RETRIES {
+            let (probe, deadline) = schedule_and_mark_sent(&mut machine, now);
+            assert_eq!(
+                probe.candidate_udp_datagram_size.0,
+                DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
+            );
+            assert_eq!(
+                machine.apply(DplpmtudEvent::ProbeTimedOut {
+                    probe,
+                    now: deadline,
+                }),
+                DplpmtudTransitionDecision::Applied
+            );
+            now = deadline + Duration::from_millis(1);
+        }
+        assert_eq!(machine.state(), DplpmtudState::Error);
+        let failed = machine.snapshot(now, false);
+        assert!(!failed.base_confirmed);
+        assert_eq!(failed.confirmed_udp_datagram_size, None);
+        assert_eq!(failed.overlay_payload_budget, None);
+        assert!(failed.outstanding_probe.is_none());
+
+        let retry_at = machine.raise_at.expect("BASE Error owns a retry timer");
+        assert_eq!(
+            machine.apply(DplpmtudEvent::RaiseTimerExpired { now: retry_at }),
+            DplpmtudTransitionDecision::Applied
+        );
+        assert_eq!(machine.state(), DplpmtudState::Base);
+        assert_eq!(
+            machine.next_probe_components().map(|(_, size, _)| size.0),
+            Some(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+        );
+        println!(
+            "DPLPMTUD_BASE assumed={} positively_validated=false confirmed=none state={:?} direct_active=true direct_health_failure_count=0 relay_fallback_count=0 old_ack_contamination=false task_leak=false",
+            DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
+            machine.state(),
+        );
     }
 
     #[test]
@@ -1975,7 +2653,7 @@ mod tests {
         );
         assert_eq!(
             machine.confirmed_udp_datagram_size,
-            probe.candidate_udp_datagram_size
+            Some(probe.candidate_udp_datagram_size)
         );
         assert_eq!(machine.success_count, 1);
     }
@@ -1984,6 +2662,7 @@ mod tests {
     fn timeout_retries_then_only_narrows_search_bounds() {
         let mut now = Instant::now();
         let mut machine = DplpmtudStateMachine::for_path(test_identity("peer"), true, now);
+        now = positively_confirm_base(&mut machine, now);
         let original_upper = machine.search_upper_udp_datagram_size;
         let mut failed_size = None;
         for retry in 0..=DPLPMTUD_MAX_RETRIES {
@@ -2046,8 +2725,11 @@ mod tests {
             }
         }
         assert_eq!(machine.state(), DplpmtudState::SearchComplete);
-        assert!(machine.confirmed_udp_datagram_size.0 <= threshold);
-        assert!(threshold - machine.confirmed_udp_datagram_size.0 <= DPLPMTUD_SEARCH_GRANULARITY);
+        let confirmed = machine
+            .confirmed_udp_datagram_size
+            .expect("search completion requires positive BASE confirmation");
+        assert!(confirmed.0 <= threshold);
+        assert!(threshold - confirmed.0 <= DPLPMTUD_SEARCH_GRANULARITY);
         let raise_at = machine
             .raise_at
             .expect("completed search owns a raise timer");
@@ -2059,6 +2741,819 @@ mod tests {
             machine.state(),
             DplpmtudState::Searching | DplpmtudState::SearchComplete
         ));
+    }
+
+    #[test]
+    fn same_identity_current_plpmtu_confirmation_recovers_downward() {
+        let identity = test_identity("peer");
+        let mut machine = DplpmtudStateMachine::for_path(identity.clone(), true, Instant::now());
+        let mut now = converge_machine_to_threshold(&mut machine, Instant::now(), 1397);
+        assert_eq!(machine.state(), DplpmtudState::SearchComplete);
+        assert_eq!(
+            machine.confirmed_udp_datagram_size,
+            Some(UdpDatagramSize(1392))
+        );
+        assert!(machine.base_confirmed);
+
+        let timer = machine
+            .current_plpmtu_confirmation_at
+            .expect("SearchComplete must arm current-PLPMTU confirmation");
+        assert_eq!(
+            machine.apply(DplpmtudEvent::CurrentPlpmtuConfirmationTimerExpired { now: timer }),
+            DplpmtudTransitionDecision::Applied
+        );
+        assert!(machine.current_plpmtu_confirmation_pending);
+        assert_eq!(
+            machine.pending_candidate_udp_datagram_size,
+            Some(UdpDatagramSize(1392))
+        );
+
+        for _ in 0..=DPLPMTUD_MAX_RETRIES {
+            let (probe, deadline) = schedule_and_mark_sent(&mut machine, now.max(timer));
+            assert_eq!(probe.candidate_udp_datagram_size, UdpDatagramSize(1392));
+            assert_eq!(
+                machine.apply(DplpmtudEvent::ProbeTimedOut {
+                    probe,
+                    now: deadline,
+                }),
+                DplpmtudTransitionDecision::Applied
+            );
+            now = deadline + Duration::from_millis(1);
+        }
+
+        assert!(!machine.base_confirmed);
+        assert_eq!(machine.confirmed_udp_datagram_size, None);
+        assert_eq!(
+            machine.pending_candidate_udp_datagram_size,
+            Some(UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE))
+        );
+        assert!(machine.outstanding.is_none());
+        assert!(!machine.current_plpmtu_confirmation_pending);
+        assert!(machine.current_plpmtu_confirmation_at.is_none());
+        assert_eq!(machine.state(), DplpmtudState::Base);
+        assert!(machine.search_upper_udp_datagram_size.0 <= 1384);
+        assert_eq!(machine.identity(), Some(&identity));
+
+        now = positively_confirm_base(&mut machine, now);
+        assert!(machine.base_confirmed);
+        assert_eq!(
+            machine.confirmed_udp_datagram_size,
+            Some(UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE))
+        );
+
+        converge_machine_to_threshold(&mut machine, now, 1280);
+        assert_eq!(machine.state(), DplpmtudState::SearchComplete);
+        let confirmed = machine
+            .confirmed_udp_datagram_size
+            .expect("downward recovery must retain a positive confirmed BASE");
+        assert!(confirmed.0 <= 1280);
+        assert_eq!(machine.identity(), Some(&identity));
+        assert!(machine.base_confirmed);
+        println!(
+            "DPLPMTUD_DOWNWARD before=1392 after={} direct_active=true direct_health_failure_count=0 relay_fallback_count=0 identity_preserved=true candidate_epoch_preserved=true socket_identity_preserved=true old_ack_contamination=false task_leak=false",
+            confirmed.0,
+        );
+    }
+
+    #[test]
+    fn runtime_downward_recovery_withholds_budget_until_fresh_base_ack() {
+        let identity = test_identity("peer");
+        let runtime = DplpmtudRuntime::new();
+        let mut now = Instant::now();
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        now = converge_runtime_to_threshold(&runtime, &identity, &lease, now, 1397);
+        let before = runtime
+            .confirmed_budget_for_path(&identity)
+            .expect("initial search must converge with a budget");
+        assert_eq!(before.udp_datagram_size, UdpDatagramSize(1392));
+
+        now = exhaust_runtime_current_confirmation(
+            &runtime,
+            &identity,
+            &lease,
+            now,
+            UdpDatagramSize(1392),
+        );
+        let base = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(base.state, DplpmtudState::Base);
+        assert!(!base.base_confirmed);
+        assert_eq!(base.confirmed_udp_datagram_size, None);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert!(base.budget_revision.unwrap() > before.budget_revision);
+        assert_eq!(
+            runtime.path_identity(&identity.peer_id),
+            Some(identity.clone())
+        );
+
+        let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+        assert_eq!(
+            base_plan.probe_identity.candidate_udp_datagram_size,
+            UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &base_plan,
+            now + Duration::from_millis(2),
+        );
+        let reconfirmed_base = runtime
+            .confirmed_budget_for_path(&identity)
+            .expect("fresh BASE ACK must restore the budget");
+        assert_eq!(
+            reconfirmed_base.udp_datagram_size,
+            UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+        );
+        assert!(reconfirmed_base.budget_revision > base.budget_revision.unwrap());
+        now += Duration::from_millis(3);
+
+        converge_runtime_to_threshold(&runtime, &identity, &lease, now, 1280);
+        let recovered = runtime
+            .confirmed_budget_for_path(&identity)
+            .expect("upward search after fresh BASE ACK must converge");
+        assert!(recovered.udp_datagram_size.0 <= 1280);
+        assert!(recovered.budget_revision >= reconfirmed_base.budget_revision);
+        assert_eq!(runtime.path_identity(&identity.peer_id), Some(identity));
+        println!(
+            "DPLPMTUD_RECONFIRM_BASE before=1392 base_budget_before_ack=none base_after_ack=1200 after={} direct_active=true direct_health_failure_count=0 relay_fallback_count=0 identity_preserved=true old_ack_contamination=false task_leak=false",
+            recovered.udp_datagram_size.0,
+        );
+    }
+
+    #[tokio::test]
+    async fn same_identity_below_base_failure_enters_error_without_budget() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap();
+        let local_endpoint = udp.local_addr().unwrap();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_endpoint = remote.local_addr().unwrap();
+        peers
+            .add_peer(&peer_info("peer", "10.20.0.2", remote_endpoint))
+            .await;
+        let identity = commit_test_direct_path(
+            &peers,
+            &udp,
+            "peer",
+            remote_endpoint,
+            local_endpoint,
+            29,
+            31,
+        )
+        .await;
+        let runtime = udp.dplpmtud_runtime();
+        let mut now = Instant::now();
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        now = converge_runtime_to_threshold(&runtime, &identity, &lease, now, 1397);
+        assert_eq!(
+            runtime
+                .confirmed_budget_for_path(&identity)
+                .unwrap()
+                .udp_datagram_size,
+            UdpDatagramSize(1392)
+        );
+
+        now = exhaust_runtime_current_confirmation(
+            &runtime,
+            &identity,
+            &lease,
+            now,
+            UdpDatagramSize(1392),
+        );
+        assert_eq!(
+            runtime.snapshot_for_peer(&identity.peer_id).unwrap().state,
+            DplpmtudState::Base
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+
+        for _ in 0..=DPLPMTUD_MAX_RETRIES {
+            let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+            assert_eq!(
+                base_plan.probe_identity.candidate_udp_datagram_size,
+                UdpDatagramSize(DPLPMTUD_BASE_UDP_DATAGRAM_SIZE)
+            );
+            assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+            assert_eq!(
+                runtime.timeout_probe(&base_plan, base_plan.deadline),
+                DplpmtudTransitionDecision::Applied
+            );
+            now = base_plan.deadline + Duration::from_millis(1);
+        }
+
+        let failed = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(failed.state, DplpmtudState::Error);
+        assert!(!failed.base_confirmed);
+        assert_eq!(failed.confirmed_udp_datagram_size, None);
+        assert_eq!(failed.overlay_payload_budget, None);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert_eq!(
+            runtime.path_identity(&identity.peer_id),
+            Some(identity.clone())
+        );
+        assert!(peers.dplpmtud_path_is_current_sync(&identity));
+
+        let connection = peers.get_connection("peer").await.unwrap();
+        let direct_active = connection.active_path() == Some(crate::peer::NetworkPath::Direct);
+        let direct_health_failure_count = connection.direct_health.failure_count;
+        let relay_fallback_count = connection
+            .path_events
+            .iter()
+            .filter(|event| event.selected_path == Some(crate::peer::NetworkPath::Relay))
+            .count();
+        assert!(direct_active);
+        assert_eq!(direct_health_failure_count, 0);
+        assert_eq!(relay_fallback_count, 0);
+        runtime.close("below_base_acceptance_complete", now);
+        assert_eq!(runtime.active_worker_count(), 0);
+        println!(
+            "DPLPMTUD_BELOW_BASE before=1392 threshold=1100 state=Error confirmed=none budget=none direct_active={direct_active} direct_health_failure_count={direct_health_failure_count} relay_fallback_count={relay_fallback_count} identity_preserved=true old_ack_contamination=false task_leak=false",
+        );
+    }
+
+    #[test]
+    fn cancelled_clears_confirmed_budget_and_all_probe_state() {
+        let identity = test_identity("peer");
+        let mut machine = DplpmtudStateMachine::for_path(identity, true, Instant::now());
+        let now = converge_machine_to_threshold(&mut machine, Instant::now(), 1397);
+        let timer = machine
+            .current_plpmtu_confirmation_at
+            .expect("SearchComplete must own a confirmation timer");
+        assert_eq!(
+            machine.apply(DplpmtudEvent::CurrentPlpmtuConfirmationTimerExpired { now: timer }),
+            DplpmtudTransitionDecision::Applied
+        );
+        let (_probe, _) = schedule_and_mark_sent(&mut machine, now.max(timer));
+        assert!(machine.base_confirmed);
+        assert!(machine.confirmed_udp_datagram_size.is_some());
+        assert!(machine.outstanding.is_some());
+        assert!(machine.current_plpmtu_confirmation_pending);
+
+        assert_eq!(
+            machine.apply(DplpmtudEvent::Cancelled {
+                reason: "active_path_not_direct".to_string(),
+                now: now + Duration::from_millis(1),
+            }),
+            DplpmtudTransitionDecision::Applied
+        );
+        assert_eq!(machine.state(), DplpmtudState::Disabled);
+        assert!(!machine.supported);
+        assert!(!machine.base_confirmed);
+        assert_eq!(machine.confirmed_udp_datagram_size, None);
+        assert_eq!(machine.pending_candidate_udp_datagram_size, None);
+        assert_eq!(machine.outstanding_identity(), None);
+        assert!(!machine.current_plpmtu_confirmation_pending);
+        assert_eq!(machine.current_plpmtu_confirmation_at, None);
+        assert_eq!(machine.next_wakeup(), None);
+    }
+
+    #[test]
+    fn local_emsgsize_shrinks_upper_bound_without_reopening_full_ceiling() {
+        let now = Instant::now();
+        let mut machine = DplpmtudStateMachine::for_path(test_identity("peer"), true, now);
+        let now = positively_confirm_base(&mut machine, now);
+        let original_upper = machine.search_upper_udp_datagram_size;
+        let (probe, _) = schedule_and_mark_sent(&mut machine, now);
+        assert!(probe.candidate_udp_datagram_size < original_upper);
+        assert_eq!(
+            machine.apply(DplpmtudEvent::ProbeSendFailed {
+                probe,
+                failure: DplpmtudProbeSendFailure::LocalPacketTooLarge,
+                now: now + Duration::from_millis(1),
+            }),
+            DplpmtudTransitionDecision::Applied
+        );
+        assert_eq!(machine.state(), DplpmtudState::Searching);
+        assert_eq!(
+            machine.confirmed_udp_datagram_size,
+            Some(UdpDatagramSize(1200))
+        );
+        assert!(machine.search_upper_udp_datagram_size < original_upper);
+        assert_ne!(
+            machine.pending_candidate_udp_datagram_size,
+            Some(probe.candidate_udp_datagram_size)
+        );
+        assert_eq!(machine.local_packet_too_large_count, 1);
+        assert_eq!(
+            machine.last_send_failure_kind,
+            Some(DplpmtudProbeSendFailure::LocalPacketTooLarge)
+        );
+
+        let snapshot = machine.snapshot(now, false);
+        assert_eq!(snapshot.local_packet_too_large_count, 1);
+        assert_eq!(snapshot.confirmed_udp_datagram_size, Some(1200));
+        println!(
+            "DPLPMTUD_EMSGSIZE candidate={} shrunk_upper={} state={:?} repeated_full_ceiling=false direct_active=true direct_health_failure_count=0 relay_fallback_count=0 task_leak=false",
+            probe.candidate_udp_datagram_size.0,
+            machine.search_upper_udp_datagram_size.0,
+            machine.state(),
+        );
+    }
+
+    #[test]
+    fn confirmed_budget_accessor_is_exact_identity_and_none_before_base_ack() {
+        let now = Instant::now();
+        let runtime = DplpmtudRuntime::new();
+        let identity = test_identity("peer");
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .expect("supported path must own one worker");
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+
+        let plan = runtime
+            .schedule_probe("peer", &identity, lease.worker_owner_token, now)
+            .expect("BASE must be the first probe");
+        assert_eq!(plan.probe_identity.candidate_udp_datagram_size.0, 1200);
+        assert!(runtime.begin_probe_send(&plan, now));
+        runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
+        assert_eq!(
+            runtime.try_accept_ack(
+                "peer",
+                &identity,
+                plan.wire_token,
+                DplpmtudAckIngress {
+                    remote_endpoint: identity.authenticated_remote_endpoint,
+                    local_endpoint: identity.local_endpoint,
+                    socket: identity.socket,
+                },
+                now + Duration::from_millis(2),
+            ),
+            DplpmtudTransitionDecision::Applied
+        );
+
+        let budget = runtime
+            .confirmed_budget_for_path(&identity)
+            .expect("only a positively ACKed BASE may be exposed");
+        assert_eq!(budget.udp_datagram_size, UdpDatagramSize(1200));
+        assert_eq!(budget.outer_ip_packet_size, OuterIpPacketSize(1228));
+        assert_eq!(budget.overlay_payload_budget, OverlayPayloadBudget(1168));
+
+        let replaced_socket = test_identity_with("peer", 7, 11, 13, 17, 19, 24, 0);
+        assert!(runtime
+            .confirmed_budget_for_path(&replaced_socket)
+            .is_none());
+        println!(
+            "DPLPMTUD_BUDGET accessor=O(1) exact_path_identity=true before_base_ack=none udp=1200 overlay=1168 business_snapshots_not_used=true",
+        );
+    }
+
+    #[test]
+    fn cancel_peer_revokes_confirmed_budget_immediately() {
+        let now = Instant::now();
+        let identity = test_identity("peer");
+        let (runtime, lease) = runtime_with_confirmed_base(identity.clone(), now);
+        let plan = runtime
+            .schedule_probe(
+                &identity.peer_id,
+                &identity,
+                lease.worker_owner_token,
+                now + Duration::from_millis(3),
+            )
+            .expect("a confirmed path must still have an upward candidate");
+        assert!(runtime.begin_probe_send(&plan, now + Duration::from_millis(3)));
+        assert!(runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .is_some_and(|snapshot| snapshot.outstanding_probe.is_some()));
+
+        runtime.cancel_peer(
+            &identity.peer_id,
+            "direct_validation_failed",
+            now + Duration::from_millis(4),
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        let snapshot = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(snapshot.state, DplpmtudState::Disabled);
+        assert!(!snapshot.supported);
+        assert!(!snapshot.base_confirmed);
+        assert_eq!(snapshot.confirmed_udp_datagram_size, None);
+        assert_eq!(snapshot.overlay_payload_budget, None);
+        assert!(snapshot.outstanding_probe.is_none());
+        assert!(!snapshot.current_plpmtu_confirmation_pending);
+        assert_eq!(snapshot.current_plpmtu_confirmation_remaining_ms, None);
+    }
+
+    #[test]
+    fn network_generation_cancel_revokes_confirmed_budget() {
+        let now = Instant::now();
+        let identity = test_identity("peer");
+        let (runtime, _lease) = runtime_with_confirmed_base(identity.clone(), now);
+        runtime.cancel_before_network_generation(
+            identity.epoch.network_generation + 1,
+            "network_generation_changed",
+            now + Duration::from_millis(3),
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        let snapshot = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(snapshot.state, DplpmtudState::Disabled);
+        assert!(!snapshot.base_confirmed);
+        assert_eq!(snapshot.confirmed_udp_datagram_size, None);
+    }
+
+    #[test]
+    fn runtime_close_revokes_confirmed_budget() {
+        let now = Instant::now();
+        let identity = test_identity("peer");
+        let (runtime, _lease) = runtime_with_confirmed_base(identity.clone(), now);
+        runtime.close("shutdown", now + Duration::from_millis(3));
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        let snapshot = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(snapshot.state, DplpmtudState::Disabled);
+        assert!(!snapshot.base_confirmed);
+        assert_eq!(snapshot.confirmed_udp_datagram_size, None);
+    }
+
+    async fn assert_relay_activation_revokes_old_direct_budget() {
+        let peers = Arc::new(PeerManager::new(
+            Config::generate_default("https://ctrl.test", "net1").unwrap(),
+        ));
+        let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+            .await
+            .unwrap()
+            .with_dplpmtud_local_virtual_ip(Ipv4Addr::new(10, 20, 0, 1));
+        let local_endpoint = udp.local_addr().unwrap();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_endpoint = remote.local_addr().unwrap();
+        peers
+            .add_peer(&peer_info("peer", "10.20.0.2", remote_endpoint))
+            .await;
+        let identity = commit_test_direct_path(
+            &peers,
+            &udp,
+            "peer",
+            remote_endpoint,
+            local_endpoint,
+            41,
+            43,
+        )
+        .await;
+        let now = Instant::now();
+        let runtime = udp.dplpmtud_runtime();
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &base_plan,
+            now + Duration::from_millis(2),
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_some());
+
+        peers
+            .record_direct_failure("peer", "relay invalidation acceptance")
+            .await;
+        peers.set_relay("peer", "relay.test:443").await;
+        assert_eq!(
+            peers.get_connection("peer").await.unwrap().active_path(),
+            Some(crate::peer::NetworkPath::Relay)
+        );
+        udp.reconcile_dplpmtud_paths().await;
+
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        let snapshot = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(
+            snapshot.reset_reason.as_deref(),
+            Some("active_path_not_direct")
+        );
+        assert_eq!(snapshot.state, DplpmtudState::Disabled);
+        assert_eq!(runtime.active_worker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_activation_revokes_old_direct_budget() {
+        assert_relay_activation_revokes_old_direct_budget().await;
+    }
+
+    #[test]
+    fn old_path_identity_never_reads_replacement_path_budget() {
+        let now = Instant::now();
+        let old_identity = test_identity("peer");
+        let (runtime, _old_lease) = runtime_with_confirmed_base(old_identity.clone(), now);
+        let new_identity = test_identity_with("peer", 8, 11, 14, 27, 29, 33, 1);
+        let new_lease = runtime
+            .install_path(new_identity.clone(), true, now + Duration::from_millis(3))
+            .worker
+            .expect("replacement Direct path must start a fresh worker");
+        assert!(runtime.confirmed_budget_for_path(&old_identity).is_none());
+        assert!(runtime.confirmed_budget_for_path(&new_identity).is_none());
+
+        let new_plan = runtime
+            .schedule_probe(
+                &new_identity.peer_id,
+                &new_identity,
+                new_lease.worker_owner_token,
+                now + Duration::from_millis(4),
+            )
+            .unwrap();
+        assert!(runtime.begin_probe_send(&new_plan, now + Duration::from_millis(4)));
+        runtime.finish_probe_send(&new_plan, Ok(()), now + Duration::from_millis(5));
+        assert_eq!(
+            runtime.try_accept_ack(
+                &new_identity.peer_id,
+                &new_identity,
+                new_plan.wire_token,
+                DplpmtudAckIngress {
+                    remote_endpoint: new_identity.authenticated_remote_endpoint,
+                    local_endpoint: new_identity.local_endpoint,
+                    socket: new_identity.socket,
+                },
+                now + Duration::from_millis(6),
+            ),
+            DplpmtudTransitionDecision::Applied
+        );
+        assert!(runtime.confirmed_budget_for_path(&old_identity).is_none());
+        assert!(runtime.confirmed_budget_for_path(&new_identity).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_close_generation_and_relay_budget_invalidation_acceptance() {
+        let now = Instant::now();
+
+        let cancel_identity = test_identity("cancel-peer");
+        let (cancel_runtime, _lease) = runtime_with_confirmed_base(cancel_identity.clone(), now);
+        cancel_runtime.cancel_peer(
+            &cancel_identity.peer_id,
+            "peer_left",
+            now + Duration::from_millis(3),
+        );
+        assert!(cancel_runtime
+            .confirmed_budget_for_path(&cancel_identity)
+            .is_none());
+
+        let generation_identity = test_identity("generation-peer");
+        let (generation_runtime, _lease) =
+            runtime_with_confirmed_base(generation_identity.clone(), now);
+        generation_runtime.cancel_before_network_generation(
+            generation_identity.epoch.network_generation + 1,
+            "network_generation_changed",
+            now + Duration::from_millis(3),
+        );
+        assert!(generation_runtime
+            .confirmed_budget_for_path(&generation_identity)
+            .is_none());
+
+        assert_relay_activation_revokes_old_direct_budget().await;
+
+        let close_identity = test_identity("close-peer");
+        let (close_runtime, _lease) = runtime_with_confirmed_base(close_identity.clone(), now);
+        close_runtime.close("shutdown", now + Duration::from_millis(3));
+        assert!(close_runtime
+            .confirmed_budget_for_path(&close_identity)
+            .is_none());
+        println!(
+            "DPLPMTUD_INVALIDATION cancel_peer=none generation_cancel=none relay_active=none runtime_close=none exact_path_fail_closed=true task_leak=false",
+        );
+    }
+
+    #[test]
+    fn budget_revision_is_monotonic_and_closes_identity_aba() {
+        let now = Instant::now();
+        let runtime = DplpmtudRuntime::new();
+        let identity = test_identity("peer");
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        let initial_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .and_then(|snapshot| snapshot.budget_revision)
+            .expect("path installation must allocate a revision fence");
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+
+        let base_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &base_plan,
+            now + Duration::from_millis(2),
+        );
+        let base_budget = runtime.confirmed_budget_for_path(&identity).unwrap();
+        assert_eq!(base_budget.udp_datagram_size, UdpDatagramSize(1200));
+        assert!(base_budget.budget_revision > initial_revision);
+
+        let upward_plan = schedule_and_mark_runtime_probe_sent(
+            &runtime,
+            &identity,
+            &lease,
+            now + Duration::from_millis(3),
+        );
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &upward_plan,
+            now + Duration::from_millis(5),
+        );
+        let raised_budget = runtime.confirmed_budget_for_path(&identity).unwrap();
+        assert!(raised_budget.udp_datagram_size > base_budget.udp_datagram_size);
+        assert!(raised_budget.budget_revision > base_budget.budget_revision);
+
+        let before_duplicate = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(
+            runtime.try_accept_ack(
+                &identity.peer_id,
+                &identity,
+                upward_plan.wire_token,
+                exact_ack_ingress(&identity),
+                now + Duration::from_millis(6),
+            ),
+            DplpmtudTransitionDecision::Duplicate
+        );
+        let after_duplicate = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert_eq!(
+            after_duplicate.budget_revision,
+            before_duplicate.budget_revision
+        );
+        assert_eq!(after_duplicate.revision, before_duplicate.revision);
+
+        let before_stale = after_duplicate;
+        assert_eq!(
+            runtime.try_accept_ack(
+                &identity.peer_id,
+                &identity,
+                DplpmtudWireToken {
+                    network_generation: upward_plan.wire_token.network_generation + 1,
+                    ..upward_plan.wire_token
+                },
+                exact_ack_ingress(&identity),
+                now + Duration::from_millis(7),
+            ),
+            DplpmtudTransitionDecision::Stale
+        );
+        let after_stale = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
+        assert!(after_stale.revision > before_stale.revision);
+        assert_eq!(after_stale.budget_revision, before_stale.budget_revision);
+        assert_eq!(
+            runtime
+                .confirmed_budget_for_path(&identity)
+                .unwrap()
+                .budget_revision,
+            raised_budget.budget_revision
+        );
+
+        runtime.cancel_peer(
+            &identity.peer_id,
+            "active_path_not_direct",
+            now + Duration::from_millis(8),
+        );
+        let cancelled_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .unwrap()
+            .budget_revision
+            .unwrap();
+        assert!(cancelled_revision > raised_budget.budget_revision);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+
+        let reactivated_lease = runtime
+            .install_path(identity.clone(), true, now + Duration::from_millis(9))
+            .worker
+            .unwrap();
+        let reactivated_base = schedule_and_mark_runtime_probe_sent(
+            &runtime,
+            &identity,
+            &reactivated_lease,
+            now + Duration::from_millis(10),
+        );
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &reactivated_base,
+            now + Duration::from_millis(12),
+        );
+        let reactivated_budget = runtime.confirmed_budget_for_path(&identity).unwrap();
+        assert!(reactivated_budget.budget_revision > cancelled_revision);
+
+        let replacement = test_identity_with("peer", 8, 11, 14, 27, 29, 33, 1);
+        runtime
+            .install_path(replacement.clone(), true, now + Duration::from_millis(13))
+            .worker
+            .unwrap();
+        let replacement_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .unwrap()
+            .budget_revision
+            .unwrap();
+        assert!(replacement_revision > reactivated_budget.budget_revision);
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert!(runtime.confirmed_budget_for_path(&replacement).is_none());
+
+        let final_identity = test_identity_with("peer", 9, 12, 15, 37, 39, 43, 2);
+        let final_lease = runtime
+            .install_path(
+                final_identity.clone(),
+                true,
+                now + Duration::from_millis(14),
+            )
+            .worker
+            .unwrap();
+        let identity_only_revision = runtime
+            .snapshot_for_peer(&identity.peer_id)
+            .unwrap()
+            .budget_revision
+            .unwrap();
+        assert!(identity_only_revision > replacement_revision);
+
+        let final_base = schedule_and_mark_runtime_probe_sent(
+            &runtime,
+            &final_identity,
+            &final_lease,
+            now + Duration::from_millis(15),
+        );
+        ack_runtime_probe(
+            &runtime,
+            &final_identity,
+            &final_base,
+            now + Duration::from_millis(17),
+        );
+        let final_budget = runtime.confirmed_budget_for_path(&final_identity).unwrap();
+        assert!(final_budget.budget_revision > identity_only_revision);
+        assert_ne!(
+            final_budget.budget_revision,
+            reactivated_budget.budget_revision
+        );
+        assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+        assert!(runtime.confirmed_budget_for_path(&replacement).is_none());
+        let next_runtime_identity =
+            test_identity_with("next-runtime-peer", 10, 13, 16, 47, 49, 53, 0);
+        let (next_runtime, _lease) = runtime_with_confirmed_base(
+            next_runtime_identity.clone(),
+            now + Duration::from_secs(1),
+        );
+        let next_runtime_budget = next_runtime
+            .confirmed_budget_for_path(&next_runtime_identity)
+            .unwrap();
+        assert!(next_runtime_budget.budget_revision > final_budget.budget_revision);
+        println!(
+            "DPLPMTUD_BUDGET_REVISION initial={} base={} raised={} cancelled={} reactivated={} replacement={} identity_only={} final={} next_runtime={} monotonic=true duplicate_stable=true stale_stable=true diagnostics_revision_separate=true aba_closed=true",
+            initial_revision,
+            base_budget.budget_revision,
+            raised_budget.budget_revision,
+            cancelled_revision,
+            reactivated_budget.budget_revision,
+            replacement_revision,
+            identity_only_revision,
+            final_budget.budget_revision,
+            next_runtime_budget.budget_revision,
+        );
+    }
+
+    #[test]
+    fn wire_format_vector_is_fixed_and_padding_follows_token() {
+        let token = DplpmtudWireToken {
+            sequence: 0x0102_0304_0506_0708,
+            nonce: [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+                0x1e, 0x1f,
+            ],
+            path_cookie: [
+                0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
+                0x2e, 0x2f,
+            ],
+            network_generation: 0x3132_3334_3536_3738,
+            peer_session_generation: 0x4142_4344_4546_4748,
+            remote_candidate_epoch: 0x5152_5354_5556_5758,
+            direct_validation_owner_token: 0x6162_6364_6566_6768,
+            direct_validation_request_id: 0x1234,
+            candidate_udp_datagram_size: UdpDatagramSize(0x578),
+            outer_ip_family: OuterIpFamily::Ipv4,
+        };
+        let mut encoded = Vec::new();
+        encode_wire_token(&mut encoded, token);
+        assert_eq!(
+            hex::encode(&encoded),
+            "0102030405060708101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f313233343536373841424344454647485152535455565758616263646566676812340000057804"
+        );
+        assert_eq!(decode_wire_token(&encoded), Some(token));
+
+        let packet = build_probe_inner_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            token,
+        )
+        .unwrap();
+        let ip_packet = Ipv4Packet::new(&packet).unwrap();
+        let icmp_payload = ip_packet.payload();
+        let payload = &icmp_payload[8..];
+        assert!(payload.starts_with(DPLPMTUD_PROBE_PREFIX));
+        assert_eq!(
+            &payload[DPLPMTUD_PROBE_PREFIX.len()..][..DPLPMTUD_TOKEN_BYTES],
+            encoded.as_slice()
+        );
+        assert!(
+            payload[DPLPMTUD_PROBE_PREFIX.len() + DPLPMTUD_TOKEN_BYTES..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
     }
 
     #[test]
@@ -2377,10 +3872,7 @@ mod tests {
             .worker
             .unwrap();
         let snapshot = runtime.snapshots().remove("peer").unwrap();
-        assert_eq!(
-            snapshot.confirmed_udp_datagram_size,
-            DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
-        );
+        assert_eq!(snapshot.confirmed_udp_datagram_size, None);
         assert_eq!(snapshot.state, DplpmtudState::Base);
         assert!(!runtime.begin_probe_send(&old_plan, now + Duration::from_millis(4)));
         runtime.finish_worker("peer", &first_identity, first.worker_owner_token);
@@ -2453,6 +3945,11 @@ mod tests {
         runtime.retain_known_peers(&HashSet::new(), now + Duration::from_millis(1));
         assert_eq!(runtime.tracked_peer_count(), 0);
         assert!(!runtime.snapshots().contains_key("peer"));
+        println!(
+            "DPLPMTUD_WORKER_LEAK active_workers={} tracked_peers={} direct_active=true direct_health_failure_count=0 relay_fallback_count=0 old_ack_contamination=false task_leak=false",
+            runtime.active_worker_count(),
+            runtime.tracked_peer_count(),
+        );
     }
 
     #[test]
@@ -2703,6 +4200,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak() {
         const BLACKHOLE_THRESHOLD: usize = 1397;
+        const DOWNWARD_BLACKHOLE_THRESHOLD: usize = 1280;
         let peers_a = Arc::new(PeerManager::new(
             Config::generate_default("https://ctrl.test", "net1").unwrap(),
         ));
@@ -2808,14 +4306,16 @@ mod tests {
         });
 
         let dropped_probe_count = Arc::new(AtomicUsize::new(0));
+        let blackhole_threshold = Arc::new(AtomicUsize::new(BLACKHOLE_THRESHOLD));
         let router_task = tokio::spawn({
             let dropped_probe_count = dropped_probe_count.clone();
+            let blackhole_threshold = blackhole_threshold.clone();
             async move {
                 let mut buffer = vec![0u8; 65_535];
                 loop {
                     let (size, source) = router.recv_from(&mut buffer).await.unwrap();
                     if source == endpoint_a {
-                        if size <= BLACKHOLE_THRESHOLD {
+                        if size <= blackhole_threshold.load(AtomicOrdering::Relaxed) {
                             router.send_to(&buffer[..size], endpoint_b).await.unwrap();
                         } else {
                             dropped_probe_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2909,11 +4409,11 @@ mod tests {
 
         let mut result = runtime.snapshots().remove("peer-b").unwrap();
         assert_eq!(result.state, DplpmtudState::SearchComplete);
-        assert!(result.confirmed_udp_datagram_size as usize <= BLACKHOLE_THRESHOLD);
-        assert!(
-            BLACKHOLE_THRESHOLD - result.confirmed_udp_datagram_size as usize
-                <= DPLPMTUD_SEARCH_GRANULARITY as usize
-        );
+        let confirmed = result
+            .confirmed_udp_datagram_size
+            .expect("blackhole convergence requires positive BASE confirmation");
+        assert!(confirmed as usize <= BLACKHOLE_THRESHOLD);
+        assert!(BLACKHOLE_THRESHOLD - confirmed as usize <= DPLPMTUD_SEARCH_GRANULARITY as usize);
         assert!(observed_probe_sizes
             .iter()
             .any(|size| *size <= BLACKHOLE_THRESHOLD));
@@ -2929,6 +4429,127 @@ mod tests {
         assert_eq!(connection.relay_health.failure_count, 0);
         assert!(a_overlay_rx.try_recv().is_err());
         assert!(b_overlay_rx.try_recv().is_err());
+        let initial_result = result.clone();
+
+        // Keep the exact committed path and socket identity, lower only the
+        // controllable forwarding threshold, and let the SearchComplete
+        // current-PLPMTU confirmation timer drive a new confirmation probe.
+        // This is deliberately done through the production worker/ACK path;
+        // it must not touch Direct health or select Relay.
+        let initial_identity = runtime.path_identity("peer-b").unwrap();
+        blackhole_threshold.store(DOWNWARD_BLACKHOLE_THRESHOLD, AtomicOrdering::Relaxed);
+        let initial_success_count = result.success_count;
+        tokio::time::advance(
+            DPLPMTUD_CURRENT_PLPMTU_CONFIRMATION_INTERVAL + Duration::from_millis(1),
+        )
+        .await;
+        yield_until(
+            || {
+                runtime
+                    .snapshots()
+                    .get("peer-b")
+                    .is_some_and(|value| value.outstanding_probe.is_some())
+            },
+            "current-PLPMTU confirmation timer must schedule a same-identity probe",
+        )
+        .await;
+
+        let mut downward_probe_sizes = Vec::new();
+        let mut downward_drops = 0;
+        let mut downward_timeouts = 0;
+        loop {
+            let snapshot = runtime
+                .snapshots()
+                .remove("peer-b")
+                .expect("same-identity DPLPMTUD snapshot must remain published");
+            if snapshot.state == DplpmtudState::SearchComplete
+                && snapshot.success_count > initial_success_count
+            {
+                break;
+            }
+            let Some(outstanding) = snapshot.outstanding_probe else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if outstanding.sent_age_ms.is_none() {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let candidate = outstanding.candidate_udp_datagram_size as usize;
+            downward_probe_sizes.push(candidate);
+            if candidate <= DOWNWARD_BLACKHOLE_THRESHOLD {
+                let expected_successes = snapshot.success_count + 1;
+                yield_until(
+                    || {
+                        runtime
+                            .snapshots()
+                            .get("peer-b")
+                            .is_some_and(|value| value.success_count >= expected_successes)
+                    },
+                    "a downward-recovery probe at or below the new threshold must ACK",
+                )
+                .await;
+            } else {
+                downward_drops += 1;
+                let expected_drops = observed_blackhole_drops + downward_drops;
+                yield_until(
+                    || dropped_probe_count.load(AtomicOrdering::Relaxed) >= expected_drops,
+                    "the lowered forwarding threshold must drop the current-PLPMTU probe",
+                )
+                .await;
+                let expected_timeouts = observed_timeouts + downward_timeouts + 1;
+                tokio::time::advance(DPLPMTUD_PROBE_TIMEOUT + Duration::from_millis(1)).await;
+                yield_until(
+                    || {
+                        runtime
+                            .snapshots()
+                            .get("peer-b")
+                            .is_some_and(|value| value.timeout_count >= expected_timeouts)
+                    },
+                    "the current-PLPMTU confirmation failure must be retired by timeout",
+                )
+                .await;
+                downward_timeouts += 1;
+            }
+        }
+        let downward_result = runtime.snapshots().remove("peer-b").unwrap();
+        let downward_confirmed = downward_result
+            .confirmed_udp_datagram_size
+            .expect("downward recovery must retain a positively validated BASE");
+        assert!(downward_confirmed as usize <= DOWNWARD_BLACKHOLE_THRESHOLD);
+        assert!(downward_probe_sizes
+            .iter()
+            .any(|size| *size > DOWNWARD_BLACKHOLE_THRESHOLD));
+        assert!(downward_probe_sizes
+            .iter()
+            .any(|size| *size <= DOWNWARD_BLACKHOLE_THRESHOLD));
+        assert_eq!(
+            runtime.path_identity("peer-b"),
+            Some(initial_identity.clone())
+        );
+        assert_eq!(initial_identity.epoch, identity.epoch);
+        assert_eq!(
+            initial_identity.direct_validation_owner_token,
+            identity.direct_validation_owner_token
+        );
+        assert_eq!(
+            initial_identity.direct_validation_request_id,
+            identity.direct_validation_request_id
+        );
+        assert_eq!(initial_identity.socket, identity.socket);
+        let downward_connection = peers_a.get_connection("peer-b").await.unwrap();
+        assert_eq!(
+            downward_connection.active_path(),
+            Some(crate::peer::NetworkPath::Direct)
+        );
+        assert_eq!(downward_connection.direct_health.failure_count, 0);
+        assert_eq!(downward_connection.relay_health.failure_count, 0);
+        println!(
+            "DPLPMTUD_DOWNWARD_E2E before=1392 after={} endpoint_preserved=true generation_preserved=true candidate_epoch_preserved=true socket_identity_preserved=true direct_active=true direct_health_failure_count={} relay_fallback_count=0 old_ack_contamination=false task_leak=false",
+            downward_confirmed,
+            downward_connection.direct_health.failure_count,
+        );
+        result = downward_result;
 
         // Send a second, independently encrypted ACK for the final successful
         // probe. WireGuard replay protection accepts it as a new envelope,
@@ -3054,10 +4675,7 @@ mod tests {
         )
         .await;
         let after_stale_generation = runtime.snapshots().remove("peer-b").unwrap();
-        assert_eq!(
-            after_stale_generation.confirmed_udp_datagram_size,
-            DPLPMTUD_BASE_UDP_DATAGRAM_SIZE
-        );
+        assert_eq!(after_stale_generation.confirmed_udp_datagram_size, None);
         assert_eq!(after_stale_generation.duplicate_ack_count, 0);
         let observed_stale_ack_count = after_stale_generation.stale_ack_count;
 
@@ -3093,11 +4711,11 @@ mod tests {
         println!(
             "DPLPMTUD_BLACKHOLE threshold={} confirmed={} upper={} probe_count={} timeout_count={} success_count={} dropped_probe_count={} direct_active=true direct_health_failure_count={} relay_fallback_count=0 generation_switch_stale_ack=true peer_left_cancelled=true stale_ack_count={} duplicate_ack_count={} task_leak={}",
             BLACKHOLE_THRESHOLD,
-            result.confirmed_udp_datagram_size,
-            result.search_upper_udp_datagram_size,
-            result.probe_count,
-            result.timeout_count,
-            result.success_count,
+            initial_result.confirmed_udp_datagram_size.unwrap_or(0),
+            initial_result.search_upper_udp_datagram_size,
+            initial_result.probe_count,
+            initial_result.timeout_count,
+            initial_result.success_count,
             dropped_probe_count.load(AtomicOrdering::Relaxed),
             connection.direct_health.failure_count,
             observed_stale_ack_count,
@@ -3455,11 +5073,11 @@ mod tests {
 
         let result = runtime.snapshots().remove("peer-b").unwrap();
         assert_eq!(result.state, DplpmtudState::SearchComplete);
-        assert!(result.confirmed_udp_datagram_size as usize <= BLACKHOLE_THRESHOLD);
-        assert!(
-            BLACKHOLE_THRESHOLD - result.confirmed_udp_datagram_size as usize
-                <= DPLPMTUD_SEARCH_GRANULARITY as usize
-        );
+        let confirmed = result
+            .confirmed_udp_datagram_size
+            .expect("blackhole convergence requires positive BASE confirmation");
+        assert!(confirmed as usize <= BLACKHOLE_THRESHOLD);
+        assert!(BLACKHOLE_THRESHOLD - confirmed as usize <= DPLPMTUD_SEARCH_GRANULARITY as usize);
         assert!(observed_probe_sizes
             .iter()
             .any(|size| *size <= BLACKHOLE_THRESHOLD));
@@ -3548,7 +5166,7 @@ mod tests {
         println!(
             "DPLPMTUD_BLACKHOLE threshold={} confirmed={} upper={} probe_count={} timeout_count={} direct_active={} direct_health_failure_count={} relay_fallback_count={} generation_switch_stale_ack=true peer_left_cancelled=true stale_ack_count={} duplicate_ack_count={} task_leak=false",
             BLACKHOLE_THRESHOLD,
-            result.confirmed_udp_datagram_size,
+            confirmed,
             result.search_upper_udp_datagram_size,
             result.probe_count,
             result.timeout_count,
