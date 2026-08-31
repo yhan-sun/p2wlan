@@ -88,7 +88,6 @@ impl Daemon {
         }
         if !self
             .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
-            .await
         {
             self.timeline.emit(
                 "peer_answer_rejected",

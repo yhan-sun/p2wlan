@@ -1483,6 +1483,75 @@ fn cancelled_responder_owner_cannot_consume_a_new_offer() {
 }
 
 #[test]
+fn candidate_offer_work_is_newest_wins_owner_scoped_and_capacity_bounded() {
+    fn offer(peer_id: &str, generation: u64) -> PendingPeerOffer {
+        PendingPeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec![format!("198.51.100.10:{}", 41_000 + generation)],
+            candidate_sources: HashMap::new(),
+            candidate_generation: generation,
+            network_generation: 0,
+            peer_session_generation: None,
+            candidates_expires_at_ms: None,
+            sender_public_key: Some("candidate-owner-key".to_string()),
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            delivery_receipt: None,
+        }
+    }
+
+    let mut state = PendingHandshakeState::default();
+    let CandidateOfferWorkAdmission::Started(reservation, first) =
+        state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 1))
+    else {
+        panic!("first candidate payload must acquire an owner");
+    };
+    assert!(matches!(
+        state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 2)),
+        CandidateOfferWorkAdmission::Coalesced,
+    ));
+    assert!(matches!(
+        state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 3)),
+        CandidateOfferWorkAdmission::Coalesced,
+    ));
+    assert_eq!(first.candidate_generation, 1);
+    let newest = state
+        .take_queued_candidate_offer_work("peer-candidate-owner", reservation.owner)
+        .expect("one newest-wins successor must be retained");
+    assert_eq!(newest.candidate_generation, 3);
+    assert!(state
+        .finish_candidate_offer_work("peer-candidate-owner", reservation.owner)
+        .is_none());
+
+    state.clear_peer("peer-candidate-owner");
+    let CandidateOfferWorkAdmission::Started(replacement, _) =
+        state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 4))
+    else {
+        panic!("a cleared lifecycle must admit a replacement owner");
+    };
+    assert_ne!(replacement.owner, reservation.owner);
+
+    let mut full = PendingHandshakeState::default();
+    for index in 0..MAX_CANDIDATE_OFFER_WORKERS {
+        assert!(matches!(
+            full.enqueue_candidate_offer_work(offer(&format!("peer-capacity-{index}"), 1)),
+            CandidateOfferWorkAdmission::Started(_, _),
+        ));
+    }
+    assert!(matches!(
+        full.enqueue_candidate_offer_work(offer("peer-over-capacity", 1)),
+        CandidateOfferWorkAdmission::Capacity,
+    ));
+    assert_eq!(
+        full.candidate_offer_workers.len(),
+        MAX_CANDIDATE_OFFER_WORKERS
+    );
+}
+
+#[test]
 fn peer_reflexive_work_is_newest_wins_and_owner_scoped() {
     fn observation(peer_id: &str, endpoint: &str) -> PendingPeerReflexive {
         PendingPeerReflexive {
@@ -1543,11 +1612,13 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
         probe_ephemeral_public_key: None,
         delivery_receipt: None,
     };
-    let (reservation, offer) = daemon
+    let CandidateOfferWorkAdmission::Started(reservation, offer) = daemon
         .pending_handshakes
         .lock()
-        .enqueue_responder_work(offer)
-        .expect("unknown offer must acquire one deferred owner");
+        .enqueue_candidate_offer_work(offer)
+    else {
+        panic!("unknown offer must acquire one deferred candidate owner");
+    };
 
     let join = async {
         sleep(Duration::from_millis(25)).await;
@@ -1568,7 +1639,7 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
             .await;
     };
     tokio::join!(
-        daemon.run_deferred_peer_offer_worker(offer, reservation),
+        daemon.run_candidate_offer_worker(*offer, reservation),
         join
     );
 
@@ -1580,7 +1651,7 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
     assert!(!daemon
         .pending_handshakes
         .lock()
-        .responder_workers
+        .candidate_offer_workers
         .contains_key(peer_id));
 }
 
@@ -2020,6 +2091,304 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
         .await
         .expect("control event loop did not stop")
         .expect("control event loop task panicked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_offer() {
+    fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
+        0x4000_0000_0000_0000 | (incarnation << 21) | counter
+    }
+
+    let mut control_capture = start_handshake_control_capture().await;
+    let mut config =
+        Config::generate_default(&control_capture.base_url, "candidate-hol-responder").unwrap();
+    config.control.auth_token = "candidate-hol-responder-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    let daemon = Daemon::new(config);
+    timeout(Duration::from_secs(2), control_capture.wait_registered())
+        .await
+        .expect("daemon registration must complete before the HOL regression");
+
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let remote_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "peer-candidate-hol-responder";
+    let peer_info = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        public_key: hex::encode(remote_identity.public_key()),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    let mut remote_initiator =
+        HandshakeInitiator::new(remote_identity.clone(), local_public, None);
+    let initiation = remote_initiator.create_initiation().unwrap().to_bytes();
+    let session_id = "candidate-hol-responder-session".to_string();
+    let probe_public_key = hex::encode(DhKeyPair::generate().public_key());
+
+    daemon.relay_available_tx.send_replace(true);
+    let control = daemon.control.clone();
+    let peers = daemon.peers.clone();
+    let pending = daemon.pending_handshakes.clone();
+    let transport = daemon.transport.clone();
+    let shutdown = daemon.shutdown_sender();
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let loop_start = start.clone();
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        loop_start.wait().await;
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+    start.wait().await;
+
+    control
+        .event_sender()
+        .send(ControlEvent::PeerJoined(peer_info))
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        while !peers.peer_exists_sync(peer_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer lifecycle must be published before the contention edge");
+
+    // A read guard makes candidate mutation need the connection writer. The
+    // candidate owner must use try-write, retain the exact payload locally,
+    // and ACK its durable row without joining Tokio's fair writer queue.
+    let connection_reader = peers.hold_connections_reader_for_test().await;
+    let candidate_receipt = control::SignalDeliveryReceipt::pending();
+    control
+        .event_sender()
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: "candidate-before-handshake".to_string(),
+            signal_seq: Some(1),
+            event: Box::new(ControlEvent::PeerOffer {
+                from_node_id: peer_id.to_string(),
+                candidates: vec!["198.51.100.80:48000".to_string()],
+                session_id: None,
+                probe_ephemeral_public_key: None,
+                candidate_sources: HashMap::from([(
+                    "198.51.100.80:48000".to_string(),
+                    "stun".to_string(),
+                )]),
+                candidate_generation: encoded_generation(733, 1),
+                candidates_expires_at_ms: None,
+                handshake_init: Vec::new(),
+                punch_at_ms: None,
+                punch_at_server_ms: None,
+                sender_public_key: Some(hex::encode(remote_identity.public_key())),
+            }),
+            receipt: candidate_receipt.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), candidate_receipt.wait())
+            .await
+            .expect("candidate enqueue must commit while the reader is held"),
+        control::SignalApplyOutcome::Applied
+    );
+    assert!(
+        peers.connection_map_for_test().try_read().is_ok(),
+        "candidate admission queued a connection writer behind the held reader"
+    );
+
+    let responder_receipt = control::SignalDeliveryReceipt::pending();
+    control
+        .event_sender()
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: "handshake-after-candidate".to_string(),
+            signal_seq: Some(2),
+            event: Box::new(ControlEvent::PeerOffer {
+                from_node_id: peer_id.to_string(),
+                candidates: vec!["198.51.100.80:48000".to_string()],
+                session_id: Some(session_id),
+                probe_ephemeral_public_key: Some(probe_public_key),
+                candidate_sources: HashMap::from([(
+                    "198.51.100.80:48000".to_string(),
+                    "stun".to_string(),
+                )]),
+                candidate_generation: encoded_generation(733, 2),
+                candidates_expires_at_ms: None,
+                handshake_init: initiation,
+                punch_at_ms: None,
+                punch_at_server_ms: None,
+                sender_public_key: Some(hex::encode(remote_identity.public_key())),
+            }),
+            receipt: responder_receipt.clone(),
+        })
+        .unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        while !pending.lock().responder_workers.contains_key(peer_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("handshake must enter its independent responder owner");
+    assert_eq!(
+        responder_receipt.current(),
+        control::SignalApplyOutcome::Pending,
+        "the handshake receipt must remain exact until responder commit"
+    );
+
+    // A following marker proves the serial actor is still consuming events
+    // while both bounded workers observe connection contention.
+    let marker_receipt = control::SignalDeliveryReceipt::pending();
+    control
+        .event_sender()
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: "post-handshake-marker".to_string(),
+            signal_seq: Some(3),
+            event: Box::new(ControlEvent::ServerError {
+                code: 4999,
+                message: "candidate HOL regression marker".to_string(),
+            }),
+            receipt: marker_receipt.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(1), marker_receipt.wait())
+            .await
+            .expect("serial actor stopped behind candidate/responder contention"),
+        control::SignalApplyOutcome::Applied
+    );
+
+    drop(connection_reader);
+    assert_eq!(
+        timeout(Duration::from_secs(2), responder_receipt.wait())
+            .await
+            .expect("responder did not commit after connection contention cleared"),
+        control::SignalApplyOutcome::Applied
+    );
+    timeout(Duration::from_secs(1), control_capture.wait_for_signal_count(1))
+        .await
+        .expect("mock control did not receive the responder Answer");
+    assert_eq!(
+        control_capture
+            .signal_bodies()
+            .iter()
+            .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .filter(|body| {
+                body.get("type").and_then(serde_json::Value::as_str) == Some("peer_answer")
+            })
+            .count(),
+        1,
+        "candidate contention may produce only one exact Answer"
+    );
+    assert!(transport.has_session(peer_id).await);
+
+    let _ = shutdown.send(true);
+    timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+    control_capture.stop().await;
+}
+
+#[tokio::test]
+async fn remote_incarnation_cleanup_fence_prevents_no_reset_race() {
+    fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
+        0x4000_0000_0000_0000 | (incarnation << 21) | counter
+    }
+
+    let config = Config::generate_default("http://127.0.0.1:1", "reset-fence").unwrap();
+    let daemon = Daemon::new(config);
+    let remote_identity = NodeIdentity::generate();
+    let peer_id = "peer-reset-fence";
+    let peer_info = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        public_key: hex::encode(remote_identity.public_key()),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    daemon.peers.add_peer(&peer_info).await;
+
+    let first = encoded_generation(8_000, 1);
+    assert_eq!(
+        daemon
+            .peers
+            .try_claim_remote_candidate_incarnation_for_identity(
+                peer_id,
+                first,
+                Some(&peer_info.public_key),
+            ),
+        crate::peer::RemoteCandidateIncarnationTryClaim::Committed(
+            crate::peer::RemoteCandidateIncarnationClaim::NoReset,
+        )
+    );
+    let restart = encoded_generation(8_001, 1);
+    let (old_incarnation, claimed_incarnation) = match daemon
+        .peers
+        .try_claim_remote_candidate_incarnation_for_identity(
+            peer_id,
+            restart,
+            Some(&peer_info.public_key),
+        ) {
+        crate::peer::RemoteCandidateIncarnationTryClaim::Committed(
+            crate::peer::RemoteCandidateIncarnationClaim::Reset {
+                old_incarnation,
+                new_incarnation,
+            },
+        ) => (old_incarnation, new_incarnation),
+        outcome => panic!("restart claim was not admitted: {outcome:?}"),
+    };
+    assert!(
+        daemon
+            .pending_handshakes
+            .lock()
+            .begin_remote_incarnation_reset(peer_id, claimed_incarnation)
+    );
+
+    assert_eq!(
+        daemon
+            .reset_peer_for_remote_incarnation_if_needed_for_identity(
+                peer_id,
+                restart,
+                Some(&peer_info.public_key),
+                RemoteIncarnationResetWork::PreserveResponder,
+            )
+            .await,
+        RemoteIncarnationResetOutcome::PendingCleanup,
+        "a parallel worker must not mistake a claimed high-water for committed cleanup",
+    );
+
+    assert!(
+        daemon
+            .peers
+            .finish_claimed_remote_incarnation_reset(
+                peer_id,
+                old_incarnation,
+                claimed_incarnation,
+                "test_reset_fence",
+            )
+            .await
+    );
+    daemon
+        .pending_handshakes
+        .lock()
+        .finish_remote_incarnation_reset(peer_id, claimed_incarnation);
+    assert_eq!(
+        daemon
+            .reset_peer_for_remote_incarnation_if_needed_for_identity(
+                peer_id,
+                restart,
+                Some(&peer_info.public_key),
+                RemoteIncarnationResetWork::PreserveResponder,
+            )
+            .await,
+        RemoteIncarnationResetOutcome::Unchanged,
+        "NoReset is admissible only after the claimed cleanup commits",
+    );
 }
 
 #[tokio::test]
@@ -7828,15 +8197,17 @@ async fn stale_sender_deferred_offer_releases_owner_without_mutating_peer() {
         probe_ephemeral_public_key: None,
         delivery_receipt: None,
     };
-    let (reservation, offer) = daemon
+    let CandidateOfferWorkAdmission::Started(reservation, offer) = daemon
         .pending_handshakes
         .lock()
-        .enqueue_responder_work(offer)
-        .expect("the deferred offer must acquire an owner");
+        .enqueue_candidate_offer_work(offer)
+    else {
+        panic!("the deferred offer must acquire a candidate owner");
+    };
 
     timeout(
         Duration::from_secs(1),
-        daemon.run_deferred_peer_offer_worker(offer, reservation),
+        daemon.run_candidate_offer_worker(*offer, reservation),
     )
     .await
     .expect("the stale deferred owner must finish instead of wedging the lane");
@@ -7857,7 +8228,7 @@ async fn stale_sender_deferred_offer_releases_owner_without_mutating_peer() {
     );
     let pending = daemon.pending_handshakes.lock();
     assert!(pending.pending.contains_key(peer_id));
-    assert!(!pending.responder_workers.contains_key(peer_id));
+    assert!(!pending.candidate_offer_workers.contains_key(peer_id));
 }
 
 #[tokio::test]

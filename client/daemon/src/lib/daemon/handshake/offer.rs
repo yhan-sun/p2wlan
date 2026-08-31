@@ -34,9 +34,10 @@ impl Daemon {
     }
 
     /// Acquire the responder's short mutation turn with both cancellation and
-    /// a hard lock-wait bound.  A control signal is already acknowledged when
-    /// it enters the responder worker, so an unbounded arbiter wait would turn
-    /// one stale initiator/lifecycle task into a permanent session blackout.
+    /// a hard lock-wait bound. The responder worker retains the exact durable
+    /// receipt, so an unbounded arbiter wait would head-of-line block every
+    /// later signal from this sender and turn one stale lifecycle task into a
+    /// permanent session blackout.
     async fn acquire_responder_handshake_guard(
         &self,
         from_node_id: &str,
@@ -253,13 +254,11 @@ impl Daemon {
                 return Ok(());
             }
         }
-        // Identity lookup may wait behind control/connection state. Never hold
-        // the per-peer arbiter across it: this responder future is cooperatively
-        // polled by the serial control loop, whose lifecycle branch may itself
-        // be waiting to acquire the same arbiter.
+        // Identity comes from the synchronous lifecycle mirror, so this
+        // admission check cannot queue behind control or connection state.
+        // The per-peer arbiter still remains a short mutation turn only.
         if !self
             .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
-            .await
         {
             self.timeline.emit(
                 "peer_offer_rejected",
@@ -330,20 +329,7 @@ impl Daemon {
         // rule on inbound offers prevents crossing rekeys from staging a
         // second responder transaction after this node already claimed the
         // initiator side.
-        let known_peer_public_key = self
-            .control
-            .peers()
-            .await
-            .get(from_node_id)
-            .map(|peer| peer.public_key.clone());
-        let known_peer_public_key = match known_peer_public_key {
-            Some(public_key) => Some(public_key),
-            None => self
-                .peers
-                .get_connection(from_node_id)
-                .await
-                .map(|peer| peer.public_key),
-        };
+        let known_peer_public_key = self.peers.peer_identity_public_key_sync(from_node_id);
         let expected_peer_public = known_peer_public_key
             .as_deref()
             .map(|public_key| decode_x25519_key(public_key, "peer public key"))

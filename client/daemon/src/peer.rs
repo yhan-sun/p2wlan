@@ -412,11 +412,23 @@ pub enum CandidateSetApplyResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteCandidateIncarnationClaim {
     IdentityMismatch,
+    RejectedLifecycle,
     NoReset,
     Reset {
         old_incarnation: u64,
         new_incarnation: u64,
     },
+}
+
+/// Non-queuing form of the remote-incarnation preflight used by inbound
+/// control workers.  Contention is explicit: callers retain their bounded
+/// owner and retry instead of joining the fair connection-writer queue and
+/// blocking later handshake signals behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteCandidateIncarnationTryClaim {
+    Committed(RemoteCandidateIncarnationClaim),
+    ContendedEpoch,
+    ContendedConnections,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

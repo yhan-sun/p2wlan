@@ -204,6 +204,36 @@ fn same_responder_sender_identity(left: Option<&str>, right: Option<&str>) -> bo
     }
 }
 
+/// Owner token for one independently polled candidate-offer worker.
+///
+/// Candidate application may wait on the network epoch, the connection map,
+/// STUN or UDP actors.  It therefore has a separate owner from the responder
+/// transaction: a candidate-only signal can never occupy the peer's
+/// latency-critical WireGuard responder slot.
+struct CandidateOfferWorkReservation {
+    owner: u64,
+    cancellation: tokio::sync::watch::Receiver<bool>,
+}
+
+struct CandidateOfferWorkOwner {
+    owner: u64,
+    cancellation: tokio::sync::watch::Sender<bool>,
+    active_sender_public_key: Option<String>,
+    queued: Option<PendingPeerOffer>,
+}
+
+enum CandidateOfferWorkAdmission {
+    Started(CandidateOfferWorkReservation, Box<PendingPeerOffer>),
+    Coalesced,
+    RejectedIdentity,
+    Capacity,
+}
+
+/// A corrupt or hostile control stream must not turn the per-peer candidate
+/// ledger into an unbounded process allocation.  The active value plus one
+/// newest-wins queued value per admitted peer are the complete retained set.
+const MAX_CANDIDATE_OFFER_WORKERS: usize = 1024;
+
 /// Owner token for the one peer-reflexive worker admitted for a peer.
 struct PeerReflexiveWorkReservation {
     owner: u64,
@@ -282,6 +312,15 @@ struct PendingHandshakeState {
     /// a peer. Later offers coalesce into a single newest-wins queue slot.
     responder_workers: HashMap<String, ResponderWorkOwner>,
     next_responder_worker_id: u64,
+    /// Candidate application is intentionally disjoint from responder work.
+    /// Each peer owns at most one active and one newest-wins queued value.
+    candidate_offer_workers: HashMap<String, CandidateOfferWorkOwner>,
+    next_candidate_offer_worker_id: u64,
+    /// A claimed remote incarnation is not current until its old transport
+    /// cleanup and peer-session rotation commit. Candidate and responder
+    /// owners consult this one-entry-per-peer fence before interpreting the
+    /// synchronous incarnation high-water as `NoReset`.
+    remote_incarnation_resets: HashMap<String, u64>,
     /// Exactly one slow peer-reflexive worker may wait on candidate refresh
     /// or HTTP for a peer. Later observations replace its one queued value.
     peer_reflexive_workers: HashMap<String, PeerReflexiveWorkOwner>,
@@ -921,6 +960,9 @@ impl PendingHandshakeState {
             }
             worker.cancellation.send_replace(true);
         }
+        if let Some(worker) = self.candidate_offer_workers.remove(peer_id) {
+            worker.cancellation.send_replace(true);
+        }
         if let Some(worker) = self.peer_reflexive_workers.remove(peer_id) {
             if let Some(queued) = worker.queued.as_ref() {
                 queued.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
@@ -939,6 +981,9 @@ impl PendingHandshakeState {
             if let Some(queued) = worker.queued.as_ref() {
                 queued.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
             }
+            worker.cancellation.send_replace(true);
+        }
+        if let Some(worker) = self.candidate_offer_workers.remove(peer_id) {
             worker.cancellation.send_replace(true);
         }
         if let Some(worker) = self.peer_reflexive_workers.remove(peer_id) {
@@ -1166,6 +1211,127 @@ impl PendingHandshakeState {
         self.responder_workers
             .get(peer_id)
             .is_some_and(|worker| worker.owner == owner && !*worker.cancellation.borrow())
+    }
+
+    /// Retain one bounded candidate transaction per peer, with one
+    /// newest-wins successor.  The durable signal receipt is deliberately not
+    /// stored here: admission itself is the application commit, after which
+    /// this owner is responsible for transient retries.
+    fn enqueue_candidate_offer_work(
+        &mut self,
+        offer: PendingPeerOffer,
+    ) -> CandidateOfferWorkAdmission {
+        debug_assert!(offer.delivery_receipt.is_none());
+        let cancelled = self
+            .candidate_offer_workers
+            .get(&offer.from_node_id)
+            .is_some_and(|worker| *worker.cancellation.borrow());
+        if cancelled {
+            self.candidate_offer_workers.remove(&offer.from_node_id);
+        }
+        if let Some(worker) = self.candidate_offer_workers.get_mut(&offer.from_node_id) {
+            let incoming_matches_active = same_responder_sender_identity(
+                worker.active_sender_public_key.as_deref(),
+                offer.sender_public_key.as_deref(),
+            );
+            let queued_has_different_identity = worker.queued.as_ref().is_some_and(|queued| {
+                !same_responder_sender_identity(
+                    queued.sender_public_key.as_deref(),
+                    offer.sender_public_key.as_deref(),
+                )
+            });
+            if incoming_matches_active && queued_has_different_identity {
+                return CandidateOfferWorkAdmission::RejectedIdentity;
+            }
+            worker.queued = Some(offer);
+            return CandidateOfferWorkAdmission::Coalesced;
+        }
+        if self.candidate_offer_workers.len() >= MAX_CANDIDATE_OFFER_WORKERS {
+            return CandidateOfferWorkAdmission::Capacity;
+        }
+
+        self.next_candidate_offer_worker_id =
+            self.next_candidate_offer_worker_id.saturating_add(1);
+        let owner = self.next_candidate_offer_worker_id;
+        let peer_id = offer.from_node_id.clone();
+        let active_sender_public_key = offer.sender_public_key.clone();
+        let (cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
+        self.candidate_offer_workers.insert(
+            peer_id,
+            CandidateOfferWorkOwner {
+                owner,
+                cancellation: cancellation_tx,
+                active_sender_public_key,
+                queued: None,
+            },
+        );
+        CandidateOfferWorkAdmission::Started(
+            CandidateOfferWorkReservation {
+                owner,
+                cancellation,
+            },
+            Box::new(offer),
+        )
+    }
+
+    fn finish_candidate_offer_work(
+        &mut self,
+        peer_id: &str,
+        owner: u64,
+    ) -> Option<PendingPeerOffer> {
+        let worker = self.candidate_offer_workers.get_mut(peer_id)?;
+        if worker.owner != owner || *worker.cancellation.borrow() {
+            return None;
+        }
+        if let Some(next) = worker.queued.take() {
+            worker.active_sender_public_key = next.sender_public_key.clone();
+            return Some(next);
+        }
+        self.candidate_offer_workers.remove(peer_id);
+        None
+    }
+
+    fn take_queued_candidate_offer_work(
+        &mut self,
+        peer_id: &str,
+        owner: u64,
+    ) -> Option<PendingPeerOffer> {
+        let worker = self.candidate_offer_workers.get_mut(peer_id)?;
+        if worker.owner != owner || *worker.cancellation.borrow() {
+            return None;
+        }
+        let next = worker.queued.take()?;
+        worker.active_sender_public_key = next.sender_public_key.clone();
+        Some(next)
+    }
+
+    fn candidate_offer_work_is_current(&self, peer_id: &str, owner: u64) -> bool {
+        self.candidate_offer_workers
+            .get(peer_id)
+            .is_some_and(|worker| worker.owner == owner && !*worker.cancellation.borrow())
+    }
+
+    fn remote_incarnation_reset_in_progress(&self, peer_id: &str) -> Option<u64> {
+        self.remote_incarnation_resets.get(peer_id).copied()
+    }
+
+    fn begin_remote_incarnation_reset(&mut self, peer_id: &str, incarnation: u64) -> bool {
+        if self.remote_incarnation_resets.contains_key(peer_id) {
+            return false;
+        }
+        self.remote_incarnation_resets
+            .insert(peer_id.to_string(), incarnation);
+        true
+    }
+
+    fn finish_remote_incarnation_reset(&mut self, peer_id: &str, incarnation: u64) {
+        if self
+            .remote_incarnation_resets
+            .get(peer_id)
+            .is_some_and(|pending| *pending == incarnation)
+        {
+            self.remote_incarnation_resets.remove(peer_id);
+        }
     }
 
     /// Coalesce slow peer-reflexive work to one active worker per peer.
