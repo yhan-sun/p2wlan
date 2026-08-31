@@ -2160,6 +2160,220 @@ async fn blocking_candidate_apply_releases_epoch_before_waiting_for_writer_turn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_incarnation_claim_and_finish_never_queue_writer_with_epoch() {
+    fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
+        0x4000_0000_0000_0000 | (incarnation << 21) | counter
+    }
+
+    let config = Config::generate_default("http://127.0.0.1:1", "incarnation-lock-order")
+        .unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-incarnation-lock-order";
+    let peer_identity = NodeIdentity::generate();
+    let sender_public_key = hex::encode(peer_identity.public_key());
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: sender_public_key.clone(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+
+    let peers = daemon.peers.clone();
+    let reader = peers.connection_map_for_test().read_owned().await;
+    let claim_start = Arc::new(tokio::sync::Barrier::new(2));
+    let worker_start = claim_start.clone();
+    let worker_peers = peers.clone();
+    let claim = tokio::spawn(async move {
+        worker_start.wait().await;
+        worker_peers
+            .claim_remote_candidate_incarnation_for_identity(
+                peer_id,
+                encoded_generation(9_000, 1),
+                Some(&sender_public_key),
+            )
+            .await
+    });
+    claim_start.wait().await;
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers.connection_map_for_test().try_read().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("remote-incarnation claim never entered the fair writer queue");
+    assert!(
+        peers.network_epoch_gate().try_lock().is_ok(),
+        "remote-incarnation claim queued the writer while retaining the epoch"
+    );
+    drop(reader);
+    assert_eq!(
+        timeout(Duration::from_secs(1), claim)
+            .await
+            .expect("remote-incarnation claim did not finish after reader release")
+            .expect("remote-incarnation claim task panicked"),
+        crate::peer::RemoteCandidateIncarnationClaim::NoReset
+    );
+
+    let (old_incarnation, claimed_incarnation) = match peers
+        .claim_remote_candidate_incarnation_for_identity(
+            peer_id,
+            encoded_generation(9_001, 1),
+            None,
+        )
+        .await
+    {
+        crate::peer::RemoteCandidateIncarnationClaim::Reset {
+            old_incarnation,
+            new_incarnation,
+        } => (old_incarnation, new_incarnation),
+        outcome => panic!("new incarnation was not claimed: {outcome:?}"),
+    };
+    let retired_peer_session = peers.peer_session_generation_sync(peer_id).unwrap();
+    let reader = peers.connection_map_for_test().read_owned().await;
+    let finish_start = Arc::new(tokio::sync::Barrier::new(2));
+    let worker_start = finish_start.clone();
+    let worker_peers = peers.clone();
+    let finish = tokio::spawn(async move {
+        worker_start.wait().await;
+        worker_peers
+            .finish_claimed_remote_incarnation_reset(
+                peer_id,
+                old_incarnation,
+                claimed_incarnation,
+                "test_incarnation_lock_order",
+            )
+            .await
+    });
+    finish_start.wait().await;
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers.connection_map_for_test().try_read().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("remote-incarnation finish never entered the fair writer queue");
+    assert!(
+        peers.network_epoch_gate().try_lock().is_ok(),
+        "remote-incarnation finish queued the writer while retaining the epoch"
+    );
+    drop(reader);
+    assert!(
+        timeout(Duration::from_secs(1), finish)
+            .await
+            .expect("remote-incarnation finish did not complete after reader release")
+            .expect("remote-incarnation finish task panicked")
+    );
+    assert_ne!(
+        peers.peer_session_generation_sync(peer_id),
+        Some(retired_peer_session),
+        "remote-incarnation finish must rotate the peer lifecycle"
+    );
+}
+
+#[tokio::test]
+async fn remote_incarnation_rotation_cancels_retry_and_kicks_replacement() {
+    fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
+        0x4000_0000_0000_0000 | (incarnation << 21) | counter
+    }
+
+    let config = Config::generate_default("http://127.0.0.1:1", "incarnation-retry-kick")
+        .unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-incarnation-retry-kick";
+    let peer_identity = NodeIdentity::generate();
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: hex::encode(peer_identity.public_key()),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    assert_eq!(
+        daemon
+            .peers
+            .claim_remote_candidate_incarnation_for_identity(
+                peer_id,
+                encoded_generation(9_100, 1),
+                None,
+            )
+            .await,
+        crate::peer::RemoteCandidateIncarnationClaim::NoReset
+    );
+
+    let network_generation = daemon.peers.current_network_generation_sync();
+    let retired_peer_session = daemon.peers.peer_session_generation_sync(peer_id).unwrap();
+    let reservation = {
+        let mut pending = daemon.pending_handshakes.lock();
+        let reservation = pending
+            .reserve_start_with_owner_at_generation_and_kind(
+                peer_id,
+                network_generation,
+                retired_peer_session,
+                HandshakeOwnerKind::EventInitiatorReserve,
+            )
+            .expect("the exact initiator reservation must be available");
+        assert!(
+            pending
+                .schedule_initiator_retry(
+                    peer_id,
+                    &reservation,
+                    InitiatorRetryPhase::Preparation,
+                    Instant::now(),
+                )
+                .is_some(),
+            "the exact retry must commit before the incarnation edge"
+        );
+        reservation
+    };
+    let mut restart_kick = daemon.path_setup_kick_tx.subscribe();
+
+    assert!(
+        daemon
+            .reset_peer_for_remote_incarnation_if_needed(
+                peer_id,
+                encoded_generation(9_101, 1),
+                RemoteIncarnationResetWork::PreserveResponder,
+            )
+            .await,
+        "the newer remote incarnation must rotate the peer lifecycle"
+    );
+    timeout(Duration::from_secs(1), restart_kick.changed())
+        .await
+        .expect("the committed lifecycle rotation did not wake handshake maintenance")
+        .expect("the handshake-maintenance kick sender closed");
+
+    let pending = daemon.pending_handshakes.lock();
+    assert!(
+        !pending.starting.contains(peer_id) && !pending.initiator_retries.contains_key(peer_id),
+        "the retired generation's reservation and retry must be cancelled together"
+    );
+    assert!(
+        *reservation.cancellation.borrow(),
+        "the retired exact owner must observe terminal cancellation"
+    );
+    assert_ne!(
+        daemon.peers.peer_session_generation_sync(peer_id),
+        Some(retired_peer_session),
+        "the replacement wake is valid only after PeerSessionGeneration rotates"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_offer() {
     fn encoded_generation(incarnation: u64, counter: u64) -> u64 {
         0x4000_0000_0000_0000 | (incarnation << 21) | counter
@@ -2295,10 +2509,21 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
         peers.connection_map_for_test().try_read().is_ok(),
         "candidate admission queued a connection writer behind the held reader"
     );
-    assert!(
-        peers.network_epoch_gate().try_lock().is_ok(),
-        "candidate apply retained the network epoch after try-write contention"
-    );
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(epoch) = peers.network_epoch_gate().try_lock() {
+                drop(epoch);
+                break;
+            }
+            // The bounded owner may be inside its next legitimate try-only
+            // transaction at the exact instant the receipt is observed. It
+            // must nevertheless expose an epoch-free retry boundary while
+            // the connection reader remains held.
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate apply retained the network epoch across connection contention");
 
     let responder_receipt = control::SignalDeliveryReceipt::pending();
     control

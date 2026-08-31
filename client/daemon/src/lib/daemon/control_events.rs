@@ -211,6 +211,29 @@ impl RemoteIncarnationResetOutcome {
 }
 
 impl Daemon {
+    fn kick_handshake_after_remote_incarnation_rotation(
+        &self,
+        peer_id: &str,
+        claimed_incarnation: u64,
+    ) {
+        // Rotating PeerSessionGeneration correctly invalidates every starting
+        // initiator reservation stamped by the retired incarnation. Publish a
+        // separate commit-before-wake edge so the supervised maintenance
+        // owner immediately reserves a replacement under the new generation
+        // when this node is the deterministic initiator. The responder role
+        // observes the same edge and exits without claiming a reservation.
+        self.path_setup_kick_tx
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.timeline.emit(
+            "remote_incarnation_handshake_restart_kicked",
+            None,
+            Some("peer_session_generation_rotated"),
+            Some(format!(
+                "peer={peer_id} incarnation={claimed_incarnation}"
+            )),
+        );
+    }
+
     fn clear_peer_handshake_lifecycle(&self, peer_id: &str, phase: &'static str) {
         let identity = HandshakeLeaseIdentity::new(
             peer_id,
@@ -418,6 +441,12 @@ impl Daemon {
                 .lock()
                 .finish_remote_incarnation_reset(peer_id, claimed_incarnation);
             drop(udp_slot);
+            if changed {
+                self.kick_handshake_after_remote_incarnation_rotation(
+                    peer_id,
+                    claimed_incarnation,
+                );
+            }
             return if changed {
                 RemoteIncarnationResetOutcome::Changed
             } else {
@@ -541,6 +570,10 @@ impl Daemon {
         }
         drop(udp_slot);
         if changed {
+            self.kick_handshake_after_remote_incarnation_rotation(
+                peer_id,
+                claimed_incarnation,
+            );
             RemoteIncarnationResetOutcome::Changed
         } else {
             RemoteIncarnationResetOutcome::RejectedLifecycle

@@ -327,8 +327,20 @@ impl PeerManager {
         sender_public_key: Option<&str>,
     ) -> RemoteCandidateIncarnationClaim {
         let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
-        let mut connections = self.connections.write().await;
+        let (_epoch_guard, mut connections) = loop {
+            let epoch_guard = epoch_gate.lock().await;
+            match self.connections.try_write() {
+                Ok(connections) => break (epoch_guard, connections),
+                Err(_) => {
+                    // A connection reader may itself be finishing an
+                    // epoch-fenced transaction. Never retain the epoch while
+                    // joining Tokio's fair writer queue: wait for one writer
+                    // turn without the epoch, then retry in canonical order.
+                    drop(epoch_guard);
+                    drop(self.connections.write().await);
+                }
+            }
+        };
         self.claim_remote_candidate_incarnation_in_connection(
             node_id,
             candidate_generation,
@@ -472,8 +484,23 @@ impl PeerManager {
     ) -> bool {
         let had_relay_confirmation = {
             let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
-            let mut connections = self.connections.write().await;
+            let (_epoch_guard, mut connections) = loop {
+                let epoch_guard = epoch_gate.lock().await;
+                match self.connections.try_write() {
+                    Ok(connections) => break (epoch_guard, connections),
+                    Err(_) => {
+                        // Remote-incarnation cleanup already owns the peer's
+                        // adoption fence. A connection reader can still need
+                        // the epoch to retire its pre-cleanup observation, so
+                        // queueing the writer while retaining the epoch would
+                        // close a reader -> epoch -> writer -> reader cycle.
+                        // Wait fairly without epoch ownership and retry the
+                        // actual mutation in canonical order.
+                        drop(epoch_guard);
+                        drop(self.connections.write().await);
+                    }
+                }
+            };
             let Some(conn) = connections.get_mut(node_id) else {
                 return false;
             };
