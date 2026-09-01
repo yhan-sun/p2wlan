@@ -1,0 +1,61 @@
+name: Repair PR 41 admitted candidate retry
+
+on:
+  push:
+    branches:
+      - feat/dplpmtud-business-budget-20260831
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/dplpmtud-business-budget-20260831
+          fetch-depth: 0
+
+      - name: Preserve the admitted candidate transaction across contention
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("client/daemon/src/lib/daemon/control_events.rs")
+          text = path.read_text(encoding="utf-8")
+          old = '''                                    if let Some(newest) = self
+                                        .pending_handshakes
+                                        .lock()
+                                        .take_queued_candidate_offer_work(
+                                            &peer_id,
+                                            reservation.owner,
+                                        )
+                                    {
+                                        offer = newest;
+                                        continue 'work;
+                                    }
+'''
+          new = '''                                    // `offer_ingress_verdict` has already committed
+                                    // this payload's Apply admission. Do not replace the
+                                    // active value here: a same-fingerprint successor
+                                    // would be classified as Duplicate even though this
+                                    // candidate mutation never committed. Retain the exact
+                                    // payload across bounded contention; the one
+                                    // newest-wins successor remains queued and is consumed
+                                    // by `finish_candidate_offer_work` after this mutation.
+'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"expected exactly one unsafe preemption block, found {count}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
+          git diff --check
+          rm .github/workflows/repair-pr41-candidate-owner.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add client/daemon/src/lib/daemon/control_events.rs .github/workflows/repair-pr41-candidate-owner.yml
+          git commit -m "fix: preserve admitted candidate work across contention"
+          git push origin HEAD:feat/dplpmtud-business-budget-20260831
