@@ -22,6 +22,55 @@ pub(crate) enum DirectValidationSendError {
     NoSocket,
 }
 
+/// Exact socket lease and immutable budget token captured before WireGuard
+/// encryption for one normal Direct business packet.
+#[derive(Debug)]
+pub(crate) struct PreparedDirectBusinessSend {
+    pub(crate) token: crate::dplpmtud::DirectBusinessSendToken,
+    pub(crate) socket: Arc<UdpSocket>,
+    pub(crate) endpoint: SocketAddr,
+    pub(crate) socket_index: usize,
+    _lease: DynamicSocketSendLease,
+}
+
+#[derive(Debug)]
+pub(crate) enum DirectBusinessBudgetGate {
+    /// Capability was not negotiated, or this platform's exact socket cannot
+    /// provide the no-fragment profile. Preserve pre-DPLPMTUD behavior.
+    Unmanaged,
+    /// Modern peer, but BASE/budget/exact identity is not currently usable.
+    ManagedPending { reason: &'static str },
+    Ready(Box<PreparedDirectBusinessSend>),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DirectBusinessUdpSendError {
+    #[error("Direct business send token is stale")]
+    StaleToken,
+    #[error("encrypted UDP datagram exceeds confirmed budget")]
+    CiphertextTooLarge,
+    #[error("local UDP path rejected the datagram as too large")]
+    LocalPacketTooLarge,
+    #[error("local UDP socket would block before handoff")]
+    WouldBlock,
+    #[error("UDP send failed before handoff: {0}")]
+    Io(String),
+    #[error("short UDP send: sent {sent} of {expected} bytes")]
+    Short { sent: usize, expected: usize },
+}
+
+/// Exact reverse target learned from an authenticated Direct-validation
+/// Request. A dependent NAT may need this target to reproduce the public
+/// source mapping which the peer committed from our validation ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DplpmtudAckReverseRoute {
+    network_generation: u64,
+    peer_session_generation: PeerSessionGeneration,
+    remote_endpoint: SocketAddr,
+    local_endpoint: SocketAddr,
+    socket_index: usize,
+}
+
 #[cfg(test)]
 type RemoteIncarnationCleanupGateSlot =
     Arc<std::sync::Mutex<Option<(String, Arc<RemoteIncarnationCleanupGate>)>>>;
@@ -131,6 +180,19 @@ pub struct UdpTransport {
     /// race regression.
     #[cfg(test)]
     remote_incarnation_cleanup_gate: RemoteIncarnationCleanupGateSlot,
+    /// One-shot deterministic seam between business encryption and the exact
+    /// UDP handoff. Production builds contain no hook or additional branch.
+    #[cfg(test)]
+    direct_business_send_gate:
+        Arc<std::sync::Mutex<Option<Arc<DirectBusinessSendGate>>>>,
+    /// Inject one typed local EMSGSIZE at the exact business syscall boundary.
+    #[cfg(test)]
+    direct_business_emsgsize_once: Arc<AtomicBool>,
+    /// Deterministic per-peer `WouldBlock` injection at the same exact syscall
+    /// boundary. Production builds contain neither the map nor its branch.
+    #[cfg(test)]
+    direct_business_would_block:
+        Arc<StdMutex<HashMap<String, DirectBusinessWouldBlockInjection>>>,
     authenticated_punch_replay: AuthPunchReplayState,
     authenticated_punch_rate: AuthPunchRateState,
     outbound_probe_budget: OutboundProbeBudgetState,
@@ -148,6 +210,11 @@ pub struct UdpTransport {
     /// DPLPMTUD state, capability receipts and exact-path workers owned by
     /// this concrete UDP publication.
     dplpmtud: crate::dplpmtud::DplpmtudRuntime,
+    /// One authenticated reverse response route per peer, bounded by the same
+    /// 256-peer ceiling as DPLPMTUD. This belongs to the concrete UDP
+    /// publication and is cleared by peer lifecycle cleanup.
+    dplpmtud_ack_reverse_routes:
+        Arc<StdMutex<HashMap<String, DplpmtudAckReverseRoute>>>,
     dplpmtud_worker_ingress: crate::dplpmtud::DplpmtudWorkerIngress,
     dplpmtud_local_virtual_ip: Option<Ipv4Addr>,
     /// Adaptive-prediction learner state for the current network generation.
@@ -188,7 +255,9 @@ impl UdpTransport {
         peers
             .register_direct_validation_registry(direct_validation.clone())
             .await;
-        let dplpmtud = crate::dplpmtud::DplpmtudRuntime::new();
+        let dplpmtud = crate::dplpmtud::DplpmtudRuntime::new_with_business_change_notifier(
+            peers.direct_business_budget_change_sender(),
+        );
         peers.register_dplpmtud_runtime(dplpmtud.clone()).await;
 
         Ok(Self {
@@ -236,6 +305,12 @@ impl UdpTransport {
             probe_send_failure_hook_enabled: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            direct_business_send_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            direct_business_emsgsize_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            direct_business_would_block: Arc::new(StdMutex::new(HashMap::new())),
             authenticated_punch_replay: Arc::new(Mutex::new(HashMap::new())),
             authenticated_punch_rate: Arc::new(Mutex::new(HashMap::new())),
             outbound_probe_budget: Arc::new(Mutex::new(HashMap::new())),
@@ -244,6 +319,7 @@ impl UdpTransport {
             wireguard_transport: None,
             direct_validation,
             dplpmtud,
+            dplpmtud_ack_reverse_routes: Arc::new(StdMutex::new(HashMap::new())),
             dplpmtud_worker_ingress: crate::dplpmtud::DplpmtudWorkerIngress::default(),
             dplpmtud_local_virtual_ip: None,
             learning_cache: Arc::new(Mutex::new(LearningCache::new())),
@@ -281,8 +357,386 @@ impl UdpTransport {
         peer_id: &str,
         peer_session_generation: PeerSessionGeneration,
     ) -> bool {
+        self.peers
+            .mark_dplpmtud_capable_sync(peer_id, peer_session_generation);
         self.dplpmtud
             .mark_supported(peer_id, peer_session_generation.value())
+    }
+
+    pub(crate) fn direct_business_budget_ready_for_peer(&self, peer_id: &str) -> bool {
+        let Some(session_generation) = self.peers.peer_session_generation_sync(peer_id) else {
+            return false;
+        };
+        if !self
+            .peers
+            .peer_supports_dplpmtud_sync(peer_id, session_generation)
+        {
+            return true;
+        }
+        self.dplpmtud
+            .direct_business_budget_entry(peer_id)
+            .is_some_and(|entry| {
+                !entry.enforced
+                    || (entry.update.budget.is_some()
+                        && self.inbound_publication_owner() != 0)
+            })
+    }
+
+    /// Bind the peer's authenticated Direct-validation Request ingress to the
+    /// exact receiving socket and local lifecycle. The route is response-only:
+    /// it never selects or promotes a business path.
+    pub(crate) fn remember_dplpmtud_ack_reverse_route(
+        &self,
+        peer_id: &str,
+        network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        remote_endpoint: SocketAddr,
+        local_endpoint: Option<SocketAddr>,
+        socket_index: Option<usize>,
+    ) -> bool {
+        let (Some(local_endpoint), Some(socket_index)) = (local_endpoint, socket_index) else {
+            return false;
+        };
+        if self.peers.current_network_generation_sync() != network_generation
+            || !self
+                .peers
+                .peer_session_is_current_sync(peer_id, peer_session_generation)
+            || local_endpoint.is_ipv4() != remote_endpoint.is_ipv4()
+        {
+            return false;
+        }
+        let mut routes = self
+            .dplpmtud_ack_reverse_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if routes.len() >= crate::dplpmtud::MAX_TRACKED_DPLPMTUD_PEERS
+            && !routes.contains_key(peer_id)
+        {
+            return false;
+        }
+        routes.insert(
+            peer_id.to_string(),
+            DplpmtudAckReverseRoute {
+                network_generation,
+                peer_session_generation,
+                remote_endpoint,
+                local_endpoint,
+                socket_index,
+            },
+        );
+        true
+    }
+
+    /// Read one exact current reverse route without awaiting or touching the
+    /// DPLPMTUD registry. Stale generation/session/socket bindings fail closed.
+    pub(crate) fn dplpmtud_ack_reverse_endpoint(
+        &self,
+        peer_id: &str,
+        peer_session_generation: PeerSessionGeneration,
+        local_endpoint: SocketAddr,
+        socket_index: usize,
+    ) -> Option<SocketAddr> {
+        let route = self
+            .dplpmtud_ack_reverse_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .copied()?;
+        (route.network_generation == self.peers.current_network_generation_sync()
+            && route.peer_session_generation == peer_session_generation
+            && self
+                .peers
+                .peer_session_is_current_sync(peer_id, peer_session_generation)
+            && route.local_endpoint == local_endpoint
+            && route.socket_index == socket_index)
+            .then_some(route.remote_endpoint)
+    }
+
+    pub(crate) fn peer_requires_direct_business_budget(&self, peer_id: &str) -> bool {
+        self.peers
+            .peer_session_generation_sync(peer_id)
+            .is_some_and(|generation| {
+                self.peers
+                    .peer_supports_dplpmtud_sync(peer_id, generation)
+            })
+            && self
+                .dplpmtud
+                .direct_business_budget_entry(peer_id)
+                .is_none_or(|entry| entry.enforced)
+    }
+
+    /// Capture exact committed Direct identity, exact socket lease, owner and
+    /// confirmed budget before allocating a WireGuard counter.
+    pub(crate) async fn prepare_direct_business_send(
+        &self,
+        peer_id: &str,
+        expected_endpoint: SocketAddr,
+    ) -> DirectBusinessBudgetGate {
+        let Some(session_generation) = self.peers.peer_session_generation_sync(peer_id) else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "peer_session_missing",
+            };
+        };
+        if !self
+            .peers
+            .peer_supports_dplpmtud_sync(peer_id, session_generation)
+        {
+            return DirectBusinessBudgetGate::Unmanaged;
+        }
+
+        let Some((socket_index, socket, lease)) = self
+            .resolve_send_socket_with_lease(peer_id)
+            .await
+        else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "exact_socket_missing",
+            };
+        };
+        let Some(committed) = self
+            .peers
+            .committed_business_path_snapshot_sync(peer_id)
+        else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "committed_path_missing",
+            };
+        };
+        let validation = match committed.active {
+            ActiveBusinessPath::Direct(validation)
+                if committed.lifecycle == PeerPathLifecycle::Online => validation,
+            _ => {
+                return DirectBusinessBudgetGate::ManagedPending {
+                    reason: "active_path_not_direct",
+                }
+            }
+        };
+        let Some(epoch) = committed.epoch.filter(|epoch| *epoch == validation.epoch) else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "path_epoch_mismatch",
+            };
+        };
+        let Some(remote_endpoint) = validation.commit_endpoint() else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "direct_identity_unconfirmed",
+            };
+        };
+        if remote_endpoint != expected_endpoint {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "selector_endpoint_changed",
+            };
+        }
+        let Some(pair) = self.peers.direct_commit_pair_snapshot_sync(peer_id) else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "direct_pair_missing",
+            };
+        };
+        let Some(local_endpoint) = pair.local_endpoint else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "local_endpoint_missing",
+            };
+        };
+        if pair.generation != epoch.network_generation
+            || pair.remote_candidate_epoch != epoch.remote_candidate_epoch
+            || socket.local_addr().ok() != Some(local_endpoint)
+        {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "exact_socket_identity_changed",
+            };
+        }
+        let Some(path_identity) =
+            crate::dplpmtud::DplpmtudPathIdentity::from_committed_validation(
+                peer_id,
+                validation,
+                remote_endpoint,
+                local_endpoint,
+                self.transport_instance_id,
+                socket_index,
+            )
+        else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "exact_path_identity_incomplete",
+            };
+        };
+        let Some(entry) = self.dplpmtud.direct_business_budget_entry(peer_id) else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "budget_not_published",
+            };
+        };
+        if !entry.enforced {
+            return DirectBusinessBudgetGate::Unmanaged;
+        }
+        if entry.update.path_identity != path_identity {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "budget_path_identity_stale",
+            };
+        }
+        let Some(publication) = entry.update.budget else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "confirmed_budget_withheld",
+            };
+        };
+        let publication_owner = self.inbound_publication_owner();
+        if publication_owner == 0 {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "udp_publication_withdrawn",
+            };
+        }
+        let token = crate::dplpmtud::DirectBusinessSendToken {
+            path_identity,
+            budget_revision: publication.budget_revision,
+            max_udp_datagram_size: publication.udp_datagram_size,
+            max_overlay_payload_size: publication.overlay_payload_budget,
+            udp_publication_owner: publication_owner,
+        };
+        DirectBusinessBudgetGate::Ready(Box::new(PreparedDirectBusinessSend {
+            token,
+            socket,
+            endpoint: remote_endpoint,
+            socket_index,
+            _lease: lease,
+        }))
+    }
+
+    /// Final exact Direct UDP handoff. The caller owns `network_epoch_gate`;
+    /// the runtime gate below orders budget/owner revocation against this one
+    /// synchronous nonblocking syscall.
+    pub(crate) fn try_send_direct_business_packet(
+        &self,
+        prepared: &PreparedDirectBusinessSend,
+        packet: &EncryptedPeerPacket,
+    ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
+        if packet.wire_bytes.len() > prepared.token.max_udp_datagram_size.0 as usize {
+            return Err(DirectBusinessUdpSendError::CiphertextTooLarge);
+        }
+        let attempted = self.dplpmtud.with_current_direct_business_token(
+            &prepared.token,
+            || {
+                if self.inbound_publication_owner() != prepared.token.udp_publication_owner
+                    || self.transport_instance_id
+                        != prepared.token.path_identity.socket.transport_instance_id
+                    || prepared.socket.local_addr().ok()
+                        != Some(prepared.token.path_identity.local_endpoint)
+                {
+                    return Err(DirectBusinessUdpSendError::StaleToken);
+                }
+                #[cfg(test)]
+                if self
+                    .direct_business_emsgsize_once
+                    .swap(false, Ordering::AcqRel)
+                {
+                    return Err(DirectBusinessUdpSendError::LocalPacketTooLarge);
+                }
+                #[cfg(test)]
+                if self.injected_direct_business_would_block_for_test(
+                    &prepared.token.path_identity.peer_id,
+                ) {
+                    return Err(DirectBusinessUdpSendError::WouldBlock);
+                }
+                prepared
+                    .socket
+                    .try_send_to(&packet.wire_bytes, prepared.endpoint)
+                    .map_err(|error| {
+                        if is_local_packet_too_large(&error) {
+                            DirectBusinessUdpSendError::LocalPacketTooLarge
+                        } else if error.kind() == std::io::ErrorKind::WouldBlock {
+                            DirectBusinessUdpSendError::WouldBlock
+                        } else {
+                            DirectBusinessUdpSendError::Io(error.to_string())
+                        }
+                    })
+            },
+        );
+        let sent = attempted.ok_or(DirectBusinessUdpSendError::StaleToken)??;
+        if sent != packet.wire_bytes.len() {
+            return Err(DirectBusinessUdpSendError::Short {
+                sent,
+                expected: packet.wire_bytes.len(),
+            });
+        }
+        self.update_socket_diagnostics_try(prepared.socket_index, |metrics| {
+            metrics.encrypted_packets_sent += 1;
+        });
+        Ok(sent)
+    }
+
+    pub(crate) fn invalidate_direct_business_budget(
+        &self,
+        token: &crate::dplpmtud::DirectBusinessSendToken,
+    ) -> bool {
+        self.dplpmtud
+            .invalidate_direct_business_budget(token, tokio::time::Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_direct_business_send_gate_for_test(
+        &self,
+        gate: Arc<DirectBusinessSendGate>,
+    ) {
+        *self
+            .direct_business_send_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_at_direct_business_send_gate_for_test(&self) {
+        let gate = self
+            .direct_business_send_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.reached.wait().await;
+            gate.release.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_direct_business_emsgsize_once_for_test(&self) {
+        self.direct_business_emsgsize_once
+            .store(true, Ordering::Release);
+    }
+
+    /// Inject exactly `attempts` local-backpressure results for one peer and
+    /// return an observable attempt counter. The peer key is part of the exact
+    /// immutable send token, so a blocked Peer A cannot affect Peer B.
+    #[cfg(test)]
+    pub(crate) fn inject_direct_business_would_block_for_test(
+        &self,
+        peer_id: &str,
+        attempts: usize,
+    ) -> watch::Receiver<usize> {
+        assert!(attempts > 0, "WouldBlock injection must contain an attempt");
+        let (attempts_tx, attempts_rx) = watch::channel(0usize);
+        self.direct_business_would_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                peer_id.to_string(),
+                DirectBusinessWouldBlockInjection {
+                    remaining: attempts,
+                    attempts_tx,
+                },
+            );
+        attempts_rx
+    }
+
+    #[cfg(test)]
+    fn injected_direct_business_would_block_for_test(&self, peer_id: &str) -> bool {
+        let mut injections = self
+            .direct_business_would_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(injection) = injections.get_mut(peer_id) else {
+            return false;
+        };
+        if injection.remaining == 0 {
+            return false;
+        }
+        injection.remaining = injection.remaining.saturating_sub(1);
+        injection
+            .attempts_tx
+            .send_modify(|attempts| *attempts = attempts.saturating_add(1));
+        true
     }
 
     /// Reconcile DPLPMTUD only from the authoritative committed-path mirror.
@@ -391,9 +845,21 @@ impl UdpTransport {
                     )),
                 );
             }
-            let protocol_supported = self
-                .dplpmtud
-                .is_supported(&snapshot.peer_id, epoch.peer_session_generation.value());
+            // Capability belongs to the peer session, not to one UDP
+            // transport instance. A replacement transport starts with an
+            // empty DPLPMTUD runtime, so its first reconcile must seed that
+            // runtime from the immutable session-scoped manager mirror. If it
+            // consulted only the new runtime here, a negotiated peer could
+            // transiently become `Unmanaged` and bypass BASE confirmation.
+            let protocol_supported = self.peers.peer_supports_dplpmtud_sync(
+                &snapshot.peer_id,
+                epoch.peer_session_generation,
+            );
+            if protocol_supported {
+                let _ = self
+                    .dplpmtud
+                    .mark_supported(&snapshot.peer_id, epoch.peer_session_generation.value());
+            }
             let no_fragment_supported = p2pnet_netbind::udp_no_fragment_supported(
                 &socket,
                 remote_endpoint.ip(),
@@ -1175,17 +1641,30 @@ impl UdpTransport {
     /// deliberately reserved for unpublished transports.
     pub(crate) fn set_inbound_publication_owner(&self, owner: u64) {
         debug_assert_ne!(owner, 0, "UDP publication owner zero is reserved");
-        self.inbound_publication_owner
-            .store(owner, Ordering::Release);
+        self.dplpmtud.with_business_publication_gate(|| {
+            self.inbound_publication_owner
+                .store(owner, Ordering::Release);
+        });
+        self.peers.notify_direct_business_budget_changed();
     }
 
     /// Revoke an owner only when this transport still carries that exact
     /// publication. A late cleanup from a retired worker must never clear a
     /// transport which has already been republished under a newer owner.
     pub(crate) fn clear_inbound_publication_owner_if_matches(&self, owner: u64) -> bool {
-        self.inbound_publication_owner
-            .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        let cleared = self.dplpmtud.with_business_publication_gate(|| {
+            self.inbound_publication_owner
+                .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+        if cleared {
+            // Closing publishes an explicit Some -> None revision for every
+            // managed peer before this retired transport can disappear.
+            self.dplpmtud
+                .close("udp_transport_unpublished", tokio::time::Instant::now());
+            self.peers.notify_direct_business_budget_changed();
+        }
+        cleared
     }
 
     /// The owner token socket readers put on encrypted UDP envelopes. Zero
@@ -1346,6 +1825,10 @@ impl UdpTransport {
         reason: &str,
         remove_connection: bool,
     ) {
+        self.dplpmtud_ack_reverse_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(peer_id);
         // Revoke the validation owner before removing peer/socket state.  A
         // worker that was waiting for a handshake or ACK immediately observes
         // cancellation, and its owner-conditional cleanup cannot erase a

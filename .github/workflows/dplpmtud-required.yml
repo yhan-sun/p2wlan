@@ -83,8 +83,29 @@ jobs:
       - name: Encrypted UDP blackhole test with evidence
         run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak -- --exact --nocapture --test-threads=1
 
-      - name: Cargo workspace tests
-        run: cargo test --workspace
+      - name: Cargo workspace tests (general suite)
+        run: cargo test --workspace --all-targets -- --test-threads=1 --skip hard_hard_
+
+      - name: Cargo workspace tests (Hard-Hard isolated suite)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p p2wlan-daemon --lib --no-run
+          hard_hard_binary="$(find target/debug/deps -maxdepth 1 -type f -name 'p2pnet_daemon-*' -perm -111 -print0 | xargs -0 ls -t | head -n 1)"
+          if [ -z "$hard_hard_binary" ]; then
+            echo "Hard-Hard test binary was not built" >&2
+            exit 1
+          fi
+          hard_hard_tests="$("$hard_hard_binary" hard_hard_ --list | sed -n 's/: test$//p')"
+          test_count="$(printf '%s\n' "$hard_hard_tests" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [ "$test_count" -eq 0 ]; then
+            echo "No Hard-Hard tests discovered" >&2
+            exit 1
+          fi
+          while IFS= read -r test_name; do
+            [ -n "$test_name" ] || continue
+            "$hard_hard_binary" "$test_name" --exact --test-threads=1
+          done <<< "$hard_hard_tests"
 
       - name: Diff whitespace check
         run: git diff --check

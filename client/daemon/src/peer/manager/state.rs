@@ -329,6 +329,21 @@ pub struct PeerManager {
         Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
     /// Latest-value notification for committed path/lifecycle/epoch changes.
     committed_business_path_change_tx: tokio::sync::watch::Sender<u64>,
+    /// Session-bound DPLPMTUD capability mirror.  The immutable map survives
+    /// a UDP transport replacement, so a modern peer cannot temporarily fall
+    /// back to legacy business sending while the replacement exact path is
+    /// still re-confirming BASE.
+    dplpmtud_capability_tx:
+        tokio::sync::watch::Sender<Arc<HashMap<String, PeerSessionGeneration>>>,
+    /// Latest-value wakeup for Direct business-budget publication changes.
+    /// The actual budget remains owned by the concrete UDP transport; this
+    /// sequence is only an event-driven queue wakeup.
+    direct_business_budget_change_tx: tokio::sync::watch::Sender<u64>,
+    /// Bounded local packet injection channel used for ICMP PMTU/unreachable
+    /// feedback.  `DataPlane` owns the production receiver.
+    local_mtu_feedback_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    local_mtu_feedback_limiter:
+        Arc<std::sync::Mutex<crate::business_mtu::LocalMtuFeedbackRateLimiter>>,
     /// Virtual IP → node ID mapping for routing.
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
     /// Monotonic local network generation. Incremented when local UDP candidates change.

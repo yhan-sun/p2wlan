@@ -3498,6 +3498,12 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
     harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
 
+    // Do not let the initial "not active and no sockets" state satisfy the
+    // cleanup predicate before the control event has started either side's
+    // session.  The two durable terminal events prove both birthday sweeps
+    // actually ran; only then is it meaningful to assert complete cleanup.
+    wait_for_both_sweep_failures(&harness).await;
+
     timeout(Duration::from_secs(5), async {
         loop {
             if !harness.peers_a.is_direct(HARD_HARD_B).await
@@ -3512,6 +3518,16 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
                     .await
                 && harness.udp_a.dynamic_socket_count().await == 0
                 && harness.udp_b.dynamic_socket_count().await == 0
+                && harness
+                    .udp_a
+                    .hard_hard_pending_probe_count_for_test(HARD_HARD_B)
+                    .await
+                    == 0
+                && harness
+                    .udp_b
+                    .hard_hard_pending_probe_count_for_test(HARD_HARD_A)
+                    .await
+                    == 0
             {
                 return;
             }
@@ -3521,8 +3537,14 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
     .await
     .expect("bounded birthday no-collision session must terminate and clean up");
 
-    for peers in [&harness.peers_a, &harness.peers_b] {
-        let peer = &peers.diagnostics().await[0];
+    for (peers, peer_id) in [
+        (&harness.peers_a, HARD_HARD_B),
+        (&harness.peers_b, HARD_HARD_A),
+    ] {
+        let peer = peers
+            .get_connection(peer_id)
+            .await
+            .expect("the completed Hard↔Hard sweep must retain its peer lifecycle");
         assert!(peer.state != ConnectionState::Direct);
         assert!(!peer
             .direct_events

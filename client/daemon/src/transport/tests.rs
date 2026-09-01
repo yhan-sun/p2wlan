@@ -127,6 +127,80 @@ mod tests {
     }
 
     #[test]
+    fn dplpmtud_ack_uses_authenticated_reverse_route_across_nat_source_drift() {
+        let local_endpoint: SocketAddr = "127.0.0.1:42001".parse().unwrap();
+        let committed_remote: SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let transient_probe_source: SocketAddr = "127.0.0.1:42003".parse().unwrap();
+        let authenticated_reverse_endpoint: SocketAddr = "127.0.0.1:42004".parse().unwrap();
+        let identity = crate::dplpmtud::DplpmtudPathIdentity {
+            peer_id: "peer-b".to_string(),
+            epoch: crate::peer::PathEpoch::new(
+                7,
+                crate::peer::PeerSessionGeneration::for_test(11),
+                13,
+            ),
+            direct_validation_owner_token: 17,
+            direct_validation_request_id: 19,
+            authenticated_remote_endpoint: committed_remote,
+            local_endpoint,
+            socket: crate::dplpmtud::DplpmtudSocketIdentity {
+                transport_instance_id: 23,
+                socket_index: 2,
+            },
+            outer_ip_family: crate::dplpmtud::OuterIpFamily::Ipv4,
+        };
+
+        assert_eq!(
+            dplpmtud_ack_destination(
+                Some(&identity),
+                Some(authenticated_reverse_endpoint),
+                23,
+                transient_probe_source,
+                local_endpoint,
+                2,
+            ),
+            authenticated_reverse_endpoint,
+            "the exact receiving path must answer through the authenticated request ingress",
+        );
+        assert_eq!(
+            dplpmtud_ack_destination(
+                Some(&identity),
+                Some(authenticated_reverse_endpoint),
+                23,
+                transient_probe_source,
+                local_endpoint,
+                3,
+            ),
+            transient_probe_source,
+            "a different socket must fail closed to the historical reply target",
+        );
+        assert_eq!(
+            dplpmtud_ack_destination(
+                None,
+                Some(authenticated_reverse_endpoint),
+                23,
+                transient_probe_source,
+                local_endpoint,
+                2,
+            ),
+            transient_probe_source,
+            "a peer without a current exact reverse path retains compatibility behavior",
+        );
+        assert_eq!(
+            dplpmtud_ack_destination(
+                Some(&identity),
+                None,
+                23,
+                transient_probe_source,
+                local_endpoint,
+                2,
+            ),
+            transient_probe_source,
+            "a missing authenticated reverse route must fail closed to reply-to-source",
+        );
+    }
+
+    #[test]
     fn wire_counter_extracts_only_wireguard_transport_headers() {
         let message = MessageTransport {
             receiver_index: 0x1122_3344,

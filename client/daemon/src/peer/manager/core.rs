@@ -28,6 +28,10 @@ impl PeerManager {
         traversal_history: TraversalHistory,
     ) -> Self {
         let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
+        let (dplpmtud_capability_tx, _) =
+            tokio::sync::watch::channel(Arc::new(HashMap::new()));
+        let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
+        let (local_mtu_feedback_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
@@ -40,6 +44,12 @@ impl PeerManager {
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             committed_business_path_change_tx,
+            dplpmtud_capability_tx,
+            direct_business_budget_change_tx,
+            local_mtu_feedback_tx,
+            local_mtu_feedback_limiter: Arc::new(std::sync::Mutex::new(
+                crate::business_mtu::LocalMtuFeedbackRateLimiter::default(),
+            )),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
             network_generation: Arc::new(RwLock::new(0)),
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -90,6 +100,98 @@ impl PeerManager {
                 OutboundLossCounters::default(),
             )),
             config,
+        }
+    }
+
+    /// Remember a negotiated capability at the WireGuard peer-session scope.
+    /// The immutable watch value gives the business hot path a registry-free
+    /// read and remains valid across a UDP socket publication replacement.
+    pub(crate) fn mark_dplpmtud_capable_sync(
+        &self,
+        peer_id: &str,
+        peer_session_generation: PeerSessionGeneration,
+    ) {
+        let current = self.dplpmtud_capability_tx.borrow().clone();
+        if current.get(peer_id) == Some(&peer_session_generation) {
+            return;
+        }
+        let mut next = (*current).clone();
+        next.retain(|candidate, generation| {
+            self.peer_session_is_current_sync(candidate, *generation)
+        });
+        // This mirror is bounded by the authoritative live peer-session set,
+        // not by the smaller DPLPMTUD worker/publication cap. Evicting a live
+        // negotiated capability would incorrectly turn that modern peer into
+        // a legacy bypass while its old runtime entry still existed.
+        next.insert(peer_id.to_string(), peer_session_generation);
+        self.dplpmtud_capability_tx.send_replace(Arc::new(next));
+        self.notify_direct_business_budget_changed();
+    }
+
+    pub(crate) fn peer_supports_dplpmtud_sync(
+        &self,
+        peer_id: &str,
+        peer_session_generation: PeerSessionGeneration,
+    ) -> bool {
+        self.dplpmtud_capability_tx
+            .borrow()
+            .get(peer_id)
+            .is_some_and(|generation| *generation == peer_session_generation)
+    }
+
+    pub(crate) fn direct_business_budget_change_sender(
+        &self,
+    ) -> tokio::sync::watch::Sender<u64> {
+        self.direct_business_budget_change_tx.clone()
+    }
+
+    pub(crate) fn subscribe_direct_business_budget_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        self.direct_business_budget_change_tx.subscribe()
+    }
+
+    pub(crate) fn notify_direct_business_budget_changed(&self) {
+        self.direct_business_budget_change_tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+
+    pub(crate) fn subscribe_local_mtu_feedback(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
+        self.local_mtu_feedback_tx.subscribe()
+    }
+
+    pub(crate) fn emit_local_mtu_feedback(
+        &self,
+        peer_id: &str,
+        original: &[u8],
+        kind: crate::business_mtu::LocalMtuFeedbackKind,
+    ) -> crate::business_mtu::LocalMtuFeedbackOutcome {
+        use crate::business_mtu::{
+            build_local_mtu_feedback, LocalMtuFeedbackOutcome, LocalMtuFeedbackSuppression,
+        };
+
+        let packet = match build_local_mtu_feedback(original, kind) {
+            Ok(packet) => packet,
+            Err(reason) => return LocalMtuFeedbackOutcome::Suppressed(reason),
+        };
+        let admitted = self
+            .local_mtu_feedback_limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit(peer_id, tokio::time::Instant::now());
+        if !admitted {
+            return LocalMtuFeedbackOutcome::Suppressed(
+                LocalMtuFeedbackSuppression::RateLimited,
+            );
+        }
+        match self.local_mtu_feedback_tx.send(packet) {
+            Ok(_) => LocalMtuFeedbackOutcome::Published,
+            Err(_) => LocalMtuFeedbackOutcome::Suppressed(
+                LocalMtuFeedbackSuppression::NoTunConsumer,
+            ),
         }
     }
 

@@ -332,6 +332,11 @@ pub(crate) enum DplpmtudEvent {
         failure: DplpmtudProbeSendFailure,
         now: Instant,
     },
+    /// A normal business datagram was rejected locally with EMSGSIZE.  The
+    /// runtime accepts this only for the exact current identity + revision.
+    BusinessPacketTooLarge {
+        now: Instant,
+    },
     CurrentPlpmtuConfirmationTimerExpired {
         now: Instant,
     },
@@ -390,6 +395,7 @@ pub(crate) struct DplpmtudStateMachine {
     emit_lock_unavailable_count: u64,
     session_unavailable_count: u64,
     local_packet_too_large_count: u64,
+    business_packet_too_large_count: u64,
     last_send_failure_kind: Option<DplpmtudProbeSendFailure>,
     stale_ack_count: u64,
     duplicate_ack_count: u64,
@@ -450,6 +456,7 @@ impl DplpmtudStateMachine {
             emit_lock_unavailable_count: 0,
             session_unavailable_count: 0,
             local_packet_too_large_count: 0,
+            business_packet_too_large_count: 0,
             last_send_failure_kind: None,
             stale_ack_count: 0,
             duplicate_ack_count: 0,
@@ -771,6 +778,29 @@ impl DplpmtudStateMachine {
                     DplpmtudTransitionDecision::Applied
                 }
             }
+            DplpmtudEvent::BusinessPacketTooLarge { now } => {
+                if self.business_confirmed_udp_datagram_size().is_none() {
+                    DplpmtudTransitionDecision::Noop
+                } else {
+                    next.business_packet_too_large_count =
+                        next.business_packet_too_large_count.saturating_add(1);
+                    next.local_packet_too_large_count =
+                        next.local_packet_too_large_count.saturating_add(1);
+                    next.last_send_failure_kind =
+                        Some(DplpmtudProbeSendFailure::LocalPacketTooLarge);
+                    next.last_failure_at = Some(now);
+                    next.base_confirmed = false;
+                    next.confirmed_udp_datagram_size = None;
+                    next.outstanding = None;
+                    next.pending_candidate_udp_datagram_size = Some(next.base_udp_datagram_size);
+                    next.current_plpmtu_confirmation_pending = false;
+                    next.current_plpmtu_confirmation_at = None;
+                    next.retry_count = 0;
+                    next.raise_at = None;
+                    next.state = DplpmtudState::Base;
+                    DplpmtudTransitionDecision::Applied
+                }
+            }
             DplpmtudEvent::CurrentPlpmtuConfirmationTimerExpired { now } => {
                 if self.state != DplpmtudState::SearchComplete
                     || self
@@ -945,6 +975,7 @@ impl DplpmtudStateMachine {
             emit_lock_unavailable_count: self.emit_lock_unavailable_count,
             session_unavailable_count: self.session_unavailable_count,
             local_packet_too_large_count: self.local_packet_too_large_count,
+            business_packet_too_large_count: self.business_packet_too_large_count,
             last_send_failure_kind: self.last_send_failure_kind,
             stale_ack_count: self.stale_ack_count,
             duplicate_ack_count: self.duplicate_ack_count,
@@ -1095,6 +1126,8 @@ pub(crate) struct DplpmtudSnapshot {
     pub(crate) emit_lock_unavailable_count: u64,
     pub(crate) session_unavailable_count: u64,
     pub(crate) local_packet_too_large_count: u64,
+    #[serde(default)]
+    pub(crate) business_packet_too_large_count: u64,
     pub(crate) last_send_failure_kind: Option<DplpmtudProbeSendFailure>,
     pub(crate) stale_ack_count: u64,
     pub(crate) duplicate_ack_count: u64,
@@ -1396,6 +1429,44 @@ pub(crate) struct DplpmtudConfirmedBudget {
     pub(crate) overlay_payload_budget: OverlayPayloadBudget,
 }
 
+/// Immutable confirmed budget consumed by normal Direct business traffic.
+/// The full path identity deliberately travels with the value rather than
+/// living only in the map key, closing endpoint/socket/publication ABA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectBusinessBudgetPublication {
+    pub(crate) path_identity: DplpmtudPathIdentity,
+    pub(crate) budget_revision: u64,
+    pub(crate) udp_datagram_size: UdpDatagramSize,
+    pub(crate) overlay_payload_budget: OverlayPayloadBudget,
+}
+
+/// Every business-visible revision is published, including `Some -> None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectBusinessBudgetUpdate {
+    pub(crate) path_identity: DplpmtudPathIdentity,
+    pub(crate) budget_revision: u64,
+    pub(crate) budget: Option<DirectBusinessBudgetPublication>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectBusinessBudgetMirrorEntry {
+    /// False only when this exact platform/path is intentionally legacy-
+    /// compatible (capability absent or no-fragment unavailable).
+    pub(crate) enforced: bool,
+    pub(crate) update: DirectBusinessBudgetUpdate,
+}
+
+/// Token captured before WireGuard encryption and revalidated at the exact
+/// UDP syscall boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectBusinessSendToken {
+    pub(crate) path_identity: DplpmtudPathIdentity,
+    pub(crate) budget_revision: u64,
+    pub(crate) max_udp_datagram_size: UdpDatagramSize,
+    pub(crate) max_overlay_payload_size: OverlayPayloadBudget,
+    pub(crate) udp_publication_owner: u64,
+}
+
 struct RuntimeEntry {
     machine: DplpmtudStateMachine,
     budget_revision: Option<u64>,
@@ -1406,6 +1477,7 @@ struct RuntimeEntry {
     notify: Arc<Notify>,
     worker_running: bool,
     send_in_progress: bool,
+    business_enforced: bool,
 }
 
 #[derive(Default)]
@@ -1423,21 +1495,40 @@ pub(crate) struct DplpmtudRuntime {
     registry: Arc<StdMutex<RuntimeRegistry>>,
     snapshots: Arc<StdRwLock<HashMap<String, DplpmtudSnapshot>>>,
     next_worker_owner_token: Arc<AtomicU64>,
+    /// Latest immutable per-peer business publication. Readers clone one Arc
+    /// through Tokio watch and never touch `registry`.
+    business_publications: watch::Sender<Arc<HashMap<String, DirectBusinessBudgetMirrorEntry>>>,
+    /// Serializes budget/owner revocation against the final nonblocking UDP
+    /// syscall. It is intentionally independent from the DPLPMTUD registry.
+    business_publication_gate: Arc<StdMutex<()>>,
+    business_change_notifier: Option<watch::Sender<u64>>,
 }
 
 impl Default for DplpmtudRuntime {
     fn default() -> Self {
+        let (business_publications, _) = watch::channel(Arc::new(HashMap::new()));
         Self {
             registry: Arc::new(StdMutex::new(RuntimeRegistry::default())),
             snapshots: Arc::new(StdRwLock::new(HashMap::new())),
             next_worker_owner_token: Arc::new(AtomicU64::new(1)),
+            business_publications,
+            business_publication_gate: Arc::new(StdMutex::new(())),
+            business_change_notifier: None,
         }
     }
 }
 
 impl DplpmtudRuntime {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn new_with_business_change_notifier(notifier: watch::Sender<u64>) -> Self {
+        Self {
+            business_change_notifier: Some(notifier),
+            ..Self::default()
+        }
     }
 
     fn allocate_worker_owner_token(&self) -> Option<u64> {
@@ -1517,6 +1608,7 @@ impl DplpmtudRuntime {
             != Some(peer_session_generation)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_supported(&self, peer_id: &str, peer_session_generation: u64) -> bool {
         self.registry
             .lock()
@@ -1574,6 +1666,7 @@ impl DplpmtudRuntime {
 
         if let Some(existing) = registry.entries.get_mut(&peer_id) {
             if existing.machine.identity() == Some(&identity) {
+                existing.business_enforced = supported;
                 if supported
                     && existing.worker_running
                     && existing.worker_owner_token.is_some()
@@ -1671,6 +1764,7 @@ impl DplpmtudRuntime {
                 notify,
                 worker_running: false,
                 send_in_progress: false,
+                business_enforced: false,
             };
             registry.entries.insert(peer_id.clone(), entry);
             let entry = registry
@@ -1702,6 +1796,7 @@ impl DplpmtudRuntime {
             notify: notify.clone(),
             worker_running: true,
             send_in_progress: false,
+            business_enforced: true,
         };
         registry.entries.insert(peer_id.clone(), entry);
         let entry = registry
@@ -1742,6 +1837,7 @@ impl DplpmtudRuntime {
                     now,
                 });
                 self.refresh_budget_revision(&mut entry);
+                self.publish_direct_business_budget_locked(&peer_id, &entry);
             }
             registry.supported_sessions.remove(&peer_id);
             registry.ack_response_times.remove(&peer_id);
@@ -2155,7 +2251,7 @@ impl DplpmtudRuntime {
 
     /// Read one exact path's diagnostics without cloning the all-peer table.
     /// This is for control/timeline reporting; business packetization uses
-    /// [`Self::confirmed_budget_for_path`] instead.
+    /// the immutable publication mirror instead.
     pub(crate) fn snapshot_for_path(
         &self,
         identity: &DplpmtudPathIdentity,
@@ -2202,6 +2298,155 @@ impl DplpmtudRuntime {
             outer_ip_packet_size,
             overlay_payload_budget,
         })
+    }
+
+    /// Registry-free read used by the business data plane. Tokio watch owns
+    /// one immutable, bounded map; cloning this entry never acquires the
+    /// mutable DPLPMTUD registry mutex.
+    pub(crate) fn direct_business_budget_entry(
+        &self,
+        peer_id: &str,
+    ) -> Option<DirectBusinessBudgetMirrorEntry> {
+        self.business_publications.borrow().get(peer_id).cloned()
+    }
+
+    /// Test seam for proving that the production post-encryption check uses
+    /// the real WireGuard datagram length rather than the plaintext estimate.
+    /// It intentionally makes one immutable publication conservative while
+    /// leaving the reducer state untouched.
+    #[cfg(test)]
+    pub(crate) fn force_business_udp_budget_for_test(
+        &self,
+        peer_id: &str,
+        udp_datagram_size: UdpDatagramSize,
+    ) -> bool {
+        self.with_business_publication_gate(|| {
+            let current = self.business_publications.borrow().clone();
+            let mut next = (*current).clone();
+            let Some(entry) = next.get_mut(peer_id) else {
+                return false;
+            };
+            let Some(publication) = entry.update.budget.as_mut() else {
+                return false;
+            };
+            publication.udp_datagram_size = udp_datagram_size;
+            self.business_publications.send_replace(Arc::new(next));
+            if let Some(notifier) = self.business_change_notifier.as_ref() {
+                notifier.send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+            }
+            true
+        })
+    }
+
+    /// Test seam for publishing one internally consistent confirmed business
+    /// budget without driving the upward-probe timer. Unlike the conservative
+    /// ciphertext-defense seam above, this updates both UDP and overlay sizes.
+    #[cfg(test)]
+    pub(crate) fn force_coherent_business_budget_for_test(
+        &self,
+        peer_id: &str,
+        udp_datagram_size: UdpDatagramSize,
+    ) -> bool {
+        let Some(overlay_payload_budget) = udp_datagram_size.overlay_payload_budget() else {
+            return false;
+        };
+        self.with_business_publication_gate(|| {
+            let current = self.business_publications.borrow().clone();
+            let mut next = (*current).clone();
+            let Some(entry) = next.get_mut(peer_id) else {
+                return false;
+            };
+            let Some(publication) = entry.update.budget.as_mut() else {
+                return false;
+            };
+            publication.udp_datagram_size = udp_datagram_size;
+            publication.overlay_payload_budget = overlay_payload_budget;
+            self.business_publications.send_replace(Arc::new(next));
+            if let Some(notifier) = self.business_change_notifier.as_ref() {
+                notifier.send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+            }
+            true
+        })
+    }
+
+    /// Serialize UDP publication-owner stores with the final business send.
+    /// This gate is deliberately independent from `registry`; holding the
+    /// registry in a test or worker cannot delay a confirmed business send.
+    pub(crate) fn with_business_publication_gate<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let _guard = self
+            .business_publication_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation()
+    }
+
+    /// Final budget linearization point. If this returns `Some`, the token was
+    /// current for the entire synchronous operation (normally one
+    /// `UdpSocket::try_send_to` syscall). A revocation that wins the gate makes
+    /// this return `None`; a send that wins is ordered before the revocation.
+    pub(crate) fn with_current_direct_business_token<R>(
+        &self,
+        token: &DirectBusinessSendToken,
+        operation: impl FnOnce() -> R,
+    ) -> Option<R> {
+        self.with_business_publication_gate(|| {
+            let publications = self.business_publications.borrow();
+            let entry = publications.get(&token.path_identity.peer_id)?;
+            if !entry.enforced
+                || entry.update.path_identity != token.path_identity
+                || entry.update.budget_revision != token.budget_revision
+            {
+                return None;
+            }
+            let publication = entry.update.budget.as_ref()?;
+            if publication.path_identity != token.path_identity
+                || publication.budget_revision != token.budget_revision
+                || publication.udp_datagram_size != token.max_udp_datagram_size
+                || publication.overlay_payload_budget != token.max_overlay_payload_size
+            {
+                return None;
+            }
+            Some(operation())
+        })
+    }
+
+    /// Fail closed after a business EMSGSIZE (or an impossible actual-
+    /// ciphertext overrun). Exact identity + revision make duplicate reports
+    /// idempotent. No path-health or Relay state is touched here.
+    pub(crate) fn invalidate_direct_business_budget(
+        &self,
+        token: &DirectBusinessSendToken,
+        now: Instant,
+    ) -> bool {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.closed {
+            return false;
+        }
+        let Some(entry) = registry.entries.get_mut(&token.path_identity.peer_id) else {
+            return false;
+        };
+        if entry.machine.identity() != Some(&token.path_identity)
+            || entry.budget_revision != Some(token.budget_revision)
+            || entry
+                .machine
+                .business_confirmed_udp_datagram_size()
+                .is_none()
+        {
+            return false;
+        }
+        if entry
+            .machine
+            .apply(DplpmtudEvent::BusinessPacketTooLarge { now })
+            != DplpmtudTransitionDecision::Applied
+        {
+            return false;
+        }
+        entry.notify.notify_waiters();
+        self.publish_snapshot_locked(&token.path_identity.peer_id, entry, now);
+        true
     }
 
     #[cfg(test)]
@@ -2255,12 +2500,74 @@ impl DplpmtudRuntime {
 
     fn publish_snapshot_locked(&self, peer_id: &str, entry: &mut RuntimeEntry, now: Instant) {
         self.refresh_budget_revision(entry);
+        self.publish_direct_business_budget_locked(peer_id, entry);
         let mut snapshot = entry.machine.snapshot(now, entry.worker_running);
         snapshot.budget_revision = entry.budget_revision;
         self.snapshots
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(peer_id.to_string(), snapshot);
+    }
+
+    fn publish_direct_business_budget_locked(&self, peer_id: &str, entry: &RuntimeEntry) {
+        let identity = entry.machine.identity().cloned();
+        let revision = entry.budget_revision;
+        self.with_business_publication_gate(|| {
+            let current = self.business_publications.borrow().clone();
+            let mut next = (*current).clone();
+            let next_entry = identity
+                .zip(revision)
+                .map(|(path_identity, budget_revision)| {
+                    let budget = entry
+                        .machine
+                        .business_confirmed_udp_datagram_size()
+                        .and_then(|udp_datagram_size| {
+                            udp_datagram_size.overlay_payload_budget().map(
+                                |overlay_payload_budget| DirectBusinessBudgetPublication {
+                                    path_identity: path_identity.clone(),
+                                    budget_revision,
+                                    udp_datagram_size,
+                                    overlay_payload_budget,
+                                },
+                            )
+                        });
+                    DirectBusinessBudgetMirrorEntry {
+                        enforced: entry.business_enforced,
+                        update: DirectBusinessBudgetUpdate {
+                            path_identity,
+                            budget_revision,
+                            budget,
+                        },
+                    }
+                });
+
+            let changed = match next_entry {
+                Some(next_entry) => {
+                    if !next.contains_key(peer_id) && next.len() >= MAX_TRACKED_DPLPMTUD_PEERS {
+                        if let Some(tombstone) = next.iter().find_map(|(candidate, entry)| {
+                            entry.update.budget.is_none().then(|| candidate.clone())
+                        }) {
+                            next.remove(&tombstone);
+                        }
+                    }
+                    if (next.len() >= MAX_TRACKED_DPLPMTUD_PEERS && !next.contains_key(peer_id))
+                        || next.get(peer_id) == Some(&next_entry)
+                    {
+                        false
+                    } else {
+                        next.insert(peer_id.to_string(), next_entry);
+                        true
+                    }
+                }
+                None => next.remove(peer_id).is_some(),
+            };
+            if changed {
+                self.business_publications.send_replace(Arc::new(next));
+                if let Some(notifier) = self.business_change_notifier.as_ref() {
+                    notifier.send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+                }
+            }
+        });
     }
 }
 
@@ -2423,6 +2730,23 @@ mod tests {
             remote_endpoint: identity.authenticated_remote_endpoint,
             local_endpoint: identity.local_endpoint,
             socket: identity.socket,
+        }
+    }
+
+    fn business_token(
+        entry: DirectBusinessBudgetMirrorEntry,
+        publication_owner: u64,
+    ) -> DirectBusinessSendToken {
+        let publication = entry
+            .update
+            .budget
+            .expect("test requires a confirmed business publication");
+        DirectBusinessSendToken {
+            path_identity: publication.path_identity,
+            budget_revision: publication.budget_revision,
+            max_udp_datagram_size: publication.udp_datagram_size,
+            max_overlay_payload_size: publication.overlay_payload_budget,
+            udp_publication_owner: publication_owner,
         }
     }
 
@@ -3508,6 +3832,148 @@ mod tests {
     }
 
     #[test]
+    fn business_publication_is_explicit_revisioned_and_registry_independent() {
+        let now = Instant::now();
+        let identity = test_identity("peer");
+        let (runtime, _lease) = runtime_with_confirmed_base(identity.clone(), now);
+        let published = runtime
+            .direct_business_budget_entry(&identity.peer_id)
+            .expect("confirmed BASE must be visible in the immutable mirror");
+        assert!(published.enforced);
+        let token = business_token(published.clone(), 101);
+        assert_eq!(token.max_udp_datagram_size, UdpDatagramSize(1200));
+        assert_eq!(token.max_overlay_payload_size, OverlayPayloadBudget(1168));
+
+        // Hold the mutable registry on one thread. The business reader and
+        // final token gate must still complete on another thread; a per-packet
+        // registry lock would make the bounded receive time out.
+        let registry = runtime.registry.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let holder = std::thread::spawn(move || {
+            let _registry_guard = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+
+        let hot_runtime = runtime.clone();
+        let hot_token = token.clone();
+        let (hot_tx, hot_rx) = std::sync::mpsc::sync_channel(0);
+        let hot_path = std::thread::spawn(move || {
+            let mirror = hot_runtime
+                .direct_business_budget_entry("peer")
+                .expect("immutable mirror remains readable");
+            let result = hot_runtime.with_current_direct_business_token(&hot_token, || 42);
+            hot_tx
+                .send((mirror.update.budget_revision, result))
+                .unwrap();
+        });
+        let (observed_revision, result) = hot_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("business hot path must not wait for the DPLPMTUD registry");
+        assert_eq!(observed_revision, token.budget_revision);
+        assert_eq!(result, Some(42));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        hot_path.join().unwrap();
+
+        assert!(runtime.invalidate_direct_business_budget(&token, now + Duration::from_millis(3),));
+        let revoked = runtime
+            .direct_business_budget_entry("peer")
+            .expect("Some -> None is an explicit tombstone, not a deletion");
+        assert!(revoked.update.budget.is_none());
+        assert!(revoked.update.budget_revision > token.budget_revision);
+        assert_eq!(revoked.update.path_identity, identity);
+        assert_eq!(
+            runtime.with_current_direct_business_token(&token, || ()),
+            None
+        );
+        assert!(!runtime.invalidate_direct_business_budget(&token, now + Duration::from_millis(4),));
+        let snapshot = runtime.snapshot_for_peer("peer").unwrap();
+        assert_eq!(snapshot.state, DplpmtudState::Base);
+        assert!(!snapshot.base_confirmed);
+        assert_eq!(snapshot.business_packet_too_large_count, 1);
+    }
+
+    #[test]
+    fn old_business_tokens_fail_after_raise_drop_and_path_replacement() {
+        let mut now = Instant::now();
+        let identity = test_identity("peer");
+        let (runtime, lease) = runtime_with_confirmed_base(identity.clone(), now);
+        let base_token = business_token(runtime.direct_business_budget_entry("peer").unwrap(), 101);
+
+        now += Duration::from_millis(3);
+        let raised_plan = schedule_and_mark_runtime_probe_sent(&runtime, &identity, &lease, now);
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &raised_plan,
+            now + Duration::from_millis(2),
+        );
+        let raised_token =
+            business_token(runtime.direct_business_budget_entry("peer").unwrap(), 101);
+        assert!(raised_token.budget_revision > base_token.budget_revision);
+        assert!(raised_token.max_udp_datagram_size > base_token.max_udp_datagram_size);
+        assert_eq!(
+            runtime.with_current_direct_business_token(&base_token, || ()),
+            None,
+            "an old revision cannot inherit a newly raised budget"
+        );
+        assert_eq!(
+            runtime.with_current_direct_business_token(&raised_token, || 7),
+            Some(7)
+        );
+
+        assert!(runtime
+            .invalidate_direct_business_budget(&raised_token, now + Duration::from_millis(3),));
+        assert_eq!(
+            runtime.with_current_direct_business_token(&raised_token, || ()),
+            None
+        );
+        let base_plan = schedule_and_mark_runtime_probe_sent(
+            &runtime,
+            &identity,
+            &lease,
+            now + Duration::from_millis(5),
+        );
+        ack_runtime_probe(
+            &runtime,
+            &identity,
+            &base_plan,
+            now + Duration::from_millis(7),
+        );
+        let lowered_token =
+            business_token(runtime.direct_business_budget_entry("peer").unwrap(), 101);
+        assert_eq!(lowered_token.max_udp_datagram_size, UdpDatagramSize(1200));
+        assert_eq!(
+            lowered_token.max_overlay_payload_size,
+            OverlayPayloadBudget(1168)
+        );
+        assert!(lowered_token.budget_revision > raised_token.budget_revision);
+        assert_eq!(
+            runtime.with_current_direct_business_token(&raised_token, || ()),
+            None,
+            "a large old token cannot survive a downward recovery"
+        );
+        assert_eq!(
+            runtime.with_current_direct_business_token(&lowered_token, || 9),
+            Some(9),
+            "a fresh small-budget token remains usable"
+        );
+
+        let replacement = test_identity_with("peer", 8, 11, 14, 27, 29, 33, 0);
+        runtime.install_path(replacement, true, now + Duration::from_millis(8));
+        assert_eq!(
+            runtime.with_current_direct_business_token(&lowered_token, || ()),
+            None,
+            "an exact path replacement invalidates the old token"
+        );
+    }
+
+    #[test]
     fn wire_format_vector_is_fixed_and_padding_follows_token() {
         let token = DplpmtudWireToken {
             sequence: 0x0102_0304_0506_0708,
@@ -3911,6 +4377,11 @@ mod tests {
         }
         assert_eq!(runtime.tracked_peer_count(), MAX_TRACKED_DPLPMTUD_PEERS);
         assert_eq!(
+            runtime.business_publications.borrow().len(),
+            MAX_TRACKED_DPLPMTUD_PEERS,
+            "the immutable business mirror has the same strict peer cap"
+        );
+        assert_eq!(
             runtime
                 .install_path(test_identity("overflow-peer"), false, now)
                 .decision,
@@ -4240,8 +4711,8 @@ mod tests {
         )
         .await;
         let runtime = udp_a.dplpmtud_runtime();
-        let peer_session_generation = identity.epoch.peer_session_generation.value();
-        assert!(runtime.mark_supported("peer-b", peer_session_generation));
+        let peer_session_generation = identity.epoch.peer_session_generation;
+        assert!(udp_a.mark_peer_dplpmtud_supported("peer-b", peer_session_generation));
 
         let (session_a, session_b) = establish_sessions();
         let (wireguard_a, _) = WireGuardTransport::new();
