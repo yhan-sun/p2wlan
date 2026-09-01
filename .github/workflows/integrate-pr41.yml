@@ -1,0 +1,75 @@
+name: Integrate PR 41 onto current main
+
+on:
+  push:
+    branches:
+      - automation/integrate-pr41-20260901
+
+permissions:
+  contents: write
+
+concurrency:
+  group: integrate-pr41-20260901
+  cancel-in-progress: false
+
+jobs:
+  integrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      EXPECTED_MAIN: 9683a0d1ce91b487898b4b20043f1db47a823e09
+      PHASE2_BASE: e3e33718360f499848ec8c2772603e254a654b84
+      PHASE2_HEAD: ff6a67374bfa7fced38fcc39b0d4261030fe7011
+      TARGET_BRANCH: feat/dplpmtud-business-budget-20260831
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase the five Phase 2B commits onto the merged main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --force origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" \
+            "+refs/heads/fix/dplpmtud-acceptance-20260830:refs/remotes/origin/fix/dplpmtud-acceptance-20260830"
+          test "$(git rev-parse refs/remotes/origin/main)" = "${EXPECTED_MAIN}"
+          test "$(git rev-parse refs/remotes/origin/${TARGET_BRANCH})" = "${PHASE2_HEAD}"
+          mapfile -t commits < <(git rev-list --reverse "${PHASE2_BASE}..${PHASE2_HEAD}")
+          test "${#commits[@]}" -eq 5
+          git checkout --detach "${EXPECTED_MAIN}"
+          for commit in "${commits[@]}"; do
+            echo "cherry-pick ${commit}"
+            if ! git cherry-pick "${commit}"; then
+              git status --short
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+          done
+          test "$(git merge-base "${EXPECTED_MAIN}" HEAD)" = "${EXPECTED_MAIN}"
+          git diff --check "${EXPECTED_MAIN}..HEAD"
+          echo "INTEGRATED_HEAD=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Publish validated PR head
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${INTEGRATED_HEAD}"
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}" \
+            --force-with-lease="refs/heads/${TARGET_BRANCH}:${PHASE2_HEAD}"
+          echo "validated_pr41_head=${INTEGRATED_HEAD}"
