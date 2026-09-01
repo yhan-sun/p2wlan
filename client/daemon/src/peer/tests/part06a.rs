@@ -295,7 +295,7 @@ async fn relay_confirmation_and_business_markers_reject_retired_generation() {
 }
 
 #[tokio::test]
-async fn generation_advance_wins_over_queued_relay_confirmation() {
+async fn generation_advance_wins_over_nonqueued_relay_confirmation() {
     let manager = std::sync::Arc::new(PeerManager::new(test_config()));
     manager
         .add_peer(&test_peer("peer1", "127.0.0.1:51837".parse().unwrap()))
@@ -306,34 +306,34 @@ async fn generation_advance_wins_over_queued_relay_confirmation() {
         .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
         .await;
 
-    // Queue the lifecycle transition ahead of the stale confirmation while
-    // the epoch gate is held. Tokio's mutex is FIFO, so releasing the gate
-    // deterministically lets the generation advance retire the state before
-    // the old ACK's commit attempt runs.
+    // Queue the lifecycle transition while the epoch gate is held. Relay
+    // confirmation is a serial-inbound transaction and must reject contention
+    // immediately instead of joining the mutex queue behind that transition.
     let epoch_gate = manager.network_epoch_gate();
     let epoch_guard = epoch_gate.lock().await;
     let advance_task = tokio::spawn({
         let manager = manager.clone();
         async move { manager.advance_network_generation("queued_before_old_ack").await }
     });
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
     assert!(!advance_task.is_finished());
 
-    let confirm_task = tokio::spawn({
-        let manager = manager.clone();
-        async move {
-            manager
-                .confirm_relay_peer("peer1", "relay.test:443", old_generation)
-                .await
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(!confirm_task.is_finished());
+    assert!(
+        !manager
+            .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+            .await,
+        "relay confirmation must not queue behind the generation owner"
+    );
     drop(epoch_guard);
 
     let new_generation = advance_task.await.unwrap();
     assert!(new_generation > old_generation);
-    assert!(!confirm_task.await.unwrap());
+    assert!(
+        !manager
+            .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+            .await,
+        "the old generation must remain rejected after the transition"
+    );
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.relay_confirmed_generation, None);
     assert_eq!(connection.relay_ready_generation, None);

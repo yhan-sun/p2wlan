@@ -46,21 +46,48 @@ impl Daemon {
                 handshake_token_fingerprint(session_id.as_deref())
             )),
         );
-        let _handshake_guard = self.handshake_arbiter.acquire(from_node_id).await;
-        self.timeline.emit(
-            "initiator_answer_lock_acquired",
+        let identity = HandshakeLeaseIdentity::new(
+            from_node_id,
+            HandshakeOwnerKind::InitiatorAnswer,
             None,
-            None,
-            Some(format!(
-                "peer={from_node_id} generation={} wait_ms={} session_fp={}",
-                self.peers.current_network_generation_sync(),
-                lock_wait_started.elapsed().as_millis(),
-                handshake_token_fingerprint(session_id.as_deref())
-            )),
+            ingress_generation,
+            self.peers.peer_session_generation_sync(from_node_id),
+            "answer_admission",
         );
+        {
+            let handshake_guard = self
+                .handshake_arbiter
+                .acquire_with_timeout(identity, INITIATOR_ANSWER_HANDSHAKE_ARBITER_TIMEOUT)
+                .await;
+            if handshake_guard.is_none() {
+                self.timeline.emit(
+                    "initiator_answer_lock_timeout",
+                    None,
+                    Some("mutation_turn_timeout"),
+                    Some(format!(
+                        "peer={from_node_id} generation={ingress_generation} session_fp={}",
+                        handshake_token_fingerprint(session_id.as_deref())
+                    )),
+                );
+            } else {
+                self.timeline.emit(
+                    "initiator_answer_lock_acquired",
+                    None,
+                    None,
+                    Some(format!(
+                        "peer={from_node_id} generation={} wait_ms={} session_fp={}",
+                        self.peers.current_network_generation_sync(),
+                        lock_wait_started.elapsed().as_millis(),
+                        handshake_token_fingerprint(session_id.as_deref())
+                    )),
+                );
+            }
+            // The answer's exact pending-id and lifecycle stamps own the slow
+            // identity/session commit below.  The arbiter protects only this
+            // admission observation and is never carried through an await.
+        }
         if !self
             .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
-            .await
         {
             self.timeline.emit(
                 "peer_answer_rejected",
@@ -105,7 +132,7 @@ impl Daemon {
         let epoch_guard = epoch_gate.lock().await;
         let current_generation = self.peers.current_network_generation_sync();
         let (keys, expected_session_id, probe_ephemeral_shared, peer_session_generation) = {
-            let mut state = self.pending_handshakes.lock().await;
+            let mut state = self.pending_handshakes.lock();
             let expected_session_id = state.session_id(from_node_id).map(str::to_string);
             let Some(peer_session_generation) = state.peer_session_generation(from_node_id) else {
                 warn!("Ignoring WireGuard answer from {from_node_id}: no lifecycle-bound pending handshake");

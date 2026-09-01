@@ -436,7 +436,6 @@ impl PeerConnection {
             self.relay_first.business_received_generation = None;
             self.relay_first.business_exchange_generation = None;
             self.relay_first.business_pathcommit_generation = None;
-            self.relay_first.preconfirmation = None;
         }
         if self.relay_first.gate_generation != Some(local_generation) {
             self.relay_first.gate_generation = None;
@@ -451,7 +450,6 @@ impl PeerConnection {
             self.relay_first.business_received_generation = None;
             self.relay_first.business_exchange_generation = None;
             self.relay_first.business_pathcommit_generation = None;
-            self.relay_first.preconfirmation = None;
             self.relay_confirm_seq = self.relay_confirm_seq.wrapping_add(1);
         }
         self.candidate_pairs
@@ -684,7 +682,6 @@ impl PeerConnection {
             self.relay_first.business_received_generation = None;
             self.relay_first.business_exchange_generation = None;
             self.relay_first.business_pathcommit_generation = None;
-            self.relay_first.preconfirmation = None;
             self.relay_first.gate_generation = None;
             self.relay_first.gate_started_at = None;
         } else {
@@ -696,7 +693,6 @@ impl PeerConnection {
             self.relay_first.business_received_generation = None;
             self.relay_first.business_exchange_generation = None;
             self.relay_first.business_pathcommit_generation = None;
-            self.relay_first.preconfirmation = None;
             self.relay_first.gate_generation = None;
             self.relay_first.gate_started_at = None;
         }

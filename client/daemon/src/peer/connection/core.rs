@@ -22,18 +22,6 @@ struct PendingProbeSessionBinding {
     promote_on_match: bool,
 }
 
-/// A real decrypted relay business packet can arrive a few milliseconds
-/// before this daemon receives the matching encrypted relay-probe ACK.  Keep
-/// only that bounded evidence tuple so the later confirmation can complete
-/// the proof without replaying the WireGuard ciphertext.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingRelayBusinessEvidence {
-    pub generation: u64,
-    pub relay_endpoint: String,
-    pub relay_connection_id: Option<u64>,
-    pub received_at: Instant,
-}
-
 /// The relay-first business gate state for one peer connection.
 ///
 /// This is the set of fields that describe relay-first startup/fallback
@@ -82,11 +70,6 @@ pub(crate) struct RelayFirstBusinessState {
     /// already-established Direct path must not be demoted and forced to
     /// repeat the initial relay-first gate.
     pub business_gate_completed_generation: Option<u64>,
-    /// Real relay business ingress observed before local RelayPeerConfirmed.
-    /// It is promoted only when the later confirmation matches generation,
-    /// endpoint and transport incarnation; relay transport renewal clears the
-    /// pending tuple, while a generation/session reset clears all gate state.
-    pub(crate) preconfirmation: Option<PendingRelayBusinessEvidence>,
 }
 
 /// No-await, generation-bound projection of one peer's committed business

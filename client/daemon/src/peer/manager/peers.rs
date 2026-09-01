@@ -211,28 +211,45 @@ impl PeerManager {
             .record_candidate_generation_replay_floor(node_id, public_key, generation);
     }
 
-    /// Publish the strict replay floor for one valid encoded generation, then
-    /// claim a strictly newer remote daemon incarnation when necessary.
-    ///
-    /// The replay floor is published for first-incarnation and same-incarnation
-    /// signals too: candidate apply happens after this helper returns, so a
-    /// PeerLeft/rejoin in that gap must not admit a lower counter. A new
-    /// incarnation claim remains the high-water linearization point before
-    /// slow WireGuard/UDP cleanup.
-    pub(crate) async fn claim_remote_candidate_incarnation_for_identity(
+    /// Snapshot the currently published peer identity without waiting on the
+    /// async connection map.  The identity ledger is populated before the
+    /// membership lifecycle is published; re-checking that lifecycle after
+    /// the ledger read closes a concurrent remove/rejoin boundary.
+    pub(crate) fn peer_identity_public_key_sync(&self, node_id: &str) -> Option<String> {
+        let lifecycle = self.peer_session_generation_sync(node_id)?;
+        let public_key = self
+            .remote_identity_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(node_id)
+            .map(|identity| identity.public_key.clone())?;
+        self.peer_session_is_current_sync(node_id, lifecycle)
+            .then_some(public_key)
+    }
+
+    pub(crate) fn signal_sender_identity_matches_peer_sync(
+        &self,
+        node_id: &str,
+        sender_public_key: Option<&str>,
+    ) -> bool {
+        let Some(sender_public_key) = sender_public_key.map(str::trim) else {
+            return true;
+        };
+        !sender_public_key.is_empty()
+            && self
+                .peer_identity_public_key_sync(node_id)
+                .is_some_and(|known| known.trim() == sender_public_key)
+    }
+
+    fn claim_remote_candidate_incarnation_in_connection(
         &self,
         node_id: &str,
         candidate_generation: u64,
         sender_public_key: Option<&str>,
+        conn: Option<&mut PeerConnection>,
     ) -> RemoteCandidateIncarnationClaim {
-        // Only an absent fingerprint is legacy-compatible. An explicitly
-        // present but empty fingerprint is malformed identity evidence and
-        // must fail closed like every other non-matching `Some` value.
         let sender_public_key = sender_public_key.map(str::trim);
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
-        let mut connections = self.connections.write().await;
-        let Some(conn) = connections.get_mut(node_id) else {
+        let Some(conn) = conn else {
             return if sender_public_key.is_some() {
                 RemoteCandidateIncarnationClaim::IdentityMismatch
             } else {
@@ -244,6 +261,9 @@ impl PeerManager {
         {
             return RemoteCandidateIncarnationClaim::IdentityMismatch;
         }
+        if crate::control::candidate_generation_is_malformed_encoded(candidate_generation) {
+            return RemoteCandidateIncarnationClaim::RejectedLifecycle;
+        }
         let Some(new_incarnation) =
             crate::control::candidate_generation_incarnation(candidate_generation)
         else {
@@ -254,6 +274,14 @@ impl PeerManager {
         else {
             return RemoteCandidateIncarnationClaim::NoReset;
         };
+        if conn
+            .remote_candidate_incarnation_high_water
+            .is_some_and(|accepted| new_incarnation < accepted)
+            || (conn.remote_candidate_incarnation_high_water == Some(new_incarnation)
+                && candidate_generation < conn.last_candidate_generation)
+        {
+            return RemoteCandidateIncarnationClaim::RejectedLifecycle;
+        }
         conn.last_candidate_generation = conn.last_candidate_generation.max(claim_floor);
         self.record_remote_candidate_generation_replay_floor(
             node_id,
@@ -273,9 +301,6 @@ impl PeerManager {
             return RemoteCandidateIncarnationClaim::NoReset;
         }
         conn.remote_candidate_incarnation_high_water = Some(new_incarnation);
-        // The predecessor was published above before this claim. Mirror the
-        // new incarnation itself before slow transport cleanup as the second
-        // half of the replay fence.
         self.record_remote_candidate_incarnation_high_water(
             node_id,
             &conn.public_key,
@@ -285,6 +310,144 @@ impl PeerManager {
             old_incarnation,
             new_incarnation,
         }
+    }
+
+    /// Publish the strict replay floor for one valid encoded generation, then
+    /// claim a strictly newer remote daemon incarnation when necessary.
+    ///
+    /// The replay floor is published for first-incarnation and same-incarnation
+    /// signals too: candidate apply happens after this helper returns, so a
+    /// PeerLeft/rejoin in that gap must not admit a lower counter. A new
+    /// incarnation claim remains the high-water linearization point before
+    /// slow WireGuard/UDP cleanup.
+    pub(crate) async fn claim_remote_candidate_incarnation_for_identity(
+        &self,
+        node_id: &str,
+        candidate_generation: u64,
+        sender_public_key: Option<&str>,
+    ) -> RemoteCandidateIncarnationClaim {
+        let epoch_gate = self.network_epoch_gate();
+        let (_epoch_guard, mut connections) = loop {
+            let epoch_guard = epoch_gate.lock().await;
+            match self.connections.try_write() {
+                Ok(connections) => break (epoch_guard, connections),
+                Err(_) => {
+                    // A connection reader may itself be finishing an
+                    // epoch-fenced transaction. Never retain the epoch while
+                    // joining Tokio's fair writer queue: wait for one writer
+                    // turn without the epoch, then retry in canonical order.
+                    drop(epoch_guard);
+                    drop(self.connections.write().await);
+                }
+            }
+        };
+        self.claim_remote_candidate_incarnation_in_connection(
+            node_id,
+            candidate_generation,
+            sender_public_key,
+            connections.get_mut(node_id),
+        )
+    }
+
+    /// Non-queuing remote-incarnation transaction for the inbound control
+    /// coordinator.  It preserves the canonical `epoch -> connections`
+    /// ordering, but never joins either wait queue.
+    pub(crate) fn try_claim_remote_candidate_incarnation_for_identity(
+        &self,
+        node_id: &str,
+        candidate_generation: u64,
+        sender_public_key: Option<&str>,
+    ) -> RemoteCandidateIncarnationTryClaim {
+        // The synchronous ledger is published in the same transaction as the
+        // connection high-water.  Once this incarnation is already current,
+        // a later revision needs no lifecycle mutation and must not touch the
+        // fair connection lock at all.  This is the common candidate-first ->
+        // handshake sequence: candidate application may already be queued on
+        // the writer, while the responder can still proceed immediately.
+        let sender_public_key = sender_public_key.map(str::trim);
+        let lifecycle = self.peer_session_generation_sync(node_id);
+        let known_identity = lifecycle.and_then(|expected| {
+            let identity = {
+                self.remote_identity_ledger
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(node_id)
+                    .cloned()
+            };
+            identity.filter(|_| self.peer_session_is_current_sync(node_id, expected))
+        });
+        if sender_public_key.is_some_and(|sender| {
+            sender.is_empty()
+                || known_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.public_key.trim() != sender)
+        }) {
+            return RemoteCandidateIncarnationTryClaim::Committed(
+                RemoteCandidateIncarnationClaim::IdentityMismatch,
+            );
+        }
+        if crate::control::candidate_generation_is_malformed_encoded(candidate_generation) {
+            return RemoteCandidateIncarnationTryClaim::Committed(
+                RemoteCandidateIncarnationClaim::RejectedLifecycle,
+            );
+        }
+        match crate::control::candidate_generation_incarnation(candidate_generation) {
+            None if sender_public_key.is_none() || known_identity.is_some() => {
+                return RemoteCandidateIncarnationTryClaim::Committed(
+                    RemoteCandidateIncarnationClaim::NoReset,
+                );
+            }
+            Some(incoming) => {
+                if let Some(identity) = known_identity.as_ref() {
+                    match identity.candidate_incarnation_high_water {
+                        Some(accepted) if incoming < accepted => {
+                            return RemoteCandidateIncarnationTryClaim::Committed(
+                                RemoteCandidateIncarnationClaim::RejectedLifecycle,
+                            );
+                        }
+                        Some(accepted) if incoming == accepted => {
+                            let outcome = if candidate_generation
+                                < identity.candidate_generation_replay_floor
+                            {
+                                RemoteCandidateIncarnationClaim::RejectedLifecycle
+                            } else {
+                                if let Some(claim_floor) =
+                                    crate::control::candidate_generation_predecessor_floor(
+                                        candidate_generation,
+                                    )
+                                {
+                                    self.record_remote_candidate_generation_replay_floor(
+                                        node_id,
+                                        &identity.public_key,
+                                        claim_floor,
+                                    );
+                                }
+                                RemoteCandidateIncarnationClaim::NoReset
+                            };
+                            return RemoteCandidateIncarnationTryClaim::Committed(outcome);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let epoch_gate = self.network_epoch_gate();
+        let Ok(_epoch_guard) = epoch_gate.try_lock() else {
+            return RemoteCandidateIncarnationTryClaim::ContendedEpoch;
+        };
+        let Ok(mut connections) = self.connections.try_write() else {
+            return RemoteCandidateIncarnationTryClaim::ContendedConnections;
+        };
+        RemoteCandidateIncarnationTryClaim::Committed(
+            self.claim_remote_candidate_incarnation_in_connection(
+                node_id,
+                candidate_generation,
+                sender_public_key,
+                connections.get_mut(node_id),
+            ),
+        )
     }
 
     /// Compatibility wrapper for internal tests that exercise only incarnation
@@ -304,6 +467,7 @@ impl PeerManager {
                 new_incarnation,
             } => Some((old_incarnation, new_incarnation)),
             RemoteCandidateIncarnationClaim::IdentityMismatch
+            | RemoteCandidateIncarnationClaim::RejectedLifecycle
             | RemoteCandidateIncarnationClaim::NoReset => None,
         }
     }
@@ -320,8 +484,23 @@ impl PeerManager {
     ) -> bool {
         let had_relay_confirmation = {
             let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
-            let mut connections = self.connections.write().await;
+            let (_epoch_guard, mut connections) = loop {
+                let epoch_guard = epoch_gate.lock().await;
+                match self.connections.try_write() {
+                    Ok(connections) => break (epoch_guard, connections),
+                    Err(_) => {
+                        // Remote-incarnation cleanup already owns the peer's
+                        // adoption fence. A connection reader can still need
+                        // the epoch to retire its pre-cleanup observation, so
+                        // queueing the writer while retaining the epoch would
+                        // close a reader -> epoch -> writer -> reader cycle.
+                        // Wait fairly without epoch ownership and retry the
+                        // actual mutation in canonical order.
+                        drop(epoch_guard);
+                        drop(self.connections.write().await);
+                    }
+                }
+            };
             let Some(conn) = connections.get_mut(node_id) else {
                 return false;
             };
@@ -945,19 +1124,57 @@ impl PeerManager {
         let generation = self.current_network_generation_sync();
         let stage = stage.into();
         let detail = detail.into();
-        if Self::direct_event_requires_durable_ring(&stage) {
-            let mut connections = self.connections.write().await;
-            if let Some(conn) = connections.get_mut(node_id) {
-                conn.record_direct_event(
-                    generation,
-                    stage.clone(),
-                    endpoint,
-                    candidate_count,
-                    sent_probes,
-                    detail.clone(),
-                );
-            }
-        } else if let Ok(mut connections) = self.connections.try_write() {
+        if !Self::direct_event_requires_durable_ring(&stage) {
+            self.record_direct_event_non_queuing(
+                node_id,
+                stage,
+                endpoint,
+                candidate_count,
+                sent_probes,
+                detail,
+            );
+            return;
+        }
+        let mut connections = self.connections.write().await;
+        if let Some(conn) = connections.get_mut(node_id) {
+            conn.record_direct_event(
+                generation,
+                stage.clone(),
+                endpoint,
+                candidate_count,
+                sent_probes,
+                detail.clone(),
+            );
+        }
+        self.emit_direct_traversal_debug(
+            node_id,
+            generation,
+            &stage,
+            endpoint,
+            None,
+            candidate_count,
+            sent_probes,
+            &detail,
+        );
+    }
+
+    /// Best-effort diagnostic event for serial actor paths. This method never
+    /// joins the fair connection-writer queue; the structured debug timeline
+    /// is still emitted when the in-memory per-peer ring is contended.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_direct_event_non_queuing(
+        &self,
+        node_id: &str,
+        stage: impl Into<String>,
+        endpoint: Option<SocketAddr>,
+        candidate_count: Option<usize>,
+        sent_probes: Option<u32>,
+        detail: impl Into<String>,
+    ) {
+        let generation = self.current_network_generation_sync();
+        let stage = stage.into();
+        let detail = detail.into();
+        if let Ok(mut connections) = self.connections.try_write() {
             if let Some(conn) = connections.get_mut(node_id) {
                 conn.record_direct_event(
                     generation,
@@ -1295,6 +1512,7 @@ impl PeerManager {
     /// responder marks its staged key promotable by authenticated inbound
     /// traffic; an initiator waits for the matching answer and installs it
     /// explicitly.
+    #[cfg(test)]
     pub(crate) async fn stage_probe_session_binding(
         &self,
         node_id: &str,
@@ -1350,40 +1568,32 @@ impl PeerManager {
         ))
     }
 
-    /// Queue once for connection-writer availability without retaining the
-    /// writer. The independently scheduled initiator retry task calls this
-    /// only after the cooperative control-loop future has released every
-    /// upper guard and returned. Dropping this future on cancellation removes
-    /// its waiter from Tokio's writer-preferred queue; the explicit bound
-    /// prevents this availability barrier from starving later readers.
-    pub(crate) async fn wait_for_probe_session_binding_writer(
-        &self,
-        max_wait: Duration,
-    ) -> bool {
-        tokio::time::timeout(max_wait, async {
-            drop(self.connections.write().await);
-        })
-        .await
-        .is_ok()
-    }
-
     /// Extend a staged responder binding after the control-plane answer
     /// delivery attempt completes. This keeps signaling latency separate from
     /// the authenticated adoption window.
-    pub(crate) async fn refresh_pending_probe_session_binding_grace(
+    /// Refresh a responder binding without joining the connection writer
+    /// queue.  The original staging grace remains valid on contention; later
+    /// authenticated ingress is the authoritative promotion trigger.
+    pub(crate) fn try_refresh_pending_probe_session_binding_grace(
         &self,
         node_id: &str,
         token: &str,
-    ) -> bool {
-        let mut conns = self.connections.write().await;
+    ) -> PendingProbeBindingCommitOutcome {
+        let Ok(mut conns) = self.connections.try_write() else {
+            return PendingProbeBindingCommitOutcome::ContendedConnections;
+        };
         let Some(conn) = conns.get_mut(node_id) else {
-            return false;
+            return PendingProbeBindingCommitOutcome::Missing;
         };
         let Some(pending) = conn.pending_probe_bindings.get_mut(token) else {
-            return false;
+            return if conn.probe_binding_token.as_deref() == Some(token) {
+                PendingProbeBindingCommitOutcome::AlreadyCurrent
+            } else {
+                PendingProbeBindingCommitOutcome::Missing
+            };
         };
         pending.expires_at = Instant::now() + PENDING_PROBE_SESSION_BINDING_GRACE;
-        true
+        PendingProbeBindingCommitOutcome::Committed
     }
 
     /// Install an answer-confirmed Probe-v2 binding for outbound traffic while
@@ -1431,30 +1641,74 @@ impl PeerManager {
         true
     }
 
-    /// Promote a responder's staged Probe-v2 binding after a packet validates
-    /// under that exact key and token.
-    pub(crate) async fn confirm_pending_probe_session_binding(
+    /// Roll back an unpublished Probe-v2 replacement without entering the
+    /// fair connection-writer queue. `None` means the caller must leave the
+    /// exact token to its bounded TTL or retry the cleanup from an owning
+    /// lifecycle worker; it must not turn cleanup into a global reader gate.
+    pub(crate) fn try_discard_pending_probe_session_binding(
         &self,
         node_id: &str,
         token: &str,
-    ) -> bool {
-        let mut conns = self.connections.write().await;
+    ) -> Option<bool> {
+        let mut conns = self.connections.try_write().ok()?;
         let Some(conn) = conns.get_mut(node_id) else {
-            return false;
+            return Some(true);
+        };
+        prune_probe_session_bindings(conn, Instant::now());
+        if conn.probe_binding_token.as_deref() == Some(token) {
+            return Some(false);
+        }
+        conn.pending_probe_bindings.remove(token);
+        Some(true)
+    }
+
+    /// Promote a responder's staged Probe-v2 binding after a packet validates
+    /// under that exact key and token.
+    /// Promote the responder binding at an authenticated WireGuard boundary
+    /// without parking the serial inbound actor behind a connection reader.
+    /// On contention the promoted transport token remains in its bounded
+    /// queue and the next authenticated packet retries the same transaction.
+    pub(crate) fn try_confirm_pending_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> PendingProbeBindingCommitOutcome {
+        let Ok(mut conns) = self.connections.try_write() else {
+            return PendingProbeBindingCommitOutcome::ContendedConnections;
+        };
+        let Some(conn) = conns.get_mut(node_id) else {
+            return PendingProbeBindingCommitOutcome::Missing;
         };
         let should_promote = conn
             .pending_probe_bindings
             .get(token)
             .is_some_and(|pending| pending.promote_on_match);
         if !should_promote {
-            return conn.probe_binding_token.as_deref() == Some(token);
+            return if conn.probe_binding_token.as_deref() == Some(token) {
+                PendingProbeBindingCommitOutcome::AlreadyCurrent
+            } else {
+                PendingProbeBindingCommitOutcome::Missing
+            };
         }
         let pending = conn
             .pending_probe_bindings
             .remove(token)
             .expect("pending Probe binding checked above");
         install_active_probe_binding(conn, pending.binding, true);
-        true
+        PendingProbeBindingCommitOutcome::Committed
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn confirm_pending_probe_session_binding(
+        &self,
+        node_id: &str,
+        token: &str,
+    ) -> bool {
+        matches!(
+            self.try_confirm_pending_probe_session_binding(node_id, token),
+            PendingProbeBindingCommitOutcome::Committed
+                | PendingProbeBindingCommitOutcome::AlreadyCurrent
+        )
     }
 
     /// Bridge a Probe-v2 adoption check with its matching WireGuard responder

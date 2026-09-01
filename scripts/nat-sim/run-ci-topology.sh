@@ -7,10 +7,26 @@ SMOKE="$ROOT_DIR/scripts/nat-sim/nat-sim-smoke.sh"
 PROFILE=${1:-unit}
 RUN_ID=${GITHUB_RUN_ID:-local-$$}
 RUN_ATTEMPT=${GITHUB_RUN_ATTEMPT:-1}
+REPLICA=${NAT_TOPOLOGY_REPLICA:-1}
+EXPECTED_HEAD_SHA=${NAT_TOPOLOGY_HEAD_SHA:-}
 ARTIFACT_PARENT=${NAT_TOPOLOGY_ARTIFACT_ROOT:-${RUNNER_TEMP:-/tmp}}
-ARTIFACT_DIR="$ARTIFACT_PARENT/p2wlan-nat-topology-${RUN_ID}-${RUN_ATTEMPT}-${PROFILE}"
+ARTIFACT_DIR="$ARTIFACT_PARENT/p2wlan-nat-topology-${RUN_ID}-${RUN_ATTEMPT}-${PROFILE}-${REPLICA}"
 LOG_FILE="${ARTIFACT_DIR}.log"
-RUN_NAME="nat-ci-${PROFILE}-${RUN_ID}-${RUN_ATTEMPT}"
+RUN_NAME="nat-ci-${PROFILE}-${RUN_ID}-${RUN_ATTEMPT}-${REPLICA}"
+
+if ! [[ "$REPLICA" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[nat-ci] NAT_TOPOLOGY_REPLICA must be a positive integer" >&2
+  exit 2
+fi
+if [[ -n "$EXPECTED_HEAD_SHA" ]]; then
+  ACTUAL_HEAD_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD)
+  if [[ "$ACTUAL_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]]; then
+    echo "[nat-ci] exact Head mismatch expected=$EXPECTED_HEAD_SHA actual=$ACTUAL_HEAD_SHA replica=$REPLICA" >&2
+    exit 2
+  fi
+else
+  ACTUAL_HEAD_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
+fi
 
 mkdir -p "$ARTIFACT_PARENT"
 if [[ -e "$ARTIFACT_DIR" || -e "$LOG_FILE" ]]; then
@@ -30,6 +46,8 @@ run_smoke() {
       ROUNDS=1 \
       NAT_SEED_BASE=20260828 \
       NAT_SIM_RUN_ID="$RUN_NAME" \
+      NAT_TOPOLOGY_HEAD_SHA="$ACTUAL_HEAD_SHA" \
+      NAT_TOPOLOGY_REPLICA="$REPLICA" \
       NAT_SIM_ARTIFACT_DIR="$ARTIFACT_DIR" \
       "$@" \
       bash "$SMOKE" 2>&1 | tee "$LOG_FILE"

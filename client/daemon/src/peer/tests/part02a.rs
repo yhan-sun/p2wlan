@@ -801,6 +801,98 @@ async fn peer_left_after_remote_restart_reset_preserves_claimed_generation_floor
 }
 
 #[tokio::test]
+async fn remote_incarnation_try_claim_is_non_queuing_and_fences_retired_work() {
+    let manager = PeerManager::new(test_config());
+    let endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+    let peer = test_peer("peer-incarnation-try-claim", endpoint);
+    manager.add_peer(&peer).await;
+
+    let generation =
+        |incarnation: u64, counter: u64| 0x4000_0000_0000_0000u64 | (incarnation << 21) | counter;
+    let first = generation(4_000, 10);
+    assert_eq!(
+        manager.try_claim_remote_candidate_incarnation_for_identity(
+            &peer.node_id,
+            first,
+            Some(&peer.public_key),
+        ),
+        RemoteCandidateIncarnationTryClaim::Committed(
+            RemoteCandidateIncarnationClaim::NoReset,
+        )
+    );
+    assert_eq!(
+        manager
+            .add_candidates_with_metadata(
+                &peer.node_id,
+                &[endpoint.to_string()],
+                &HashMap::new(),
+                first,
+                None,
+            )
+            .await,
+        CandidateSetApplyResult::Applied
+    );
+
+    let reader = manager.connections.clone().read_owned().await;
+    let same_incarnation = generation(4_000, 20);
+    assert_eq!(
+        manager.try_claim_remote_candidate_incarnation_for_identity(
+            &peer.node_id,
+            same_incarnation,
+            Some(&peer.public_key),
+        ),
+        RemoteCandidateIncarnationTryClaim::Committed(
+            RemoteCandidateIncarnationClaim::NoReset,
+        ),
+        "the synchronous incarnation ledger must bypass a contended connection map",
+    );
+    assert!(
+        manager.connections.try_read().is_ok(),
+        "the same-incarnation fast path must not queue a fair writer",
+    );
+
+    let newer_incarnation = generation(4_001, 1);
+    assert_eq!(
+        manager.try_claim_remote_candidate_incarnation_for_identity(
+            &peer.node_id,
+            newer_incarnation,
+            Some(&peer.public_key),
+        ),
+        RemoteCandidateIncarnationTryClaim::ContendedConnections,
+    );
+    assert!(
+        manager.connections.try_read().is_ok(),
+        "explicit contention must return without joining the writer queue",
+    );
+    assert_eq!(
+        manager.try_claim_remote_candidate_incarnation_for_identity(
+            &peer.node_id,
+            first,
+            Some(&peer.public_key),
+        ),
+        RemoteCandidateIncarnationTryClaim::Committed(
+            RemoteCandidateIncarnationClaim::RejectedLifecycle,
+        ),
+        "an older counter below the synchronous replay floor is terminally stale",
+    );
+
+    drop(reader);
+    assert!(matches!(
+        manager.try_claim_remote_candidate_incarnation_for_identity(
+            &peer.node_id,
+            newer_incarnation,
+            Some(&peer.public_key),
+        ),
+        RemoteCandidateIncarnationTryClaim::Committed(
+            RemoteCandidateIncarnationClaim::Reset {
+                old_incarnation: 4_000,
+                new_incarnation: 4_001,
+            },
+        )
+    ));
+}
+
+#[tokio::test]
 async fn peer_left_before_candidate_apply_preserves_first_and_same_incarnation_floors() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();

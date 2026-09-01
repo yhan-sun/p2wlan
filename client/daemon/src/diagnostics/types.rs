@@ -113,9 +113,8 @@ pub struct DiagnosticsSnapshot {
     /// `/status.uptime_ms` and timeline-event `at_ms` clock; it is not Unix time.
     #[serde(default)]
     pub captured_at_ms: u64,
-    /// Whether `peers` came from an older validated capture. The current
-    /// endpoint fails closed with 503 under sustained lock contention, so a
-    /// successful response always sets this to false.
+    /// Whether `peers` came from an older validated capture because a live
+    /// connection-map read was blocked by an active or fairly queued writer.
     #[serde(default)]
     pub peer_snapshot_stale: bool,
     /// Age of the validated peer capture when this response was assembled.
@@ -455,6 +454,7 @@ impl DiagnosticsContext {
 #[derive(Debug, Clone)]
 struct CachedPeerSnapshot {
     peers: Vec<PeerDiagnostics>,
+    network_generation: u64,
     capture_revision: u64,
     captured_at: std::time::Instant,
     captured_at_ms: u64,

@@ -2,6 +2,12 @@
 // Peer Manager
 // ============================================================
 
+type NetworkGenerationHandshakeCancellation = (usize, usize, Vec<(String, String)>);
+type NetworkGenerationHandshakeCancelHook =
+    Arc<dyn Fn(u64) -> NetworkGenerationHandshakeCancellation + Send + Sync>;
+type NetworkGenerationHandshakeCancelHookSlot =
+    Arc<std::sync::Mutex<Option<NetworkGenerationHandshakeCancelHook>>>;
+
 /// The local, non-wire identity fence for one Hard↔Hard rendezvous.
 ///
 /// The session id alone is not sufficient: a late response from an older
@@ -334,6 +340,10 @@ pub struct PeerManager {
     /// advances between the read and the lock would let a stale entry pass the
     /// check).
     network_generation_sync: Arc<std::sync::atomic::AtomicU64>,
+    /// Nonblocking daemon hook that cancels exact handshake reservations from
+    /// older generations in the same generation-advance transaction.  The
+    /// hook performs only a short synchronous pending-state mutation.
+    network_generation_handshake_cancel_hook: NetworkGenerationHandshakeCancelHookSlot,
     /// Shared network-epoch gate serializing every generation advance against
     /// every UDP socket-state mutation that stamps, commits, finalizes or
     /// adopts socket ownership for a generation.
@@ -495,6 +505,11 @@ pub struct PeerManager {
     /// is verified before RelayPeerConfirmed is set.
     relay_probe_expectations:
         Arc<std::sync::Mutex<HashMap<String, crate::relay_probe::RelayProbeExpectation>>>,
+    /// Authenticated Relay business evidence which could not immediately take
+    /// the epoch/connection transaction. One newest-wins entry per peer, with
+    /// a strict TTL and global capacity bound.
+    pending_relay_business_evidence:
+        Arc<std::sync::Mutex<HashMap<String, PendingRelayBusinessEvidence>>>,
     /// Bounded per-peer path-commit expectations: the token the local daemon
     /// sent in a synthetic path-commit request, against which a relay-ingress
     /// ACK is verified before the relay-first business gate is closed for

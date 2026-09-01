@@ -1,7 +1,7 @@
 struct HandshakeMaintenanceContext {
     peers: Arc<PeerManager>,
     transport: WireGuardTransport,
-    pending: Arc<tokio::sync::Mutex<PendingHandshakeState>>,
+    pending: Arc<PendingHandshakeStore>,
     handshake_arbiter: HandshakeArbiter,
     control: ControlClient,
     local_candidates: Arc<RwLock<Vec<String>>>,
@@ -19,6 +19,71 @@ struct HandshakeMaintenanceContext {
     /// immediately. The ten-second tick remains the recovery backstop, but it
     /// must not be the first chance to recreate a missing encrypted session.
     kick_rx: tokio::sync::watch::Receiver<u64>,
+    handshake_retry_kick_tx: tokio::sync::watch::Sender<u64>,
+}
+
+enum MaintenanceInitiatorReservationOutcome {
+    Reserved {
+        reservation: HandshakeStartReservation,
+        stale_session_id: Option<String>,
+        retry_budget_reset: bool,
+    },
+    Busy,
+    Contended,
+}
+
+/// Claim the maintenance producer's long-lived reservation in one short,
+/// zero-wait mutation turn. All actor/control/candidate snapshots happen
+/// before this function and every slow continuation happens after it.
+fn try_reserve_maintenance_initiator(
+    pending: &PendingHandshakeStore,
+    handshake_arbiter: &HandshakeArbiter,
+    peer_id: &str,
+    network_generation: u64,
+    peer_session_generation: PeerSessionGeneration,
+) -> MaintenanceInitiatorReservationOutcome {
+    let identity = HandshakeLeaseIdentity::new(
+        peer_id,
+        HandshakeOwnerKind::MaintenanceInitiator,
+        None,
+        network_generation,
+        Some(peer_session_generation),
+        "reserve",
+    );
+    let Ok(handshake_guard) = handshake_arbiter.try_acquire(identity) else {
+        return MaintenanceInitiatorReservationOutcome::Contended;
+    };
+    let transaction = pending.try_with(|state| {
+        let stale_session_id = state.remove_stale_pending_for_generation(
+            peer_id,
+            network_generation,
+            peer_session_generation,
+        );
+        let reservation = state.reserve_start_with_owner_at_generation_and_kind(
+            peer_id,
+            network_generation,
+            peer_session_generation,
+            HandshakeOwnerKind::MaintenanceInitiator,
+        );
+        let retry_budget_reset = reservation.is_some()
+            && state.attempts.get(peer_id).copied().unwrap_or(0) >= MAX_HANDSHAKE_ATTEMPTS;
+        if retry_budget_reset {
+            state.attempts.remove(peer_id);
+        }
+        (stale_session_id, reservation, retry_budget_reset)
+    });
+    drop(handshake_guard);
+    let Some((stale_session_id, reservation, retry_budget_reset)) = transaction else {
+        return MaintenanceInitiatorReservationOutcome::Contended;
+    };
+    match reservation {
+        Some(reservation) => MaintenanceInitiatorReservationOutcome::Reserved {
+            reservation,
+            stale_session_id,
+            retry_budget_reset,
+        },
+        None => MaintenanceInitiatorReservationOutcome::Busy,
+    }
 }
 
 async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
@@ -40,6 +105,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
         udp_advertise,
         node_private_key,
         mut kick_rx,
+        handshake_retry_kick_tx,
     } = ctx;
 
     let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -52,6 +118,19 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 }
                 kick_rx.borrow_and_update();
             }
+        }
+        // The exact retry record is committed before its wake.  Republishing
+        // the current revision from the supervised maintenance owner makes a
+        // receiver replacement or coalesced watch notification harmless: the
+        // control coordinator always scans the authoritative ledger.
+        let retry_revision = {
+            let state = pending.lock();
+            state
+                .has_initiator_retries()
+                .then(|| state.retry_revision())
+        };
+        if let Some(retry_revision) = retry_revision {
+            handshake_retry_kick_tx.send_replace(retry_revision);
         }
         let conns = peers.all_connections().await;
         for conn in conns {
@@ -72,13 +151,13 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 );
                 continue;
             }
-            let handshake_guard = handshake_arbiter.acquire(&conn.node_id).await;
-            let Some(peer_session_generation) =
-                peers.peer_session_generation_sync(&conn.node_id)
+            let Some(peer_session_generation) = peers.peer_session_generation_sync(&conn.node_id)
             else {
                 continue;
             };
-            // Establish missing sessions and refresh sessions that need rekey.
+            // Maintenance is a low-priority producer.  Snapshot every actor or
+            // control-plane dependency before attempting the zero-wait mutation
+            // turn; an Event/Responder owner must never queue behind this scan.
             let status = transport.session_status(&conn.node_id).await;
             if status.has_pending_responder {
                 debug!(
@@ -108,102 +187,60 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 );
             }
             let handshake_generation = peers.current_network_generation_sync();
+            let control_peers = control.peers().await;
+            let Some(peer_info) = control_peers.get(&conn.node_id) else {
+                debug!("No control peer info for handshake with {}", conn.node_id);
+                continue;
+            };
+            let Ok(private_key) = decode_x25519_key(&node_private_key, "node private key") else {
+                continue;
+            };
+            let Ok(peer_public) = decode_x25519_key(&peer_info.public_key, "peer public key")
+            else {
+                continue;
+            };
+            let identity = NodeIdentity::from_private_key(private_key);
+            if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
+                continue;
+            }
+            let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
+            let Ok(initiation) = initiator.create_initiation() else {
+                continue;
+            };
+            let initiation_bytes = initiation.to_bytes();
 
-            // Reserve before any further awaits.  The peer-join path can run at
-            // the same time as this maintenance loop; without this reservation,
-            // both paths could create an initiator and the later one would
-            // overwrite the former pending handshake.
-            let stale_session_id = pending
-                .lock()
-                .await
-                .remove_stale_pending_for_generation(
+            let (mut reservation, stale_session_id, retry_budget_reset) =
+                match try_reserve_maintenance_initiator(
+                    &pending,
+                    &handshake_arbiter,
                     &conn.node_id,
                     handshake_generation,
                     peer_session_generation,
+                ) {
+                    MaintenanceInitiatorReservationOutcome::Reserved {
+                        reservation,
+                        stale_session_id,
+                        retry_budget_reset,
+                    } => (reservation, stale_session_id, retry_budget_reset),
+                    MaintenanceInitiatorReservationOutcome::Busy
+                    | MaintenanceInitiatorReservationOutcome::Contended => {
+                        // A high-priority Event/Responder turn owns the peer, or
+                        // the short state store is momentarily busy. Never join
+                        // either wait queue; a kick/tick reevaluates lifecycle.
+                        continue;
+                    }
+                };
+            if retry_budget_reset {
+                warn!(
+                    "Handshake for {} reached max attempts; resetting retry budget",
+                    conn.node_id
                 );
+            }
             if let Some(session_id) = stale_session_id {
                 peers
                     .discard_pending_probe_session_binding(&conn.node_id, &session_id)
                     .await;
             }
-            let Some(reservation) = ({
-                let mut state = pending.lock().await;
-                let reservation = state.reserve_start_with_owner_at_generation(
-                    &conn.node_id,
-                    handshake_generation,
-                    peer_session_generation,
-                );
-                if reservation.is_some()
-                    && state.attempts.get(&conn.node_id).copied().unwrap_or(0)
-                        >= MAX_HANDSHAKE_ATTEMPTS
-                {
-                    warn!(
-                        "Handshake for {} reached max attempts; resetting retry budget",
-                        conn.node_id
-                    );
-                    state.attempts.remove(&conn.node_id);
-                }
-                reservation
-            }) else {
-                continue;
-            };
-
-            // PeerConnection doesn't store public key; look up from control.
-            // Best-effort: if control has the peer, use it.
-            // (control.peers is async)
-            // We intentionally skip initiation if we can't get the key —
-            // the peer may also rekey from its side.
-            let control_peers = control.peers().await;
-            let Some(peer_info) = control_peers.get(&conn.node_id) else {
-                pending
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                debug!("No control peer info for handshake with {}", conn.node_id);
-                continue;
-            };
-            let Ok(private_key) = decode_x25519_key(&node_private_key, "node private key") else {
-                pending
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                continue;
-            };
-            let Ok(peer_public) = decode_x25519_key(&peer_info.public_key, "peer public key")
-            else {
-                pending
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                continue;
-            };
-            let identity = NodeIdentity::from_private_key(private_key);
-            if !local_is_designated_handshake_initiator(&identity.public_key(), &peer_public) {
-                // Let the deterministically selected peer initiate.
-                pending
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                continue;
-            }
-            let mut initiator = HandshakeInitiator::new(identity, peer_public, None);
-            let Ok(initiation) = initiator.create_initiation() else {
-                pending
-                    .lock()
-                    .await
-                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                continue;
-            };
-            let initiation_bytes = initiation.to_bytes();
-            // The per-peer handshake reservation above is the actual
-            // mutual-exclusion primitive.  The arbiter guard must NOT be held
-            // across the slow steps below (STUN candidate refresh, control
-            // plane offer POST): a crossing inbound offer/answer handler
-            // waits on the same arbiter, and holding it through a multi-second
-            // refresh or POST stalls (or effectively deadlocks) the responder
-            // path — the peer never answers, the session never forms, and
-            // direct validation can never promote.
-            drop(handshake_guard);
             // Rekey defaults to the cached candidate snapshot: a live STUN
             // gather is only run when no snapshot exists yet (first boot), so
             // a healthy Direct peer's rekey never re-triggers traversal churn.
@@ -212,7 +249,12 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 let snapshot_state = candidate_snapshot.read().await.clone();
                 let leased = snapshot_state.as_ref().and_then(|snapshot| {
                     (snapshot.initial_gather_complete && !snapshot.candidates.is_empty()).then(
-                        || (snapshot.candidates.clone(), snapshot.candidate_sources.clone()),
+                        || {
+                            (
+                                snapshot.candidates.clone(),
+                                snapshot.candidate_sources.clone(),
+                            )
+                        },
                     )
                 });
                 let startup_snapshot_is_provisional = snapshot_state
@@ -271,54 +313,82 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     reservation.peer_session_generation,
                 )
                 || should_cancel_maintenance_offer(
-                is_rekey,
-                current_status.has_active,
-                current_status.needs_rekey,
-                current_status.expired,
-                current_status.has_pending_responder,
-            )
+                    is_rekey,
+                    current_status.has_active,
+                    current_status.needs_rekey,
+                    current_status.expired,
+                    current_status.has_pending_responder,
+                )
             {
                 pending
                     .lock()
-                    .await
                     .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 continue;
             }
 
             let session_id = new_probe_session_id();
             let (probe_ephemeral, probe_ephemeral_public_key) = new_probe_ephemeral_keypair();
+            let publish_identity = HandshakeLeaseIdentity::new(
+                &conn.node_id,
+                HandshakeOwnerKind::MaintenanceInitiator,
+                Some(reservation.owner),
+                handshake_generation,
+                Some(reservation.peer_session_generation),
+                "publish",
+            );
+            let Ok(publish_guard) = handshake_arbiter.try_acquire(publish_identity) else {
+                pending
+                    .lock()
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                continue;
+            };
             let Some((attempt_no, pending_id)) = ({
                 let epoch_gate = peers.network_epoch_gate();
-                let _epoch_guard = epoch_gate.lock().await;
-                if peers.current_network_generation_sync() != handshake_generation
+                let Ok(_epoch_guard) = epoch_gate.try_lock() else {
+                    drop(publish_guard);
+                    pending
+                        .lock()
+                        .cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                    continue;
+                };
+                if *reservation.cancellation.borrow()
+                    || peers.current_network_generation_sync() != handshake_generation
                     || !peers.peer_session_is_current_sync(
                         &conn.node_id,
                         reservation.peer_session_generation,
                     )
                 {
+                    drop(_epoch_guard);
+                    drop(publish_guard);
                     pending
                         .lock()
-                        .await
                         .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                     continue;
                 }
-                let mut state = pending.lock().await;
-                state
-                    .insert_reserved_if_current_with_generation(
-                        conn.node_id.clone(),
-                        reservation.owner,
-                        initiator,
-                        Some(session_id.clone()),
-                        Some(probe_ephemeral),
-                        handshake_generation,
-                        reservation.peer_session_generation,
-                    )
-                    .map(|pending_id| {
-                        let attempts = state.attempts.entry(conn.node_id.clone()).or_insert(0);
-                        *attempts = attempts.saturating_add(1);
-                        (*attempts, pending_id)
-                    })
+                let inserted = pending.try_with(|state| {
+                    state
+                        .insert_reserved_if_current_with_generation(
+                            conn.node_id.clone(),
+                            reservation.owner,
+                            initiator,
+                            Some(session_id.clone()),
+                            Some(probe_ephemeral),
+                            handshake_generation,
+                            reservation.peer_session_generation,
+                        )
+                        .map(|pending_id| {
+                            let attempts = state.attempts.entry(conn.node_id.clone()).or_insert(0);
+                            *attempts = attempts.saturating_add(1);
+                            (*attempts, pending_id)
+                        })
+                });
+                drop(_epoch_guard);
+                drop(publish_guard);
+                inserted.flatten()
             }) else {
+                pending
+                    .lock()
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 continue;
             };
             // An inbound responder rekey can be staged after the candidate
@@ -326,28 +396,56 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             // staged. Re-check at the mutation boundary so the crossing
             // initiator never overwrites the responder's pending binding.
             let pre_probe_status = transport.session_status(&conn.node_id).await;
-            if should_cancel_maintenance_offer(
-                is_rekey,
-                pre_probe_status.has_active,
-                pre_probe_status.needs_rekey,
-                pre_probe_status.expired,
-                pre_probe_status.has_pending_responder,
-            ) {
-                pending.lock().await.remove(&conn.node_id);
+            if *reservation.cancellation.borrow()
+                || peers.current_network_generation_sync() != handshake_generation
+                || !peers.peer_session_is_current_sync(
+                    &conn.node_id,
+                    reservation.peer_session_generation,
+                )
+                || should_cancel_maintenance_offer(
+                    is_rekey,
+                    pre_probe_status.has_active,
+                    pre_probe_status.needs_rekey,
+                    pre_probe_status.expired,
+                    pre_probe_status.has_pending_responder,
+                )
+            {
+                pending.lock().remove_if_current(&conn.node_id, pending_id);
                 continue;
             }
-            if peers
-                .stage_probe_session_binding(
-                    &conn.node_id,
-                    session_id.clone(),
-                    Some(session_id.clone()),
-                    None,
-                    false,
-                )
-                .await
-                != ProbeBindingStage::Staged
-            {
-                pending.lock().await.remove(&conn.node_id);
+            // Stage the Probe binding in the same generation transaction and
+            // never queue a connection writer. Maintenance is the low-priority
+            // producer: contention cancels this exact pending owner and the
+            // next kick/tick takes a fresh snapshot.
+            let binding_stage = {
+                let epoch_gate = peers.network_epoch_gate();
+                let Ok(_epoch_guard) = epoch_gate.try_lock() else {
+                    pending.lock().remove_if_current(&conn.node_id, pending_id);
+                    continue;
+                };
+                if *reservation.cancellation.borrow()
+                    || peers.current_network_generation_sync() != handshake_generation
+                    || !peers.peer_session_is_current_sync(
+                        &conn.node_id,
+                        reservation.peer_session_generation,
+                    )
+                {
+                    None
+                } else {
+                    peers.try_stage_probe_session_binding(
+                        &conn.node_id,
+                        session_id.clone(),
+                        Some(session_id.clone()),
+                        None,
+                        false,
+                    )
+                }
+            };
+            if binding_stage != Some(ProbeBindingStage::Staged) {
+                pending.lock().remove_if_current(&conn.node_id, pending_id);
+                peers
+                    .discard_pending_probe_session_binding(&conn.node_id, &session_id)
+                    .await;
                 warn!(
                     "Failed to stage Probe v2 binding for handshake with {}",
                     conn.node_id
@@ -356,8 +454,8 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             }
 
             let punch_at_ms = Some(relay_assisted_punch_at_ms());
-            let offer_result = control
-                .send_peer_offer_with_sources_punch_and_session(
+            let Some(offer_result) = await_initiator_offer_or_cancellation(
+                control.send_peer_offer_with_sources_punch_and_session(
                     &conn.node_id,
                     &candidates,
                     &candidate_sources,
@@ -365,8 +463,16 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     punch_at_ms,
                     Some(session_id.clone()),
                     Some(probe_ephemeral_public_key.clone()),
-                )
-                .await;
+                ),
+                &mut reservation.cancellation,
+            )
+            .await
+            else {
+                peers
+                    .discard_pending_probe_session_binding(&conn.node_id, &session_id)
+                    .await;
+                continue;
+            };
             if offer_result.is_ok() {
                 if is_rekey {
                     info!(
@@ -412,7 +518,7 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 // an answer/retry/rejoin that replaced it makes this task a
                 // no-op. The stored lifecycle stamp closes the same-node ABA.
                 let removed = {
-                    let mut state = pending2.lock().await;
+                    let mut state = pending2.lock();
                     if state.is_current(&timeout_peer, pending_id)
                         && state.peer_session_generation(&timeout_peer)
                             == Some(timeout_peer_session_generation)
@@ -430,10 +536,9 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     return;
                 }
 
-                if peers2.peer_session_is_current_sync(
-                    &timeout_peer,
-                    timeout_peer_session_generation,
-                ) {
+                if peers2
+                    .peer_session_is_current_sync(&timeout_peer, timeout_peer_session_generation)
+                {
                     let status = transport2.session_status(&timeout_peer).await;
                     if !is_rekey
                         && !status.has_active

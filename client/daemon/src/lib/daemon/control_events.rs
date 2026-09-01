@@ -82,6 +82,9 @@ fn responder_offer_error_is_retryable(error: &DaemonError) -> bool {
             error,
             DaemonError::Network(reason)
                 if reason == REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT
+                    || reason == REASON_RESPONDER_SESSION_STAGE_TIMEOUT
+                    || reason == REASON_RESPONDER_PROBE_BINDING_CONTENDED
+                    || reason == REASON_RESPONDER_COMMIT_CONTENDED
         )
 }
 
@@ -90,6 +93,15 @@ fn responder_offer_error_reason_code(error: &DaemonError) -> &'static str {
         DaemonError::ControlPlane(_) => "control_plane_error",
         DaemonError::Network(reason) if reason == REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT => {
             REASON_RESPONDER_HANDSHAKE_ARBITER_TIMEOUT
+        }
+        DaemonError::Network(reason) if reason == REASON_RESPONDER_SESSION_STAGE_TIMEOUT => {
+            REASON_RESPONDER_SESSION_STAGE_TIMEOUT
+        }
+        DaemonError::Network(reason) if reason == REASON_RESPONDER_PROBE_BINDING_CONTENDED => {
+            REASON_RESPONDER_PROBE_BINDING_CONTENDED
+        }
+        DaemonError::Network(reason) if reason == REASON_RESPONDER_COMMIT_CONTENDED => {
+            REASON_RESPONDER_COMMIT_CONTENDED
         }
         _ => "responder_offer_error",
     }
@@ -166,12 +178,109 @@ enum RemoteIncarnationResetWork {
     PreserveResponder,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteIncarnationResetOutcome {
+    Unchanged,
+    Changed,
+    RejectedIdentity,
+    RejectedLifecycle,
+    PendingCleanup,
+    ContendedEpoch,
+    ContendedConnections,
+}
+
+impl RemoteIncarnationResetOutcome {
+    const fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::PendingCleanup | Self::ContendedEpoch | Self::ContendedConnections
+        )
+    }
+
+    const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Changed => "changed",
+            Self::RejectedIdentity => "stale_sender_identity",
+            Self::RejectedLifecycle => "remote_incarnation_cleanup_rejected",
+            Self::PendingCleanup => "remote_incarnation_cleanup_pending",
+            Self::ContendedEpoch => "network_epoch_busy",
+            Self::ContendedConnections => "connections_busy",
+        }
+    }
+}
+
 impl Daemon {
+    fn kick_handshake_after_remote_incarnation_rotation(
+        &self,
+        peer_id: &str,
+        claimed_incarnation: u64,
+    ) {
+        // Rotating PeerSessionGeneration correctly invalidates every starting
+        // initiator reservation stamped by the retired incarnation. Publish a
+        // separate commit-before-wake edge so the supervised maintenance
+        // owner immediately reserves a replacement under the new generation
+        // when this node is the deterministic initiator. The responder role
+        // observes the same edge and exits without claiming a reservation.
+        self.path_setup_kick_tx
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.timeline.emit(
+            "remote_incarnation_handshake_restart_kicked",
+            None,
+            Some("peer_session_generation_rotated"),
+            Some(format!(
+                "peer={peer_id} incarnation={claimed_incarnation}"
+            )),
+        );
+    }
+
+    fn clear_peer_handshake_lifecycle(&self, peer_id: &str, phase: &'static str) {
+        let identity = HandshakeLeaseIdentity::new(
+            peer_id,
+            HandshakeOwnerKind::Cleanup,
+            None,
+            self.peers.current_network_generation_sync(),
+            self.peers.peer_session_generation_sync(peer_id),
+            phase,
+        );
+        let lease = self.handshake_arbiter.try_acquire(identity);
+        match lease {
+            Ok(lease) => {
+                let cleared = self
+                    .pending_handshakes
+                    .try_with(|state| state.clear_peer(peer_id))
+                    .is_some();
+                drop(lease);
+                if !cleared {
+                    // Authoritative lifecycle cancellation may briefly wait
+                    // for another short pending-state transaction, but never
+                    // while owning the handshake mutation turn.
+                    self.pending_handshakes.lock().clear_peer(peer_id);
+                }
+            }
+            Err(contention) => {
+                self.pending_handshakes.lock().clear_peer(peer_id);
+                let holder = contention
+                    .holder
+                    .as_ref()
+                    .map(HandshakeHolderSnapshot::detail)
+                    .unwrap_or_else(|| "holder_kind=unknown holder_phase=unknown".to_string());
+                self.timeline.emit(
+                    "handshake_cleanup_turn_contended",
+                    None,
+                    Some("arbiter_contended"),
+                    Some(format!("peer={peer_id} phase={phase} {holder}")),
+                );
+            }
+        }
+    }
+
     /// A same-node remote restart is identified by the encoded candidate
     /// generation carried in its offer. Keep this narrow: endpoint metadata is
     /// also changed by ordinary NAT churn and is not safe as a lifecycle
-    /// signal. The arbiter covers the short state boundary; UDP cleanup then
-    /// invalidates late probes and dynamic socket adoption.
+    /// signal. PeerManager's claimed-incarnation transaction and the exact
+    /// peer-session generation provide the boundary; the handshake arbiter is
+    /// intentionally absent because this cleanup crosses actor awaits.
     #[cfg(test)]
     async fn reset_peer_for_remote_incarnation_if_needed(
         &self,
@@ -186,146 +295,165 @@ impl Daemon {
             pending_work,
         )
         .await
-        .unwrap_or(false)
+            == RemoteIncarnationResetOutcome::Changed
     }
 
-    /// Identity-aware production preflight. `None` means the signal belonged
-    /// to a retired public key and must be dropped wholesale; `Some(changed)`
-    /// preserves the original restart-result contract for legacy callers.
+    /// Identity-aware production preflight.  Responder/candidate owners use
+    /// the non-queuing claim and receive explicit contention; other lifecycle
+    /// callers retain their existing serialized claim transaction.
     async fn reset_peer_for_remote_incarnation_if_needed_for_identity(
         &self,
         peer_id: &str,
         candidate_generation: u64,
         sender_public_key: Option<&str>,
         pending_work: RemoteIncarnationResetWork,
-    ) -> Option<bool> {
+    ) -> RemoteIncarnationResetOutcome {
         if pending_work == RemoteIncarnationResetWork::PreserveResponder {
-            // `responder_work` is cooperatively polled by the serial control
-            // loop. If it held the arbiter while awaiting transport/UDP actors,
-            // a lifecycle branch could wait for that arbiter and stop polling
-            // its owner forever. Run the complete claim/cleanup/commit turn in
-            // an independently scheduled task so the owner keeps progressing.
-            let handshake_arbiter = self.handshake_arbiter.clone();
-            let transport = self.transport.clone();
-            let punch_attempts = self.punch_attempts.clone();
-            let udp_transport = self.udp_transport.clone();
-            let peers = self.peers.clone();
-            let pending_handshakes = self.pending_handshakes.clone();
-            let timeline = self.timeline.clone();
-            let peer_id = peer_id.to_string();
-            let peer_id_for_error = peer_id.clone();
-            let sender_public_key = sender_public_key.map(str::to_string);
-            return match tokio::spawn(async move {
-                let handshake_guard = handshake_arbiter.acquire(&peer_id).await;
-                let claim = peers
-                    .claim_remote_candidate_incarnation_for_identity(
-                        &peer_id,
-                        candidate_generation,
-                        sender_public_key.as_deref(),
-                    )
-                    .await;
-                let (old_incarnation, claimed_incarnation) = match claim {
-                    crate::peer::RemoteCandidateIncarnationClaim::IdentityMismatch => {
-                        drop(handshake_guard);
-                        peers
-                            .record_direct_event(
-                                &peer_id,
-                                "remote_signal_stale_identity",
-                                None,
-                                None,
-                                None,
-                                format!(
-                                    "ignored signal before incarnation/handshake/candidate mutation candidate_generation={candidate_generation}"
-                                ),
-                            )
-                            .await;
-                        timeline.emit(
-                            "remote_signal_rejected",
+            // A claim publishes the incarnation high-water before its slow
+            // transport cleanup commits. Candidate and responder futures are
+            // independently polled, so fence that interval explicitly: the
+            // second future must not reinterpret the claimed high-water as a
+            // completed NoReset lifecycle.
+            if let Some(pending_incarnation) = self
+                .pending_handshakes
+                .lock()
+                .remote_incarnation_reset_in_progress(peer_id)
+            {
+                return if crate::control::candidate_generation_incarnation(candidate_generation)
+                    .is_some_and(|incoming| incoming < pending_incarnation)
+                {
+                    RemoteIncarnationResetOutcome::RejectedLifecycle
+                } else {
+                    RemoteIncarnationResetOutcome::PendingCleanup
+                };
+            }
+            let claim = self
+                .peers
+                .try_claim_remote_candidate_incarnation_for_identity(
+                    peer_id,
+                    candidate_generation,
+                    sender_public_key,
+                );
+            let (old_incarnation, claimed_incarnation) = match claim {
+                crate::peer::RemoteCandidateIncarnationTryClaim::ContendedEpoch => {
+                    return RemoteIncarnationResetOutcome::ContendedEpoch;
+                }
+                crate::peer::RemoteCandidateIncarnationTryClaim::ContendedConnections => {
+                    return RemoteIncarnationResetOutcome::ContendedConnections;
+                }
+                crate::peer::RemoteCandidateIncarnationTryClaim::Committed(
+                    crate::peer::RemoteCandidateIncarnationClaim::IdentityMismatch,
+                ) => {
+                    self.peers
+                        .record_direct_event(
+                            peer_id,
+                            "remote_signal_stale_identity",
                             None,
-                            Some("stale_sender_identity"),
-                            Some(format!(
-                                "peer={peer_id} candidate_generation={candidate_generation}"
-                            )),
-                        );
-                        return None;
-                    }
-                    crate::peer::RemoteCandidateIncarnationClaim::NoReset => {
-                        drop(handshake_guard);
-                        return Some(false);
-                    }
+                            None,
+                            None,
+                            format!(
+                                "ignored signal before incarnation/handshake/candidate mutation candidate_generation={candidate_generation}"
+                            ),
+                        )
+                        .await;
+                    self.timeline.emit(
+                        "remote_signal_rejected",
+                        None,
+                        Some("stale_sender_identity"),
+                        Some(format!(
+                            "peer={peer_id} candidate_generation={candidate_generation}"
+                        )),
+                    );
+                    return RemoteIncarnationResetOutcome::RejectedIdentity;
+                }
+                crate::peer::RemoteCandidateIncarnationTryClaim::Committed(
+                    crate::peer::RemoteCandidateIncarnationClaim::RejectedLifecycle,
+                ) => return RemoteIncarnationResetOutcome::RejectedLifecycle,
+                crate::peer::RemoteCandidateIncarnationTryClaim::Committed(
+                    crate::peer::RemoteCandidateIncarnationClaim::NoReset,
+                ) => return RemoteIncarnationResetOutcome::Unchanged,
+                crate::peer::RemoteCandidateIncarnationTryClaim::Committed(
                     crate::peer::RemoteCandidateIncarnationClaim::Reset {
                         old_incarnation,
                         new_incarnation,
-                    } => (old_incarnation, new_incarnation),
-                };
+                    },
+                ) => (old_incarnation, new_incarnation),
+            };
+            if !self
+                .pending_handshakes
+                .lock()
+                .begin_remote_incarnation_reset(peer_id, claimed_incarnation)
+            {
+                return RemoteIncarnationResetOutcome::PendingCleanup;
+            }
 
-                let retiring_peer_session = peers.peer_session_generation_sync(&peer_id);
-                if let Some(retiring_peer_session) = retiring_peer_session {
-                    punch_attempts.retire_peer_session(&peer_id, retiring_peer_session);
-                } else {
-                    punch_attempts.cancel(&peer_id);
-                }
-                info!(
-                    event = "peer_restart_detected",
-                    peer_id = %peer_id,
+            let retiring_peer_session = self.peers.peer_session_generation_sync(peer_id);
+            if let Some(retiring_peer_session) = retiring_peer_session {
+                self.punch_attempts
+                    .retire_peer_session(peer_id, retiring_peer_session);
+            } else {
+                self.punch_attempts.cancel(peer_id);
+            }
+            info!(
+                event = "peer_restart_detected",
+                peer_id = %peer_id,
+                old_incarnation,
+                new_incarnation = claimed_incarnation,
+                caller = "control_events.remote_incarnation_responder",
+                "remote daemon incarnation advanced; rotating the peer session"
+            );
+            self.transport
+                .remove_session_with_reason(
+                    peer_id,
+                    "remote_incarnation_changed",
+                    "control_events.remote_incarnation_responder",
+                )
+                .await;
+            let udp_slot = self.udp_transport.read().await;
+            let changed = if let Some(udp) = udp_slot.clone() {
+                // Keep the UDP adoption fence held from old-session cleanup
+                // through publication of the rotated PeerSessionGeneration.
+                udp.cleanup_peer_lifecycle_and_finish_remote_incarnation_reset(
+                    peer_id,
+                    "remote_incarnation_changed",
                     old_incarnation,
-                    new_incarnation = claimed_incarnation,
-                    caller = "control_events.remote_incarnation_responder",
-                    "remote daemon incarnation advanced; rotating the peer session"
-                );
-                transport
-                    .remove_session_with_reason(
-                        &peer_id,
-                        "remote_incarnation_changed",
-                        "control_events.remote_incarnation_responder",
-                    )
-                    .await;
-                let udp_slot = udp_transport.read().await;
-                let changed = if let Some(udp) = udp_slot.clone() {
-                    // Keep the UDP adoption fence held from old-session cleanup
-                    // through publication of the rotated PeerSessionGeneration.
-                    udp.cleanup_peer_lifecycle_and_finish_remote_incarnation_reset(
-                        &peer_id,
-                        "remote_incarnation_changed",
+                    claimed_incarnation,
+                )
+                .await
+            } else {
+                // The slot read guard prevents a replacement UDP transport
+                // from publishing before the reset commit completes.
+                self.peers
+                    .finish_claimed_remote_incarnation_reset(
+                        peer_id,
                         old_incarnation,
                         claimed_incarnation,
+                        "remote_incarnation_changed",
                     )
                     .await
-                } else {
-                    // The slot read guard prevents a replacement UDP transport
-                    // from publishing before the reset commit completes.
-                    peers
-                        .finish_claimed_remote_incarnation_reset(
-                            &peer_id,
-                            old_incarnation,
-                            claimed_incarnation,
-                            "remote_incarnation_changed",
-                        )
-                        .await
-                };
-                if changed {
-                    pending_handshakes
-                        .lock()
-                        .await
-                        .clear_peer_except_responder_owner(&peer_id);
-                }
-                drop(udp_slot);
-                drop(handshake_guard);
-                Some(changed)
-            })
-            .await
-            {
-                Ok(changed) => changed,
-                Err(error) => {
-                    warn!(
-                        "Remote-incarnation responder reset task failed for {peer_id_for_error}: {error}"
-                    );
-                    Some(false)
-                }
+            };
+            if changed {
+                self.pending_handshakes
+                    .lock()
+                    .clear_peer_except_responder_owner(peer_id);
+            }
+            self.pending_handshakes
+                .lock()
+                .finish_remote_incarnation_reset(peer_id, claimed_incarnation);
+            drop(udp_slot);
+            if changed {
+                self.kick_handshake_after_remote_incarnation_rotation(
+                    peer_id,
+                    claimed_incarnation,
+                );
+            }
+            return if changed {
+                RemoteIncarnationResetOutcome::Changed
+            } else {
+                RemoteIncarnationResetOutcome::RejectedLifecycle
             };
         }
 
-        let handshake_guard = self.handshake_arbiter.acquire(peer_id).await;
         let claim = self
             .peers
             .claim_remote_candidate_incarnation_for_identity(
@@ -336,7 +464,6 @@ impl Daemon {
             .await;
         let (old_incarnation, claimed_incarnation) = match claim {
             crate::peer::RemoteCandidateIncarnationClaim::IdentityMismatch => {
-                drop(handshake_guard);
                 self.peers
                     .record_direct_event(
                         peer_id,
@@ -357,11 +484,13 @@ impl Daemon {
                         "peer={peer_id} candidate_generation={candidate_generation}"
                     )),
                 );
-                return None;
+                return RemoteIncarnationResetOutcome::RejectedIdentity;
+            }
+            crate::peer::RemoteCandidateIncarnationClaim::RejectedLifecycle => {
+                return RemoteIncarnationResetOutcome::RejectedLifecycle;
             }
             crate::peer::RemoteCandidateIncarnationClaim::NoReset => {
-                drop(handshake_guard);
-                return Some(false);
+                return RemoteIncarnationResetOutcome::Unchanged;
             }
             crate::peer::RemoteCandidateIncarnationClaim::Reset {
                 old_incarnation,
@@ -415,7 +544,7 @@ impl Daemon {
                 .await
         };
         if changed {
-            let mut pending = self.pending_handshakes.lock().await;
+            let mut pending = self.pending_handshakes.lock();
             match pending_work {
                 RemoteIncarnationResetWork::ClearAll => pending.clear_peer(peer_id),
                 RemoteIncarnationResetWork::PreserveInitiator => {
@@ -440,8 +569,15 @@ impl Daemon {
             }
         }
         drop(udp_slot);
-        drop(handshake_guard);
-        Some(changed)
+        if changed {
+            self.kick_handshake_after_remote_incarnation_rotation(
+                peer_id,
+                claimed_incarnation,
+            );
+            RemoteIncarnationResetOutcome::Changed
+        } else {
+            RemoteIncarnationResetOutcome::RejectedLifecycle
+        }
     }
 
     /// Decide whether an offer may touch candidate-plane state.
@@ -643,7 +779,11 @@ impl Daemon {
     ) -> bool {
         let deadline = Instant::now() + UNKNOWN_PEER_OFFER_WAIT;
         loop {
-            if self.peers.get_connection(peer_id).await.is_some() {
+            if self
+                .peers
+                .peer_identity_public_key_sync(peer_id)
+                .is_some()
+            {
                 return true;
             }
             if self
@@ -1223,7 +1363,6 @@ impl Daemon {
             let Some(next) = self
                 .pending_handshakes
                 .lock()
-                .await
                 .finish_peer_reflexive_work(&peer_id, reservation.owner)
             else {
                 return;
@@ -1234,12 +1373,12 @@ impl Daemon {
 
     /// Handle one admitted responder offer with a bounded, idempotent retry.
     ///
-    /// The control signal receiver acknowledges after local enqueue, so a
-    /// transient failure after dequeue must be repaired by the worker itself.
+    /// The exact durable receipt remains attached to this worker until the
+    /// responder transaction commits or returns a typed retry/terminal result.
     /// `handle_event_peer_offer` uses the exact responder cache keyed by the
     /// WireGuard token, therefore retrying the same plaintext offer cannot
-    /// create a second response or a second session.  No encrypted data
-    /// packet is retained here; this is control-plane handshake material only.
+    /// create a second response or a second session. No encrypted data packet
+    /// is retained here; this is control-plane handshake material only.
     async fn handle_admitted_responder_offer(
         &self,
         offer: &PendingPeerOffer,
@@ -1468,11 +1607,10 @@ impl Daemon {
         offer.complete_delivery(control::SignalApplyOutcome::Retry);
     }
 
-    /// Finish an offer that arrived before PeerJoined.  Candidate/fresh
-    /// admission is deliberately repeated after registration, because the
-    /// first attempt would return `PeerMissing` and must not consume a fresh
-    /// prediction identity.  The same responder owner handles queued retries.
-    async fn run_deferred_peer_offer_worker(
+    /// Consume only the latency-critical responder half of an offer.  Remote
+    /// incarnation admission is non-queuing; bounded contention completes the
+    /// durable receipt as Retry so ordered server delivery can replay it.
+    async fn run_responder_offer_worker(
         &self,
         mut offer: PendingPeerOffer,
         mut reservation: ResponderWorkReservation,
@@ -1494,7 +1632,6 @@ impl Daemon {
                 let Some(next) = self
                     .pending_handshakes
                     .lock()
-                    .await
                     .finish_responder_work(&peer_id, reservation.owner)
                 else {
                     offer.complete_delivery(control::SignalApplyOutcome::Retry);
@@ -1511,41 +1648,90 @@ impl Daemon {
             if let Some(newest) = self
                 .pending_handshakes
                 .lock()
-                .await
                 .take_queued_responder_work(&peer_id, reservation.owner)
             {
                 offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
                 offer = newest;
                 continue;
             }
-            let remote_incarnation_reset = match self
-                .reset_peer_for_remote_incarnation_if_needed_for_identity(
-                    &offer.from_node_id,
-                    offer.candidate_generation,
-                    offer.sender_public_key.as_deref(),
-                    RemoteIncarnationResetWork::PreserveResponder,
-                )
-                .await
-            {
-                Some(changed) => changed,
-                None => {
-                    // The queued signal belongs to a retired public-key
-                    // identity. Finish this exact owner turn normally so a
-                    // newer queued offer can run and the per-peer responder
-                    // lane cannot stay wedged.
-                    offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
-                    let Some(next) = self
-                        .pending_handshakes
-                        .lock()
-                        .await
-                        .finish_responder_work(&peer_id, reservation.owner)
-                    else {
-                        return;
-                    };
-                    offer = next;
-                    continue;
+            let mut reset_outcome = RemoteIncarnationResetOutcome::Unchanged;
+            for reset_attempt in 0..=RESPONDER_WORK_RETRY_LIMIT {
+                reset_outcome = self
+                    .reset_peer_for_remote_incarnation_if_needed_for_identity(
+                        &offer.from_node_id,
+                        offer.candidate_generation,
+                        offer.sender_public_key.as_deref(),
+                        RemoteIncarnationResetWork::PreserveResponder,
+                    )
+                    .await;
+                if !reset_outcome.retryable() {
+                    break;
                 }
-            };
+                if reset_attempt == RESPONDER_WORK_RETRY_LIMIT {
+                    break;
+                }
+                let delay = responder_offer_retry_delay(reset_attempt.saturating_add(1));
+                self.timeline.emit(
+                    "peer_offer_incarnation_retry",
+                    None,
+                    Some(reset_outcome.reason_code()),
+                    Some(format!(
+                        "peer={} owner={} retry_attempt={} delay_ms={}",
+                        peer_id,
+                        reservation.owner,
+                        reset_attempt.saturating_add(1),
+                        delay.as_millis()
+                    )),
+                );
+                tokio::select! {
+                    _ = sleep(delay) => {}
+                    changed = reservation.cancellation.changed() => {
+                        let _ = changed;
+                        offer.complete_delivery(control::SignalApplyOutcome::Retry);
+                        return;
+                    }
+                }
+            }
+            if reset_outcome == RemoteIncarnationResetOutcome::RejectedIdentity {
+                offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_responder_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+            if reset_outcome == RemoteIncarnationResetOutcome::RejectedLifecycle {
+                // The incarnation high-water mark has already advanced, but
+                // the claimed lifecycle was removed or superseded before its
+                // cleanup commit. This exact offer is stale; redelivery must
+                // not reinterpret a subsequent NoReset as a successful reset.
+                offer.complete_delivery(control::SignalApplyOutcome::TerminalRejected);
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_responder_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+            if reset_outcome.retryable() {
+                offer.complete_delivery(control::SignalApplyOutcome::Retry);
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_responder_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
             let Some(peer_session_generation) =
                 self.peers.peer_session_generation_sync(&offer.from_node_id)
             else {
@@ -1553,7 +1739,6 @@ impl Daemon {
                 let Some(next) = self
                     .pending_handshakes
                     .lock()
-                    .await
                     .finish_responder_work(&peer_id, reservation.owner)
                 else {
                     return;
@@ -1562,74 +1747,271 @@ impl Daemon {
                 continue;
             };
             offer.peer_session_generation = Some(peer_session_generation);
-            // The peer is now registered. Answer the encrypted initiation
-            // before candidate/fresh-prediction work, for the same reason as
-            // the normal known-peer path: a delayed candidate plane must not
-            // turn a delivered control signal into a silent handshake gap.
-            if !offer.handshake_init.is_empty() {
-                self.handle_admitted_responder_offer(
-                    &offer,
-                    reservation.owner,
-                    &mut reservation.cancellation,
-                )
-                .await;
-            }
+            self.handle_admitted_responder_offer(
+                &offer,
+                reservation.owner,
+                &mut reservation.cancellation,
+            )
+            .await;
             if *reservation.cancellation.borrow() {
-                if offer.handshake_init.is_empty() {
-                    offer.complete_delivery(control::SignalApplyOutcome::Retry);
-                }
                 return;
             }
-            // The offer-ingress verdict runs before any candidate-plane
-            // state: duplicates and rate-limited retransmissions never apply
-            // candidates, never run a fresh transaction and never trigger a
-            // punch — the handshake part below is still answered.
-            let (_fresh_verdict, candidate_apply_result, fresh_punch) = if self
-                .offer_ingress_verdict(
-                    &offer.from_node_id,
-                    &offer.candidates,
-                    &offer.candidate_sources,
-                    offer.candidates_expires_at_ms,
-                    offer.sender_public_key.as_deref(),
-                )
-                .await
-                == OfferIngressVerdict::Apply
+
+            let Some(next) = self
+                .pending_handshakes
+                .lock()
+                .finish_responder_work(&peer_id, reservation.owner)
+            else {
+                return;
+            };
+            offer = next;
+        }
+    }
+
+    /// Apply candidate/fresh-prediction work in its own bounded per-peer
+    /// owner.  Durable delivery was committed at enqueue, so contention is
+    /// repaired here without retaining a server receipt or blocking later
+    /// signals from the same sender.
+    async fn run_candidate_offer_worker(
+        &self,
+        mut offer: PendingPeerOffer,
+        mut reservation: CandidateOfferWorkReservation,
+    ) {
+        'work: loop {
+            let peer_id = offer.from_node_id.clone();
+            if *reservation.cancellation.borrow()
+                || !self
+                    .pending_handshakes
+                    .lock()
+                    .candidate_offer_work_is_current(&peer_id, reservation.owner)
             {
-                self.fresh_prediction_transaction(
-                    &offer.from_node_id,
-                    &offer.candidates,
-                    &offer.candidate_sources,
-                    offer.candidate_generation,
-                    offer.candidates_expires_at_ms,
-                    offer.sender_public_key.as_deref(),
-                )
+                return;
+            }
+            if !self
+                .wait_for_peer_offer_identity(&peer_id, &mut reservation.cancellation)
                 .await
-            } else {
-                self.peers
-                    .record_direct_event(
-                        &offer.from_node_id,
-                        "peer_offer_ingress_suppressed",
-                        None,
-                        Some(offer.candidates.len()),
-                        None,
-                        "offer suppressed by ingress verdict; candidate apply, fresh prediction and punch skipped; handshake still handled",
+            {
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_candidate_offer_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+            if let Some(newest) = self
+                .pending_handshakes
+                .lock()
+                .take_queued_candidate_offer_work(&peer_id, reservation.owner)
+            {
+                offer = newest;
+                continue;
+            }
+            if self.peers.current_network_generation_sync() != offer.network_generation {
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_candidate_offer_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+
+            let mut retry_attempt = 0u8;
+            let remote_incarnation_reset = loop {
+                let outcome = self
+                    .reset_peer_for_remote_incarnation_if_needed_for_identity(
+                        &peer_id,
+                        offer.candidate_generation,
+                        offer.sender_public_key.as_deref(),
+                        RemoteIncarnationResetWork::PreserveResponder,
                     )
                     .await;
-                (
-                    FreshSignalVerdict::None,
-                    CandidateSetApplyResult::IgnoredStale,
-                    FreshPunchDecision::None,
-                )
+                match outcome {
+                    RemoteIncarnationResetOutcome::Changed => break true,
+                    RemoteIncarnationResetOutcome::Unchanged => break false,
+                    RemoteIncarnationResetOutcome::RejectedIdentity
+                    | RemoteIncarnationResetOutcome::RejectedLifecycle => {
+                        let Some(next) = self
+                            .pending_handshakes
+                            .lock()
+                            .finish_candidate_offer_work(&peer_id, reservation.owner)
+                        else {
+                            return;
+                        };
+                        offer = next;
+                        continue 'work;
+                    }
+                    RemoteIncarnationResetOutcome::PendingCleanup
+                    | RemoteIncarnationResetOutcome::ContendedEpoch
+                    | RemoteIncarnationResetOutcome::ContendedConnections => {
+                        if let Some(newest) = self
+                            .pending_handshakes
+                            .lock()
+                            .take_queued_candidate_offer_work(&peer_id, reservation.owner)
+                        {
+                            offer = newest;
+                            continue 'work;
+                        }
+                        retry_attempt = retry_attempt.saturating_add(1);
+                        let delay = responder_offer_retry_delay(retry_attempt);
+                        self.timeline.emit(
+                            "peer_offer_candidate_retry",
+                            None,
+                            Some(outcome.reason_code()),
+                            Some(format!(
+                                "peer={} owner={} retry_attempt={} delay_ms={}",
+                                peer_id,
+                                reservation.owner,
+                                retry_attempt,
+                                delay.as_millis()
+                            )),
+                        );
+                        tokio::select! {
+                            _ = sleep(delay) => {}
+                            changed = reservation.cancellation.changed() => {
+                                let _ = changed;
+                                return;
+                            }
+                        }
+                    }
+                }
             };
+
+            offer.peer_session_generation = self.peers.peer_session_generation_sync(&peer_id);
+            let ingress = self
+                .offer_ingress_verdict(
+                    &peer_id,
+                    &offer.candidates,
+                    &offer.candidate_sources,
+                    offer.candidates_expires_at_ms,
+                    offer.sender_public_key.as_deref(),
+                )
+                .await;
+            let (_fresh_verdict, candidate_apply_result, fresh_punch) =
+                if ingress == OfferIngressVerdict::Apply {
+                    if matches!(
+                        fresh_prediction_from_sources(&offer.candidate_sources),
+                        Ok(None)
+                    ) {
+                        // Ordinary candidate revisions are the common cold-start
+                        // path. Never hold the epoch while queueing a connection
+                        // writer: the bounded candidate owner already retains the
+                        // exact payload and can retry without blocking RelayReady,
+                        // confirmation, status, or the responder receipt.
+                        let mut apply_retry_attempt = 0u8;
+                        let apply_result = loop {
+                            match self
+                                .peers
+                                .try_add_candidates_with_metadata_for_identity(
+                                    &peer_id,
+                                    &offer.candidates,
+                                    &offer.candidate_sources,
+                                    offer.candidate_generation,
+                                    offer.candidates_expires_at_ms,
+                                    offer.sender_public_key.as_deref(),
+                                )
+                                .await
+                            {
+                                crate::peer::CandidateSetTryApplyOutcome::Completed(result) => {
+                                    break result;
+                                }
+                                outcome @ (crate::peer::CandidateSetTryApplyOutcome::ContendedEpoch
+                                | crate::peer::CandidateSetTryApplyOutcome::ContendedConnections) => {
+                                    if let Some(newest) = self
+                                        .pending_handshakes
+                                        .lock()
+                                        .take_queued_candidate_offer_work(
+                                            &peer_id,
+                                            reservation.owner,
+                                        )
+                                    {
+                                        offer = newest;
+                                        continue 'work;
+                                    }
+                                    apply_retry_attempt = apply_retry_attempt.saturating_add(1);
+                                    let delay =
+                                        responder_offer_retry_delay(apply_retry_attempt);
+                                    let reason_code = match outcome {
+                                        crate::peer::CandidateSetTryApplyOutcome::ContendedEpoch => {
+                                            "candidate_epoch_busy"
+                                        }
+                                        crate::peer::CandidateSetTryApplyOutcome::ContendedConnections => {
+                                            "candidate_connections_busy"
+                                        }
+                                        crate::peer::CandidateSetTryApplyOutcome::Completed(_) => {
+                                            unreachable!()
+                                        }
+                                    };
+                                    self.timeline.emit(
+                                        "peer_offer_candidate_retry",
+                                        None,
+                                        Some(reason_code),
+                                        Some(format!(
+                                            "peer={} owner={} retry_attempt={} delay_ms={}",
+                                            peer_id,
+                                            reservation.owner,
+                                            apply_retry_attempt,
+                                            delay.as_millis()
+                                        )),
+                                    );
+                                    tokio::select! {
+                                        _ = sleep(delay) => {}
+                                        changed = reservation.cancellation.changed() => {
+                                            let _ = changed;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        (
+                            FreshSignalVerdict::None,
+                            apply_result,
+                            FreshPunchDecision::None,
+                        )
+                    } else {
+                        self.fresh_prediction_transaction(
+                            &peer_id,
+                            &offer.candidates,
+                            &offer.candidate_sources,
+                            offer.candidate_generation,
+                            offer.candidates_expires_at_ms,
+                            offer.sender_public_key.as_deref(),
+                        )
+                        .await
+                    }
+                } else {
+                    self.peers
+                        .record_direct_event(
+                            &peer_id,
+                            "peer_offer_ingress_suppressed",
+                            None,
+                            Some(offer.candidates.len()),
+                            None,
+                            format!(
+                                "offer suppressed by ingress verdict={ingress:?}; candidate apply, fresh prediction and punch skipped"
+                            ),
+                        )
+                        .await;
+                    (
+                        FreshSignalVerdict::None,
+                        CandidateSetApplyResult::IgnoredStale,
+                        FreshPunchDecision::None,
+                    )
+                };
+            if !offer.handshake_init.is_empty() {
+                self.peers
+                    .recovery_reopen_on_evidence(&peer_id, "authenticated_peer_offer")
+                    .await;
+            }
             self.apply_deferred_peer_offer_punch(&offer, candidate_apply_result, fresh_punch)
                 .await;
-
             if remote_incarnation_reset && !*reservation.cancellation.borrow() {
-                // This is the critical Air-first recovery edge: the remote
-                // restart invalidated its stored copy of our candidates, while
-                // our local candidate hash may be unchanged. Replay it now so
-                // the two sides enter the same punch window without requiring
-                // a local daemon restart.
                 self.publish_current_candidates_to_peer(
                     &peer_id,
                     "remote incarnation candidate replay",
@@ -1637,24 +2019,10 @@ impl Daemon {
                 .await;
             }
 
-            if offer.handshake_init.is_empty() {
-                offer.complete_delivery(
-                    if self
-                        .peers
-                        .peer_session_is_current_sync(&peer_id, peer_session_generation)
-                    {
-                        control::SignalApplyOutcome::Applied
-                    } else {
-                        control::SignalApplyOutcome::TerminalRejected
-                    },
-                );
-            }
-
             let Some(next) = self
                 .pending_handshakes
                 .lock()
-                .await
-                .finish_responder_work(&peer_id, reservation.owner)
+                .finish_candidate_offer_work(&peer_id, reservation.owner)
             else {
                 return;
             };
@@ -1715,21 +2083,13 @@ impl Daemon {
     /// are treated as stale.  Signals without a fingerprint (old server) or
     /// for a peer without a recorded public key are conservatively treated as
     /// matching (no identity information to contradict them).
-    async fn signal_sender_identity_matches_peer(
+    fn signal_sender_identity_matches_peer(
         &self,
         peer_id: &str,
         sender_public_key: Option<&str>,
     ) -> bool {
-        let Some(sender_public_key) = sender_public_key.map(str::trim) else {
-            return true;
-        };
-        if sender_public_key.is_empty() {
-            return false;
-        }
-        let Some(connection) = self.peers.get_connection(peer_id).await else {
-            return false;
-        };
-        connection.public_key.trim() == sender_public_key
+        self.peers
+            .signal_sender_identity_matches_peer_sync(peer_id, sender_public_key)
     }
 
     /// The prepare/apply/commit transaction for one fresh signal, shared by
@@ -1772,9 +2132,8 @@ impl Daemon {
             }
             Ok(None) => FreshSignalVerdict::None,
             Ok(Some(id)) => {
-                let signal_identity_matches = self
-                    .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
-                    .await;
+                let signal_identity_matches =
+                    self.signal_sender_identity_matches_peer(from_node_id, sender_public_key);
                 if !signal_identity_matches {
                     // The signal was bound by the control server to a sender
                     // identity fingerprint that is NOT the peer's current
@@ -2009,7 +2368,7 @@ impl Daemon {
     /// after the global slow-work cap. This drain is newest-wins per peer,
     /// checks the current online state before starting, and leaves the
     /// per-peer reservation as the single-flight boundary for duplicates.
-    async fn drain_deferred_initiator_handshakes<'a>(
+    fn drain_deferred_initiator_handshakes<'a>(
         &'a self,
         slow_work: &mut FuturesUnordered<ControlEventWork<'a>>,
         deferred: &mut InitiatorQueue<control::PeerInfo>,
@@ -2027,22 +2386,8 @@ impl Daemon {
             };
             scanned = scanned.saturating_add(1);
             let peer_id = peer_info.node_id.clone();
-            let current_online = self
-                .peers
-                .get_connection(&peer_id)
-                .await
-                .is_some_and(|peer| peer.online);
+            let current_online = self.peers.peer_session_generation_sync(&peer_id).is_some();
             if !current_online {
-                self.peers
-                    .record_direct_event(
-                        &peer_id,
-                        "initiator_handshake_deferred_dropped",
-                        None,
-                        None,
-                        None,
-                        "reason_code=peer_offline_or_removed deferred control handshake was not started",
-                    )
-                    .await;
                 self.timeline.emit(
                     "initiator_handshake_deferred_dropped",
                     None,
@@ -2056,7 +2401,10 @@ impl Daemon {
                 continue;
             }
 
-            let Some(reservation) = self.reserve_event_initiator_handshake(&peer_id).await else {
+            let Some(reservation) = self
+                .reserve_event_initiator_handshake(&peer_id)
+                .into_reservation()
+            else {
                 // An existing pending handshake or starting worker owns this
                 // peer. Keep the newest roster update for the next completion
                 // pass; dropping it here would make endpoint/incarnation
@@ -2074,6 +2422,111 @@ impl Daemon {
             slow_work.push(Box::pin(async move {
                 daemon
                     .run_event_initiator_handshake(peer_info, reservation)
+                    .await;
+            }));
+        }
+    }
+
+    /// Validate one already-claimed retry inside the bounded slow-work lane.
+    /// In particular, the control roster snapshot may wait on its own actor;
+    /// it must never stall the serial control receiver which owns ledger
+    /// admission and wake processing.
+    async fn run_claimed_initiator_retry(
+        &self,
+        identity: HandshakeRetryIdentity,
+        mut reservation: HandshakeStartReservation,
+    ) {
+        let lifecycle_current = self.peers.current_network_generation_sync()
+            == identity.network_generation
+            && self
+                .peers
+                .peer_session_is_current_sync(&identity.peer_id, identity.peer_session_generation);
+        if !lifecycle_current {
+            self.pending_handshakes
+                .lock()
+                .cancel_reservation_if_current(&identity.peer_id, identity.reservation_owner);
+            self.timeline.emit(
+                "initiator_handshake_retry_cancelled",
+                None,
+                Some("stale_lifecycle"),
+                Some(format!(
+                    "peer={} owner={} generation={} peer_session_generation={} phase={} attempt={} cancellation_generation={}",
+                    identity.peer_id,
+                    identity.reservation_owner,
+                    identity.network_generation,
+                    identity.peer_session_generation.value(),
+                    identity.phase.as_str(),
+                    identity.attempt,
+                    identity.cancellation_generation,
+                )),
+            );
+            return;
+        }
+
+        let peer_info = self.control.peers().await.get(&identity.peer_id).cloned();
+        let Some(peer_info) = peer_info else {
+            if !self.schedule_initiator_retry(
+                &identity.peer_id,
+                &mut reservation,
+                identity.phase,
+                "control_snapshot_unavailable",
+            ) {
+                self.pending_handshakes
+                    .lock()
+                    .cancel_reservation_if_current(&identity.peer_id, identity.reservation_owner);
+            }
+            return;
+        };
+        if !peer_info.online || !self.should_start_initiator_handshake(&peer_info) {
+            self.pending_handshakes
+                .lock()
+                .cancel_reservation_if_current(&identity.peer_id, identity.reservation_owner);
+            return;
+        }
+
+        self.timeline.emit(
+            "initiator_handshake_retry_admitted",
+            None,
+            None,
+            Some(format!(
+                "peer={} owner={} generation={} peer_session_generation={} phase={} attempt={} cancellation_generation={}",
+                identity.peer_id,
+                identity.reservation_owner,
+                identity.network_generation,
+                identity.peer_session_generation.value(),
+                identity.phase.as_str(),
+                identity.attempt,
+                identity.cancellation_generation,
+            )),
+        );
+        self.run_event_initiator_handshake(peer_info, reservation)
+            .await;
+    }
+
+    /// Drain exact preparation/publication retries from the authoritative
+    /// per-peer ledger. Records are removed only when this supervised owner
+    /// claims them; a repeated watch kick merely causes another bounded scan.
+    /// This coordinator performs no await: all roster/session/control work is
+    /// polled as part of the existing bounded slow-work lane.
+    fn drain_initiator_retry_ledger<'a>(
+        &'a self,
+        slow_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+    ) {
+        self.pending_handshakes
+            .lock()
+            .expire_initiator_retries(Instant::now());
+        while slow_work.len() < MAX_CONTROL_EVENT_SLOW_WORK {
+            let claimed = self
+                .pending_handshakes
+                .lock()
+                .claim_ready_initiator_retry(Instant::now());
+            let Some((identity, reservation)) = claimed else {
+                break;
+            };
+            let daemon = self;
+            slow_work.push(Box::pin(async move {
+                daemon
+                    .run_claimed_initiator_retry(identity, reservation)
                     .await;
             }));
         }
@@ -2098,8 +2551,16 @@ impl Daemon {
         // blocked candidate refresh or peer-reflexive HTTP task must not
         // prevent a received WireGuard initiation from producing an answer.
         let mut responder_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+        // Candidate application has independent per-peer owners and futures.
+        // Its durable receipt commits at bounded local enqueue, so neither a
+        // connection writer nor slow UDP work can head-of-line block the next
+        // signal from the same sender.
+        let mut candidate_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mut task_shutdown_rx = self.task_manager.shutdown_rx();
+        let mut handshake_retry_kick_rx = self.handshake_retry_kick_tx.subscribe();
+        let mut handshake_retry_tick = tokio::time::interval(Duration::from_millis(25));
+        handshake_retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -2118,12 +2579,12 @@ impl Daemon {
                         // Completion frees a bounded slot. Admit the oldest still
                         // live deferred peer immediately instead of waiting for a
                         // later control poll.
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
                                 &mut deferred_initiators,
-                            )
-                            .await;
+                            );
                     }
                     _ = responder_work.next(), if !responder_work.is_empty() => {
                         // Responder workers own their per-peer pending state and
@@ -2131,12 +2592,40 @@ impl Daemon {
                         // completion can also free a pending initiator's
                         // reservation, so retry deferred roster work here even
                         // when the general slow-work lane is otherwise idle.
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
                                 &mut deferred_initiators,
-                            )
-                            .await;
+                            );
+                    }
+                    _ = candidate_work.next(), if !candidate_work.is_empty() => {
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            );
+                    }
+                    changed = handshake_retry_kick_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        handshake_retry_kick_rx.borrow_and_update();
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            );
+                    }
+                    _ = handshake_retry_tick.tick() => {
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            );
                     }
                     event = control_rx.recv() => {
                         let Some(event) = event else {
@@ -2319,7 +2808,7 @@ impl Daemon {
                             } else if should_start_initiator {
                                 if let Some(reservation) = self
                                     .reserve_event_initiator_handshake(&peer_info.node_id)
-                                    .await
+                                    .into_reservation()
                                 {
                                     debug!(
                                         "PeerJoined handshake reserved: peer={} elapsed_ms={}",
@@ -2379,13 +2868,11 @@ impl Daemon {
 
                     ControlEvent::PeerUpdated(peer_info) => {
                         // Public-key/offline publication and old-session removal
-                        // are one handshake lifecycle boundary. Offer/answer
-                        // workers re-check the server-bound sender key while they
-                        // own this same arbiter, so they can observe wholly before
-                        // or wholly after the update, never between `add_peer` and
-                        // the retired session cleanup.
-                        let peer_update_handshake_guard =
-                            self.handshake_arbiter.acquire(&peer_info.node_id).await;
+                        // are fenced by PeerSessionGeneration and exact pending
+                        // ownership.  This branch intentionally does not own the
+                        // handshake arbiter across connection/session/UDP actor
+                        // awaits; old work is cancelled synchronously in the
+                        // pending store before it can publish into the new life.
                         let previous = self.peers.get_connection(&peer_info.node_id).await;
                         let previous_peer_session_generation = self
                             .peers
@@ -2415,6 +2902,10 @@ impl Daemon {
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
+                            self.clear_peer_handshake_lifecycle(
+                                &peer_info.node_id,
+                                "peer_offline",
+                            );
                             self.transport
                                 .remove_session_with_reason(
                                     &peer_info.node_id,
@@ -2422,11 +2913,6 @@ impl Daemon {
                                     "control_events.peer_updated_offline",
                                 )
                                 .await;
-                            self.pending_handshakes
-                                .lock()
-                                .await
-                                .clear_peer(&peer_info.node_id);
-                            drop(peer_update_handshake_guard);
                             if previous_peer_session_generation.is_none() {
                                 self.punch_attempts.cancel(&peer_info.node_id);
                             }
@@ -2468,6 +2954,10 @@ impl Daemon {
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
+                            self.clear_peer_handshake_lifecycle(
+                                &peer_info.node_id,
+                                "public_key_changed",
+                            );
                             self.transport
                                 .remove_session_with_reason(
                                     &peer_info.node_id,
@@ -2475,11 +2965,6 @@ impl Daemon {
                                     "control_events.peer_updated_public_key",
                                 )
                                 .await;
-                            self.pending_handshakes
-                                .lock()
-                                .await
-                                .clear_peer(&peer_info.node_id);
-                            drop(peer_update_handshake_guard);
                             info!(
                                 "Peer {} public key changed; discarded the old WireGuard session",
                                 peer_info.node_id
@@ -2504,7 +2989,6 @@ impl Daemon {
                                 .await;
                             }
                         } else {
-                            drop(peer_update_handshake_guard);
                             if update.endpoint_changed {
                                 // Endpoint metadata changes are normal NAT/candidate
                                 // churn. They must not tear down a confirmed relay or
@@ -2592,7 +3076,7 @@ impl Daemon {
                         } else if should_start_initiator {
                             if let Some(reservation) = self
                                 .reserve_event_initiator_handshake(&peer_info.node_id)
-                                .await
+                                .into_reservation()
                             {
                                 let peer_info = peer_info.clone();
                                 slow_work.push(Box::pin(async move {
@@ -2639,20 +3123,17 @@ impl Daemon {
                                 self.dns.unregister(&previous.virtual_ip).await;
                             }
                         }
-                        {
-                            // PeerLeft shares the same short state boundary as
-                            // offer staging. It never holds the arbiter across the
-                            // subsequent UDP lifecycle cleanup.
-                            let _handshake_guard = self.handshake_arbiter.acquire(&node_id).await;
-                            self.transport
-                                .remove_session_with_reason(
-                                    &node_id,
-                                    "peer_left",
-                                    "control_events.peer_left",
-                                )
-                                .await;
-                            self.pending_handshakes.lock().await.clear_peer(&node_id);
-                        }
+                        // Cancel the exact reservation/retry first.  This is a
+                        // short in-memory transaction; the subsequent session
+                        // and UDP actor cleanup owns no handshake arbiter lease.
+                        self.clear_peer_handshake_lifecycle(&node_id, "peer_left");
+                        self.transport
+                            .remove_session_with_reason(
+                                &node_id,
+                                "peer_left",
+                                "control_events.peer_left",
+                            )
+                            .await;
                         // Keep the slot read guard through the selected cleanup.
                         // A UDP task cannot publish between observing `None` and
                         // structural removal (or replace a `Some` transport while
@@ -2706,19 +3187,17 @@ impl Daemon {
                             from_node_id,
                             candidates.len()
                         );
-                        self.peers
-                            .record_direct_event(
-                                &from_node_id,
-                                "peer_offer_received",
-                                None,
-                                Some(candidates.len()),
-                                None,
-                                format!(
-                                    "received offer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
-                                    handshake_init.len()
-                                ),
-                            )
-                            .await;
+                        self.peers.record_direct_event_non_queuing(
+                            &from_node_id,
+                            "peer_offer_received",
+                            None,
+                            Some(candidates.len()),
+                            None,
+                            format!(
+                                "received offer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
+                                handshake_init.len()
+                            ),
+                        );
                         self.timeline.emit(
                             "peer_offer_received",
                             None,
@@ -2731,112 +3210,67 @@ impl Daemon {
                                 candidates.len()
                             )),
                         );
-                        // Signal delivery can race the peer-list poll: an offer
-                        // may be received before PeerJoined has installed the
-                        // sender's static public key.  Do not run candidate
-                        // admission or consume the responder transaction in that
-                        // state.  Enqueue the complete newest offer under the
-                        // existing per-peer owner and replay it once registration
-                        // becomes visible.
-                        if !self.peers.peer_exists_sync(&from_node_id) {
-                            // Wake the peer poll immediately: the regular cadence
-                            // can be seconds away and a cold-start handshake must
-                            // not wait it out.
+                        let peer_known = self.peers.peer_exists_sync(&from_node_id);
+                        if !peer_known {
+                            // REST signal delivery can beat the independent roster poll.
+                            // Both bounded owners wait for identity publication; waking
+                            // the poll keeps that interval short without blocking this actor.
                             self.control.refresh_peers_now();
-                            self.peers
-                                .record_direct_event(
-                                    &from_node_id,
-                                    "peer_offer_deferred_unknown",
-                                    None,
-                                    Some(candidates.len()),
-                                    None,
-                                    "deferred offer until PeerJoined installs peer identity",
-                                )
-                                .await;
-                            let admitted = {
-                                let mut state = self.pending_handshakes.lock().await;
-                                state.enqueue_responder_work(PendingPeerOffer {
-                                    from_node_id: from_node_id.clone(),
-                                    candidates: candidates.clone(),
-                                    candidate_sources: candidate_sources.clone(),
-                                    candidate_generation,
-                                    network_generation,
-                                    peer_session_generation: None,
-                                    candidates_expires_at_ms,
-                                    sender_public_key: sender_public_key.clone(),
-                                    handshake_init: handshake_init.clone(),
-                                    punch_at_ms,
-                                    punch_at_server_ms,
-                                    session_id: session_id.clone(),
-                                    probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                    delivery_receipt: delivery_receipt.clone(),
-                                })
-                            };
-                            if let Some((reservation, offer)) = admitted {
-                                self.timeline.emit(
-                                    "peer_offer_responder_work_admitted",
-                                    None,
-                                    None,
-                                    Some(format!(
-                                        "peer={} owner={} network_generation={} candidate_generation={} session_fp={} deferred_unknown=true",
-                                        from_node_id,
-                                        reservation.owner,
-                                        network_generation,
-                                        candidate_generation,
-                                        handshake_token_fingerprint(session_id.as_deref())
-                                    )),
-                                );
-                                responder_work.push(Box::pin(async move {
-                                    daemon
-                                        .run_deferred_peer_offer_worker(offer, reservation)
-                                        .await;
-                                }));
-                            } else {
-                                self.timeline.emit(
-                                    "peer_offer_responder_work_coalesced",
-                                    None,
-                                    Some("newest_wins_coalesced"),
-                                    Some(format!(
-                                        "peer={} network_generation={} candidate_generation={} session_fp={} deferred_unknown=true queued=true",
-                                        from_node_id,
-                                        network_generation,
-                                        candidate_generation,
-                                        handshake_token_fingerprint(session_id.as_deref())
-                                    )),
-                                );
+                        } else if !self.signal_sender_identity_matches_peer(
+                            &from_node_id,
+                            sender_public_key.as_deref(),
+                        ) {
+                            self.peers.record_direct_event_non_queuing(
+                                &from_node_id,
+                                "remote_signal_stale_identity",
+                                None,
+                                None,
+                                None,
+                                format!(
+                                    "ignored signal before incarnation/handshake/candidate mutation candidate_generation={candidate_generation}"
+                                ),
+                            );
+                            self.timeline.emit(
+                                "remote_signal_rejected",
+                                None,
+                                Some("stale_sender_identity"),
+                                Some(format!(
+                                    "peer={from_node_id} candidate_generation={candidate_generation}"
+                                )),
+                            );
+                            if let Some(receipt) = delivery_receipt.as_ref() {
+                                receipt.complete(control::SignalApplyOutcome::TerminalRejected);
                             }
                             continue;
                         }
-                        // Candidate-only offers have no latency-critical
-                        // WireGuard response to stage.  They still carry remote
-                        // candidate state and may need to wait behind the shared
-                        // epoch/UDP validation locks, so run them through the
-                        // existing per-peer newest-wins responder lane instead of
-                        // blocking the serial control receiver.  A later offer
-                        // for the same peer is coalesced by the same owner.
-                        if handshake_init.is_empty() {
-                            let admitted = {
-                                let mut state = self.pending_handshakes.lock().await;
-                                state.enqueue_responder_work(PendingPeerOffer {
-                                    from_node_id: from_node_id.clone(),
-                                    candidates: candidates.clone(),
-                                    candidate_sources: candidate_sources.clone(),
-                                    candidate_generation,
-                                    network_generation,
-                                    peer_session_generation: self
-                                        .peers
-                                        .peer_session_generation_sync(&from_node_id),
-                                    candidates_expires_at_ms,
-                                    sender_public_key: sender_public_key.clone(),
-                                    handshake_init: Vec::new(),
-                                    punch_at_ms,
-                                    punch_at_server_ms,
-                                    session_id: session_id.clone(),
-                                    probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                    delivery_receipt: delivery_receipt.clone(),
-                                })
-                            };
-                            if let Some((reservation, offer)) = admitted {
+
+                        // Retain the candidate half first in its own bounded ledger.
+                        // No durable receipt enters this worker: successful local
+                        // admission is the application commit, and the owner repairs
+                        // connection/epoch contention independently.
+                        let candidate_admission = {
+                            let mut state = self.pending_handshakes.lock();
+                            state.enqueue_candidate_offer_work(PendingPeerOffer {
+                                from_node_id: from_node_id.clone(),
+                                candidates: candidates.clone(),
+                                candidate_sources: candidate_sources.clone(),
+                                candidate_generation,
+                                network_generation,
+                                peer_session_generation: self
+                                    .peers
+                                    .peer_session_generation_sync(&from_node_id),
+                                candidates_expires_at_ms,
+                                sender_public_key: sender_public_key.clone(),
+                                handshake_init: handshake_init.clone(),
+                                punch_at_ms,
+                                punch_at_server_ms,
+                                session_id: session_id.clone(),
+                                probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
+                                delivery_receipt: None,
+                            })
+                        };
+                        let candidate_signal_outcome = match candidate_admission {
+                            CandidateOfferWorkAdmission::Started(reservation, offer) => {
                                 self.timeline.emit(
                                     "peer_offer_candidate_work_admitted",
                                     None,
@@ -2850,12 +3284,14 @@ impl Daemon {
                                         candidates.len()
                                     )),
                                 );
-                                responder_work.push(Box::pin(async move {
+                                candidate_work.push(Box::pin(async move {
                                     daemon
-                                        .run_deferred_peer_offer_worker(offer, reservation)
+                                        .run_candidate_offer_worker(*offer, reservation)
                                         .await;
                                 }));
-                            } else {
+                                control::SignalApplyOutcome::Applied
+                            }
+                            CandidateOfferWorkAdmission::Coalesced => {
                                 self.timeline.emit(
                                     "peer_offer_candidate_work_coalesced",
                                     None,
@@ -2868,301 +3304,105 @@ impl Daemon {
                                         candidates.len()
                                     )),
                                 );
+                                control::SignalApplyOutcome::Applied
+                            }
+                            CandidateOfferWorkAdmission::RejectedIdentity => {
+                                control::SignalApplyOutcome::TerminalRejected
+                            }
+                            CandidateOfferWorkAdmission::Capacity => {
+                                self.timeline.emit(
+                                    "peer_offer_candidate_work_rejected",
+                                    None,
+                                    Some("candidate_owner_capacity"),
+                                    Some(format!(
+                                        "peer={} capacity={}",
+                                        from_node_id, MAX_CANDIDATE_OFFER_WORKERS
+                                    )),
+                                );
+                                control::SignalApplyOutcome::Retry
+                            }
+                        };
+
+                        if handshake_init.is_empty() {
+                            // The exact candidate payload is now owned locally. ACK its
+                            // durable row immediately so the sender's next independently
+                            // encrypted handshake signal is not head-of-line blocked.
+                            if let Some(receipt) = delivery_receipt.as_ref() {
+                                receipt.complete(candidate_signal_outcome);
                             }
                             continue;
                         }
 
-                        let remote_incarnation_reset = match self
-                            .reset_peer_for_remote_incarnation_if_needed_for_identity(
-                                &from_node_id,
-                                candidate_generation,
-                                sender_public_key.as_deref(),
-                                RemoteIncarnationResetWork::ClearAll,
-                            )
-                            .await
-                        {
-                            Some(changed) => changed,
-                            None => {
-                                debug!(
-                                    "Ignored peer offer from {from_node_id}: signal sender public key is stale"
-                                );
-                                if let Some(receipt) = delivery_receipt.as_ref() {
-                                    receipt.complete(control::SignalApplyOutcome::TerminalRejected);
-                                }
-                                continue;
+                        if candidate_signal_outcome != control::SignalApplyOutcome::Applied {
+                            // A combined offer is one durable transaction. If
+                            // its candidate half could not enter the bounded
+                            // local ledger, do not acknowledge only the
+                            // responder half and silently discard candidates.
+                            // Server redelivery replays the exact encrypted
+                            // offer once capacity or identity turnover clears.
+                            if let Some(receipt) = delivery_receipt.as_ref() {
+                                receipt.complete(candidate_signal_outcome);
                             }
-                        };
-                        if remote_incarnation_reset {
-                            // The peer's restart invalidated its copy of our
-                            // candidate snapshot. Replay our current set in a
-                            // separate worker; the responder admission below
-                            // remains latency-critical and is not delayed by
-                            // candidate publication.
-                            schedule_candidate_republication(
-                                daemon,
-                                &mut responder_work,
-                                from_node_id.clone(),
-                                "remote incarnation reset",
-                            );
-                        }
-                        // Admit the latency-critical responder before touching
-                        // candidate/fresh-prediction state.  A candidate refresh
-                        // may wait on STUN/HTTP or the general slow-work budget;
-                        // an already-delivered WireGuard initiation must not be
-                        // acknowledged locally and then wait behind that work.
-                        if !handshake_init.is_empty() {
-                            let admitted = {
-                                let mut state = self.pending_handshakes.lock().await;
-                                state.enqueue_responder_work(PendingPeerOffer {
-                                    from_node_id: from_node_id.clone(),
-                                    candidates: candidates.clone(),
-                                    candidate_sources: candidate_sources.clone(),
-                                    candidate_generation,
-                                    network_generation,
-                                    peer_session_generation: self
-                                        .peers
-                                        .peer_session_generation_sync(&from_node_id),
-                                    candidates_expires_at_ms,
-                                    sender_public_key: sender_public_key.clone(),
-                                    handshake_init: handshake_init.clone(),
-                                    punch_at_ms,
-                                    punch_at_server_ms,
-                                    session_id: session_id.clone(),
-                                    probe_ephemeral_public_key: probe_ephemeral_public_key.clone(),
-                                    delivery_receipt: delivery_receipt.clone(),
-                                })
-                            };
-                            if let Some((reservation, offer)) = admitted {
-                                self.peers
-                                    .record_direct_event(
-                                        &from_node_id,
-                                        "peer_offer_responder_work_admitted",
-                                        None,
-                                        Some(candidates.len()),
-                                        None,
-                                        format!(
-                                            "responder owner={} generation={} session_fp={} admitted before candidate-plane work",
-                                            reservation.owner,
-                                            offer.network_generation,
-                                            handshake_token_fingerprint(offer.session_id.as_deref())
-                                        ),
-                                    )
-                                    .await;
-                                debug!(
-                                    "Peer offer responder worker admitted: peer={} owner={} candidates={}",
-                                    from_node_id,
-                                    reservation.owner,
-                                    candidates.len()
-                                );
-                                daemon.timeline.emit(
-                                        "peer_offer_responder_work_admitted",
-                                    None,
-                                    None,
-                                        Some(format!(
-                                        "peer={} owner={} network_generation={} candidate_generation={} session_fp={} deferred_unknown=false",
-                                        from_node_id,
-                                        reservation.owner,
-                                        network_generation,
-                                        candidate_generation,
-                                        handshake_token_fingerprint(session_id.as_deref())
-                                    )),
-                                );
-                                responder_work.push(Box::pin(async move {
-                                    let mut offer = offer;
-                                    let mut reservation = reservation;
-                                    loop {
-                                        let peer_id = offer.from_node_id.clone();
-                                        daemon
-                                            .handle_admitted_responder_offer(
-                                                &offer,
-                                                reservation.owner,
-                                                &mut reservation.cancellation,
-                                            )
-                                            .await;
-                                        if *reservation.cancellation.borrow() {
-                                            return;
-                                        }
-                                        let Some(next) = daemon
-                                            .pending_handshakes
-                                            .lock()
-                                            .await
-                                            .finish_responder_work(&peer_id, reservation.owner)
-                                        else {
-                                            break;
-                                        };
-                                        offer = next;
-                                    }
-                                }));
-                            } else {
-                                self.peers
-                                    .record_direct_event(
-                                        &from_node_id,
-                                        "peer_offer_responder_work_coalesced",
-                                        None,
-                                        Some(candidates.len()),
-                                        None,
-                                        "newest responder offer replaced the per-peer queued offer",
-                                    )
-                                    .await;
-                                debug!(
-                                    "Peer offer responder work coalesced: peer={} candidates={}",
-                                    from_node_id,
-                                    candidates.len()
-                                );
-                                self.timeline.emit(
-                                    "peer_offer_responder_work_coalesced",
-                                    None,
-                                    Some("newest_wins_coalesced"),
-                                    Some(format!(
-                                        "peer={} network_generation={} candidate_generation={} session_fp={} queued=true",
-                                        from_node_id,
-                                        network_generation,
-                                        candidate_generation,
-                                        handshake_token_fingerprint(session_id.as_deref())
-                                    )),
-                                );
-                            }
-                        }
-                        // Fresh-prediction verification happens BEFORE any
-                        // candidate state is touched: a superseded prediction
-                        // must not pollute the candidate set, while the handshake
-                        // itself is still handled below.  The prepare/apply/commit
-                        // transaction is shared with the answer path.
-                        //
-                        // The offer-ingress verdict runs even earlier: a duplicate
-                        // or rate-limited offer never touches the candidate plane
-                        // at all (no candidate apply, no fresh transaction, no
-                        // punch), while its handshake part is still answered.
-                        let ingress = self
-                            .offer_ingress_verdict(
-                                &from_node_id,
-                                &candidates,
-                                &candidate_sources,
-                                candidates_expires_at_ms,
-                                sender_public_key.as_deref(),
-                            )
-                            .await;
-                        let (_fresh_verdict, candidate_apply_result, fresh_punch) = if ingress
-                            == OfferIngressVerdict::Apply
-                        {
-                            self.fresh_prediction_transaction(
-                                &from_node_id,
-                                &candidates,
-                                &candidate_sources,
-                                candidate_generation,
-                                candidates_expires_at_ms,
-                                sender_public_key.as_deref(),
-                            )
-                            .await
-                        } else {
-                            self.peers
-                                .record_direct_event(
-                                    &from_node_id,
-                                    "peer_offer_ingress_suppressed",
-                                    None,
-                                    Some(candidates.len()),
-                                    None,
-                                    format!(
-                                        "offer suppressed by ingress verdict={ingress:?}; candidate apply, fresh prediction and punch skipped; handshake_bytes={}",
-                                        handshake_init.len()
-                                    ),
-                                )
-                                .await;
-                            (
-                                FreshSignalVerdict::None,
-                                CandidateSetApplyResult::IgnoredStale,
-                                FreshPunchDecision::None,
-                            )
-                        };
-                        if !handshake_init.is_empty() {
-                            // A successful authenticated offer is fresh
-                            // reachability evidence even when the candidate
-                            // list is byte-for-byte unchanged.  This is the
-                            // common rekey path for Android and must be able
-                            // to wake a frozen direct-recovery epoch before
-                            // the ordinary punch admission gate runs.
-                            self.peers
-                                .recovery_reopen_on_evidence(
-                                    &from_node_id,
-                                    "authenticated_peer_offer",
-                                )
-                                .await;
-                        }
-                        let hard_hard_handling = self
-                            .handle_hard_hard_fresh_offer(
-                                &from_node_id,
-                                session_id.as_deref(),
-                                punch_at_ms,
-                                fresh_punch.clone(),
-                            )
-                            .await;
-                        if candidate_apply_result == CandidateSetApplyResult::Applied
-                            && hard_hard_handling != HardHardOfferHandling::Started
-                        {
-                            self.peers
-                                .clear_hard_hard_sessions(Some(&from_node_id))
-                                .await;
-                        }
-                        if matches!(
-                            hard_hard_handling,
-                            HardHardOfferHandling::Rejected | HardHardOfferHandling::Started
-                        ) {
                             continue;
                         }
-                        match fresh_punch {
-                            // A valid fresh snapshot punches its frozen targets at
-                            // FRESH priority, always.
-                            FreshPunchDecision::Fresh(id, frozen_targets) => {
-                                self.start_hole_punch_at(
-                                    &from_node_id,
-                                    punch_at_ms,
-                                    Some(id),
-                                    Some(frozen_targets),
-                                )
-                                .await;
-                            }
-                            // An expired or empty committed snapshot must never
-                            // claim fresh priority or fall back to the shared
-                            // candidates as a fresh signal: only a handshake-
-                            // carrying offer degrades to an ordinary priority
-                            // punch; a candidate-only offer is ignored.
-                            FreshPunchDecision::Degraded => {
-                                if !handshake_init.is_empty() {
-                                    debug!(
-                                        "Degrading synchronized punch for {from_node_id}: the fresh snapshot is expired or empty; punching at ordinary priority"
-                                    );
-                                    self.start_hole_punch_at(
-                                        &from_node_id,
-                                        punch_at_ms,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                } else {
-                                    debug!(
-                                        "Skipping punch for candidate-only offer from {from_node_id}: its fresh snapshot is expired or empty"
-                                    );
-                                }
-                            }
-                            FreshPunchDecision::None => {
-                                if candidate_signal_starts_synchronized_punch(
-                                    &handshake_init,
-                                    candidate_apply_result,
-                                ) {
-                                    self.start_hole_punch_at(
-                                        &from_node_id,
-                                        punch_at_ms,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                } else {
-                                    debug!(
-                                        "Skipping synchronized punch for rejected candidate-only offer from {from_node_id}: {candidate_apply_result:?}"
-                                    );
-                                }
-                            }
+
+                        // Handshake material has a disjoint per-peer owner. It retains
+                        // the durable receipt until the exact responder transaction is
+                        // Applied/TerminalRejected; candidate work cannot occupy this slot.
+                        let admitted = {
+                            let mut state = self.pending_handshakes.lock();
+                            state.enqueue_responder_work(PendingPeerOffer {
+                                from_node_id: from_node_id.clone(),
+                                candidates,
+                                candidate_sources,
+                                candidate_generation,
+                                network_generation,
+                                peer_session_generation: self
+                                    .peers
+                                    .peer_session_generation_sync(&from_node_id),
+                                candidates_expires_at_ms,
+                                sender_public_key,
+                                handshake_init,
+                                punch_at_ms,
+                                punch_at_server_ms,
+                                session_id: session_id.clone(),
+                                probe_ephemeral_public_key,
+                                delivery_receipt: delivery_receipt.clone(),
+                            })
+                        };
+                        if let Some((reservation, offer)) = admitted {
+                            self.timeline.emit(
+                                "peer_offer_responder_work_admitted",
+                                None,
+                                None,
+                                Some(format!(
+                                    "peer={} owner={} network_generation={} candidate_generation={} session_fp={} deferred_unknown={}",
+                                    from_node_id,
+                                    reservation.owner,
+                                    network_generation,
+                                    candidate_generation,
+                                    handshake_token_fingerprint(session_id.as_deref()),
+                                    !peer_known
+                                )),
+                            );
+                            responder_work.push(Box::pin(async move {
+                                daemon.run_responder_offer_worker(offer, reservation).await;
+                            }));
+                        } else {
+                            self.timeline.emit(
+                                "peer_offer_responder_work_coalesced",
+                                None,
+                                Some("newest_wins_coalesced"),
+                                Some(format!(
+                                    "peer={} network_generation={} candidate_generation={} session_fp={} queued=true",
+                                    from_node_id,
+                                    network_generation,
+                                    candidate_generation,
+                                    handshake_token_fingerprint(session_id.as_deref())
+                                )),
+                            );
                         }
+                        continue;
                     }
 
                     ControlEvent::PeerAnswer {
@@ -3192,19 +3432,29 @@ impl Daemon {
                         if !self.peers.peer_exists_sync(&from_node_id) {
                             self.control.refresh_peers_now();
                         }
-                        self.peers
-                            .record_direct_event(
-                                &from_node_id,
-                                "peer_answer_received",
-                                None,
-                                Some(candidates.len()),
-                                None,
-                                format!(
-                                    "received answer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
-                                    handshake_response.len()
-                                ),
-                            )
-                            .await;
+                        self.peers.record_direct_event_non_queuing(
+                            &from_node_id,
+                            "peer_answer_received",
+                            None,
+                            Some(candidates.len()),
+                            None,
+                            format!(
+                                "received answer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
+                                handshake_response.len()
+                            ),
+                        );
+                        self.timeline.emit(
+                            "peer_answer_received",
+                            None,
+                            None,
+                            Some(format!(
+                                "peer={} candidate_generation={} handshake_bytes={} candidates={}",
+                                from_node_id,
+                                candidate_generation,
+                                handshake_response.len(),
+                                candidates.len()
+                            )),
+                        );
                         // The answer can be the first signal observed after the
                         // remote daemon restarted. Fence the retired transport but
                         // preserve the exact local initiator that this answer is
@@ -3222,8 +3472,9 @@ impl Daemon {
                             )
                             .await
                         {
-                            Some(changed) => changed,
-                            None => {
+                            RemoteIncarnationResetOutcome::Changed => true,
+                            RemoteIncarnationResetOutcome::Unchanged => false,
+                            RemoteIncarnationResetOutcome::RejectedIdentity => {
                                 debug!(
                                     "Ignored peer answer from {from_node_id}: signal sender public key is stale"
                                 );
@@ -3232,6 +3483,21 @@ impl Daemon {
                                 }
                                 continue;
                             }
+                            RemoteIncarnationResetOutcome::RejectedLifecycle => {
+                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                    receipt.complete(
+                                        control::SignalApplyOutcome::TerminalRejected,
+                                    );
+                                }
+                                continue;
+                            }
+                            outcome if outcome.retryable() => {
+                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                    receipt.complete(control::SignalApplyOutcome::Retry);
+                                }
+                                continue;
+                            }
+                            _ => false,
                         };
                         // Consume the WireGuard answer before candidate refresh or
                         // fresh-mapping work. Those paths may perform HTTP/STUN
@@ -3390,7 +3656,7 @@ impl Daemon {
                             delivery_receipt,
                         };
                         let admitted = {
-                            let mut state = self.pending_handshakes.lock().await;
+                            let mut state = self.pending_handshakes.lock();
                             if !state.has_peer_reflexive_worker(&from_node_id)
                                 && slow_work.len() >= MAX_CONTROL_EVENT_SLOW_WORK
                             {
@@ -3470,12 +3736,12 @@ impl Daemon {
                         // in either cooperative lane. Revisit the newest
                         // deferred roster edge before waiting for another
                         // unrelated event.
+                        daemon.drain_initiator_retry_ledger(&mut slow_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
                                 &mut deferred_initiators,
-                            )
-                            .await;
+                            );
                     }
                 }
         }
@@ -3484,6 +3750,7 @@ impl Daemon {
         // daemon shutdown rather than leaving detached work behind.
         drop(slow_work);
         drop(responder_work);
+        drop(candidate_work);
         self.control_rx = control_rx;
     }
 }

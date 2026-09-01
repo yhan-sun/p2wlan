@@ -35,16 +35,25 @@ impl PeerManager {
         candidate_generation: u64,
         candidates_expires_at_ms: Option<u64>,
     ) -> CandidateSetApplyResult {
-        self.add_candidates_with_metadata_for_identity_with_hard_hard_retire(
-            node_id,
-            candidates,
-            candidate_sources,
-            candidate_generation,
-            candidates_expires_at_ms,
-            None,
-            true,
-        )
-        .await
+        match self
+            .add_candidates_with_metadata_for_identity_with_hard_hard_retire(
+                node_id,
+                candidates,
+                candidate_sources,
+                candidate_generation,
+                candidates_expires_at_ms,
+                None,
+                true,
+                false,
+            )
+            .await
+        {
+            CandidateSetTryApplyOutcome::Completed(result) => result,
+            CandidateSetTryApplyOutcome::ContendedEpoch
+            | CandidateSetTryApplyOutcome::ContendedConnections => {
+                unreachable!("blocking candidate transaction returned contention")
+            }
+        }
     }
 
     /// Identity-bound candidate apply used by control-plane signals.
@@ -62,6 +71,42 @@ impl PeerManager {
         candidates_expires_at_ms: Option<u64>,
         sender_public_key: Option<&str>,
     ) -> CandidateSetApplyResult {
+        match self
+            .add_candidates_with_metadata_for_identity_with_hard_hard_retire(
+                node_id,
+                candidates,
+                candidate_sources,
+                candidate_generation,
+                candidates_expires_at_ms,
+                sender_public_key,
+                false,
+                false,
+            )
+            .await
+        {
+            CandidateSetTryApplyOutcome::Completed(result) => result,
+            CandidateSetTryApplyOutcome::ContendedEpoch
+            | CandidateSetTryApplyOutcome::ContendedConnections => {
+                unreachable!("blocking candidate transaction returned contention")
+            }
+        }
+    }
+
+    /// Apply one identity-bound control-plane candidate revision without
+    /// queueing on either canonical lifecycle lock. The caller owns the
+    /// bounded newest-wins retry ledger. Once both guards are acquired, the
+    /// existing epoch fence remains held through the post-commit cancellation
+    /// transaction, but connection-lock contention is never awaited while
+    /// that epoch fence is owned.
+    pub(crate) async fn try_add_candidates_with_metadata_for_identity(
+        &self,
+        node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+        sender_public_key: Option<&str>,
+    ) -> CandidateSetTryApplyOutcome {
         self.add_candidates_with_metadata_for_identity_with_hard_hard_retire(
             node_id,
             candidates,
@@ -70,6 +115,7 @@ impl PeerManager {
             candidates_expires_at_ms,
             sender_public_key,
             false,
+            true,
         )
         .await
     }
@@ -84,16 +130,40 @@ impl PeerManager {
         candidates_expires_at_ms: Option<u64>,
         sender_public_key: Option<&str>,
         retire_hard_hard: bool,
-    ) -> CandidateSetApplyResult {
+        non_queuing: bool,
+    ) -> CandidateSetTryApplyOutcome {
         let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let (_epoch_guard, mut connections) = loop {
+            let epoch_guard = if non_queuing {
+                let Ok(guard) = epoch_gate.try_lock() else {
+                    return CandidateSetTryApplyOutcome::ContendedEpoch;
+                };
+                guard
+            } else {
+                epoch_gate.lock().await
+            };
+            match self.connections.try_write() {
+                Ok(connections) => break (epoch_guard, connections),
+                Err(_) if non_queuing => {
+                    return CandidateSetTryApplyOutcome::ContendedConnections;
+                }
+                Err(_) => {
+                    // Preserve the canonical epoch -> connections order for
+                    // mutation, but never join Tokio's writer queue while the
+                    // epoch is held. Taking and immediately releasing a writer
+                    // turn without the epoch lets an older reader finish its
+                    // epoch-fenced work before this transaction retries.
+                    drop(epoch_guard);
+                    drop(self.connections.write().await);
+                }
+            }
+        };
         let generation = self.current_network_generation_sync();
         let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
-            return CandidateSetApplyResult::PeerMissing;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::PeerMissing);
         };
-        let mut connections = self.connections.write().await;
         let Some(conn) = connections.get_mut(node_id) else {
-            return CandidateSetApplyResult::PeerMissing;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::PeerMissing);
         };
         if sender_public_key.map(str::trim).is_some_and(|public_key| {
             public_key.is_empty() || conn.public_key.trim() != public_key
@@ -106,7 +176,7 @@ impl PeerManager {
                 None,
                 "ignored candidate signal bound to a retired sender public key",
             );
-            return CandidateSetApplyResult::IgnoredStale;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredStale);
         }
         let valid_candidates = candidates
             .iter()
@@ -122,7 +192,7 @@ impl PeerManager {
                 None,
                 "ignored empty or entirely invalid signaled UDP candidate set",
             );
-            return CandidateSetApplyResult::IgnoredEmpty;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredEmpty);
         }
 
         let now_ms = SystemTime::now()
@@ -141,7 +211,7 @@ impl PeerManager {
                 None,
                 "ignored expired signaled UDP candidate set",
             );
-            return CandidateSetApplyResult::IgnoredExpired;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredExpired);
         }
         let candidate_incarnation =
             crate::control::candidate_generation_incarnation(candidate_generation);
@@ -156,7 +226,7 @@ impl PeerManager {
                     "ignored malformed incarnation-encoded candidate generation {candidate_generation}"
                 ),
             );
-            return CandidateSetApplyResult::IgnoredStale;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredStale);
         }
         if candidate_incarnation.is_some_and(|incoming| {
             conn.remote_candidate_incarnation_high_water
@@ -172,7 +242,7 @@ impl PeerManager {
                     "ignored candidate generation {candidate_generation} from a retired remote incarnation"
                 ),
             );
-            return CandidateSetApplyResult::IgnoredStale;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredStale);
         }
         if candidate_generation != 0 && candidate_generation <= conn.last_candidate_generation {
             conn.record_direct_event(
@@ -183,7 +253,7 @@ impl PeerManager {
                 None,
                 format!("ignored stale candidate generation {candidate_generation}"),
             );
-            return CandidateSetApplyResult::IgnoredStale;
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredStale);
         }
         if candidate_generation != 0 {
             conn.last_candidate_generation = candidate_generation;
@@ -386,7 +456,7 @@ impl PeerManager {
                 self.clear_hard_hard_sessions(Some(node_id)).await;
             }
         }
-        CandidateSetApplyResult::Applied
+        CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::Applied)
     }
 
 }
