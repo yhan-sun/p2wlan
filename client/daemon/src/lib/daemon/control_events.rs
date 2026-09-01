@@ -1922,17 +1922,14 @@ impl Daemon {
                                 }
                                 outcome @ (crate::peer::CandidateSetTryApplyOutcome::ContendedEpoch
                                 | crate::peer::CandidateSetTryApplyOutcome::ContendedConnections) => {
-                                    if let Some(newest) = self
-                                        .pending_handshakes
-                                        .lock()
-                                        .take_queued_candidate_offer_work(
-                                            &peer_id,
-                                            reservation.owner,
-                                        )
-                                    {
-                                        offer = newest;
-                                        continue 'work;
-                                    }
+                                    // `offer_ingress_verdict` has already committed
+                                    // this payload's Apply admission. Do not replace the
+                                    // active value here: a same-fingerprint successor
+                                    // would be classified as Duplicate even though this
+                                    // candidate mutation never committed. Retain the exact
+                                    // payload across bounded contention; the one
+                                    // newest-wins successor remains queued and is consumed
+                                    // by `finish_candidate_offer_work` after this mutation.
                                     apply_retry_attempt = apply_retry_attempt.saturating_add(1);
                                     let delay =
                                         responder_offer_retry_delay(apply_retry_attempt);
