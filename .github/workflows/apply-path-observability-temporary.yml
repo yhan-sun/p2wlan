@@ -38,7 +38,8 @@ jobs:
           test "$(wc -c < "$root/repair-00-0")" -eq 6000
           test "$(wc -c < "$root/repair-00-1")" -eq 6000
           test "$(wc -c < "$root/part-01")" -eq 12000
-          test "$(wc -c < "$root/repair-02-0")" -eq 6000
+          test "$(wc -c < "$root/repair-02-0a")" -eq 3000
+          test "$(wc -c < "$root/repair-02-0b")" -eq 3000
           test "$(wc -c < "$root/repair-02-1")" -eq 6000
           for index in 03 04 05 06 07 08; do
             test "$(wc -c < "$root/part-$index")" -eq 12000
@@ -48,7 +49,8 @@ jobs:
             "$root/repair-00-0" \
             "$root/repair-00-1" \
             "$root/part-01" \
-            "$root/repair-02-0" \
+            "$root/repair-02-0a" \
+            "$root/repair-02-0b" \
             "$root/repair-02-1" \
             "$root/part-03" \
             "$root/part-04" \
