@@ -197,6 +197,8 @@ impl PeerManager {
         };
         for peer in &mut peers {
             peer.dplpmtud = dplpmtud_reports.get(&peer.node_id).cloned();
+            peer.path_observability
+                .apply_dplpmtud_runtime(peer.dplpmtud.as_ref());
         }
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         self.cache_diagnostics(&peers);
@@ -276,6 +278,8 @@ impl PeerManager {
         };
         for peer in &mut peers {
             peer.dplpmtud = dplpmtud_reports.get(&peer.node_id).cloned();
+            peer.path_observability
+                .apply_dplpmtud_runtime(peer.dplpmtud.as_ref());
         }
         peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         self.cache_diagnostics(&peers);
@@ -348,6 +352,9 @@ impl PeerManager {
             Some(&fresh_mapping_history),
         );
         diagnostics.dplpmtud = dplpmtud;
+        diagnostics
+            .path_observability
+            .apply_dplpmtud_runtime(diagnostics.dplpmtud.as_ref());
         diagnostics.recovery = recovery;
         Some((generation, diagnostics))
     }
@@ -414,6 +421,7 @@ impl PeerManager {
             relay_connections: relay,
             total_bytes_sent,
             total_bytes_received,
+            path_observability: PathObservabilityMetrics::default(),
             outbound_drops: HashMap::new(),
             outbound_send_failures: HashMap::new(),
             outbound_loss_events: Vec::new(),

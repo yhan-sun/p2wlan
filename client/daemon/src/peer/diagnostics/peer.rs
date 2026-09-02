@@ -113,6 +113,9 @@ pub struct PeerDiagnostics {
     pub last_path_selection: Option<PathSelectionDiagnostics>,
     pub path_events: Vec<PathSelectionEventDiagnostics>,
     pub direct_events: Vec<DirectTraversalEventDiagnostics>,
+    /// Versioned, bounded transition/metric snapshot recorded at the typed path commit point.
+    #[serde(default)]
+    pub path_observability: PathObservabilitySnapshot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fresh_mapping: Vec<FreshMappingDiag>,
     /// Read-only DPLPMTUD snapshot for the exact committed Direct UDP path.
@@ -531,6 +534,7 @@ impl PeerDiagnostics {
                 .iter()
                 .map(DirectTraversalEventDiagnostics::from)
                 .collect(),
+            path_observability: conn.path_observability.snapshot(conn),
             fresh_mapping: fresh_mapping_history
                 .and_then(|history| history.get(&conn.node_id))
                 .map(|results| {

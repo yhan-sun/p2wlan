@@ -11,6 +11,7 @@
 /// Coverage:
 ///  - PEM private-key blocks (whole body masked);
 ///  - `Bearer <token>` (the standard Authorization header value);
+///  - non-Bearer `Authorization: value` headers;
 ///  - `key : "value"` / `key = 'value'` (quoted, e.g. JSON) — value masked,
 ///    quotes and key preserved;
 ///  - `key: value` / `key=value` (bare single-token, e.g. `token=abc`).
@@ -36,6 +37,28 @@ String redactSensitive(String input) {
     (_) => 'Bearer <redacted>',
   );
 
+  // A non-Bearer Authorization value can contain more than one token (for
+  // example, `Basic user:password`). Consume the complete value up to a log
+  // or JSON delimiter so a second token cannot remain exposed. JSON strings
+  // are handled by the quoted-field rule below.
+  result = _mapMatches(
+    result,
+    RegExp(
+      r'''(["']?authorization["']?\s*[:=]\s*)([^\r\n,;{}\]\)"']+)''',
+      caseSensitive: false,
+    ),
+    (m) {
+      final full = m[0] ?? '';
+      final value = m[2]?.trimLeft() ?? '';
+      // Preserve the standard Bearer spelling produced by the rule above;
+      // only non-Bearer schemes need this complete-value fallback.
+      if (RegExp(r'^Bearer\b', caseSensitive: false).hasMatch(value)) {
+        return full;
+      }
+      return '${m[1]}<redacted>';
+    },
+  );
+
   // Quoted form: key : "value" / key = 'value'.
   const quotedKeys = <String>[
     'authorization',
@@ -46,13 +69,16 @@ String redactSensitive(String input) {
     'session',
     'cookie',
     'api_key',
+    'api-key',
     'apikey',
     'secret',
     'password',
     'private_key',
     'device_credential',
     'access_token',
+    'access-token',
     'refresh_token',
+    'refresh-token',
     'jwt',
   ];
   result = _mapMatches(
@@ -64,10 +90,9 @@ String redactSensitive(String input) {
     (m) => '${m[1]}${m[3]}<redacted>${m[3]}',
   );
 
-  // Bare single-token form: key: value / key=value. `authorization` is excluded
-  // here because its real value is the multi-word `Bearer <tok>` handled above
-  // (and its quoted JSON form is handled by the quoted rule); masking only its
-  // first token would leave the actual credential intact.
+  // Bare single-token form: key: value / key=value. `authorization` is
+  // handled by the dedicated multi-token rule above so masking only its first
+  // token cannot leave the actual credential intact.
   const bareKeys = <String>[
     'token',
     'authtoken',
@@ -76,13 +101,16 @@ String redactSensitive(String input) {
     'session',
     'cookie',
     'api_key',
+    'api-key',
     'apikey',
     'secret',
     'password',
     'private_key',
     'device_credential',
     'access_token',
+    'access-token',
     'refresh_token',
+    'refresh-token',
     'jwt',
   ];
   result = _mapMatches(

@@ -171,6 +171,7 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
                 value_u64(stats, "direct_connections"),
                 value_u64(stats, "relay_connections")
             );
+            print_path_observability(stats);
             suggestions.extend(protocol_boundary_suggestions(&snapshot));
             suggestions.extend(mtu_snapshot_suggestions(config.network.mtu, &snapshot));
             let mtu_diagnostics = mtu_diagnostic_suggestions(&snapshot);
@@ -214,4 +215,26 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn print_path_observability(stats: &Value) {
+    let Some(metrics) = stats.get("path_observability") else {
+        return;
+    };
+    let histogram = metrics
+        .get("direct_time_to_connect_ms")
+        .unwrap_or(&Value::Null);
+    println!(
+        "Path observability：transitions={} changes={} direct={}/{} relay_fallbacks={} rejected={} tasks={} sockets={} connect_samples={}",
+        value_u64(metrics, "accepted_transitions")
+            .saturating_add(value_u64(metrics, "accepted_observations")),
+        value_u64(metrics, "path_changes"),
+        value_u64(metrics, "direct_successes"),
+        value_u64(metrics, "direct_attempts"),
+        value_u64(metrics, "relay_fallbacks"),
+        value_u64(metrics, "rejected_transitions"),
+        value_u64(metrics, "active_tasks"),
+        value_u64(metrics, "active_sockets"),
+        value_u64(histogram, "count"),
+    );
 }

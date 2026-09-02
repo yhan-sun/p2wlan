@@ -630,6 +630,14 @@ pub use types::{
     PathScore, PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
 };
 
+mod path_observability;
+use path_observability::PathObservabilityState;
+pub use path_observability::{
+    CandidatePunchSummaryDiagnostics, PathEpochDiagnostics, PathHandshakeDiagnostics,
+    PathLatencyHistogram, PathObservabilityMetrics, PathObservabilitySnapshot,
+    PathTransitionDiagnostics, PathValidationDiagnostics,
+};
+
 mod path_state_machine;
 pub(crate) use path_state_machine::{
     ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,
