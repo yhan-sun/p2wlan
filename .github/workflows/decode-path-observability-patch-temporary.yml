@@ -19,18 +19,81 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Decode staged patches
+      - name: Inspect and decode staged patches
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p decoded
-          base64 --decode .p2wlan-task/path-observability/part-00 > decoded/path-observability-main.patch
-          base64 --decode .tmp/path-observability-patch/part-00 > decoded/path-observability-extra.patch
-          sha256sum decoded/*.patch > decoded/SHA256SUMS
-          wc -c decoded/*.patch | tee decoded/SIZES
-          git apply --stat decoded/path-observability-main.patch > decoded/main-stat.txt || true
-          git apply --stat decoded/path-observability-extra.patch > decoded/extra-stat.txt || true
-      - name: Upload decoded patch
+          mkdir -p decoded/raw decoded/candidates
+          cp .p2wlan-task/path-observability/part-00 decoded/raw/main-part-00.txt
+          cp .tmp/path-observability-patch/part-00 decoded/raw/extra-part-00.txt
+          python3 - <<'PY'
+          from __future__ import annotations
+          import base64
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path('decoded')
+          raw = {
+              'main': (root / 'raw/main-part-00.txt').read_bytes(),
+              'extra': (root / 'raw/extra-part-00.txt').read_bytes(),
+          }
+          report = {}
+          for name, data in raw.items():
+              compact = b''.join(data.split())
+              padded = compact + b'=' * ((-len(compact)) % 4)
+              entry = {
+                  'raw_size': len(data),
+                  'compact_size': len(compact),
+                  'mod4': len(compact) % 4,
+                  'raw_sha256': hashlib.sha256(data).hexdigest(),
+                  'head_ascii': data[:96].decode('ascii', 'backslashreplace'),
+                  'tail_ascii': data[-96:].decode('ascii', 'backslashreplace'),
+              }
+              try:
+                  decoded = base64.b64decode(padded, validate=True)
+                  (root / 'candidates' / f'{name}-padded.patch').write_bytes(decoded)
+                  entry['decoded'] = True
+                  entry['decoded_size'] = len(decoded)
+                  entry['decoded_sha256'] = hashlib.sha256(decoded).hexdigest()
+                  entry['decoded_head'] = decoded[:120].decode('utf-8', 'backslashreplace')
+                  entry['decoded_tail'] = decoded[-120:].decode('utf-8', 'backslashreplace')
+              except Exception as exc:
+                  entry['decoded'] = False
+                  entry['error'] = repr(exc)
+              report[name] = entry
+
+          for name, data in {
+              'main-extra': raw['main'] + raw['extra'],
+              'extra-main': raw['extra'] + raw['main'],
+          }.items():
+              compact = b''.join(data.split())
+              padded = compact + b'=' * ((-len(compact)) % 4)
+              entry = {'compact_size': len(compact), 'mod4': len(compact) % 4}
+              try:
+                  decoded = base64.b64decode(padded, validate=True)
+                  (root / 'candidates' / f'{name}.patch').write_bytes(decoded)
+                  entry['decoded'] = True
+                  entry['decoded_size'] = len(decoded)
+                  entry['decoded_sha256'] = hashlib.sha256(decoded).hexdigest()
+                  entry['decoded_head'] = decoded[:120].decode('utf-8', 'backslashreplace')
+                  entry['decoded_tail'] = decoded[-120:].decode('utf-8', 'backslashreplace')
+              except Exception as exc:
+                  entry['decoded'] = False
+                  entry['error'] = repr(exc)
+              report[name] = entry
+
+          (root / 'inspection.json').write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')
+          PY
+          find decoded -type f -maxdepth 3 -print -exec wc -c {} \;
+          for patch in decoded/candidates/*.patch; do
+            echo "== $patch =="
+            git apply --stat "$patch" || true
+            git apply --check "$patch" || true
+          done > decoded/apply-check.txt 2>&1
+          sha256sum decoded/raw/* decoded/candidates/* > decoded/SHA256SUMS || true
+      - name: Upload patch inspection
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: decoded-path-observability-patches
