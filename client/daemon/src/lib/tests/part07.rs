@@ -3705,8 +3705,17 @@ async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
         .await
         .unwrap();
     sleep(Duration::from_millis(50)).await;
-    for peers in [&harness.peers_a, &harness.peers_b] {
-        let peer = &peers.diagnostics().await[0];
+    for (peers, peer_id) in [
+        (&harness.peers_a, HARD_HARD_B),
+        (&harness.peers_b, HARD_HARD_A),
+    ] {
+        // `diagnostics()` is a non-blocking snapshot and can legitimately
+        // return its still-empty cache while the connection-map writer is
+        // busy. The peer lifecycle itself is the authoritative state here.
+        let peer = peers
+            .get_connection(peer_id)
+            .await
+            .expect("the seeded Hard↔Hard peer must remain in the lifecycle map");
         assert!(!peer
             .direct_events
             .iter()
