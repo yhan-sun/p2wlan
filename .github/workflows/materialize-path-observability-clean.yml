@@ -1,0 +1,182 @@
+name: Materialize Path Observability Clean
+
+on:
+  push:
+    branches:
+      - ops/path-observability-materialize-20260902
+
+permissions:
+  contents: write
+
+env:
+  EXPECTED_BASE_SHA: 2c9ebe8bc85bf8b4556fd2365c075fa2341a91db
+  EXPECTED_XZ_SHA256: 3016efa5ee267864ee90cc0680494f1f2b5ce0424e5465a840f096682626c2d2
+  EXPECTED_PATCH_SHA256: 5b6bcb98b6453e89a83f33a7a06cda9ddb34c967f715235a320ff044a8280b55
+  EXPECTED_PATCH_SIZE: "95419"
+  MATERIALIZE_BRANCH: ops/path-observability-materialize-20260902
+
+jobs:
+  materialize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact triggering commit and base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          git merge-base --is-ancestor "$EXPECTED_BASE_SHA" HEAD
+
+      - name: Reassemble and verify exact binary payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/path-observability-logs
+          root=.p2wlan-materialize
+          test "$(find "$root" -maxdepth 1 -type f -name 'chunk-*' | wc -l)" -eq 5
+          echo "319a687eed7c11b098aa750b01afaaa79202011807a60c5d60c37952e08763e9  $root/chunk-00" | sha256sum --check --strict
+          echo "476110c531aa5f2722f30e3e2317eb8956f29581028ba98fc2f1efa0cc290ccd  $root/chunk-01" | sha256sum --check --strict
+          echo "9581c149bf70bc1eb0e5128f31d6f022d718c9b13915f4aa76f04abec29be342  $root/chunk-02" | sha256sum --check --strict
+          echo "eeb9a96dc947c4d9de260d7cbecbf53bfcca8b527ba1860b584fb71cbe074422  $root/chunk-03" | sha256sum --check --strict
+          echo "592fec23ddbb6188d1f93ad178acfe8ba319e6ed357e3977ba42f2e47216ae68  $root/chunk-04" | sha256sum --check --strict
+          cat "$root"/chunk-00 "$root"/chunk-01 "$root"/chunk-02 "$root"/chunk-03 "$root"/chunk-04 > /tmp/path-observability.patch.xz
+          test "$(wc -c < /tmp/path-observability.patch.xz)" -eq 18176
+          echo "$EXPECTED_XZ_SHA256  /tmp/path-observability.patch.xz" | sha256sum --check --strict
+          xz --test /tmp/path-observability.patch.xz
+          xz --decompress --stdout /tmp/path-observability.patch.xz > /tmp/path-observability.patch
+          test "$(wc -c < /tmp/path-observability.patch)" -eq "$EXPECTED_PATCH_SIZE"
+          echo "$EXPECTED_PATCH_SHA256  /tmp/path-observability.patch" | sha256sum --check --strict
+          git apply --check /tmp/path-observability.patch
+          git apply /tmp/path-observability.patch
+          rm -rf .p2wlan-materialize
+          rm -f .github/workflows/materialize-path-observability-clean.yml
+          git diff --check
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Format formal sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all 2>&1 | tee /tmp/path-observability-logs/cargo-fmt.log
+          pushd apps/flutter_client
+          flutter pub get 2>&1 | tee /tmp/path-observability-logs/flutter-pub-get.log
+          dart format \
+            lib/core/models/diagnostics_models.dart \
+            lib/core/models/diagnostics_models/peer.dart \
+            lib/core/models/diagnostics_models/snapshot.dart \
+            lib/core/models/diagnostics_models/path_observability.dart \
+            test/contract_test.dart 2>&1 | tee /tmp/path-observability-logs/dart-format.log
+          popd
+          bash scripts/release/hermetic_build.sh restore
+
+      - name: Rust compile lint and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets --all-features 2>&1 | tee /tmp/path-observability-logs/cargo-check.log
+          cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/path-observability-logs/cargo-clippy.log
+          cargo test -p p2wlan-daemon --lib path_observability -- --test-threads=1 2>&1 | tee /tmp/path-observability-logs/path-observability-tests.log
+          cargo test -p p2wlan-daemon --test contract_fixture -- --test-threads=1 2>&1 | tee /tmp/path-observability-logs/rust-contract-tests.log
+
+      - name: Flutter contracts
+        shell: bash
+        working-directory: apps/flutter_client
+        run: |
+          set -euo pipefail
+          flutter analyze 2>&1 | tee /tmp/path-observability-logs/flutter-analyze.log
+          flutter test test/contract_test.dart 2>&1 | tee /tmp/path-observability-logs/flutter-contract-tests.log
+
+      - name: Go contracts and structured evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          pushd server
+          go vet ./... 2>&1 | tee /tmp/path-observability-logs/go-vet.log
+          go test ./... -count=1 2>&1 | tee /tmp/path-observability-logs/go-test.log
+          popd
+          P2WLAN_PATH_OBSERVABILITY_EVIDENCE=/tmp/path-observability-evidence.json \
+            python3 scripts/path-observability-evidence.py 2>&1 | tee /tmp/path-observability-logs/evidence.log
+          cp /tmp/path-observability-evidence.json /tmp/path-observability-logs/
+
+      - name: Verify clean formal change set
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/expected-paths.txt <<'EOF'
+          .github/workflows/path-observability-required.yml
+          apps/flutter_client/lib/core/models/diagnostics_models.dart
+          apps/flutter_client/lib/core/models/diagnostics_models/path_observability.dart
+          apps/flutter_client/lib/core/models/diagnostics_models/peer.dart
+          apps/flutter_client/lib/core/models/diagnostics_models/snapshot.dart
+          apps/flutter_client/test/contract_test.dart
+          client/cli/src/main/diagnostics.rs
+          client/daemon/src/diagnostics/snapshot.rs
+          client/daemon/src/peer.rs
+          client/daemon/src/peer/connection/core.rs
+          client/daemon/src/peer/diagnostics/manager_stats.rs
+          client/daemon/src/peer/diagnostics/peer.rs
+          client/daemon/src/peer/manager/diagnostics.rs
+          client/daemon/src/peer/path_observability.rs
+          client/daemon/tests/contract_fixture.rs
+          contracts/fixtures/status.json
+          docs/path-observability.md
+          scripts/path-observability-evidence.py
+          EOF
+          sed -i 's/^          //' /tmp/expected-paths.txt
+          git diff --name-only "$EXPECTED_BASE_SHA" -- | sort > /tmp/actual-paths.txt
+          diff -u /tmp/expected-paths.txt /tmp/actual-paths.txt
+          test ! -e .p2wlan-task
+          test ! -e .p2wlan-materialize
+          test ! -e .tmp
+          test ! -e .p2wlan-diagnostics
+          test ! -e .github/workflows/materialize-path-observability-clean.yml
+          git diff --check
+
+      - name: Commit validated formal implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat:增加有界路径可观测性"
+          git push origin HEAD:"$MATERIALIZE_BRANCH"
+
+      - name: Upload materialization evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: path-observability-materialization-${{ github.run_id }}
+          path: /tmp/path-observability-logs
+          if-no-files-found: warn
+          retention-days: 7
