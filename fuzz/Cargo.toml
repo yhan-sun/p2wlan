@@ -3,13 +3,14 @@ name = "p2wlan-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+license = "MIT"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-p2pnet-nat = { path = "../client/nat" }
+p2pnet-nat = { path = "../client/nat", version = "0.1.147" }
 
 [[bin]]
 name = "pnch_parser"

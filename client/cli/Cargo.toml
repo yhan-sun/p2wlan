@@ -10,7 +10,7 @@ name = "p2wlan"
 path = "src/main.rs"
 
 [dependencies]
-p2pnet-daemon = { package = "p2wlan-daemon", path = "../daemon" }
+p2pnet-daemon = { package = "p2wlan-daemon", path = "../daemon", version = "0.1.147" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

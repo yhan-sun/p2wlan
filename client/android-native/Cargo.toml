@@ -10,9 +10,9 @@ name = "p2wlan_android"
 crate-type = ["cdylib"]
 
 [dependencies]
-p2wlan-daemon = { path = "../daemon" }
-p2pnet-tun = { path = "../tun" }
-p2pnet-netbind = { path = "../netbind" }
+p2wlan-daemon = { path = "../daemon", version = "0.1.147" }
+p2pnet-tun = { path = "../tun", version = "0.1.147" }
+p2pnet-netbind = { path = "../netbind", version = "0.1.147" }
 jni = "0.21"
 serde = { workspace = true }
 serde_json = { workspace = true }

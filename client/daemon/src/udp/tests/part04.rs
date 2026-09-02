@@ -3138,7 +3138,7 @@ async fn stale_watcher_never_detaches_new_incarnation_socket() {
 /// Nine consecutive successful fresh-mapping generations: after every commit
 /// the predecessor socket is detached, so the dynamic socket count must stay
 /// exactly 1 and the affinity must point at the newest committed socket.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consecutive_committed_generations_leave_exactly_one_dynamic_socket() {
     let (peers, transport, nat) = generation_env().await;
     for round in 0..9u64 {
