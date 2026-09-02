@@ -1,0 +1,414 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-audit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  P2WLAN_EXACT_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  repository-policy:
+    name: Workflow permissions and credential transport
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+
+      - name: Run security policy unit tests
+        run: python3 -m unittest discover -s scripts/security/tests -p 'test_*.py'
+
+      - name: Audit workflow permissions and release-secret ownership
+        run: |
+          mkdir -p "$RUNNER_TEMP/security-policy"
+          python3 scripts/security/workflow_permissions.py \
+            --root . \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --output "$RUNNER_TEMP/security-policy/workflow-permissions.json"
+
+      - name: Scan tracked sources and credential transport
+        run: |
+          python3 scripts/security/credential_scan.py \
+            --root . \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --output "$RUNNER_TEMP/security-policy/credential-scan.json"
+
+      - name: Upload repository-policy evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-policy-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-policy/
+          if-no-files-found: error
+          retention-days: 30
+
+  rust-dependencies:
+    name: Rust advisory license ban and source audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pinned audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Audit Rust dependency graphs
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/security-rust"
+          mkdir -p "$evidence"
+
+          set +e
+          cargo audit --file Cargo.lock --json \
+            >"$evidence/cargo-audit-root.json" \
+            2>"$evidence/cargo-audit-root.stderr"
+          root_audit_status=$?
+
+          cargo audit --file fuzz/Cargo.lock --json \
+            >"$evidence/cargo-audit-fuzz.json" \
+            2>"$evidence/cargo-audit-fuzz.stderr"
+          fuzz_audit_status=$?
+
+          cargo deny \
+            --config deny.toml \
+            --format json \
+            check advisories bans licenses sources \
+            >"$evidence/cargo-deny-root.jsonl" \
+            2>"$evidence/cargo-deny-root.stderr"
+          root_deny_status=$?
+
+          cargo deny \
+            --manifest-path fuzz/Cargo.toml \
+            --config deny.toml \
+            --format json \
+            check advisories bans licenses sources \
+            >"$evidence/cargo-deny-fuzz.jsonl" \
+            2>"$evidence/cargo-deny-fuzz.stderr"
+          fuzz_deny_status=$?
+          set -e
+
+          python3 scripts/security/dependency_reports.py rust \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --root-audit "$evidence/cargo-audit-root.json" \
+            --fuzz-audit "$evidence/cargo-audit-fuzz.json" \
+            --root-deny "$evidence/cargo-deny-root.jsonl" \
+            --fuzz-deny "$evidence/cargo-deny-fuzz.jsonl" \
+            --root-audit-status "$root_audit_status" \
+            --fuzz-audit-status "$fuzz_audit_status" \
+            --root-deny-status "$root_deny_status" \
+            --fuzz-deny-status "$fuzz_deny_status" \
+            --cargo-audit-version "$(cargo audit --version)" \
+            --cargo-deny-version "$(cargo deny --version)" \
+            --output "$evidence/rust-summary.json"
+
+      - name: Upload Rust audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-rust-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-rust/
+          if-no-files-found: error
+          retention-days: 30
+
+  go-dependencies:
+    name: Go vulnerability and module audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Install pinned govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      - name: Verify and audit Go packages
+        working-directory: server
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/security-go"
+          mkdir -p "$evidence"
+          export PATH="$(go env GOPATH)/bin:$PATH"
+
+          set +e
+          go mod verify >"$evidence/go-mod-verify.txt" 2>&1
+          mod_status=$?
+          go test ./... -count=1 >"$evidence/go-test.txt" 2>&1
+          test_status=$?
+          go list -m -json all >"$evidence/go-modules.json" 2>"$evidence/go-modules.stderr"
+          modules_status=$?
+          govulncheck -json ./... >"$evidence/govulncheck.jsonl" 2>"$evidence/govulncheck-json.stderr"
+          json_status=$?
+          govulncheck ./... >"$evidence/govulncheck.txt" 2>&1
+          vuln_status=$?
+          set -e
+
+          python3 ../scripts/security/dependency_reports.py go \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --govulncheck-json "$evidence/govulncheck.jsonl" \
+            --modules-json "$evidence/go-modules.json" \
+            --mod-status "$mod_status" \
+            --test-status "$test_status" \
+            --modules-status "$modules_status" \
+            --json-status "$json_status" \
+            --vuln-status "$vuln_status" \
+            --go-version "$(go version)" \
+            --govulncheck-version "$(govulncheck -version 2>&1 | tr '\n' ' ')" \
+            --output "$evidence/go-summary.json"
+
+      - name: Upload Go audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-go-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-go/
+          if-no-files-found: error
+          retention-days: 30
+
+  flutter-dependencies:
+    name: Flutter dependency source and maintenance audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - name: Resolve analyze and classify dependencies
+        working-directory: apps/flutter_client
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/security-flutter"
+          mkdir -p "$evidence"
+          cp pubspec.lock "$evidence/pubspec.lock.before"
+
+          set +e
+          flutter pub get >"$evidence/flutter-pub-get.txt" 2>&1
+          get_status=$?
+          cmp -s pubspec.lock "$evidence/pubspec.lock.before"
+          lock_status=$?
+          flutter pub deps --style=compact >"$evidence/flutter-deps.txt" 2>"$evidence/flutter-deps.stderr"
+          deps_status=$?
+          flutter pub outdated --json >"$evidence/flutter-outdated.json" 2>"$evidence/flutter-outdated.stderr"
+          outdated_status=$?
+          flutter analyze >"$evidence/flutter-analyze.txt" 2>&1
+          analyze_status=$?
+          python3 ../../scripts/security/flutter_lock_policy.py \
+            --lockfile pubspec.lock \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --output "$evidence/flutter-lock-policy.json" \
+            >"$evidence/flutter-lock-policy.txt" 2>&1
+          lock_policy_status=$?
+          python3 ../../scripts/security/flutter_outdated_triage.py \
+            --input "$evidence/flutter-outdated.json" \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --output "$evidence/flutter-outdated-triage.json" \
+            >"$evidence/flutter-outdated-triage.txt" 2>&1
+          triage_status=$?
+          set -e
+
+          bash ../../scripts/release/hermetic_build.sh restore
+
+          flutter_version="$(flutter --version --machine | python3 -c 'import json,sys; value=json.load(sys.stdin); print(value.get("frameworkVersion", "unknown"))')"
+          python3 ../../scripts/security/dependency_reports.py flutter \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --lock-policy "$evidence/flutter-lock-policy.json" \
+            --triage "$evidence/flutter-outdated-triage.json" \
+            --get-status "$get_status" \
+            --lock-status "$lock_status" \
+            --deps-status "$deps_status" \
+            --outdated-status "$outdated_status" \
+            --analyze-status "$analyze_status" \
+            --lock-policy-status "$lock_policy_status" \
+            --triage-status "$triage_status" \
+            --flutter-version "$flutter_version" \
+            --dart-version "$(dart --version 2>&1)" \
+            --output "$evidence/flutter-summary.json"
+
+      - name: Upload Flutter audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-flutter-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-flutter/
+          if-no-files-found: error
+          retention-days: 30
+
+  release-assets:
+    name: Published release checksum and plaintext audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+
+      - name: Download and verify latest published release
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/security-release"
+          assets="$RUNNER_TEMP/security-release-assets"
+          mkdir -p "$evidence" "$assets"
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" >"$evidence/release.json"
+          tag="$(jq -r '.tag_name' "$evidence/release.json")"
+          test -n "$tag"
+          test "$tag" != "null"
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$assets" \
+            --clobber
+          gh version >"$evidence/gh-version.txt"
+          python3 scripts/security/verify_release_assets.py \
+            --release-json "$evidence/release.json" \
+            --assets-dir "$assets" \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --output "$evidence/release-assets.json"
+          python3 scripts/security/credential_scan.py \
+            --root "$assets" \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --scan-binary \
+            --output "$evidence/release-asset-credential-scan.json"
+
+      - name: Upload release verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-release/
+          if-no-files-found: error
+          retention-days: 30
+
+  required:
+    name: Security Audit Required
+    if: always()
+    needs:
+      - repository-policy
+      - rust-dependencies
+      - go-dependencies
+      - flutter-dependencies
+      - release-assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+
+      - name: Download component evidence
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: security-audit-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-audit-components
+          merge-multiple: true
+
+      - name: Scan generated artifact and log evidence
+        id: evidence_scan
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 scripts/security/credential_scan.py \
+            --root "$RUNNER_TEMP/security-audit-components" \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --output "$RUNNER_TEMP/security-audit-components/evidence-credential-scan.json"
+
+      - name: Build aggregate evidence
+        id: aggregate
+        if: always()
+        continue-on-error: true
+        run: |
+          python3 scripts/security/aggregate_evidence.py \
+            --root "$RUNNER_TEMP/security-audit-components" \
+            --head-sha "$P2WLAN_EXACT_HEAD" \
+            --output "$RUNNER_TEMP/security-audit-evidence.json"
+
+      - name: Upload aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-audit-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce all security audit gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.repository-policy.result }}" = "success"
+          test "${{ needs.rust-dependencies.result }}" = "success"
+          test "${{ needs.go-dependencies.result }}" = "success"
+          test "${{ needs.flutter-dependencies.result }}" = "success"
+          test "${{ needs.release-assets.result }}" = "success"
+          test "${{ steps.download.outcome }}" = "success"
+          test "${{ steps.evidence_scan.outcome }}" = "success"
+          test "${{ steps.aggregate.outcome }}" = "success"
+          echo "Security Audit Required passed for $P2WLAN_EXACT_HEAD"
