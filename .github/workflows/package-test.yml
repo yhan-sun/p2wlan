@@ -178,38 +178,14 @@ jobs:
       - name: Restore Flutter-managed source files
         run: bash scripts/release/hermetic_build.sh restore
 
-      - name: Configure stable Android release signing
-        if: github.event_name != 'pull_request'
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          : "${ANDROID_KEYSTORE_BASE64:?Missing repository secret ANDROID_KEYSTORE_BASE64}"
-          : "${ANDROID_KEYSTORE_PASSWORD:?Missing repository secret ANDROID_KEYSTORE_PASSWORD}"
-          : "${ANDROID_KEY_ALIAS:?Missing repository secret ANDROID_KEY_ALIAS}"
-          : "${ANDROID_KEY_PASSWORD:?Missing repository secret ANDROID_KEY_PASSWORD}"
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode \
-            > apps/flutter_client/android/app/release-keystore.jks
-          chmod 600 apps/flutter_client/android/app/release-keystore.jks
-          cat > apps/flutter_client/android/key.properties <<EOF
-          storeFile=app/release-keystore.jks
-          storePassword=${ANDROID_KEYSTORE_PASSWORD}
-          keyAlias=${ANDROID_KEY_ALIAS}
-          keyPassword=${ANDROID_KEY_PASSWORD}
-          EOF
-          chmod 600 apps/flutter_client/android/key.properties
-
       - name: Build arm64 APK
         working-directory: apps/flutter_client
         env:
           P2WLAN_ANDROID_ABIS: arm64-v8a
-          # Fork and same-repository PRs intentionally receive no release
-          # signing material. A debug-signed release-mode APK is sufficient to
-          # prove packaging; tagged releases retain stable signing.
-          P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+          # Package-test builds never receive production release signing
+          # material. The tag-only release workflow is the sole owner of the
+          # stable key; this APK is release-mode but debug-signed for CI only.
+          P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: "1"
         run: |
           bash ../../scripts/release/build_flutter_client.sh apk \
             --release \
@@ -236,9 +212,9 @@ jobs:
           fi
           echo "android_apk_sha256=$(sha256sum "$apk" | awk '{print $1}')"
           mkdir -p ../../dist-test
-          cp "$apk" ../../dist-test/p2wlan-android-arm64-release.apk
-          sha256sum ../../dist-test/p2wlan-android-arm64-release.apk \
-            > ../../dist-test/p2wlan-android-arm64-release.apk.sha256
+          cp "$apk" ../../dist-test/p2wlan-android-arm64-ci-test.apk
+          sha256sum ../../dist-test/p2wlan-android-arm64-ci-test.apk \
+            > ../../dist-test/p2wlan-android-arm64-ci-test.apk.sha256
 
       - name: Upload Android test package
         uses: actions/upload-artifact@v4
