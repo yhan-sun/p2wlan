@@ -272,6 +272,12 @@ void main() {
       );
     });
 
+    test('masks complete non-Bearer authorization values', () {
+      final out = redactSensitive('Authorization: Basic user:password');
+      expect(out, 'Authorization: <redacted>');
+      expect(out, isNot(contains('user:password')));
+    });
+
     test('masks json token fields (double-quoted)', () {
       expect(
         redactSensitive(r'{"token":"secret123"}'),

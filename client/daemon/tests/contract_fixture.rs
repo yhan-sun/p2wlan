@@ -39,6 +39,15 @@ fn status_fixture_deserializes_into_daemon_snapshot() {
     assert_eq!(snapshot.node_id, "node-a");
     assert_eq!(snapshot.network_id, "net1");
     assert_eq!(snapshot.virtual_ip, "10.20.0.7");
+    assert_eq!(snapshot.stats.path_observability.active_sockets, 1);
+    assert_eq!(
+        snapshot
+            .stats
+            .path_observability
+            .direct_time_to_connect_ms
+            .bounds_ms,
+        vec![50, 100, 250, 500, 1_000, 3_000, 10_000, 30_000]
+    );
     // Contract fields introduced for the Flutter unification.
     assert!(snapshot.revision > 0);
     assert!(

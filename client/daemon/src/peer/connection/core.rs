@@ -150,6 +150,8 @@ pub struct PeerConnection {
     /// Authoritative typed path state. `state` above is updated atomically as
     /// its compatibility projection by `commit_path_transition`.
     path_state_machine: PathStateMachine,
+    /// Bounded, synchronous telemetry recorded only at the typed commit point.
+    path_observability: PathObservabilityState,
     /// When the connection was established.
     pub connected_at: Option<Instant>,
     /// Bytes sent to this peer.
@@ -382,6 +384,7 @@ impl PeerConnection {
             remote_relay_rtt_ms: None,
             state: ConnectionState::Idle,
             path_state_machine: PathStateMachine::new(ConnectionState::Idle),
+            path_observability: PathObservabilityState::default(),
             connected_at: None,
             bytes_sent: 0,
             bytes_received: 0,
@@ -527,10 +530,13 @@ impl PeerConnection {
         apply_side_effects: impl FnOnce(&mut Self),
     ) -> PathTransitionOutcome {
         let event_epoch = event.epoch();
+        let observability_event = event.clone();
         let previous_active = self.path_state_machine.active_path();
         let previous_state = self.state;
         let transition = self.path_state_machine.reduce(event);
         let outcome = self.path_state_machine.commit(transition);
+        self.path_observability
+            .record(&observability_event, &outcome, Instant::now());
         if !outcome.accepted() {
             debug!(
                 target: "p2pnet_daemon::peer::path_state_machine",

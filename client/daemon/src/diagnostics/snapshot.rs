@@ -31,6 +31,14 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     stats.outbound_drops = outbound_loss.drops;
     stats.outbound_send_failures = outbound_loss.send_failures;
     stats.outbound_loss_events = outbound_loss.events;
+    stats.path_observability.active_tasks = health_snap
+        .critical_tasks
+        .iter()
+        .filter(|task| task.running && !task.finished)
+        .count() as u64;
+    stats.path_observability.active_sockets = udp_socket_count as u64;
+    stats.path_observability.control_reconnects = context.timeline.control_reconnects();
+    let connection_timeline = context.timeline.snapshot();
     let candidate_snapshot = context.candidate_snapshot.read().await.clone();
     let (local_candidates, candidate_snapshot_version, candidate_snapshot_hash) =
         candidate_snapshot
@@ -104,7 +112,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         control_proxy_consults_env: crate::control::proxy_consults_environment(
             context.config.control.proxy_mode,
         ),
-        connection_timeline: context.timeline.snapshot(),
+        connection_timeline,
         traversal_history,
         peers,
         stats,

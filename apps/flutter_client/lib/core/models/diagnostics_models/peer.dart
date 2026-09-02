@@ -31,6 +31,7 @@ class PeerSnapshot {
     required this.currentPathSelection,
     required this.relayConfirmedEndpoint,
     required this.relayConfirmedGeneration,
+    required this.pathObservability,
   });
 
   final String nodeId;
@@ -71,6 +72,8 @@ class PeerSnapshot {
   /// Network generation of the relay probe ACK confirmation.
   final int? relayConfirmedGeneration;
 
+  final PathObservabilitySnapshot pathObservability;
+
   factory PeerSnapshot.fromJson(JsonMap json) {
     final selectionJson = _mapOrNull(json['current_path_selection']);
     return PeerSnapshot(
@@ -104,6 +107,7 @@ class PeerSnapshot {
           : PathSelectionSnapshot.fromJson(selectionJson),
       relayConfirmedEndpoint: _nullableString(json['relay_confirmed_endpoint']),
       relayConfirmedGeneration: _intOrNull(json['relay_confirmed_generation']),
+      pathObservability: _pathObservabilityOrEmpty(json['path_observability']),
     );
   }
 

@@ -534,6 +534,7 @@ class PeerManagerStatsSnapshot {
     required this.relayConnections,
     required this.totalBytesSent,
     required this.totalBytesReceived,
+    required this.pathObservability,
   });
 
   final int totalPeers;
@@ -541,6 +542,7 @@ class PeerManagerStatsSnapshot {
   final int relayConnections;
   final int totalBytesSent;
   final int totalBytesReceived;
+  final PathObservabilityMetricsSnapshot pathObservability;
 
   factory PeerManagerStatsSnapshot.fromJson(JsonMap json) {
     return PeerManagerStatsSnapshot(
@@ -549,6 +551,9 @@ class PeerManagerStatsSnapshot {
       relayConnections: _int(json['relay_connections']),
       totalBytesSent: _int(json['total_bytes_sent']),
       totalBytesReceived: _int(json['total_bytes_received']),
+      pathObservability: PathObservabilityMetricsSnapshot.fromJson(
+        _map(json['path_observability']),
+      ),
     );
   }
 }

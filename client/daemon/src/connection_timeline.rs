@@ -21,6 +21,7 @@
 //! - `direct_promoted` still requires the existing encrypted validation chain.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -88,6 +89,10 @@ pub struct ConnectionTimeline {
     /// single choke point that covers all timeline emits without touching each
     /// call site. Absent in tests that do not need the diagnostics surface.
     status_events: Mutex<Option<Arc<crate::diagnostics::StatusEventBus>>>,
+    /// Monotonic control-plane registration count. This deliberately lives
+    /// outside the bounded event ring so reconnects remain observable after
+    /// older timeline entries have been evicted.
+    control_registration_count: AtomicU64,
 }
 
 impl ConnectionTimeline {
@@ -112,6 +117,7 @@ impl ConnectionTimeline {
             events: Mutex::new(VecDeque::new()),
             first_events: Mutex::new(HashSet::new()),
             status_events: Mutex::new(None),
+            control_registration_count: AtomicU64::new(0),
         })
     }
 
@@ -147,6 +153,10 @@ impl ConnectionTimeline {
         detail: Option<String>,
     ) -> u64 {
         let at_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if event == "control_registered" {
+            self.control_registration_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let fields = detail
             .as_deref()
             .map(parse_detail_fields)
@@ -188,6 +198,15 @@ impl ConnectionTimeline {
             bus.record(event, at_ms, path, reason_code, mirror_peer_id.as_deref());
         }
         at_ms
+    }
+
+    /// Number of control-plane reconnects observed after the initial
+    /// registration. Unlike the event timeline, this counter is not bounded
+    /// by `TIMELINE_MAX_EVENTS` and therefore survives ring eviction.
+    pub fn control_reconnects(&self) -> u64 {
+        self.control_registration_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(1)
     }
 
     /// Record and log one timeline event with the shared correlation id and the
@@ -525,5 +544,29 @@ mod tests {
         assert_eq!(observed[0].path.as_deref(), Some("direct"));
         assert_eq!(observed[1].path.as_deref(), Some("relay"));
         assert_eq!(observed[1].relay_id.as_deref(), Some("relay.test"));
+    }
+
+    #[test]
+    fn control_reconnect_counter_survives_timeline_eviction() {
+        let timeline = ConnectionTimeline::new("node-a", 0);
+
+        // The first registration is the initial connection, not a reconnect.
+        timeline.emit("control_registered", None, None, None);
+        for _ in 0..TIMELINE_MAX_EVENTS {
+            timeline.record_event("diagnostic_noise", None, None, None);
+        }
+        // The initial registration has been evicted from the bounded ring.
+        timeline.emit("control_registered", None, None, None);
+
+        assert_eq!(
+            timeline
+                .snapshot()
+                .events
+                .iter()
+                .filter(|event| event.event == "control_registered")
+                .count(),
+            1
+        );
+        assert_eq!(timeline.control_reconnects(), 1);
     }
 }

@@ -6,6 +6,9 @@ pub struct PeerManagerStats {
     pub relay_connections: usize,
     pub total_bytes_sent: u64,
     pub total_bytes_received: u64,
+    /// Process-bounded path transition counters and fixed-bucket latency histogram.
+    #[serde(default)]
+    pub path_observability: PathObservabilityMetrics,
     /// Dropped outbound business packets (packets/bytes) by stable reason
     /// code, accumulated since daemon start.  Terminal loss only.
     #[serde(default)]
@@ -37,6 +40,13 @@ impl PeerManagerStats {
                 .count(),
             total_bytes_sent: peers.iter().map(|peer| peer.bytes_sent).sum(),
             total_bytes_received: peers.iter().map(|peer| peer.bytes_received).sum(),
+            path_observability: peers.iter().fold(
+                PathObservabilityMetrics::default(),
+                |mut aggregate, peer| {
+                    aggregate.merge_from(&peer.path_observability.metrics);
+                    aggregate
+                },
+            ),
             outbound_drops: HashMap::new(),
             outbound_send_failures: HashMap::new(),
             outbound_loss_events: Vec::new(),

@@ -111,7 +111,57 @@
     "total_bytes_received": 0,
     "outbound_drops": {},
     "outbound_send_failures": {},
-    "outbound_loss_events": []
+    "outbound_loss_events": [],
+    "path_observability": {
+      "accepted_transitions": 0,
+      "accepted_observations": 0,
+      "duplicate_events": 0,
+      "rejected_transitions": 0,
+      "path_changes": 0,
+      "direct_attempts": 0,
+      "direct_retries": 0,
+      "direct_validations": 0,
+      "direct_successes": 0,
+      "direct_failures": 0,
+      "validation_failures": 0,
+      "relay_confirmations": 0,
+      "relay_fallbacks": 0,
+      "relay_failures": 0,
+      "candidate_refreshes": 0,
+      "control_reconnects": 0,
+      "network_generation_changes": 0,
+      "lifecycle_resets": 0,
+      "dplpmtud_changes": 0,
+      "active_tasks": 0,
+      "active_sockets": 1,
+      "dropped_transition_events": 0,
+      "direct_time_to_connect_ms": {
+        "bounds_ms": [
+          50,
+          100,
+          250,
+          500,
+          1000,
+          3000,
+          10000,
+          30000
+        ],
+        "buckets": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "count": 0,
+        "sum_ms": 0,
+        "max_ms": null
+      }
+    }
   },
   "health": {
     "status": "healthy",

@@ -34,6 +34,11 @@ void main() {
         expect(snapshot.virtualIp, '10.20.0.7');
         expect(snapshot.revision, greaterThan(0));
         expect(snapshot.readyPhase, isNotEmpty);
+        expect(snapshot.stats.pathObservability.activeSockets, 1);
+        expect(
+          snapshot.stats.pathObservability.directTimeToConnectMs.boundsMs,
+          [50, 100, 250, 500, 1000, 3000, 10000, 30000],
+        );
       },
     );
 
@@ -66,6 +71,97 @@ void main() {
           ) as Map<String, dynamic>;
           expect(DiagnosticsSnapshot.fromJson(raw).readyPhase, phase);
         }
+      },
+    );
+
+    test(
+      'path observability is additive and old peer snapshots still parse',
+      () {
+        final legacyPeer = PeerSnapshot.fromJson({
+          'node_id': 'legacy-peer',
+          'device_name': 'Legacy',
+          'app_version': '0.1.146',
+          'virtual_ip': '10.20.0.2',
+          'nat_type': 'unknown',
+          'online': true,
+          'last_seen': 1,
+          'state': 'connecting',
+          'direct_type': 'unknown',
+          'is_relay': false,
+          'bytes_sent': 0,
+          'bytes_received': 0,
+          'direct': <String, dynamic>{},
+          'relay': <String, dynamic>{},
+        });
+        expect(legacyPeer.pathObservability.schemaVersion, 0);
+        expect(legacyPeer.pathObservability.transitions, isEmpty);
+
+        final currentPeer = PeerSnapshot.fromJson({
+          'node_id': 'current-peer',
+          'device_name': 'Current',
+          'app_version': '0.1.147',
+          'virtual_ip': '10.20.0.3',
+          'nat_type': 'endpoint_independent',
+          'online': true,
+          'last_seen': 1,
+          'state': 'direct',
+          'active_path': 'direct',
+          'direct_type': 'public_udp',
+          'is_relay': false,
+          'bytes_sent': 10,
+          'bytes_received': 20,
+          'direct': <String, dynamic>{},
+          'relay': <String, dynamic>{},
+          'path_observability': {
+            'schema_version': 1,
+            'network_epoch': {
+              'network_generation': 7,
+              'peer_session_generation': 3,
+              'remote_candidate_epoch': 11,
+            },
+            'lifecycle': 'online',
+            'current_path': 'direct',
+            'previous_path': 'relay',
+            'transition_reason': 'direct_committed',
+            'path_age_ms': 12,
+            'path_state_revision': 9,
+            'direct_state': 'committed',
+            'relay_state': 'usable',
+            'recovery_state': 'stable',
+            'direct_health': <String, dynamic>{},
+            'relay_health': <String, dynamic>{},
+            'latest_handshake': <String, dynamic>{},
+            'latest_validation': {'validation_rtt_ms': 18},
+            'candidate_punch': {
+              'candidate_pair_count': 2,
+              'signaled_candidate_count': 3,
+            },
+            'selected_path_mtu': 1360,
+            'metrics': <String, dynamic>{},
+            'transitions': [
+              {
+                'age_ms': 12,
+                'revision': 9,
+                'event_kind': 'direct_committed',
+                'decision': 'applied',
+                'reason_code': 'direct_committed',
+                'current_path': 'direct',
+              },
+            ],
+          },
+        });
+        expect(currentPeer.pathObservability.schemaVersion, 1);
+        expect(currentPeer.pathObservability.currentPath, 'direct');
+        expect(currentPeer.pathObservability.previousPath, 'relay');
+        expect(currentPeer.pathObservability.selectedPathMtu, 1360);
+        expect(
+          currentPeer.pathObservability.latestValidation.validationRttMs,
+          18,
+        );
+        expect(
+          currentPeer.pathObservability.transitions.single.decision,
+          'applied',
+        );
       },
     );
   });
