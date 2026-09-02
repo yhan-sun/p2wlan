@@ -92,7 +92,7 @@ jobs:
         run: flutter test
 
   android:
-    name: Android arm64 Release APK
+    name: Android arm64 CI test APK
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,30 +122,6 @@ jobs:
           sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
           ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
           echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
-
-      - name: Configure stable Android release signing
-        if: github.event_name != 'pull_request'
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          : "${ANDROID_KEYSTORE_BASE64:?Missing repository secret ANDROID_KEYSTORE_BASE64}"
-          : "${ANDROID_KEYSTORE_PASSWORD:?Missing repository secret ANDROID_KEYSTORE_PASSWORD}"
-          : "${ANDROID_KEY_ALIAS:?Missing repository secret ANDROID_KEY_ALIAS}"
-          : "${ANDROID_KEY_PASSWORD:?Missing repository secret ANDROID_KEY_PASSWORD}"
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode \
-            > android/app/release-keystore.jks
-          chmod 600 android/app/release-keystore.jks
-          cat > android/key.properties <<EOF
-          storeFile=app/release-keystore.jks
-          storePassword=${ANDROID_KEYSTORE_PASSWORD}
-          keyAlias=${ANDROID_KEY_ALIAS}
-          keyPassword=${ANDROID_KEY_PASSWORD}
-          EOF
-          chmod 600 android/key.properties
 
       - name: Flutter pub get
         run: flutter pub get
@@ -179,9 +155,10 @@ jobs:
           P2WLAN_ANDROID_ABIS: arm64-v8a
           P2WLAN_ANDROID_TUN_MODE: ${{ inputs.android_tun_mode || 'async_fd' }}
           P2WLAN_ANDROID_WIFI_LOW_LATENCY: ${{ inputs.android_wifi_low_latency || 'false' }}
-          # Fork PRs do not receive repository secrets. They may still build
-          # a test APK, but only push/workflow-dispatch builds are distributable.
-          P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+          # Ordinary CI never receives the production Android signing key.
+          # This is a release-mode, debug-signed test package and is never
+          # eligible for GitHub Release publication.
+          P2WLAN_ALLOW_DEBUG_RELEASE_SIGNING: "1"
         run: >
           bash ../../scripts/release/build_flutter_client.sh apk
           --release
@@ -209,7 +186,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: p2wlan-flutter-android-arm64-release-apk
+          name: p2wlan-flutter-android-arm64-ci-test-apk
           path: apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 
   linux:
