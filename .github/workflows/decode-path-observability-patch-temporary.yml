@@ -1,0 +1,39 @@
+name: Decode Path Observability Patch Temporary
+
+on:
+  push:
+    branches:
+      - feat/path-observability-20260902
+    paths:
+      - ".p2wlan-task/path-observability/**"
+      - ".tmp/path-observability-patch/**"
+      - ".github/workflows/decode-path-observability-patch-temporary.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  decode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode staged patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p decoded
+          base64 --decode .p2wlan-task/path-observability/part-00 > decoded/path-observability-main.patch
+          base64 --decode .tmp/path-observability-patch/part-00 > decoded/path-observability-extra.patch
+          sha256sum decoded/*.patch > decoded/SHA256SUMS
+          wc -c decoded/*.patch | tee decoded/SIZES
+          git apply --stat decoded/path-observability-main.patch > decoded/main-stat.txt || true
+          git apply --stat decoded/path-observability-extra.patch > decoded/extra-stat.txt || true
+      - name: Upload decoded patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: decoded-path-observability-patches
+          path: decoded
+          if-no-files-found: error
+          retention-days: 2
