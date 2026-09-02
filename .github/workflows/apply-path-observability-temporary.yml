@@ -5,7 +5,7 @@ on:
     branches:
       - feat/path-observability-20260902
     paths:
-      - ".p2wlan-task/path-observability-v2/READY"
+      - ".p2wlan-task/path-observability-payload/READY"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,8 @@ permissions:
 
 env:
   EXPECTED_BRANCH: feat/path-observability-20260902
-  EXPECTED_PATCH_SHA256: 1c29e768fa17f16a7ca62509ad14bf133c0027429fde30e73709371299a25ded
+  EXPECTED_XZ_SHA256: e894b7298a8f182feb6b0e841c26a49424dd1cc19e1e4ff298499c85ba88df5a
+  EXPECTED_PATCH_SHA256: 9d351c6cc297f71094c1390799193364147376771a07bdf7e54c01976a606239
 
 jobs:
   apply:
@@ -24,61 +25,50 @@ jobs:
         with:
           ref: feat/path-observability-20260902
           fetch-depth: 0
+
       - name: Verify branch and base
         shell: bash
         run: |
           set -euo pipefail
           test "$(git branch --show-current)" = "$EXPECTED_BRANCH"
           git merge-base --is-ancestor 2c9ebe8bc85bf8b4556fd2365c075fa2341a91db HEAD
+
       - name: Assemble and apply exact patch
         shell: bash
         run: |
           set -euo pipefail
-          root=.p2wlan-task/path-observability-v2
-          test "$(wc -c < "$root/repair-00-0")" -eq 6000
-          test "$(wc -c < "$root/repair-00-1")" -eq 6000
-          test "$(wc -c < "$root/part-01")" -eq 12000
-          test "$(wc -c < "$root/repair-02-0a")" -eq 3000
-          test "$(wc -c < "$root/repair-02-0b")" -eq 3000
-          test "$(wc -c < "$root/repair-02-1")" -eq 6000
-          for index in 03 04 05 06 07 08; do
-            test "$(wc -c < "$root/part-$index")" -eq 12000
+          root=.p2wlan-task/path-observability-payload
+          test "$(find "$root" -maxdepth 1 -type f -name 'part-*' | wc -l)" -eq 20
+          for index in $(seq -w 0 18); do
+            test "$(wc -c < "$root/part-$index")" -eq 1000
           done
-          test "$(wc -c < "$root/part-09")" -eq 4096
-          cat \
-            "$root/repair-00-0" \
-            "$root/repair-00-1" \
-            "$root/part-01" \
-            "$root/repair-02-0a" \
-            "$root/repair-02-0b" \
-            "$root/repair-02-1" \
-            "$root/part-03" \
-            "$root/part-04" \
-            "$root/part-05" \
-            "$root/part-06" \
-            "$root/part-07" \
-            "$root/part-08" \
-            "$root/part-09" \
-            > /tmp/path-observability.b64
-          test "$(wc -c < /tmp/path-observability.b64)" -eq 112096
-          base64 --decode /tmp/path-observability.b64 > /tmp/path-observability.patch
+          test "$(wc -c < "$root/part-19")" -eq 824
+          cat "$root"/part-* > /tmp/path-observability.patch.xz.b64
+          test "$(wc -c < /tmp/path-observability.patch.xz.b64)" -eq 19824
+          base64 --decode /tmp/path-observability.patch.xz.b64 > /tmp/path-observability.patch.xz
+          echo "$EXPECTED_XZ_SHA256  /tmp/path-observability.patch.xz" | sha256sum --check --strict
+          xz --decompress --stdout /tmp/path-observability.patch.xz > /tmp/path-observability.patch
           echo "$EXPECTED_PATCH_SHA256  /tmp/path-observability.patch" | sha256sum --check --strict
-          git apply --check /tmp/path-observability.patch
-          git apply /tmp/path-observability.patch
+          git apply --unidiff-zero --check /tmp/path-observability.patch
+          git apply --unidiff-zero /tmp/path-observability.patch
           rm -rf .p2wlan-task .tmp
           rm -f .github/workflows/decode-path-observability-patch-temporary.yml
           rm -f .github/workflows/apply-path-observability-temporary.yml
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           flutter-version-file: .fvmrc
           cache: true
+
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
+
       - name: Install Linux workspace dependencies
         run: |
           sudo apt-get update
@@ -90,6 +80,7 @@ jobs:
             librsvg2-dev \
             xdotool \
             patchelf
+
       - name: Format generated sources
         shell: bash
         run: |
@@ -105,6 +96,7 @@ jobs:
             test/contract_test.dart
           cd ../..
           bash scripts/release/hermetic_build.sh restore
+
       - name: Compile and test path observability
         shell: bash
         run: |
@@ -123,6 +115,16 @@ jobs:
           P2WLAN_PATH_OBSERVABILITY_EVIDENCE=/tmp/path-observability-evidence.json \
             python3 scripts/path-observability-evidence.py
           git diff --check
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: path-observability-apply-evidence-${{ github.run_id }}
+          path: /tmp/path-observability-evidence.json
+          if-no-files-found: warn
+          retention-days: 2
+
       - name: Commit validated implementation
         shell: bash
         run: |
