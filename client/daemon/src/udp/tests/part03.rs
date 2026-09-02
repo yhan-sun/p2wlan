@@ -492,7 +492,7 @@ async fn keepalive_ack_timeout_degrades_direct_after_three_misses() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn matching_keepalive_ack_preserves_direct_health() {
     let peers = peer_manager();
     let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -527,8 +527,11 @@ async fn matching_keepalive_ack_preserves_direct_health() {
             .unwrap();
     });
 
+    // The production consent deadline is two seconds.  Keep this fixture
+    // comfortably below that limit while leaving enough scheduling margin for
+    // the inbound worker and responder to run on a loaded workspace test host.
     transport
-        .run_keepalive_round(Duration::from_millis(100))
+        .run_keepalive_round(Duration::from_millis(500))
         .await;
     responder.await.unwrap();
 

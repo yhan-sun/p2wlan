@@ -2014,6 +2014,34 @@ async fn wait_for_stage(
     panic!("peer {peer_id} did not record stage {stage}; diagnostics={diagnostics:#?}")
 }
 
+async fn wait_for_remote_candidates(
+    peers: &PeerManager,
+    peer_id: &str,
+    expected_candidates: &[String],
+) {
+    let result = timeout(HARD_HARD_E2E_TIMEOUT, async {
+        loop {
+            let matches = peers
+                .diagnostics()
+                .await
+                .into_iter()
+                .find(|peer| peer.node_id == peer_id)
+                .is_some_and(|peer| peer.candidates == expected_candidates);
+            if matches {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if result.is_err() {
+        let diagnostics = peers.diagnostics().await;
+        panic!(
+            "peer {peer_id} did not apply the expected remote candidates {expected_candidates:?}; diagnostics={diagnostics:#?}"
+        );
+    }
+}
+
 async fn wait_for_both_sweep_failures(harness: &TwoPeerHarness) {
     let (_a, _b) = tokio::join!(
         wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_sweep_failed"),
@@ -5106,6 +5134,13 @@ async fn hard_hard_two_peer_duplicate_and_stale_signals_do_not_reopen_session() 
     harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
     let response = wait_for_hard_hard_response_signal(&harness).await;
+    // The response signal is logged when it is admitted to the control lane,
+    // while candidate-only work is applied by a separate newest-wins worker.
+    // Wait for the original candidate set to be visible before injecting an
+    // exact duplicate; otherwise the duplicate can become the first applied
+    // payload and legitimately create the initial epoch, making this test
+    // assert on queue admission order instead of duplicate idempotence.
+    wait_for_remote_candidates(&harness.peers_a, HARD_HARD_B, &response.candidates).await;
     let original_a = harness.udp_a.dynamic_socket_count().await;
     let original_b = harness.udp_b.dynamic_socket_count().await;
 

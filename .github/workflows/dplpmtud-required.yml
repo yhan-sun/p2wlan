@@ -229,7 +229,7 @@ jobs:
               // Flutter Client publishes one check-run per job rather than a
               // workflow-level check with the workflow name.
               'Analyze and Test',
-              'Android arm64 Release APK',
+              'Android arm64 CI test APK',
               'Linux x64 Release Bundle',
               'macOS Release Apps',
               'Windows x64 Release Bundle',

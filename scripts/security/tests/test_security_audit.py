@@ -17,6 +17,7 @@ import dependency_reports
 import flutter_lock_policy
 import flutter_outdated_triage
 import verify_release_assets
+import workflow_check_contract
 import workflow_permissions
 
 
@@ -987,6 +988,96 @@ class AggregateTests(unittest.TestCase):
                 needs_results=needs,
             )
             self.assertTrue(any(item["code"] == "needs_result_missing" for item in evidence["findings"]))
+
+
+class WorkflowCheckContractTests(unittest.TestCase):
+    def write_workflow(self, root: Path, name: str, content: str) -> None:
+        path = root / ".github" / "workflows" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def test_repository_required_checks_resolve_to_unique_jobs(self) -> None:
+        evidence = workflow_check_contract.run(SECURITY_DIR.parents[1])
+        self.assertEqual(evidence["result"], "pass", evidence)
+
+    def test_missing_required_check_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(
+                root,
+                "contract.yml",
+                """name: Contract
+jobs:
+  producer:
+    name: Present
+    runs-on: ubuntu-latest
+    steps: []
+  aggregate:
+    name: Aggregate
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          const requiredNames = ['Missing'];
+""",
+            )
+            evidence = workflow_check_contract.run(root)
+            self.assertTrue(
+                any(item["code"] == "required_check_missing" for item in evidence["findings"])
+            )
+
+    def test_duplicate_required_name_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(
+                root,
+                "contract.yml",
+                """name: Contract
+jobs:
+  producer:
+    name: Present
+    runs-on: ubuntu-latest
+    steps: []
+  aggregate:
+    name: Aggregate
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          const requiredNames = ['Present', 'Present'];
+""",
+            )
+            evidence = workflow_check_contract.run(root)
+            self.assertTrue(
+                any(item["code"] == "required_check_duplicate" for item in evidence["findings"])
+            )
+
+    def test_ambiguous_declared_name_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(
+                root,
+                "contract.yml",
+                """name: Contract
+jobs:
+  first:
+    name: Shared
+    runs-on: ubuntu-latest
+    steps: []
+  second:
+    name: Shared
+    runs-on: ubuntu-latest
+    steps: []
+  aggregate:
+    name: Aggregate
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          const requiredNames = ['Shared'];
+""",
+            )
+            evidence = workflow_check_contract.run(root)
+            codes = {item["code"] for item in evidence["findings"]}
+            self.assertIn("declared_check_ambiguous", codes)
+            self.assertIn("required_check_ambiguous", codes)
 
 
 if __name__ == "__main__":

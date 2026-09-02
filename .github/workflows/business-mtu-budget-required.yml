@@ -173,7 +173,7 @@ jobs:
               'CI Required',
               // Flutter Client publishes concrete job checks.
               'Analyze and Test',
-              'Android arm64 Release APK',
+              'Android arm64 CI test APK',
               'Linux x64 Release Bundle',
               'macOS Release Apps',
               'Windows x64 Release Bundle',
