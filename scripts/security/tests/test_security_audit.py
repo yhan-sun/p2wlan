@@ -538,6 +538,164 @@ class ReleaseAssetTests(unittest.TestCase):
 
 
 class DependencyReportTests(unittest.TestCase):
+    def advisory_exception(self, advisory_id: str = "RUSTSEC-2024-0429") -> dict[str, object]:
+        return {
+            "advisory_id": advisory_id,
+            "package": "glib",
+            "affected_version": "0.18.5",
+            "dependency_path": "p2wlan-tray -> tao -> tray-icon -> libappindicator -> glib",
+            "status": "temporary_exception",
+            "rationale": "GTK3 tray backend cannot consume the fixed glib release yet.",
+            "mitigation": "Keep the tray opt-in and revisit the backend before the review date.",
+            "tracking_issue": 52,
+            "review_by": "2099-09-30",
+        }
+
+    def rust_args(
+        self,
+        root: Path,
+        *,
+        deny_config: Path | None = None,
+        advisory_exceptions: Path | None = None,
+    ) -> object:
+        audit = root / "audit.json"
+        audit.write_text('{"vulnerabilities":{"count":0},"warnings":{}}', encoding="utf-8")
+        fuzz_audit = root / "fuzz-audit.json"
+        fuzz_audit.write_text(audit.read_text(encoding="utf-8"), encoding="utf-8")
+        deny = root / "deny.jsonl"
+        deny.write_text("", encoding="utf-8")
+        fuzz_deny = root / "fuzz-deny.jsonl"
+        fuzz_deny.write_text("", encoding="utf-8")
+        return type(
+            "Args",
+            (),
+            {
+                "root_audit": audit,
+                "fuzz_audit": fuzz_audit,
+                "root_deny": deny,
+                "fuzz_deny": fuzz_deny,
+                "deny_config": deny_config or root / "deny.toml",
+                "advisory_exceptions": advisory_exceptions or root / "advisory-exceptions.json",
+                "root_audit_status": 0,
+                "fuzz_audit_status": 0,
+                "root_deny_status": 0,
+                "fuzz_deny_status": 0,
+                "head_sha": HEAD_SHA,
+                "cargo_audit_version": "cargo-audit 0.22.2",
+                "cargo_deny_version": "cargo-deny 0.20.2",
+            },
+        )()
+
+    def write_rust_contract(
+        self,
+        root: Path,
+        *,
+        ignored: list[str] | None = None,
+        exceptions: list[dict[str, object]] | None = None,
+    ) -> tuple[Path, Path]:
+        deny = root / "deny.toml"
+        deny.write_text(
+            "[advisories]\nignore = " + json.dumps(ignored or ["RUSTSEC-2024-0429"]) + "\n",
+            encoding="utf-8",
+        )
+        metadata = root / "advisory-exceptions.json"
+        metadata.write_text(
+            json.dumps({"exceptions": exceptions or [self.advisory_exception()]}),
+            encoding="utf-8",
+        )
+        return deny, metadata
+
+    def test_rust_report_reads_deny_and_emits_current_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.rust_args(
+                root,
+                deny_config=SECURITY_DIR.parents[1] / "deny.toml",
+                advisory_exceptions=SECURITY_DIR.parents[1] / "security" / "advisory-exceptions.json",
+            )
+            evidence = dependency_reports.rust_summary(args)
+            self.assertEqual(evidence["result"], "pass")
+            self.assertEqual(evidence["advisory_exception_count"], 1)
+            self.assertEqual(evidence["advisory_exception_ids"], ["RUSTSEC-2024-0429"])
+            self.assertEqual(evidence["advisory_ignores"][0]["package"], "glib")
+            self.assertEqual(evidence["advisory_ignores"][0]["tracking_issue"], 52)
+
+    def test_rust_deny_ignore_without_metadata_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deny, metadata = self.write_rust_contract(root)
+            metadata.unlink()
+            evidence = dependency_reports.rust_summary(
+                self.rust_args(root, deny_config=deny, advisory_exceptions=metadata)
+            )
+            self.assertEqual(evidence["result"], "fail")
+            self.assertIn(
+                "advisory_exception_metadata_invalid",
+                {item["code"] for item in evidence["findings"]},
+            )
+
+    def test_rust_metadata_extra_id_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deny, metadata = self.write_rust_contract(
+                root,
+                exceptions=[self.advisory_exception(), self.advisory_exception("RUSTSEC-EXTRA")],
+            )
+            evidence = dependency_reports.rust_summary(
+                self.rust_args(root, deny_config=deny, advisory_exceptions=metadata)
+            )
+            self.assertEqual(evidence["result"], "fail")
+            self.assertIn(
+                "advisory_exception_metadata_extra_id",
+                {item["code"] for item in evidence["findings"]},
+            )
+
+    def test_rust_metadata_duplicate_id_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deny, metadata = self.write_rust_contract(
+                root,
+                exceptions=[self.advisory_exception(), self.advisory_exception()],
+            )
+            evidence = dependency_reports.rust_summary(
+                self.rust_args(root, deny_config=deny, advisory_exceptions=metadata)
+            )
+            self.assertEqual(evidence["result"], "fail")
+            self.assertIn(
+                "advisory_exception_metadata_duplicate_id",
+                {item["code"] for item in evidence["findings"]},
+            )
+
+    def test_rust_expired_review_date_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expired = self.advisory_exception()
+            expired["review_by"] = "2000-01-01"
+            deny, metadata = self.write_rust_contract(root, exceptions=[expired])
+            evidence = dependency_reports.rust_summary(
+                self.rust_args(root, deny_config=deny, advisory_exceptions=metadata)
+            )
+            self.assertEqual(evidence["result"], "fail")
+            self.assertIn(
+                "advisory_exception_review_expired",
+                {item["code"] for item in evidence["findings"]},
+            )
+
+    def test_rust_missing_tracking_issue_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing_tracking = self.advisory_exception()
+            del missing_tracking["tracking_issue"]
+            deny, metadata = self.write_rust_contract(root, exceptions=[missing_tracking])
+            evidence = dependency_reports.rust_summary(
+                self.rust_args(root, deny_config=deny, advisory_exceptions=metadata)
+            )
+            self.assertEqual(evidence["result"], "fail")
+            self.assertIn(
+                "advisory_exception_metadata_field_missing",
+                {item["code"] for item in evidence["findings"]},
+            )
+
     def test_go_summary_counts_actionable_unique_vulnerabilities_from_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -637,6 +795,17 @@ class DependencyReportTests(unittest.TestCase):
 
 class AggregateTests(unittest.TestCase):
     def write_clean_reports(self, root: Path, *, head: str = HEAD_SHA, workflow: str = WORKFLOW_SHA) -> None:
+        rust_exception = {
+            "advisory_id": "RUSTSEC-2024-0429",
+            "package": "glib",
+            "affected_version": "0.18.5",
+            "dependency_path": "p2wlan-tray -> tao -> tray-icon -> libappindicator -> glib",
+            "status": "temporary_exception",
+            "rationale": "Fixture rationale.",
+            "mitigation": "Fixture mitigation.",
+            "tracking_issue": 52,
+            "review_by": "2099-09-30",
+        }
         for filename, component in aggregate_evidence.REQUIRED.items():
             report: dict[str, object] = {
                 "schema_version": 2,
@@ -656,7 +825,15 @@ class AggregateTests(unittest.TestCase):
                 "findings": [],
             }
             if component == "rust_dependency_audit":
-                report.update({"checks": {"audit": 0}, "vulnerability_counts": {"total": 0}})
+                report.update(
+                    {
+                        "checks": {"audit": 0},
+                        "vulnerability_counts": {"total": 0},
+                        "advisory_exception_count": 1,
+                        "advisory_exception_ids": ["RUSTSEC-2024-0429"],
+                        "advisory_ignores": [rust_exception],
+                    }
+                )
             elif component == "go_vulnerability_audit":
                 report.update({"checks": {"govulncheck": 0}, "vulnerability_count": 0})
             elif component == "flutter_outdated_triage":
@@ -672,6 +849,16 @@ class AggregateTests(unittest.TestCase):
                     }
                 )
             (root / filename).write_text(json.dumps(report), encoding="utf-8")
+        (root / "deny.toml").write_text(
+            '[advisories]\nignore = ["RUSTSEC-2024-0429"]\n',
+            encoding="utf-8",
+        )
+        metadata = root / "security" / "advisory-exceptions.json"
+        metadata.parent.mkdir(parents=True, exist_ok=True)
+        metadata.write_text(
+            json.dumps({"exceptions": [rust_exception]}),
+            encoding="utf-8",
+        )
 
     def aggregate(self, root: Path, **kwargs: object) -> dict[str, object]:
         return aggregate_evidence.run(
@@ -718,6 +905,19 @@ class AggregateTests(unittest.TestCase):
             path.write_text(json.dumps(report), encoding="utf-8")
             evidence = self.aggregate(root)
             self.assertTrue(any(item["code"] == "report_result_inconsistent" for item in evidence["findings"]))
+
+    def test_forged_empty_rust_advisory_ignores_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_clean_reports(root)
+            path = root / "rust-summary.json"
+            report = json.loads(path.read_text(encoding="utf-8"))
+            report["advisory_ignores"] = []
+            path.write_text(json.dumps(report), encoding="utf-8")
+            evidence = self.aggregate(root)
+            self.assertTrue(
+                any(item["code"] == "rust_advisory_ignores_mismatch" for item in evidence["findings"])
+            )
 
     def test_source_sha_repository_and_workflow_sha_tampering_fails(self) -> None:
         for field, value, code in (

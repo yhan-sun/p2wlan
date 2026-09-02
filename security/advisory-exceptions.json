@@ -1,0 +1,15 @@
+{
+  "exceptions": [
+    {
+      "advisory_id": "RUSTSEC-2024-0429",
+      "package": "glib",
+      "affected_version": "0.18.5",
+      "dependency_path": "p2wlan-tray -> tao -> tray-icon -> libappindicator -> glib",
+      "status": "temporary_exception",
+      "rationale": "The optional Linux tray currently depends on the GTK3 tao/tray-icon/libappindicator stack, which cannot consume the fixed glib release without replacing that backend. P2WLAN does not call glib::VariantStrIter.",
+      "mitigation": "Keep the native tray opt-in, run the native tray and full workspace tests, and remove this exception when the tray stack has a GTK4-compatible backend.",
+      "tracking_issue": 52,
+      "review_by": "2026-09-30"
+    }
+  ]
+}

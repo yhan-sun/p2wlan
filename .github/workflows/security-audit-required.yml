@@ -98,6 +98,9 @@ jobs:
           set -uo pipefail
           evidence="$RUNNER_TEMP/security-rust"
           mkdir -p "$evidence"
+          mkdir -p "$evidence/security"
+          cp -- deny.toml "$evidence/deny.toml"
+          cp -- security/advisory-exceptions.json "$evidence/security/advisory-exceptions.json"
 
           set +e
           cargo audit --file Cargo.lock --json \
@@ -136,6 +139,8 @@ jobs:
             --fuzz-audit "$evidence/cargo-audit-fuzz.json" \
             --root-deny "$evidence/cargo-deny-root.jsonl" \
             --fuzz-deny "$evidence/cargo-deny-fuzz.jsonl" \
+            --deny-config deny.toml \
+            --advisory-exceptions security/advisory-exceptions.json \
             --root-audit-status "$root_audit_status" \
             --fuzz-audit-status "$fuzz_audit_status" \
             --root-deny-status "$root_deny_status" \

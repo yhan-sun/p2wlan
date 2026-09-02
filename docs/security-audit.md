@@ -40,8 +40,13 @@ release is not compatible with that backend. P2WLAN does not call
 iterator behavior in the optional native tray process. The mitigation is to
 keep the tray opt-in, run the native tray and workspace tests, and revisit the
 exception when the tray stack has a GTK4-compatible backend. This is a
-temporary, non-broad exception tracked by Issue #30 and expires for review on
-2026-09-30; it must not be copied to another advisory.
+temporary, non-broad exception tracked by Issue #52 and expires for review on
+2026-09-30; it must not be copied to another advisory. The machine-readable
+record is `security/advisory-exceptions.json`; the Rust report must be derived
+from both this metadata and `[advisories].ignore` in `deny.toml`.
+The Rust evidence preserves both input files, emits the complete
+`advisory_ignores` records, and the aggregate records the active exception
+count and advisory IDs after checking that the two inputs and the report agree.
 
 ### Go dependency graph
 

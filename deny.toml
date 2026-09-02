@@ -17,7 +17,7 @@ git-fetch-with-cli = true
 # Temporary, exact exception: the Linux tray's tao/tray-icon/libappindicator
 # stack is GTK3-bound and cannot consume glib >=0.20 without replacing that
 # backend. The application does not call glib::VariantStrIter; the exception
-# is tracked and must be revisited before 2026-09-30 (Issue #30).
+# is tracked in Issue #52 and must be revisited before 2026-09-30.
 ignore = ["RUSTSEC-2024-0429"]
 
 [licenses]

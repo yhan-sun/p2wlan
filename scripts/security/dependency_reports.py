@@ -8,11 +8,251 @@ tool metadata without converting a failed scanner into a warning.
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import json
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and earlier
+    tomllib = None  # type: ignore[assignment]
+
 from report_common import make_report
+
+
+ADVISORY_EXCEPTION_REQUIRED_FIELDS = frozenset(
+    {
+        "advisory_id",
+        "package",
+        "status",
+        "rationale",
+        "mitigation",
+        "tracking_issue",
+        "review_by",
+    }
+)
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _iso_date(value: Any) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+def _exception_finding(
+    findings: list[dict[str, Any]], code: str, message: str
+) -> None:
+    findings.append({"code": code, "message": message})
+
+
+def _read_deny_config(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    if tomllib is not None:
+        return tomllib.loads(text)
+
+    # The macOS runner used for local validation is Python 3.9. Keep the
+    # fallback deliberately narrow and fail closed for anything other than the
+    # simple [advisories].ignore array used by this repository.
+    in_advisories = False
+    ignore_value: Any = None
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_advisories = line == "[advisories]"
+            continue
+        if in_advisories and line.startswith("ignore"):
+            key, separator, value = line.partition("=")
+            if key.strip() != "ignore" or not separator or ignore_value is not None:
+                raise ValueError("invalid [advisories].ignore assignment")
+            ignore_value = json.loads(value.strip())
+    if ignore_value is None:
+        raise ValueError("missing [advisories].ignore")
+    return {"advisories": {"ignore": ignore_value}}
+
+
+def load_advisory_exception_contract(
+    deny_config: Path,
+    metadata_path: Path,
+    findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Load and validate the one-to-one deny.toml exception contract.
+
+    The deny configuration is authoritative for active exception IDs. The
+    metadata file only supplies the reviewable rationale and mitigation for
+    those IDs; neither side may contain an unpaired or duplicate advisory.
+    """
+    try:
+        deny_value = _read_deny_config(deny_config)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        _exception_finding(
+            findings,
+            "advisory_exception_deny_config_invalid",
+            f"{deny_config}: {error}",
+        )
+        return []
+
+    advisories = deny_value.get("advisories")
+    if not isinstance(advisories, dict):
+        _exception_finding(
+            findings,
+            "advisory_exception_deny_section_missing",
+            f"{deny_config}: missing [advisories] table",
+        )
+        return []
+    ignored = advisories.get("ignore", [])
+    if not isinstance(ignored, list) or any(
+        not _nonempty_string(item) for item in ignored
+    ):
+        _exception_finding(
+            findings,
+            "advisory_exception_ignore_invalid",
+            f"{deny_config}: [advisories].ignore must be a list of non-empty strings",
+        )
+        ignored = []
+    ignored_ids = [item.strip() for item in ignored]
+    if len(set(ignored_ids)) != len(ignored_ids):
+        _exception_finding(
+            findings,
+            "advisory_exception_deny_duplicate_id",
+            f"{deny_config}: duplicate advisory ID in [advisories].ignore",
+        )
+
+    try:
+        metadata_value = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        _exception_finding(
+            findings,
+            "advisory_exception_metadata_invalid",
+            f"{metadata_path}: {error}",
+        )
+        return []
+    if not isinstance(metadata_value, dict) or not isinstance(
+        metadata_value.get("exceptions"), list
+    ):
+        _exception_finding(
+            findings,
+            "advisory_exception_metadata_schema",
+            f"{metadata_path}: expected an object with an exceptions array",
+        )
+        return []
+
+    metadata_by_id: dict[str, dict[str, Any]] = {}
+    for index, value in enumerate(metadata_value["exceptions"]):
+        if not isinstance(value, dict):
+            _exception_finding(
+                findings,
+                "advisory_exception_record_invalid",
+                f"{metadata_path}: exceptions[{index}] is not an object",
+            )
+            continue
+        advisory_id = value.get("advisory_id")
+        if not _nonempty_string(advisory_id):
+            _exception_finding(
+                findings,
+                "advisory_exception_id_missing",
+                f"{metadata_path}: exceptions[{index}] advisory_id is missing",
+            )
+            continue
+        advisory_id = advisory_id.strip()
+        if advisory_id in metadata_by_id:
+            _exception_finding(
+                findings,
+                "advisory_exception_metadata_duplicate_id",
+                f"{metadata_path}: duplicate advisory ID {advisory_id}",
+            )
+            continue
+        metadata_by_id[advisory_id] = value
+
+        missing = sorted(ADVISORY_EXCEPTION_REQUIRED_FIELDS - value.keys())
+        if missing:
+            _exception_finding(
+                findings,
+                "advisory_exception_metadata_field_missing",
+                f"{metadata_path}: {advisory_id} missing {', '.join(missing)}",
+            )
+        if not _nonempty_string(value.get("package")):
+            _exception_finding(
+                findings,
+                "advisory_exception_package_invalid",
+                f"{metadata_path}: {advisory_id} package is empty",
+            )
+        if not (
+            _nonempty_string(value.get("affected_version"))
+            or _nonempty_string(value.get("dependency_path"))
+        ):
+            _exception_finding(
+                findings,
+                "advisory_exception_scope_missing",
+                f"{metadata_path}: {advisory_id} needs affected_version or dependency_path",
+            )
+        if value.get("status") != "temporary_exception":
+            _exception_finding(
+                findings,
+                "advisory_exception_status_invalid",
+                f"{metadata_path}: {advisory_id} status is not temporary_exception",
+            )
+        for field in ("rationale", "mitigation"):
+            if not _nonempty_string(value.get(field)):
+                _exception_finding(
+                    findings,
+                    "advisory_exception_text_missing",
+                    f"{metadata_path}: {advisory_id} {field} is empty",
+                )
+        tracking_issue = value.get("tracking_issue")
+        if (
+            isinstance(tracking_issue, bool)
+            or not isinstance(tracking_issue, int)
+            or tracking_issue <= 0
+        ):
+            _exception_finding(
+                findings,
+                "advisory_exception_tracking_issue_invalid",
+                f"{metadata_path}: {advisory_id} tracking_issue is invalid",
+            )
+        review_by = _iso_date(value.get("review_by"))
+        if review_by is None:
+            _exception_finding(
+                findings,
+                "advisory_exception_review_date_invalid",
+                f"{metadata_path}: {advisory_id} review_by is not an ISO date",
+            )
+        elif review_by < date.today():
+            _exception_finding(
+                findings,
+                "advisory_exception_review_expired",
+                f"{metadata_path}: {advisory_id} review_by {review_by.isoformat()} has expired",
+            )
+        if advisory_id not in ignored_ids:
+            _exception_finding(
+                findings,
+                "advisory_exception_metadata_extra_id",
+                f"{metadata_path}: {advisory_id} is absent from deny.toml",
+            )
+
+    for advisory_id in ignored_ids:
+        if advisory_id not in metadata_by_id:
+            _exception_finding(
+                findings,
+                "advisory_exception_metadata_missing",
+                f"{deny_config}: {advisory_id} has no metadata record",
+            )
+
+    return [
+        metadata_by_id[advisory_id]
+        for advisory_id in ignored_ids
+        if advisory_id in metadata_by_id
+    ]
 
 
 def _read_json(
@@ -138,6 +378,14 @@ def rust_summary(args: argparse.Namespace) -> dict[str, Any]:
     fuzz_deny = _read_json_lines(
         args.fuzz_deny, findings, "invalid_cargo_deny_jsonl"
     )
+    advisory_ignores = load_advisory_exception_contract(
+        args.deny_config, args.advisory_exceptions, findings
+    )
+    advisory_exception_ids = [
+        item["advisory_id"]
+        for item in advisory_ignores
+        if isinstance(item.get("advisory_id"), str)
+    ]
 
     result = "pass" if not findings else "fail"
     return make_report(
@@ -174,6 +422,8 @@ def rust_summary(args: argparse.Namespace) -> dict[str, Any]:
                 "root": len(root_deny),
                 "fuzz": len(fuzz_deny),
             },
+            "advisory_exception_count": len(advisory_ignores),
+            "advisory_exception_ids": advisory_exception_ids,
         },
         checks=statuses,
         vulnerability_counts={
@@ -190,7 +440,9 @@ def rust_summary(args: argparse.Namespace) -> dict[str, Any]:
             "root": len(root_deny),
             "fuzz": len(fuzz_deny),
         },
-        advisory_ignores=[],
+        advisory_exception_count=len(advisory_ignores),
+        advisory_exception_ids=advisory_exception_ids,
+        advisory_ignores=advisory_ignores,
     )
 
 
@@ -388,6 +640,8 @@ def main() -> int:
     rust.add_argument("--fuzz-audit", type=Path, required=True)
     rust.add_argument("--root-deny", type=Path, required=True)
     rust.add_argument("--fuzz-deny", type=Path, required=True)
+    rust.add_argument("--deny-config", type=Path, required=True)
+    rust.add_argument("--advisory-exceptions", type=Path, required=True)
     rust.add_argument("--root-audit-status", type=int, required=True)
     rust.add_argument("--fuzz-audit-status", type=int, required=True)
     rust.add_argument("--root-deny-status", type=int, required=True)

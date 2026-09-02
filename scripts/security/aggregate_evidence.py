@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import date, datetime
 import hashlib
 import json
 import platform
 from pathlib import Path
 from typing import Any
 
+from dependency_reports import (
+    ADVISORY_EXCEPTION_REQUIRED_FIELDS,
+    load_advisory_exception_contract,
+)
 from report_common import SCHEMA_VERSION, failure_categories, make_report, repository_name
 
 REQUIRED = {
@@ -62,6 +66,8 @@ ALLOWED_EVIDENCE_FILES = {
     "release.json",
     "releases.json",
     "gh-version.txt",
+    "deny.toml",
+    "security/advisory-exceptions.json",
 }
 
 
@@ -117,6 +123,177 @@ def _valid_timestamp(value: Any) -> bool:
     return True
 
 
+def _valid_review_date(value: Any) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+def _validate_rust_advisory_ignores(
+    filename: str,
+    value: dict[str, Any],
+    expected: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+) -> None:
+    raw = value.get("advisory_ignores")
+    if not isinstance(raw, list):
+        _field(
+            findings,
+            filename,
+            "rust_advisory_ignores_invalid",
+            "advisory_ignores must be an array",
+        )
+        return
+
+    actual_by_id: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_invalid",
+                f"advisory_ignores[{index}] is not an object",
+            )
+            continue
+        advisory_id = item.get("advisory_id")
+        if not isinstance(advisory_id, str) or not advisory_id.strip():
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_id_missing",
+                f"advisory_ignores[{index}] advisory_id is missing",
+            )
+            continue
+        advisory_id = advisory_id.strip()
+        if advisory_id in actual_by_id:
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_duplicate_id",
+                f"duplicate advisory ID {advisory_id}",
+            )
+        actual_by_id[advisory_id] = item
+        missing = sorted(ADVISORY_EXCEPTION_REQUIRED_FIELDS - item.keys())
+        if missing:
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_field_missing",
+                f"{advisory_id} missing {', '.join(missing)}",
+            )
+        if not isinstance(item.get("package"), str) or not item["package"].strip():
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_package_invalid",
+                f"{advisory_id} package is empty",
+            )
+        if not (
+            isinstance(item.get("affected_version"), str)
+            and item["affected_version"].strip()
+        ) and not (
+            isinstance(item.get("dependency_path"), str)
+            and item["dependency_path"].strip()
+        ):
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_scope_missing",
+                f"{advisory_id} needs affected_version or dependency_path",
+            )
+        if item.get("status") != "temporary_exception":
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_status_invalid",
+                f"{advisory_id} status is not temporary_exception",
+            )
+        for field in ("rationale", "mitigation"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                _field(
+                    findings,
+                    filename,
+                    "rust_advisory_exception_text_missing",
+                    f"{advisory_id} {field} is empty",
+                )
+        tracking_issue = item.get("tracking_issue")
+        if (
+            isinstance(tracking_issue, bool)
+            or not isinstance(tracking_issue, int)
+            or tracking_issue <= 0
+        ):
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_tracking_issue_invalid",
+                f"{advisory_id} tracking_issue is invalid",
+            )
+        review_by = _valid_review_date(item.get("review_by"))
+        if review_by is None:
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_review_date_invalid",
+                f"{advisory_id} review_by is not an ISO date",
+            )
+        elif review_by < date.today():
+            _field(
+                findings,
+                filename,
+                "rust_advisory_exception_review_expired",
+                f"{advisory_id} review_by {review_by.isoformat()} has expired",
+            )
+
+    expected_by_id = {
+        item.get("advisory_id"): item
+        for item in expected
+        if isinstance(item.get("advisory_id"), str)
+    }
+    if set(actual_by_id) != set(expected_by_id):
+        _field(
+            findings,
+            filename,
+            "rust_advisory_ignores_mismatch",
+            f"report IDs {sorted(actual_by_id)} do not match deny.toml IDs {sorted(expected_by_id)}",
+        )
+    for advisory_id in sorted(set(actual_by_id) & set(expected_by_id)):
+        actual = actual_by_id[advisory_id]
+        expected_item = expected_by_id[advisory_id]
+        for field in sorted(ADVISORY_EXCEPTION_REQUIRED_FIELDS | {"affected_version", "dependency_path"}):
+            if field in expected_item and actual.get(field) != expected_item.get(field):
+                _field(
+                    findings,
+                    filename,
+                    "rust_advisory_exception_metadata_mismatch",
+                    f"{advisory_id} field {field} differs from exception metadata",
+                )
+
+    report_count = value.get("advisory_exception_count")
+    if (
+        isinstance(report_count, bool)
+        or not isinstance(report_count, int)
+        or report_count != len(raw)
+    ):
+        _field(
+            findings,
+            filename,
+            "rust_advisory_exception_count_mismatch",
+            "advisory_exception_count does not match advisory_ignores",
+        )
+    report_ids = value.get("advisory_exception_ids")
+    if report_ids != sorted(actual_by_id):
+        _field(
+            findings,
+            filename,
+            "rust_advisory_exception_ids_mismatch",
+            "advisory_exception_ids does not match advisory_ignores",
+        )
+
+
 def _validate_report(
     filename: str,
     expected_component: str,
@@ -125,6 +302,7 @@ def _validate_report(
     repository: str,
     head_sha: str,
     workflow_sha: str | None,
+    rust_advisory_exceptions: list[dict[str, Any]],
     findings: list[dict[str, Any]],
 ) -> None:
     required_fields = {
@@ -200,6 +378,10 @@ def _validate_report(
 
     if expected_component == "rust_dependency_audit" and _nested_int(value, "vulnerability_counts", "total") != 0:
         _field(findings, filename, "report_vulnerability_count_nonzero", "Rust vulnerability count is non-zero")
+    if expected_component == "rust_dependency_audit":
+        _validate_rust_advisory_ignores(
+            filename, value, rust_advisory_exceptions, findings
+        )
     if expected_component == "go_vulnerability_audit" and _int_value(value, "vulnerability_count") != 0:
         _field(findings, filename, "report_vulnerability_count_nonzero", "Go vulnerability count is non-zero")
     if expected_component == "flutter_outdated_triage" and _nested_int(value, "counts", "blockers") != 0:
@@ -250,6 +432,11 @@ def run(
             elif status != "success":
                 findings.append({"code": "required_job_not_success", "message": f"{name}: {status}"})
 
+    rust_advisory_exceptions = load_advisory_exception_contract(
+        root / "deny.toml",
+        root / "security" / "advisory-exceptions.json",
+        findings,
+    )
     checks: dict[str, Any] = {}
     evidence_files: list[dict[str, Any]] = []
     loaded: dict[str, dict[str, Any]] = {}
@@ -279,6 +466,7 @@ def run(
             repository=expected_repository,
             head_sha=head_sha,
             workflow_sha=workflow_sha,
+            rust_advisory_exceptions=rust_advisory_exceptions,
             findings=findings,
         )
         checks[component] = {
@@ -307,6 +495,12 @@ def run(
     release = loaded.get("release-assets.json", {})
     counts = {
         "rust_vulnerabilities": _nested_int(rust, "vulnerability_counts", "total"),
+        "rust_advisory_exception_count": len(rust_advisory_exceptions),
+        "rust_advisory_exception_ids": [
+            item["advisory_id"]
+            for item in rust_advisory_exceptions
+            if isinstance(item.get("advisory_id"), str)
+        ],
         "go_vulnerabilities": _int_value(go, "vulnerability_count"),
         "flutter_outdated_classified": _nested_int(flutter, "outdated_dependency_counts", "classified"),
         "flutter_outdated_blockers": _nested_int(flutter, "outdated_dependency_counts", "blockers"),
