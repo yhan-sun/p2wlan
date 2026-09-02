@@ -34,7 +34,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .p2wlan-task/path-observability-v2/part-* > /tmp/path-observability.b64
+          root=.p2wlan-task/path-observability-v2
+          test "$(wc -c < "$root/repair-00-0")" -eq 6000
+          test "$(wc -c < "$root/repair-00-1")" -eq 6000
+          test "$(wc -c < "$root/part-01")" -eq 12000
+          test "$(wc -c < "$root/repair-02-0")" -eq 6000
+          test "$(wc -c < "$root/repair-02-1")" -eq 6000
+          for index in 03 04 05 06 07 08; do
+            test "$(wc -c < "$root/part-$index")" -eq 12000
+          done
+          test "$(wc -c < "$root/part-09")" -eq 4096
+          cat \
+            "$root/repair-00-0" \
+            "$root/repair-00-1" \
+            "$root/part-01" \
+            "$root/repair-02-0" \
+            "$root/repair-02-1" \
+            "$root/part-03" \
+            "$root/part-04" \
+            "$root/part-05" \
+            "$root/part-06" \
+            "$root/part-07" \
+            "$root/part-08" \
+            "$root/part-09" \
+            > /tmp/path-observability.b64
+          test "$(wc -c < /tmp/path-observability.b64)" -eq 112096
           base64 --decode /tmp/path-observability.b64 > /tmp/path-observability.patch
           echo "$EXPECTED_PATCH_SHA256  /tmp/path-observability.patch" | sha256sum --check --strict
           git apply --check /tmp/path-observability.patch
