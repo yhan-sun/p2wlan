@@ -1,0 +1,111 @@
+name: Apply Path Observability Temporary
+
+on:
+  push:
+    branches:
+      - feat/path-observability-20260902
+    paths:
+      - ".p2wlan-task/path-observability-v2/READY"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  EXPECTED_BRANCH: feat/path-observability-20260902
+  EXPECTED_PATCH_SHA256: 1c29e768fa17f16a7ca62509ad14bf133c0027429fde30e73709371299a25ded
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/path-observability-20260902
+          fetch-depth: 0
+      - name: Verify branch and base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "$EXPECTED_BRANCH"
+          git merge-base --is-ancestor 2c9ebe8bc85bf8b4556fd2365c075fa2341a91db HEAD
+      - name: Assemble and apply exact patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .p2wlan-task/path-observability-v2/part-* > /tmp/path-observability.b64
+          base64 --decode /tmp/path-observability.b64 > /tmp/path-observability.patch
+          echo "$EXPECTED_PATCH_SHA256  /tmp/path-observability.patch" | sha256sum --check --strict
+          git apply --check /tmp/path-observability.patch
+          git apply /tmp/path-observability.patch
+          rm -rf .p2wlan-task .tmp
+          rm -f .github/workflows/decode-path-observability-patch-temporary.yml
+          rm -f .github/workflows/apply-path-observability-temporary.yml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+      - name: Format generated sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cd apps/flutter_client
+          flutter pub get
+          dart format \
+            lib/core/models/diagnostics_models.dart \
+            lib/core/models/diagnostics_models/peer.dart \
+            lib/core/models/diagnostics_models/snapshot.dart \
+            lib/core/models/diagnostics_models/path_observability.dart \
+            test/contract_test.dart
+          cd ../..
+          bash scripts/release/hermetic_build.sh restore
+      - name: Compile and test path observability
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets --all-features
+          cargo clippy -p p2wlan-daemon -p p2wlan-cli --all-targets --all-features -- -D warnings
+          cargo test -p p2wlan-daemon --lib path_observability -- --test-threads=1
+          cargo test -p p2wlan-daemon --test contract_fixture -- --test-threads=1
+          cd apps/flutter_client
+          flutter analyze
+          flutter test test/contract_test.dart
+          cd ../../server
+          go vet ./...
+          go test ./... -count=1
+          cd ..
+          P2WLAN_PATH_OBSERVABILITY_EVIDENCE=/tmp/path-observability-evidence.json \
+            python3 scripts/path-observability-evidence.py
+          git diff --check
+      - name: Commit validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e .p2wlan-task
+          test ! -e .tmp
+          test ! -e .github/workflows/apply-path-observability-temporary.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat:增加路径可观测性门禁"
+          git push origin HEAD:feat/path-observability-20260902
