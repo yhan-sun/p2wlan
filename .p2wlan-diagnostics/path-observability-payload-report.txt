@@ -1,0 +1,83 @@
+head=e0a83ae1f2464125c9a89a034ff697cd004c2df7
+branch=feat/path-observability-20260902
+part_count=20
+-- parts --
+.p2wlan-task/path-observability-payload/part-00 bytes=1000
+100644 253bc58bf97ca11b1921672d62a5b67138fbb8ce 0	.p2wlan-task/path-observability-payload/part-00
+1165c717bd5a3f5314f474e1b300f55d1f4a5ab6b1f59541f772fc8390ba5970  .p2wlan-task/path-observability-payload/part-00
+.p2wlan-task/path-observability-payload/part-01 bytes=1000
+100644 a847bc0f3fe4ddf28fce00d31bc3481978cc7a11 0	.p2wlan-task/path-observability-payload/part-01
+2d4145cfe02ec151e8e45a4b30493de0f91ae8bd4254d419bea93aabe43d1184  .p2wlan-task/path-observability-payload/part-01
+.p2wlan-task/path-observability-payload/part-02 bytes=1000
+100644 723f56910509f6bf10d2496e73413efbe742761c 0	.p2wlan-task/path-observability-payload/part-02
+d90198ba54ff6e59c730a2793412212f0eb587480544725477c92eede2bdaf21  .p2wlan-task/path-observability-payload/part-02
+.p2wlan-task/path-observability-payload/part-03 bytes=1000
+100644 02007f161bd99eeaf0a503948b92d905fce33205 0	.p2wlan-task/path-observability-payload/part-03
+3cc69266f1c399489386e0bfcfc1326b16cc548adba2139be4cba3f37c316153  .p2wlan-task/path-observability-payload/part-03
+.p2wlan-task/path-observability-payload/part-04 bytes=1000
+100644 31294163f8a905665e940f7d6bd6402695c63126 0	.p2wlan-task/path-observability-payload/part-04
+f2b07b0a03d9203977a00d4070ee7c9c36c730cfc3111c5d5ed9afe90e741499  .p2wlan-task/path-observability-payload/part-04
+.p2wlan-task/path-observability-payload/part-05 bytes=1000
+100644 de6af7574d3b90609e9320ae7254f0648d8d0b50 0	.p2wlan-task/path-observability-payload/part-05
+a0ac83173f7f0a37c40e9329564a5ae6a791ff9e7d1bc575078224bc6019b5e3  .p2wlan-task/path-observability-payload/part-05
+.p2wlan-task/path-observability-payload/part-06 bytes=1000
+100644 1d4729c43884bcfe5634465976db9f99657cb0e1 0	.p2wlan-task/path-observability-payload/part-06
+dbbb93af563c9a6ecc3d7f5cb3406e0103a42fbaf6c172a9dc1d6a87f80e82e8  .p2wlan-task/path-observability-payload/part-06
+.p2wlan-task/path-observability-payload/part-07 bytes=1000
+100644 c23f172e7e2174bd7d177884a0ef7ea4272bca78 0	.p2wlan-task/path-observability-payload/part-07
+640f7ec668c4bfc6c96b9af22c2eb4b8c6da0b6774794bc8a6d7d9792bed4c08  .p2wlan-task/path-observability-payload/part-07
+.p2wlan-task/path-observability-payload/part-08 bytes=1000
+100644 01d6546952dd6a21e0a55c61cc3207b4a4af6eb6 0	.p2wlan-task/path-observability-payload/part-08
+c95582302576ce7e563f66799ec82b6c788cd26a58ced59fd212b79ad6f5f6d3  .p2wlan-task/path-observability-payload/part-08
+.p2wlan-task/path-observability-payload/part-09 bytes=1000
+100644 360723449fa6da5812c722522ce21af3fdfe44a7 0	.p2wlan-task/path-observability-payload/part-09
+22988cb1e553302ea9ade18e62d6617ab3ca4a17f19546c7e53c876363429f3d  .p2wlan-task/path-observability-payload/part-09
+.p2wlan-task/path-observability-payload/part-10 bytes=1000
+100644 b2b9d901a3f0b97fb7833ec6baf4153d5fdd88da 0	.p2wlan-task/path-observability-payload/part-10
+1fa9ed061ae48a0c982aaac5b9578c84679da528074905f4f2fb0551de497526  .p2wlan-task/path-observability-payload/part-10
+.p2wlan-task/path-observability-payload/part-11 bytes=1000
+100644 ce82225baba5ae25c10125dfb544bc7cf82bfd5a 0	.p2wlan-task/path-observability-payload/part-11
+348ef54c681e7f5a90672079436c62f3a7bd999180446335d9fd7c9f54a49b46  .p2wlan-task/path-observability-payload/part-11
+.p2wlan-task/path-observability-payload/part-12 bytes=1000
+100644 b25ffa9273208151ebd0ffa150aa6518f70e96f4 0	.p2wlan-task/path-observability-payload/part-12
+79e1681a52d15c15275b6efd789aebdf70793828cb64eb0ec61a8cf227ea4f93  .p2wlan-task/path-observability-payload/part-12
+.p2wlan-task/path-observability-payload/part-13 bytes=1000
+100644 fe5347c04d54eb25cc4ecfeb2b0739e7c7813641 0	.p2wlan-task/path-observability-payload/part-13
+67fd6d9b97d3066256cb801349009f0eff249d69d0ec71963b3502197ba20522  .p2wlan-task/path-observability-payload/part-13
+.p2wlan-task/path-observability-payload/part-14 bytes=1000
+100644 428e27cff2f4e56745980fc0821c2af2255078fb 0	.p2wlan-task/path-observability-payload/part-14
+672bf257f745218f20eee51f67e43fd48c2cc7f95d4defe36d7b4f3d3a9476b4  .p2wlan-task/path-observability-payload/part-14
+.p2wlan-task/path-observability-payload/part-15 bytes=1000
+100644 00fb7f3d18d6fa652211233829b4f14df8e42a23 0	.p2wlan-task/path-observability-payload/part-15
+ed5a92203160da30f02033945d66c38fec701780767b4b80a055faa944953a36  .p2wlan-task/path-observability-payload/part-15
+.p2wlan-task/path-observability-payload/part-16 bytes=1000
+100644 4073650a22eaba21a24c57c99c091d0e4258afd1 0	.p2wlan-task/path-observability-payload/part-16
+3b8aca1153806cf95a9b83086a8d1ab625b58ac19727bd2e49862fe9020abc9a  .p2wlan-task/path-observability-payload/part-16
+.p2wlan-task/path-observability-payload/part-17 bytes=1000
+100644 64ced2a3ba86da313f74bc424c52ee8c9d84962e 0	.p2wlan-task/path-observability-payload/part-17
+a9b086de0d7de66a1d6e02d9be232c3aa30dbaea68b422390d85b4afffe54947  .p2wlan-task/path-observability-payload/part-17
+.p2wlan-task/path-observability-payload/part-18 bytes=1000
+100644 1bdaf74ef5393de83fd09fbc61a02dbbe5cd9873 0	.p2wlan-task/path-observability-payload/part-18
+5bf1355fa1418476e5b2432f693f9b51a8567893b81c0d6d9b580dfd5bda958c  .p2wlan-task/path-observability-payload/part-18
+.p2wlan-task/path-observability-payload/part-19 bytes=889
+100644 2d5cfd374e377a2c2dec5bb8d8b48b199aeaa848 0	.p2wlan-task/path-observability-payload/part-19
+f7d43dab42ec5000f2a56c78bab7d32368cb8513d65508ac2510bbdde55e37c2  .p2wlan-task/path-observability-payload/part-19
+-- assemble --
+cat_status=0
+b64_size=19889
+6f1081ed927571e43acb626246141efb1ef517b50522ac3c6ef07242330f8dcf  /tmp/path-observability.patch.xz.b64
+base64_status=1
+xz_size=14916
+83c5acffda016fca1db1830b08e0254c6f4af8817e049e78b77c1df81b40c00b  /tmp/path-observability.patch.xz
+base64: invalid input
+xz_test_status=1
+xz: /tmp/path-observability.patch.xz: Compressed data is corrupt
+xz_decode_status=1
+patch_size=77422
+67003b08e74776af3cf84a0930cc0eeacefb9789abf0340a1dd3dfffd463c0ff  /tmp/path-observability.patch
+xz: /tmp/path-observability.patch.xz: Compressed data is corrupt
+git_apply_status=128
+error: corrupt patch at /tmp/path-observability.patch:1939
+expected_b64_size=19824
+expected_xz_sha256=e894b7298a8f182feb6b0e841c26a49424dd1cc19e1e4ff298499c85ba88df5a
+expected_patch_sha256=9d351c6cc297f71094c1390799193364147376771a07bdf7e54c01976a606239
