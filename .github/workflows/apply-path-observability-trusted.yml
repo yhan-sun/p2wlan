@@ -1,0 +1,160 @@
+name: Apply Path Observability Trusted
+
+on:
+  push:
+    branches:
+      - feat/path-observability-20260902
+    paths:
+      - ".p2wlan-task/path-observability-payload/RUN2"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  EXPECTED_XZ_SHA256: e894b7298a8f182feb6b0e841c26a49424dd1cc19e1e4ff298499c85ba88df5a
+  EXPECTED_PATCH_SHA256: 9d351c6cc297f71094c1390799193364147376771a07bdf7e54c01976a606239
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact triggering commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          git merge-base --is-ancestor 2c9ebe8bc85bf8b4556fd2365c075fa2341a91db HEAD
+
+      - name: Assemble verify and apply payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/path-observability-logs
+          root=.p2wlan-task/path-observability-payload
+          find "$root" -maxdepth 1 -type f -name 'part-*' -printf '%f %s\n' | sort | tee /tmp/path-observability-logs/parts.txt
+          test "$(find "$root" -maxdepth 1 -type f -name 'part-*' | wc -l)" -eq 20
+          for index in $(seq -w 0 18); do
+            test "$(wc -c < "$root/part-$index")" -eq 1000
+          done
+          test "$(wc -c < "$root/part-19")" -eq 824
+          cat "$root"/part-* > /tmp/path-observability.patch.xz.b64
+          test "$(wc -c < /tmp/path-observability.patch.xz.b64)" -eq 19824
+          base64 --decode /tmp/path-observability.patch.xz.b64 > /tmp/path-observability.patch.xz
+          sha256sum /tmp/path-observability.patch.xz | tee /tmp/path-observability-logs/xz.sha256
+          echo "$EXPECTED_XZ_SHA256  /tmp/path-observability.patch.xz" | sha256sum --check --strict
+          xz --test /tmp/path-observability.patch.xz
+          xz --decompress --stdout /tmp/path-observability.patch.xz > /tmp/path-observability.patch
+          sha256sum /tmp/path-observability.patch | tee /tmp/path-observability-logs/patch.sha256
+          echo "$EXPECTED_PATCH_SHA256  /tmp/path-observability.patch" | sha256sum --check --strict
+          git apply --unidiff-zero --check /tmp/path-observability.patch 2>&1 | tee /tmp/path-observability-logs/git-apply-check.log
+          git apply --unidiff-zero /tmp/path-observability.patch
+          rm -rf .p2wlan-task .tmp .p2wlan-diagnostics
+          rm -f .github/workflows/decode-path-observability-patch-temporary.yml
+          rm -f .github/workflows/apply-path-observability-temporary.yml
+          rm -f .github/workflows/diagnose-path-observability-payload.yml
+          rm -f .github/workflows/apply-path-observability-trusted.yml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install Linux workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+
+      - name: Format generated sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all 2>&1 | tee /tmp/path-observability-logs/cargo-fmt.log
+          cd apps/flutter_client
+          flutter pub get 2>&1 | tee /tmp/path-observability-logs/flutter-pub-get.log
+          dart format \
+            lib/core/models/diagnostics_models.dart \
+            lib/core/models/diagnostics_models/peer.dart \
+            lib/core/models/diagnostics_models/snapshot.dart \
+            lib/core/models/diagnostics_models/path_observability.dart \
+            test/contract_test.dart 2>&1 | tee /tmp/path-observability-logs/dart-format.log
+          cd ../..
+          bash scripts/release/hermetic_build.sh restore
+
+      - name: Rust compile and clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets --all-features 2>&1 | tee /tmp/path-observability-logs/cargo-check.log
+          cargo clippy -p p2wlan-daemon -p p2wlan-cli --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/path-observability-logs/cargo-clippy.log
+
+      - name: Rust path and contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p p2wlan-daemon --lib path_observability -- --test-threads=1 2>&1 | tee /tmp/path-observability-logs/path-tests.log
+          cargo test -p p2wlan-daemon --test contract_fixture -- --test-threads=1 2>&1 | tee /tmp/path-observability-logs/contract-tests.log
+
+      - name: Flutter contracts
+        working-directory: apps/flutter_client
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter analyze 2>&1 | tee /tmp/path-observability-logs/flutter-analyze.log
+          flutter test test/contract_test.dart 2>&1 | tee /tmp/path-observability-logs/flutter-contract.log
+
+      - name: Go contracts and evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd server
+          go vet ./... 2>&1 | tee /tmp/path-observability-logs/go-vet.log
+          go test ./... -count=1 2>&1 | tee /tmp/path-observability-logs/go-test.log
+          cd ..
+          P2WLAN_PATH_OBSERVABILITY_EVIDENCE=/tmp/path-observability-logs/path-observability-evidence.json \
+            python3 scripts/path-observability-evidence.py 2>&1 | tee /tmp/path-observability-logs/evidence.log
+          git diff --check 2>&1 | tee /tmp/path-observability-logs/diff-check.log
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: path-observability-trusted-${{ github.run_id }}
+          path: /tmp/path-observability-logs
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Commit validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e .p2wlan-task
+          test ! -e .tmp
+          test ! -e .p2wlan-diagnostics
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat:增加路径可观测性门禁"
+          git push origin HEAD:feat/path-observability-20260902
