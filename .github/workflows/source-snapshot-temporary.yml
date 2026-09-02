@@ -1,0 +1,38 @@
+name: Temporary Source Snapshot
+
+on:
+  push:
+    branches:
+      - ops/source-snapshot-20260902
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create exact source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > source-snapshot-sha.txt
+          tar \
+            --exclude=.git \
+            --exclude=.github/workflows/source-snapshot-temporary.yml \
+            -czf "$RUNNER_TEMP/p2wlan-source.tar.gz" .
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2wlan-source-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/p2wlan-source.tar.gz
+            source-snapshot-sha.txt
+          if-no-files-found: error
+          retention-days: 1
