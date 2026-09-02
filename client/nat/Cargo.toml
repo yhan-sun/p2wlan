@@ -6,8 +6,8 @@ license.workspace = true
 description = "NAT traversal (STUN/ICE/UDP Hole Punching) for P2PNet"
 
 [dependencies]
-p2pnet-crypto = { path = "../crypto" }
-p2pnet-netbind = { path = "../netbind" }
+p2pnet-crypto = { path = "../crypto", version = "0.1.147" }
+p2pnet-netbind = { path = "../netbind", version = "0.1.147" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

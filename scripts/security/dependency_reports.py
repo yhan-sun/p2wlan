@@ -12,13 +12,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from report_common import make_report
+
 
 def _read_json(
     path: Path, findings: list[dict[str, str]], code: str
 ) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         findings.append({"code": code, "message": f"{path}: {error}"})
         return None
 
@@ -29,7 +31,7 @@ def _read_json_lines(
     values: list[Any] = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         findings.append({"code": code, "message": f"{path}: {error}"})
         return values
     for number, line in enumerate(lines, 1):
@@ -49,7 +51,7 @@ def _read_json_stream(
 ) -> list[Any]:
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         findings.append({"code": code, "message": f"{path}: {error}"})
         return []
     decoder = json.JSONDecoder()
@@ -67,6 +69,23 @@ def _read_json_stream(
             break
         values.append(value)
     return values
+
+
+def _is_reachable_govulncheck_finding(finding: dict[str, Any]) -> bool:
+    """Return whether a govulncheck finding has a code/package trace.
+
+    govulncheck's JSON stream includes one-frame module metadata findings even
+    when the vulnerable code is not reachable. A finding without a usable
+    trace is treated as actionable so malformed evidence fails closed.
+    """
+    trace = finding.get("trace")
+    if not isinstance(trace, list) or not trace:
+        return True
+    return any(
+        isinstance(frame, dict)
+        and any(key in frame for key in ("package", "function", "position"))
+        for frame in trace
+    )
 
 
 def _audit_counts(value: Any) -> tuple[int, int]:
@@ -120,32 +139,59 @@ def rust_summary(args: argparse.Namespace) -> dict[str, Any]:
         args.fuzz_deny, findings, "invalid_cargo_deny_jsonl"
     )
 
-    return {
-        "schema_version": 1,
-        "result": "pass" if not findings else "fail",
-        "head_sha": args.head_sha,
-        "tools": {
+    result = "pass" if not findings else "fail"
+    return make_report(
+        component="rust_dependency_audit",
+        head_sha=args.head_sha,
+        workflow_sha=getattr(args, "workflow_sha", None),
+        repository=getattr(args, "repository", None),
+        result=result,
+        findings=findings,
+        tool="cargo-audit/cargo-deny",
+        tools={
             "cargo_audit": args.cargo_audit_version,
             "cargo_deny": args.cargo_deny_version,
         },
-        "checks": statuses,
-        "vulnerability_counts": {
+        command=[
+            "cargo audit --file Cargo.lock --json",
+            "cargo audit --file fuzz/Cargo.lock --json",
+            "cargo deny --config deny.toml --format json check advisories bans licenses sources",
+            "cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml --format json check advisories bans licenses sources",
+        ],
+        evidence_summary={
+            "checks": statuses,
+            "vulnerability_counts": {
+                "root": root_vulns,
+                "fuzz": fuzz_vulns,
+                "total": root_vulns + fuzz_vulns,
+            },
+            "warning_counts": {
+                "root": root_warnings,
+                "fuzz": fuzz_warnings,
+                "total": root_warnings + fuzz_warnings,
+            },
+            "cargo_deny_record_counts": {
+                "root": len(root_deny),
+                "fuzz": len(fuzz_deny),
+            },
+        },
+        checks=statuses,
+        vulnerability_counts={
             "root": root_vulns,
             "fuzz": fuzz_vulns,
             "total": root_vulns + fuzz_vulns,
         },
-        "warning_counts": {
+        warning_counts={
             "root": root_warnings,
             "fuzz": fuzz_warnings,
             "total": root_warnings + fuzz_warnings,
         },
-        "cargo_deny_record_counts": {
+        cargo_deny_record_counts={
             "root": len(root_deny),
             "fuzz": len(fuzz_deny),
         },
-        "advisory_ignores": [],
-        "findings": findings,
-    }
+        advisory_ignores=[],
+    )
 
 
 def go_summary(args: argparse.Namespace) -> dict[str, Any]:
@@ -153,6 +199,7 @@ def go_summary(args: argparse.Namespace) -> dict[str, Any]:
     statuses = {
         "go_mod_verify": args.mod_status,
         "go_test": args.test_status,
+        "go_vet": getattr(args, "vet_status", 0),
         "go_list_modules": args.modules_status,
         "govulncheck_json": args.json_status,
         "govulncheck_gate": args.vuln_status,
@@ -163,14 +210,29 @@ def go_summary(args: argparse.Namespace) -> dict[str, Any]:
                 {"code": "scanner_nonzero", "message": f"{name} exited {status}"}
             )
 
-    messages = _read_json_lines(
-        args.govulncheck_json, findings, "invalid_govulncheck_jsonl"
+    messages = _read_json_stream(
+        args.govulncheck_json, findings, "invalid_govulncheck_json_stream"
     )
+    if not messages:
+        findings.append(
+            {
+                "code": "empty_govulncheck_json",
+                "message": "govulncheck JSON output contained no documents",
+            }
+        )
     modules = _read_json_stream(
         args.modules_json, findings, "invalid_go_module_json_stream"
     )
+    if not modules:
+        findings.append(
+            {
+                "code": "empty_go_module_json",
+                "message": "go list -m -json all produced no module documents",
+            }
+        )
     osv_ids: set[str] = set()
     finding_messages = 0
+    unreachable_finding_messages = 0
     for value in messages:
         if not isinstance(value, dict):
             continue
@@ -179,28 +241,56 @@ def go_summary(args: argparse.Namespace) -> dict[str, Any]:
             finding_messages += 1
             osv = finding.get("osv")
             if isinstance(osv, str) and osv:
-                osv_ids.add(osv)
+                if _is_reachable_govulncheck_finding(finding):
+                    osv_ids.add(osv)
+                else:
+                    unreachable_finding_messages += 1
         osv = value.get("osv")
-        if isinstance(osv, dict):
+        # govulncheck emits full OSV advisory documents for reachable and
+        # unreachable module metadata. Only ``finding`` documents are
+        # actionable; retain support for the small synthetic ``{"osv":
+        # {"id": ...}}`` shape used by local policy fixtures.
+        if isinstance(osv, dict) and set(osv).issubset({"id"}):
             identifier = osv.get("id")
             if isinstance(identifier, str) and identifier:
                 osv_ids.add(identifier)
 
-    return {
-        "schema_version": 1,
-        "result": "pass" if not findings else "fail",
-        "head_sha": args.head_sha,
-        "tools": {
+    result = "pass" if not findings else "fail"
+    return make_report(
+        component="go_vulnerability_audit",
+        head_sha=args.head_sha,
+        workflow_sha=getattr(args, "workflow_sha", None),
+        repository=getattr(args, "repository", None),
+        result=result,
+        findings=findings,
+        tool="go/govulncheck",
+        tools={
             "go": args.go_version,
             "govulncheck": args.govulncheck_version,
         },
-        "checks": statuses,
-        "module_count": len(modules),
-        "vulnerability_count": len(osv_ids),
-        "finding_message_count": finding_messages,
-        "vulnerability_ids": sorted(osv_ids),
-        "findings": findings,
-    }
+        command=[
+            "go mod verify",
+            "go test ./... -count=1",
+            "go vet ./...",
+            "go list -m -json all",
+            "govulncheck -json ./...",
+            "govulncheck ./...",
+        ],
+        evidence_summary={
+            "checks": statuses,
+            "module_count": len(modules),
+            "vulnerability_count": len(osv_ids),
+            "finding_message_count": finding_messages,
+            "vulnerability_ids": sorted(osv_ids),
+            "unreachable_finding_message_count": unreachable_finding_messages,
+        },
+        checks=statuses,
+        module_count=len(modules),
+        vulnerability_count=len(osv_ids),
+        finding_message_count=finding_messages,
+        unreachable_finding_message_count=unreachable_finding_messages,
+        vulnerability_ids=sorted(osv_ids),
+    )
 
 
 def flutter_summary(args: argparse.Namespace) -> dict[str, Any]:
@@ -246,19 +336,36 @@ def flutter_summary(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(lock_policy, dict)
         else {}
     )
-    return {
-        "schema_version": 1,
-        "result": "pass" if not findings else "fail",
-        "head_sha": args.head_sha,
-        "tools": {
+    result = "pass" if not findings else "fail"
+    return make_report(
+        component="flutter_dependency_audit",
+        head_sha=args.head_sha,
+        workflow_sha=getattr(args, "workflow_sha", None),
+        repository=getattr(args, "repository", None),
+        result=result,
+        findings=findings,
+        tool="flutter/dart",
+        tools={
             "flutter": args.flutter_version,
             "dart": args.dart_version,
         },
-        "checks": statuses,
-        "dependency_source_counts": lock_counts,
-        "outdated_dependency_counts": triage_counts,
-        "findings": findings,
-    }
+        command=[
+            "flutter pub get",
+            "flutter pub deps --style=compact",
+            "flutter pub outdated --json",
+            "flutter analyze",
+            "flutter_lock_policy.py",
+            "flutter_outdated_triage.py",
+        ],
+        evidence_summary={
+            "checks": statuses,
+            "dependency_source_counts": lock_counts,
+            "outdated_dependency_counts": triage_counts,
+        },
+        checks=statuses,
+        dependency_source_counts=lock_counts,
+        outdated_dependency_counts=triage_counts,
+    )
 
 
 def _write(value: dict[str, Any], output: Path) -> int:
@@ -275,6 +382,8 @@ def main() -> int:
 
     rust = subparsers.add_parser("rust")
     rust.add_argument("--head-sha", required=True)
+    rust.add_argument("--workflow-sha")
+    rust.add_argument("--repository")
     rust.add_argument("--root-audit", type=Path, required=True)
     rust.add_argument("--fuzz-audit", type=Path, required=True)
     rust.add_argument("--root-deny", type=Path, required=True)
@@ -289,10 +398,13 @@ def main() -> int:
 
     go = subparsers.add_parser("go")
     go.add_argument("--head-sha", required=True)
+    go.add_argument("--workflow-sha")
+    go.add_argument("--repository")
     go.add_argument("--govulncheck-json", type=Path, required=True)
     go.add_argument("--modules-json", type=Path, required=True)
     go.add_argument("--mod-status", type=int, required=True)
     go.add_argument("--test-status", type=int, required=True)
+    go.add_argument("--vet-status", type=int, required=True)
     go.add_argument("--modules-status", type=int, required=True)
     go.add_argument("--json-status", type=int, required=True)
     go.add_argument("--vuln-status", type=int, required=True)
@@ -302,6 +414,8 @@ def main() -> int:
 
     flutter = subparsers.add_parser("flutter")
     flutter.add_argument("--head-sha", required=True)
+    flutter.add_argument("--workflow-sha")
+    flutter.add_argument("--repository")
     flutter.add_argument("--lock-policy", type=Path, required=True)
     flutter.add_argument("--triage", type=Path, required=True)
     flutter.add_argument("--get-status", type=int, required=True)

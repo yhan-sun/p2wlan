@@ -20,6 +20,17 @@ import verify_release_assets
 import workflow_permissions
 
 
+HEAD_SHA = "a" * 40
+WORKFLOW_SHA = "b" * 40
+NEEDS_SUCCESS = {
+    "repository-policy": "success",
+    "rust-dependencies": "success",
+    "go-dependencies": "success",
+    "flutter-dependencies": "success",
+    "release-assets": "success",
+}
+
+
 class WorkflowPermissionTests(unittest.TestCase):
     def write_workflow(self, root: Path, name: str, content: str) -> Path:
         path = root / ".github" / "workflows" / name
@@ -41,7 +52,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    steps: []
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 """,
             )
             self.assertEqual(workflow_permissions.run(root)["result"], "pass")
@@ -62,10 +74,7 @@ jobs: {}
             )
             evidence = workflow_permissions.run(root)
             self.assertTrue(
-                any(
-                    item["code"] == "write_permission_not_allowlisted"
-                    for item in evidence["findings"]
-                )
+                any(item["code"] == "write_permission_not_allowlisted" for item in evidence["findings"])
             )
 
     def test_release_write_passes_with_tag_trigger(self) -> None:
@@ -105,10 +114,7 @@ jobs: {}
             )
             evidence = workflow_permissions.run(root)
             self.assertTrue(
-                any(
-                    item["code"] == "pull_request_target_forbidden"
-                    for item in evidence["findings"]
-                )
+                any(item["code"] == "pull_request_target_forbidden" for item in evidence["findings"])
             )
 
     def test_production_signing_secret_is_release_only(self) -> None:
@@ -133,12 +139,69 @@ jobs:
             )
             evidence = workflow_permissions.run(root)
             self.assertTrue(
-                any(
-                    item["code"]
-                    == "production_secret_outside_release_workflow"
-                    for item in evidence["findings"]
-                )
+                any(item["code"] == "production_secret_outside_release_workflow" for item in evidence["findings"])
             )
+
+    def test_floating_action_reference_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(
+                root,
+                "ci.yml",
+                """name: CI
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+""",
+            )
+            evidence = workflow_permissions.run(root)
+            self.assertTrue(any(item["code"] == "floating_action_reference" for item in evidence["findings"]))
+
+    def test_untrusted_shell_interpolation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(
+                root,
+                "ci.yml",
+                """name: CI
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          printf '%s' "${{ github.event.pull_request.title }}"
+""",
+            )
+            evidence = workflow_permissions.run(root)
+            self.assertTrue(any(item["code"] == "untrusted_shell_interpolation" for item in evidence["findings"]))
+
+    def test_remote_shell_pipe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_workflow(
+                root,
+                "ci.yml",
+                """name: CI
+on: push
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsSL https://example.invalid/install.sh | sh
+""",
+            )
+            evidence = workflow_permissions.run(root)
+            self.assertTrue(any(item["code"] == "remote_shell_pipe" for item in evidence["findings"]))
 
 
 class CredentialScanTests(unittest.TestCase):
@@ -146,9 +209,7 @@ class CredentialScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             token = "ghp_" + "abcdefghijklmnopqrstuvwxyz012345"
-            (root / "script.sh").write_text(
-                f"set -x\nTOKEN={token}\n", encoding="utf-8"
-            )
+            (root / "script.sh").write_text(f"set -x\nTOKEN={token}\n", encoding="utf-8")
             evidence = credential_scan.run(root)
             codes = {item["code"] for item in evidence["findings"]}
             self.assertIn("shell_xtrace", codes)
@@ -169,16 +230,9 @@ run: printf '%s\\n' "$TOKEN" | ./daemon --token-file /dev/stdin
     def test_direct_actions_secret_interpolation_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "unsafe.yml").write_text(
-                "run: echo '${{ secrets.API_TOKEN }}'\n", encoding="utf-8"
-            )
+            (root / "unsafe.yml").write_text("run: echo '${{ secrets.API_TOKEN }}'\n", encoding="utf-8")
             evidence = credential_scan.run(root)
-            self.assertTrue(
-                any(
-                    item["code"] == "direct_actions_secret_interpolation"
-                    for item in evidence["findings"]
-                )
-            )
+            self.assertTrue(any(item["code"] == "direct_actions_secret_interpolation" for item in evidence["findings"]))
 
     def test_placeholder_private_key_is_not_real(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,12 +249,33 @@ run: printf '%s\\n' "$TOKEN" | ./daemon --token-file /dev/stdin
             token = "ghp_" + "abcdefghijklmnopqrstuvwxyz012345"
             (root / "artifact.bin").write_bytes(token.encode())
             evidence = credential_scan.run(root, scan_binary=True)
-            self.assertTrue(
-                any(
-                    item["code"] == "binary_github_token"
-                    for item in evidence["findings"]
-                )
-            )
+            self.assertTrue(any(item["code"] == "binary_github_token" for item in evidence["findings"]))
+
+    def test_sensitive_key_filename_fails_even_when_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "id_rsa").write_bytes(b"not-a-real-key")
+            evidence = credential_scan.run(root)
+            self.assertTrue(any(item["code"] == "tracked_sensitive_file" for item in evidence["findings"]))
+
+    def test_empty_scan_scope_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = credential_scan.run(Path(tmp))
+            self.assertTrue(any(item["code"] == "empty_scan_scope" for item in evidence["findings"]))
+            self.assertEqual(evidence["result"], "fail")
+
+    def test_empty_workflow_scope_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = workflow_permissions.run(Path(tmp))
+            self.assertTrue(any(item["code"] == "workflow_scope_empty" for item in evidence["findings"]))
+            self.assertEqual(evidence["result"], "fail")
+
+    def test_remote_shell_pipe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "install.sh").write_text("curl https://example.invalid/x | sh\n", encoding="utf-8")
+            evidence = credential_scan.run(root)
+            self.assertTrue(any(item["code"] == "remote_shell_pipe" for item in evidence["findings"]))
 
 
 class FlutterPolicyTests(unittest.TestCase):
@@ -242,6 +317,36 @@ class FlutterPolicyTests(unittest.TestCase):
             )
             self.assertEqual(flutter_lock_policy.run(lock)["result"], "fail")
 
+    def test_manifest_override_and_path_source_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock = root / "pubspec.lock"
+            lock.write_text(
+                """packages:
+  safe:
+    description:
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      url: https://pub.dev
+    source: hosted
+    version: 1.0.0
+""",
+                encoding="utf-8",
+            )
+            manifest = root / "pubspec.yaml"
+            manifest.write_text(
+                """dependencies:
+  local:
+    path: ../local
+dependency_overrides:
+  safe: 1.0.1
+""",
+                encoding="utf-8",
+            )
+            evidence = flutter_lock_policy.run(lock, manifest=manifest)
+            codes = {item["code"] for item in evidence["findings"]}
+            self.assertIn("dependency_override", codes)
+            self.assertIn("untrusted_manifest_source", codes)
+
     def write_outdated(self, root: Path, packages: list[dict]) -> Path:
         path = root / "outdated.json"
         path.write_text(json.dumps({"packages": packages}), encoding="utf-8")
@@ -263,10 +368,7 @@ class FlutterPolicyTests(unittest.TestCase):
             )
             evidence = flutter_outdated_triage.run(report)
             self.assertEqual(evidence["result"], "pass")
-            self.assertEqual(
-                evidence["packages"][0]["classification"],
-                "transitive_or_sdk_pinned",
-            )
+            self.assertEqual(evidence["packages"][0]["classification"], "transitive_or_sdk_pinned")
 
     def test_direct_resolvable_update_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -282,9 +384,7 @@ class FlutterPolicyTests(unittest.TestCase):
                     }
                 ],
             )
-            self.assertEqual(
-                flutter_outdated_triage.run(report)["result"], "fail"
-            )
+            self.assertEqual(flutter_outdated_triage.run(report)["result"], "fail")
 
     def test_discontinued_package_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -300,9 +400,35 @@ class FlutterPolicyTests(unittest.TestCase):
                     }
                 ],
             )
-            self.assertEqual(
-                flutter_outdated_triage.run(report)["result"], "fail"
+            self.assertEqual(flutter_outdated_triage.run(report)["result"], "fail")
+
+    def test_advisory_affected_package_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.write_outdated(
+                Path(tmp),
+                [
+                    {
+                        "package": "affected_dep",
+                        "kind": "transitive",
+                        "current": {"version": "1.0.0"},
+                        "latest": {"version": "1.0.0"},
+                        "isCurrentAffectedByAdvisory": True,
+                    }
+                ],
             )
+            evidence = flutter_outdated_triage.run(report)
+            self.assertEqual(evidence["result"], "fail")
+            self.assertEqual(
+                evidence["packages"][0]["classification"],
+                "current_version_affected_by_advisory",
+            )
+
+    def test_malformed_outdated_package_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.write_outdated(Path(tmp), [None])
+            evidence = flutter_outdated_triage.run(report)
+            self.assertEqual(evidence["result"], "fail")
+            self.assertTrue(any(item["code"] == "invalid_package_record" for item in evidence["findings"]))
 
 
 class ReleaseAssetTests(unittest.TestCase):
@@ -350,60 +476,109 @@ class ReleaseAssetTests(unittest.TestCase):
     def test_matching_release_assets_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, assets = self.make_release(Path(tmp))
-            self.assertEqual(
-                verify_release_assets.run(release, assets)["result"], "pass"
-            )
+            self.assertEqual(verify_release_assets.run(release, assets)["result"], "pass")
 
     def test_digest_mismatch_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release, assets = self.make_release(Path(tmp))
             (assets / "p2wlan-linux-x64-cli.tar.gz").write_bytes(b"tampered")
             evidence = verify_release_assets.run(release, assets)
-            self.assertTrue(
-                any(
-                    item["code"] == "asset_digest_mismatch"
-                    for item in evidence["findings"]
-                )
+            self.assertTrue(any(item["code"] == "asset_digest_mismatch" for item in evidence["findings"]))
+
+    def test_checksum_sidecar_is_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, assets = self.make_release(root)
+            name = "p2wlan-linux-x64-cli.tar.gz"
+            product = assets / name
+            sidecar_name = f"{name}.sha256"
+            sidecar_content = f"{hashlib.sha256(product.read_bytes()).hexdigest()}  {name}\n".encode()
+            (assets / sidecar_name).write_bytes(sidecar_content)
+            payload = json.loads(release.read_text(encoding="utf-8"))
+            payload["assets"].append(
+                {
+                    "name": sidecar_name,
+                    "state": "uploaded",
+                    "size": len(sidecar_content),
+                    "digest": f"sha256:{hashlib.sha256(sidecar_content).hexdigest()}",
+                }
             )
+            release.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(verify_release_assets.run(release, assets)["result"], "pass")
+
+    def test_checksum_sidecar_mismatch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, assets = self.make_release(root)
+            name = "p2wlan-linux-x64-cli.tar.gz"
+            product = assets / name
+            (assets / f"{name}.sha256").write_text(f"{'0' * 64}  {name}\n", encoding="utf-8")
+            payload = json.loads(release.read_text(encoding="utf-8"))
+            payload["assets"].append(
+                {
+                    "name": f"{name}.sha256",
+                    "state": "uploaded",
+                    "size": (assets / f"{name}.sha256").stat().st_size,
+                    "digest": f"sha256:{hashlib.sha256((assets / f'{name}.sha256').read_bytes()).hexdigest()}",
+                }
+            )
+            release.write_text(json.dumps(payload), encoding="utf-8")
+            evidence = verify_release_assets.run(release, assets)
+            self.assertTrue(any(item["code"] == "checksum_sidecar_mismatch" for item in evidence["findings"]))
+
+    def test_asset_path_traversal_fails_without_reading_outside_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            release, assets = self.make_release(root)
+            payload = json.loads(release.read_text(encoding="utf-8"))
+            payload["assets"][0]["name"] = "../outside"
+            release.write_text(json.dumps(payload), encoding="utf-8")
+            evidence = verify_release_assets.run(release, assets)
+            self.assertTrue(any(item["code"] == "unsafe_asset_name" for item in evidence["findings"]))
 
 
 class DependencyReportTests(unittest.TestCase):
-    def test_go_summary_counts_unique_vulnerabilities(self) -> None:
+    def test_go_summary_counts_actionable_unique_vulnerabilities_from_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             govuln = root / "govuln.jsonl"
             govuln.write_text(
-                json.dumps({"finding": {"osv": "GO-2026-0001"}})
-                + "\n"
-                + json.dumps({"osv": {"id": "GO-2026-0002"}})
-                + "\n",
+                "\n".join(
+                    [
+                        json.dumps({"config": {"protocol": "https"}}, indent=2),
+                        json.dumps({"osv": {"id": "GO-2026-0000", "affected": []}}),
+                        json.dumps({"finding": {"osv": "GO-2026-0001", "trace": [{"package": "example/p"}]}}),
+                        json.dumps({"finding": {"osv": "GO-2026-0001", "trace": [{"package": "example/p"}]}}),
+                        json.dumps({"finding": {"osv": "GO-2026-0002", "trace": [{"function": "F"}]}}),
+                    ]
+                ),
                 encoding="utf-8",
             )
             modules = root / "modules.json"
-            modules.write_text(
-                '{"Path":"a"}\n{"Path":"b"}\n', encoding="utf-8"
-            )
+            modules.write_text('{"Path":"a"}\n{"Path":"b"}\n', encoding="utf-8")
             args = type(
                 "Args",
                 (),
                 {
                     "mod_status": 0,
                     "test_status": 0,
+                    "vet_status": 0,
                     "modules_status": 0,
                     "json_status": 0,
                     "vuln_status": 0,
                     "govulncheck_json": govuln,
                     "modules_json": modules,
-                    "head_sha": "a" * 40,
-                    "go_version": "go1.22.12",
+                    "head_sha": HEAD_SHA,
+                    "go_version": "go1.26.6",
                     "govulncheck_version": "v1.1.4",
                 },
             )()
             evidence = dependency_reports.go_summary(args)
             self.assertEqual(evidence["module_count"], 2)
             self.assertEqual(evidence["vulnerability_count"], 2)
+            self.assertEqual(evidence["finding_message_count"], 3)
 
-    def test_nonzero_scanner_status_is_not_normalized(self) -> None:
+    def test_empty_govulncheck_output_fails_even_with_zero_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             govuln = root / "govuln.jsonl"
@@ -416,13 +591,42 @@ class DependencyReportTests(unittest.TestCase):
                 {
                     "mod_status": 0,
                     "test_status": 0,
+                    "vet_status": 0,
+                    "modules_status": 0,
+                    "json_status": 0,
+                    "vuln_status": 0,
+                    "govulncheck_json": govuln,
+                    "modules_json": modules,
+                    "head_sha": HEAD_SHA,
+                    "go_version": "go1.26.6",
+                    "govulncheck_version": "v1.1.4",
+                },
+            )()
+            evidence = dependency_reports.go_summary(args)
+            self.assertEqual(evidence["result"], "fail")
+            self.assertIn("empty_govulncheck_json", {item["code"] for item in evidence["findings"]})
+
+    def test_nonzero_scanner_status_is_not_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            govuln = root / "govuln.jsonl"
+            govuln.write_text(json.dumps({"config": {}}), encoding="utf-8")
+            modules = root / "modules.json"
+            modules.write_text('{"Path":"a"}\n', encoding="utf-8")
+            args = type(
+                "Args",
+                (),
+                {
+                    "mod_status": 0,
+                    "test_status": 0,
+                    "vet_status": 0,
                     "modules_status": 0,
                     "json_status": 3,
                     "vuln_status": 3,
                     "govulncheck_json": govuln,
                     "modules_json": modules,
-                    "head_sha": "a" * 40,
-                    "go_version": "go1.22.12",
+                    "head_sha": HEAD_SHA,
+                    "go_version": "go1.26.6",
                     "govulncheck_version": "v1.1.4",
                 },
             )()
@@ -432,26 +636,157 @@ class DependencyReportTests(unittest.TestCase):
 
 
 class AggregateTests(unittest.TestCase):
+    def write_clean_reports(self, root: Path, *, head: str = HEAD_SHA, workflow: str = WORKFLOW_SHA) -> None:
+        for filename, component in aggregate_evidence.REQUIRED.items():
+            report: dict[str, object] = {
+                "schema_version": 2,
+                "repository": "yhan-sun/p2wlan",
+                "component": component,
+                "source_commit": head,
+                "head_sha": head,
+                "workflow_sha": workflow,
+                "tool": "fixture",
+                "tools": {"fixture": "1"},
+                "tool_versions": {"fixture": "1"},
+                "command": ["fixture"],
+                "generated_at": "2026-09-02T00:00:00+00:00",
+                "result": "pass",
+                "failure_category": [],
+                "evidence_summary": {"fixture": True},
+                "findings": [],
+            }
+            if component == "rust_dependency_audit":
+                report.update({"checks": {"audit": 0}, "vulnerability_counts": {"total": 0}})
+            elif component == "go_vulnerability_audit":
+                report.update({"checks": {"govulncheck": 0}, "vulnerability_count": 0})
+            elif component == "flutter_outdated_triage":
+                report.update({"counts": {"blockers": 0}})
+            elif component == "flutter_dependency_audit":
+                report.update({"outdated_dependency_counts": {"blockers": 0}})
+            elif component == "release_asset_verification":
+                report.update(
+                    {
+                        "asset_count": 1,
+                        "verified_asset_count": 1,
+                        "required_asset_classes": {name: True for name in verify_release_assets.REQUIRED_ASSET_PATTERNS},
+                    }
+                )
+            (root / filename).write_text(json.dumps(report), encoding="utf-8")
+
+    def aggregate(self, root: Path, **kwargs: object) -> dict[str, object]:
+        return aggregate_evidence.run(
+            root,
+            HEAD_SHA,
+            repository="yhan-sun/p2wlan",
+            workflow_sha=WORKFLOW_SHA,
+            needs_results=NEEDS_SUCCESS,
+            **kwargs,
+        )
+
     def test_all_required_pass_evidence_aggregates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for filename in aggregate_evidence.REQUIRED:
-                (root / filename).write_text(
-                    '{"result":"pass"}\n', encoding="utf-8"
-                )
-            evidence = aggregate_evidence.run(root, "a" * 40)
+            self.write_clean_reports(root)
+            evidence = self.aggregate(root)
             self.assertEqual(evidence["result"], "pass")
-            self.assertEqual(
-                evidence["product_signing"]["notarization"],
-                "deferred_non_blocking",
-            )
+            self.assertEqual(evidence["product_signing"]["notarization"], "deferred_non_blocking")
 
     def test_missing_evidence_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(
-                aggregate_evidence.run(Path(tmp), "a" * 40)["result"],
-                "fail",
+            root = Path(tmp)
+            evidence = self.aggregate(root)
+            self.assertEqual(evidence["result"], "fail")
+            self.assertTrue(any(item["code"] == "evidence_root_empty" for item in evidence["findings"]))
+
+    def test_missing_report_schema_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_clean_reports(root)
+            (root / "go-summary.json").write_text('{"result":"pass"}\n', encoding="utf-8")
+            evidence = self.aggregate(root)
+            self.assertTrue(any(item["code"] == "report_schema_field_missing" for item in evidence["findings"]))
+
+    def test_forged_pass_result_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_clean_reports(root)
+            path = root / "go-summary.json"
+            report = json.loads(path.read_text(encoding="utf-8"))
+            report["result"] = "pass"
+            report["findings"] = [{"code": "scanner_nonzero"}]
+            report["failure_category"] = ["scanner_nonzero"]
+            path.write_text(json.dumps(report), encoding="utf-8")
+            evidence = self.aggregate(root)
+            self.assertTrue(any(item["code"] == "report_result_inconsistent" for item in evidence["findings"]))
+
+    def test_source_sha_repository_and_workflow_sha_tampering_fails(self) -> None:
+        for field, value, code in (
+            ("source_commit", "c" * 40, "evidence_head_mismatch"),
+            ("head_sha", "c" * 40, "evidence_head_mismatch"),
+            ("repository", "evil/example", "report_repository_mismatch"),
+            ("workflow_sha", "d" * 40, "evidence_workflow_sha_mismatch"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_clean_reports(root)
+                path = root / "rust-summary.json"
+                report = json.loads(path.read_text(encoding="utf-8"))
+                report[field] = value
+                path.write_text(json.dumps(report), encoding="utf-8")
+                evidence = self.aggregate(root)
+                self.assertTrue(any(item["code"] == code for item in evidence["findings"]))
+
+    def test_extra_unknown_evidence_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_clean_reports(root)
+            (root / "unexpected.json").write_text("{}\n", encoding="utf-8")
+            evidence = self.aggregate(root)
+            self.assertTrue(any(item["code"] == "unknown_evidence_file" for item in evidence["findings"]))
+
+    def test_corrupt_and_duplicate_reports_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_clean_reports(root)
+            (root / "flutter-summary.json").write_text("{not json}\n", encoding="utf-8")
+            duplicate = root / "nested"
+            duplicate.mkdir()
+            (duplicate / "flutter-summary.json").write_text("{}\n", encoding="utf-8")
+            evidence = self.aggregate(root)
+            codes = {item["code"] for item in evidence["findings"]}
+            self.assertIn("evidence_file_missing_or_ambiguous", codes)
+            self.assertIn("unknown_evidence_file", codes)
+
+    def test_every_non_success_need_result_fails_closed(self) -> None:
+        for status in ("failure", "cancelled", "skipped"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_clean_reports(root)
+                needs = dict(NEEDS_SUCCESS)
+                needs["go-dependencies"] = status
+                evidence = aggregate_evidence.run(
+                    root,
+                    HEAD_SHA,
+                    repository="yhan-sun/p2wlan",
+                    workflow_sha=WORKFLOW_SHA,
+                    needs_results=needs,
+                )
+                self.assertTrue(any(item["code"] == "required_job_not_success" for item in evidence["findings"]))
+
+    def test_missing_need_result_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_clean_reports(root)
+            needs = dict(NEEDS_SUCCESS)
+            del needs["release-assets"]
+            evidence = aggregate_evidence.run(
+                root,
+                HEAD_SHA,
+                repository="yhan-sun/p2wlan",
+                workflow_sha=WORKFLOW_SHA,
+                needs_results=needs,
             )
+            self.assertTrue(any(item["code"] == "needs_result_missing" for item in evidence["findings"]))
 
 
 if __name__ == "__main__":

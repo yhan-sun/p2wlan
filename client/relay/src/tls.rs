@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
@@ -155,7 +155,7 @@ pub fn build_tls_connector(ca_cert_path: Option<&PathBuf>) -> Result<TlsConnecto
         })?;
 
         let mut added = 0;
-        for cert_result in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
+        for cert_result in CertificateDer::pem_slice_iter(&ca_pem) {
             let cert = cert_result.map_err(|e| {
                 RelayError::TlsError(format!("failed to parse CA certificate: {e}"))
             })?;
@@ -211,7 +211,7 @@ pub fn load_tls_server_config(
     })?;
 
     let mut certs = Vec::new();
-    for cert_result in rustls_pemfile::certs(&mut cert_pem.as_slice()) {
+    for cert_result in CertificateDer::pem_slice_iter(&cert_pem) {
         let cert = cert_result
             .map_err(|e| RelayError::TlsError(format!("failed to parse certificate: {e}")))?;
         certs.push(cert);
@@ -231,9 +231,8 @@ pub fn load_tls_server_config(
         ))
     })?;
 
-    let private_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|e| RelayError::TlsError(format!("failed to read private key: {e}")))?
-        .ok_or_else(|| RelayError::TlsError("no private key found in private key file".into()))?;
+    let private_key = PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|e| RelayError::TlsError(format!("failed to read private key: {e}")))?;
 
     let config = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()

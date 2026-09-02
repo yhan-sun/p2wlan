@@ -18,6 +18,7 @@ concurrency:
 
 env:
   P2WLAN_EXACT_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+  P2WLAN_WORKFLOW_SHA: ${{ github.sha }}
 
 jobs:
   repository-policy:
@@ -25,7 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ env.P2WLAN_EXACT_HEAD }}
           fetch-depth: 1
@@ -37,24 +38,33 @@ jobs:
       - name: Run security policy unit tests
         run: python3 -m unittest discover -s scripts/security/tests -p 'test_*.py'
 
+      - name: Prepare repository-policy evidence
+        if: always()
+        run: mkdir -p "$RUNNER_TEMP/security-policy"
+
       - name: Audit workflow permissions and release-secret ownership
+        if: always()
         run: |
-          mkdir -p "$RUNNER_TEMP/security-policy"
           python3 scripts/security/workflow_permissions.py \
             --root . \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --output "$RUNNER_TEMP/security-policy/workflow-permissions.json"
 
       - name: Scan tracked sources and credential transport
+        if: always()
         run: |
           python3 scripts/security/credential_scan.py \
             --root . \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --output "$RUNNER_TEMP/security-policy/credential-scan.json"
 
       - name: Upload repository-policy evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: security-audit-policy-${{ github.run_id }}
           path: ${{ runner.temp }}/security-policy/
@@ -66,7 +76,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ env.P2WLAN_EXACT_HEAD }}
           fetch-depth: 1
@@ -75,7 +85,7 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
 
       - name: Install pinned audit tools
         run: |
@@ -120,6 +130,8 @@ jobs:
 
           python3 scripts/security/dependency_reports.py rust \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --root-audit "$evidence/cargo-audit-root.json" \
             --fuzz-audit "$evidence/cargo-audit-fuzz.json" \
             --root-deny "$evidence/cargo-deny-root.jsonl" \
@@ -134,7 +146,7 @@ jobs:
 
       - name: Upload Rust audit evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: security-audit-rust-${{ github.run_id }}
           path: ${{ runner.temp }}/security-rust/
@@ -146,7 +158,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ env.P2WLAN_EXACT_HEAD }}
           fetch-depth: 1
@@ -155,7 +167,7 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
@@ -177,6 +189,8 @@ jobs:
           mod_status=$?
           go test ./... -count=1 >"$evidence/go-test.txt" 2>&1
           test_status=$?
+          go vet ./... >"$evidence/go-vet.txt" 2>&1
+          vet_status=$?
           go list -m -json all >"$evidence/go-modules.json" 2>"$evidence/go-modules.stderr"
           modules_status=$?
           govulncheck -json ./... >"$evidence/govulncheck.jsonl" 2>"$evidence/govulncheck-json.stderr"
@@ -187,10 +201,13 @@ jobs:
 
           python3 ../scripts/security/dependency_reports.py go \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --govulncheck-json "$evidence/govulncheck.jsonl" \
             --modules-json "$evidence/go-modules.json" \
             --mod-status "$mod_status" \
             --test-status "$test_status" \
+            --vet-status "$vet_status" \
             --modules-status "$modules_status" \
             --json-status "$json_status" \
             --vuln-status "$vuln_status" \
@@ -200,7 +217,7 @@ jobs:
 
       - name: Upload Go audit evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: security-audit-go-${{ github.run_id }}
           path: ${{ runner.temp }}/security-go/
@@ -212,7 +229,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ env.P2WLAN_EXACT_HEAD }}
           fetch-depth: 1
@@ -221,7 +238,7 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
 
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
         with:
           channel: stable
           flutter-version-file: .fvmrc
@@ -249,23 +266,28 @@ jobs:
           analyze_status=$?
           python3 ../../scripts/security/flutter_lock_policy.py \
             --lockfile pubspec.lock \
+            --manifest pubspec.yaml \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --output "$evidence/flutter-lock-policy.json" \
             >"$evidence/flutter-lock-policy.txt" 2>&1
           lock_policy_status=$?
           python3 ../../scripts/security/flutter_outdated_triage.py \
             --input "$evidence/flutter-outdated.json" \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --output "$evidence/flutter-outdated-triage.json" \
             >"$evidence/flutter-outdated-triage.txt" 2>&1
           triage_status=$?
           set -e
 
-          bash ../../scripts/release/hermetic_build.sh restore
-
           flutter_version="$(flutter --version --machine | python3 -c 'import json,sys; value=json.load(sys.stdin); print(value.get("frameworkVersion", "unknown"))')"
           python3 ../../scripts/security/dependency_reports.py flutter \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --lock-policy "$evidence/flutter-lock-policy.json" \
             --triage "$evidence/flutter-outdated-triage.json" \
             --get-status "$get_status" \
@@ -279,9 +301,14 @@ jobs:
             --dart-version "$(dart --version 2>&1)" \
             --output "$evidence/flutter-summary.json"
 
+      - name: Restore SDK-migrated files
+        if: always()
+        working-directory: .
+        run: bash scripts/release/hermetic_build.sh restore
+
       - name: Upload Flutter audit evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: security-audit-flutter-${{ github.run_id }}
           path: ${{ runner.temp }}/security-flutter/
@@ -295,7 +322,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ env.P2WLAN_EXACT_HEAD }}
           fetch-depth: 1
@@ -311,10 +338,14 @@ jobs:
           evidence="$RUNNER_TEMP/security-release"
           assets="$RUNNER_TEMP/security-release-assets"
           mkdir -p "$evidence" "$assets"
-          gh api "repos/$GITHUB_REPOSITORY/releases/latest" >"$evidence/release.json"
-          tag="$(jq -r '.tag_name' "$evidence/release.json")"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$evidence/releases.json"
+          jq -e 'map(select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")))) | sort_by(.published_at // .created_at) | last' \
+            "$evidence/releases.json" >"$evidence/release.json"
+          test -s "$evidence/release.json"
+          release_id="$(jq -er '.id' "$evidence/release.json")"
+          tag="$(jq -er '.tag_name' "$evidence/release.json")"
+          test -n "$release_id"
           test -n "$tag"
-          test "$tag" != "null"
           gh release download "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --dir "$assets" \
@@ -324,16 +355,21 @@ jobs:
             --release-json "$evidence/release.json" \
             --assets-dir "$assets" \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
             --output "$evidence/release-assets.json"
           python3 scripts/security/credential_scan.py \
             --root "$assets" \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --component release_asset_plaintext_scan \
             --scan-binary \
             --output "$evidence/release-asset-credential-scan.json"
 
       - name: Upload release verification evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: security-audit-release-${{ github.run_id }}
           path: ${{ runner.temp }}/security-release/
@@ -351,8 +387,14 @@ jobs:
       - release-assets
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      REPOSITORY_POLICY_RESULT: ${{ needs.repository-policy.result }}
+      RUST_DEPENDENCIES_RESULT: ${{ needs.rust-dependencies.result }}
+      GO_DEPENDENCIES_RESULT: ${{ needs.go-dependencies.result }}
+      FLUTTER_DEPENDENCIES_RESULT: ${{ needs.flutter-dependencies.result }}
+      RELEASE_ASSETS_RESULT: ${{ needs.release-assets.result }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ env.P2WLAN_EXACT_HEAD }}
           fetch-depth: 1
@@ -363,8 +405,8 @@ jobs:
 
       - name: Download component evidence
         id: download
-        continue-on-error: true
-        uses: actions/download-artifact@v4
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: security-audit-*-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-components
@@ -373,26 +415,35 @@ jobs:
       - name: Scan generated artifact and log evidence
         id: evidence_scan
         if: always()
-        continue-on-error: true
         run: |
+          mkdir -p "$RUNNER_TEMP/security-audit-components"
           python3 scripts/security/credential_scan.py \
             --root "$RUNNER_TEMP/security-audit-components" \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --component generated_evidence_plaintext_scan \
             --output "$RUNNER_TEMP/security-audit-components/evidence-credential-scan.json"
 
       - name: Build aggregate evidence
         id: aggregate
         if: always()
-        continue-on-error: true
         run: |
           python3 scripts/security/aggregate_evidence.py \
             --root "$RUNNER_TEMP/security-audit-components" \
             --head-sha "$P2WLAN_EXACT_HEAD" \
+            --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --need "repository-policy=$REPOSITORY_POLICY_RESULT" \
+            --need "rust-dependencies=$RUST_DEPENDENCIES_RESULT" \
+            --need "go-dependencies=$GO_DEPENDENCIES_RESULT" \
+            --need "flutter-dependencies=$FLUTTER_DEPENDENCIES_RESULT" \
+            --need "release-assets=$RELEASE_ASSETS_RESULT" \
             --output "$RUNNER_TEMP/security-audit-evidence.json"
 
       - name: Upload aggregate evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: security-audit-evidence-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-evidence.json
@@ -400,15 +451,20 @@ jobs:
           retention-days: 90
 
       - name: Enforce all security audit gates
+        if: always()
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          EVIDENCE_SCAN_OUTCOME: ${{ steps.evidence_scan.outcome }}
+          AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         shell: bash
         run: |
           set -euo pipefail
-          test "${{ needs.repository-policy.result }}" = "success"
-          test "${{ needs.rust-dependencies.result }}" = "success"
-          test "${{ needs.go-dependencies.result }}" = "success"
-          test "${{ needs.flutter-dependencies.result }}" = "success"
-          test "${{ needs.release-assets.result }}" = "success"
-          test "${{ steps.download.outcome }}" = "success"
-          test "${{ steps.evidence_scan.outcome }}" = "success"
-          test "${{ steps.aggregate.outcome }}" = "success"
+          test "$REPOSITORY_POLICY_RESULT" = "success"
+          test "$RUST_DEPENDENCIES_RESULT" = "success"
+          test "$GO_DEPENDENCIES_RESULT" = "success"
+          test "$FLUTTER_DEPENDENCIES_RESULT" = "success"
+          test "$RELEASE_ASSETS_RESULT" = "success"
+          test "$DOWNLOAD_OUTCOME" = "success"
+          test "$EVIDENCE_SCAN_OUTCOME" = "success"
+          test "$AGGREGATE_OUTCOME" = "success"
           echo "Security Audit Required passed for $P2WLAN_EXACT_HEAD"

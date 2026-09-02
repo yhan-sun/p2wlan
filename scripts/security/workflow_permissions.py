@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+from report_common import make_report
+
 VALID_LEVELS = {"read", "write", "none"}
 WRITE_ALLOWLIST = {"release.yml": {"contents"}}
 WRITE_ALLOWLIST_REASONS = {
@@ -32,6 +34,14 @@ PRODUCTION_SECRET_NAMES = {
 SECRET_REFERENCE_RE = re.compile(
     r"\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}"
 )
+ACTION_REFERENCE_RE = re.compile(
+    r"^\s*(?:-\s*)?uses:\s*([^\s#]+)\s*$"
+)
+ACTION_SHA_RE = re.compile(r"^[^@]+@[0-9a-fA-F]{40}$")
+UNTRUSTED_SHELL_EXPRESSION_RE = re.compile(
+    r"\$\{\{\s*(?:github\.event\.|inputs\.)"
+)
+REMOTE_SHELL_PIPE_RE = re.compile(r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:ba)?sh\b")
 
 
 @dataclass(frozen=True)
@@ -177,6 +187,50 @@ def audit_workflow(
             )
         )
 
+    run_indent: int | None = None
+    for number, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        run_match = re.match(r"(?:-\s*)?run:\s*(.*)", stripped)
+        direct_run = run_match is not None
+        if run_match and run_match.group(1).strip() in {"", "|", ">", "|-", ">-", "|+", ">+"}:
+            run_indent = indent
+        elif run_indent is not None and indent <= run_indent:
+            run_indent = None
+        in_run = run_indent is not None and indent > run_indent
+        action_match = ACTION_REFERENCE_RE.match(raw)
+        if action_match:
+            action = action_match.group(1)
+            if not action.startswith(("./", "docker://")) and not ACTION_SHA_RE.fullmatch(action):
+                findings.append(
+                    Finding(
+                        relative,
+                        f"line:{number}",
+                        "floating_action_reference",
+                        f"third-party action must be pinned to a full commit SHA: {action}",
+                    )
+                )
+        if (in_run or direct_run) and UNTRUSTED_SHELL_EXPRESSION_RE.search(raw):
+            findings.append(
+                Finding(
+                    relative,
+                    f"line:{number}",
+                    "untrusted_shell_interpolation",
+                    "untrusted event/input data must enter shell commands through a validated env value",
+                )
+            )
+        if (in_run or direct_run) and REMOTE_SHELL_PIPE_RE.search(raw):
+            findings.append(
+                Finding(
+                    relative,
+                    f"line:{number}",
+                    "remote_shell_pipe",
+                    "do not execute a remotely fetched script through a shell pipe",
+                )
+            )
+
     secret_names = sorted(set(SECRET_REFERENCE_RE.findall(text)))
     production_names = [
         name for name in secret_names if name in PRODUCTION_SECRET_NAMES
@@ -268,34 +322,65 @@ def workflow_paths(root: Path) -> Iterable[Path]:
     )
 
 
-def run(root: Path, head_sha: str | None = None) -> dict[str, object]:
+def run(
+    root: Path,
+    head_sha: str | None = None,
+    *,
+    repository: str | None = None,
+    workflow_sha: str | None = None,
+) -> dict[str, object]:
     all_blocks: dict[str, list[dict[str, object]]] = {}
     all_findings: list[Finding] = []
     paths = list(workflow_paths(root))
+    if not paths:
+        all_findings.append(
+            Finding(
+                ".github/workflows",
+                "workflow",
+                "workflow_scope_empty",
+                "no GitHub Actions workflow files were found",
+            )
+        )
     for path in paths:
         blocks, findings = audit_workflow(path, root)
         all_blocks[path.relative_to(root).as_posix()] = [
             asdict(block) for block in blocks
         ]
         all_findings.extend(findings)
-    return {
-        "schema_version": 1,
-        "result": "pass" if not all_findings else "fail",
-        "head_sha": head_sha,
-        "tool_versions": {"python": platform.python_version()},
-        "workflow_count": len(paths),
-        "write_allowlist": {
+    action_count = sum(
+        1
+        for path in paths
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if ACTION_REFERENCE_RE.match(line)
+    )
+    return make_report(
+        component="workflow_permission_audit",
+        head_sha=head_sha,
+        workflow_sha=workflow_sha,
+        repository=repository,
+        result="pass" if not all_findings else "fail",
+        findings=[asdict(finding) for finding in all_findings],
+        tool="workflow_permissions.py",
+        tools={"python": platform.python_version()},
+        command=["workflow_permissions.py", "--root", root.as_posix()],
+        evidence_summary={
+            "workflow_count": len(paths),
+            "action_reference_count": action_count,
+            "finding_count": len(all_findings),
+        },
+        workflow_count=len(paths),
+        write_allowlist={
             key: sorted(value) for key, value in WRITE_ALLOWLIST.items()
         },
-        "allowlisted_exceptions": [
+        allowlisted_exceptions=[
             {"path": path, "permission": permission, "reason": reason}
             for path, permissions in sorted(WRITE_ALLOWLIST_REASONS.items())
             for permission, reason in sorted(permissions.items())
         ],
-        "production_secret_names": sorted(PRODUCTION_SECRET_NAMES),
-        "workflows": all_blocks,
-        "findings": [asdict(finding) for finding in all_findings],
-    }
+        production_secret_names=sorted(PRODUCTION_SECRET_NAMES),
+        workflows=all_blocks,
+        action_reference_count=action_count,
+    )
 
 
 def main() -> int:
@@ -303,8 +388,15 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--output", type=Path)
     parser.add_argument("--head-sha")
+    parser.add_argument("--workflow-sha")
+    parser.add_argument("--repository")
     args = parser.parse_args()
-    evidence = run(args.root.resolve(), args.head_sha)
+    evidence = run(
+        args.root.resolve(),
+        args.head_sha,
+        repository=args.repository,
+        workflow_sha=args.workflow_sha,
+    )
     rendered = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -8,8 +8,9 @@ credential-transport and published-asset checksum gate. It implements Issue
 
 Every job checks out `github.event.pull_request.head.sha` (or `github.sha` for
 push, scheduled and manual runs) and verifies that checkout before auditing.
-Results from another branch or an older commit cannot satisfy the aggregate
-check.
+Reports bind both the audited source/head SHA and the actual workflow event
+SHA (`github.sha`); results from another branch, workflow run, or older commit
+cannot satisfy the aggregate check.
 
 The workflow runs on every pull request to `main`, every push to `main`, a
 weekly schedule, and manual dispatch. Consequently a version/release PR cannot
@@ -26,9 +27,21 @@ skip the gate through path filters.
 - Vulnerability, unsoundness, yanked-package, disallowed-license, wildcard
   dependency and unknown registry/Git-source findings fail.
 - Multiple versions remain visible as warnings because they are not themselves
-  a release vulnerability. There are no advisory ignores.
+  a release vulnerability. Advisory exceptions are exact-ID-only and must be
+  documented with their risk, mitigation, owner/tracking issue and review date.
 - Machine-readable scanner output, stderr, exact exit status, tool version,
   vulnerability count and warning count are retained as evidence.
+
+The only current advisory exception is the exact ID `RUSTSEC-2024-0429`.
+`p2wlan-tray` reaches `glib 0.18.5` through the GTK3-only
+`tao`/`tray-icon`/`libappindicator` Linux backend, while the fixed `glib`
+release is not compatible with that backend. P2WLAN does not call
+`glib::VariantStrIter`; the residual risk is confined to transitive GTK3
+iterator behavior in the optional native tray process. The mitigation is to
+keep the tray opt-in, run the native tray and workspace tests, and revisit the
+exception when the tray stack has a GTK4-compatible backend. This is a
+temporary, non-broad exception tracked by Issue #30 and expires for review on
+2026-09-30; it must not be copied to another advisory.
 
 ### Go dependency graph
 
@@ -36,7 +49,7 @@ skip the gate through path filters.
   duplicated workflow version.
 - `govulncheck v1.1.4` runs in both JSON evidence mode and normal gate mode over
   `./...`.
-- `go mod verify`, `go test ./... -count=1`, and
+- `go mod verify`, `go test ./... -count=1`, `go vet ./...`, and
   `go list -m -json all` must also succeed.
 - Structured evidence records the module count, unique vulnerability IDs,
   finding-message count, exact command statuses and tool versions.
@@ -63,6 +76,9 @@ skip the gate through path filters.
 Every workflow must declare exactly one explicit top-level `permissions` map.
 `write-all`, scalar shortcuts, ambiguous/empty mappings,
 `pull_request_target`, and write permissions outside the allowlist fail.
+Every remote third-party action reference is pinned to a full 40-character
+commit SHA. Inline shell is also checked for direct untrusted event/input
+interpolation and remote `curl|sh`/`wget|sh` execution.
 
 The only write exception is:
 
@@ -104,8 +120,9 @@ is recorded in the evidence instead of being hidden.
 
 ### Published release assets
 
-The latest non-draft, non-prerelease semantic-version release is queried through
-the GitHub API. Every published asset is downloaded and checked for:
+The latest non-draft, non-prerelease semantic-version release is selected from
+the GitHub API response and its explicit immutable tag is used for download.
+Every published asset is downloaded and checked for:
 
 - exact metadata/downloaded asset-name equality;
 - `uploaded` state;
@@ -115,11 +132,16 @@ the GitHub API. Every published asset is downloaded and checked for:
 - required Android, iOS, Linux, macOS, Windows and Linux CLI asset classes.
 
 Any missing digest, asset, size mismatch or digest mismatch blocks the gate.
+If a `.sha256` sidecar is published, its filename, format and digest are
+verified against the downloaded asset as well.
 
 ## Evidence contract
 
 The final `security-audit-evidence-<run-id>` artifact requires one unambiguous,
-passing report for every component. It records:
+passing report for every component. Each report uses schema version `2` and
+contains the repository, source/head SHA, workflow SHA, command, timestamp,
+tool versions, result, failure categories, evidence summary and findings. It
+records:
 
 - exact audited head SHA;
 - every component result and source filename;
@@ -129,6 +151,12 @@ passing report for every component. It records:
 - verified release-asset count;
 - scanner/tool versions;
 - any policy finding without converting it to a warning.
+
+The aggregate runs with `always()` and validates every declared `needs` result;
+failure, cancellation, skip, missing results, missing/corrupt/empty reports,
+identity mismatches, duplicate or unknown evidence files, and inconsistent
+counts fail closed. Component and aggregate evidence uploads are also required
+to complete successfully.
 
 The stable aggregate check is named exactly `Security Audit Required`.
 
@@ -148,3 +176,7 @@ python3 scripts/security/credential_scan.py --root .
 python3 scripts/security/flutter_lock_policy.py \
   --lockfile apps/flutter_client/pubspec.lock
 ```
+
+The workflow additionally runs the complete Rust, Go, Flutter and published
+release-asset checks, including raw-output retention and generated-evidence
+credential scanning.
