@@ -536,12 +536,18 @@ function Invoke-FlutterTrayNoAdapterExit {
     $beforePids = Get-ProcessIdList
     $process = $null
     $forcedTermination = $false
+    $stdoutTask = $null
+    $stderrTask = $null
+    $stdout = ''
+    $stderr = ''
     try {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = [System.IO.Path]::GetFullPath($FlutterReleasePath)
         $startInfo.WorkingDirectory = Split-Path -Parent $startInfo.FileName
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
         $startInfo.Environment['P2WLAN_WINDOWS_TRAY_LIFECYCLE_TEST'] = 'no-adapter-exit'
         $startInfo.Environment['P2WLAN_ENABLE_FLUTTER_TRAY'] = '1'
         # Keep this release run isolated from any persisted desktop settings;
@@ -551,12 +557,16 @@ function Invoke-FlutterTrayNoAdapterExit {
         $process = [System.Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
         if (-not $process.Start()) { throw "failed to start Flutter release app" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
         $result = Wait-ProcessExited -Process $process -TimeoutSeconds 30
         if (-not $result.exited) {
             try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
             $forcedTermination = $true
             throw 'Flutter release tray app did not exit within the bounded no-adapter budget'
         }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         $afterPids = Get-ProcessIdList
         $daemonProcessesClean = @(
             $afterPids | Where-Object { $beforePids -notcontains $_ }
@@ -577,6 +587,15 @@ function Invoke-FlutterTrayNoAdapterExit {
         }
     } catch {
         $detail = $_.Exception.Message
+        if ($stdoutTask -ne $null) {
+            try { $stdout = $stdoutTask.GetAwaiter().GetResult() } catch {}
+        }
+        if ($stderrTask -ne $null) {
+            try { $stderr = $stderrTask.GetAwaiter().GetResult() } catch {}
+        }
+        if ($stdout -or $stderr) {
+            $detail = "$detail; stdout=[$stdout]; stderr=[$stderr]"
+        }
         $daemonProcessesClean = @(
             Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
         ).Count -eq 0
