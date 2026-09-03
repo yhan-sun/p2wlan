@@ -219,7 +219,7 @@ unsafe extern "system" fn windows_service_main(
     let signal = Arc::new(WindowsLifecycleSignal::new());
     let context = Box::new(WindowsServiceContext {
         signal: signal.clone(),
-        status_handle: 0,
+        status_handle: std::ptr::null_mut(),
     });
     let context_ptr = Box::into_raw(context);
 
@@ -232,7 +232,7 @@ unsafe extern "system" fn windows_service_main(
         Some(windows_service_handler),
         context_ptr.cast(),
     );
-    if handle == 0 {
+    if handle == std::ptr::null_mut() {
         let _ = Box::from_raw(context_ptr);
         return;
     }
@@ -254,7 +254,7 @@ unsafe extern "system" fn windows_service_main(
             return;
         }
     };
-    let result = runtime.block_on(run_daemon(Some(signal.clone())));
+    let result = runtime.block_on(run_daemon(signal.clone()));
     let exit_code = if result.is_ok() { 0 } else { 1 };
     set_windows_service_status(handle, SERVICE_STOPPED, exit_code);
     signal.complete();
