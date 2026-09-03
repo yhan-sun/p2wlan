@@ -157,14 +157,43 @@ function Wait-ProcessExited {
         try {
             $Process.Refresh()
             if ($Process.HasExited) {
-                return [pscustomobject]@{ exited = $true; exit_code = $Process.ExitCode }
+                $exitCode = $null
+                try { $exitCode = [int]$Process.ExitCode } catch {}
+                if ($null -eq $exitCode -and ('P2WlanLifecycleNative' -as [type])) {
+                    $nativeExitCode = 0
+                    if ([P2WlanLifecycleNative]::TryGetExitCode($Process.Id, [ref]$nativeExitCode)) {
+                        $exitCode = $nativeExitCode
+                    }
+                }
+                return [pscustomobject]@{ exited = $true; exit_code = $exitCode }
             }
         } catch {
-            return [pscustomobject]@{ exited = $true; exit_code = $null }
+            $exitCode = $null
+            if ('P2WlanLifecycleNative' -as [type]) {
+                $nativeExitCode = 0
+                if ([P2WlanLifecycleNative]::TryGetExitCode($Process.Id, [ref]$nativeExitCode)) {
+                    $exitCode = $nativeExitCode
+                }
+            }
+            return [pscustomobject]@{ exited = $true; exit_code = $exitCode }
         }
         Start-Sleep -Milliseconds 100
     }
     [pscustomobject]@{ exited = $false; exit_code = $null }
+}
+
+function Wait-ObservedChildProcessesGone {
+    param(
+        [Parameter(Mandatory = $true)][int[]]$ProcessIds,
+        [int]$TimeoutSeconds = 10
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $alive = @($ProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($alive.Count -eq 0) { return $true }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $false
 }
 
 function Start-ProductionDaemon {
@@ -240,12 +269,26 @@ public static class P2WlanLifecycleNative {
   [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; }
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
   [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
   [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate bool HandlerRoutine(uint ctrlType);
   [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleCtrlHandler(HandlerRoutine handlerRoutine, bool add);
   private static readonly HandlerRoutine ignoreCtrlC = IgnoreCtrlC;
   private static bool IgnoreCtrlC(uint ctrlType) { return ctrlType == 0; }
   public static void IgnoreCtrlCInCurrentProcess() {
     if (!SetConsoleCtrlHandler(ignoreCtrlC, true)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  }
+  public static bool TryGetExitCode(int processId, out int exitCode) {
+    exitCode = 0;
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000;
+    var process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)processId);
+    if (process == IntPtr.Zero) return false;
+    try {
+      uint raw;
+      if (!GetExitCodeProcess(process, out raw)) return false;
+      exitCode = unchecked((int)raw);
+      return true;
+    } finally { CloseHandle(process); }
   }
   public static int StartInNewConsole(string fileName, string arguments, string cwd) {
     var si = new STARTUPINFO(); si.cb = (uint)Marshal.SizeOf(si); si.dwFlags = 0x00000001; si.wShowWindow = 0;
@@ -404,7 +447,7 @@ function Invoke-ProductionCycle {
         $childrenAfterExit = @(Get-DescendantProcessIds -RootPid $process.Id)
         $observedChildPids = @($childPids) + @($childrenAfterExit)
         $observedChildPids = @($observedChildPids | Sort-Object -Unique)
-        $childrenGone = @($observedChildPids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -eq 0
+        $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds $observedChildPids
         $portReleased = Test-LoopbackPortReleased -Port $port
         $authRemoved = -not (Test-Path -LiteralPath $authPath)
         $afterWintun = Get-WintunSnapshot
@@ -436,6 +479,7 @@ function Invoke-ProductionCycle {
         $authRemoved = -not (Test-Path -LiteralPath $authPath)
         $afterWintun = Get-WintunSnapshot
         $wintunStale = -not (Wait-TargetWintunReleased)
+        $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds @($childPids)
         $daemonProcessesClean = @(
             Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
         ).Count -eq 0
