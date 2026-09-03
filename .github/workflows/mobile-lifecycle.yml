@@ -85,7 +85,7 @@ jobs:
           P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR: ${{ runner.temp }}/p2wlan-mobile-lifecycle-flutter
         run: |
           set +e
-          flutter pub get
+          (cd apps/flutter_client && flutter pub get)
           dependency_status=$?
           if [[ "$dependency_status" -eq 0 ]]; then
             bash scripts/mobile-lifecycle-regression.sh
