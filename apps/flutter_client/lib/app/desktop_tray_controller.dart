@@ -54,6 +54,8 @@ class DesktopTrayController with TrayListener, WindowListener {
   String? _lastDesktopTitle;
   bool _macosDockBadgeCleared = false;
   Future<DaemonCommandResult>? _stopDaemonFuture;
+  Future<void>? _disposeFuture;
+  Future<void>? _quitFuture;
   Timer? _windowsLeftClickDedupeTimer;
   var _windowsLeftClickHandled = false;
 
@@ -85,8 +87,11 @@ class DesktopTrayController with TrayListener, WindowListener {
     }
   }
 
-  Future<void> dispose() async {
-    if (!_initialized) return;
+  Future<void> dispose() {
+    final existing = _disposeFuture;
+    if (existing != null) return existing;
+    if (!_initialized) return Future<void>.value();
+
     _initialized = false;
     _windowsLeftClickDedupeTimer?.cancel();
     _windowsLeftClickDedupeTimer = null;
@@ -97,9 +102,13 @@ class DesktopTrayController with TrayListener, WindowListener {
     windowManager.removeListener(this);
     trayManager.removeListener(this);
     final pendingUpdate = _menuUpdateInFlight;
-    if (pendingUpdate != null) {
-      await pendingUpdate;
-    }
+    final future = _finishDispose(pendingUpdate);
+    _disposeFuture = future;
+    return future;
+  }
+
+  Future<void> _finishDispose(Future<void>? pendingUpdate) async {
+    if (pendingUpdate != null) await pendingUpdate;
     try {
       await trayManager.destroy();
     } catch (_) {
@@ -586,33 +595,52 @@ class DesktopTrayController with TrayListener, WindowListener {
     }
   }
 
-  Future<void> _quitApp() async {
+  Future<void> _quitApp() {
+    final existing = _quitFuture;
+    if (existing != null) return existing;
+
+    final future = _performQuit();
+    _quitFuture = future;
+    future.then<void>(
+      (_) {
+        if (!_quitting && identical(_quitFuture, future)) {
+          _quitFuture = null;
+        }
+      },
+      onError: (Object _, StackTrace _) {
+        if (identical(_quitFuture, future)) _quitFuture = null;
+      },
+    );
+    return future;
+  }
+
+  Future<void> _performQuit() async {
     if (_quitting) return;
     _quitting = true;
-    final stopResult = await _stopDaemonForQuit();
-    if (!stopResult.ok) {
+    try {
+      final stopResult = await _stopDaemonForQuit();
+      if (!stopResult.ok) {
+        _quitting = false;
+        await _showWindow();
+        await _updateMenu();
+        return;
+      }
+      await _destroyTrayWindowAndExit();
+    } catch (_) {
       _quitting = false;
-      await _showWindow();
-      await _updateMenu();
-      return;
+      rethrow;
     }
-    await _destroyTrayWindowAndExit();
   }
 
   Future<void> _destroyTrayWindowAndExit() async {
-    try {
-      await trayManager.destroy();
-    } catch (_) {
-      // Ignore best effort tray teardown.
-    }
-    try {
-      await DesktopWindowOperations.run(() async {
-        await windowManager.setPreventClose(false);
-        await windowManager.destroy();
-      });
-    } finally {
-      Timer(const Duration(milliseconds: 400), () => exit(0));
-    }
+    // This also makes any Widget.dispose during engine shutdown return the
+    // same Future. The tray plugin must receive exactly one destroy call per
+    // controller lifetime.
+    await dispose();
+    await DesktopWindowOperations.run(() async {
+      await windowManager.setPreventClose(false);
+      await windowManager.destroy();
+    });
   }
 
   Directory _defaultLogDir() {
