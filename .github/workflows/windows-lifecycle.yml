@@ -8,9 +8,12 @@ on:
       - ".github/workflows/path-state-machine-required.yml"
       - ".github/workflows/windows-lifecycle.yml"
       - "client/daemon/**"
+      - "client/cli/**"
       - "client/tray/**"
       - "client/desktop-host/**"
       - "apps/flutter_client/**"
+      - "scripts/release/**"
+      - "scripts/windows_lifecycle/**"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -19,9 +22,12 @@ on:
       - ".fvmrc"
       - ".github/workflows/windows-lifecycle.yml"
       - "client/daemon/**"
+      - "client/cli/**"
       - "client/tray/**"
       - "client/desktop-host/**"
       - "apps/flutter_client/**"
+      - "scripts/release/**"
+      - "scripts/windows_lifecycle/**"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -37,7 +43,7 @@ jobs:
   lifecycle:
     name: Windows Lifecycle Required
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -51,6 +57,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Set up Flutter
@@ -59,6 +66,10 @@ jobs:
           channel: stable
           flutter-version-file: .fvmrc
           cache: true
+
+      - name: Enable Windows desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-windows-desktop
 
       - name: Flutter dependencies
         working-directory: apps/flutter_client
@@ -71,12 +82,27 @@ jobs:
       - name: Formatting gates
         shell: bash
         run: |
-          cargo fmt --all --check
+          cargo fmt --all -- --check
           cd apps/flutter_client
-          dart format --output=none --set-exit-if-changed test/windows_daemon_lifecycle_integration_test.dart
+          dart format --output=none --set-exit-if-changed \
+            lib/app/desktop_tray_controller.dart \
+            lib/app/p2wlan_app.dart \
+            lib/core/daemon/daemon_controller.dart \
+            test/windows_daemon_lifecycle_integration_test.dart \
+            test/windows_production_lifecycle_integration_test.dart
 
-      - name: Build release daemon
-        run: cargo build -p p2wlan-daemon --release
+      - name: Validate lifecycle evidence aggregator
+        run: python -m unittest discover -s scripts/windows_lifecycle -p "test_*.py"
+
+      - name: Build release daemon and CLI
+        shell: bash
+        run: |
+          cargo build -p p2wlan-daemon --release
+          cargo build -p p2wlan-cli --release
+
+      - name: Bundle Wintun for the production harness
+        shell: pwsh
+        run: .\apps\flutter_client\scripts\fetch_wintun.ps1 -DestinationDirectory "${{ github.workspace }}\target\release" -Architecture amd64
 
       - name: Run Rust lifecycle regression
         env:
@@ -89,14 +115,58 @@ jobs:
           P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
         run: flutter test test/windows_daemon_lifecycle_integration_test.dart
 
+      - name: Build Flutter Windows release bundle
+        working-directory: apps/flutter_client
+        shell: bash
+        run: bash ../../scripts/release/build_flutter_client.sh windows --release
+
+      - name: Restore Flutter-managed source files after build
+        shell: bash
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Bundle daemon, Wintun, and MSVC runtime into Flutter release
+        shell: pwsh
+        run: |
+          $release = "${{ github.workspace }}\apps\flutter_client\build\windows\x64\runner\Release"
+          Copy-Item "${{ github.workspace }}\target\release\p2wlan-daemon.exe" "$release\p2wlan-daemon.exe" -Force
+          .\apps\flutter_client\scripts\fetch_wintun.ps1 -DestinationDirectory $release -Architecture amd64
+          .\apps\flutter_client\scripts\bundle_msvc_runtime.ps1 -DestinationDirectory $release
+
+      - name: Flutter analyze gate
+        working-directory: apps/flutter_client
+        shell: bash
+        run: flutter analyze
+
+      - name: Run Flutter UI stop lifecycle evidence
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
+          P2WLAN_WINDOWS_LIFECYCLE_EVIDENCE: ${{ github.workspace }}/flutter-ui-lifecycle-evidence.json
+          P2WLAN_WINDOWS_LIFECYCLE_UI_CYCLES: 8
+        run: flutter test test/windows_production_lifecycle_integration_test.dart
+
+      - name: Run production Windows lifecycle acceptance harness
+        if: always()
+        shell: pwsh
+        run: |
+          .\scripts\windows_lifecycle\windows_lifecycle_acceptance.ps1 `
+            -DaemonPath "${{ github.workspace }}\target\release\p2wlan-daemon.exe" `
+            -CliPath "${{ github.workspace }}\target\release\p2wlan.exe" `
+            -FlutterReleasePath "${{ github.workspace }}\apps\flutter_client\build\windows\x64\runner\Release\p2wlan_flutter_client.exe" `
+            -FlutterEvidencePath "${{ github.workspace }}\flutter-ui-lifecycle-evidence.json" `
+            -EvidencePath "${{ github.workspace }}\windows-lifecycle-evidence.json" `
+            -ProductionCycles 50 `
+            -AttemptRealWintun
+
       - name: Assert no daemon process leaked
         if: always()
         shell: pwsh
         run: |
-          $leaked = @(Get-Process -Name 'p2wlan-daemon' -ErrorAction SilentlyContinue)
+          $leaked = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -notmatch '(?i)(^|\s)--build-info(\s|$)' })
           if ($leaked.Count -gt 0) {
-            $leaked | Format-Table Id, ProcessName, StartTime -AutoSize
-            Stop-Process -Id ($leaked | Select-Object -ExpandProperty Id) -Force -ErrorAction SilentlyContinue
+            $leaked | Select-Object ProcessId, CommandLine | Format-List
+            Stop-Process -Id ($leaked | Select-Object -ExpandProperty ProcessId) -Force -ErrorAction SilentlyContinue
             throw "p2wlan-daemon process leaked after lifecycle tests"
           }
           Write-Host 'No p2wlan-daemon process leaked.'
@@ -113,17 +183,60 @@ jobs:
             } |
             Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message)
           $events | ConvertTo-Json -Depth 4 | Set-Content -Path windows-lifecycle-events.json -Encoding utf8
+          if (Test-Path -LiteralPath windows-lifecycle-evidence.json) {
+            $evidence = Get-Content -LiteralPath windows-lifecycle-evidence.json -Raw | ConvertFrom-Json
+            if ($null -eq $evidence.wer) {
+              $evidence | Add-Member -NotePropertyName wer -NotePropertyValue ([pscustomobject]@{})
+            }
+            $evidence.wer.event_ids_checked = @(1000, 1001)
+            $evidence.wer.events = @($events)
+            $capabilities = @($evidence.capabilities | Where-Object { $_.name -ne 'wer_scan' })
+            $capabilities += [pscustomobject]@{
+              name = 'wer_scan'
+              status = if ($events.Count -eq 0) { 'verified' } else { 'failed' }
+              detail = if ($events.Count -eq 0) { 'Application WER event IDs 1000/1001 were empty for the acceptance window' } else { "found $($events.Count) matching WER/BEX event(s)" }
+            }
+            $evidence.capabilities = $capabilities
+            $evidence | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath windows-lifecycle-evidence.json -Encoding utf8
+          } else {
+            # Preserve a rejected artifact when an earlier build/test failed
+            # before the harness could emit its document. This is failure
+            # evidence, never a synthetic pass.
+            $rejected = [ordered]@{
+              schema_version = 1
+              head_sha = $env:GITHUB_SHA
+              runner_os = 'windows-latest'
+              capabilities = @(
+                [ordered]@{ name = 'production_start_stop'; status = 'failed'; detail = 'acceptance harness did not produce evidence' },
+                [ordered]@{ name = 'wer_scan'; status = if ($events.Count -eq 0) { 'verified' } else { 'failed' }; detail = 'harness evidence was missing' }
+              )
+              cycles = @()
+              service_controls = @()
+              flutter_tray = [ordered]@{ process_exited = $false; exit_code = $null; daemon_processes_clean = $false; forced_termination = $false }
+              wer = [ordered]@{ event_ids_checked = @(1000, 1001); events = @($events) }
+            }
+            $rejected | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath windows-lifecycle-evidence.json -Encoding utf8
+          }
           if ($events.Count -gt 0) {
             $events | Format-List
             throw "Windows recorded a P2WLAN crash/BEX event during lifecycle tests"
           }
           Write-Host 'No P2WLAN crash or BEX event was recorded.'
 
+      - name: Aggregate Windows lifecycle evidence
+        if: always()
+        shell: pwsh
+        run: python scripts/windows_lifecycle/aggregate_evidence.py --input windows-lifecycle-evidence.json --output windows-lifecycle-aggregate.json
+
       - name: Upload lifecycle evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-lifecycle-evidence
-          path: windows-lifecycle-events.json
+          path: |
+            windows-lifecycle-evidence.json
+            windows-lifecycle-aggregate.json
+            flutter-ui-lifecycle-evidence.json
+            windows-lifecycle-events.json
           if-no-files-found: warn
           retention-days: 14

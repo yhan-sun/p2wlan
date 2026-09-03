@@ -562,6 +562,12 @@ class DesktopTrayController with TrayListener, WindowListener {
     return _stopDaemonForQuit();
   }
 
+  /// Exercise the packaged tray quit path from the Windows release harness.
+  /// The harness starts the app without a virtual adapter; `_quitApp` must
+  /// still tear down the tray/window and exit without trying to force-kill a
+  /// nonexistent daemon.
+  Future<void> quitForLifecycleTest() => _quitApp();
+
   Future<void> _copyPeerIp(String virtualIp) async {
     final value = virtualIp.trim();
     if (value.isEmpty) return;

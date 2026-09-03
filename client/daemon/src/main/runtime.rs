@@ -1,11 +1,73 @@
-#[tokio::main]
-async fn main() -> p2pnet_daemon::Result<()> {
+fn main() -> p2pnet_daemon::Result<()> {
     // The lifecycle probes are intentionally parsed before Clap and before any
     // token/config/logging/instance-lock side effect. They are strict, hidden
     // packaging contracts rather than production daemon options.
     if run_lifecycle_probe_from_process_args()? {
         return Ok(());
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        // A GUI-subsystem process normally has no console, but a console
+        // launched from a terminal (and the dedicated CI Ctrl+C harness) can
+        // attach one explicitly before registering the native handler.
+        let _ = attach_windows_parent_console_for_test();
+        if windows_service_requested() {
+            return run_windows_service();
+        }
+        let signal = install_windows_console_handler()?;
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| DaemonError::TaskCrash(error.to_string()))?
+            .block_on(run_daemon(signal));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| DaemonError::TaskCrash(error.to_string()))?
+        .block_on(run_daemon())
+}
+
+#[cfg(target_os = "windows")]
+async fn run_daemon(windows_signal: std::sync::Arc<WindowsLifecycleSignal>) -> p2pnet_daemon::Result<()> {
+    let _completion = WindowsLifecycleCompletionGuard(windows_signal.clone());
+    run_daemon_inner(Some(windows_signal)).await
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn run_daemon() -> p2pnet_daemon::Result<()> {
+    run_daemon_inner().await
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsLifecycleCompletionGuard(std::sync::Arc<WindowsLifecycleSignal>);
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsLifecycleCompletionGuard {
+    fn drop(&mut self) {
+        self.0.complete();
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn wait_for_windows_lifecycle_signal(
+    signal: std::sync::Arc<WindowsLifecycleSignal>,
+) -> &'static str {
+    loop {
+        let reason = signal.reason();
+        if reason != 0 {
+            return windows_lifecycle_reason(reason);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+async fn run_daemon_inner(
+    #[cfg(target_os = "windows")] windows_signal: Option<std::sync::Arc<WindowsLifecycleSignal>>,
+) -> p2pnet_daemon::Result<()> {
 
     // Parse arguments BEFORE any side effects (including logging setup)
     // This guarantees --help and --version exit cleanly without side effects.
@@ -262,7 +324,35 @@ async fn main() -> p2pnet_daemon::Result<()> {
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(target_os = "windows")]
+        {
+            let windows_signal = windows_signal
+                .clone()
+                .expect("Windows lifecycle signal must be installed before daemon startup");
+            tokio::select! {
+                result = &mut daemon_handle => {
+                    match result {
+                        Ok(Ok(())) => {
+                            info!("Daemon exited cleanly");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            error!("Daemon exited with error: {e}");
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            error!("Daemon task failed: {e}");
+                            return Err(DaemonError::TaskCrash(e.to_string()));
+                        }
+                    }
+                }
+                reason = wait_for_windows_lifecycle_signal(windows_signal) => {
+                    info!("Received Windows lifecycle event {reason}, shutting down...");
+                    Some(reason)
+                }
+            }
+        }
+        #[cfg(all(not(unix), not(target_os = "windows")))]
         {
             tokio::select! {
                 result = &mut daemon_handle => {
@@ -302,7 +392,10 @@ async fn main() -> p2pnet_daemon::Result<()> {
                 return Err(DaemonError::TaskCrash(e.to_string()));
             }
             Err(_) => {
-                warn!("Timed out waiting for daemon to stop after {reason}");
+                error!("Timed out waiting for daemon to stop after {reason}");
+                return Err(DaemonError::TaskCrash(format!(
+                    "graceful shutdown timed out after {reason}"
+                )));
             }
         }
     }

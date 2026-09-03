@@ -97,7 +97,22 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
         settingsStore: _settingsStore,
         statusStore: _statusStore,
       );
-      unawaited(_desktopTrayController!.initialize());
+      final trayInitialization = _desktopTrayController!.initialize();
+      if (_isWindowsTrayNoAdapterExitTest) {
+        // This is used only by the Windows release acceptance harness. It
+        // enters through the same tray bootstrap and quit path as a real
+        // packaged desktop app, while the harness deliberately provides no
+        // virtual adapter or running daemon.
+        unawaited(
+          trayInitialization.then((_) {
+            final tray = _desktopTrayController;
+            if (tray == null) return;
+            return tray.quitForLifecycleTest();
+          }),
+        );
+      } else {
+        unawaited(trayInitialization);
+      }
     } else if (widget.enableDesktopTaskbarStatus &&
         DesktopWindowStatusController.isSupported) {
       _desktopWindowStatusController = DesktopWindowStatusController(
@@ -115,6 +130,12 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     } else if (widget.initialRefresh && canPollLocalDaemon) {
       unawaited(_statusStore.refreshUntilPeerCatalogSettled(silent: true));
     }
+  }
+
+  bool get _isWindowsTrayNoAdapterExitTest {
+    return Platform.isWindows &&
+        Platform.environment['P2WLAN_WINDOWS_TRAY_LIFECYCLE_TEST']?.trim() ==
+            'no-adapter-exit';
   }
 
   Future<void> _logout() async {

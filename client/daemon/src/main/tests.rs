@@ -49,6 +49,8 @@ use super::*;
             device_name: None,
             diagnostics_url: None,
             diagnostics_client_sid: None,
+            windows_service: false,
+            windows_service_name: None,
             log_file: None,
         }
     }
@@ -171,6 +173,8 @@ use super::*;
             device_name: None,
             diagnostics_url: None,
             diagnostics_client_sid: None,
+            windows_service: false,
+            windows_service_name: None,
             log_file: None,
         };
 
@@ -241,6 +245,8 @@ use super::*;
             device_name: None,
             diagnostics_url: None,
             diagnostics_client_sid: None,
+            windows_service: false,
+            windows_service_name: None,
             log_file: None,
         };
 
@@ -378,6 +384,8 @@ use super::*;
             device_name: None,
             diagnostics_url: None,
             diagnostics_client_sid: None,
+            windows_service: false,
+            windows_service_name: None,
             log_file: None,
         };
 
