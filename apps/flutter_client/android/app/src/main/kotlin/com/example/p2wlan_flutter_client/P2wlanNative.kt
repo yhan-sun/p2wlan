@@ -51,10 +51,15 @@ internal object P2wlanNative {
         }
     }
 
-    fun stop(): Boolean {
+    /**
+     * Stop only the runtime incarnation the caller owns. A zero expected
+     * incarnation retains the legacy unscoped call for diagnostics/tests; the
+     * VpnService always supplies its bridge incarnation.
+     */
+    fun stop(expectedIncarnation: Long? = null): Boolean {
         if (!ensureLoaded()) return false
         return try {
-            nativeStop()
+            nativeStop(expectedIncarnation ?: 0L)
         } catch (error: Throwable) {
             val message = formatError("Android 原生 daemon 停止失败", error)
             loadError = message
@@ -96,6 +101,19 @@ internal object P2wlanNative {
         }
     }
 
+    /** Current Rust runtime incarnation, or null when no native runtime owns a slot. */
+    fun incarnation(): Long? {
+        if (!ensureLoaded()) return null
+        return try {
+            nativeIncarnation().takeIf { it > 0L }
+        } catch (error: Throwable) {
+            val message = formatError("无法读取 Android 原生 daemon incarnation", error)
+            loadError = message
+            Log.w(TAG, message, error)
+            null
+        }
+    }
+
     private fun formatError(prefix: String, error: Throwable): String {
         val detail = error.message?.trim().orEmpty()
         return if (detail.isEmpty()) {
@@ -120,11 +138,13 @@ internal object P2wlanNative {
         requestJson: String,
     ): String?
 
-    private external fun nativeStop(): Boolean
+    private external fun nativeStop(expectedIncarnation: Long): Boolean
 
     private external fun nativeIsRunning(): Boolean
 
     private external fun nativeIsReady(): Boolean
 
     private external fun nativeLastError(): String?
+
+    private external fun nativeIncarnation(): Long
 }

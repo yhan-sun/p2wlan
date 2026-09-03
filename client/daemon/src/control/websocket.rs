@@ -9,7 +9,7 @@
 //! default interface so a kernel-level TUN route cannot capture it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -42,6 +42,64 @@ pub fn websocket_proxy_policy_label() -> &'static str {
     "direct_only"
 }
 
+/// Owner of the current signaling WebSocket connection. A late task cleanup
+/// can only clear the connected bit while its connection generation is still
+/// current, so a reconnect cannot be torn down by the old task.
+#[derive(Clone)]
+pub(super) struct SignalConnectionLifecycle {
+    generation: Arc<Mutex<u64>>,
+    connected: Arc<AtomicBool>,
+}
+
+impl SignalConnectionLifecycle {
+    pub(super) fn new(connected: Arc<AtomicBool>) -> Self {
+        Self {
+            generation: Arc::new(Mutex::new(0)),
+            connected,
+        }
+    }
+
+    pub(super) fn begin(&self) -> u64 {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.saturating_add(1);
+        *generation
+    }
+
+    pub(super) fn mark_connected(&self, owner: u64) -> bool {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *generation != owner {
+            return false;
+        }
+        self.connected.store(true, Ordering::Release);
+        true
+    }
+
+    pub(super) fn mark_disconnected(&self, owner: u64) {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *generation == owner {
+            self.connected.store(false, Ordering::Release);
+        }
+    }
+
+    pub(super) fn close(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.saturating_add(1);
+        self.connected.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SignalWebSocketMessage {
     #[serde(rename = "type")]
@@ -59,12 +117,12 @@ struct SignalWebSocketMessage {
 
 pub(super) struct SignalWebSocketTask {
     handle: tokio::task::JoinHandle<()>,
-    connected: Arc<AtomicBool>,
+    lifecycle: SignalConnectionLifecycle,
 }
 
 impl Drop for SignalWebSocketTask {
     fn drop(&mut self) {
-        self.connected.store(false, Ordering::Release);
+        self.lifecycle.close();
         self.handle.abort();
     }
 }
@@ -77,25 +135,27 @@ pub(super) fn spawn_signal_websocket(
     wake_tx: mpsc::Sender<()>,
     connected: Arc<AtomicBool>,
 ) -> SignalWebSocketTask {
-    let task_connected = connected.clone();
+    let lifecycle = SignalConnectionLifecycle::new(connected);
+    let task_lifecycle = lifecycle.clone();
     let base_url = base_url.to_string();
     let token = token.to_string();
     let node_id = node_id.to_string();
     let network_id = network_id.to_string();
     let handle = tokio::spawn(async move {
-        run_signal_websocket(
+        run_signal_websocket_with_lifecycle(
             &base_url,
             &token,
             &node_id,
             &network_id,
             wake_tx,
-            task_connected,
+            task_lifecycle,
         )
         .await;
     });
-    SignalWebSocketTask { handle, connected }
+    SignalWebSocketTask { handle, lifecycle }
 }
 
+#[cfg(test)]
 pub(super) async fn run_signal_websocket(
     base_url: &str,
     token: &str,
@@ -103,6 +163,25 @@ pub(super) async fn run_signal_websocket(
     expected_network_id: &str,
     wake_tx: mpsc::Sender<()>,
     connected: Arc<AtomicBool>,
+) {
+    run_signal_websocket_with_lifecycle(
+        base_url,
+        token,
+        expected_node_id,
+        expected_network_id,
+        wake_tx,
+        SignalConnectionLifecycle::new(connected),
+    )
+    .await;
+}
+
+async fn run_signal_websocket_with_lifecycle(
+    base_url: &str,
+    token: &str,
+    expected_node_id: &str,
+    expected_network_id: &str,
+    wake_tx: mpsc::Sender<()>,
+    lifecycle: SignalConnectionLifecycle,
 ) {
     let ws_url = match signal_websocket_url(base_url) {
         Ok(url) => url,
@@ -121,7 +200,8 @@ pub(super) async fn run_signal_websocket(
 
     let mut attempt = 0u32;
     loop {
-        connected.store(false, Ordering::Release);
+        let connection_generation = lifecycle.begin();
+        lifecycle.mark_disconnected(connection_generation);
         let mut request = match ws_url.as_str().into_client_request() {
             Ok(request) => request,
             Err(err) => {
@@ -278,7 +358,9 @@ pub(super) async fn run_signal_websocket(
                                             break;
                                         }
                                         ready = true;
-                                        connected.store(true, Ordering::Release);
+                                        if !lifecycle.mark_connected(connection_generation) {
+                                            break;
+                                        }
                                         debug!(
                                             "WebSocket signaling ready for node {} at server_time_ms={}",
                                             expected_node_id, message.server_time_ms
@@ -340,7 +422,7 @@ pub(super) async fn run_signal_websocket(
             }
         }
 
-        connected.store(false, Ordering::Release);
+        lifecycle.mark_disconnected(connection_generation);
         attempt = attempt.saturating_add(1);
         let exponent = attempt.saturating_sub(1).min(5);
         let base = Duration::from_secs(1u64 << exponent).min(SIGNAL_WS_MAX_BACKOFF);
@@ -471,5 +553,20 @@ mod route_tests {
             &mut pending,
             replacement,
         ));
+    }
+
+    #[test]
+    fn new_control_connection_survives_old_task_teardown() {
+        let connected = Arc::new(AtomicBool::new(false));
+        let lifecycle = SignalConnectionLifecycle::new(connected.clone());
+        let old = lifecycle.begin();
+        assert!(lifecycle.mark_connected(old));
+        let current = lifecycle.begin();
+        assert!(lifecycle.mark_connected(current));
+
+        lifecycle.mark_disconnected(old);
+        assert!(connected.load(Ordering::Acquire));
+        lifecycle.mark_disconnected(current);
+        assert!(!connected.load(Ordering::Acquire));
     }
 }

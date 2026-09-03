@@ -1,0 +1,194 @@
+{
+  "schema_version": 2,
+  "repository": "yhan-sun/p2wlan",
+  "events": [
+    "app_backgrounded",
+    "app_resumed",
+    "physical_network_changed",
+    "vpn_permission_request_started",
+    "vpn_permission_revoked",
+    "vpn_permission_granted",
+    "vpn_start_requested",
+    "explicit_stop_requested",
+    "activity_recreated",
+    "service_recreated",
+    "bridge_attached",
+    "bridge_detached",
+    "native_runtime_started",
+    "native_runtime_stopped",
+    "native_monitor_callback",
+    "automatic_restart_scheduled",
+    "automatic_restart_rejected",
+    "control_disconnected",
+    "control_reconnected",
+    "candidate_refresh_started",
+    "relay_retained",
+    "direct_reconfirmed"
+  ],
+  "outcomes": [
+    "applied",
+    "duplicate",
+    "stale_rejected",
+    "superseded",
+    "failed"
+  ],
+  "forbidden_outcomes": [
+    "skipped",
+    "assumed",
+    "manually_verified",
+    "deferred"
+  ],
+  "identity_fields": [
+    "app_epoch",
+    "event_loop_generation",
+    "daemon_process_id",
+    "daemon_revision",
+    "permission_request_id",
+    "activity_incarnation",
+    "engine_incarnation",
+    "service_incarnation",
+    "automatic_restart_generation",
+    "bridge_incarnation",
+    "network_generation",
+    "candidate_epoch",
+    "socket_publication_generation",
+    "control_connection_generation",
+    "peer_session_generation",
+    "relay_connection_id",
+    "direct_validation_owner",
+    "trace_id"
+  ],
+  "components": [
+    "flutter",
+    "android_jvm",
+    "rust"
+  ],
+  "required_scenarios": [
+    {
+      "id": "ML-01",
+      "name": "app-background-late-long-poll",
+      "authoritative_components": ["flutter"],
+      "required_decision": "stale_rejected",
+      "required_invariants": ["old_callback_fenced"]
+    },
+    {
+      "id": "ML-02",
+      "name": "app-resume-refresh-before-reconnect",
+      "authoritative_components": ["flutter"],
+      "required_decision": "applied",
+      "required_invariants": ["resume_refresh_precedes_poll"]
+    },
+    {
+      "id": "ML-03",
+      "name": "daemon-process-recreation",
+      "authoritative_components": ["flutter", "android_jvm", "rust"],
+      "required_decision": "applied",
+      "required_invariants": ["new_process_adopted"]
+    },
+    {
+      "id": "ML-04",
+      "name": "wifi-to-cellular-handoff",
+      "authoritative_components": ["android_jvm", "rust"],
+      "required_decision": "applied",
+      "required_invariants": ["single_network_generation_advance"]
+    },
+    {
+      "id": "ML-05",
+      "name": "cellular-to-wifi-hotspot-handoff",
+      "authoritative_components": ["android_jvm", "rust"],
+      "required_decision": "applied",
+      "required_invariants": ["single_network_generation_advance"]
+    },
+    {
+      "id": "ML-06",
+      "name": "vpn-permission-revoke",
+      "authoritative_components": ["flutter", "android_jvm"],
+      "required_decision": "stale_rejected",
+      "required_invariants": ["pending_permission_invalidated"]
+    },
+    {
+      "id": "ML-07",
+      "name": "vpn-permission-regrant",
+      "authoritative_components": ["flutter", "android_jvm"],
+      "required_decision": "applied",
+      "required_invariants": ["new_permission_attempt"]
+    },
+    {
+      "id": "ML-08",
+      "name": "activity-engine-recreation",
+      "authoritative_components": ["flutter", "android_jvm"],
+      "required_decision": "stale_rejected",
+      "required_invariants": ["old_engine_callback_rejected"]
+    },
+    {
+      "id": "ML-09",
+      "name": "service-process-recreation",
+      "authoritative_components": ["android_jvm"],
+      "required_decision": "applied",
+      "required_invariants": ["new_service_incarnation"]
+    },
+    {
+      "id": "ML-10",
+      "name": "native-bridge-reattachment",
+      "authoritative_components": ["flutter", "android_jvm", "rust"],
+      "required_decision": "applied",
+      "required_invariants": ["bridge_identity_adopted"]
+    },
+    {
+      "id": "ML-11",
+      "name": "stale-bridge-teardown-rejected",
+      "authoritative_components": ["android_jvm", "rust"],
+      "required_decision": "stale_rejected",
+      "required_invariants": ["old_bridge_cleanup_rejected"]
+    },
+    {
+      "id": "ML-12",
+      "name": "control-websocket-reconnect",
+      "authoritative_components": ["flutter", "rust"],
+      "required_decision": "applied",
+      "required_invariants": ["new_control_generation_adopted"]
+    },
+    {
+      "id": "ML-13",
+      "name": "stale-control-message-rejected",
+      "authoritative_components": ["rust"],
+      "required_decision": "stale_rejected",
+      "required_invariants": ["old_control_message_rejected"]
+    },
+    {
+      "id": "ML-14",
+      "name": "stale-network-candidate-rejected",
+      "authoritative_components": ["rust"],
+      "required_decision": "stale_rejected",
+      "required_invariants": ["old_candidate_rejected"]
+    },
+    {
+      "id": "ML-15",
+      "name": "stale-socket-publication-rejected",
+      "authoritative_components": ["rust"],
+      "required_decision": "stale_rejected",
+      "required_invariants": ["old_socket_publication_rejected"]
+    },
+    {
+      "id": "ML-16",
+      "name": "relay-retained-during-direct-rediscovery",
+      "authoritative_components": ["rust"],
+      "required_decision": "applied",
+      "required_invariants": ["relay_retained_until_direct_commit", "relay_retained_on_timeout"]
+    },
+    {
+      "id": "ML-17",
+      "name": "direct-current-generation-confirmed",
+      "authoritative_components": ["rust"],
+      "required_decision": "applied",
+      "required_invariants": ["direct_confirmed_current_generation"]
+    },
+    {
+      "id": "ML-18",
+      "name": "duplicate-events-idempotent",
+      "authoritative_components": ["flutter", "android_jvm", "rust"],
+      "required_decision": "duplicate",
+      "required_invariants": ["duplicate_has_no_second_effect"]
+    }
+  ]
+}

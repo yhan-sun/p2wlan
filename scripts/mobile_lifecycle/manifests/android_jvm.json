@@ -1,0 +1,95 @@
+{
+  "component": "android_jvm",
+  "scenarios": [
+    {
+      "scenario_id": "ML-03",
+      "test_name": "service recreation gets a new runtime identity",
+      "events": ["service_recreated", "native_runtime_started"],
+      "old_identity": {"daemon_process_id": 41, "service_incarnation": 8, "bridge_incarnation": 4},
+      "new_identity": {"daemon_process_id": 42, "service_incarnation": 9, "bridge_incarnation": 5},
+      "decision": "applied",
+      "invariants": {"new_process_adopted": true}
+    },
+    {
+      "scenario_id": "ML-04",
+      "test_name": "Wi-Fi to cellular advances one physical network generation",
+      "events": ["physical_network_changed", "candidate_refresh_started"],
+      "old_identity": {"network_generation": 11},
+      "new_identity": {"network_generation": 12},
+      "decision": "applied",
+      "invariants": {"single_network_generation_advance": true}
+    },
+    {
+      "scenario_id": "ML-05",
+      "test_name": "cellular to Wi-Fi hotspot identity advances once",
+      "events": ["physical_network_changed", "candidate_refresh_started"],
+      "old_identity": {"network_generation": 12},
+      "new_identity": {"network_generation": 13},
+      "decision": "applied",
+      "invariants": {"single_network_generation_advance": true}
+    },
+    {
+      "scenario_id": "ML-06",
+      "test_name": "permission revoke invalidates the pending request",
+      "events": ["vpn_permission_revoked", "bridge_detached"],
+      "old_identity": {"app_epoch": 1, "permission_request_id": 7},
+      "new_identity": {"app_epoch": 2, "permission_request_id": 8},
+      "decision": "stale_rejected",
+      "invariants": {"pending_permission_invalidated": true}
+    },
+    {
+      "scenario_id": "ML-07",
+      "test_name": "permission regrant allocates a new request generation",
+      "events": ["vpn_permission_granted", "native_runtime_started"],
+      "old_identity": {"app_epoch": 2, "permission_request_id": 8},
+      "new_identity": {"app_epoch": 3, "permission_request_id": 9},
+      "decision": "applied",
+      "invariants": {"new_permission_attempt": true}
+    },
+    {
+      "scenario_id": "ML-08",
+      "test_name": "old engine permission result is rejected after recreation",
+      "events": ["activity_recreated", "vpn_permission_granted"],
+      "old_identity": {"activity_incarnation": 2, "permission_request_id": 9},
+      "new_identity": {"activity_incarnation": 3, "permission_request_id": 10},
+      "decision": "stale_rejected",
+      "invariants": {"old_engine_callback_rejected": true}
+    },
+    {
+      "scenario_id": "ML-09",
+      "test_name": "START_STICKY recreation gets a new service incarnation",
+      "events": ["service_recreated", "native_runtime_started"],
+      "old_identity": {"service_incarnation": 8},
+      "new_identity": {"service_incarnation": 9},
+      "decision": "applied",
+      "invariants": {"new_service_incarnation": true}
+    },
+    {
+      "scenario_id": "ML-10",
+      "test_name": "bridge reattachment adopts the current native incarnation",
+      "events": ["bridge_detached", "bridge_attached"],
+      "old_identity": {"bridge_incarnation": 4, "service_incarnation": 8},
+      "new_identity": {"bridge_incarnation": 5, "service_incarnation": 9},
+      "decision": "applied",
+      "invariants": {"bridge_identity_adopted": true}
+    },
+    {
+      "scenario_id": "ML-11",
+      "test_name": "old bridge teardown cannot stop the replacement",
+      "events": ["bridge_detached", "bridge_attached"],
+      "old_identity": {"bridge_incarnation": 4},
+      "new_identity": {"bridge_incarnation": 5},
+      "decision": "stale_rejected",
+      "invariants": {"old_bridge_cleanup_rejected": true}
+    },
+    {
+      "scenario_id": "ML-18",
+      "test_name": "duplicate Android lifecycle events have no second effect",
+      "events": ["vpn_permission_granted", "vpn_permission_granted", "physical_network_changed", "physical_network_changed"],
+      "old_identity": {"service_incarnation": 9, "network_generation": 13},
+      "new_identity": {"service_incarnation": 9, "network_generation": 13},
+      "decision": "duplicate",
+      "invariants": {"duplicate_has_no_second_effect": true}
+    }
+  ]
+}

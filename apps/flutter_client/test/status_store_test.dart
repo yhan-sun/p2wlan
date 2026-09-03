@@ -318,6 +318,43 @@ void main() {
     expect(stores.statusStore.snapshot?.peers, isEmpty);
   });
 
+  test('rejects a late response from a retired daemon process', () async {
+    final fixture = await _loadFixture();
+    final oldProcess = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 10,
+      uptimeMs: 10000,
+    );
+    final newProcess = _snapshotCopy(
+      fixture,
+      processId: 43,
+      revision: 1,
+      uptimeMs: 100,
+      peers: const <dynamic>[],
+    );
+    final delayedOldProcess = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 11,
+      uptimeMs: 11000,
+    );
+    final api = _SwitchingDiagnosticsApi(
+      snapshot: newProcess,
+      snapshots: [oldProcess, newProcess, delayedOldProcess],
+    );
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+
+    expect(stores.statusStore.snapshot?.processId, 43);
+    expect(stores.statusStore.snapshot?.revision, 1);
+    expect(stores.statusStore.snapshot?.peers, isEmpty);
+  });
+
   test(
     'startup settling never restores an older larger peer catalog',
     () async {
@@ -512,6 +549,23 @@ void main() {
       stores.statusStore.setAutoRefresh(enabled: false);
     },
   );
+
+  test('disposed store cannot restart polling', () async {
+    final fixture = await _loadFixture();
+    final api = _SwitchingDiagnosticsApi(snapshot: fixture);
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    final statusCount = api.statusFetchCount;
+    stores.statusStore.dispose();
+
+    stores.statusStore.setAutoRefresh(enabled: true, refreshImmediately: true);
+    await stores.statusStore.refresh();
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+
+    expect(api.statusFetchCount, statusCount);
+  });
 }
 
 DiagnosticsSnapshot _snapshotCopy(

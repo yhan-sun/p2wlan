@@ -7,7 +7,7 @@ description = "JNI bridge for the P2WLAN Android VPN service"
 
 [lib]
 name = "p2wlan_android"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 p2wlan-daemon = { path = "../daemon", version = "0.1.147" }
