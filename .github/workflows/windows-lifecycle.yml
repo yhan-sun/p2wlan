@@ -8,9 +8,12 @@ on:
       - ".github/workflows/path-state-machine-required.yml"
       - ".github/workflows/windows-lifecycle.yml"
       - "client/daemon/**"
+      - "client/cli/**"
       - "client/tray/**"
       - "client/desktop-host/**"
       - "apps/flutter_client/**"
+      - "scripts/release/**"
+      - "scripts/windows_lifecycle/**"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -19,12 +22,20 @@ on:
       - ".fvmrc"
       - ".github/workflows/windows-lifecycle.yml"
       - "client/daemon/**"
+      - "client/cli/**"
       - "client/tray/**"
       - "client/desktop-host/**"
       - "apps/flutter_client/**"
+      - "scripts/release/**"
+      - "scripts/windows_lifecycle/**"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
+    inputs:
+      validation_sha:
+        description: Exact source commit SHA to validate
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -33,13 +44,29 @@ concurrency:
   group: windows-lifecycle-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  P2WLAN_EXACT_HEAD: ${{ github.event.pull_request.head.sha || inputs.validation_sha || github.sha }}
+  P2WLAN_WORKFLOW_SHA: ${{ github.sha }}
+
 jobs:
   lifecycle:
     name: Windows Lifecycle Required
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source checkout identity
+        shell: bash
+        run: |
+          [[ "$P2WLAN_EXACT_HEAD" =~ ^[0-9a-fA-F]{40}$ ]]
+          actual_head_sha="$(git rev-parse HEAD)"
+          test "$actual_head_sha" = "$P2WLAN_EXACT_HEAD"
+          echo "source_head_sha=$actual_head_sha"
+          echo "workflow_sha=$P2WLAN_WORKFLOW_SHA"
 
       - name: Capture Windows Error Reporting baseline
         shell: pwsh
@@ -48,9 +75,27 @@ jobs:
           "P2WLAN_WER_BASELINE=$baseline" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "WER baseline: $baseline"
 
+      - name: Configure WER LocalDumps for tray regression
+        shell: pwsh
+        run: |
+          $dumpDir = Join-Path $env:RUNNER_TEMP 'p2wlan-tray-dumps'
+          $traceDir = Join-Path $env:RUNNER_TEMP 'p2wlan-tray-traces'
+          $diagnosticDir = Join-Path $env:RUNNER_TEMP 'p2wlan-tray-diagnostics'
+          New-Item -ItemType Directory -Path $dumpDir, $traceDir, $diagnosticDir -Force | Out-Null
+          "P2WLAN_TRAY_DUMP_DIR=$dumpDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "P2WLAN_TRAY_TRACE_DIR=$traceDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "P2WLAN_TRAY_DIAGNOSTICS_DIR=$diagnosticDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $localDumps = 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\p2wlan_flutter_client.exe'
+          New-Item -Path $localDumps -Force | Out-Null
+          New-ItemProperty -Path $localDumps -Name DumpFolder -PropertyType ExpandString -Value $dumpDir -Force | Out-Null
+          New-ItemProperty -Path $localDumps -Name DumpType -PropertyType DWord -Value 2 -Force | Out-Null
+          New-ItemProperty -Path $localDumps -Name DumpCount -PropertyType DWord -Value 5 -Force | Out-Null
+          Write-Host "WER LocalDumps configured: $dumpDir"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
+          toolchain: stable
           components: rustfmt
 
       - name: Set up Flutter
@@ -59,6 +104,10 @@ jobs:
           channel: stable
           flutter-version-file: .fvmrc
           cache: true
+
+      - name: Enable Windows desktop
+        working-directory: apps/flutter_client
+        run: flutter config --enable-windows-desktop
 
       - name: Flutter dependencies
         working-directory: apps/flutter_client
@@ -71,17 +120,48 @@ jobs:
       - name: Formatting gates
         shell: bash
         run: |
-          cargo fmt --all --check
+          cargo fmt --all -- --check
           cd apps/flutter_client
-          dart format --output=none --set-exit-if-changed test/windows_daemon_lifecycle_integration_test.dart
+          dart format --output=none --set-exit-if-changed \
+            lib/app/desktop_tray_controller.dart \
+            lib/app/p2wlan_app.dart \
+            lib/core/daemon/daemon_controller.dart \
+            test/windows_daemon_lifecycle_integration_test.dart \
+            test/windows_production_lifecycle_integration_test.dart
 
-      - name: Build release daemon
-        run: cargo build -p p2wlan-daemon --release
+      - name: Validate lifecycle evidence aggregator
+        run: python -m unittest discover -s scripts/windows_lifecycle -p "test_*.py"
+
+      - name: Build release daemon and CLI
+        shell: bash
+        run: |
+          cargo build -p p2wlan-daemon --release
+          cargo build -p p2wlan-cli --release
+
+      - name: Bundle Wintun for the production harness
+        shell: pwsh
+        run: .\apps\flutter_client\scripts\fetch_wintun.ps1 -DestinationDirectory "${{ github.workspace }}\target\release" -Architecture amd64
 
       - name: Run Rust lifecycle regression
         env:
           P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
         run: cargo test -p p2wlan-daemon --test windows_lifecycle --release -- --test-threads=1
+
+      - name: Capture production Windows lifecycle handler mapping
+        if: always()
+        shell: pwsh
+        env:
+          P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
+        run: |
+          $outputPath = Join-Path $env:GITHUB_WORKSPACE 'windows-handler-mapping.json'
+          if (-not (Test-Path -LiteralPath $env:P2WLAN_DAEMON_BIN)) {
+            throw "daemon binary not found: $env:P2WLAN_DAEMON_BIN"
+          }
+          $probeOutput = @(& $env:P2WLAN_DAEMON_BIN --windows-lifecycle-handler-probe 2>&1 | Out-String)
+          $exitCode = $LASTEXITCODE
+          $probeOutput -join '' | Set-Content -LiteralPath $outputPath -Encoding utf8
+          if ($exitCode -ne 0) { throw "Windows handler mapping probe exited with $exitCode" }
+          Write-Host "Handler mapping evidence written to $outputPath"
 
       - name: Run Flutter process lifecycle regression
         working-directory: apps/flutter_client
@@ -89,14 +169,186 @@ jobs:
           P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
         run: flutter test test/windows_daemon_lifecycle_integration_test.dart
 
+      - name: Build Flutter Windows release bundle
+        working-directory: apps/flutter_client
+        shell: bash
+        run: bash ../../scripts/release/build_flutter_client.sh windows --release
+
+      - name: Restore Flutter-managed source files after build
+        shell: bash
+        run: bash scripts/release/hermetic_build.sh restore
+
+      - name: Bundle daemon, Wintun, and MSVC runtime into Flutter release
+        shell: pwsh
+        run: |
+          $release = "${{ github.workspace }}\apps\flutter_client\build\windows\x64\runner\Release"
+          Copy-Item "${{ github.workspace }}\target\release\p2wlan-daemon.exe" "$release\p2wlan-daemon.exe" -Force
+          .\apps\flutter_client\scripts\fetch_wintun.ps1 -DestinationDirectory $release -Architecture amd64
+          .\apps\flutter_client\scripts\bundle_msvc_runtime.ps1 -DestinationDirectory $release
+
+      - name: Flutter analyze gate
+        working-directory: apps/flutter_client
+        shell: bash
+        run: flutter analyze
+
+      - name: Run Flutter UI stop lifecycle evidence
+        working-directory: apps/flutter_client
+        env:
+          P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
+          P2WLAN_WINDOWS_LIFECYCLE_EVIDENCE: ${{ github.workspace }}/flutter-ui-lifecycle-evidence.json
+          P2WLAN_WINDOWS_LIFECYCLE_UI_CYCLES: 8
+        run: flutter test test/windows_production_lifecycle_integration_test.dart
+
+      - name: Run production Windows lifecycle acceptance harness
+        if: always()
+        shell: pwsh
+        run: |
+          .\scripts\windows_lifecycle\windows_lifecycle_acceptance.ps1 `
+            -DaemonPath "${{ github.workspace }}\target\release\p2wlan-daemon.exe" `
+            -CliPath "${{ github.workspace }}\target\release\p2wlan.exe" `
+            -FlutterReleasePath "${{ github.workspace }}\apps\flutter_client\build\windows\x64\runner\Release\p2wlan_flutter_client.exe" `
+            -FlutterEvidencePath "${{ github.workspace }}\flutter-ui-lifecycle-evidence.json" `
+            -HandlerMappingPath "${{ github.workspace }}\windows-handler-mapping.json" `
+            -EvidencePath "${{ github.workspace }}\windows-lifecycle-evidence.json" `
+            -ProductionCycles 50 `
+            -TrayCycles 20 `
+            -AttemptRealWintun
+
+      - name: Collect Windows tray crash diagnostics
+        id: tray_diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $diagnosticDir = $env:P2WLAN_TRAY_DIAGNOSTICS_DIR
+          $dumpDir = $env:P2WLAN_TRAY_DUMP_DIR
+          $traceDir = $env:P2WLAN_TRAY_TRACE_DIR
+          New-Item -ItemType Directory -Path $diagnosticDir -Force | Out-Null
+          Start-Sleep -Seconds 2
+
+          $dumpDestination = Join-Path $diagnosticDir 'dumps'
+          New-Item -ItemType Directory -Path $dumpDestination -Force | Out-Null
+          $dumpFiles = @(
+            Get-ChildItem -LiteralPath $dumpDir -Filter '*.dmp' -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTimeUtc
+          )
+          foreach ($dump in $dumpFiles) {
+            Copy-Item -LiteralPath $dump.FullName -Destination (Join-Path $dumpDestination $dump.Name) -Force
+          }
+
+          $traceDestination = Join-Path $diagnosticDir 'traces'
+          if (Test-Path -LiteralPath $traceDir) {
+            Copy-Item -LiteralPath $traceDir -Destination $traceDestination -Recurse -Force
+          } else {
+            New-Item -ItemType Directory -Path $traceDestination -Force | Out-Null
+          }
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE 'apps\flutter_client\build\windows\x64\runner\Release'
+          $symbolDestination = Join-Path $diagnosticDir 'release-symbols'
+          New-Item -ItemType Directory -Path $symbolDestination -Force | Out-Null
+          foreach ($fileName in @('p2wlan_flutter_client.exe', 'flutter_windows.dll')) {
+            $source = Join-Path $releaseDir $fileName
+            if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination $symbolDestination -Force }
+          }
+          if (Test-Path -LiteralPath $releaseDir) {
+            Get-ChildItem -LiteralPath $releaseDir -Filter '*.pdb' -File -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $symbolDestination -Force
+          }
+
+          $pluginDestination = Join-Path $diagnosticDir 'tray-manager-source'
+          $pluginCandidates = @()
+          foreach ($cacheRoot in @(
+              (Join-Path $env:LOCALAPPDATA 'Pub\Cache\hosted\pub.dev'),
+              (Join-Path $env:USERPROFILE '.pub-cache\hosted\pub.dev')
+          )) {
+            if (Test-Path -LiteralPath $cacheRoot) {
+              $pluginCandidates += @(Get-ChildItem -LiteralPath $cacheRoot -Directory -Filter 'tray_manager-*' -ErrorAction SilentlyContinue)
+            }
+          }
+          $plugin = @($pluginCandidates | Sort-Object FullName -Descending | Select-Object -First 1)
+          if ($plugin.Count -eq 1) {
+            Copy-Item -LiteralPath $plugin[0].FullName -Destination $pluginDestination -Recurse -Force
+          } else {
+            'tray_manager source was not found in the existing runner pub cache; no network download was attempted.' |
+              Set-Content -LiteralPath (Join-Path $diagnosticDir 'tray-manager-source-not-found.txt') -Encoding utf8
+          }
+
+          $start = [DateTime]::Parse($env:P2WLAN_WER_BASELINE).ToLocalTime()
+          $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $start } -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Id -in @(1000, 1001) -and
+              (($_.Message + "`n" + $_.ToXml()) -match '(?i)p2wlan[-_](daemon|desktop|flutter_client).*\.exe|BEX64')
+            })
+          $xmlItems = foreach ($event in $events) { $event.ToXml() }
+          $xml = "<Events>`n$($xmlItems -join "`n")`n</Events>`n"
+          $xml | Set-Content -LiteralPath (Join-Path $diagnosticDir 'wer-events.xml') -Encoding utf8
+          $eventSummaries = foreach ($event in $events) {
+            $eventXml = [xml]$event.ToXml()
+            $data = [ordered]@{}
+            foreach ($item in @($eventXml.Event.EventData.Data)) {
+              if ($item.Name) { $data[[string]$item.Name] = [string]$item.'#text' }
+            }
+            [ordered]@{
+              time_created = $event.TimeCreated
+              id = $event.Id
+              provider_name = $event.ProviderName
+              message = $event.Message
+              faulting_module = $data['FaultingModuleName']
+              faulting_module_path = $data['FaultingModulePath']
+              fault_offset = $data['FaultingModuleOffset']
+              exception_code = $data['ExceptionCode']
+              faulting_process_id = $data['FaultingProcessId']
+              application_name = $data['FaultingApplicationName']
+              application_path = $data['FaultingApplicationPath']
+              report_id = $data['ReportId']
+              event_data = $data
+            }
+          }
+
+          $debuggerPath = $null
+          foreach ($candidate in @('cdb.exe', 'windbg.exe', 'windbgx.exe')) {
+            $command = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($command) { $debuggerPath = $command.Source; break }
+          }
+          $firstDump = @($dumpFiles | Select-Object -First 1)
+          if ($debuggerPath -and $firstDump.Count -eq 1) {
+            $stack = @(& $debuggerPath -z $firstDump[0].FullName -c '!analyze -v; .ecxr; .exr -1; kv; kPn; ~* kb; q' 2>&1 | Out-String)
+            $stack -join '' | Set-Content -LiteralPath (Join-Path $diagnosticDir 'native-stack.txt') -Encoding utf8
+          } else {
+            $reason = if (-not $debuggerPath) { 'No cdb.exe, windbg.exe, or windbgx.exe was already installed on the runner.' } else { 'No WER dump was available for native stack analysis.' }
+            $reason | Set-Content -LiteralPath (Join-Path $diagnosticDir 'native-stack-not-run.txt') -Encoding utf8
+          }
+
+          $dumpMetadata = foreach ($dump in $dumpFiles) {
+            $hash = Get-FileHash -LiteralPath $dump.FullName -Algorithm SHA256
+            [ordered]@{ name = $dump.Name; bytes = $dump.Length; sha256 = $hash.Hash; last_write_time_utc = $dump.LastWriteTimeUtc }
+          }
+          [ordered]@{
+            schema_version = 1
+            repository = 'yhan-sun/p2wlan'
+            source_head_sha = $env:P2WLAN_EXACT_HEAD
+            workflow_sha = $env:P2WLAN_WORKFLOW_SHA
+            runner_os = 'windows-latest'
+            event_count = $events.Count
+            events = @($eventSummaries)
+            dump_count = $dumpFiles.Count
+            dumps = @($dumpMetadata)
+            debugger = $debuggerPath
+            diagnostic_dir = $diagnosticDir
+          } | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath (Join-Path $diagnosticDir 'tray-crash-summary.json') -Encoding utf8
+          "diagnostic_dir=$diagnosticDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "dump_count=$($dumpFiles.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Tray diagnostic directory: $diagnosticDir"
+          Write-Host "Tray WER dumps captured: $($dumpFiles.Count)"
+
       - name: Assert no daemon process leaked
         if: always()
         shell: pwsh
         run: |
-          $leaked = @(Get-Process -Name 'p2wlan-daemon' -ErrorAction SilentlyContinue)
+          $leaked = @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -notmatch '(?i)(^|\s)--build-info(\s|$)' })
           if ($leaked.Count -gt 0) {
-            $leaked | Format-Table Id, ProcessName, StartTime -AutoSize
-            Stop-Process -Id ($leaked | Select-Object -ExpandProperty Id) -Force -ErrorAction SilentlyContinue
+            $leaked | Select-Object ProcessId, CommandLine | Format-List
+            Stop-Process -Id ($leaked | Select-Object -ExpandProperty ProcessId) -Force -ErrorAction SilentlyContinue
             throw "p2wlan-daemon process leaked after lifecycle tests"
           }
           Write-Host 'No p2wlan-daemon process leaked.'
@@ -109,21 +361,92 @@ jobs:
           $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $start } -ErrorAction SilentlyContinue |
             Where-Object {
               $_.Id -in @(1000, 1001) -and
-              ($_.Message -match '(?i)p2wlan-(daemon|desktop|flutter_client).*\.exe|(?i)BEX64')
+              (($_.Message + "`n" + $_.ToXml()) -match '(?i)p2wlan[-_](daemon|desktop|flutter_client).*\.exe|BEX64')
             } |
             Select-Object TimeCreated, Id, ProviderName, LevelDisplayName, Message)
           $events | ConvertTo-Json -Depth 4 | Set-Content -Path windows-lifecycle-events.json -Encoding utf8
+          $eventXml = foreach ($event in $events) { $event.ToXml() }
+          "<Events>`n$($eventXml -join "`n")`n</Events>`n" | Set-Content -Path windows-lifecycle-events.xml -Encoding utf8
+          if (Test-Path -LiteralPath windows-lifecycle-evidence.json) {
+            $evidence = Get-Content -LiteralPath windows-lifecycle-evidence.json -Raw | ConvertFrom-Json
+            if ($null -eq $evidence.wer) {
+              $evidence | Add-Member -NotePropertyName wer -NotePropertyValue ([pscustomobject]@{})
+            }
+            $evidence.wer.event_ids_checked = @(1000, 1001)
+            $evidence.wer.events = @($events)
+            $capabilities = @($evidence.capabilities | Where-Object { $_.name -ne 'wer_scan' })
+            $capabilities += [pscustomobject]@{
+              name = 'wer_scan'
+              status = if ($events.Count -eq 0) { 'verified' } else { 'failed' }
+              detail = if ($events.Count -eq 0) { 'Application WER event IDs 1000/1001 were empty for the acceptance window' } else { "found $($events.Count) matching WER/BEX event(s)" }
+            }
+            $evidence.capabilities = $capabilities
+            $evidence | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath windows-lifecycle-evidence.json -Encoding utf8
+          } else {
+            # Preserve a rejected artifact when an earlier build/test failed
+            # before the harness could emit its document. This is failure
+            # evidence, never a synthetic pass.
+            $rejected = [ordered]@{
+              schema_version = 2
+              repository = 'yhan-sun/p2wlan'
+              source_head_sha = $env:P2WLAN_EXACT_HEAD
+              workflow_sha = $env:P2WLAN_WORKFLOW_SHA
+              runner_os = 'windows-latest'
+              components = @(
+                [ordered]@{ name = 'production_harness'; schema_version = 2; repository = 'yhan-sun/p2wlan'; source_head_sha = $env:P2WLAN_EXACT_HEAD; workflow_sha = $env:P2WLAN_WORKFLOW_SHA; runner_os = 'windows-latest'; status = 'failed'; detail = 'acceptance harness did not produce evidence' },
+                [ordered]@{ name = 'flutter_ui'; schema_version = 2; repository = 'yhan-sun/p2wlan'; source_head_sha = $env:P2WLAN_EXACT_HEAD; workflow_sha = $env:P2WLAN_WORKFLOW_SHA; runner_os = 'windows-latest'; status = 'failed'; detail = 'acceptance harness did not produce evidence' },
+                [ordered]@{ name = 'handler_mapping'; schema_version = 2; repository = 'yhan-sun/p2wlan'; source_head_sha = $env:P2WLAN_EXACT_HEAD; workflow_sha = $env:P2WLAN_WORKFLOW_SHA; runner_os = 'windows-latest'; status = 'failed'; detail = 'handler mapping probe did not produce evidence' }
+              )
+              handler_mapping = [ordered]@{ status = 'failed'; live_system_delivery = 'deferred'; live_system_delivery_detail = 'handler mapping probe did not produce evidence'; console = @(); service = @(); idempotent_first_request_wins = $false; no_duplicate_frees = $false; coordinator_entered = $false; callback_non_blocking = $false; callback_elapsed_ms = $null; bounded_deadline = $false; shutdown_deadline_ms = $null; force_kill = $false; coordinator = '' }
+              capabilities = @(
+                [ordered]@{ name = 'production_start_stop'; status = 'failed'; detail = 'acceptance harness did not produce evidence' },
+                [ordered]@{ name = 'wer_scan'; status = if ($events.Count -eq 0) { 'verified' } else { 'failed' }; detail = 'harness evidence was missing' }
+              )
+              cycles = @()
+              service_controls = @()
+              flutter_tray = [ordered]@{ attempted_cycles = 0; successful_cycles = 0; first_failure_cycle = 1; process_exited = $false; exit_code = $null; daemon_processes_clean = $false; forced_termination = $false; dump_paths = @(); cycles = @() }
+              wer = [ordered]@{ event_ids_checked = @(1000, 1001); events = @($events) }
+            }
+            $rejected | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath windows-lifecycle-evidence.json -Encoding utf8
+          }
           if ($events.Count -gt 0) {
             $events | Format-List
             throw "Windows recorded a P2WLAN crash/BEX event during lifecycle tests"
           }
           Write-Host 'No P2WLAN crash or BEX event was recorded.'
 
+      - name: Aggregate Windows lifecycle evidence
+        if: always()
+        shell: pwsh
+        run: python scripts/windows_lifecycle/aggregate_evidence.py --input windows-lifecycle-evidence.json --output windows-lifecycle-aggregate.json
+
       - name: Upload lifecycle evidence
         if: always()
+        id: upload_lifecycle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-lifecycle-evidence
-          path: windows-lifecycle-events.json
+          path: |
+            windows-lifecycle-evidence.json
+            windows-lifecycle-aggregate.json
+            flutter-ui-lifecycle-evidence.json
+            windows-handler-mapping.json
+            windows-lifecycle-events.json
+            windows-lifecycle-events.xml
+            ${{ env.P2WLAN_TRAY_DIAGNOSTICS_DIR }}
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Report lifecycle artifact identity
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "Windows lifecycle artifact id: ${{ steps.upload_lifecycle.outputs.artifact-id }}"
+          Write-Host "Windows lifecycle artifact digest: ${{ steps.upload_lifecycle.outputs.artifact-digest }}"
+          Write-Host "Windows lifecycle artifact URL: ${{ steps.upload_lifecycle.outputs.artifact-url }}"
+
+      - name: Remove temporary WER LocalDumps configuration
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item -LiteralPath 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\p2wlan_flutter_client.exe' -Recurse -Force -ErrorAction SilentlyContinue

@@ -27,12 +27,25 @@ class DaemonCommandResult {
     required this.message,
     this.manualCommand,
     this.failureCode,
+    this.graceful = false,
+    this.forcedTermination = false,
   });
 
   final bool ok;
   final String message;
   final String? manualCommand;
   final DaemonStartupFailureCode? failureCode;
+
+  /// Whether the daemon acknowledged a graceful shutdown and exited within
+  /// the bounded drain window. A process killed by taskkill/SIGKILL is never
+  /// reported as graceful, even when it is no longer running afterwards.
+  final bool graceful;
+
+  /// True when the fallback termination path had to use forceful process
+  /// termination. This is retained in structured results for CI evidence and
+  /// is intentionally independent from [ok]: the UI may still be able to
+  /// leave the machine stopped while the lifecycle proof must fail closed.
+  final bool forcedTermination;
 }
 
 class DaemonController {
@@ -567,6 +580,7 @@ class DaemonController {
         return const DaemonCommandResult(
           ok: true,
           message: 'p2wlan-daemon stopped.',
+          graceful: true,
         );
       }
     }
@@ -586,10 +600,12 @@ class DaemonController {
       ],
     ];
     final attempted = <int>{};
+    var forcefulTerminationUsed = false;
     for (final pid in candidatePids.whereType<int>()) {
       if (!attempted.add(pid)) continue;
       if (!await _processLooksLikeDaemon(pid)) continue;
       if (!await _terminatePid(pid)) continue;
+      forcefulTerminationUsed = true;
       final processDown = await _waitForDaemonPidExit(
         pid,
         const Duration(seconds: 3),
@@ -603,6 +619,7 @@ class DaemonController {
         return const DaemonCommandResult(
           ok: true,
           message: 'p2wlan-daemon stopped after forced process termination fallback.',
+          forcedTermination: true,
         );
       }
     }
@@ -612,9 +629,23 @@ class DaemonController {
     if (!await _diagnosticsApi.fetchHealth(diagnosticsUrl) &&
         knownProcessesDown) {
       await _removePidMarker();
+      if (forcefulTerminationUsed) {
+        return const DaemonCommandResult(
+          ok: true,
+          message: 'p2wlan-daemon stopped after forced process termination fallback.',
+          forcedTermination: true,
+        );
+      }
+      if (shutdownRequested) {
+        return const DaemonCommandResult(
+          ok: false,
+          message: 'p2wlan-daemon is no longer reachable, but graceful shutdown was not confirmed within the bounded window.',
+        );
+      }
       return const DaemonCommandResult(
         ok: true,
         message: 'p2wlan-daemon stopped.',
+        graceful: true,
       );
     }
 

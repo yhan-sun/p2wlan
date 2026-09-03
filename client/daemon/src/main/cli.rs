@@ -225,6 +225,16 @@ struct Cli {
     #[arg(long, hide = true)]
     diagnostics_client_sid: Option<String>,
 
+    /// Run as a Windows Service Control Manager service. This is a hidden
+    /// packaging/lifecycle entry point; normal desktop launches must not set
+    /// it directly.
+    #[arg(long, hide = true)]
+    windows_service: bool,
+
+    /// Service name supplied by the SCM acceptance harness.
+    #[arg(long, hide = true, requires = "windows_service")]
+    windows_service_name: Option<String>,
+
     /// Write daemon logs to a file instead of stderr/stdout
     #[arg(long, name = "log-file")]
     log_file: Option<PathBuf>,

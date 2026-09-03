@@ -266,6 +266,8 @@ void main() {
       api.close();
 
       expect(stopped.ok, isTrue, reason: stopped.message);
+      expect(stopped.graceful, isTrue, reason: stopped.message);
+      expect(stopped.forcedTermination, isFalse, reason: stopped.message);
       expect(
         stopped.message,
         isNot(contains('forced process termination')),

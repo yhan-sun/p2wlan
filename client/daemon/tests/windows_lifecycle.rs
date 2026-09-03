@@ -122,3 +122,34 @@ fn windows_tray_event_source_drains_bounded_sequence_before_exit() {
         assert_eq!(envelope["event"]["sequence"], 77 + index as u64);
     }
 }
+
+#[test]
+fn windows_handler_mapping_probe_uses_production_adapters() {
+    let output = run_daemon(&["--windows-lifecycle-handler-probe".to_string()]);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "handler mapping probe returned invalid JSON: {error}; stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["component"], "handler_mapping");
+    assert_eq!(value["handler_mapping"]["status"], "verified");
+    assert_eq!(value["handler_mapping"]["live_system_delivery"], "deferred");
+    assert_eq!(
+        value["handler_mapping"]["idempotent_first_request_wins"],
+        true
+    );
+    assert_eq!(value["handler_mapping"]["coordinator_entered"], true);
+    assert_eq!(value["handler_mapping"]["callback_non_blocking"], true);
+    assert_eq!(value["handler_mapping"]["force_kill"], false);
+    assert_eq!(
+        value["handler_mapping"]["console"].as_array().map(Vec::len),
+        Some(5)
+    );
+    assert_eq!(
+        value["handler_mapping"]["service"].as_array().map(Vec::len),
+        Some(4)
+    );
+}

@@ -15,6 +15,20 @@ import 'app_constants.dart';
 import 'app_strings.dart';
 import 'desktop_window_operations.dart';
 
+void writeDesktopTrayLifecycleTrace(String event) {
+  final path = Platform.environment['P2WLAN_TRAY_TRACE_FILE']?.trim();
+  if (path == null || path.isEmpty) return;
+  try {
+    File(path).writeAsStringSync(
+      '${DateTime.now().toUtc().toIso8601String()} $event\n',
+      mode: FileMode.append,
+      flush: true,
+    );
+  } catch (_) {
+    // Diagnostics must never change the tray lifecycle being measured.
+  }
+}
+
 /// Windows tray events have used both `MouseDown` and `MouseUp` callback names
 /// across tray_manager builds (the native message is a button-up notification
 /// in the current plug-in). The controller accepts either left-click callback
@@ -54,6 +68,8 @@ class DesktopTrayController with TrayListener, WindowListener {
   String? _lastDesktopTitle;
   bool _macosDockBadgeCleared = false;
   Future<DaemonCommandResult>? _stopDaemonFuture;
+  Future<void>? _disposeFuture;
+  Future<void>? _quitFuture;
   Timer? _windowsLeftClickDedupeTimer;
   var _windowsLeftClickHandled = false;
 
@@ -63,30 +79,44 @@ class DesktopTrayController with TrayListener, WindowListener {
   }
 
   Future<void> initialize() async {
+    _trace('initialize.enter initialized=$_initialized supported=$isSupported');
     if (_initialized || !isSupported) return;
     _initialized = true;
     trayManager.addListener(this);
     windowManager.addListener(this);
     settingsStore.addListener(_scheduleMenuUpdate);
     statusStore.addListener(_scheduleMenuUpdate);
+    _trace('initialize.listeners-added');
 
     try {
+      _trace('window.setPreventClose.begin');
       await DesktopWindowOperations.run(
         () => windowManager.setPreventClose(true),
       );
+      _trace('window.setPreventClose.end');
       if (!_initialized) return;
       if (Platform.isMacOS || Platform.isLinux) {
+        _trace('tray.setTitle.begin');
         await trayManager.setTitle(trayMenuBarTitleForTesting());
+        _trace('tray.setTitle.end');
       }
+      _trace('tray.updateIcon.begin');
       await _updateTrayIcon(force: true);
+      _trace('tray.updateIcon.end');
+      _trace('tray.queueMenu.begin');
       await _queueMenuUpdate();
+      _trace('tray.queueMenu.end');
     } catch (error) {
+      _trace('initialize.error ${error.runtimeType}: $error');
       debugPrint('Failed to initialize P2WLAN tray: $error');
     }
   }
 
-  Future<void> dispose() async {
-    if (!_initialized) return;
+  Future<void> dispose() {
+    final existing = _disposeFuture;
+    if (existing != null) return existing;
+    if (!_initialized) return Future<void>.value();
+
     _initialized = false;
     _windowsLeftClickDedupeTimer?.cancel();
     _windowsLeftClickDedupeTimer = null;
@@ -97,12 +127,19 @@ class DesktopTrayController with TrayListener, WindowListener {
     windowManager.removeListener(this);
     trayManager.removeListener(this);
     final pendingUpdate = _menuUpdateInFlight;
-    if (pendingUpdate != null) {
-      await pendingUpdate;
-    }
+    final future = _finishDispose(pendingUpdate);
+    _disposeFuture = future;
+    return future;
+  }
+
+  Future<void> _finishDispose(Future<void>? pendingUpdate) async {
+    if (pendingUpdate != null) await pendingUpdate;
+    _trace('tray.destroy.begin');
     try {
       await trayManager.destroy();
+      _trace('tray.destroy.end');
     } catch (_) {
+      _trace('tray.destroy.error');
       // Best effort cleanup on app shutdown.
     }
   }
@@ -221,9 +258,12 @@ class DesktopTrayController with TrayListener, WindowListener {
     try {
       while (_initialized && _menuUpdateRequested) {
         _menuUpdateRequested = false;
+        _trace('tray.updateMenu.begin');
         try {
           await _updateMenu();
+          _trace('tray.updateMenu.end');
         } catch (error) {
+          _trace('tray.updateMenu.error ${error.runtimeType}: $error');
           debugPrint('Failed to update P2WLAN tray: $error');
         }
       }
@@ -241,15 +281,21 @@ class DesktopTrayController with TrayListener, WindowListener {
     final taskbarTitle = desktopVisibleTitleForTesting();
 
     await _updateTrayIcon();
+    _trace('tray.setToolTip.begin');
     await trayManager.setToolTip(
       Platform.isMacOS ? p2wlanAppName : '$taskbarTitle - $statusLabel',
     );
+    _trace('tray.setToolTip.end');
     if (Platform.isMacOS || Platform.isLinux) {
+      _trace('tray.setTitle.begin');
       await trayManager.setTitle(trayMenuBarTitleForTesting());
+      _trace('tray.setTitle.end');
     }
     await _updateDesktopWindowIndicators(taskbarTitle);
 
+    _trace('tray.setContextMenu.begin');
     await trayManager.setContextMenu(buildMenuForTesting());
+    _trace('tray.setContextMenu.end');
   }
 
   Future<void> _updateDesktopWindowIndicators(String title) async {
@@ -285,13 +331,16 @@ class DesktopTrayController with TrayListener, WindowListener {
     final asset = trayIconAssetForTesting();
     if (!force && _lastTrayIconAsset == asset) return;
     try {
+      _trace('tray.setIcon.begin asset=$asset');
       await trayManager.setIcon(
         asset,
         isTemplate: trayIconUsesTemplateForTesting(),
         iconSize: Platform.isMacOS ? _macosTrayIconSize : 18,
       );
       _lastTrayIconAsset = asset;
+      _trace('tray.setIcon.end');
     } catch (error) {
+      _trace('tray.setIcon.error ${error.runtimeType}: $error');
       debugPrint('Failed to update P2WLAN tray icon $asset: $error');
     }
   }
@@ -562,6 +611,12 @@ class DesktopTrayController with TrayListener, WindowListener {
     return _stopDaemonForQuit();
   }
 
+  /// Exercise the packaged tray quit path from the Windows release harness.
+  /// The harness starts the app without a virtual adapter; `_quitApp` must
+  /// still tear down the tray/window and exit without trying to force-kill a
+  /// nonexistent daemon.
+  Future<void> quitForLifecycleTest() => _quitApp();
+
   Future<void> _copyPeerIp(String virtualIp) async {
     final value = virtualIp.trim();
     if (value.isEmpty) return;
@@ -580,34 +635,57 @@ class DesktopTrayController with TrayListener, WindowListener {
     }
   }
 
-  Future<void> _quitApp() async {
+  Future<void> _quitApp() {
+    final existing = _quitFuture;
+    if (existing != null) return existing;
+
+    final future = _performQuit();
+    _quitFuture = future;
+    future.then<void>(
+      (_) {
+        if (!_quitting && identical(_quitFuture, future)) {
+          _quitFuture = null;
+        }
+      },
+      onError: (Object _, StackTrace _) {
+        if (identical(_quitFuture, future)) _quitFuture = null;
+      },
+    );
+    return future;
+  }
+
+  Future<void> _performQuit() async {
     if (_quitting) return;
     _quitting = true;
-    final stopResult = await _stopDaemonForQuit();
-    if (!stopResult.ok) {
+    try {
+      final stopResult = await _stopDaemonForQuit();
+      if (!stopResult.ok) {
+        _quitting = false;
+        await _showWindow();
+        await _updateMenu();
+        return;
+      }
+      await _destroyTrayWindowAndExit();
+    } catch (_) {
       _quitting = false;
-      await _showWindow();
-      await _updateMenu();
-      return;
+      rethrow;
     }
-    await _destroyTrayWindowAndExit();
   }
 
   Future<void> _destroyTrayWindowAndExit() async {
-    try {
-      await trayManager.destroy();
-    } catch (_) {
-      // Ignore best effort tray teardown.
-    }
-    try {
-      await DesktopWindowOperations.run(() async {
-        await windowManager.setPreventClose(false);
-        await windowManager.destroy();
-      });
-    } finally {
-      Timer(const Duration(milliseconds: 400), () => exit(0));
-    }
+    // This also makes any Widget.dispose during engine shutdown return the
+    // same Future. The tray plugin must receive exactly one destroy call per
+    // controller lifetime.
+    await dispose();
+    _trace('window.close.begin');
+    await DesktopWindowOperations.run(() async {
+      await windowManager.setPreventClose(false);
+      await windowManager.close();
+    });
+    _trace('window.close.end');
   }
+
+  void _trace(String event) => writeDesktopTrayLifecycleTrace(event);
 
   Directory _defaultLogDir() {
     if (Platform.isMacOS) {

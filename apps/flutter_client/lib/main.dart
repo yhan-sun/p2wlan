@@ -4,22 +4,31 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'app/desktop_tray_controller.dart';
 import 'app/desktop_window_operations.dart';
 import 'app/p2wlan_app.dart';
 
 Future<void> main() async {
+  writeDesktopTrayLifecycleTrace('main.ensureInitialized.begin');
   WidgetsFlutterBinding.ensureInitialized();
+  writeDesktopTrayLifecycleTrace('main.ensureInitialized.end');
   final enableFlutterTray = _enableFlutterTray;
   if (_supportsDesktopHost) {
+    writeDesktopTrayLifecycleTrace('window.ensureInitialized.begin');
     await windowManager.ensureInitialized();
+    writeDesktopTrayLifecycleTrace('window.ensureInitialized.end');
+    writeDesktopTrayLifecycleTrace('window.configure.begin');
     await _configureDesktopWindowChrome();
+    writeDesktopTrayLifecycleTrace('window.configure.end');
   }
+  writeDesktopTrayLifecycleTrace('runApp.begin');
   runApp(
     P2WlanApp(
       enableDesktopTray: enableFlutterTray,
       enableDesktopTaskbarStatus: _supportsDesktopHost && !enableFlutterTray,
     ),
   );
+  writeDesktopTrayLifecycleTrace('runApp.end');
 }
 
 Future<void> _configureDesktopWindowChrome() async {

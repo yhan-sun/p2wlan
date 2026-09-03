@@ -1,0 +1,1091 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$DaemonPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$CliPath,
+
+    [Parameter(Mandatory = $true)]
+    [string]$EvidencePath,
+
+    [string]$FlutterReleasePath,
+    [string]$FlutterEvidencePath,
+    [string]$HandlerMappingPath,
+    [int]$ProductionCycles = 50,
+    [int]$TrayCycles = 20,
+    [switch]$AttemptRealWintun
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$runRoot = Join-Path ([System.IO.Path]::GetTempPath()) "p2wlan-windows-lifecycle-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+$records = [System.Collections.Generic.List[object]]::new()
+$capabilities = [System.Collections.Generic.List[object]]::new()
+$serviceRecords = [System.Collections.Generic.List[object]]::new()
+$components = [System.Collections.Generic.List[object]]::new()
+$handlerMapping = $null
+$previousDisableTun = $env:P2WLAN_DISABLE_TUN
+$previousStateDir = $env:P2WLAN_STATE_DIR
+$expectedSourceHeadSha = [string]$env:P2WLAN_EXACT_HEAD
+$expectedWorkflowSha = [string]$env:P2WLAN_WORKFLOW_SHA
+if ($expectedSourceHeadSha -notmatch '^[0-9a-fA-F]{40}$') {
+    throw 'P2WLAN_EXACT_HEAD must be a 40-character git SHA'
+}
+if ($expectedWorkflowSha -notmatch '^[0-9a-fA-F]{40}$') {
+    throw 'P2WLAN_WORKFLOW_SHA must be a 40-character git SHA'
+}
+$traceRoot = if ($env:P2WLAN_TRAY_TRACE_DIR) { $env:P2WLAN_TRAY_TRACE_DIR } else { Join-Path $runRoot 'flutter-tray-traces' }
+New-Item -ItemType Directory -Path $traceRoot -Force | Out-Null
+
+function Add-Capability {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet('verified', 'deferred', 'failed')][string]$Status,
+        [Parameter(Mandatory = $false)][string]$Detail = ''
+    )
+    foreach ($existing in @($capabilities | Where-Object { $_.name -eq $Name })) {
+        [void]$capabilities.Remove($existing)
+    }
+    $capabilities.Add([ordered]@{
+            name = $Name
+            status = $Status
+            detail = $Detail
+        })
+}
+
+function Add-Component {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet('verified', 'deferred', 'failed')][string]$Status,
+        [Parameter(Mandatory = $false)][string]$Detail = ''
+    )
+    foreach ($existing in @($components | Where-Object { $_.name -eq $Name })) {
+        [void]$components.Remove($existing)
+    }
+    $components.Add([ordered]@{
+            name = $Name
+            schema_version = 2
+            repository = 'yhan-sun/p2wlan'
+            source_head_sha = $expectedSourceHeadSha
+            workflow_sha = $expectedWorkflowSha
+            runner_os = 'windows-latest'
+            status = $Status
+            detail = $Detail
+        })
+}
+
+function Get-DaemonProcesses {
+    @(Get-CimInstance Win32_Process -Filter "Name = 'p2wlan-daemon.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -notmatch '(?i)(^|\s)--build-info(\s|$)' })
+}
+
+function Get-ProcessIdList {
+    @(Get-DaemonProcesses | ForEach-Object { [int]$_.ProcessId })
+}
+
+function Get-DescendantProcessIds {
+    param([Parameter(Mandatory = $true)][int]$RootPid)
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $children = [System.Collections.Generic.List[int]]::new()
+    $frontier = [System.Collections.Generic.Queue[int]]::new()
+    $frontier.Enqueue($RootPid)
+    while ($frontier.Count -gt 0) {
+        $parent = $frontier.Dequeue()
+        foreach ($process in $all | Where-Object { [int]$_.ParentProcessId -eq $parent }) {
+            $child = [int]$process.ProcessId
+            if (-not $children.Contains($child)) {
+                $children.Add($child)
+                $frontier.Enqueue($child)
+            }
+        }
+    }
+    @($children)
+}
+
+function Get-WintunSnapshot {
+    @(
+        Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '(?i)p2wlan|wintun' -or
+                $_.InterfaceDescription -match '(?i)p2wlan|wintun'
+            } |
+            ForEach-Object { "$($_.Name)|$($_.InterfaceDescription)|$($_.Status)" } |
+            Sort-Object
+    )
+}
+
+function Test-TargetWintunPresent {
+    param([string[]]$Snapshot)
+    @($Snapshot | Where-Object { $_ -match '(?i)(^|\|)p2wlan-lifecycle(?:\||$)' }).Count -gt 0
+}
+
+function Wait-TargetWintunReleased {
+    param([int]$TimeoutSeconds = 10)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (-not (Test-TargetWintunPresent -Snapshot (Get-WintunSnapshot))) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $false
+}
+
+function Get-FreeLoopbackPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        [int]$listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function Test-LoopbackPortReleased {
+    param([Parameter(Mandatory = $true)][int]$Port)
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    try {
+        $listener.Start()
+        $true
+    } catch {
+        $false
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function Wait-DaemonReady {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][string]$AuthPath,
+        [int]$TimeoutSeconds = 20
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $health = Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/health" -TimeoutSec 2
+            if ($health.StatusCode -ge 200 -and $health.StatusCode -lt 300 -and (Test-Path -LiteralPath $AuthPath)) {
+                $token = (Get-Content -LiteralPath $AuthPath -Raw).Trim()
+                if ($token) {
+                    return $token
+                }
+            }
+        } catch {
+            # The daemon can be between instance-lock, diagnostics bind, and
+            # auth-file publication. Keep polling inside the bounded budget.
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "daemon diagnostics did not become ready at $BaseUrl"
+}
+
+function Wait-ProcessExited {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [int]$TimeoutSeconds = 20
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $Process.Refresh()
+            if ($Process.HasExited) {
+                $exitCode = $null
+                try { $exitCode = [int]$Process.ExitCode } catch {}
+                if ($null -eq $exitCode -and ('P2WlanLifecycleNative' -as [type])) {
+                    $nativeExitCode = 0
+                    if ([P2WlanLifecycleNative]::TryGetExitCode($Process.Id, [ref]$nativeExitCode)) {
+                        $exitCode = $nativeExitCode
+                    }
+                }
+                return [pscustomobject]@{ exited = $true; exit_code = $exitCode }
+            }
+        } catch {
+            $exitCode = $null
+            if ('P2WlanLifecycleNative' -as [type]) {
+                $nativeExitCode = 0
+                if ([P2WlanLifecycleNative]::TryGetExitCode($Process.Id, [ref]$nativeExitCode)) {
+                    $exitCode = $nativeExitCode
+                }
+            }
+            return [pscustomobject]@{ exited = $true; exit_code = $exitCode }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    [pscustomobject]@{ exited = $false; exit_code = $null }
+}
+
+function Wait-ObservedChildProcessesGone {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][int[]]$ProcessIds,
+        [int]$TimeoutSeconds = 10
+    )
+    if ($ProcessIds.Count -eq 0) { return $true }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $alive = @($ProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($alive.Count -eq 0) { return $true }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $false
+}
+
+function Start-ProductionDaemon {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$DiagnosticsBind
+    )
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $DaemonPath
+    $startInfo.WorkingDirectory = Split-Path -Parent $DaemonPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @(
+            '--config', $ConfigPath,
+            '--control', 'http://127.0.0.1:1',
+            '--network', 'windows-lifecycle',
+            '--diagnostics-bind', $DiagnosticsBind,
+            '--log-file', $LogPath,
+            '--manual',
+            '--interface', 'p2wlan-lifecycle',
+            '--address', '10.20.0.1',
+            '--udp-bind', '127.0.0.1:0',
+            '--stun', 'none',
+            '--socket-pool', 'off'
+        )) {
+        $null = $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "failed to start $DaemonPath"
+    }
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
+    $process
+}
+
+function Stop-DiagnosticsDaemon {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][string]$Token
+    )
+    $response = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$BaseUrl/shutdown" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 5
+    if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+        throw "diagnostics shutdown returned HTTP $($response.StatusCode)"
+    }
+}
+
+function Stop-CliDaemon {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$StateDirectory
+    )
+    $env:P2WLAN_STATE_DIR = $StateDirectory
+    $output = @(& $CliPath --config $ConfigPath down 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "p2wlan CLI stop exited with ${exitCode}: $($output -join '')"
+    }
+}
+
+function Add-ConsoleCtrlHelper {
+    if ('P2WlanLifecycleNative' -as [type]) { return }
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class P2WlanLifecycleNative {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct STARTUPINFO { public uint cb; public string lpReserved; public string lpDesktop; public string lpTitle; public uint dwX; public uint dwY; public uint dwXSize; public uint dwYSize; public uint dwXCountChars; public uint dwYCountChars; public uint dwFillAttribute; public uint dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
+  [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; }
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+  [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate bool HandlerRoutine(uint ctrlType);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleCtrlHandler(HandlerRoutine handlerRoutine, bool add);
+  private static readonly HandlerRoutine ignoreCtrlC = IgnoreCtrlC;
+  private static bool IgnoreCtrlC(uint ctrlType) { return ctrlType == 0; }
+  public static void IgnoreCtrlCInCurrentProcess() {
+    if (!SetConsoleCtrlHandler(ignoreCtrlC, true)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  }
+  public static bool TryGetExitCode(int processId, out int exitCode) {
+    exitCode = 0;
+    const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000;
+    var process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)processId);
+    if (process == IntPtr.Zero) return false;
+    try {
+      uint raw;
+      if (!GetExitCodeProcess(process, out raw)) return false;
+      exitCode = unchecked((int)raw);
+      return true;
+    } finally { CloseHandle(process); }
+  }
+  public static int StartInNewConsole(string fileName, string arguments, string cwd) {
+    var si = new STARTUPINFO(); si.cb = (uint)Marshal.SizeOf(si); si.dwFlags = 0x00000001; si.wShowWindow = 0;
+    PROCESS_INFORMATION pi;
+    // Give the daemon a console of its own. CTRL_C_EVENT is broadcast to
+    // every process attached to a console, so the injector must attach to
+    // this isolated console instead of the PowerShell job console.
+    const uint CREATE_NEW_CONSOLE = 0x00000010;
+    const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+    if (!CreateProcess(fileName, "\"" + fileName + "\" " + arguments, IntPtr.Zero, IntPtr.Zero, false, CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP, IntPtr.Zero, cwd, ref si, out pi)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return (int)pi.dwProcessId;
+  }
+}
+'@
+    [P2WlanLifecycleNative]::IgnoreCtrlCInCurrentProcess()
+}
+
+function Send-ConsoleCtrlC {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    $injectorPath = Join-Path $runRoot 'send-ctrl-c.ps1'
+    if (-not (Test-Path -LiteralPath $injectorPath)) {
+        @'
+param([Parameter(Mandatory = $true)][int]$ProcessId)
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class P2WlanCtrlCInjector {
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GenerateConsoleCtrlEvent(uint type, uint group);
+  public static void Send(int processId) {
+    FreeConsole();
+    if (!AttachConsole((uint)processId)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    if (!GenerateConsoleCtrlEvent(0, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  }
+}
+"@
+[P2WlanCtrlCInjector]::Send($ProcessId)
+'@ | Set-Content -LiteralPath $injectorPath -Encoding utf8
+    }
+    $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $pwshPath
+    $startInfo.WorkingDirectory = Split-Path -Parent $injectorPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $injectorPath,
+            '-ProcessId',
+            $ProcessId.ToString()
+        )) {
+        $null = $startInfo.ArgumentList.Add($argument)
+    }
+    $injector = [System.Diagnostics.Process]::new()
+    $injector.StartInfo = $startInfo
+    if (-not $injector.Start()) { throw 'failed to start Ctrl+C injector' }
+    $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 5
+    if (-not $result.exited) {
+        try { Stop-Process -Id $injector.Id -Force -ErrorAction SilentlyContinue } catch {}
+        throw 'Ctrl+C injector did not exit within the bounded budget'
+    }
+    # The injector is attached to the daemon console and may itself receive
+    # the broadcast CTRL_C_EVENT. Its exit code is therefore not meaningful;
+    # the daemon's graceful exit is the authoritative assertion.
+}
+
+function Invoke-ProductionCycle {
+    param(
+        [Parameter(Mandatory = $true)][int]$Cycle,
+        [Parameter(Mandatory = $true)][ValidateSet('diagnostics', 'cli', 'ctrl_c')][string]$Entrypoint,
+        [Parameter(Mandatory = $true)][bool]$RealWintun
+    )
+    $cycleRoot = Join-Path $runRoot "cycle-$Cycle"
+    New-Item -ItemType Directory -Path $cycleRoot -Force | Out-Null
+    $configPath = Join-Path $cycleRoot 'config.json'
+    $logPath = Join-Path $cycleRoot 'daemon.log'
+    $port = Get-FreeLoopbackPort
+    $baseUrl = "http://127.0.0.1:$port"
+    $authPath = Join-Path $cycleRoot 'p2wlan-daemon.diag-auth'
+    $beforeWintun = Get-WintunSnapshot
+    $beforePids = Get-ProcessIdList
+    $process = $null
+    $ctrlCProcessId = $null
+    $startSucceeded = $false
+    $stopRequested = $false
+    $forcedTermination = $false
+    $processExited = $false
+    $exitCode = $null
+    $childrenGone = $false
+    $portReleased = $false
+    $authRemoved = $false
+    $wintunStale = $false
+    $wintunObserved = $false
+    $daemonProcessesClean = $false
+    $childPids = @()
+    $detail = ''
+
+    try {
+        if ($RealWintun -and (Test-TargetWintunPresent -Snapshot $beforeWintun)) {
+            throw 'p2wlan-lifecycle Wintun adapter was already present before the cycle'
+        }
+        if ($RealWintun) {
+            Remove-Item Env:P2WLAN_DISABLE_TUN -ErrorAction SilentlyContinue
+        } else {
+            $env:P2WLAN_DISABLE_TUN = '1'
+        }
+        if ($Entrypoint -eq 'ctrl_c') {
+            Add-ConsoleCtrlHelper
+            $arguments = "--config `"$configPath`" --control http://127.0.0.1:1 --network windows-lifecycle --diagnostics-bind 127.0.0.1:$port --log-file `"$logPath`" --manual --interface p2wlan-lifecycle --address 10.20.0.1 --udp-bind 127.0.0.1:0 --stun none --socket-pool off"
+            $ctrlCProcessId = [P2WlanLifecycleNative]::StartInNewConsole($DaemonPath, $arguments, (Split-Path -Parent $DaemonPath))
+            $process = Get-Process -Id $ctrlCProcessId -ErrorAction Stop
+        } else {
+            $process = Start-ProductionDaemon -ConfigPath $configPath -LogPath $logPath -DiagnosticsBind "127.0.0.1:$port"
+        }
+        $token = Wait-DaemonReady -BaseUrl $baseUrl -AuthPath $authPath
+        $startSucceeded = $true
+        $wintunDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while ($RealWintun -and [DateTime]::UtcNow -lt $wintunDeadline) {
+            $duringWintun = Get-WintunSnapshot
+            if (Test-TargetWintunPresent -Snapshot $duringWintun) {
+                $wintunObserved = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if ($RealWintun -and -not $wintunObserved) {
+            throw 'daemon became ready without an observable p2wlan-lifecycle Wintun adapter'
+        }
+        $childPids = Get-DescendantProcessIds -RootPid $process.Id
+        switch ($Entrypoint) {
+            'diagnostics' { Stop-DiagnosticsDaemon -BaseUrl $baseUrl -Token $token }
+            'cli' { Stop-CliDaemon -ConfigPath $configPath -StateDirectory $cycleRoot }
+            'ctrl_c' { Send-ConsoleCtrlC -ProcessId $process.Id }
+        }
+        $stopRequested = $true
+        if ($Entrypoint -eq 'ctrl_c') {
+            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 5
+        } else {
+            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 20
+        }
+        $processExited = $result.exited
+        $exitCode = $result.exit_code
+        if (-not $processExited) {
+            throw "daemon did not exit after $Entrypoint"
+        }
+        if ($exitCode -ne 0) {
+            throw "daemon exited with code $exitCode after $Entrypoint"
+        }
+        $childrenAfterExit = @(Get-DescendantProcessIds -RootPid $process.Id)
+        $observedChildPids = @($childPids) + @($childrenAfterExit)
+        $observedChildPids = @($observedChildPids | Sort-Object -Unique)
+        $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds $observedChildPids
+        $portReleased = Test-LoopbackPortReleased -Port $port
+        $authRemoved = -not (Test-Path -LiteralPath $authPath)
+        $afterWintun = Get-WintunSnapshot
+        $wintunStale = if ($RealWintun) { -not (Wait-TargetWintunReleased) } else { Test-TargetWintunPresent -Snapshot $afterWintun }
+        $daemonProcessesClean = @(
+            Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
+        ).Count -eq 0
+        if (-not $childrenGone) { throw "child process remained after daemon exit" }
+        if (-not $portReleased) { throw "diagnostics port $port was not released" }
+        if (-not $authRemoved) { throw "diagnostics auth file remained" }
+        if (-not $daemonProcessesClean) { throw "a new p2wlan-daemon process remained after daemon exit" }
+        if ($RealWintun -and $wintunStale) { throw "p2wlan-lifecycle Wintun adapter remained after daemon exit" }
+    } catch {
+        $detail = $_.Exception.Message
+        $running = $false
+        try { $running = $process -and -not $process.HasExited } catch { $running = $false }
+        if ($running) {
+            # Emergency cleanup is deliberately recorded as forceful failure;
+            # it can never make this cycle a graceful pass.
+            try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $forcedTermination = $true
+        }
+        if ($process) {
+            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 5
+            $processExited = $result.exited
+            $exitCode = $result.exit_code
+        }
+        $portReleased = Test-LoopbackPortReleased -Port $port
+        $authRemoved = -not (Test-Path -LiteralPath $authPath)
+        $afterWintun = Get-WintunSnapshot
+        $wintunStale = if ($RealWintun) { -not (Wait-TargetWintunReleased) } else { Test-TargetWintunPresent -Snapshot $afterWintun }
+        $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds @($childPids)
+        $daemonProcessesClean = @(
+            Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
+        ).Count -eq 0
+    }
+    [pscustomobject]@{
+        cycle = $Cycle
+        entrypoint = $Entrypoint
+        mode = 'production'
+        real_wintun = $RealWintun
+        start_succeeded = $startSucceeded
+        graceful_stop = $stopRequested -and $processExited -and $exitCode -eq 0 -and -not $forcedTermination
+        forced_termination = $forcedTermination
+        process_exited = $processExited
+        process_exit_code = $exitCode
+        children_gone = $childrenGone
+        diagnostics_port_released = $portReleased
+        auth_token_removed = $authRemoved
+        wintun_stale = $wintunStale
+        wintun_observed = $wintunObserved
+        daemon_processes_clean = $daemonProcessesClean
+        pid = if ($process) { $process.Id } else { $null }
+        diagnostics_port = $port
+        detail = $detail
+        baseline_daemon_pids = @($beforePids)
+        baseline_wintun = @($beforeWintun)
+    }
+}
+
+function Wait-TrayDumps {
+    param(
+        [Parameter(Mandatory = $true)][string]$DumpDirectory,
+        [Parameter(Mandatory = $true)][DateTime]$SinceUtc,
+        [int]$TimeoutSeconds = 10
+    )
+    if ([string]::IsNullOrWhiteSpace($DumpDirectory) -or
+        -not (Test-Path -LiteralPath $DumpDirectory)) {
+        return @()
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $dumps = @(
+            Get-ChildItem -LiteralPath $DumpDirectory -Filter '*.dmp' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTimeUtc -ge $SinceUtc } |
+                Sort-Object LastWriteTimeUtc |
+                ForEach-Object { $_.FullName }
+        )
+        if ($dumps.Count -gt 0) { return $dumps }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    @()
+}
+
+function Invoke-FlutterTrayNoAdapterCycle {
+    param([Parameter(Mandatory = $true)][int]$Cycle)
+    $trayRoot = Join-Path $runRoot 'flutter-tray-no-adapter'
+    $cycleRoot = Join-Path $trayRoot "cycle-$Cycle"
+    $traceCycleRoot = Join-Path $traceRoot "cycle-$Cycle"
+    New-Item -ItemType Directory -Path $cycleRoot, $traceCycleRoot -Force | Out-Null
+    $beforePids = Get-ProcessIdList
+    $process = $null
+    $forcedTermination = $false
+    $stdoutTask = $null
+    $stderrTask = $null
+    $stdout = ''
+    $stderr = ''
+    $processExited = $false
+    $exitCode = $null
+    $daemonProcessesClean = $false
+    $detail = ''
+    $startedAtUtc = [DateTime]::UtcNow
+    try {
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = [System.IO.Path]::GetFullPath($FlutterReleasePath)
+        $startInfo.WorkingDirectory = Split-Path -Parent $startInfo.FileName
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.Environment['P2WLAN_WINDOWS_TRAY_LIFECYCLE_TEST'] = 'no-adapter-exit'
+        $startInfo.Environment['P2WLAN_ENABLE_FLUTTER_TRAY'] = '1'
+        $startInfo.Environment['P2WLAN_TRAY_TRACE_FILE'] = Join-Path $traceCycleRoot 'dart-lifecycle.log'
+        # Keep this release run isolated from any persisted desktop settings;
+        # no daemon is intentionally started for the no-adapter regression.
+        $startInfo.Environment['APPDATA'] = $cycleRoot
+        $startInfo.Environment['LOCALAPPDATA'] = $cycleRoot
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw "failed to start Flutter release app" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $result = Wait-ProcessExited -Process $process -TimeoutSeconds 30
+        if (-not $result.exited) {
+            try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $forcedTermination = $true
+            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 5
+            throw 'Flutter release tray app did not exit within the bounded no-adapter budget'
+        }
+        $processExited = $result.exited
+        $exitCode = $result.exit_code
+        if ($stdoutTask -ne $null -and $stdoutTask.Wait(2000)) { $stdout = $stdoutTask.Result }
+        if ($stderrTask -ne $null -and $stderrTask.Wait(2000)) { $stderr = $stderrTask.Result }
+        $daemonProcessesClean = @(
+            Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
+        ).Count -eq 0
+        if (-not $daemonProcessesClean) {
+            throw 'Flutter release tray no-adapter test left a daemon process running'
+        }
+        if ($exitCode -ne 0) {
+            throw "Flutter release tray app exited with code $exitCode"
+        }
+        $detail = 'release Flutter tray initialized and exited cleanly without a virtual adapter'
+    } catch {
+        $detail = $_.Exception.Message
+        $running = $false
+        try { $running = $process -and -not $process.HasExited } catch { $running = $false }
+        if ($running) {
+            # Emergency cleanup is deliberately recorded as forceful failure;
+            # it can never make this cycle a graceful pass.
+            try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $forcedTermination = $true
+        }
+        if ($process) {
+            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 5
+            $processExited = $result.exited
+            $exitCode = $result.exit_code
+        }
+        if ($stdoutTask -ne $null -and $stdoutTask.Wait(2000)) { $stdout = $stdoutTask.Result }
+        if ($stderrTask -ne $null -and $stderrTask.Wait(2000)) { $stderr = $stderrTask.Result }
+        if ($stdout -or $stderr) {
+            $detail = "$detail; stdout=[$stdout]; stderr=[$stderr]"
+        }
+    }
+    $daemonProcessesClean = @(
+        Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
+    ).Count -eq 0
+    $stdoutPath = Join-Path $traceCycleRoot 'stdout.txt'
+    $stderrPath = Join-Path $traceCycleRoot 'stderr.txt'
+    Set-Content -LiteralPath $stdoutPath -Value $stdout -Encoding utf8
+    Set-Content -LiteralPath $stderrPath -Value $stderr -Encoding utf8
+    [ordered]@{
+        schema_version = 1
+        cycle = $Cycle
+        started_at_utc = $startedAtUtc.ToString('o')
+        finished_at_utc = [DateTime]::UtcNow.ToString('o')
+        pid = if ($process) { $process.Id } else { $null }
+        process_exited = $processExited
+        exit_code = $exitCode
+        forced_termination = $forcedTermination
+        daemon_processes_clean = $daemonProcessesClean
+        stdout_path = $stdoutPath
+        stderr_path = $stderrPath
+        detail = $detail
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $traceCycleRoot 'lifecycle.json') -Encoding utf8
+    [pscustomobject]@{
+        cycle = $Cycle
+        status = if ($processExited -and $exitCode -eq 0 -and -not $forcedTermination -and $daemonProcessesClean) { 'verified' } else { 'failed' }
+        started_at_utc = $startedAtUtc.ToString('o')
+        finished_at_utc = [DateTime]::UtcNow.ToString('o')
+        pid = if ($process) { $process.Id } else { $null }
+        process_exited = $processExited
+        exit_code = $exitCode
+        daemon_processes_clean = $daemonProcessesClean
+        forced_termination = $forcedTermination
+        dump_paths = @()
+        stdout_path = $stdoutPath
+        stderr_path = $stderrPath
+        detail = $detail
+    }
+}
+
+function Invoke-FlutterTrayNoAdapterExit {
+    if ([string]::IsNullOrWhiteSpace($FlutterReleasePath)) {
+        return [pscustomobject]@{
+            status = 'deferred'
+            detail = 'Flutter release executable was not supplied'
+            attempted_cycles = 0
+            successful_cycles = 0
+            first_failure_cycle = $null
+            process_exited = $false
+            exit_code = $null
+            daemon_processes_clean = $true
+            forced_termination = $false
+            dump_paths = @()
+            cycles = @()
+        }
+    }
+    if (-not (Test-Path -LiteralPath $FlutterReleasePath)) {
+        return [pscustomobject]@{
+            status = 'failed'
+            detail = "Flutter release executable not found: $FlutterReleasePath"
+            attempted_cycles = 0
+            successful_cycles = 0
+            first_failure_cycle = 1
+            process_exited = $false
+            exit_code = $null
+            daemon_processes_clean = $false
+            forced_termination = $false
+            dump_paths = @()
+            cycles = @()
+        }
+    }
+    if ($TrayCycles -ne 20) {
+        return [pscustomobject]@{
+            status = 'failed'
+            detail = "Flutter release tray acceptance requires exactly 20 cycles, got $TrayCycles"
+            attempted_cycles = 0
+            successful_cycles = 0
+            first_failure_cycle = 1
+            process_exited = $false
+            exit_code = $null
+            daemon_processes_clean = $false
+            forced_termination = $false
+            dump_paths = @()
+            cycles = @()
+        }
+    }
+
+    $cycleRecords = [System.Collections.Generic.List[object]]::new()
+    $dumpPaths = [System.Collections.Generic.List[string]]::new()
+    for ($cycle = 1; $cycle -le $TrayCycles; $cycle++) {
+        $record = Invoke-FlutterTrayNoAdapterCycle -Cycle $cycle
+        if ($record.status -ne 'verified') {
+            $sinceUtc = [DateTime]::Parse($record.started_at_utc).ToUniversalTime()
+            foreach ($dumpPath in @(Wait-TrayDumps -DumpDirectory $env:P2WLAN_TRAY_DUMP_DIR -SinceUtc $sinceUtc)) {
+                $record.dump_paths += $dumpPath
+                if (-not $dumpPaths.Contains($dumpPath)) { $dumpPaths.Add($dumpPath) }
+            }
+        }
+        $cycleRecords.Add($record)
+        if ($record.status -ne 'verified') {
+            break
+        }
+    }
+    $attempted = $cycleRecords.Count
+    $successful = @($cycleRecords | Where-Object status -eq 'verified').Count
+    $firstFailure = @($cycleRecords | Where-Object status -ne 'verified' | Select-Object -First 1)
+    $allExited = $attempted -eq $TrayCycles -and @($cycleRecords | Where-Object { -not $_.process_exited }).Count -eq 0
+    $allClean = $attempted -gt 0 -and @($cycleRecords | Where-Object { -not $_.daemon_processes_clean }).Count -eq 0
+    $forced = @($cycleRecords | Where-Object forced_termination).Count -gt 0
+    [pscustomobject]@{
+        status = if ($attempted -eq $TrayCycles -and $successful -eq $TrayCycles -and -not $forced) { 'verified' } else { 'failed' }
+        detail = if ($firstFailure.Count -gt 0) { [string]$firstFailure[0].detail } else { 'all release Flutter tray no-adapter cycles exited cleanly' }
+        attempted_cycles = $attempted
+        successful_cycles = $successful
+        first_failure_cycle = if ($firstFailure.Count -gt 0) { $firstFailure[0].cycle } else { $null }
+        process_exited = $allExited
+        exit_code = if ($firstFailure.Count -gt 0) { $firstFailure[0].exit_code } else { 0 }
+        daemon_processes_clean = $allClean
+        forced_termination = $forced
+        dump_paths = @($dumpPaths)
+        cycles = @($cycleRecords)
+    }
+}
+
+function Import-FlutterLifecycleEvidence {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedSourceHeadSha,
+        [Parameter(Mandatory = $true)][string]$ExpectedWorkflowSha
+    )
+    if ([string]::IsNullOrWhiteSpace($FlutterEvidencePath)) {
+        Add-Capability -Name 'ui_stop' -Status 'deferred' -Detail 'Flutter UI evidence path was not supplied'
+        Add-Component -Name 'flutter_ui' -Status 'deferred' -Detail 'Flutter UI evidence path was not supplied'
+        return
+    }
+    if (-not (Test-Path -LiteralPath $FlutterEvidencePath)) {
+        $detail = "Flutter UI evidence was not written: $FlutterEvidencePath"
+        Add-Capability -Name 'ui_stop' -Status 'failed' -Detail $detail
+        Add-Component -Name 'flutter_ui' -Status 'failed' -Detail $detail
+        return
+    }
+    try {
+        $flutter = Get-Content -LiteralPath $FlutterEvidencePath -Raw | ConvertFrom-Json
+        if ($flutter.schema_version -ne 2) { throw "Flutter UI evidence schema_version=$($flutter.schema_version) is not 2" }
+        if ($flutter.repository -ne 'yhan-sun/p2wlan') { throw "Flutter UI evidence repository=$($flutter.repository) is not yhan-sun/p2wlan" }
+        if ($flutter.runner_os -ne 'windows-latest') { throw "Flutter UI evidence runner_os=$($flutter.runner_os) is not windows-latest" }
+        if ($flutter.source_head_sha -ne $ExpectedSourceHeadSha) {
+            throw "Flutter UI evidence source_head_sha=$($flutter.source_head_sha) does not match $ExpectedSourceHeadSha"
+        }
+        if ($flutter.workflow_sha -ne $ExpectedWorkflowSha) {
+            throw "Flutter UI evidence workflow_sha=$($flutter.workflow_sha) does not match $ExpectedWorkflowSha"
+        }
+        foreach ($cycle in @($flutter.cycles)) { $records.Add($cycle) }
+        $uiCapability = @($flutter.capabilities | Where-Object { $_.name -eq 'ui_stop' } | Select-Object -First 1)
+        if ($uiCapability.Count -ne 1) {
+            throw 'Flutter UI evidence did not contain a ui_stop capability'
+        }
+        Add-Capability -Name 'ui_stop' -Status $uiCapability[0].status -Detail ([string]$uiCapability[0].detail)
+        Add-Component -Name 'flutter_ui' -Status $uiCapability[0].status -Detail ([string]$uiCapability[0].detail)
+    } catch {
+        $detail = "Flutter UI evidence could not be imported: $($_.Exception.Message)"
+        Add-Capability -Name 'ui_stop' -Status 'failed' -Detail $detail
+        Add-Component -Name 'flutter_ui' -Status 'failed' -Detail $detail
+    }
+}
+
+function Import-HandlerMappingEvidence {
+    if ([string]::IsNullOrWhiteSpace($HandlerMappingPath)) {
+        $detail = 'Windows lifecycle handler mapping probe path was not supplied'
+        $script:handlerMapping = [ordered]@{
+            status = 'failed'
+            live_system_delivery = 'deferred'
+            live_system_delivery_detail = $detail
+            console = @()
+            service = @()
+            idempotent_first_request_wins = $false
+            no_duplicate_frees = $false
+            coordinator_entered = $false
+            callback_non_blocking = $false
+            callback_elapsed_ms = $null
+            bounded_deadline = $false
+            shutdown_deadline_ms = $null
+            force_kill = $false
+            coordinator = ''
+        }
+        Add-Component -Name 'handler_mapping' -Status 'failed' -Detail $detail
+        return
+    }
+    if (-not (Test-Path -LiteralPath $HandlerMappingPath)) {
+        $detail = "Windows lifecycle handler mapping probe was not written: $HandlerMappingPath"
+        $script:handlerMapping = [ordered]@{
+            status = 'failed'
+            live_system_delivery = 'deferred'
+            live_system_delivery_detail = $detail
+            console = @()
+            service = @()
+            idempotent_first_request_wins = $false
+            no_duplicate_frees = $false
+            coordinator_entered = $false
+            callback_non_blocking = $false
+            callback_elapsed_ms = $null
+            bounded_deadline = $false
+            shutdown_deadline_ms = $null
+            force_kill = $false
+            coordinator = ''
+        }
+        Add-Component -Name 'handler_mapping' -Status 'failed' -Detail $detail
+        return
+    }
+    try {
+        $probe = Get-Content -LiteralPath $HandlerMappingPath -Raw | ConvertFrom-Json
+        if ($probe.schema_version -ne 2) { throw "handler mapping schema_version=$($probe.schema_version) is not 2" }
+        if ($probe.component -ne 'handler_mapping') { throw "handler mapping component=$($probe.component) is not handler_mapping" }
+        if ($probe.repository -ne 'yhan-sun/p2wlan') { throw "handler mapping repository=$($probe.repository) is not yhan-sun/p2wlan" }
+        if ($probe.runner_os -ne 'windows-latest') { throw "handler mapping runner_os=$($probe.runner_os) is not windows-latest" }
+        if ($probe.source_head_sha -ne $expectedSourceHeadSha) { throw "handler mapping source_head_sha=$($probe.source_head_sha) does not match $expectedSourceHeadSha" }
+        if ($probe.workflow_sha -ne $expectedWorkflowSha) { throw "handler mapping workflow_sha=$($probe.workflow_sha) does not match $expectedWorkflowSha" }
+        if ($null -eq $probe.handler_mapping) { throw 'handler mapping payload was missing' }
+        $mappingStatus = [string]$probe.handler_mapping.status
+        if ($mappingStatus -notin @('verified', 'deferred', 'failed')) { throw "handler mapping status=$mappingStatus is invalid" }
+        $script:handlerMapping = $probe.handler_mapping
+        Add-Component -Name 'handler_mapping' -Status $mappingStatus -Detail 'production console/HandlerEx mapping probe'
+    } catch {
+        $detail = "Windows lifecycle handler mapping could not be imported: $($_.Exception.Message)"
+        $script:handlerMapping = [ordered]@{
+            status = 'failed'
+            live_system_delivery = 'deferred'
+            live_system_delivery_detail = $detail
+        }
+        Add-Component -Name 'handler_mapping' -Status 'failed' -Detail $detail
+    }
+}
+
+function Invoke-ServiceCycle {
+    param([ValidateSet('stop', 'preshutdown')][string]$Control)
+    $serviceName = "p2wlan-lifecycle-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $serviceRoot = Join-Path $runRoot $serviceName
+    New-Item -ItemType Directory -Path $serviceRoot -Force | Out-Null
+    $configPath = Join-Path $serviceRoot 'config.json'
+    $logPath = Join-Path $serviceRoot 'service.log'
+    $binPath = '"{0}" --windows-service --windows-service-name {1} --config "{2}" --control http://127.0.0.1:1 --network windows-lifecycle --manual --diagnostics-disable --log-file "{3}" --interface p2wlan-lifecycle --address 10.20.0.1 --udp-bind 127.0.0.1:0 --stun none --socket-pool off' -f $DaemonPath, $serviceName, $configPath, $logPath
+    $beforeWintun = Get-WintunSnapshot
+    $status = 'failed'
+    $detail = ''
+    $processId = $null
+    $processGone = $false
+    $wintunStale = $false
+    $wintunObserved = $false
+    $previousServiceDisableTun = $env:P2WLAN_DISABLE_TUN
+    try {
+        # Service control must exercise the real Wintun path even if a manual
+        # invocation of this script was configured for no-TUN production
+        # cycles. The workflow always requests real Wintun explicitly.
+        Remove-Item Env:P2WLAN_DISABLE_TUN -ErrorAction SilentlyContinue
+        if (Test-TargetWintunPresent -Snapshot $beforeWintun) {
+            throw 'p2wlan-lifecycle Wintun adapter was already present before the service cycle'
+        }
+        & sc.exe create $serviceName binPath= $binPath start= demand DisplayName= 'P2WLAN lifecycle acceptance' | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "sc.exe create returned $LASTEXITCODE" }
+        & sc.exe start $serviceName | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "sc.exe start returned $LASTEXITCODE" }
+        $deadline = [DateTime]::UtcNow.AddSeconds(25)
+        do {
+            Start-Sleep -Milliseconds 250
+            $query = (& sc.exe query $serviceName | Out-String)
+            if ($query -match 'STATE\s+:\s+4\s+RUNNING') { break }
+            if ($query -match 'STATE\s+:\s+1\s+STOPPED') { throw "service stopped before reaching RUNNING" }
+        } while ([DateTime]::UtcNow -lt $deadline)
+        $queryEx = (& sc.exe queryex $serviceName | Out-String)
+        $pidMatch = [regex]::Match($queryEx, 'PID\s+\:\s+(\d+)')
+        if ($pidMatch.Success) { $processId = [int]$pidMatch.Groups[1].Value }
+        if (-not $processId) { throw 'SCM did not expose a service process id' }
+        $wintunDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ([DateTime]::UtcNow -lt $wintunDeadline) {
+            $duringWintun = Get-WintunSnapshot
+            if (Test-TargetWintunPresent -Snapshot $duringWintun) {
+                $wintunObserved = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $wintunObserved) { throw 'SCM reported RUNNING without an observable p2wlan-lifecycle Wintun adapter' }
+        if ($Control -eq 'stop') {
+            & sc.exe stop $serviceName | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "sc.exe stop returned $LASTEXITCODE" }
+        } else {
+            # Microsoft documents that ControlService/sc.exe cannot send
+            # SERVICE_CONTROL_PRESHUTDOWN; only the operating system can
+            # deliver it during host shutdown. The production HandlerEx
+            # mapping is covered by the injected probe, while live delivery
+            # remains explicit deferred evidence on a hosted runner.
+            $status = 'deferred'
+            $detail = 'live SERVICE_CONTROL_PRESHUTDOWN delivery deferred: only the system can send this notification; sc.exe/ControlService is unsupported'
+        }
+        if ($Control -eq 'stop') {
+            $deadline = [DateTime]::UtcNow.AddSeconds(25)
+            do {
+                Start-Sleep -Milliseconds 250
+                $query = (& sc.exe query $serviceName | Out-String)
+                if ($query -match 'STATE\s+:\s+1\s+STOPPED') { $status = 'verified'; break }
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if ($status -ne 'verified') { throw "service did not reach STOPPED within the bounded budget" }
+            $processDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ((Get-Process -Id $processId -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $processDeadline) {
+                Start-Sleep -Milliseconds 250
+            }
+            $processGone = $null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)
+            if (-not $processGone) { throw "service process $processId remained after SCM $Control" }
+            $serviceLog = if (Test-Path -LiteralPath $logPath) { Get-Content -LiteralPath $logPath -Raw } else { '' }
+            if ($serviceLog -notmatch [regex]::Escape('event SERVICE_STOP')) {
+                throw 'service log did not prove delivery of SERVICE_STOP'
+            }
+            $status = 'verified'
+        }
+    } catch {
+        $detail = $_.Exception.Message
+        $status = 'failed'
+        if ($Control -eq 'preshutdown' -and ($detail -match 'PRESHUTDOWN|control 15|not deliver')) {
+            $status = 'deferred'
+        }
+    } finally {
+        & sc.exe stop $serviceName | Out-Null
+        $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while ($processId -and (Get-Process -Id $processId -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $cleanupDeadline) {
+            Start-Sleep -Milliseconds 250
+        }
+        $processGone = $processId -and $null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)
+        & sc.exe delete $serviceName | Out-Null
+        if ($previousServiceDisableTun) { $env:P2WLAN_DISABLE_TUN = $previousServiceDisableTun } else { Remove-Item Env:P2WLAN_DISABLE_TUN -ErrorAction SilentlyContinue }
+    }
+    $wintunStale = -not (Wait-TargetWintunReleased)
+    $serviceRecords.Add([pscustomobject]@{
+            name = $serviceName
+            control = $Control
+            status = $status
+            detail = $detail
+            process_id = $processId
+            process_gone = [bool]$processGone -and (@((Get-DaemonProcesses)).Count -eq 0)
+            wintun_observed = $wintunObserved
+            wintun_stale = $wintunStale
+            baseline_wintun = @($beforeWintun)
+        })
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $DaemonPath)) { throw "daemon binary not found: $DaemonPath" }
+    if (-not (Test-Path -LiteralPath $CliPath)) { throw "CLI binary not found: $CliPath" }
+    Add-ConsoleCtrlHelper
+    $RealWintun = [bool]$AttemptRealWintun
+    for ($cycle = 1; $cycle -le $ProductionCycles; $cycle++) {
+        $entrypoint = switch (($cycle - 1) % 3) {
+            0 { 'diagnostics' }
+            1 { 'cli' }
+            default { 'ctrl_c' }
+        }
+        $record = Invoke-ProductionCycle -Cycle $cycle -Entrypoint $entrypoint -RealWintun $RealWintun
+        $records.Add($record)
+        if (-not $record.graceful_stop) {
+            throw "production cycle $cycle did not prove graceful cleanup: $($record.detail)"
+        }
+    }
+
+    Invoke-ServiceCycle -Control stop
+    Invoke-ServiceCycle -Control preshutdown
+
+    Add-Capability -Name 'production_start_stop' -Status 'verified' -Detail "$ProductionCycles production daemon cycles completed"
+    Add-Capability -Name 'diagnostics_port_release' -Status 'verified' -Detail 'every production cycle rebound the same loopback port'
+    Add-Capability -Name 'child_process_cleanup' -Status 'verified' -Detail 'every production cycle checked descendants'
+    Add-Capability -Name 'cli_stop' -Status 'verified' -Detail 'CLI stop was exercised in rotating production cycles'
+    Add-Capability -Name 'ctrl_c' -Status 'verified' -Detail 'CTRL_C_EVENT was delivered by a new-process-group helper'
+    Add-Capability -Name 'service_stop' -Status (($serviceRecords | Where-Object control -eq 'stop' | Select-Object -First 1).status) -Detail (($serviceRecords | Where-Object control -eq 'stop' | Select-Object -First 1).detail)
+    Add-Capability -Name 'service_preshutdown' -Status (($serviceRecords | Where-Object control -eq 'preshutdown' | Select-Object -First 1).status) -Detail (($serviceRecords | Where-Object control -eq 'preshutdown' | Select-Object -First 1).detail)
+    Add-Capability -Name 'wintun_ownership' -Status $(if ($RealWintun) { 'verified' } else { 'deferred' }) -Detail $(if ($RealWintun) { 'real Wintun mode checked after every production cycle' } else { 'real Wintun mode was not requested' })
+} catch {
+    Add-Capability -Name 'production_start_stop' -Status 'failed' -Detail $_.Exception.Message
+    Add-Capability -Name 'diagnostics_port_release' -Status 'failed' -Detail 'production loop aborted before all cycles completed'
+    Add-Capability -Name 'child_process_cleanup' -Status 'failed' -Detail 'production loop aborted before all cycles completed'
+    Add-Capability -Name 'cli_stop' -Status 'failed' -Detail $_.Exception.Message
+    Add-Capability -Name 'ctrl_c' -Status 'failed' -Detail $_.Exception.Message
+    Add-Capability -Name 'service_stop' -Status 'failed' -Detail $_.Exception.Message
+    Add-Capability -Name 'service_preshutdown' -Status 'deferred' -Detail 'not reached because the production loop failed'
+    Add-Capability -Name 'wintun_ownership' -Status $(if ($AttemptRealWintun) { 'failed' } else { 'deferred' }) -Detail $_.Exception.Message
+}
+
+if ($serviceRecords.Count -eq 0) {
+    Add-Capability -Name 'service_stop' -Status 'failed' -Detail 'service control cycle did not run'
+    Add-Capability -Name 'service_preshutdown' -Status 'deferred' -Detail 'service control cycle did not run'
+}
+
+# These hooks require a host logoff/shutdown and would terminate the hosted
+# job itself. Record the limitation explicitly; never emit a verified pass.
+Add-Capability -Name 'logoff_hook' -Status 'deferred' -Detail 'GitHub-hosted job cannot log off the runner without terminating the job'
+Add-Capability -Name 'shutdown_hook' -Status 'deferred' -Detail 'GitHub-hosted job cannot shut down the runner without terminating the job'
+
+$productionCapability = @($capabilities | Where-Object { $_.name -eq 'production_start_stop' } | Select-Object -First 1)
+if ($productionCapability.Count -eq 1) {
+    Add-Component -Name 'production_harness' -Status $productionCapability[0].status -Detail ([string]$productionCapability[0].detail)
+} else {
+    Add-Component -Name 'production_harness' -Status 'failed' -Detail 'production harness did not emit a production_start_stop capability'
+}
+
+Import-FlutterLifecycleEvidence -ExpectedSourceHeadSha $expectedSourceHeadSha -ExpectedWorkflowSha $expectedWorkflowSha
+Import-HandlerMappingEvidence
+$trayResult = Invoke-FlutterTrayNoAdapterExit
+Add-Capability -Name 'flutter_release_tray_no_adapter_exit' -Status $trayResult.status -Detail $trayResult.detail
+
+$evidence = [ordered]@{
+    schema_version = 2
+    repository = 'yhan-sun/p2wlan'
+    source_head_sha = $expectedSourceHeadSha
+    workflow_sha = $expectedWorkflowSha
+    runner_os = 'windows-latest'
+    generated_at_utc = [DateTime]::UtcNow.ToString('o')
+    components = @($components)
+    handler_mapping = $handlerMapping
+    capabilities = @($capabilities)
+    cycles = @($records)
+    service_controls = @($serviceRecords)
+    flutter_tray = [ordered]@{
+        attempted_cycles = $trayResult.attempted_cycles
+        successful_cycles = $trayResult.successful_cycles
+        first_failure_cycle = $trayResult.first_failure_cycle
+        process_exited = $trayResult.process_exited
+        exit_code = $trayResult.exit_code
+        daemon_processes_clean = $trayResult.daemon_processes_clean
+        forced_termination = $trayResult.forced_termination
+        dump_paths = @($trayResult.dump_paths)
+        cycles = @($trayResult.cycles)
+        detail = $trayResult.detail
+    }
+    wer = [ordered]@{
+        event_ids_checked = @(1000, 1001)
+        events = @()
+        note = 'WER events are added by the workflow after this script returns.'
+    }
+}
+$parent = Split-Path -Parent $EvidencePath
+if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+$evidence | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $EvidencePath -Encoding utf8
+
+if ($previousDisableTun) { $env:P2WLAN_DISABLE_TUN = $previousDisableTun } else { Remove-Item Env:P2WLAN_DISABLE_TUN -ErrorAction SilentlyContinue }
+if ($previousStateDir) { $env:P2WLAN_STATE_DIR = $previousStateDir } else { Remove-Item Env:P2WLAN_STATE_DIR -ErrorAction SilentlyContinue }
+
+Write-Host "Windows lifecycle evidence written to $EvidencePath"

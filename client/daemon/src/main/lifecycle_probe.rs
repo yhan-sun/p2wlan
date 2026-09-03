@@ -6,6 +6,8 @@ const TRAY_SOURCE_FLAG: &str = "--test-tray-event-source";
 const TRAY_EVENT_FLAG: &str = "--test-tray-event";
 const TRAY_COUNT_FLAG: &str = "--test-tray-event-count";
 const TRAY_DELAY_FLAG: &str = "--test-tray-event-delay-ms";
+#[cfg(target_os = "windows")]
+const WINDOWS_HANDLER_PROBE_FLAG: &str = "--windows-lifecycle-handler-probe";
 
 #[derive(Debug, PartialEq, Eq)]
 enum LifecycleProbeCommand {
@@ -15,6 +17,8 @@ enum LifecycleProbeCommand {
         count: usize,
         delay_ms: u64,
     },
+    #[cfg(target_os = "windows")]
+    WindowsHandlerMapping,
 }
 
 fn lifecycle_probe_error(message: impl Into<String>) -> DaemonError {
@@ -28,8 +32,12 @@ fn parse_lifecycle_probe_args(
     let mentions_tray = args
         .iter()
         .any(|arg| arg == TRAY_SOURCE_FLAG || arg.starts_with("--test-tray-event"));
+    #[cfg(target_os = "windows")]
+    let mentions_handler = args.iter().any(|arg| arg == WINDOWS_HANDLER_PROBE_FLAG);
+    #[cfg(not(target_os = "windows"))]
+    let mentions_handler = false;
 
-    if !mentions_binary && !mentions_tray {
+    if !mentions_binary && !mentions_tray && !mentions_handler {
         return Ok(None);
     }
     if mentions_binary {
@@ -38,6 +46,16 @@ fn parse_lifecycle_probe_args(
         }
         return Err(lifecycle_probe_error(
             "--binary-probe must be the only argument",
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    if mentions_handler {
+        if args.len() == 1 && args[0] == WINDOWS_HANDLER_PROBE_FLAG {
+            return Ok(Some(LifecycleProbeCommand::WindowsHandlerMapping));
+        }
+        return Err(lifecycle_probe_error(
+            "--windows-lifecycle-handler-probe must be the only argument",
         ));
     }
 
@@ -149,6 +167,8 @@ fn run_lifecycle_probe_from_process_args() -> p2pnet_daemon::Result<bool> {
             count,
             delay_ms,
         } => emit_tray_lifecycle_probe(&event, count, delay_ms)?,
+        #[cfg(target_os = "windows")]
+        LifecycleProbeCommand::WindowsHandlerMapping => emit_windows_lifecycle_handler_probe()?,
     }
     Ok(true)
 }
@@ -292,5 +312,22 @@ mod lifecycle_probe_tests {
         ]))
         .expect_err("unbounded tray output must fail");
         assert!(too_many.to_string().contains("between 1 and 1024"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_handler_probe_is_exact_and_standalone() {
+        assert_eq!(
+            parse_lifecycle_probe_args(&owned(&[WINDOWS_HANDLER_PROBE_FLAG]))
+                .expect("Windows handler probe must parse"),
+            Some(LifecycleProbeCommand::WindowsHandlerMapping)
+        );
+        let error = parse_lifecycle_probe_args(&owned(&[
+            WINDOWS_HANDLER_PROBE_FLAG,
+            "--config",
+            "daemon.json",
+        ]))
+        .expect_err("Windows handler probe must reject mixed daemon arguments");
+        assert!(error.to_string().contains("must be the only argument"));
     }
 }
