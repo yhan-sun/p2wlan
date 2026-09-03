@@ -240,6 +240,13 @@ public static class P2WlanLifecycleNative {
   [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; }
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
   [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+  [UnmanagedFunctionPointer(CallingConvention.Winapi)] private delegate bool HandlerRoutine(uint ctrlType);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleCtrlHandler(HandlerRoutine handlerRoutine, bool add);
+  private static readonly HandlerRoutine ignoreCtrlC = IgnoreCtrlC;
+  private static bool IgnoreCtrlC(uint ctrlType) { return ctrlType == 0; }
+  public static void IgnoreCtrlCInCurrentProcess() {
+    if (!SetConsoleCtrlHandler(ignoreCtrlC, true)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  }
   public static int StartInNewConsole(string fileName, string arguments, string cwd) {
     var si = new STARTUPINFO(); si.cb = (uint)Marshal.SizeOf(si); si.dwFlags = 0x00000001; si.wShowWindow = 0;
     PROCESS_INFORMATION pi;
@@ -254,6 +261,7 @@ public static class P2WlanLifecycleNative {
   }
 }
 '@
+    [P2WlanLifecycleNative]::IgnoreCtrlCInCurrentProcess()
 }
 
 function Send-ConsoleCtrlC {
@@ -678,6 +686,7 @@ function Invoke-ServiceCycle {
 try {
     if (-not (Test-Path -LiteralPath $DaemonPath)) { throw "daemon binary not found: $DaemonPath" }
     if (-not (Test-Path -LiteralPath $CliPath)) { throw "CLI binary not found: $CliPath" }
+    Add-ConsoleCtrlHelper
     $RealWintun = [bool]$AttemptRealWintun
     for ($cycle = 1; $cycle -le $ProductionCycles; $cycle++) {
         $entrypoint = switch (($cycle - 1) % 3) {
