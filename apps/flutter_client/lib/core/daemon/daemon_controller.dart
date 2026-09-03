@@ -122,8 +122,7 @@ class DaemonController {
         startupTrace,
         stage: 1,
         code: DaemonStartupFailureCode.daemonBinaryLoadFailed,
-        message:
-            'Could not find p2wlan-daemon. Build it with cargo or set P2WLAN_DAEMON_BIN.',
+        message: 'Could not find p2wlan-daemon. Build it with cargo or set P2WLAN_DAEMON_BIN.',
       );
     }
     await startupTrace?.stageOk(1, 'resolve_daemon');
@@ -619,8 +618,7 @@ class DaemonController {
         await _removePidMarker();
         return const DaemonCommandResult(
           ok: true,
-          message:
-              'p2wlan-daemon stopped after forced process termination fallback.',
+          message: 'p2wlan-daemon stopped after forced process termination fallback.',
           forcedTermination: true,
         );
       }
@@ -634,16 +632,14 @@ class DaemonController {
       if (forcefulTerminationUsed) {
         return const DaemonCommandResult(
           ok: true,
-          message:
-              'p2wlan-daemon stopped after forced process termination fallback.',
+          message: 'p2wlan-daemon stopped after forced process termination fallback.',
           forcedTermination: true,
         );
       }
       if (shutdownRequested) {
         return const DaemonCommandResult(
           ok: false,
-          message:
-              'p2wlan-daemon is no longer reachable, but graceful shutdown was not confirmed within the bounded window.',
+          message: 'p2wlan-daemon is no longer reachable, but graceful shutdown was not confirmed within the bounded window.',
         );
       }
       return const DaemonCommandResult(

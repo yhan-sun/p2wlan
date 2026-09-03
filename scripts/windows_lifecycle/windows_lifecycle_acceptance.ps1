@@ -225,7 +225,7 @@ function Stop-CliDaemon {
     $output = @(& $CliPath --config $ConfigPath down 2>&1 | Out-String)
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
-        throw "p2wlan CLI stop exited with $exitCode: $($output -join '')"
+        throw "p2wlan CLI stop exited with ${exitCode}: $($output -join '')"
     }
 }
 
