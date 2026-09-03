@@ -16,11 +16,11 @@ fn main() -> p2pnet_daemon::Result<()> {
             return run_windows_service();
         }
         let signal = install_windows_console_handler()?;
-        return tokio::runtime::Builder::new_multi_thread()
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| DaemonError::TaskCrash(error.to_string()))?
-            .block_on(run_daemon(signal));
+            .block_on(run_daemon(signal))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -31,25 +31,16 @@ fn main() -> p2pnet_daemon::Result<()> {
         .block_on(run_daemon())
 }
 
+const WINDOWS_SHUTDOWN_DEADLINE_MS: u64 = 10_000;
+
 #[cfg(target_os = "windows")]
 async fn run_daemon(windows_signal: std::sync::Arc<WindowsLifecycleSignal>) -> p2pnet_daemon::Result<()> {
-    let _completion = WindowsLifecycleCompletionGuard(windows_signal.clone());
     run_daemon_inner(Some(windows_signal)).await
 }
 
 #[cfg(not(target_os = "windows"))]
 async fn run_daemon() -> p2pnet_daemon::Result<()> {
     run_daemon_inner().await
-}
-
-#[cfg(target_os = "windows")]
-struct WindowsLifecycleCompletionGuard(std::sync::Arc<WindowsLifecycleSignal>);
-
-#[cfg(target_os = "windows")]
-impl Drop for WindowsLifecycleCompletionGuard {
-    fn drop(&mut self) {
-        self.0.complete();
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -381,7 +372,12 @@ async fn run_daemon_inner(
 
     if let Some(reason) = shutdown_reason {
         let _ = shutdown_tx.send(true);
-        match tokio::time::timeout(std::time::Duration::from_secs(10), daemon_handle).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(WINDOWS_SHUTDOWN_DEADLINE_MS),
+            daemon_handle,
+        )
+        .await
+        {
             Ok(Ok(Ok(()))) => info!("Daemon exited cleanly after {reason}"),
             Ok(Ok(Err(e))) => {
                 error!("Daemon exited with error after {reason}: {e}");

@@ -11,7 +11,9 @@ param(
 
     [string]$FlutterReleasePath,
     [string]$FlutterEvidencePath,
+    [string]$HandlerMappingPath,
     [int]$ProductionCycles = 50,
+    [int]$TrayCycles = 20,
     [switch]$AttemptRealWintun
 )
 
@@ -23,8 +25,20 @@ New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
 $records = [System.Collections.Generic.List[object]]::new()
 $capabilities = [System.Collections.Generic.List[object]]::new()
 $serviceRecords = [System.Collections.Generic.List[object]]::new()
+$components = [System.Collections.Generic.List[object]]::new()
+$handlerMapping = $null
 $previousDisableTun = $env:P2WLAN_DISABLE_TUN
 $previousStateDir = $env:P2WLAN_STATE_DIR
+$expectedSourceHeadSha = [string]$env:P2WLAN_EXACT_HEAD
+$expectedWorkflowSha = [string]$env:P2WLAN_WORKFLOW_SHA
+if ($expectedSourceHeadSha -notmatch '^[0-9a-fA-F]{40}$') {
+    throw 'P2WLAN_EXACT_HEAD must be a 40-character git SHA'
+}
+if ($expectedWorkflowSha -notmatch '^[0-9a-fA-F]{40}$') {
+    throw 'P2WLAN_WORKFLOW_SHA must be a 40-character git SHA'
+}
+$traceRoot = if ($env:P2WLAN_TRAY_TRACE_DIR) { $env:P2WLAN_TRAY_TRACE_DIR } else { Join-Path $runRoot 'flutter-tray-traces' }
+New-Item -ItemType Directory -Path $traceRoot -Force | Out-Null
 
 function Add-Capability {
     param(
@@ -37,6 +51,27 @@ function Add-Capability {
     }
     $capabilities.Add([ordered]@{
             name = $Name
+            status = $Status
+            detail = $Detail
+        })
+}
+
+function Add-Component {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet('verified', 'deferred', 'failed')][string]$Status,
+        [Parameter(Mandatory = $false)][string]$Detail = ''
+    )
+    foreach ($existing in @($components | Where-Object { $_.name -eq $Name })) {
+        [void]$components.Remove($existing)
+    }
+    $components.Add([ordered]@{
+            name = $Name
+            schema_version = 2
+            repository = 'yhan-sun/p2wlan'
+            source_head_sha = $expectedSourceHeadSha
+            workflow_sha = $expectedWorkflowSha
+            runner_os = 'windows-latest'
             status = $Status
             detail = $Detail
         })
@@ -479,7 +514,7 @@ function Invoke-ProductionCycle {
         $portReleased = Test-LoopbackPortReleased -Port $port
         $authRemoved = -not (Test-Path -LiteralPath $authPath)
         $afterWintun = Get-WintunSnapshot
-        $wintunStale = -not (Wait-TargetWintunReleased)
+        $wintunStale = if ($RealWintun) { -not (Wait-TargetWintunReleased) } else { Test-TargetWintunPresent -Snapshot $afterWintun }
         $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds @($childPids)
         $daemonProcessesClean = @(
             Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
@@ -509,30 +544,36 @@ function Invoke-ProductionCycle {
     }
 }
 
-function Invoke-FlutterTrayNoAdapterExit {
-    if ([string]::IsNullOrWhiteSpace($FlutterReleasePath)) {
-        return [pscustomobject]@{
-            status = 'deferred'
-            detail = 'Flutter release executable was not supplied'
-            process_exited = $false
-            exit_code = $null
-            daemon_processes_clean = $true
-            forced_termination = $false
-        }
+function Wait-TrayDumps {
+    param(
+        [Parameter(Mandatory = $true)][string]$DumpDirectory,
+        [Parameter(Mandatory = $true)][DateTime]$SinceUtc,
+        [int]$TimeoutSeconds = 10
+    )
+    if ([string]::IsNullOrWhiteSpace($DumpDirectory) -or
+        -not (Test-Path -LiteralPath $DumpDirectory)) {
+        return @()
     }
-    if (-not (Test-Path -LiteralPath $FlutterReleasePath)) {
-        return [pscustomobject]@{
-            status = 'failed'
-            detail = "Flutter release executable not found: $FlutterReleasePath"
-            process_exited = $false
-            exit_code = $null
-            daemon_processes_clean = $false
-            forced_termination = $false
-        }
-    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $dumps = @(
+            Get-ChildItem -LiteralPath $DumpDirectory -Filter '*.dmp' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTimeUtc -ge $SinceUtc } |
+                Sort-Object LastWriteTimeUtc |
+                ForEach-Object { $_.FullName }
+        )
+        if ($dumps.Count -gt 0) { return $dumps }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    @()
+}
 
+function Invoke-FlutterTrayNoAdapterCycle {
+    param([Parameter(Mandatory = $true)][int]$Cycle)
     $trayRoot = Join-Path $runRoot 'flutter-tray-no-adapter'
-    New-Item -ItemType Directory -Path $trayRoot -Force | Out-Null
+    $cycleRoot = Join-Path $trayRoot "cycle-$Cycle"
+    $traceCycleRoot = Join-Path $traceRoot "cycle-$Cycle"
+    New-Item -ItemType Directory -Path $cycleRoot, $traceCycleRoot -Force | Out-Null
     $beforePids = Get-ProcessIdList
     $process = $null
     $forcedTermination = $false
@@ -540,6 +581,11 @@ function Invoke-FlutterTrayNoAdapterExit {
     $stderrTask = $null
     $stdout = ''
     $stderr = ''
+    $processExited = $false
+    $exitCode = $null
+    $daemonProcessesClean = $false
+    $detail = ''
+    $startedAtUtc = [DateTime]::UtcNow
     try {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = [System.IO.Path]::GetFullPath($FlutterReleasePath)
@@ -552,8 +598,8 @@ function Invoke-FlutterTrayNoAdapterExit {
         $startInfo.Environment['P2WLAN_ENABLE_FLUTTER_TRAY'] = '1'
         # Keep this release run isolated from any persisted desktop settings;
         # no daemon is intentionally started for the no-adapter regression.
-        $startInfo.Environment['APPDATA'] = $trayRoot
-        $startInfo.Environment['LOCALAPPDATA'] = $trayRoot
+        $startInfo.Environment['APPDATA'] = $cycleRoot
+        $startInfo.Environment['LOCALAPPDATA'] = $cycleRoot
         $process = [System.Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
         if (-not $process.Start()) { throw "failed to start Flutter release app" }
@@ -563,78 +609,271 @@ function Invoke-FlutterTrayNoAdapterExit {
         if (-not $result.exited) {
             try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
             $forcedTermination = $true
+            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 5
             throw 'Flutter release tray app did not exit within the bounded no-adapter budget'
         }
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $afterPids = Get-ProcessIdList
+        $processExited = $result.exited
+        $exitCode = $result.exit_code
+        if ($stdoutTask -ne $null -and $stdoutTask.Wait(2000)) { $stdout = $stdoutTask.Result }
+        if ($stderrTask -ne $null -and $stderrTask.Wait(2000)) { $stderr = $stderrTask.Result }
         $daemonProcessesClean = @(
-            $afterPids | Where-Object { $beforePids -notcontains $_ }
+            Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
         ).Count -eq 0
         if (-not $daemonProcessesClean) {
             throw 'Flutter release tray no-adapter test left a daemon process running'
         }
-        if ($result.exit_code -ne 0) {
-            throw "Flutter release tray app exited with code $($result.exit_code)"
+        if ($exitCode -ne 0) {
+            throw "Flutter release tray app exited with code $exitCode"
         }
-        return [pscustomobject]@{
-            status = 'verified'
-            detail = 'release Flutter tray initialized and exited cleanly without a virtual adapter'
-            process_exited = $true
-            exit_code = $result.exit_code
-            daemon_processes_clean = $daemonProcessesClean
-            forced_termination = $false
-        }
+        $detail = 'release Flutter tray initialized and exited cleanly without a virtual adapter'
     } catch {
         $detail = $_.Exception.Message
-        if ($stdoutTask -ne $null) {
-            try { $stdout = $stdoutTask.GetAwaiter().GetResult() } catch {}
+        $running = $false
+        try { $running = $process -and -not $process.HasExited } catch { $running = $false }
+        if ($running) {
+            # Emergency cleanup is deliberately recorded as forceful failure;
+            # it can never make this cycle a graceful pass.
+            try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
+            $forcedTermination = $true
         }
-        if ($stderrTask -ne $null) {
-            try { $stderr = $stderrTask.GetAwaiter().GetResult() } catch {}
+        if ($process) {
+            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 5
+            $processExited = $result.exited
+            $exitCode = $result.exit_code
         }
+        if ($stdoutTask -ne $null -and $stdoutTask.Wait(2000)) { $stdout = $stdoutTask.Result }
+        if ($stderrTask -ne $null -and $stderrTask.Wait(2000)) { $stderr = $stderrTask.Result }
         if ($stdout -or $stderr) {
             $detail = "$detail; stdout=[$stdout]; stderr=[$stderr]"
         }
-        $daemonProcessesClean = @(
-            Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
-        ).Count -eq 0
+    }
+    $daemonProcessesClean = @(
+        Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
+    ).Count -eq 0
+    $stdoutPath = Join-Path $traceCycleRoot 'stdout.txt'
+    $stderrPath = Join-Path $traceCycleRoot 'stderr.txt'
+    Set-Content -LiteralPath $stdoutPath -Value $stdout -Encoding utf8
+    Set-Content -LiteralPath $stderrPath -Value $stderr -Encoding utf8
+    [ordered]@{
+        schema_version = 1
+        cycle = $Cycle
+        started_at_utc = $startedAtUtc.ToString('o')
+        finished_at_utc = [DateTime]::UtcNow.ToString('o')
+        pid = if ($process) { $process.Id } else { $null }
+        process_exited = $processExited
+        exit_code = $exitCode
+        forced_termination = $forcedTermination
+        daemon_processes_clean = $daemonProcessesClean
+        stdout_path = $stdoutPath
+        stderr_path = $stderrPath
+        detail = $detail
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $traceCycleRoot 'lifecycle.json') -Encoding utf8
+    [pscustomobject]@{
+        cycle = $Cycle
+        status = if ($processExited -and $exitCode -eq 0 -and -not $forcedTermination -and $daemonProcessesClean) { 'verified' } else { 'failed' }
+        started_at_utc = $startedAtUtc.ToString('o')
+        finished_at_utc = [DateTime]::UtcNow.ToString('o')
+        pid = if ($process) { $process.Id } else { $null }
+        process_exited = $processExited
+        exit_code = $exitCode
+        daemon_processes_clean = $daemonProcessesClean
+        forced_termination = $forcedTermination
+        dump_paths = @()
+        stdout_path = $stdoutPath
+        stderr_path = $stderrPath
+        detail = $detail
+    }
+}
+
+function Invoke-FlutterTrayNoAdapterExit {
+    if ([string]::IsNullOrWhiteSpace($FlutterReleasePath)) {
+        return [pscustomobject]@{
+            status = 'deferred'
+            detail = 'Flutter release executable was not supplied'
+            attempted_cycles = 0
+            successful_cycles = 0
+            first_failure_cycle = $null
+            process_exited = $false
+            exit_code = $null
+            daemon_processes_clean = $true
+            forced_termination = $false
+            dump_paths = @()
+            cycles = @()
+        }
+    }
+    if (-not (Test-Path -LiteralPath $FlutterReleasePath)) {
         return [pscustomobject]@{
             status = 'failed'
-            detail = $detail
-            process_exited = if ($process) { $process.HasExited } else { $false }
-            exit_code = if ($process -and $process.HasExited) { $process.ExitCode } else { $null }
-            daemon_processes_clean = $daemonProcessesClean
-            forced_termination = $forcedTermination
+            detail = "Flutter release executable not found: $FlutterReleasePath"
+            attempted_cycles = 0
+            successful_cycles = 0
+            first_failure_cycle = 1
+            process_exited = $false
+            exit_code = $null
+            daemon_processes_clean = $false
+            forced_termination = $false
+            dump_paths = @()
+            cycles = @()
         }
+    }
+    if ($TrayCycles -ne 20) {
+        return [pscustomobject]@{
+            status = 'failed'
+            detail = "Flutter release tray acceptance requires exactly 20 cycles, got $TrayCycles"
+            attempted_cycles = 0
+            successful_cycles = 0
+            first_failure_cycle = 1
+            process_exited = $false
+            exit_code = $null
+            daemon_processes_clean = $false
+            forced_termination = $false
+            dump_paths = @()
+            cycles = @()
+        }
+    }
+
+    $cycleRecords = [System.Collections.Generic.List[object]]::new()
+    $dumpPaths = [System.Collections.Generic.List[string]]::new()
+    for ($cycle = 1; $cycle -le $TrayCycles; $cycle++) {
+        $record = Invoke-FlutterTrayNoAdapterCycle -Cycle $cycle
+        if ($record.status -ne 'verified') {
+            $sinceUtc = [DateTime]::Parse($record.started_at_utc).ToUniversalTime()
+            foreach ($dumpPath in @(Wait-TrayDumps -DumpDirectory $env:P2WLAN_TRAY_DUMP_DIR -SinceUtc $sinceUtc)) {
+                $record.dump_paths += $dumpPath
+                if (-not $dumpPaths.Contains($dumpPath)) { $dumpPaths.Add($dumpPath) }
+            }
+        }
+        $cycleRecords.Add($record)
+        if ($record.status -ne 'verified') {
+            break
+        }
+    }
+    $attempted = $cycleRecords.Count
+    $successful = @($cycleRecords | Where-Object status -eq 'verified').Count
+    $firstFailure = @($cycleRecords | Where-Object status -ne 'verified' | Select-Object -First 1)
+    $allExited = $attempted -eq $TrayCycles -and @($cycleRecords | Where-Object { -not $_.process_exited }).Count -eq 0
+    $allClean = $attempted -gt 0 -and @($cycleRecords | Where-Object { -not $_.daemon_processes_clean }).Count -eq 0
+    $forced = @($cycleRecords | Where-Object forced_termination).Count -gt 0
+    [pscustomobject]@{
+        status = if ($attempted -eq $TrayCycles -and $successful -eq $TrayCycles -and -not $forced) { 'verified' } else { 'failed' }
+        detail = if ($firstFailure.Count -gt 0) { [string]$firstFailure[0].detail } else { 'all release Flutter tray no-adapter cycles exited cleanly' }
+        attempted_cycles = $attempted
+        successful_cycles = $successful
+        first_failure_cycle = if ($firstFailure.Count -gt 0) { $firstFailure[0].cycle } else { $null }
+        process_exited = $allExited
+        exit_code = if ($firstFailure.Count -gt 0) { $firstFailure[0].exit_code } else { 0 }
+        daemon_processes_clean = $allClean
+        forced_termination = $forced
+        dump_paths = @($dumpPaths)
+        cycles = @($cycleRecords)
     }
 }
 
 function Import-FlutterLifecycleEvidence {
-    param([Parameter(Mandatory = $true)][string]$ExpectedHeadSha)
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedSourceHeadSha,
+        [Parameter(Mandatory = $true)][string]$ExpectedWorkflowSha
+    )
     if ([string]::IsNullOrWhiteSpace($FlutterEvidencePath)) {
         Add-Capability -Name 'ui_stop' -Status 'deferred' -Detail 'Flutter UI evidence path was not supplied'
+        Add-Component -Name 'flutter_ui' -Status 'deferred' -Detail 'Flutter UI evidence path was not supplied'
         return
     }
     if (-not (Test-Path -LiteralPath $FlutterEvidencePath)) {
-        Add-Capability -Name 'ui_stop' -Status 'failed' -Detail "Flutter UI evidence was not written: $FlutterEvidencePath"
+        $detail = "Flutter UI evidence was not written: $FlutterEvidencePath"
+        Add-Capability -Name 'ui_stop' -Status 'failed' -Detail $detail
+        Add-Component -Name 'flutter_ui' -Status 'failed' -Detail $detail
         return
     }
     try {
         $flutter = Get-Content -LiteralPath $FlutterEvidencePath -Raw | ConvertFrom-Json
-        if ($flutter.head_sha -ne $ExpectedHeadSha) {
-            Add-Capability -Name 'ui_stop' -Status 'failed' -Detail "Flutter UI evidence head_sha=$($flutter.head_sha) does not match $ExpectedHeadSha"
-            return
+        if ($flutter.schema_version -ne 2) { throw "Flutter UI evidence schema_version=$($flutter.schema_version) is not 2" }
+        if ($flutter.repository -ne 'yhan-sun/p2wlan') { throw "Flutter UI evidence repository=$($flutter.repository) is not yhan-sun/p2wlan" }
+        if ($flutter.runner_os -ne 'windows-latest') { throw "Flutter UI evidence runner_os=$($flutter.runner_os) is not windows-latest" }
+        if ($flutter.source_head_sha -ne $ExpectedSourceHeadSha) {
+            throw "Flutter UI evidence source_head_sha=$($flutter.source_head_sha) does not match $ExpectedSourceHeadSha"
+        }
+        if ($flutter.workflow_sha -ne $ExpectedWorkflowSha) {
+            throw "Flutter UI evidence workflow_sha=$($flutter.workflow_sha) does not match $ExpectedWorkflowSha"
         }
         foreach ($cycle in @($flutter.cycles)) { $records.Add($cycle) }
         $uiCapability = @($flutter.capabilities | Where-Object { $_.name -eq 'ui_stop' } | Select-Object -First 1)
         if ($uiCapability.Count -ne 1) {
-            Add-Capability -Name 'ui_stop' -Status 'failed' -Detail 'Flutter UI evidence did not contain a ui_stop capability'
-            return
+            throw 'Flutter UI evidence did not contain a ui_stop capability'
         }
         Add-Capability -Name 'ui_stop' -Status $uiCapability[0].status -Detail ([string]$uiCapability[0].detail)
+        Add-Component -Name 'flutter_ui' -Status $uiCapability[0].status -Detail ([string]$uiCapability[0].detail)
     } catch {
-        Add-Capability -Name 'ui_stop' -Status 'failed' -Detail "Flutter UI evidence could not be imported: $($_.Exception.Message)"
+        $detail = "Flutter UI evidence could not be imported: $($_.Exception.Message)"
+        Add-Capability -Name 'ui_stop' -Status 'failed' -Detail $detail
+        Add-Component -Name 'flutter_ui' -Status 'failed' -Detail $detail
+    }
+}
+
+function Import-HandlerMappingEvidence {
+    if ([string]::IsNullOrWhiteSpace($HandlerMappingPath)) {
+        $detail = 'Windows lifecycle handler mapping probe path was not supplied'
+        $script:handlerMapping = [ordered]@{
+            status = 'failed'
+            live_system_delivery = 'deferred'
+            live_system_delivery_detail = $detail
+            console = @()
+            service = @()
+            idempotent_first_request_wins = $false
+            no_duplicate_frees = $false
+            coordinator_entered = $false
+            callback_non_blocking = $false
+            callback_elapsed_ms = $null
+            bounded_deadline = $false
+            shutdown_deadline_ms = $null
+            force_kill = $false
+            coordinator = ''
+        }
+        Add-Component -Name 'handler_mapping' -Status 'failed' -Detail $detail
+        return
+    }
+    if (-not (Test-Path -LiteralPath $HandlerMappingPath)) {
+        $detail = "Windows lifecycle handler mapping probe was not written: $HandlerMappingPath"
+        $script:handlerMapping = [ordered]@{
+            status = 'failed'
+            live_system_delivery = 'deferred'
+            live_system_delivery_detail = $detail
+            console = @()
+            service = @()
+            idempotent_first_request_wins = $false
+            no_duplicate_frees = $false
+            coordinator_entered = $false
+            callback_non_blocking = $false
+            callback_elapsed_ms = $null
+            bounded_deadline = $false
+            shutdown_deadline_ms = $null
+            force_kill = $false
+            coordinator = ''
+        }
+        Add-Component -Name 'handler_mapping' -Status 'failed' -Detail $detail
+        return
+    }
+    try {
+        $probe = Get-Content -LiteralPath $HandlerMappingPath -Raw | ConvertFrom-Json
+        if ($probe.schema_version -ne 2) { throw "handler mapping schema_version=$($probe.schema_version) is not 2" }
+        if ($probe.component -ne 'handler_mapping') { throw "handler mapping component=$($probe.component) is not handler_mapping" }
+        if ($probe.repository -ne 'yhan-sun/p2wlan') { throw "handler mapping repository=$($probe.repository) is not yhan-sun/p2wlan" }
+        if ($probe.runner_os -ne 'windows-latest') { throw "handler mapping runner_os=$($probe.runner_os) is not windows-latest" }
+        if ($probe.source_head_sha -ne $expectedSourceHeadSha) { throw "handler mapping source_head_sha=$($probe.source_head_sha) does not match $expectedSourceHeadSha" }
+        if ($probe.workflow_sha -ne $expectedWorkflowSha) { throw "handler mapping workflow_sha=$($probe.workflow_sha) does not match $expectedWorkflowSha" }
+        if ($null -eq $probe.handler_mapping) { throw 'handler mapping payload was missing' }
+        $mappingStatus = [string]$probe.handler_mapping.status
+        if ($mappingStatus -notin @('verified', 'deferred', 'failed')) { throw "handler mapping status=$mappingStatus is invalid" }
+        $script:handlerMapping = $probe.handler_mapping
+        Add-Component -Name 'handler_mapping' -Status $mappingStatus -Detail 'production console/HandlerEx mapping probe'
+    } catch {
+        $detail = "Windows lifecycle handler mapping could not be imported: $($_.Exception.Message)"
+        $script:handlerMapping = [ordered]@{
+            status = 'failed'
+            live_system_delivery = 'deferred'
+            live_system_delivery_detail = $detail
+        }
+        Add-Component -Name 'handler_mapping' -Status 'failed' -Detail $detail
     }
 }
 
@@ -691,31 +930,34 @@ function Invoke-ServiceCycle {
             & sc.exe stop $serviceName | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "sc.exe stop returned $LASTEXITCODE" }
         } else {
-            # PRESHUTDOWN is an SCM-delivered control. GitHub runners do not
-            # permit a job to shut down/log off the host, so only accept this
-            # as verified if the SCM actually delivers control 15.
-            & sc.exe control $serviceName 15 | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "SCM did not deliver SERVICE_CONTROL_PRESHUTDOWN (sc.exe exit $LASTEXITCODE)" }
+            # Microsoft documents that ControlService/sc.exe cannot send
+            # SERVICE_CONTROL_PRESHUTDOWN; only the operating system can
+            # deliver it during host shutdown. The production HandlerEx
+            # mapping is covered by the injected probe, while live delivery
+            # remains explicit deferred evidence on a hosted runner.
+            $status = 'deferred'
+            $detail = 'live SERVICE_CONTROL_PRESHUTDOWN delivery deferred: only the system can send this notification; sc.exe/ControlService is unsupported'
         }
-        $deadline = [DateTime]::UtcNow.AddSeconds(25)
-        do {
-            Start-Sleep -Milliseconds 250
-            $query = (& sc.exe query $serviceName | Out-String)
-            if ($query -match 'STATE\s+:\s+1\s+STOPPED') { $status = 'verified'; break }
-        } while ([DateTime]::UtcNow -lt $deadline)
-        if ($status -ne 'verified') { throw "service did not reach STOPPED within the bounded budget" }
-        $processDeadline = [DateTime]::UtcNow.AddSeconds(10)
-        while ((Get-Process -Id $processId -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $processDeadline) {
-            Start-Sleep -Milliseconds 250
+        if ($Control -eq 'stop') {
+            $deadline = [DateTime]::UtcNow.AddSeconds(25)
+            do {
+                Start-Sleep -Milliseconds 250
+                $query = (& sc.exe query $serviceName | Out-String)
+                if ($query -match 'STATE\s+:\s+1\s+STOPPED') { $status = 'verified'; break }
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if ($status -ne 'verified') { throw "service did not reach STOPPED within the bounded budget" }
+            $processDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ((Get-Process -Id $processId -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $processDeadline) {
+                Start-Sleep -Milliseconds 250
+            }
+            $processGone = $null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)
+            if (-not $processGone) { throw "service process $processId remained after SCM $Control" }
+            $serviceLog = if (Test-Path -LiteralPath $logPath) { Get-Content -LiteralPath $logPath -Raw } else { '' }
+            if ($serviceLog -notmatch [regex]::Escape('event SERVICE_STOP')) {
+                throw 'service log did not prove delivery of SERVICE_STOP'
+            }
+            $status = 'verified'
         }
-        $processGone = $null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)
-        if (-not $processGone) { throw "service process $processId remained after SCM $Control" }
-        $serviceLog = if (Test-Path -LiteralPath $logPath) { Get-Content -LiteralPath $logPath -Raw } else { '' }
-        $expectedReason = if ($Control -eq 'stop') { 'SERVICE_STOP' } else { 'SERVICE_PRESHUTDOWN' }
-        if ($serviceLog -notmatch [regex]::Escape("event $expectedReason")) {
-            throw "service log did not prove delivery of $expectedReason"
-        }
-        $status = 'verified'
     } catch {
         $detail = $_.Exception.Message
         $status = 'failed'
@@ -732,8 +974,7 @@ function Invoke-ServiceCycle {
         & sc.exe delete $serviceName | Out-Null
         if ($previousServiceDisableTun) { $env:P2WLAN_DISABLE_TUN = $previousServiceDisableTun } else { Remove-Item Env:P2WLAN_DISABLE_TUN -ErrorAction SilentlyContinue }
     }
-    $afterWintun = Get-WintunSnapshot
-    $wintunStale = Test-TargetWintunPresent -Snapshot $afterWintun
+    $wintunStale = -not (Wait-TargetWintunReleased)
     $serviceRecords.Add([pscustomobject]@{
             name = $serviceName
             control = $Control
@@ -797,24 +1038,40 @@ if ($serviceRecords.Count -eq 0) {
 Add-Capability -Name 'logoff_hook' -Status 'deferred' -Detail 'GitHub-hosted job cannot log off the runner without terminating the job'
 Add-Capability -Name 'shutdown_hook' -Status 'deferred' -Detail 'GitHub-hosted job cannot shut down the runner without terminating the job'
 
-$evidenceHeadSha = if ($env:GITHUB_SHA) { $env:GITHUB_SHA } else { 'unknown' }
-Import-FlutterLifecycleEvidence -ExpectedHeadSha $evidenceHeadSha
+$productionCapability = @($capabilities | Where-Object { $_.name -eq 'production_start_stop' } | Select-Object -First 1)
+if ($productionCapability.Count -eq 1) {
+    Add-Component -Name 'production_harness' -Status $productionCapability[0].status -Detail ([string]$productionCapability[0].detail)
+} else {
+    Add-Component -Name 'production_harness' -Status 'failed' -Detail 'production harness did not emit a production_start_stop capability'
+}
+
+Import-FlutterLifecycleEvidence -ExpectedSourceHeadSha $expectedSourceHeadSha -ExpectedWorkflowSha $expectedWorkflowSha
+Import-HandlerMappingEvidence
 $trayResult = Invoke-FlutterTrayNoAdapterExit
 Add-Capability -Name 'flutter_release_tray_no_adapter_exit' -Status $trayResult.status -Detail $trayResult.detail
 
 $evidence = [ordered]@{
-    schema_version = 1
-    head_sha = $evidenceHeadSha
+    schema_version = 2
+    repository = 'yhan-sun/p2wlan'
+    source_head_sha = $expectedSourceHeadSha
+    workflow_sha = $expectedWorkflowSha
     runner_os = 'windows-latest'
     generated_at_utc = [DateTime]::UtcNow.ToString('o')
+    components = @($components)
+    handler_mapping = $handlerMapping
     capabilities = @($capabilities)
     cycles = @($records)
     service_controls = @($serviceRecords)
     flutter_tray = [ordered]@{
+        attempted_cycles = $trayResult.attempted_cycles
+        successful_cycles = $trayResult.successful_cycles
+        first_failure_cycle = $trayResult.first_failure_cycle
         process_exited = $trayResult.process_exited
         exit_code = $trayResult.exit_code
         daemon_processes_clean = $trayResult.daemon_processes_clean
         forced_termination = $trayResult.forced_termination
+        dump_paths = @($trayResult.dump_paths)
+        cycles = @($trayResult.cycles)
         detail = $trayResult.detail
     }
     wer = [ordered]@{
@@ -825,7 +1082,7 @@ $evidence = [ordered]@{
 }
 $parent = Split-Path -Parent $EvidencePath
 if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-$evidence | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $EvidencePath -Encoding utf8
+$evidence | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $EvidencePath -Encoding utf8
 
 if ($previousDisableTun) { $env:P2WLAN_DISABLE_TUN = $previousDisableTun } else { Remove-Item Env:P2WLAN_DISABLE_TUN -ErrorAction SilentlyContinue }
 if ($previousStateDir) { $env:P2WLAN_STATE_DIR = $previousStateDir } else { Remove-Item Env:P2WLAN_STATE_DIR -ErrorAction SilentlyContinue }

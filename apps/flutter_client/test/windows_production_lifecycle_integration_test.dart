@@ -363,10 +363,13 @@ Future<void> _writeEvidence(
   List<Map<String, dynamic>> records,
 ) async {
   final failed = records.where((record) => record['graceful_stop'] != true);
-  final headSha = Platform.environment['GITHUB_SHA'] ?? 'unknown';
+  final sourceHeadSha = _lifecycleEvidenceSha('P2WLAN_EXACT_HEAD');
+  final workflowSha = _lifecycleEvidenceSha('P2WLAN_WORKFLOW_SHA');
   final evidence = {
-    'schema_version': 1,
-    'head_sha': headSha,
+    'schema_version': 2,
+    'repository': 'yhan-sun/p2wlan',
+    'source_head_sha': sourceHeadSha,
+    'workflow_sha': workflowSha,
     'runner_os': 'windows-latest',
     'generated_at_utc': DateTime.now().toUtc().toIso8601String(),
     'capabilities': [
@@ -386,4 +389,15 @@ Future<void> _writeEvidence(
     '${const JsonEncoder.withIndent('  ').convert(evidence)}\n',
     flush: true,
   );
+}
+
+String _lifecycleEvidenceSha(String variable) {
+  final value = Platform.environment[variable]?.trim();
+  if (!Platform.isWindows) return value ?? 'non-windows-local';
+  if (value == null || !RegExp(r'^[0-9a-fA-F]{40}$').hasMatch(value)) {
+    throw StateError(
+      '$variable must be a 40-character git SHA for Windows evidence',
+    );
+  }
+  return value;
 }
