@@ -677,12 +677,12 @@ class DesktopTrayController with TrayListener, WindowListener {
     // same Future. The tray plugin must receive exactly one destroy call per
     // controller lifetime.
     await dispose();
-    _trace('window.destroy.begin');
+    _trace('window.close.begin');
     await DesktopWindowOperations.run(() async {
       await windowManager.setPreventClose(false);
-      await windowManager.destroy();
+      await windowManager.close();
     });
-    _trace('window.destroy.end');
+    _trace('window.close.end');
   }
 
   void _trace(String event) => writeDesktopTrayLifecycleTrace(event);
