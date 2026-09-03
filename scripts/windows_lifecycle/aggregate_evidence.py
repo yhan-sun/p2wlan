@@ -596,8 +596,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")
     print(rendered, end="")
-    if report["overall"] != VERIFIED:
+    if report["overall"] == FAILED:
         return 2
+    if report["overall"] == DEFERRED:
+        print(
+            "Windows lifecycle evidence accepted with explicit deferred operations; "
+            "see the aggregate JSON for the non-verified scope.",
+            file=sys.stderr,
+        )
     return 0
 
 

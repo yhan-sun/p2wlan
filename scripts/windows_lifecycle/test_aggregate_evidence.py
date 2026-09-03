@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import importlib.util
+import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("aggregate_evidence.py")
@@ -262,6 +266,36 @@ class AggregateEvidenceTests(unittest.TestCase):
         self.assertEqual(report["source_head_sha"], SOURCE_SHA)
         self.assertEqual(report["workflow_sha"], WORKFLOW_SHA)
         self.assertEqual(report["overall"], "deferred")
+
+    def test_clean_deferred_document_is_a_successful_cli_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "evidence.json"
+            output_path = Path(directory) / "aggregate.json"
+            input_path.write_text(
+                json.dumps(valid_document()), encoding="utf-8"
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "P2WLAN_EXACT_HEAD": SOURCE_SHA,
+                    "P2WLAN_WORKFLOW_SHA": WORKFLOW_SHA,
+                },
+            ):
+                self.assertEqual(
+                    MODULE.main(
+                        [
+                            "--input",
+                            str(input_path),
+                            "--output",
+                            str(output_path),
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                json.loads(output_path.read_text(encoding="utf-8"))["overall"],
+                "deferred",
+            )
 
     def test_component_identity_must_match_top_level_identity(self):
         document = valid_document()
