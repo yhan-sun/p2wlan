@@ -184,9 +184,10 @@ function Wait-ProcessExited {
 
 function Wait-ObservedChildProcessesGone {
     param(
-        [Parameter(Mandatory = $true)][int[]]$ProcessIds,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][int[]]$ProcessIds,
         [int]$TimeoutSeconds = 10
     )
+    if ($ProcessIds.Count -eq 0) { return $true }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $alive = @($ProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
