@@ -88,7 +88,7 @@ function Test-TargetWintunPresent {
 }
 
 function Wait-TargetWintunReleased {
-    param([Parameter(Mandatory = $true)][int]$TimeoutSeconds = 10)
+    param([int]$TimeoutSeconds = 10)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         if (-not (Test-TargetWintunPresent -Snapshot (Get-WintunSnapshot))) {
@@ -126,7 +126,7 @@ function Wait-DaemonReady {
     param(
         [Parameter(Mandatory = $true)][string]$BaseUrl,
         [Parameter(Mandatory = $true)][string]$AuthPath,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds = 20
+        [int]$TimeoutSeconds = 20
     )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -150,7 +150,7 @@ function Wait-DaemonReady {
 function Wait-ProcessExited {
     param(
         [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds = 20
+        [int]$TimeoutSeconds = 20
     )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
