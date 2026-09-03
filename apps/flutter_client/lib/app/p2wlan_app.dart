@@ -84,7 +84,9 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrap() async {
+    writeDesktopTrayLifecycleTrace('bootstrap.begin');
     await _settingsStore.load();
+    writeDesktopTrayLifecycleTrace('bootstrap.settings-loaded');
     final authToken = _settingsStore.settings.authToken.trim();
     _authenticated =
         _settingsStore.settings.manualMode ||
@@ -92,21 +94,28 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     if (mounted) {
       setState(() => _ready = true);
     }
+    writeDesktopTrayLifecycleTrace('bootstrap.ready');
     if (widget.enableDesktopTray && DesktopTrayController.isSupported) {
+      writeDesktopTrayLifecycleTrace('bootstrap.tray-controller.begin');
       _desktopTrayController = DesktopTrayController(
         settingsStore: _settingsStore,
         statusStore: _statusStore,
       );
+      writeDesktopTrayLifecycleTrace('bootstrap.tray-controller.created');
       final trayInitialization = _desktopTrayController!.initialize();
+      writeDesktopTrayLifecycleTrace('bootstrap.tray-initialize.started');
       if (_isWindowsTrayNoAdapterExitTest) {
         // This is used only by the Windows release acceptance harness. It
         // enters through the same tray bootstrap and quit path as a real
         // packaged desktop app, while the harness deliberately provides no
         // virtual adapter or running daemon.
         await trayInitialization;
+        writeDesktopTrayLifecycleTrace('bootstrap.tray-initialize.completed');
         final tray = _desktopTrayController;
         if (tray != null) {
+          writeDesktopTrayLifecycleTrace('bootstrap.tray-quit.begin');
           await tray.quitForLifecycleTest();
+          writeDesktopTrayLifecycleTrace('bootstrap.tray-quit.end');
         }
         // Do not start the normal daemon polling loop after the lifecycle
         // probe has entered the real packaged tray quit path.

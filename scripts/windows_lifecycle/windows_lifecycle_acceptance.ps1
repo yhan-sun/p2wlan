@@ -596,6 +596,7 @@ function Invoke-FlutterTrayNoAdapterCycle {
         $startInfo.RedirectStandardError = $true
         $startInfo.Environment['P2WLAN_WINDOWS_TRAY_LIFECYCLE_TEST'] = 'no-adapter-exit'
         $startInfo.Environment['P2WLAN_ENABLE_FLUTTER_TRAY'] = '1'
+        $startInfo.Environment['P2WLAN_TRAY_TRACE_FILE'] = Join-Path $traceCycleRoot 'dart-lifecycle.log'
         # Keep this release run isolated from any persisted desktop settings;
         # no daemon is intentionally started for the no-adapter regression.
         $startInfo.Environment['APPDATA'] = $cycleRoot
