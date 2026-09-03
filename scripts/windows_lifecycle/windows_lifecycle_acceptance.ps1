@@ -233,40 +233,82 @@ function Add-ConsoleCtrlHelper {
     if ('P2WlanLifecycleNative' -as [type]) { return }
     Add-Type @'
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 public static class P2WlanLifecycleNative {
   [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
   public struct STARTUPINFO { public uint cb; public string lpReserved; public string lpDesktop; public string lpTitle; public uint dwX; public uint dwY; public uint dwXSize; public uint dwYSize; public uint dwXCountChars; public uint dwYCountChars; public uint dwFillAttribute; public uint dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; }
   [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; }
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcess(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GenerateConsoleCtrlEvent(uint type, uint group);
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
-  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
   [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
-  public static int StartInNewProcessGroup(string fileName, string arguments, string cwd) {
+  public static int StartInNewConsole(string fileName, string arguments, string cwd) {
     var si = new STARTUPINFO(); si.cb = (uint)Marshal.SizeOf(si); si.dwFlags = 0x00000001; si.wShowWindow = 0;
     PROCESS_INFORMATION pi;
-    if (!CreateProcess(fileName, "\"" + fileName + "\" " + arguments, IntPtr.Zero, IntPtr.Zero, false, 0x00000200, IntPtr.Zero, cwd, ref si, out pi)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    // Give the daemon a console of its own. CTRL_C_EVENT is broadcast to
+    // every process attached to a console, so the injector must attach to
+    // this isolated console instead of the PowerShell job console.
+    const uint CREATE_NEW_CONSOLE = 0x00000010;
+    const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+    if (!CreateProcess(fileName, "\"" + fileName + "\" " + arguments, IntPtr.Zero, IntPtr.Zero, false, CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP, IntPtr.Zero, cwd, ref si, out pi)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return (int)pi.dwProcessId;
   }
-  public static void SendCtrlC(int processId) {
-    // CTRL_C_EVENT cannot be scoped to a process group. Temporarily attach
-    // this helper to the daemon's inherited console, with the PowerShell
-    // parent detached, so the event reaches only the daemon. Restore the
-    // parent console before returning to the acceptance script.
-    FreeConsole();
-    try {
-      if (!AttachConsole((uint)processId)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-      if (!GenerateConsoleCtrlEvent(0, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-    } finally {
-      FreeConsole();
-      AttachConsole(0xffffffff);
-    }
-  }
 }
 '@
+}
+
+function Send-ConsoleCtrlC {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    $injectorPath = Join-Path $runRoot 'send-ctrl-c.ps1'
+    if (-not (Test-Path -LiteralPath $injectorPath)) {
+        @'
+param([Parameter(Mandatory = $true)][int]$ProcessId)
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class P2WlanCtrlCInjector {
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GenerateConsoleCtrlEvent(uint type, uint group);
+  public static void Send(int processId) {
+    FreeConsole();
+    if (!AttachConsole((uint)processId)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    if (!GenerateConsoleCtrlEvent(0, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  }
+}
+"@
+[P2WlanCtrlCInjector]::Send($ProcessId)
+'@ | Set-Content -LiteralPath $injectorPath -Encoding utf8
+    }
+    $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $pwshPath
+    $startInfo.WorkingDirectory = Split-Path -Parent $injectorPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in @(
+            '-NoLogo',
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $injectorPath,
+            '-ProcessId',
+            $ProcessId.ToString()
+        )) {
+        $null = $startInfo.ArgumentList.Add($argument)
+    }
+    $injector = [System.Diagnostics.Process]::new()
+    $injector.StartInfo = $startInfo
+    if (-not $injector.Start()) { throw 'failed to start Ctrl+C injector' }
+    $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 5
+    if (-not $result.exited) {
+        try { Stop-Process -Id $injector.Id -Force -ErrorAction SilentlyContinue } catch {}
+        throw 'Ctrl+C injector did not exit within the bounded budget'
+    }
+    # The injector is attached to the daemon console and may itself receive
+    # the broadcast CTRL_C_EVENT. Its exit code is therefore not meaningful;
+    # the daemon's graceful exit is the authoritative assertion.
 }
 
 function Invoke-ProductionCycle {
@@ -312,7 +354,7 @@ function Invoke-ProductionCycle {
         if ($Entrypoint -eq 'ctrl_c') {
             Add-ConsoleCtrlHelper
             $arguments = "--config `"$configPath`" --control http://127.0.0.1:1 --network windows-lifecycle --diagnostics-bind 127.0.0.1:$port --log-file `"$logPath`" --manual --interface p2wlan-lifecycle --address 10.20.0.1 --udp-bind 127.0.0.1:0 --stun none --socket-pool off"
-            $ctrlCProcessId = [P2WlanLifecycleNative]::StartInNewProcessGroup($DaemonPath, $arguments, (Split-Path -Parent $DaemonPath))
+            $ctrlCProcessId = [P2WlanLifecycleNative]::StartInNewConsole($DaemonPath, $arguments, (Split-Path -Parent $DaemonPath))
             $process = Get-Process -Id $ctrlCProcessId -ErrorAction Stop
         } else {
             $process = Start-ProductionDaemon -ConfigPath $configPath -LogPath $logPath -DiagnosticsBind "127.0.0.1:$port"
@@ -335,7 +377,7 @@ function Invoke-ProductionCycle {
         switch ($Entrypoint) {
             'diagnostics' { Stop-DiagnosticsDaemon -BaseUrl $baseUrl -Token $token }
             'cli' { Stop-CliDaemon -ConfigPath $configPath -StateDirectory $cycleRoot }
-            'ctrl_c' { [P2WlanLifecycleNative]::SendCtrlC($process.Id) }
+            'ctrl_c' { Send-ConsoleCtrlC -ProcessId $process.Id }
         }
         $stopRequested = $true
         if ($Entrypoint -eq 'ctrl_c') {
