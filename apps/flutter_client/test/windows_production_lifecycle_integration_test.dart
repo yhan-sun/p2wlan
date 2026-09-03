@@ -5,7 +5,6 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:p2wlan_flutter_client/app/desktop_tray_controller.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
-import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
@@ -39,7 +38,7 @@ void main() {
       if (!Platform.isWindows) return;
 
       for (var cycle = 1; cycle <= cycles; cycle++) {
-        records.add(await _runUiStopCycle(daemonPath!, cycle));
+        records.add(await _runUiStopCycle(daemonPath, cycle));
       }
       await _writeEvidence(evidencePath, records);
 
