@@ -103,13 +103,14 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
         // enters through the same tray bootstrap and quit path as a real
         // packaged desktop app, while the harness deliberately provides no
         // virtual adapter or running daemon.
-        unawaited(
-          trayInitialization.then((_) async {
-            final tray = _desktopTrayController;
-            if (tray == null) return;
-            await tray.quitForLifecycleTest();
-          }),
-        );
+        await trayInitialization;
+        final tray = _desktopTrayController;
+        if (tray != null) {
+          await tray.quitForLifecycleTest();
+        }
+        // Do not start the normal daemon polling loop after the lifecycle
+        // probe has entered the real packaged tray quit path.
+        return;
       } else {
         unawaited(trayInitialization);
       }
