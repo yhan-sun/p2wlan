@@ -150,4 +150,10 @@ export ORG_GRADLE_PROJECT_p2wlanSourceIdentityFile="$source_identity_file"
 export ORG_GRADLE_PROJECT_p2wlanSourceIdentityNonce="$identity_nonce"
 
 cd "$ROOT_DIR/apps/flutter_client"
+if [[ "${1:-}" == windows ]]; then
+  # tray_manager 0.5.3 reads an uninitialized HICON on its first Windows
+  # setIcon call. Patch the exact resolved pub-cache source before compiling
+  # the packaged Windows client; the patch script refuses unknown source.
+  python3 "$ROOT_DIR/scripts/release/patch_tray_manager_windows.py" "$PWD"
+fi
 flutter build "$@" "${DEFINES[@]}"
