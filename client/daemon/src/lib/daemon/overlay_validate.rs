@@ -609,6 +609,19 @@ async fn send_overlay_payloads(
         }
         let virtual_ip = peer.virtual_ip.clone();
         let peer_id = peer.peer_id.clone();
+        // The strict Direct acceptance profile is a make-before-break proof:
+        // its first Direct business packet must not race ahead of the forced
+        // encrypted Relay confirmation.  This is an authoritative manager
+        // read, not a second path state machine and not a timing sleep.  The
+        // Relay-availability profile intentionally allows Relay immediately.
+        if !overlay_any_path
+            && peer.active_path() == Some(crate::peer::NetworkPath::Direct)
+            && !peers
+                .is_relay_peer_confirmed_for_generation(&peer_id, generation)
+                .await
+        {
+            continue;
+        }
         *next_nonce = next_nonce.wrapping_add(1);
         *next_seq = next_seq.wrapping_add(1);
         let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, *next_nonce, *next_seq);

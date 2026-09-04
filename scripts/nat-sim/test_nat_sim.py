@@ -2,10 +2,14 @@
 """Regression tests for the deterministic dual-NAT simulator."""
 
 import asyncio
+import copy
 import importlib.util
+import json
 import socket
 import struct
+import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 
@@ -22,6 +26,20 @@ assert OBS_SPEC is not None
 assert OBS_SPEC.loader is not None
 OBSERVABILITY = importlib.util.module_from_spec(OBS_SPEC)
 OBS_SPEC.loader.exec_module(OBSERVABILITY)
+
+COLLECT_PATH = Path(__file__).with_name("collect_evidence.py")
+COLLECT_SPEC = importlib.util.spec_from_file_location("p2wlan_nat_collect_evidence", COLLECT_PATH)
+assert COLLECT_SPEC is not None
+assert COLLECT_SPEC.loader is not None
+COLLECT_EVIDENCE = importlib.util.module_from_spec(COLLECT_SPEC)
+COLLECT_SPEC.loader.exec_module(COLLECT_EVIDENCE)
+
+AGGREGATE_PATH = Path(__file__).with_name("aggregate_evidence.py")
+AGGREGATE_SPEC = importlib.util.spec_from_file_location("p2wlan_nat_aggregate_evidence", AGGREGATE_PATH)
+assert AGGREGATE_SPEC is not None
+assert AGGREGATE_SPEC.loader is not None
+AGGREGATE_EVIDENCE = importlib.util.module_from_spec(AGGREGATE_SPEC)
+AGGREGATE_SPEC.loader.exec_module(AGGREGATE_EVIDENCE)
 
 
 class CaptureProtocol(asyncio.DatagramProtocol):
@@ -107,6 +125,479 @@ class ObservabilityFailClosedTests(unittest.TestCase):
         drops = validated["stats"]["outbound_drops"]
         self.assertEqual(sum(item["packets"] for item in drops.values()), 5)
         self.assertEqual(sum(item["bytes"] for item in drops.values()), 500)
+
+
+class NatEvidenceContractTests(unittest.TestCase):
+    SOURCE_SHA = "a" * 40
+    WORKFLOW_SHA = "b" * 40
+
+    @staticmethod
+    def _status(process_id: int, expected_path: str = "relay", revision: int = 4) -> dict:
+        peer = {
+            "node_id": "node-b",
+            "online": True,
+            "relay_confirmed_endpoint": "relay.test" if expected_path == "relay" else None,
+            "relay_confirmed_generation": 1 if expected_path == "relay" else None,
+            "relay_confirmed_connection_id": 12 if expected_path == "relay" else None,
+            "relay_first_business_sent_generation": 1 if expected_path == "relay" else None,
+            "relay_first_business_received_generation": 1 if expected_path == "relay" else None,
+            "relay_first_business_exchange_generation": 1 if expected_path == "relay" else None,
+        }
+        summary = {
+            "schema_version": 1,
+            "peer_id": "node-b",
+            "path": expected_path,
+            "network_generation": 1,
+            "first_usable_at_ms": 20,
+            "transition_revision": 3,
+            "relay_ready_at_ms": 10,
+            "first_usable_delta_ms": 10,
+            "business_sent": True,
+            "business_received": True,
+            "business_exchange": True,
+            "relay_id": "relay.test" if expected_path == "relay" else None,
+            "relay_connection_id": 12 if expected_path == "relay" else None,
+            "source": "authoritative_business_ingress_commit",
+        }
+        return {
+            "process_id": process_id,
+            "node_id": "node-a",
+            "network_generation": 1,
+            "uptime_ms": 30,
+            "revision": revision,
+            "captured_revision": revision,
+            "captured_at_ms": 30,
+            "peer_snapshot_stale": False,
+            "relay_connected": expected_path == "relay",
+            "connection_timeline": {
+                "correlation_id": "node-a-1",
+                "events": [
+                    {
+                        "event": "relay_transport_ready_peer",
+                        "at_ms": 10,
+                        "peer_id": "node-b",
+                        "connection_generation": 1,
+                    },
+                    {
+                        "event": "first_usable_path",
+                        "at_ms": 20,
+                        "path": expected_path,
+                        "peer_id": "node-b",
+                        "connection_generation": 1,
+                    },
+                ],
+                "first_usable_summaries": [summary],
+            },
+            "peers": [peer],
+            "stats": {"outbound_drops": {}, "outbound_loss_events": []},
+            "health": {
+                "critical_tasks": [
+                    {"critical": True, "running": True, "finished": False, "error": None}
+                ]
+            },
+        }
+
+    def _write_record(self, root: Path, topology: str, replica: int) -> dict:
+        expected_path = "relay" if topology == "relay-blackhole" else "direct"
+        baseline = self._status(1234, expected_path, revision=1)
+        baseline["captured_at_ms"] = 5
+        baseline["uptime_ms"] = 5
+        final = self._status(1234, expected_path)
+        record = self._build_record(
+            root,
+            topology,
+            replica,
+            baseline,
+            baseline,
+            final,
+            final,
+        )
+        output_dir = root / f"record-{topology}-{replica}"
+        output_dir.mkdir()
+        (output_dir / "nat-evidence.json").write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+        return record
+
+    def _build_record(
+        self,
+        root: Path,
+        topology: str,
+        replica: int,
+        baseline_a: dict,
+        baseline_b: dict,
+        final_a: dict,
+        final_b: dict,
+        log_text: str = "overlay_payload_verified\noverlay_burst_complete\n",
+    ) -> dict:
+        expected_path = "relay" if topology == "relay-blackhole" else "direct"
+        log = root / f"{topology}-{replica}.log"
+        if expected_path == "direct" and "direct_promoted" not in log_text:
+            log_text = "direct_promoted\n" + log_text
+        log.write_text(log_text, encoding="utf-8")
+        baseline_a_path = root / f"{topology}-{replica}.a.baseline.json"
+        baseline_b_path = root / f"{topology}-{replica}.b.baseline.json"
+        final_a_path = root / f"{topology}-{replica}.a.final.json"
+        final_b_path = root / f"{topology}-{replica}.b.final.json"
+        baseline_a_path.write_text(json.dumps(baseline_a), encoding="utf-8")
+        baseline_b_path.write_text(json.dumps(baseline_b), encoding="utf-8")
+        final_a_path.write_text(json.dumps(final_a), encoding="utf-8")
+        final_b_path.write_text(json.dumps(final_b), encoding="utf-8")
+        return COLLECT_EVIDENCE.build_record(
+            Namespace(
+                topology=topology,
+                replica=replica,
+                round=1,
+                source_head_sha=self.SOURCE_SHA,
+                workflow_sha=self.WORKFLOW_SHA,
+                baseline_a=str(baseline_a_path),
+                baseline_b=str(baseline_b_path),
+                final_a=str(final_a_path),
+                final_b=str(final_b_path),
+                log_a=str(log),
+                log_b=str(log),
+                expected_path=expected_path,
+                overlay_burst=64 if expected_path == "relay" else 0,
+            )
+        )
+
+    def _all_records(self, root: Path) -> list[tuple[Path, dict]]:
+        records = []
+        for path in sorted(root.rglob("nat-evidence.json")):
+            records.append((path, json.loads(path.read_text(encoding="utf-8"))))
+        return records
+
+    @staticmethod
+    def _remove_first_usable(status: dict, clear_relay_business: bool = False) -> dict:
+        value = copy.deepcopy(status)
+        timeline = value["connection_timeline"]
+        timeline["events"] = [
+            event for event in timeline["events"] if event.get("event") != "first_usable_path"
+        ]
+        timeline["first_usable_summaries"] = []
+        if clear_relay_business:
+            peer = value["peers"][0]
+            peer["relay_first_business_sent_generation"] = None
+            peer["relay_first_business_received_generation"] = None
+            peer["relay_first_business_exchange_generation"] = None
+        return value
+
+    def test_transition_after_baseline_computes_delta_from_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                self._status(1234, "relay"),
+                self._status(1235, "relay"),
+            )
+            self.assertEqual(record["result"], "pass")
+            self.assertEqual(record["observed"]["a"]["first_usable"]["delta_ms"], 10)
+            self.assertFalse(record["observed"]["a"]["first_usable"]["baseline_after_transition"])
+
+    def test_transition_before_baseline_requires_persistent_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline_a = self._status(1234, "relay", revision=4)
+            baseline_b = self._status(1235, "relay", revision=4)
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                baseline_a,
+                baseline_b,
+                self._status(1234, "relay"),
+                self._status(1235, "relay"),
+            )
+            self.assertEqual(record["result"], "pass")
+            self.assertTrue(record["observed"]["a"]["first_usable"]["baseline_after_transition"])
+            self.assertEqual(record["observed"]["a"]["first_usable"]["source"], "persistent_summary")
+
+    def test_event_fallback_is_revision_fenced_and_computes_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                timeline = final["connection_timeline"]
+                timeline["first_usable_summaries"] = []
+                for event in timeline["events"]:
+                    if event["event"] == "first_usable_path":
+                        event["transition_revision"] = 3
+            baseline_a = self._status(1234, "relay", revision=1)
+            baseline_b = self._status(1235, "relay", revision=1)
+            for baseline in (baseline_a, baseline_b):
+                baseline["captured_at_ms"] = 5
+                baseline["uptime_ms"] = 5
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                baseline_a,
+                baseline_b,
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "pass")
+            self.assertEqual(record["observed"]["a"]["first_usable"]["source"], "event")
+            self.assertEqual(record["observed"]["a"]["first_usable"]["transition_revision"], 3)
+            self.assertEqual(record["observed"]["a"]["first_usable"]["delta_ms"], 10)
+
+    def test_event_only_baseline_after_transition_fails_setup_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                timeline = final["connection_timeline"]
+                timeline["first_usable_summaries"] = []
+                for event in timeline["events"]:
+                    if event["event"] == "first_usable_path":
+                        event["transition_revision"] = 3
+            baseline_a = self._status(1234, "relay", revision=4)
+            baseline_b = self._status(1235, "relay", revision=4)
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                baseline_a,
+                baseline_b,
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(
+                record["decision"]["reason_code"], "baseline_after_transition_event_retained"
+            )
+
+    def test_event_ring_eviction_uses_durable_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                final["connection_timeline"]["events"] = [
+                    event
+                    for event in final["connection_timeline"]["events"]
+                    if event.get("event") != "first_usable_path"
+                ]
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "pass")
+            self.assertTrue(record["collector"]["a"]["timeline_evicted"])
+
+    def test_path_never_usable_is_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._remove_first_usable(self._status(1234, "direct"))
+            final_b = self._remove_first_usable(self._status(1235, "direct"))
+            record = self._build_record(
+                root,
+                "direct-cold-start",
+                1,
+                self._status(1234, "direct", revision=1),
+                self._status(1235, "direct", revision=1),
+                final_a,
+                final_b,
+                log_text="direct_promoted\n",
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "first_usable_never_observed")
+
+    def test_relay_connected_without_business_is_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._remove_first_usable(self._status(1234, "relay"), True)
+            final_b = self._remove_first_usable(self._status(1235, "relay"), True)
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "first_business_not_passed")
+
+    def test_diagnostics_revision_lag_is_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                final["captured_revision"] = final["revision"] - 1
+                final["peer_snapshot_stale"] = True
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "diagnostics_revision_not_converged")
+
+    def test_changed_process_identity_is_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                self._status(4321, "relay"),
+                self._status(1235, "relay"),
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "stale_process_identity")
+
+    def test_one_missing_side_is_reported_without_fanout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_b = self._remove_first_usable(self._status(1235, "direct"))
+            record = self._build_record(
+                root,
+                "direct-cold-start",
+                1,
+                self._status(1234, "direct", revision=1),
+                self._status(1235, "direct", revision=1),
+                self._status(1234, "direct"),
+                final_b,
+                log_text="direct_promoted\noverlay_payload_verified\n",
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["observed"]["a"]["first_usable"]["path"], "direct")
+            self.assertIsNone(record["observed"]["b"]["first_usable"]["path"])
+
+    def test_duplicate_same_generation_summary_is_parser_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                duplicate = copy.deepcopy(final["connection_timeline"]["first_usable_summaries"][0])
+                duplicate["first_usable_at_ms"] = 30
+                duplicate["first_usable_delta_ms"] = 20
+                duplicate["transition_revision"] = 4
+                final["connection_timeline"]["first_usable_summaries"].append(duplicate)
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "evidence_parser_loss")
+
+    def test_valid_actual_execution_records_aggregate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+            aggregate = AGGREGATE_EVIDENCE.aggregate_records(
+                self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
+            )
+            self.assertEqual(aggregate["result"], "pass")
+            self.assertEqual(aggregate["relay_replica_count"], 5)
+            self.assertTrue(aggregate["aggregate_digest"].startswith("sha256:"))
+
+    def test_missing_replica_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 5):
+                self._write_record(root, "relay-blackhole", replica)
+            with self.assertRaisesRegex(ValueError, "missing_scenario:.*relay-blackhole:replica-5"):
+                AGGREGATE_EVIDENCE.aggregate_records(
+                    self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+    def test_mutated_test_name_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+            path = root / "record-relay-blackhole-3" / "nat-evidence.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["exact_test_id"] = value["exact_test_id"].replace("replica-3", "replica-2")
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "exact_test_id_scenario_mismatch"):
+                AGGREGATE_EVIDENCE.aggregate_records(
+                    self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+    def test_skipped_test_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+            path = root / "record-relay-blackhole-4" / "nat-evidence.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["skipped"] = True
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "test_skipped"):
+                AGGREGATE_EVIDENCE.aggregate_records(
+                    self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+    def test_static_manifest_scenario_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+            value = json.loads(
+                (root / "record-relay-blackhole-1" / "nat-evidence.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            value["topology"] = "relay-blackhole-fictional"
+            value["scenario_id"] = "relay-blackhole-fictional:replica-1:round-1"
+            extra = root / "record-fictional"
+            extra.mkdir()
+            (extra / "nat-evidence.json").write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "scenario_identity_invalid"):
+                AGGREGATE_EVIDENCE.aggregate_records(
+                    self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+    def test_duplicate_conflicting_records_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+            original = root / "record-relay-blackhole-2" / "nat-evidence.json"
+            duplicate_dir = root / "duplicate"
+            duplicate_dir.mkdir()
+            (duplicate_dir / "nat-evidence.json").write_text(
+                original.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate_conflicting_record"):
+                AGGREGATE_EVIDENCE.aggregate_records(
+                    self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
 
 
 class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):

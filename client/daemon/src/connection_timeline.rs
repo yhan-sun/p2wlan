@@ -20,7 +20,7 @@
 //!   TCP connect, writer completion, nor metrics is business evidence;
 //! - `direct_promoted` still requires the existing encrypted validation chain.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -34,6 +34,13 @@ use tracing::{debug, info};
 /// though the structured counters still retained them. Keep the ring bounded,
 /// but large enough to correlate a burst, handshake, retries, and teardown.
 pub const TIMELINE_MAX_EVENTS: usize = 512;
+
+/// Additive schema for the durable first-usable evidence ledger. The ordinary
+/// timeline is intentionally a bounded ring and may evict the transition that
+/// proved usability; this summary remains available to `/status` after that
+/// eviction and carries the status revision fence used by the NAT harness.
+pub const FIRST_USABLE_SUMMARY_SCHEMA_VERSION: u32 = 1;
+pub const FIRST_USABLE_SUMMARY_MAX_ENTRIES: usize = 1024;
 
 /// One recorded timeline event (serializable, bounded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +69,55 @@ pub struct ConnectionTimelineEvent {
     pub relay_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_region: Option<String>,
+    /// The monotonic status-event sequence assigned at the same commit. A
+    /// missing value means this timeline is running without a status event bus
+    /// (standalone/unit mode), never that a production transition has an
+    /// unknown revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_revision: Option<u64>,
+}
+
+/// Persistent, per-peer/per-network-generation first-usable commit summary.
+///
+/// This is written only after the authoritative peer state has accepted a
+/// real authenticated business ingress. Relay confirmation, socket readiness,
+/// queue acceptance, and writer completion are represented separately and
+/// cannot create one of these records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstUsableEvidenceSummary {
+    pub schema_version: u32,
+    pub peer_id: String,
+    pub path: String,
+    pub network_generation: u64,
+    pub first_usable_at_ms: u64,
+    /// Status-event revision assigned to the `first_usable_path` commit. Zero
+    /// means the timeline is used without an attached status event bus (unit
+    /// tests and standalone diagnostics fixtures).
+    #[serde(default)]
+    pub transition_revision: u64,
+    /// The closest same-peer/same-generation relay-ready commit known to the
+    /// process-local timeline. It is optional because a long-running daemon
+    /// may have evicted the ready event before the first-usable commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_ready_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_usable_delta_ms: Option<u64>,
+    /// Business evidence dimensions are explicit so a collector cannot treat
+    /// `relay_connected` or `relay_peer_confirmed` as first usability.
+    #[serde(default)]
+    pub business_sent: bool,
+    #[serde(default)]
+    pub business_received: bool,
+    #[serde(default)]
+    pub business_exchange: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_connection_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// Stable producer label; kept additive for machine evidence audits.
+    pub source: String,
 }
 
 /// Bounded, serializable snapshot exposed by diagnostics `/status`.
@@ -71,6 +127,10 @@ pub struct ConnectionTimelineDiagnostics {
     pub run_id: Option<String>,
     pub correlation_id: String,
     pub events: Vec<ConnectionTimelineEvent>,
+    /// Persistent first-usable summaries are not subject to the event-ring
+    /// eviction window.
+    #[serde(default)]
+    pub first_usable_summaries: Vec<FirstUsableEvidenceSummary>,
 }
 
 /// Structured INFO timeline emitter shared across daemon subsystems.
@@ -79,6 +139,10 @@ pub struct ConnectionTimeline {
     correlation_id: String,
     started_at: Instant,
     events: Mutex<VecDeque<ConnectionTimelineEvent>>,
+    first_usable_summaries: Mutex<VecDeque<FirstUsableEvidenceSummary>>,
+    /// Same-peer/same-generation relay-ready times used to compute a local
+    /// delta even when the ready event later leaves the bounded event ring.
+    relay_ready_at_ms: Mutex<HashMap<(String, u64), u64>>,
     /// Events that must be emitted at most once per scope.  The scope is a
     /// stable string (`""` for process-level milestones, `peer:<id>:<generation>`
     /// for per-peer + generation milestones), so a first-milestone can never be
@@ -115,6 +179,8 @@ impl ConnectionTimeline {
             correlation_id,
             started_at: Instant::now(),
             events: Mutex::new(VecDeque::new()),
+            first_usable_summaries: Mutex::new(VecDeque::new()),
+            relay_ready_at_ms: Mutex::new(HashMap::new()),
             first_events: Mutex::new(HashSet::new()),
             status_events: Mutex::new(None),
             control_registration_count: AtomicU64::new(0),
@@ -151,7 +217,7 @@ impl ConnectionTimeline {
         path: Option<&str>,
         reason_code: Option<&str>,
         detail: Option<String>,
-    ) -> u64 {
+    ) -> (u64, u64) {
         let at_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
         if event == "control_registered" {
             self.control_registration_count
@@ -161,43 +227,67 @@ impl ConnectionTimeline {
             .as_deref()
             .map(parse_detail_fields)
             .unwrap_or_default();
-        // Captured before `fields.peer_id` is moved into the timeline event, so
-        // the diagnostics mirror below can use it without a use-after-move.
-        let mirror_peer_id = fields.peer_id.clone();
-        {
-            let mut events = self
-                .events
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            events.push_back(ConnectionTimelineEvent {
-                run_id: self.run_id.clone(),
-                event: event.to_string(),
-                at_ms,
-                path: path.map(str::to_string),
-                reason_code: reason_code.map(str::to_string),
-                detail: detail.clone(),
-                peer_id: fields.peer_id,
-                connection_generation: fields.connection_generation,
-                path_id: fields.path_id.or_else(|| path.map(str::to_string)),
-                relay_id: fields.relay_id,
-                relay_region: fields.relay_region,
-            });
-            while events.len() > TIMELINE_MAX_EVENTS {
-                events.pop_front();
+        if event == "relay_transport_ready_peer" {
+            if let (Some(peer_id), Some(generation)) =
+                (fields.peer_id.as_ref(), fields.connection_generation)
+            {
+                let mut ready_times = self
+                    .relay_ready_at_ms
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                ready_times.insert((peer_id.clone(), generation), at_ms);
+                while ready_times.len() > FIRST_USABLE_SUMMARY_MAX_ENTRIES {
+                    let Some(oldest_key) = ready_times
+                        .iter()
+                        .min_by_key(|(_, timestamp)| **timestamp)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        break;
+                    };
+                    ready_times.remove(&oldest_key);
+                }
             }
         }
-        // Mirror to the diagnostics status event bus (single choke point that
-        // covers all timeline emits). Best-effort: a detached timeline (no bus)
-        // or a transient lock failure must never break the dataplane.
-        if let Some(bus) = self
+        // Hold the event-ring lock while assigning the status sequence so
+        // concurrent producers cannot make the ring order disagree with the
+        // `/events` cursor order.
+        let mirror_peer_id = fields.peer_id.clone();
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let revision = if let Some(bus) = self
             .status_events
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
         {
-            bus.record(event, at_ms, path, reason_code, mirror_peer_id.as_deref());
+            bus.record(event, at_ms, path, reason_code, mirror_peer_id.as_deref())
+        } else {
+            0
+        };
+        events.push_back(ConnectionTimelineEvent {
+            run_id: self.run_id.clone(),
+            event: event.to_string(),
+            at_ms,
+            path: path.map(str::to_string),
+            reason_code: reason_code.map(str::to_string),
+            detail: detail.clone(),
+            peer_id: fields.peer_id,
+            connection_generation: fields.connection_generation,
+            path_id: fields.path_id.or_else(|| path.map(str::to_string)),
+            relay_id: fields.relay_id,
+            relay_region: fields.relay_region,
+            transition_revision: (revision != 0).then_some(revision),
+        });
+        while events.len() > TIMELINE_MAX_EVENTS {
+            events.pop_front();
         }
-        at_ms
+        drop(events);
+        // A detached timeline (no bus) intentionally returns revision zero;
+        // that value is omitted from the serialized event in standalone/unit
+        // mode rather than being mistaken for a production cursor.
+        (at_ms, revision)
     }
 
     /// Number of control-plane reconnects observed after the initial
@@ -219,7 +309,7 @@ impl ConnectionTimeline {
         reason_code: Option<&str>,
         detail: Option<String>,
     ) {
-        let at_ms = self.record_event(event, path, reason_code, detail.clone());
+        let (at_ms, _) = self.record_event(event, path, reason_code, detail.clone());
         info!(
             event = event,
             run_id = ?self.run_id,
@@ -331,6 +421,103 @@ impl ConnectionTimeline {
         self.emit_first_scoped("", event, path, reason_code, detail)
     }
 
+    /// Record the durable first-usable summary and its event-ring milestone as
+    /// one deduplicated commit. Callers must invoke this only after the
+    /// authoritative PeerConnection state transition returned `true`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_first_usable(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        path: &str,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+        business_sent: bool,
+        business_received: bool,
+        business_exchange: bool,
+        relay_id: Option<&str>,
+        relay_connection_id: Option<u64>,
+    ) -> bool {
+        let scope = format!("peer:{peer_id}:{generation}");
+        let mut firsts = self
+            .first_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !firsts.insert((scope, "first_usable_path:first_usable_path".to_string())) {
+            return false;
+        }
+        drop(firsts);
+
+        let fields = detail
+            .as_deref()
+            .map(parse_detail_fields)
+            .unwrap_or_default();
+        let (at_ms, transition_revision) =
+            self.record_event("first_usable_path", Some(path), reason_code, detail.clone());
+        let ready_key = (peer_id.to_string(), generation);
+        let relay_ready_at_ms = self
+            .relay_ready_at_ms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&ready_key)
+            .copied();
+        let first_usable_delta_ms = relay_ready_at_ms
+            .filter(|ready_at_ms| at_ms >= *ready_at_ms)
+            .map(|ready_at_ms| at_ms.saturating_sub(ready_at_ms));
+        let summary = FirstUsableEvidenceSummary {
+            schema_version: FIRST_USABLE_SUMMARY_SCHEMA_VERSION,
+            peer_id: peer_id.to_string(),
+            path: path.to_string(),
+            network_generation: generation,
+            first_usable_at_ms: at_ms,
+            transition_revision,
+            relay_ready_at_ms,
+            first_usable_delta_ms,
+            business_sent,
+            business_received,
+            business_exchange,
+            relay_id: relay_id.map(str::to_string).or(fields.relay_id),
+            relay_connection_id,
+            reason_code: reason_code.map(str::to_string),
+            source: "authoritative_business_ingress_commit".to_string(),
+        };
+        let mut summaries = self
+            .first_usable_summaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        summaries.push_back(summary);
+        while summaries.len() > FIRST_USABLE_SUMMARY_MAX_ENTRIES {
+            summaries.pop_front();
+        }
+        drop(summaries);
+        info!(
+            event = "first_usable_path",
+            run_id = ?self.run_id,
+            corr_id = %self.correlation_id,
+            t_ms = at_ms,
+            path = path,
+            reason_code = reason_code,
+            peer_id = peer_id,
+            generation,
+            transition_revision,
+            business_sent,
+            business_received,
+            business_exchange,
+            "first_usable_path run_id={:?} corr_id={} t_ms={} peer_id={} generation={} path={} transition_revision={} business_sent={} business_received={} business_exchange={}",
+            self.run_id,
+            self.correlation_id,
+            at_ms,
+            peer_id,
+            generation,
+            path,
+            transition_revision,
+            business_sent,
+            business_received,
+            business_exchange,
+        );
+        true
+    }
+
     /// Serialize the bounded event ring for diagnostics.
     pub fn snapshot(&self) -> ConnectionTimelineDiagnostics {
         let events = self
@@ -344,6 +531,13 @@ impl ConnectionTimeline {
             run_id: self.run_id.clone(),
             correlation_id: self.correlation_id.clone(),
             events,
+            first_usable_summaries: self
+                .first_usable_summaries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -544,6 +738,99 @@ mod tests {
         assert_eq!(observed[0].path.as_deref(), Some("direct"));
         assert_eq!(observed[1].path.as_deref(), Some("relay"));
         assert_eq!(observed[1].relay_id.as_deref(), Some("relay.test"));
+    }
+
+    #[test]
+    fn first_usable_summary_is_revision_fenced_and_deduplicated() {
+        let timeline = ConnectionTimeline::new("node-a", 0);
+        timeline.set_status_event_bus(crate::diagnostics::StatusEventBus::new());
+        timeline.emit(
+            "relay_transport_ready_peer",
+            Some("relay"),
+            None,
+            Some(
+                "peer=node-b generation=7 relay_endpoint=relay.test relay_connection_id=12"
+                    .to_string(),
+            ),
+        );
+        assert!(timeline.emit_first_usable(
+            "node-b",
+            7,
+            "relay",
+            None,
+            Some("peer=node-b generation=7 ingress=relay:relay.test".to_string()),
+            true,
+            true,
+            true,
+            Some("relay.test"),
+            Some(12),
+        ));
+        assert!(!timeline.emit_first_usable(
+            "node-b",
+            7,
+            "relay",
+            None,
+            None,
+            true,
+            true,
+            true,
+            Some("relay.test"),
+            Some(12),
+        ));
+        let snapshot = timeline.snapshot();
+        assert_eq!(snapshot.first_usable_summaries.len(), 1);
+        let summary = &snapshot.first_usable_summaries[0];
+        assert_eq!(summary.schema_version, FIRST_USABLE_SUMMARY_SCHEMA_VERSION);
+        assert_eq!(summary.transition_revision, 2);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .find(|event| event.event == "first_usable_path")
+                .and_then(|event| event.transition_revision),
+            Some(2)
+        );
+        let relay_ready_at_ms = summary.relay_ready_at_ms.expect("relay ready timestamp");
+        assert!(summary.first_usable_at_ms >= relay_ready_at_ms);
+        assert_eq!(
+            summary.first_usable_delta_ms,
+            Some(summary.first_usable_at_ms - relay_ready_at_ms)
+        );
+        assert!(summary.business_sent && summary.business_received && summary.business_exchange);
+    }
+
+    #[test]
+    fn first_usable_summary_survives_event_ring_eviction() {
+        let timeline = ConnectionTimeline::new("node-a", 0);
+        timeline.emit(
+            "relay_transport_ready_peer",
+            Some("relay"),
+            None,
+            Some("peer=node-b generation=9 relay_endpoint=relay.test".to_string()),
+        );
+        assert!(timeline.emit_first_usable(
+            "node-b",
+            9,
+            "relay",
+            None,
+            Some("peer=node-b generation=9 ingress=relay:relay.test".to_string()),
+            false,
+            true,
+            false,
+            Some("relay.test"),
+            None,
+        ));
+        for _ in 0..(TIMELINE_MAX_EVENTS + 8) {
+            timeline.emit("diagnostic_noise", None, None, None);
+        }
+        let snapshot = timeline.snapshot();
+        assert!(!snapshot
+            .events
+            .iter()
+            .any(|event| event.event == "first_usable_path"));
+        assert_eq!(snapshot.first_usable_summaries.len(), 1);
+        assert_eq!(snapshot.first_usable_summaries[0].peer_id, "node-b");
+        assert_eq!(snapshot.first_usable_summaries[0].network_generation, 9);
     }
 
     #[test]

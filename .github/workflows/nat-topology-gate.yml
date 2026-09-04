@@ -68,6 +68,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+          # The component record is consumed by the exact-head aggregate.
+          # Do not let pull_request's synthetic merge ref become its source
+          # identity.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "1.26.6"
@@ -77,6 +81,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
       - name: Run deterministic Direct topology
+        env:
+          NAT_TOPOLOGY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: bash scripts/nat-sim/run-ci-topology.sh direct
       - name: Upload Direct evidence
         if: always()
@@ -173,10 +179,79 @@ jobs:
     if: always()
     needs: [unit, direct, relay]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Enforce required topology results
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify exact aggregate source head
+        id: identity
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          test "${{ needs.unit.result }}" = "success"
-          test "${{ needs.direct.result }}" = "success"
-          test "${{ needs.relay.result }}" = "success"
-          echo "all required NAT topology profiles succeeded"
+          set -euo pipefail
+          actual_head_sha="$(git rev-parse HEAD)"
+          test "$actual_head_sha" = "$EXPECTED_HEAD_SHA"
+          workflow_sha="$(git rev-parse "$actual_head_sha:.github/workflows/nat-topology-gate.yml")"
+          {
+            echo "source_head_sha=$actual_head_sha"
+            echo "workflow_sha=$workflow_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download Direct component evidence
+        id: download_direct
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: nat-topology-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nat-topology-evidence/direct
+          merge-multiple: false
+
+      - name: Download Relay component evidence
+        id: download_relay
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: nat-topology-relay-${{ github.run_id }}-${{ github.run_attempt }}-*-of-5
+          path: ${{ runner.temp }}/nat-topology-evidence/relay
+          merge-multiple: false
+
+      - name: Build actual-execution NAT aggregate
+        id: aggregate
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 scripts/nat-sim/aggregate_evidence.py \
+            --input-root "$RUNNER_TEMP/nat-topology-evidence" \
+            --source-head-sha "${{ steps.identity.outputs.source_head_sha }}" \
+            --workflow-sha "${{ steps.identity.outputs.workflow_sha }}" \
+            --output "$RUNNER_TEMP/nat-topology-aggregate.json"
+
+      - name: Upload actual-execution NAT aggregate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nat-topology-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nat-topology-aggregate.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce required topology results and aggregate
+        env:
+          UNIT_RESULT: ${{ needs.unit.result }}
+          DIRECT_RESULT: ${{ needs.direct.result }}
+          RELAY_RESULT: ${{ needs.relay.result }}
+          DOWNLOAD_DIRECT_OUTCOME: ${{ steps.download_direct.outcome }}
+          DOWNLOAD_RELAY_OUTCOME: ${{ steps.download_relay.outcome }}
+          AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
+        run: |
+          set -euo pipefail
+          test "$UNIT_RESULT" = "success"
+          test "$DIRECT_RESULT" = "success"
+          test "$RELAY_RESULT" = "success"
+          test "$DOWNLOAD_DIRECT_OUTCOME" = "success"
+          test "$DOWNLOAD_RELAY_OUTCOME" = "success"
+          test "$AGGREGATE_OUTCOME" = "success"
+          echo "all required NAT topology profiles and actual-execution evidence passed"

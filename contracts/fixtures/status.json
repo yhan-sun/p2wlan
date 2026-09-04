@@ -97,7 +97,8 @@
   "control_proxy_consults_env": false,
   "connection_timeline": {
     "correlation_id": "node-a-boot0",
-    "events": []
+    "events": [],
+    "first_usable_summaries": []
   },
   "traversal_history": {
     "sources": []
