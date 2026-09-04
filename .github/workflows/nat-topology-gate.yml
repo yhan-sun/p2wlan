@@ -54,10 +54,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nat-topology-unit-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nat-topology-unit-${{ github.run_id }}
           path: ${{ runner.temp }}/p2wlan-nat-topology-*.log
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
 
   direct:
     name: Direct cold-start topology
@@ -88,12 +89,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nat-topology-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nat-topology-direct-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/p2wlan-nat-topology-*.log
             ${{ runner.temp }}/p2wlan-nat-topology-*/**
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
 
   relay:
     name: Relay blackhole topology ${{ matrix.run }}/5
@@ -136,12 +138,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nat-topology-relay-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}-of-5
+          name: nat-topology-relay-${{ github.run_id }}-${{ matrix.run }}-of-5
           path: |
             ${{ runner.temp }}/p2wlan-nat-topology-*.log
             ${{ runner.temp }}/p2wlan-nat-topology-*/**
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
 
   fail_closed:
     name: Observability fail-closed injection
@@ -167,12 +170,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nat-topology-fail-closed-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nat-topology-fail-closed-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/p2wlan-nat-topology-*.log
             ${{ runner.temp }}/p2wlan-nat-topology-*/**
           if-no-files-found: error
           retention-days: 14
+          overwrite: true
 
   required:
     name: NAT Topology Required
@@ -205,7 +209,7 @@ jobs:
         if: always()
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: nat-topology-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          pattern: nat-topology-direct-${{ github.run_id }}
           path: ${{ runner.temp }}/nat-topology-evidence/direct
           merge-multiple: false
 
@@ -214,7 +218,7 @@ jobs:
         if: always()
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: nat-topology-relay-${{ github.run_id }}-${{ github.run_attempt }}-*-of-5
+          pattern: nat-topology-relay-${{ github.run_id }}-*-of-5
           path: ${{ runner.temp }}/nat-topology-evidence/relay
           merge-multiple: false
 
@@ -233,10 +237,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nat-topology-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nat-topology-aggregate-${{ github.run_id }}
           path: ${{ runner.temp }}/nat-topology-aggregate.json
           if-no-files-found: error
           retention-days: 90
+          overwrite: true
 
       - name: Enforce required topology results and aggregate
         env:
