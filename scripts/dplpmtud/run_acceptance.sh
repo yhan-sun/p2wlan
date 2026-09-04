@@ -27,8 +27,10 @@ run_exact() {
   local test_id=$2
   (
     cd "$ROOT_DIR"
+    # Keep libtest's canonical `test <id> ... ok` status line intact while
+    # still retaining successful test stdout for the machine-evidence parser.
     cargo test -p p2wlan-daemon --lib "$test_id" -- \
-      --exact --nocapture --test-threads=1
+      --exact --show-output --test-threads=1
   ) 2>&1 | tee "$OUT_DIR/logs/$log_file"
 }
 
