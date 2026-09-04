@@ -280,10 +280,7 @@ class MobileLifecycleCoordinator {
     }
     _permissionPending = false;
     if (!granted) return onPermissionRevoked();
-    return invalidateEventLoop(
-      event: event,
-      advanceAppEpoch: true,
-    );
+    return invalidateEventLoop(event: event, advanceAppEpoch: true);
   }
 
   MobileLifecycleTransition invalidateDiagnostics() {

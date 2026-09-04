@@ -145,35 +145,32 @@ void main() {
     expect(coordinator.onAppResumed().outcome, MobileLifecycleOutcome.failed);
   });
 
-  test(
-    'same PID accepts a newer runtime incarnation with lower revision and uptime',
-    () {
-      final coordinator = MobileLifecycleCoordinator();
-      expect(
-        coordinator
-            .observeDaemon(processId: 1234, runtimeIncarnation: 4, revision: 50)
-            .outcome,
-        MobileLifecycleOutcome.applied,
-      );
-      final replacement = coordinator.observeDaemon(
-        processId: 1234,
-        runtimeIncarnation: 5,
-        revision: 1,
-      );
-      expect(replacement.outcome, MobileLifecycleOutcome.applied);
-      expect(coordinator.identity.daemonRuntimeIncarnation, 5);
-      expect(coordinator.identity.daemonRevision, 1);
+  test('same PID accepts a newer runtime incarnation with lower revision and uptime', () {
+    final coordinator = MobileLifecycleCoordinator();
+    expect(
+      coordinator
+          .observeDaemon(processId: 1234, runtimeIncarnation: 4, revision: 50)
+          .outcome,
+      MobileLifecycleOutcome.applied,
+    );
+    final replacement = coordinator.observeDaemon(
+      processId: 1234,
+      runtimeIncarnation: 5,
+      revision: 1,
+    );
+    expect(replacement.outcome, MobileLifecycleOutcome.applied);
+    expect(coordinator.identity.daemonRuntimeIncarnation, 5);
+    expect(coordinator.identity.daemonRevision, 1);
 
-      final lateOld = coordinator.observeDaemon(
-        processId: 1234,
-        runtimeIncarnation: 4,
-        revision: 51,
-      );
-      expect(lateOld.outcome, MobileLifecycleOutcome.staleRejected);
-      expect(coordinator.identity.daemonRuntimeIncarnation, 5);
-      expect(coordinator.identity.daemonRevision, 1);
-    },
-  );
+    final lateOld = coordinator.observeDaemon(
+      processId: 1234,
+      runtimeIncarnation: 4,
+      revision: 51,
+    );
+    expect(lateOld.outcome, MobileLifecycleOutcome.staleRejected);
+    expect(coordinator.identity.daemonRuntimeIncarnation, 5);
+    expect(coordinator.identity.daemonRevision, 1);
+  });
 
   test('Android transport is injectable at the production boundary', () async {
     final fake = _FakeAndroidVpnTransport();

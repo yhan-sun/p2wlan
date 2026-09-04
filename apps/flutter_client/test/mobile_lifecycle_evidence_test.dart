@@ -47,9 +47,7 @@ void main() {
       oldIdentity: oldIdentity,
       newIdentity: transition.newIdentity,
       decision: transition.outcome,
-      invariants: {
-        'resume_refresh_precedes_poll': resumeRefreshPrecedesPoll,
-      },
+      invariants: {'resume_refresh_precedes_poll': resumeRefreshPrecedesPoll},
     );
   });
 
@@ -103,7 +101,11 @@ void main() {
       oldIdentity: oldIdentity,
       newIdentity: revoke.newIdentity,
       decision: late.outcome,
-      invariants: {'pending_permission_invalidated': !coordinator.acceptsAppEpoch(oldIdentity.appEpoch)},
+      invariants: {
+        'pending_permission_invalidated': !coordinator.acceptsAppEpoch(
+          oldIdentity.appEpoch,
+        ),
+      },
     );
   });
 
@@ -118,7 +120,10 @@ void main() {
       granted: true,
     );
     expect(grant.outcome, MobileLifecycleOutcome.applied);
-    expect(second.newIdentity.permissionRequestId, greaterThan(first.newIdentity.permissionRequestId!));
+    expect(
+      second.newIdentity.permissionRequestId,
+      greaterThan(first.newIdentity.permissionRequestId!),
+    );
     _record(
       scenarioId: 'ML-07',
       exactTestId: _testId('ML-07 vpn-permission-regrant'),
@@ -128,7 +133,8 @@ void main() {
       decision: grant.outcome,
       invariants: {
         'new_permission_attempt':
-            grant.newIdentity.permissionRequestId != oldIdentity.permissionRequestId,
+            grant.newIdentity.permissionRequestId !=
+            oldIdentity.permissionRequestId,
       },
     );
   });
@@ -140,7 +146,9 @@ void main() {
     final recreation = coordinator.invalidateEventLoop(
       event: MobileLifecycleEvent.activityRecreated,
     );
-    final oldCallbackAccepted = coordinator.acceptsAppEpoch(oldIdentity.appEpoch);
+    final oldCallbackAccepted = coordinator.acceptsAppEpoch(
+      oldIdentity.appEpoch,
+    );
     expect(recreation.outcome, MobileLifecycleOutcome.applied);
     expect(oldCallbackAccepted, isFalse);
     _record(
@@ -167,7 +175,10 @@ void main() {
       oldIdentity: first.newIdentity,
       newIdentity: replacement.newIdentity,
       decision: replacement.outcome,
-      invariants: {'bridge_identity_adopted': replacement.newIdentity.bridgeIncarnation == 5},
+      invariants: {
+        'bridge_identity_adopted':
+            replacement.newIdentity.bridgeIncarnation == 5,
+      },
     );
   });
 
@@ -178,7 +189,10 @@ void main() {
       event: MobileLifecycleEvent.controlReconnected,
     );
     expect(reconnect.outcome, MobileLifecycleOutcome.applied);
-    expect(reconnect.newIdentity.eventLoopGeneration, greaterThan(oldIdentity.eventLoopGeneration));
+    expect(
+      reconnect.newIdentity.eventLoopGeneration,
+      greaterThan(oldIdentity.eventLoopGeneration),
+    );
     _record(
       scenarioId: 'ML-12',
       exactTestId: _testId('ML-12 control-websocket-reconnect'),
@@ -188,7 +202,8 @@ void main() {
       decision: reconnect.outcome,
       invariants: {
         'new_control_generation_adopted':
-            reconnect.newIdentity.eventLoopGeneration > oldIdentity.eventLoopGeneration,
+            reconnect.newIdentity.eventLoopGeneration >
+            oldIdentity.eventLoopGeneration,
       },
     );
   });
@@ -208,16 +223,25 @@ void main() {
     _record(
       scenarioId: 'ML-18',
       exactTestId: _testId('ML-18 duplicate-events-idempotent'),
-      events: ['app_backgrounded', 'app_backgrounded', 'app_resumed', 'app_resumed'],
+      events: [
+        'app_backgrounded',
+        'app_backgrounded',
+        'app_resumed',
+        'app_resumed',
+      ],
       oldIdentity: resumed.newIdentity,
       newIdentity: duplicateResume.newIdentity,
       decision: duplicateResume.outcome,
       invariants: {
         'duplicate_has_no_second_effect':
-            duplicateResume.newIdentity.eventLoopGeneration == resumed.newIdentity.eventLoopGeneration,
+            duplicateResume.newIdentity.eventLoopGeneration ==
+            resumed.newIdentity.eventLoopGeneration,
       },
     );
-    expect(oldIdentity.eventLoopGeneration, lessThan(resumed.newIdentity.eventLoopGeneration));
+    expect(
+      oldIdentity.eventLoopGeneration,
+      lessThan(resumed.newIdentity.eventLoopGeneration),
+    );
   });
 }
 
@@ -234,18 +258,6 @@ void _record({
   required Map<String, bool> invariants,
 }) {
   print(
-    'MOBILE_LIFECYCLE_RECORD ${jsonEncode({
-      'scenario_id': scenarioId,
-      'exact_test_id': exactTestId,
-      'executed': true,
-      'skipped': false,
-      'result': 'pass',
-      'events': events,
-      'observed_old_identity': oldIdentity.toJson(),
-      'observed_new_identity': newIdentity.toJson(),
-      'observed_decision': decision.wireName,
-      'invariants': invariants,
-      'execution_source': 'flutter_machine_reporter',
-    })}',
+    'MOBILE_LIFECYCLE_RECORD ${jsonEncode({'scenario_id': scenarioId, 'exact_test_id': exactTestId, 'executed': true, 'skipped': false, 'result': 'pass', 'events': events, 'observed_old_identity': oldIdentity.toJson(), 'observed_new_identity': newIdentity.toJson(), 'observed_decision': decision.wireName, 'invariants': invariants, 'execution_source': 'flutter_machine_reporter'})}',
   );
 }
