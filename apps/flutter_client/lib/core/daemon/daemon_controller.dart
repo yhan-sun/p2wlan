@@ -21,6 +21,85 @@ part 'daemon_controller/pids.dart';
 part 'daemon_controller/android_vpn.dart';
 part 'daemon_controller/startup_trace.dart';
 
+/// Injectable Android platform boundary. Production uses the
+/// [MethodChannelAndroidVpnTransport]; tests can provide a fake without
+/// opening a global MethodChannel or requiring an Android device.
+abstract interface class AndroidVpnTransport {
+  Future<bool> prepareVpn();
+  Future<bool> start(String requestJson);
+  Future<bool> stop();
+  Future<AndroidVpnStatus> status();
+}
+
+class AndroidVpnStatus {
+  const AndroidVpnStatus({
+    required this.serviceRunning,
+    required this.nativeRunning,
+    required this.nativeReady,
+    this.nativeError,
+    this.serviceIncarnation,
+    this.bridgeIncarnation,
+    this.lifecycleGeneration,
+    this.permissionState,
+    this.lastTransition,
+    this.lastResult,
+  });
+
+  final bool serviceRunning;
+  final bool nativeRunning;
+  final bool nativeReady;
+  final String? nativeError;
+  final int? serviceIncarnation;
+  final int? bridgeIncarnation;
+  final int? lifecycleGeneration;
+  final String? permissionState;
+  final String? lastTransition;
+  final String? lastResult;
+}
+
+class MethodChannelAndroidVpnTransport implements AndroidVpnTransport {
+  const MethodChannelAndroidVpnTransport({
+    this.channel = const MethodChannel('p2wlan/android_vpn'),
+  });
+
+  final MethodChannel channel;
+
+  @override
+  Future<bool> prepareVpn() async =>
+      await channel.invokeMethod<bool>('prepareVpn') ?? false;
+
+  @override
+  Future<bool> start(String requestJson) async =>
+      await channel.invokeMethod<bool>('start', {'requestJson': requestJson}) ??
+      false;
+
+  @override
+  Future<bool> stop() async =>
+      await channel.invokeMethod<bool>('stop') ?? false;
+
+  @override
+  Future<AndroidVpnStatus> status() async {
+    final value = await channel.invokeMethod<Map<Object?, Object?>>('status');
+    int? integer(String key) {
+      final raw = value?[key];
+      return raw is num ? raw.toInt() : null;
+    }
+
+    return AndroidVpnStatus(
+      serviceRunning: value?['serviceRunning'] == true,
+      nativeRunning: value?['nativeRunning'] == true,
+      nativeReady: value?['nativeReady'] == true,
+      nativeError: value?['nativeError']?.toString(),
+      serviceIncarnation: integer('serviceIncarnation'),
+      bridgeIncarnation: integer('bridgeIncarnation'),
+      lifecycleGeneration: integer('lifecycleGeneration'),
+      permissionState: value?['permissionState']?.toString(),
+      lastTransition: value?['lastTransition']?.toString(),
+      lastResult: value?['lastResult']?.toString(),
+    );
+  }
+}
+
 class DaemonCommandResult {
   const DaemonCommandResult({
     required this.ok,
@@ -51,6 +130,7 @@ class DaemonCommandResult {
 class DaemonController {
   DaemonController({
     required this._diagnosticsApi,
+    this.androidVpnTransport = const MethodChannelAndroidVpnTransport(),
     this.readMacosAdminPassword,
     this.saveMacosAdminPassword,
     this.clearMacosAdminPassword,
@@ -67,6 +147,14 @@ class DaemonController {
   static const _gracefulShutdownTimeout = Duration(seconds: 12);
 
   final DiagnosticsApi _diagnosticsApi;
+  final AndroidVpnTransport androidVpnTransport;
+
+  /// Returns the additive Android lifecycle identity when running on Android.
+  /// Non-Android callers receive null without touching a platform channel.
+  Future<AndroidVpnStatus?> androidStatus() async {
+    if (!Platform.isAndroid) return null;
+    return androidVpnTransport.status();
+  }
 
   /// These callbacks are supplied by [SettingsStore] for the normal app
   /// path. Keeping them as callbacks also lets the PID cleanup path reuse the

@@ -120,6 +120,18 @@ pub struct Daemon {
     /// the VPN dataplane is actually ready for diagnostics traffic.
     #[cfg(target_os = "android")]
     android_startup_ready: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Incarnation assigned by the Android JNI runtime owner. This is
+    /// additive diagnostics identity; desktop daemons continue without it.
+    #[cfg(target_os = "android")]
+    android_runtime_incarnation: Option<u64>,
+    /// Dedicated receivers stay alive from JNI startup through worker spawn,
+    /// so a callback that arrives during daemon setup is queued instead of
+    /// being dropped before direct/relay supervisors subscribe.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    android_network_change_direct_rx: Option<AndroidNetworkChangeReceiver>,
+    android_network_change_relay_rx: Option<AndroidNetworkChangeReceiver>,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    android_network_change_control_rx: Option<AndroidNetworkChangeReceiver>,
 }
 
 impl Daemon {
@@ -292,6 +304,11 @@ impl Daemon {
             android_tun_mode: AndroidTunMode::AsyncFd,
             #[cfg(target_os = "android")]
             android_startup_ready: None,
+            #[cfg(target_os = "android")]
+            android_runtime_incarnation: None,
+            android_network_change_direct_rx: None,
+            android_network_change_relay_rx: None,
+            android_network_change_control_rx: None,
         }
     }
 
@@ -327,6 +344,59 @@ impl Daemon {
         self.android_startup_ready = Some(ready);
     }
 
+    /// Bind diagnostics to the JNI bridge/runtime incarnation that owns this
+    /// embedded daemon. It is set before `run()` starts the diagnostics task.
+    #[cfg(target_os = "android")]
+    pub fn set_android_runtime_incarnation(&mut self, incarnation: u64) {
+        self.android_runtime_incarnation = (incarnation > 0).then_some(incarnation);
+    }
+
+    /// Install the Android callback hint stream. The daemon retains the
+    /// sender so every transport supervisor can subscribe independently while
+    /// the JNI runtime handle remains the owner of the channel lifetime.
+    #[cfg(target_os = "android")]
+    pub fn set_android_network_change_sender(
+        &mut self,
+        sender: broadcast::Sender<AndroidNetworkChangeHint>,
+    ) {
+        self.android_network_change_direct_rx = Some(Arc::new(Mutex::new(sender.subscribe())));
+        self.android_network_change_relay_rx = Some(Arc::new(Mutex::new(sender.subscribe())));
+        self.android_network_change_control_rx = Some(Arc::new(Mutex::new(sender.subscribe())));
+    }
+
+    /// Forward Android's already-authorized physical-network edge into the
+    /// existing control lifecycle. This bridge does not own connection state
+    /// or create a second lifecycle loop.
+    #[cfg(target_os = "android")]
+    async fn spawn_android_network_change_control_watcher(&self) {
+        let Some(network_change_rx) = self.android_network_change_control_rx.clone() else {
+            return;
+        };
+        let control = self.control.clone();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        self.task_manager
+            .spawn("android-network-control", false, async move {
+                loop {
+                    let hint = tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                        hint = recv_android_network_change(network_change_rx.clone()) => hint,
+                    };
+                    if hint.is_some() {
+                        control.network_changed();
+                    } else {
+                        break;
+                    }
+                }
+            })
+            .await;
+    }
+
     /// Return a clone of the shutdown sender so main can signal SIGTERM/SIGINT.
     pub fn shutdown_sender(&self) -> tokio::sync::watch::Sender<bool> {
         self.shutdown_tx.clone()
@@ -336,5 +406,19 @@ impl Daemon {
     pub fn request_shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
         self.task_manager.request_shutdown();
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn recv_android_network_change(
+    network_change_rx: AndroidNetworkChangeReceiver,
+) -> Option<AndroidNetworkChangeHint> {
+    let mut receiver = network_change_rx.lock().await;
+    loop {
+        match receiver.recv().await {
+            Ok(hint) => return Some(hint),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
     }
 }

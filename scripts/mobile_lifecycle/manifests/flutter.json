@@ -1,0 +1,14 @@
+{
+  "component": "flutter",
+  "scenarios": [
+    {"scenario_id": "ML-01", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-01 app-background-late-long-poll"},
+    {"scenario_id": "ML-02", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-02 app-resume-refresh-before-reconnect"},
+    {"scenario_id": "ML-03", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-03 daemon-process-recreation"},
+    {"scenario_id": "ML-06", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-06 vpn-permission-revoke"},
+    {"scenario_id": "ML-07", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-07 vpn-permission-regrant"},
+    {"scenario_id": "ML-08", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-08 activity-engine-recreation"},
+    {"scenario_id": "ML-10", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-10 native-bridge-reattachment"},
+    {"scenario_id": "ML-12", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-12 control-websocket-reconnect"},
+    {"scenario_id": "ML-18", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-18 duplicate-events-idempotent"}
+  ]
+}

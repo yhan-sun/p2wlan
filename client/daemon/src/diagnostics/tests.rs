@@ -231,6 +231,7 @@ mod tests {
             status_events,
             None,
             Some("diag-test-token".to_string()),
+            None,
         );
         let context_probe = context.clone();
         let worker = tokio::spawn(serve_diagnostics(listener, context, shutdown_rx));

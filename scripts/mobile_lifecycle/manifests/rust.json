@@ -1,0 +1,17 @@
+{
+  "component": "rust",
+  "scenarios": [
+    {"scenario_id": "ML-03", "exact_test_id": "tests::mobile_lifecycle_evidence::ml03_runtime_owner_replacement"},
+    {"scenario_id": "ML-04", "exact_test_id": "tests::mobile_lifecycle_evidence::ml04_android_network_hint"},
+    {"scenario_id": "ML-05", "exact_test_id": "tests::mobile_lifecycle_evidence::ml05_hotspot_network_hint"},
+    {"scenario_id": "ML-10", "exact_test_id": "lifecycle::tests::evidence_ml10_bridge_incarnation_adoption"},
+    {"scenario_id": "ML-11", "exact_test_id": "lifecycle::tests::evidence_ml11_old_bridge_cleanup"},
+    {"scenario_id": "ML-12", "exact_test_id": "control::websocket::route_tests::evidence_ml12_control_reconnect"},
+    {"scenario_id": "ML-13", "exact_test_id": "control::websocket::route_tests::evidence_ml13_stale_control_message"},
+    {"scenario_id": "ML-14", "exact_test_id": "tests::mobile_lifecycle_evidence::ml14_stale_candidate_result"},
+    {"scenario_id": "ML-15", "exact_test_id": "tests::mobile_lifecycle_evidence::ml15_stale_socket_publication"},
+    {"scenario_id": "ML-16", "exact_test_id": "tests::mobile_lifecycle_evidence::ml16_relay_retention"},
+    {"scenario_id": "ML-17", "exact_test_id": "tests::mobile_lifecycle_evidence::ml17_direct_current_generation"},
+    {"scenario_id": "ML-18", "exact_test_id": "lifecycle::tests::physical_network_hint_is_owner_scoped_and_exactly_once"}
+  ]
+}

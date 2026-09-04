@@ -2,6 +2,8 @@ impl Daemon {
     /// Run the daemon main loop.
     pub async fn run(&mut self) -> Result<()> {
         info!("P2WLAN daemon v{} starting...", env!("CARGO_PKG_VERSION"));
+        #[cfg(target_os = "android")]
+        self.spawn_android_network_change_control_watcher().await;
         let build = crate::build_info::current();
         info!(
             event = "daemon_build_identity",
@@ -260,6 +262,7 @@ impl Daemon {
                 timeline: self.timeline.clone(),
                 inbound_tx: network_inbound_tx.clone(),
                 control: self.control.clone(),
+                android_network_change_rx: self.android_network_change_relay_rx.clone(),
                 allow_insecure_plaintext: self.config.relay.allow_insecure_plaintext,
                 ca_cert_path: self.config.relay.ca_cert_path.clone(),
             })
@@ -422,6 +425,10 @@ impl Daemon {
         if self.config.diagnostics.enabled {
             let diagnostics_bind = self.config.diagnostics.bind.clone();
             info!("[diagnostics] starting on {diagnostics_bind}");
+            #[cfg(target_os = "android")]
+            let runtime_incarnation = self.android_runtime_incarnation;
+            #[cfg(not(target_os = "android"))]
+            let runtime_incarnation = None;
             let diagnostics_context = DiagnosticsContext::new(
                 self.config.clone(),
                 self.peers.clone(),
@@ -439,6 +446,7 @@ impl Daemon {
                 self.status_events.clone(),
                 self.config.diagnostics.log_path.clone(),
                 self.config.diagnostics.auth_token.clone(),
+                runtime_incarnation,
             );
             let shutdown_rx = self.shutdown_rx.clone();
             let (diagnostics_ready_tx, diagnostics_ready_rx) =
@@ -525,6 +533,10 @@ impl Daemon {
             proxy_env,
             excluded_interfaces,
             shutdown_rx: self.shutdown_rx.clone(),
+            android_network_change_rx: self.android_network_change_direct_rx.clone(),
+            android_network_change_observed: Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ),
         };
         self.task_manager
             .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))

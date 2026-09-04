@@ -5,6 +5,7 @@ class DiagnosticsSnapshot {
     required this.raw,
     required this.version,
     required this.processId,
+    this.runtimeIncarnation,
     required this.nodeId,
     required this.virtualIp,
     required this.networkId,
@@ -35,6 +36,10 @@ class DiagnosticsSnapshot {
   final int contractVersion;
   final String version;
   final int? processId;
+
+  /// Additive native bridge/runtime identity. Android may restart Rust inside
+  /// the same PID, with both revision and uptime reset to lower values.
+  final int? runtimeIncarnation;
   final String nodeId;
   final String virtualIp;
   final String networkId;
@@ -76,6 +81,7 @@ class DiagnosticsSnapshot {
       contractVersion: _contractVersion(json),
       version: _string(json['version']),
       processId: _intOrNull(json['process_id']),
+      runtimeIncarnation: _intOrNull(json['runtime_incarnation']),
       nodeId: _string(json['node_id']),
       virtualIp: _string(json['virtual_ip']),
       networkId: _string(json['network_id']),

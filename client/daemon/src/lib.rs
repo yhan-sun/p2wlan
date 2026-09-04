@@ -81,9 +81,26 @@ use tokio::net::lookup_host;
 #[cfg(test)]
 #[allow(unused_imports)]
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 use tokio::time::{interval, sleep, timeout};
 use tracing::{debug, error, info, warn};
+
+/// One physical-network handoff hint emitted by the Android JNI boundary.
+///
+/// The Kotlin callback reducer and the Rust bridge owner validate identity
+/// before this value is published. Once here, the existing UDP/relay/control
+/// lifecycle consumes it; it is deliberately not a second path state machine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AndroidNetworkChangeHint {
+    pub kotlin_network_generation: u64,
+    pub network_identity_hash: String,
+}
+
+/// A broadcast receiver is shared by the existing direct and relay lifecycle
+/// tasks. Each task consumes the same authoritative hint independently so a
+/// direct rebind and a relay/control reconnect can be coordinated without
+/// duplicating the Kotlin callback state.
+pub type AndroidNetworkChangeReceiver = Arc<Mutex<broadcast::Receiver<AndroidNetworkChangeHint>>>;
 
 use acl::AclEngine;
 use candidate_refresh::{

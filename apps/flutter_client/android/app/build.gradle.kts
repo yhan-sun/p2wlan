@@ -3,6 +3,7 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.util.Properties
 import java.util.UUID
+import org.gradle.api.tasks.testing.Test
 
 plugins {
     id("com.android.application")
@@ -81,6 +82,17 @@ android {
                 signingConfigs.getByName("debug")
             }
         }
+    }
+
+}
+
+// The Android lifecycle evidence parser binds every required scenario to the
+// JUnit method that actually emitted its record. Preserve stdout in the test
+// task output instead of relying on a component-wide Gradle exit status.
+tasks.withType<Test>().configureEach {
+    testLogging {
+        showStandardStreams = true
+        events("passed", "skipped", "failed", "standardOut", "standardError")
     }
 }
 

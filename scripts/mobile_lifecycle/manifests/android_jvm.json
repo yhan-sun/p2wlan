@@ -1,0 +1,15 @@
+{
+  "component": "android_jvm",
+  "scenarios": [
+    {"scenario_id": "ML-03", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl03DaemonProcessRecreation"},
+    {"scenario_id": "ML-04", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl04WifiToCellularHandoff"},
+    {"scenario_id": "ML-05", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl05CellularToWifiHotspotHandoff"},
+    {"scenario_id": "ML-06", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl06VpnPermissionRevoke"},
+    {"scenario_id": "ML-07", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl07VpnPermissionRegrant"},
+    {"scenario_id": "ML-08", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl08ActivityEngineRecreation"},
+    {"scenario_id": "ML-09", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl09ServiceRecreation"},
+    {"scenario_id": "ML-10", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl10BridgeReattachment"},
+    {"scenario_id": "ML-11", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl11OldBridgeTeardown"},
+    {"scenario_id": "ML-18", "exact_test_id": "com.example.p2wlan_flutter_client.MobileLifecycleCoordinatorTest#evidenceMl18DuplicateEvents"}
+  ]
+}

@@ -11,6 +11,7 @@ struct RelayInboundSpawnContext {
     timeline: Arc<crate::connection_timeline::ConnectionTimeline>,
     inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
     control: ControlClient,
+    android_network_change_rx: Option<AndroidNetworkChangeReceiver>,
     allow_insecure_plaintext: bool,
     ca_cert_path: Option<String>,
 }
@@ -31,6 +32,7 @@ async fn spawn_relay_inbound(ctx: RelayInboundSpawnContext) {
                 relay_available_tx: ctx.relay_available_tx,
                 timeline: ctx.timeline,
                 inbound_tx: ctx.inbound_tx,
+                android_network_change_rx: ctx.android_network_change_rx,
                 ticket_cache: Some(Arc::new(RelayTicketCache::new(ctx.control))),
                 relay_ticket: None,
                 allow_insecure_plaintext: ctx.allow_insecure_plaintext,

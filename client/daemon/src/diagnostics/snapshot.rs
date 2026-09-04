@@ -70,6 +70,7 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
     DiagnosticsSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
         process_id: std::process::id(),
+        runtime_incarnation: context.runtime_incarnation,
         node_id: context.config.node.node_id.clone(),
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),
@@ -496,6 +497,7 @@ async fn build_runtime_snapshot(context: DiagnosticsContext) -> RuntimeDiagnosti
     RuntimeDiagnosticsSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
         process_id: std::process::id(),
+        runtime_incarnation: context.runtime_incarnation,
         node_id: context.config.node.node_id.clone(),
         virtual_ip: context.config.network.virtual_ip.clone(),
         network_id: context.config.network.network_id.clone(),

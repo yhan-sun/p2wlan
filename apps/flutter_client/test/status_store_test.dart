@@ -318,6 +318,84 @@ void main() {
     expect(stores.statusStore.snapshot?.peers, isEmpty);
   });
 
+  test('rejects a late response from a retired daemon process', () async {
+    final fixture = await _loadFixture();
+    final oldProcess = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 10,
+      uptimeMs: 10000,
+    );
+    final newProcess = _snapshotCopy(
+      fixture,
+      processId: 43,
+      revision: 1,
+      uptimeMs: 100,
+      peers: const <dynamic>[],
+    );
+    final delayedOldProcess = _snapshotCopy(
+      fixture,
+      processId: 42,
+      revision: 11,
+      uptimeMs: 11000,
+    );
+    final api = _SwitchingDiagnosticsApi(
+      snapshot: newProcess,
+      snapshots: [oldProcess, newProcess, delayedOldProcess],
+    );
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+
+    expect(stores.statusStore.snapshot?.processId, 43);
+    expect(stores.statusStore.snapshot?.revision, 1);
+    expect(stores.statusStore.snapshot?.peers, isEmpty);
+  });
+
+  test('same PID runtime replacement accepts lower revision then rejects late old snapshot', () async {
+    final fixture = await _loadFixture();
+    final oldRuntime = _snapshotCopy(
+      fixture,
+      processId: 1234,
+      runtimeIncarnation: 4,
+      revision: 50,
+      uptimeMs: 10000,
+    );
+    final newRuntime = _snapshotCopy(
+      fixture,
+      processId: 1234,
+      runtimeIncarnation: 5,
+      revision: 1,
+      uptimeMs: 100,
+      peers: const <dynamic>[],
+    );
+    final lateOldRuntime = _snapshotCopy(
+      fixture,
+      processId: 1234,
+      runtimeIncarnation: 4,
+      revision: 51,
+      uptimeMs: 11000,
+    );
+    final api = _SwitchingDiagnosticsApi(
+      snapshot: newRuntime,
+      snapshots: [oldRuntime, newRuntime, lateOldRuntime],
+    );
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+    await stores.statusStore.refresh();
+
+    expect(stores.statusStore.snapshot?.processId, 1234);
+    expect(stores.statusStore.snapshot?.runtimeIncarnation, 5);
+    expect(stores.statusStore.snapshot?.revision, 1);
+    expect(stores.statusStore.snapshot?.peers, isEmpty);
+  });
+
   test(
     'startup settling never restores an older larger peer catalog',
     () async {
@@ -467,6 +545,62 @@ void main() {
     },
   );
 
+  test('one event-loop generation fences disable/enable and dispose without a spin', () async {
+    final fixture = await _loadFixture();
+    final api = _LifecycleDiagnosticsApi(snapshot: fixture);
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    stores.statusStore.setAutoRefresh(enabled: true);
+    await _waitUntil(() => api.eventRequests.length == 1);
+    final activeGeneration = stores.statusStore.eventLoopGeneration;
+
+    stores.statusStore.setAutoRefresh(enabled: false);
+    expect(stores.statusStore.eventLoopGeneration, activeGeneration + 1);
+    stores.statusStore.setAutoRefresh(enabled: true);
+    await _waitUntil(() => api.eventRequests.length == 2);
+    expect(
+      api.eventRequests,
+      hasLength(2),
+      reason: 'enable must create exactly one replacement long poll',
+    );
+
+    // Completing the request fenced by disable must not re-arm polling.
+    api.completeEventRequest(0, fixture);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(
+      api.eventRequests,
+      hasLength(2),
+      reason: 'a stale completion must be rejected without a microtask spin',
+    );
+
+    stores.statusStore.dispose();
+    api.completeEventRequest(1, fixture);
+    stores.statusStore.setAutoRefresh(enabled: true, refreshImmediately: true);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(api.eventRequests, hasLength(2));
+  });
+
+  test(
+    'rapid background/resume callbacks are idempotent at one lifecycle fence',
+    () async {
+      final fixture = await _loadFixture();
+      final api = _LifecycleDiagnosticsApi(snapshot: fixture);
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      final before = stores.statusStore.eventLoopGeneration;
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.paused);
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.paused);
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.resumed);
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.resumed);
+
+      expect(stores.statusStore.eventLoopGeneration, before + 2);
+    },
+  );
+
   test(
     'event poll carries process identity and resets on daemon restart',
     () async {
@@ -512,11 +646,29 @@ void main() {
       stores.statusStore.setAutoRefresh(enabled: false);
     },
   );
+
+  test('disposed store cannot restart polling', () async {
+    final fixture = await _loadFixture();
+    final api = _SwitchingDiagnosticsApi(snapshot: fixture);
+    final stores = await _makeStores(api);
+    addTearDown(stores.dispose);
+
+    await stores.statusStore.refresh();
+    final statusCount = api.statusFetchCount;
+    stores.statusStore.dispose();
+
+    stores.statusStore.setAutoRefresh(enabled: true, refreshImmediately: true);
+    await stores.statusStore.refresh();
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+
+    expect(api.statusFetchCount, statusCount);
+  });
 }
 
 DiagnosticsSnapshot _snapshotCopy(
   DiagnosticsSnapshot source, {
   required int processId,
+  int? runtimeIncarnation,
   required int revision,
   required int uptimeMs,
   List<dynamic>? peers,
@@ -529,6 +681,9 @@ DiagnosticsSnapshot _snapshotCopy(
     ..['peer_snapshot_stale'] = false
     ..['peer_snapshot_age_ms'] = 0
     ..['uptime_ms'] = uptimeMs;
+  if (runtimeIncarnation != null) {
+    raw['runtime_incarnation'] = runtimeIncarnation;
+  }
   if (peers != null) raw['peers'] = peers;
   return DiagnosticsSnapshot.fromJson(raw);
 }

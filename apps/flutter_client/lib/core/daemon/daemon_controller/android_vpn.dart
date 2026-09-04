@@ -5,7 +5,6 @@ part of '../daemon_controller.dart';
 /// Android has no detached executable to launch. The platform service owns the
 /// TUN permission and foreground lifecycle; the existing DiagnosticsApi still
 /// remains the readiness/status contract for the UI.
-const _androidVpnChannel = MethodChannel('p2wlan/android_vpn');
 // Build-time experiment switches keep the default APK on the existing
 // AsyncFd/no-Wi-Fi-lock path while allowing GitHub Actions/device A/B builds
 // to select the alternate implementation without adding UI state.
@@ -48,9 +47,13 @@ extension DaemonControllerAndroidVpn on DaemonController {
     final requestJson = _androidRequestJson(settings);
 
     try {
-      await _androidVpnChannel.invokeMethod<bool>('start', {
-        'requestJson': requestJson,
-      });
+      final started = await androidVpnTransport.start(requestJson);
+      if (!started) {
+        return const DaemonCommandResult(
+          ok: false,
+          message: 'Android VPN 服务拒绝启动请求。',
+        );
+      }
     } on PlatformException catch (error) {
       return DaemonCommandResult(
         ok: false,
@@ -109,7 +112,7 @@ extension DaemonControllerAndroidVpn on DaemonController {
 
   Future<DaemonCommandResult> _stopAndroidVpn() async {
     try {
-      await _androidVpnChannel.invokeMethod<bool>('stop');
+      await androidVpnTransport.stop();
     } on PlatformException catch (error) {
       return DaemonCommandResult(
         ok: false,
@@ -142,7 +145,7 @@ extension DaemonControllerAndroidVpn on DaemonController {
 
   Future<bool> _prepareAndroidVpn() async {
     try {
-      return await _androidVpnChannel.invokeMethod<bool>('prepareVpn') ?? false;
+      return await androidVpnTransport.prepareVpn();
     } catch (_) {
       return false;
     }
@@ -150,9 +153,7 @@ extension DaemonControllerAndroidVpn on DaemonController {
 
   Future<bool> _androidNativeRunning() async {
     try {
-      final status = await _androidVpnChannel
-          .invokeMethod<Map<Object?, Object?>>('status');
-      return status?['nativeRunning'] == true;
+      return (await androidVpnTransport.status()).nativeRunning;
     } catch (_) {
       return false;
     }
@@ -160,9 +161,9 @@ extension DaemonControllerAndroidVpn on DaemonController {
 
   Future<String?> _androidNativeError() async {
     try {
-      final status = await _androidVpnChannel
-          .invokeMethod<Map<Object?, Object?>>('status');
-      final value = status?['nativeError']?.toString().trim();
+      final value = (await androidVpnTransport.status()).nativeError
+          ?.toString()
+          .trim();
       return value == null || value.isEmpty ? null : value;
     } catch (_) {
       return null;

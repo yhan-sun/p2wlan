@@ -2732,6 +2732,7 @@ impl Daemon {
                 timeline: self.timeline.clone(),
                 inbound_tx: network_inbound_tx.clone(),
                 control: self.control.clone(),
+                android_network_change_rx: self.android_network_change_relay_rx.clone(),
                 allow_insecure_plaintext,
                 ca_cert_path: self.config.relay.ca_cert_path.clone(),
             })

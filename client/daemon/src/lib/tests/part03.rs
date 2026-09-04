@@ -211,6 +211,7 @@ async fn relay_supervisor_reconnects_after_stream_closes() {
             relay_available_tx: relay_available_tx.clone(),
             timeline: crate::connection_timeline::ConnectionTimeline::new("node-a", 0),
             inbound_tx,
+            android_network_change_rx: None,
             ticket_cache: None,
             relay_ticket: None,
             allow_insecure_plaintext: true, // test
@@ -264,6 +265,7 @@ async fn relay_supervisor_fails_over_to_standby_after_runtime_disconnect() {
             relay_available_tx: relay_available_tx.clone(),
             timeline: crate::connection_timeline::ConnectionTimeline::new("node-a", 0),
             inbound_tx,
+            android_network_change_rx: None,
             ticket_cache: None,
             relay_ticket: None,
             allow_insecure_plaintext: true,
@@ -5706,6 +5708,7 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
         daemon.status_events.clone(),
         None,
         Some("relay-liveness-test".to_string()),
+        None,
     );
     let (diag_ready_tx, diag_ready_rx) = tokio::sync::oneshot::channel();
     let diagnostics_worker = tokio::spawn(run_diagnostics_server_with_retry_ready(

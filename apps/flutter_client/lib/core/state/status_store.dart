@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart' show AppLifecycleState;
 
 import '../api/diagnostics_api.dart';
 import '../daemon/daemon_controller.dart';
+import '../lifecycle/mobile_lifecycle_coordinator.dart';
 import '../models/diagnostics_models.dart';
 import 'settings_store.dart';
 
@@ -14,6 +15,7 @@ class StatusStore extends ChangeNotifier {
     required this.settingsStore,
     required this.diagnosticsApi,
     DaemonController? daemonController,
+    MobileLifecycleCoordinator? lifecycleCoordinator,
     this.autoRefreshInterval = defaultActivePollingInterval,
     this.backgroundRefreshInterval = defaultBackgroundPollingInterval,
     this.maxSnapshotAge = defaultMaxSnapshotAge,
@@ -23,7 +25,9 @@ class StatusStore extends ChangeNotifier {
     this.startupCatalogRefreshInterval = defaultStartupCatalogRefreshInterval,
     this.routeVerificationInterval = Duration.zero,
     this.metricsUpdateInterval = defaultMetricsUpdateInterval,
-  }) : daemonController =
+  }) : lifecycleCoordinator =
+           lifecycleCoordinator ?? MobileLifecycleCoordinator(),
+       daemonController =
            daemonController ??
            DaemonController(
              diagnosticsApi: diagnosticsApi,
@@ -67,6 +71,7 @@ class StatusStore extends ChangeNotifier {
 
   final SettingsStore settingsStore;
   final DiagnosticsApi diagnosticsApi;
+  final MobileLifecycleCoordinator lifecycleCoordinator;
   final DaemonController daemonController;
   final Duration autoRefreshInterval;
   final Duration backgroundRefreshInterval;
@@ -81,7 +86,6 @@ class StatusStore extends ChangeNotifier {
   Timer? _timer;
   Timer? _staleTimer;
   Future<void>? _eventLoopFuture;
-  var _eventLoopGeneration = 0;
   var _disposed = false;
   DiagnosticsSnapshot? _snapshot;
   var _healthReachable = false;
@@ -143,6 +147,7 @@ class StatusStore extends ChangeNotifier {
   bool get daemonBusy => _daemonBusy;
   bool get autoRefreshEnabled => _autoRefreshEnabled;
   bool get appInForeground => _appInForeground;
+  int get eventLoopGeneration => lifecycleCoordinator.eventLoopGeneration;
   bool get snapshotStale => _snapshotStale;
   bool get statusSnapshotTimedOut => _statusSnapshotTimedOut;
 
@@ -278,6 +283,7 @@ class StatusStore extends ChangeNotifier {
     required bool enabled,
     bool refreshImmediately = false,
   }) {
+    if (_disposed) return;
     if (_autoRefreshEnabled == enabled) {
       if (enabled && refreshImmediately) {
         unawaited(refreshUntilPeerCatalogSettled(silent: true));
@@ -293,7 +299,11 @@ class StatusStore extends ChangeNotifier {
     if (enabled) {
       _ensureEventLoop();
     } else {
-      _eventLoopGeneration += 1;
+      // The coordinator owns the only event-loop generation. Clearing the
+      // slot lets enable start a fresh poll immediately; the old future is
+      // still fenced by the coordinator generation when it completes.
+      lifecycleCoordinator.invalidateEventLoop();
+      _eventLoopFuture = null;
     }
     if (enabled && refreshImmediately) {
       unawaited(refreshUntilPeerCatalogSettled(silent: true));
@@ -303,13 +313,15 @@ class StatusStore extends ChangeNotifier {
 
   void updateAppLifecycleState(AppLifecycleState state) {
     final appInForeground = state == AppLifecycleState.resumed;
-    if (_appInForeground == appInForeground) return;
+    final transition = appInForeground
+        ? lifecycleCoordinator.onAppResumed()
+        : lifecycleCoordinator.onAppBackgrounded();
+    if (transition.outcome != MobileLifecycleOutcome.applied) return;
     _appInForeground = appInForeground;
     if (!appInForeground) {
       // A long-poll request belongs to the physical network and app epoch in
       // which it started. Invalidate it before Android/iOS suspends sockets so
       // a late Wi-Fi/cellular response cannot mutate the resumed snapshot.
-      _eventLoopGeneration += 1;
       // Detach the slot immediately. The in-flight HTTP future is still
       // bounded by its request timeout, but its completion is generation-
       // fenced and `identical` will be false, so resume can start a fresh poll
@@ -327,8 +339,36 @@ class StatusStore extends ChangeNotifier {
     // Revalidate process identity, route/path state and the peer catalog before
     // opening a new event long poll. This creates an explicit resume boundary
     // instead of carrying a pre-suspend cursor across a network hand-off.
+    var appEpoch = lifecycleCoordinator.appEpoch;
+    try {
+      final androidStatus = await daemonController.androidStatus();
+      if (!lifecycleCoordinator.acceptsAppEpoch(appEpoch) ||
+          !_appInForeground) {
+        return;
+      }
+      final bridgeIncarnation = androidStatus?.bridgeIncarnation;
+      if (bridgeIncarnation != null) {
+        final transition = lifecycleCoordinator.observeBridge(
+          bridgeIncarnation,
+        );
+        if (transition.outcome == MobileLifecycleOutcome.staleRejected) {
+          return;
+        }
+        appEpoch = lifecycleCoordinator.appEpoch;
+      }
+    } catch (_) {
+      // Android status is additive diagnostics. A temporarily unavailable
+      // MethodChannel must not prevent the authoritative HTTP refresh.
+    }
+    if (!lifecycleCoordinator.acceptsAppEpoch(appEpoch) || !_appInForeground) {
+      return;
+    }
     await refresh(silent: true);
-    if (_disposed || !_autoRefreshEnabled || !_appInForeground) return;
+    if (!lifecycleCoordinator.acceptsAppEpoch(appEpoch) ||
+        !_autoRefreshEnabled ||
+        !_appInForeground) {
+      return;
+    }
     _ensureEventLoop();
   }
 
@@ -354,33 +394,36 @@ class StatusStore extends ChangeNotifier {
         _eventLoopFuture != null) {
       return;
     }
-    final generation = _eventLoopGeneration;
+    final generation = lifecycleCoordinator.eventLoopGeneration;
     final url = settingsStore.settings.diagnosticsUrl;
     late final Future<void> loop;
-    loop = _runEventLoop(url, generation);
+    loop = _runEventLoop(url, generation, lifecycleCoordinator.appEpoch);
     _eventLoopFuture = loop;
     unawaited(
       loop.whenComplete(() {
         if (identical(_eventLoopFuture, loop)) {
           _eventLoopFuture = null;
-          if (!_disposed &&
-              _autoRefreshEnabled &&
-              _appInForeground &&
-              _snapshot != null) {
-            scheduleMicrotask(_ensureEventLoop);
-          }
+          // A current loop normally remains alive until one of the shared
+          // invalidation fences changes. Do not schedule a microtask here:
+          // an immediate/empty test response must not turn completion into a
+          // zero-delay polling spin. The next refresh or explicit enable will
+          // re-arm the loop when the state is still eligible.
         }
       }),
     );
   }
 
-  Future<void> _runEventLoop(String url, int generation) async {
+  Future<void> _runEventLoop(String url, int generation, int appEpoch) async {
     var cursor = _snapshot?.revision ?? 0;
     var processId = _snapshot?.processId;
     while (!_disposed &&
         _autoRefreshEnabled &&
         _appInForeground &&
-        generation == _eventLoopGeneration &&
+        generation == lifecycleCoordinator.eventLoopGeneration &&
+        lifecycleCoordinator.acceptsEventLoop(
+          appEpoch: appEpoch,
+          generation: generation,
+        ) &&
         url == settingsStore.settings.diagnosticsUrl &&
         _snapshot != null) {
       EventsResponse response;
@@ -391,13 +434,24 @@ class StatusStore extends ChangeNotifier {
           processId: processId,
         );
       } catch (_) {
-        if (_disposed || generation != _eventLoopGeneration) return;
+        if (_disposed ||
+            generation != lifecycleCoordinator.eventLoopGeneration ||
+            !lifecycleCoordinator.acceptsEventLoop(
+              appEpoch: appEpoch,
+              generation: generation,
+            )) {
+          return;
+        }
         await Future<void>.delayed(const Duration(seconds: 1));
         continue;
       }
       if (_disposed ||
           !_autoRefreshEnabled ||
-          generation != _eventLoopGeneration ||
+          generation != lifecycleCoordinator.eventLoopGeneration ||
+          !lifecycleCoordinator.acceptsEventLoop(
+            appEpoch: appEpoch,
+            generation: generation,
+          ) ||
           url != settingsStore.settings.diagnosticsUrl) {
         return;
       }
@@ -428,7 +482,14 @@ class StatusStore extends ChangeNotifier {
           hasChange) {
         final beforeRevision = current.revision;
         await _refreshAutomatically();
-        if (_disposed || generation != _eventLoopGeneration) return;
+        if (_disposed ||
+            generation != lifecycleCoordinator.eventLoopGeneration ||
+            !lifecycleCoordinator.acceptsEventLoop(
+              appEpoch: appEpoch,
+              generation: generation,
+            )) {
+          return;
+        }
         final refreshed = _snapshot;
         if (refreshed == null) return;
         processId = refreshed.processId;
@@ -440,6 +501,11 @@ class StatusStore extends ChangeNotifier {
           // snapshot; the next long poll/refetch will converge.
           await Future<void>.delayed(const Duration(milliseconds: 250));
         }
+      } else {
+        // A machine-facing fake or a daemon that returns an empty poll
+        // immediately is still a valid response. Bound the retry cadence so
+        // an active loop cannot consume the microtask queue.
+        await Future<void>.delayed(const Duration(milliseconds: 250));
       }
     }
   }
@@ -491,6 +557,7 @@ class StatusStore extends ChangeNotifier {
   /// Refreshes the daemon snapshot. Automatic polling passes [silent] so the
   /// UI remains stable; an explicit user refresh keeps its progress feedback.
   Future<void> refresh({bool silent = false}) {
+    if (_disposed) return Future<void>.value();
     _refreshPending = true;
     final activeRefresh = _refreshFuture;
     if (activeRefresh != null) {
@@ -541,12 +608,15 @@ class StatusStore extends ChangeNotifier {
     required bool throttleMetrics,
   }) async {
     final stopwatch = Stopwatch()..start();
+    final appEpoch = lifecycleCoordinator.appEpoch;
+    bool acceptsLifecycle() => lifecycleCoordinator.acceptsAppEpoch(appEpoch);
     try {
       final health = await diagnosticsApi.fetchHealth(url);
       if (generation != _refreshGeneration) {
         _refreshPending = true;
         return;
       }
+      if (!acceptsLifecycle()) return;
 
       _lastHealthError = null;
       _lastStatusError = null;
@@ -569,6 +639,7 @@ class StatusStore extends ChangeNotifier {
           _refreshPending = true;
           return;
         }
+        if (!acceptsLifecycle()) return;
         final fetchedAt = DateTime.now();
         _statusSnapshotTimedOut = false;
         if (!_snapshotCanReplace(snapshot, _snapshot)) {
@@ -580,17 +651,51 @@ class StatusStore extends ChangeNotifier {
           _lastFetchedAt = fetchedAt;
           return;
         }
+        var routeHealthy = _routeHealthy;
+        DateTime? routeVerifiedAt;
+        if (_shouldVerifyRoutes(fetchedAt)) {
+          try {
+            final routes = await diagnosticsApi.verifyRoutes(url);
+            if (!acceptsLifecycle()) return;
+            routeHealthy = routes.healthy;
+          } catch (_) {
+            if (!acceptsLifecycle()) return;
+            routeHealthy = false;
+          } finally {
+            if (acceptsLifecycle()) {
+              routeVerifiedAt = DateTime.now();
+            }
+          }
+        }
+        if (!acceptsLifecycle()) return;
+        final daemonTransition = lifecycleCoordinator.observeDaemon(
+          processId: snapshot.processId,
+          runtimeIncarnation: snapshot.runtimeIncarnation,
+          revision: snapshot.revision,
+        );
+        if (daemonTransition.outcome == MobileLifecycleOutcome.staleRejected ||
+            daemonTransition.outcome == MobileLifecycleOutcome.failed) {
+          _lastError = null;
+          _lastFetchedAt = fetchedAt;
+          return;
+        }
+        if (daemonTransition.outcome == MobileLifecycleOutcome.applied) {
+          if (daemonTransition.oldIdentity.daemonProcessId !=
+                  snapshot.processId ||
+              daemonTransition.oldIdentity.daemonRuntimeIncarnation !=
+                  snapshot.runtimeIncarnation) {
+            // A process replacement invalidates the old event-loop slot even
+            // when the replacement reports a lower revision. Its cursor must
+            // be rebuilt from this committed snapshot.
+            _eventLoopFuture = null;
+          }
+        }
         _updatePeerTrafficRates(snapshot, fetchedAt, throttle: throttleMetrics);
         recordPeerPresence(snapshot.peers);
         _snapshot = snapshot;
-        if (_shouldVerifyRoutes(fetchedAt)) {
-          try {
-            _routeHealthy = (await diagnosticsApi.verifyRoutes(url)).healthy;
-          } catch (_) {
-            _routeHealthy = false;
-          } finally {
-            _lastRouteVerificationAt = DateTime.now();
-          }
+        _routeHealthy = routeHealthy;
+        if (routeVerifiedAt != null) {
+          _lastRouteVerificationAt = routeVerifiedAt;
         }
         _lastError = null;
         _lastFetchedAt = fetchedAt;
@@ -609,6 +714,7 @@ class StatusStore extends ChangeNotifier {
           _refreshPending = true;
           return;
         }
+        if (!acceptsLifecycle()) return;
         final snapshotTimedOut =
             error is DiagnosticsApiException &&
             error.reasonCode == 'status_snapshot_timeout';
@@ -632,6 +738,7 @@ class StatusStore extends ChangeNotifier {
         _refreshPending = true;
         return;
       }
+      if (!acceptsLifecycle()) return;
       _healthReachable = false;
       _statusSnapshotTimedOut = false;
       _clearSnapshot();
@@ -641,7 +748,7 @@ class StatusStore extends ChangeNotifier {
       _lastFetchedAt = DateTime.now();
     } finally {
       stopwatch.stop();
-      if (generation == _refreshGeneration) {
+      if (generation == _refreshGeneration && acceptsLifecycle()) {
         _lastRequestDuration = stopwatch.elapsed;
       }
     }
@@ -743,6 +850,19 @@ class StatusStore extends ChangeNotifier {
       return true;
     }
 
+    // Android can replace the embedded Rust runtime while retaining the same
+    // OS process.  Runtime incarnation is authoritative for that case: the
+    // replacement may reset both revision and uptime, while a delayed
+    // response from the retired runtime must never be allowed to replace it.
+    final candidateRuntime = candidate.runtimeIncarnation;
+    final currentRuntime = current.runtimeIncarnation;
+    if (candidateRuntime != null && currentRuntime != null) {
+      if (candidateRuntime > currentRuntime) return true;
+      if (candidateRuntime < currentRuntime) return false;
+    } else if (currentRuntime != null && candidateRuntime == null) {
+      return false;
+    }
+
     // PID reuse is possible. A lower uptime is affirmative evidence of a new
     // daemon incarnation even when the OS reused the same numeric PID.
     final restarted =
@@ -763,6 +883,7 @@ class StatusStore extends ChangeNotifier {
     bool skipInitialRefresh = false,
     bool silent = false,
   }) async {
+    if (_disposed) return;
     // A daemon can answer public /health before its per-process diagnostics
     // token is visible to the client. Keep the initial status-auth race out
     // of Home while the same background refresh loop retries it. Do not mask
@@ -780,7 +901,8 @@ class StatusStore extends ChangeNotifier {
       var stableCatalogCount = 0;
       var previousSignature = _peerCatalogSignature(_snapshot);
       while (refreshCount < _startupCatalogMaxRefreshes &&
-          DateTime.now().isBefore(deadline)) {
+          DateTime.now().isBefore(deadline) &&
+          !_disposed) {
         if (startupCatalogRefreshInterval > Duration.zero) {
           await Future<void>.delayed(startupCatalogRefreshInterval);
         } else {
@@ -976,7 +1098,8 @@ class StatusStore extends ChangeNotifier {
     if (nextDiagnosticsUrl == _lastDiagnosticsUrl) return;
     _lastDiagnosticsUrl = nextDiagnosticsUrl;
     _refreshGeneration += 1;
-    _eventLoopGeneration += 1;
+    lifecycleCoordinator.invalidateEventLoop();
+    _eventLoopFuture = null;
     _refreshPending = true;
     _healthReachable = false;
     _clearSnapshot();
@@ -995,8 +1118,10 @@ class StatusStore extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (_disposed) return;
     _disposed = true;
-    _eventLoopGeneration += 1;
+    lifecycleCoordinator.dispose();
+    _eventLoopFuture = null;
     _timer?.cancel();
     _staleTimer?.cancel();
     _automaticRefreshFuture = null;
