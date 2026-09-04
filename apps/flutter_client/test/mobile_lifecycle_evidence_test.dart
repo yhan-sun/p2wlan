@@ -1,3 +1,6 @@
+// Machine-readable evidence records intentionally use stdout.
+// ignore_for_file: avoid_print
+
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';

@@ -127,8 +127,10 @@ pub struct Daemon {
     /// Dedicated receivers stay alive from JNI startup through worker spawn,
     /// so a callback that arrives during daemon setup is queued instead of
     /// being dropped before direct/relay supervisors subscribe.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     android_network_change_direct_rx: Option<AndroidNetworkChangeReceiver>,
     android_network_change_relay_rx: Option<AndroidNetworkChangeReceiver>,
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     android_network_change_control_rx: Option<AndroidNetworkChangeReceiver>,
 }
 

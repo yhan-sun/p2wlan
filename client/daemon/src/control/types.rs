@@ -784,6 +784,7 @@ enum ControlCommand {
     PollPeersNow,
     /// Rebind the existing control HTTP/WebSocket lifecycle after an Android
     /// physical-network handoff.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     NetworkChanged,
     /// Create a tunnel.
     CreateTunnel {

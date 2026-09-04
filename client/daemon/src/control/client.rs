@@ -698,6 +698,7 @@ impl ControlClient {
     /// Notify the existing control lifecycle that Android's physical network
     /// changed. The loop rebuilds its pooled HTTP clients and reconnects the
     /// optional signaling WebSocket through its normal registration path.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub(crate) fn network_changed(&self) {
         let _ = self.cmd_tx.send(ControlCommand::NetworkChanged);
     }
