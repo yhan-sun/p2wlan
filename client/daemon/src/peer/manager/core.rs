@@ -312,6 +312,45 @@ impl PeerManager {
         }
     }
 
+    /// Record the first-usable milestone and the persistent machine-readable
+    /// summary at the same authoritative business-ingress commit. The caller
+    /// supplies the already-validated business dimensions; transport readiness
+    /// and relay confirmation alone cannot create this record.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_timeline_first_usable(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        path: &str,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+        business_sent: bool,
+        business_received: bool,
+        business_exchange: bool,
+        relay_id: Option<&str>,
+        relay_connection_id: Option<u64>,
+    ) -> bool {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        timeline.is_some_and(|timeline| {
+            timeline.emit_first_usable(
+                peer_id,
+                generation,
+                path,
+                reason_code,
+                detail,
+                business_sent,
+                business_received,
+                business_exchange,
+                relay_id,
+                relay_connection_id,
+            )
+        })
+    }
+
     /// Record dropped outbound business packets for a stable reason code so
     /// `/status` can report queue/startup-wait loss structurally.  Terminal
     /// loss only: a packet that was handed to a transport (even if the remote

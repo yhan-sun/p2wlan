@@ -10,6 +10,12 @@ use std::pin::Pin;
 type ControlEventWork<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 const MAX_CONTROL_EVENT_SLOW_WORK: usize = 64;
+/// Initiator publication retries are latency-critical evidence producers. Keep
+/// them in a separate bounded cooperative lane so a roster burst of unrelated
+/// STUN/HTTP work cannot occupy every general slow-work slot until the retry
+/// ledger expires. This is still the existing control-event loop and the
+/// existing per-peer reservation/ledger; it is only a fairness boundary.
+const MAX_INITIATOR_RETRY_WORK: usize = 16;
 /// A roster burst may contain more peers than the cooperative slow-work lane
 /// can admit at once.  Do not silently lose the initiator handshake for the
 /// peers after that boundary: retain one newest-wins entry per peer and drain
@@ -2507,12 +2513,12 @@ impl Daemon {
     /// polled as part of the existing bounded slow-work lane.
     fn drain_initiator_retry_ledger<'a>(
         &'a self,
-        slow_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+        retry_work: &mut FuturesUnordered<ControlEventWork<'a>>,
     ) {
         self.pending_handshakes
             .lock()
             .expire_initiator_retries(Instant::now());
-        while slow_work.len() < MAX_CONTROL_EVENT_SLOW_WORK {
+        while retry_work.len() < MAX_INITIATOR_RETRY_WORK {
             let claimed = self
                 .pending_handshakes
                 .lock()
@@ -2520,8 +2526,23 @@ impl Daemon {
             let Some((identity, reservation)) = claimed else {
                 break;
             };
+            self.timeline.emit(
+                "initiator_handshake_retry_claimed",
+                None,
+                None,
+                Some(format!(
+                    "peer={} owner={} generation={} peer_session_generation={} phase={} attempt={} cancellation_generation={}",
+                    identity.peer_id,
+                    identity.reservation_owner,
+                    identity.network_generation,
+                    identity.peer_session_generation.value(),
+                    identity.phase.as_str(),
+                    identity.attempt,
+                    identity.cancellation_generation,
+                )),
+            );
             let daemon = self;
-            slow_work.push(Box::pin(async move {
+            retry_work.push(Box::pin(async move {
                 daemon
                     .run_claimed_initiator_retry(identity, reservation)
                     .await;
@@ -2543,6 +2564,10 @@ impl Daemon {
         let mut control_rx = std::mem::replace(&mut self.control_rx, replacement_rx);
         let daemon: &Daemon = &*self;
         let mut slow_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+        // Retries have a distinct bounded lane. A full general slow-work lane
+        // must never turn an already-prepared initiation into a lost first
+        // usable attempt.
+        let mut retry_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
         let mut deferred_initiators: InitiatorQueue<control::PeerInfo> = InitiatorQueue::new();
         // Keep responder answers out of the general slow-work budget. A
         // blocked candidate refresh or peer-reflexive HTTP task must not
@@ -2576,7 +2601,19 @@ impl Daemon {
                         // Completion frees a bounded slot. Admit the oldest still
                         // live deferred peer immediately instead of waiting for a
                         // later control poll.
-                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon.drain_initiator_retry_ledger(&mut retry_work);
+                        daemon
+                            .drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            );
+                    }
+                    _ = retry_work.next(), if !retry_work.is_empty() => {
+                        // A retry completion frees the exact prepared
+                        // initiation owner. Revisit both the retry ledger and
+                        // any deferred roster edge without waiting for an
+                        // unrelated control signal.
+                        daemon.drain_initiator_retry_ledger(&mut retry_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
@@ -2589,7 +2626,7 @@ impl Daemon {
                         // completion can also free a pending initiator's
                         // reservation, so retry deferred roster work here even
                         // when the general slow-work lane is otherwise idle.
-                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon.drain_initiator_retry_ledger(&mut retry_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
@@ -2597,7 +2634,7 @@ impl Daemon {
                             );
                     }
                     _ = candidate_work.next(), if !candidate_work.is_empty() => {
-                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon.drain_initiator_retry_ledger(&mut retry_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
@@ -2609,7 +2646,7 @@ impl Daemon {
                             break;
                         }
                         handshake_retry_kick_rx.borrow_and_update();
-                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon.drain_initiator_retry_ledger(&mut retry_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
@@ -2617,7 +2654,7 @@ impl Daemon {
                             );
                     }
                     _ = handshake_retry_tick.tick() => {
-                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon.drain_initiator_retry_ledger(&mut retry_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
@@ -3733,7 +3770,7 @@ impl Daemon {
                         // in either cooperative lane. Revisit the newest
                         // deferred roster edge before waiting for another
                         // unrelated event.
-                        daemon.drain_initiator_retry_ledger(&mut slow_work);
+                        daemon.drain_initiator_retry_ledger(&mut retry_work);
                         daemon
                             .drain_deferred_initiator_handshakes(
                                 &mut slow_work,
@@ -3746,6 +3783,7 @@ impl Daemon {
         // Dropping these futures also releases any STUN/HTTP wait promptly on
         // daemon shutdown rather than leaving detached work behind.
         drop(slow_work);
+        drop(retry_work);
         drop(responder_work);
         drop(candidate_work);
         self.control_rx = control_rx;

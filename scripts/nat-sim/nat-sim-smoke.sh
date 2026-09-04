@@ -51,6 +51,8 @@ BASE_B=${BASE_B:-46000}
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-60}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-30}
 NAT_SIM_ARTIFACT_DIR=${NAT_SIM_ARTIFACT_DIR:-}
+NAT_TOPOLOGY_HEAD_SHA=${NAT_TOPOLOGY_HEAD_SHA:-$(git -C "$ROOT_DIR" rev-parse HEAD)}
+NAT_TOPOLOGY_WORKFLOW_SHA=${NAT_TOPOLOGY_WORKFLOW_SHA:-$(git -C "$ROOT_DIR" rev-parse "$NAT_TOPOLOGY_HEAD_SHA:.github/workflows/nat-topology-gate.yml")}
 # Give every local daemon timeline an explicit, bounded correlation namespace.
 # The dual-end harness already supplies P2WLAN_TEST_RUN_ID; NAT-sim used to
 # leave it unset, which made the logs harder to join even though each daemon
@@ -281,6 +283,9 @@ if kind == "status":
         raise SystemExit("status_schema_missing_correlation_id")
     if not isinstance(timeline.get("events"), list):
         raise SystemExit("status_schema_missing_timeline_events")
+    summaries = timeline.get("first_usable_summaries", [])
+    if not isinstance(summaries, list):
+        raise SystemExit("status_schema_invalid_first_usable_summaries")
 elif kind == "metrics":
     required = (
         "active_connections",
@@ -300,6 +305,22 @@ PY
     echo "[nat-sim] FAIL reason_code=${kind}_schema_invalid file=$output" >&2
     return 1
   fi
+}
+
+# Establish the per-daemon baseline before the topology wait begins. The
+# baseline is a daemon-local (process id, revision, monotonic uptime) fence;
+# it is not a wall-clock sample and is never reconstructed after the fact.
+capture_baseline_status() {
+  local url="$1" output="$2" token_file="$3" side="$4"
+  for _ in {1..120}; do
+    if fetch_required_json "$url" "$output" status "$token_file"; then
+      echo "[nat-sim] baseline captured side=$side file=$output" >&2
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "[nat-sim] FAIL reason_code=baseline_status_not_available side=$side file=$output" >&2
+  return 1
 }
 
 # Sample the authenticated status endpoint without writing credentials or a
@@ -596,6 +617,15 @@ for round in $(seq 1 "$ROUNDS"); do
   NODE_B_PID=$!
   PIDS+=($NODE_B_PID)
 
+  capture_baseline_status \
+    "http://127.0.0.1:$DIAG_A_PORT/status" \
+    "$ROUND_DIR/node-a.baseline.status.json" \
+    "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" a
+  capture_baseline_status \
+    "http://127.0.0.1:$DIAG_B_PORT/status" \
+    "$ROUND_DIR/node-b.baseline.status.json" \
+    "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" b
+
   if [[ "$MODE" == "relay-only" ]]; then
     # Availability pass condition: BOTH sides complete a bidirectional
     # encrypted overlay loopback (overlay_payload_verified), which here rides
@@ -712,23 +742,64 @@ for round in $(seq 1 "$ROUNDS"); do
     grep -h 'overlay_payload_verified\|overlay_payload_sent\|overlay_payload_echo\|first_usable_confirmed' "$ROUND_DIR"/node-*.log 2>/dev/null | head -6
   } >"$ROUND_DIR/evidence.log" 2>&1 || true
 
+  TOPOLOGY="direct-cold-start"
+  EXPECTED_PATH="direct"
+  if [[ "$MODE" == "relay-only" ]]; then
+    TOPOLOGY="relay-blackhole"
+    EXPECTED_PATH="relay"
+  fi
+  python3 "$ROOT_DIR/scripts/nat-sim/collect_evidence.py" \
+    --topology "$TOPOLOGY" \
+    --replica "${NAT_TOPOLOGY_REPLICA:-1}" \
+    --round "$round" \
+    --source-head-sha "$NAT_TOPOLOGY_HEAD_SHA" \
+    --workflow-sha "$NAT_TOPOLOGY_WORKFLOW_SHA" \
+    --baseline-a "$ROUND_DIR/node-a.baseline.status.json" \
+    --baseline-b "$ROUND_DIR/node-b.baseline.status.json" \
+    --final-a "$ROUND_DIR/node-a.status.json" \
+    --final-b "$ROUND_DIR/node-b.status.json" \
+    --log-a "$ROUND_DIR/node-a.log" \
+    --log-b "$ROUND_DIR/node-b.log" \
+    --expected-path "$EXPECTED_PATH" \
+    --overlay-burst "$OVERLAY_BURST" \
+    --output "$ROUND_DIR/nat-evidence.json"
+  read -r EVIDENCE_PASS EVIDENCE_REASON EVIDENCE_A_DELTA EVIDENCE_B_DELTA < <(
+    python3 - "$ROUND_DIR/nat-evidence.json" <<'PY'
+import json
+import sys
+
+try:
+    record = json.load(open(sys.argv[1], encoding="utf-8"))
+    observed = record["observed"]
+    result = record["result"] == "pass"
+    reason = record.get("decision", {}).get("reason_code") or "none"
+    a_delta = observed["a"]["first_usable"].get("delta_ms")
+    b_delta = observed["b"]["first_usable"].get("delta_ms")
+    a_delta = a_delta if isinstance(a_delta, int) else -1
+    b_delta = b_delta if isinstance(b_delta, int) else -1
+    print(int(result), reason, a_delta, b_delta)
+except Exception:
+    print("0 collector_record_invalid -1 -1")
+PY
+  )
+
   # Per-daemon monotonic relay-ready -> first production business delta: the
-  # harness computes each delta from that daemon's own t_ms values and only
+  # collector reads each daemon's own persistent summary/event fence and only
   # reports their sum as a convenience; it never subtracts wall clocks across
-  # machines.
-  A_DELTA=$(node_first_usable_delta_ms "$ROUND_DIR/node-a.log")
-  B_DELTA=$(node_first_usable_delta_ms "$ROUND_DIR/node-b.log")
+  # machines or promotes a log-only timestamp to acceptance evidence.
+  A_DELTA="$EVIDENCE_A_DELTA"
+  B_DELTA="$EVIDENCE_B_DELTA"
   DELTA_OK=1
   if [[ -z "$A_DELTA" || -z "$B_DELTA" ]]; then
     if [[ "$MODE" == "relay-only" ]]; then
-      echo "[nat-sim] ROUND $round: FAIL reason_code=first_usable_delta_missing a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
+      echo "[nat-sim] ROUND $round: FAIL reason_code=${EVIDENCE_REASON:-first_usable_delta_missing} a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
       DELTA_OK=0
       overall=1
       A_DELTA=-1
       B_DELTA=-1
       SUM_DELTA=-1
     else
-      echo "[nat-sim] ROUND $round: FAIL reason_code=first_usable_delta_missing a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
+      echo "[nat-sim] ROUND $round: FAIL reason_code=${EVIDENCE_REASON:-first_usable_delta_missing} a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
       DELTA_OK=0
       overall=1
       A_DELTA=-1
@@ -814,6 +885,7 @@ except Exception:
       [[ "$A_BURST" -ge 1 && "$B_BURST" -ge 1 && "$A_BURST_BAD" -eq 0 && "$B_BURST_BAD" -eq 0 ]] || BURST_OK=0
     fi
     if [[ "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 && "$DELTA_OK" -eq 1 \
+          && "$EVIDENCE_PASS" -eq 1 \
           && "$overlay_ok" -eq 1 && "$A_DIRECT" -eq 0 && "$B_DIRECT" -eq 0 \
           && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \
           && "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 \
@@ -887,7 +959,9 @@ except Exception:
           && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 ]]; then
       echo "[nat-sim] ROUND $round: PASS both_direct relay_before_direct_business=1 a_relay_confirmed_t_ms=$A_RELAY_CONFIRMED_TMS b_relay_confirmed_t_ms=$B_RELAY_CONFIRMED_TMS a_direct_promoted_t_ms=$A_DIRECT_PROMOTED_TMS b_direct_promoted_t_ms=$B_DIRECT_PROMOTED_TMS a_direct_business_t_ms=$A_DIRECT_BUSINESS_TMS b_direct_business_t_ms=$B_DIRECT_BUSINESS_TMS a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (a_direct=$A_DIRECT b_direct=$B_DIRECT) a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY evidence=$ROUND_DIR/evidence.log"
     else
-      if [[ "$direct_ok" -ne 1 ]]; then
+      if [[ "$EVIDENCE_PASS" -ne 1 ]]; then
+        DIRECT_REASON="${EVIDENCE_REASON:-component_evidence_invalid}"
+      elif [[ "$direct_ok" -ne 1 ]]; then
         DIRECT_REASON="direct_overlay_unverified"
       elif [[ "$DELTA_OK" -ne 1 || "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 ]]; then
         DIRECT_REASON="first_usable_delta_missing"

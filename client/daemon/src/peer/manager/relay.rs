@@ -781,7 +781,15 @@ impl PeerManager {
                 )
             })
         });
-        let (confirmation_changed, pending_committed, exchange_confirmed, first_usable_recorded) = {
+        let (
+            confirmation_changed,
+            pending_committed,
+            exchange_confirmed,
+            first_usable_recorded,
+            first_business_sent,
+            first_business_received,
+            first_business_exchange,
+        ) = {
             let epoch_gate = self.network_epoch_gate();
             let Ok(_epoch_guard) = epoch_gate.try_lock() else {
                 self.emit_timeline_first(
@@ -909,7 +917,7 @@ impl PeerManager {
                 let pending_is_current = pending_evidence.as_ref().is_some_and(|evidence| {
                     self.pending_relay_business_evidence_is_exact(evidence, Instant::now())
                 });
-                let mut result = (false, false, false, false);
+                let mut result = (false, false, false, false, false, false, false);
                 let outcome = conn.commit_path_transition(
                     PathEvent::RelayPeerConfirmed {
                         relay: relay_identity,
@@ -997,11 +1005,20 @@ impl PeerManager {
                             first_usable_recorded =
                                 conn.record_first_usable(NetworkPath::Relay, generation);
                         }
+                        let first_business_sent = first_usable_recorded
+                            && conn.relay_first.business_sent_generation == Some(generation);
+                        let first_business_received = first_usable_recorded
+                            && conn.relay_first.business_received_generation == Some(generation);
+                        let first_business_exchange = first_usable_recorded
+                            && conn.relay_first.business_exchange_generation == Some(generation);
                         result = (
                             changed,
                             pending_committed,
                             exchange_confirmed,
                             first_usable_recorded,
+                            first_business_sent,
+                            first_business_received,
+                            first_business_exchange,
                         );
                         if changed {
                             // Keep the synchronous waiter mirror in the same critical
@@ -1068,15 +1085,19 @@ impl PeerManager {
             );
         }
         if first_usable_recorded {
-            self.emit_timeline_first(
+            self.emit_timeline_first_usable(
                 node_id,
                 generation,
-                "first_usable_path",
-                Some("relay"),
+                "relay",
                 None,
                 Some(format!(
                     "peer={node_id} generation={generation} ingress=relay:{relay_endpoint} retained_preconfirmation_business=true"
                 )),
+                first_business_sent,
+                first_business_received,
+                first_business_exchange,
+                Some(relay_endpoint),
+                relay_connection_id,
             );
             self.emit_timeline(
                 "relay_first_business_evidence_promoted",
@@ -1242,15 +1263,19 @@ impl PeerManager {
                     )),
                 );
             }
-            self.emit_timeline_first(
+            self.emit_timeline_first_usable(
                 node_id,
                 generation,
-                "first_usable_path",
-                Some("direct"),
+                "direct",
                 fallback_reason,
                 Some(format!(
                     "peer={node_id} generation={generation} ingress=direct"
                 )),
+                false,
+                true,
+                false,
+                None,
+                None,
             );
         }
         recorded
@@ -1381,18 +1406,22 @@ impl PeerManager {
                     )),
                 );
             }
-            self.emit_timeline_first(
+            self.emit_timeline_first_usable(
                 node_id,
                 generation,
-                "first_usable_path",
-                Some(match path {
+                match path {
                     NetworkPath::Direct => "direct",
                     NetworkPath::Relay => "relay",
-                }),
+                },
                 fallback_reason,
                 Some(format!(
                     "peer={node_id} generation={generation} ingress={ingress_label}"
                 )),
+                false,
+                true,
+                false,
+                ingress_label.strip_prefix("relay:"),
+                None,
             );
         }
         recorded
@@ -2510,6 +2539,9 @@ impl PeerManager {
         let mut first_receive = false;
         let mut exchange_confirmed = false;
         let mut first_usable_recorded = false;
+        let mut first_business_sent = false;
+        let mut first_business_received = false;
+        let mut first_business_exchange = false;
         let outcome = conn.commit_path_transition(
             PathEvent::RelayBusinessUsable {
                 relay: relay_identity,
@@ -2528,6 +2560,12 @@ impl PeerManager {
                     conn.relay_first.business_gate_completed_generation = Some(generation);
                 }
                 first_usable_recorded = conn.record_first_usable(NetworkPath::Relay, generation);
+                first_business_sent = first_usable_recorded
+                    && conn.relay_first.business_sent_generation == Some(generation);
+                first_business_received = first_usable_recorded
+                    && conn.relay_first.business_received_generation == Some(generation);
+                first_business_exchange = first_usable_recorded
+                    && conn.relay_first.business_exchange_generation == Some(generation);
             },
         );
         if !outcome.accepted() {
@@ -2559,15 +2597,19 @@ impl PeerManager {
             );
         }
         if first_usable_recorded {
-            self.emit_timeline_first(
+            self.emit_timeline_first_usable(
                 node_id,
                 generation,
-                "first_usable_path",
-                Some("relay"),
+                "relay",
                 None,
                 Some(format!(
                     "peer={node_id} generation={generation} ingress=relay:{relay_endpoint}"
                 )),
+                first_business_sent,
+                first_business_received,
+                first_business_exchange,
+                Some(relay_endpoint),
+                relay_connection_id,
             );
         }
         finish(if first_receive || exchange_confirmed || first_usable_recorded {
