@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "repository": "yhan-sun/p2wlan",
+  "component": "dplpmtud_live_dataplane",
+  "required_boundaries": [
+    1280,
+    1360,
+    1380,
+    1420,
+    1500
+  ],
+  "stable_label_keys": [
+    "scenario_id",
+    "test_id",
+    "decision",
+    "path_kind",
+    "outer_ip_family",
+    "state",
+    "reason_code",
+    "counter_names"
+  ],
+  "scenarios": [
+    {
+      "scenario_id": "DP-01",
+      "category": "boundary_matrix",
+      "test_id": "tests::dplpmtud_final_boundary_matrix_ipv4_ipv6",
+      "log_file": "dp-01-boundary.log",
+      "marker_required": true,
+      "expected_decision": "applied"
+    },
+    {
+      "scenario_id": "DP-02",
+      "category": "identity_epoch_isolation",
+      "test_id": "tests::dplpmtud_final_epoch_and_socket_identity_isolation",
+      "log_file": "dp-02-identity.log",
+      "marker_required": true,
+      "expected_decision": "stale_rejected"
+    },
+    {
+      "scenario_id": "DP-03",
+      "category": "loss_reorder_duplicate",
+      "test_id": "tests::dplpmtud_final_loss_reorder_duplicate_are_fenced",
+      "log_file": "dp-03-loss-reorder.log",
+      "marker_required": true,
+      "expected_decision": "recovered"
+    },
+    {
+      "scenario_id": "DP-04",
+      "category": "direct_relay_switch",
+      "test_id": "tests::dplpmtud_final_direct_relay_switch_and_recovery",
+      "log_file": "dp-04-path-switch.log",
+      "marker_required": true,
+      "expected_decision": "recovered"
+    },
+    {
+      "scenario_id": "DP-05",
+      "category": "typed_bounded_evidence",
+      "test_id": "tests::dplpmtud_final_typed_counters_use_bounded_labels",
+      "log_file": "dp-05-counters.log",
+      "marker_required": true,
+      "expected_decision": "observed"
+    },
+    {
+      "scenario_id": "DP-06",
+      "category": "silent_blackhole",
+      "test_id": "dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak",
+      "log_file": "dp-06-blackhole.log",
+      "marker_required": false,
+      "expected_decision": "verified",
+      "summary_prefix": "DPLPMTUD_BLACKHOLE",
+      "required_summary_tokens": [
+        "direct_active=true",
+        "relay_fallback_count=0",
+        "generation_switch_stale_ack=true",
+        "peer_left_cancelled=true",
+        "task_leak=false"
+      ]
+    },
+    {
+      "scenario_id": "DP-07",
+      "category": "live_business_send",
+      "test_id": "tests::direct_business_budget_production_path_e2e",
+      "log_file": "dp-07-business-e2e.log",
+      "marker_required": false,
+      "expected_decision": "verified",
+      "summary_prefix": "BUSINESS_BUDGET_E2E",
+      "required_summary_tokens": [
+        "pending_fifo=true",
+        "oversize_zero_send=true",
+        "ciphertext_zero_send=true",
+        "revoke_race_zero_send=true",
+        "path_race_zero_send=true",
+        "emsgsize_recovery=true",
+        "direct_active=true",
+        "relay_fallback_count=0",
+        "task_leak=false"
+      ]
+    },
+    {
+      "scenario_id": "DP-08",
+      "category": "downward_recovery",
+      "test_id": "dplpmtud::tests::runtime_downward_recovery_withholds_budget_until_fresh_base_ack",
+      "log_file": "dp-08-downward.log",
+      "marker_required": false,
+      "expected_decision": "verified",
+      "summary_prefix": "DPLPMTUD_RECONFIRM_BASE",
+      "required_summary_tokens": [
+        "direct_active=true",
+        "relay_fallback_count=0",
+        "identity_preserved=true",
+        "old_ack_contamination=false",
+        "task_leak=false"
+      ]
+    },
+    {
+      "scenario_id": "DP-09",
+      "category": "cancellation_relay_invalidation",
+      "test_id": "dplpmtud::tests::cancel_close_generation_and_relay_budget_invalidation_acceptance",
+      "log_file": "dp-09-cancellation.log",
+      "marker_required": false,
+      "expected_decision": "verified",
+      "summary_prefix": "DPLPMTUD_INVALIDATION",
+      "required_summary_tokens": [
+        "cancel_peer=none",
+        "generation_cancel=none",
+        "relay_active=none",
+        "runtime_close=none",
+        "exact_path_fail_closed=true",
+        "task_leak=false"
+      ]
+    },
+    {
+      "scenario_id": "DP-10",
+      "category": "revision_aba_stale_duplicate",
+      "test_id": "dplpmtud::tests::budget_revision_is_monotonic_and_closes_identity_aba",
+      "log_file": "dp-10-revision.log",
+      "marker_required": false,
+      "expected_decision": "verified",
+      "summary_prefix": "DPLPMTUD_BUDGET_REVISION",
+      "required_summary_tokens": [
+        "monotonic=true",
+        "duplicate_stable=true",
+        "stale_stable=true",
+        "diagnostics_revision_separate=true",
+        "aba_closed=true"
+      ]
+    }
+  ]
+}

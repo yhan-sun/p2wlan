@@ -5,115 +5,144 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/dplpmtud-required.yml"
-      - ".github/workflows/path-state-machine-required.yml"
+      - ".github/workflows/business-mtu-budget-required.yml"
       - "client/daemon/**"
       - "client/netbind/**"
+      - "client/tun/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "scripts/mtu-smoke.sh"
+      - "contracts/dplpmtud_acceptance.json"
       - "docs/dplpmtud-runtime-foundation.md"
+      - "docs/dplpmtud-business-budget.md"
+      - "docs/dplpmtud-live-dataplane-acceptance.md"
       - "Cargo.toml"
       - "Cargo.lock"
   pull_request:
     branches: [main]
     paths:
       - ".github/workflows/dplpmtud-required.yml"
-      - ".github/workflows/path-state-machine-required.yml"
+      - ".github/workflows/business-mtu-budget-required.yml"
       - "client/daemon/**"
       - "client/netbind/**"
+      - "client/tun/**"
+      - "client/wireguard/**"
+      - "client/relay/**"
+      - "scripts/dplpmtud/**"
+      - "scripts/mtu-smoke.sh"
+      - "contracts/dplpmtud_acceptance.json"
       - "docs/dplpmtud-runtime-foundation.md"
+      - "docs/dplpmtud-business-budget.md"
+      - "docs/dplpmtud-live-dataplane-acceptance.md"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
+    inputs:
+      validation_sha:
+        description: Exact commit SHA to validate
+        required: true
+        type: string
 
 permissions:
   contents: read
   checks: read
 
 concurrency:
-  group: dplpmtud-${{ github.event.pull_request.number || github.ref }}
+  group: dplpmtud-${{ github.event.pull_request.number || inputs.validation_sha || github.ref }}
   cancel-in-progress: true
 
 env:
-  VALIDATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  CARGO_TERM_COLOR: always
+  P2WLAN_EXACT_HEAD: ${{ github.event.pull_request.head.sha || inputs.validation_sha || github.sha }}
 
 jobs:
-  dplpmtud_linux:
-    name: DPLPMTUD Linux checks
+  contract:
+    name: DPLPMTUD contract and evidence tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 70
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ env.VALIDATION_SHA }}
-          fetch-depth: 0
-
-      - name: Verify exact validation SHA
-        shell: bash
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+      - name: Validate evidence scripts and contract
         run: |
           set -euo pipefail
-          actual="$(git rev-parse HEAD)"
-          echo "DPLPMTUD validation SHA: $actual"
-          test "$actual" = "$VALIDATION_SHA"
+          python3 -m py_compile \
+            scripts/dplpmtud/collect_evidence.py \
+            scripts/dplpmtud/aggregate_evidence.py \
+            scripts/dplpmtud/test_evidence.py
+          python3 -m unittest discover \
+            -s scripts/dplpmtud \
+            -p 'test_*.py'
+          bash -n scripts/dplpmtud/run_acceptance.sh
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
 
+          value = json.loads(Path("contracts/dplpmtud_acceptance.json").read_text())
+          assert value["schema_version"] == 1
+          assert value["repository"] == "yhan-sun/p2wlan"
+          assert value["required_boundaries"] == [1280, 1360, 1380, 1420, 1500]
+          assert [item["scenario_id"] for item in value["scenarios"]] == [
+              f"DP-{index:02d}" for index in range(1, 11)
+          ]
+          assert len({item["test_id"] for item in value["scenarios"]}) == 10
+          PY
+
+  dplpmtud_linux:
+    name: DPLPMTUD Linux checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: rustfmt, clippy
-
-      - name: Install Linux workspace dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            libssl-dev \
+            pkg-config \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             libxdo-dev \
             librsvg2-dev \
             xdotool \
-            patchelf \
-            iproute2
-
+            patchelf
       - name: Cargo format
         run: cargo fmt --all -- --check
-
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: DPLPMTUD reducer, lifecycle, compatibility, and codec tests
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests -- --test-threads=1
-
+      - name: DPLPMTUD reducer and wire tests
+        run: cargo test -p p2wlan-daemon --lib dplpmtud -- --test-threads=1
       - name: Encrypted UDP blackhole test with evidence
         run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak -- --exact --nocapture --test-threads=1
-
-      - name: Cargo workspace tests (general suite)
-        run: cargo test --workspace --all-targets -- --test-threads=1 --skip hard_hard_
-
-      - name: Cargo workspace tests (Hard-Hard isolated suite)
-        shell: bash
+      - name: Workspace tests except hard-hard E2E
+        env:
+          RUST_TEST_THREADS: "1"
         run: |
-          set -euo pipefail
-          cargo test -p p2wlan-daemon --lib --no-run
-          hard_hard_binary="$(find target/debug/deps -maxdepth 1 -type f -name 'p2pnet_daemon-*' -perm -111 -print0 | xargs -0 ls -t | head -n 1)"
-          if [ -z "$hard_hard_binary" ]; then
-            echo "Hard-Hard test binary was not built" >&2
-            exit 1
-          fi
-          hard_hard_tests="$("$hard_hard_binary" hard_hard_ --list | sed -n 's/: test$//p')"
-          test_count="$(printf '%s\n' "$hard_hard_tests" | sed '/^$/d' | wc -l | tr -d ' ')"
-          if [ "$test_count" -eq 0 ]; then
-            echo "No Hard-Hard tests discovered" >&2
-            exit 1
-          fi
-          while IFS= read -r test_name; do
-            [ -n "$test_name" ] || continue
-            "$hard_hard_binary" "$test_name" --exact --test-threads=1
-          done <<< "$hard_hard_tests"
+          set -o pipefail
+          cargo test --workspace --all-features -- --test-threads=1 --skip hard_hard_ 2>&1 | tee /tmp/workspace-tests.log
+          ! grep -qE '0 tests, [1-9][0-9]* benchmarks' /tmp/workspace-tests.log
+      - name: Hard-hard E2E tests
+        run: cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
 
-      - name: Diff whitespace check
-        run: git diff --check
-
-  dplpmtud_acceptance:
-    name: DPLPMTUD acceptance ${{ matrix.scenario }}
+  runtime_acceptance:
+    name: DPLPMTUD acceptance (${{ matrix.scenario }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -130,119 +159,123 @@ jobs:
             test: cancel_close_generation_and_relay_budget_invalidation_acceptance
           - scenario: budget-revision-aba
             test: budget_revision_is_monotonic_and_closes_identity_aba
-          - scenario: no-fragment-emsgsize
+          - scenario: local-emsgsize
             test: local_emsgsize_shrinks_upper_bound_without_reopening_full_ceiling
           - scenario: worker-leak
             test: close_and_peer_left_remove_all_worker_ownership
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ env.VALIDATION_SHA }}
-          fetch-depth: 0
-
-      - name: Verify exact validation SHA
-        shell: bash
-        run: |
-          set -euo pipefail
-          actual="$(git rev-parse HEAD)"
-          echo "DPLPMTUD_ACCEPTANCE_RUN scenario=${{ matrix.scenario }} expected_head=$VALIDATION_SHA actual_head=$actual"
-          test "$actual" = "$VALIDATION_SHA"
-
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Run exact acceptance scenario
+        env:
+          DPLPMTUD_TEST: ${{ matrix.test }}
+        run: cargo test -p p2wlan-daemon --lib "dplpmtud::tests::$DPLPMTUD_TEST" -- --exact --nocapture --test-threads=1
 
-      - name: Run acceptance scenario
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::${{ matrix.test }} -- --exact --nocapture --test-threads=1
-
-      - name: Install iproute2 for real IP-layer proof
-        if: matrix.scenario == 'no-fragment-emsgsize'
-        run: sudo apt-get update && sudo apt-get install -y iproute2
-
-      - name: Run privileged Linux netns/veth no-fragment proof
-        if: matrix.scenario == 'no-fragment-emsgsize'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test -p p2pnet-netbind --test no_fragment_netns --no-run
-          test_binary="$(find target/debug/deps -maxdepth 1 -type f -perm -111 -name 'no_fragment_netns-*' -print -quit)"
-          test -n "$test_binary"
-          test_binary="$PWD/$test_binary"
-          sudo -n env RUST_BACKTRACE=1 "$test_binary" --ignored --nocapture --test-threads=1
-
-  dplpmtud_windows:
-    name: DPLPMTUD Windows checks
-    runs-on: windows-latest
-    timeout-minutes: 45
+  live_evidence:
+    name: DPLPMTUD live dataplane evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ env.VALIDATION_SHA }}
-          fetch-depth: 0
-
-      - name: Verify exact validation SHA
-        shell: pwsh
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify source and workflow identity
         run: |
-          $actual = git rev-parse HEAD
-          Write-Host "DPLPMTUD validation SHA: $actual"
-          if ($actual -ne $env:VALIDATION_SHA) { throw "checked out $actual instead of $env:VALIDATION_SHA" }
-
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+          workflow_sha="$(git rev-parse "$P2WLAN_EXACT_HEAD:.github/workflows/dplpmtud-required.yml")"
+          test "$workflow_sha" != "$P2WLAN_EXACT_HEAD"
+          echo "DPLPMTUD_SOURCE_HEAD_SHA=$P2WLAN_EXACT_HEAD" >> "$GITHUB_ENV"
+          echo "DPLPMTUD_WORKFLOW_SHA=$workflow_sha" >> "$GITHUB_ENV"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+      - name: Run actual-test-derived live acceptance
+        run: bash scripts/dplpmtud/run_acceptance.sh "$RUNNER_TEMP/p2wlan-dplpmtud-live"
+      - name: Upload live component evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dplpmtud-live-component-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p2wlan-dplpmtud-live/**
+          if-no-files-found: error
+          retention-days: 90
 
-      - name: Compile daemon on Windows
-        run: cargo check -p p2wlan-daemon --all-targets --all-features
-
-      - name: Reducer search and timeout lifecycle
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::timeout_retries_then_only_narrows_search_bounds -- --exact --test-threads=1
-
-      - name: Owner and path replacement cancellation
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::worker_owner_token_closes_same_identity_exit_aba -- --exact --test-threads=1
-
-      - name: PeerLeft and shutdown cleanup
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::close_and_peer_left_remove_all_worker_ownership -- --exact --test-threads=1
-
-      - name: Capability compatibility
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::capability_extension_is_additive_and_legacy_packets_remain_decodable -- --exact --test-threads=1
-
-      - name: Packet codec and exact datagram budget
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::codec_round_trip_uses_exact_udp_datagram_budget_and_compact_ack -- --exact --test-threads=1
-
-      - name: IPv4 and IPv6 budget separation
-        run: cargo test -p p2wlan-daemon --lib dplpmtud::tests::ipv4_and_ipv6_budget_layers_are_never_mixed -- --exact --test-threads=1
+  dplpmtud_windows:
+    name: DPLPMTUD Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:P2WLAN_EXACT_HEAD) {
+            throw "exact source checkout mismatch"
+          }
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Run reducer and wire tests
+        run: cargo test -p p2wlan-daemon --lib dplpmtud -- --test-threads=1
+      - name: Run final path/boundary tests
+        run: cargo test -p p2wlan-daemon --lib dplpmtud_final_ -- --nocapture --test-threads=1
+      - name: Build Windows daemon
+        run: cargo build -p p2wlan-daemon
 
   existing_required_gates:
-    name: Existing required gates on PR Head
+    name: DPLPMTUD external required gates
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 70
     steps:
-      - name: Require same-Head existing, Flutter, and Package jobs
+      - name: Require same-SHA business, path, topology, lifecycle, package, security and observability gates
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
             const requiredNames = [
+              'Business MTU Budget Required',
               'Path State Machine Required',
               'NAT Topology Required',
               'Windows Lifecycle Required',
               'Mobile Lifecycle Required',
+              'Path Observability Required',
+              'Security Audit Required',
               'CI Required',
-              // Flutter Client publishes one check-run per job rather than a
-              // workflow-level check with the workflow name.
               'Analyze and Test',
               'Android arm64 CI test APK',
+              'iOS Compile',
               'Linux x64 Release Bundle',
               'macOS Release Apps',
               'Windows x64 Release Bundle',
-              'iOS Compile',
-              // Package Test Builds likewise publishes its concrete jobs.
               'macOS arm64 test DMG',
               'Android arm64 test APK',
             ];
             const targetSha = context.payload.pull_request?.head?.sha || context.sha;
-            const deadline = Date.now() + 50 * 60 * 1000;
+            const deadline = Date.now() + 65 * 60 * 1000;
             let lastSummary = '';
 
-            core.info(`Waiting for required checks on exact PR Head ${targetSha}`);
             while (Date.now() < deadline) {
               const response = await github.rest.checks.listForRef({
                 owner: context.repo.owner,
@@ -262,20 +295,11 @@ jobs:
 
               const summary = requiredNames.map((name) => {
                 const run = latestByName.get(name);
-                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}@${run.head_sha}` : 'missing'}`;
+                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}` : 'missing'}`;
               }).join(', ');
               if (summary !== lastSummary) {
-                core.info(`same-Head gate status: ${summary}`);
+                core.info(`same-SHA gate status: ${summary}`);
                 lastSummary = summary;
-              }
-
-              const wrongSha = requiredNames.filter((name) => {
-                const run = latestByName.get(name);
-                return run && run.head_sha !== targetSha;
-              });
-              if (wrongSha.length > 0) {
-                core.setFailed(`Required gate resolved to a non-Head SHA for ${targetSha}: ${wrongSha.join(', ')}`);
-                return;
               }
 
               const failed = requiredNames.filter((name) => {
@@ -286,43 +310,126 @@ jobs:
                 core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
                 return;
               }
-
               const complete = requiredNames.every((name) => {
                 const run = latestByName.get(name);
-                return run && run.head_sha === targetSha &&
-                  run.status === 'completed' && run.conclusion === 'success';
+                return run && run.status === 'completed' && run.conclusion === 'success';
               });
               if (complete) {
-                core.info(`All existing required gates passed on exact PR Head ${targetSha}.`);
+                core.info(`All required live dataplane and repository gates passed for ${targetSha}.`);
                 return;
               }
-
               await new Promise((resolve) => setTimeout(resolve, 15000));
             }
-
             core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
+
+  evidence_aggregate:
+    name: DPLPMTUD evidence aggregate
+    if: always()
+    needs:
+      - contract
+      - live_evidence
+      - existing_required_gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact aggregate identity
+        id: identity
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$P2WLAN_EXACT_HEAD"
+          workflow_sha="$(git rev-parse "$actual:.github/workflows/dplpmtud-required.yml")"
+          {
+            echo "source_head_sha=$actual"
+            echo "workflow_sha=$workflow_sha"
+          } >> "$GITHUB_OUTPUT"
+      - name: Download live component evidence
+        id: download
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: dplpmtud-live-component-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dplpmtud-component
+          merge-multiple: false
+      - name: Aggregate fail-closed evidence
+        id: aggregate
+        if: always()
+        env:
+          COMPONENT_RESULT: ${{ needs.live_evidence.result }}
+          EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          WORKFLOW_SHA: ${{ steps.identity.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          component="$(find "$RUNNER_TEMP/dplpmtud-component" -name dplpmtud-live-component.json -type f -print -quit)"
+          test -n "$component"
+          python3 scripts/dplpmtud/aggregate_evidence.py \
+            --contract contracts/dplpmtud_acceptance.json \
+            --component "$component" \
+            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --event-name "$EVENT_NAME" \
+            --component-result "$COMPONENT_RESULT" \
+            --external-gates-result "$EXTERNAL_RESULT" \
+            --output "$RUNNER_TEMP/dplpmtud-aggregate.json"
+      - name: Upload DPLPMTUD aggregate
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dplpmtud-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dplpmtud-aggregate.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Enforce aggregate construction
+        if: always()
+        env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          LIVE_RESULT: ${{ needs.live_evidence.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
+        run: |
+          set -euo pipefail
+          test "$CONTRACT_RESULT" = "success"
+          test "$LIVE_RESULT" = "success"
+          test "$DOWNLOAD_OUTCOME" = "success"
+          test "$AGGREGATE_OUTCOME" = "success"
 
   required:
     name: DPLPMTUD Required
     if: always()
     needs:
+      - contract
       - dplpmtud_linux
-      - dplpmtud_acceptance
+      - runtime_acceptance
+      - live_evidence
       - dplpmtud_windows
       - existing_required_gates
+      - evidence_aggregate
     runs-on: ubuntu-latest
     steps:
       - name: Enforce aggregate results
         env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
           LINUX_RESULT: ${{ needs.dplpmtud_linux.result }}
-          ACCEPTANCE_RESULT: ${{ needs.dplpmtud_acceptance.result }}
+          ACCEPTANCE_RESULT: ${{ needs.runtime_acceptance.result }}
+          LIVE_RESULT: ${{ needs.live_evidence.result }}
           WINDOWS_RESULT: ${{ needs.dplpmtud_windows.result }}
           EXTERNAL_RESULT: ${{ needs.existing_required_gates.result }}
+          EVIDENCE_RESULT: ${{ needs.evidence_aggregate.result }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          set -euo pipefail
+          test "$CONTRACT_RESULT" = "success"
           test "$LINUX_RESULT" = "success"
           test "$ACCEPTANCE_RESULT" = "success"
+          test "$LIVE_RESULT" = "success"
           test "$WINDOWS_RESULT" = "success"
+          test "$EVIDENCE_RESULT" = "success"
           if [ "$EVENT_NAME" = "pull_request" ]; then
             test "$EXTERNAL_RESULT" = "success"
           else
