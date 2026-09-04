@@ -34,6 +34,10 @@ def validate_status(value: Any) -> dict[str, Any]:
         raise ValueError("status_schema_missing_correlation_id")
     if not isinstance(timeline.get("events"), list):
         raise ValueError("status_schema_missing_timeline_events")
+    if "first_usable_summaries" in timeline and not isinstance(
+        timeline.get("first_usable_summaries"), list
+    ):
+        raise ValueError("status_schema_invalid_first_usable_summaries")
     return value
 
 

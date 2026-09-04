@@ -27,6 +27,7 @@ if [[ -n "$EXPECTED_HEAD_SHA" ]]; then
 else
   ACTUAL_HEAD_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
 fi
+WORKFLOW_SHA=$(git -C "$ROOT_DIR" rev-parse "$ACTUAL_HEAD_SHA:.github/workflows/nat-topology-gate.yml")
 
 mkdir -p "$ARTIFACT_PARENT"
 if [[ -e "$ARTIFACT_DIR" || -e "$LOG_FILE" ]]; then
@@ -47,6 +48,7 @@ run_smoke() {
       NAT_SEED_BASE=20260828 \
       NAT_SIM_RUN_ID="$RUN_NAME" \
       NAT_TOPOLOGY_HEAD_SHA="$ACTUAL_HEAD_SHA" \
+      NAT_TOPOLOGY_WORKFLOW_SHA="$WORKFLOW_SHA" \
       NAT_TOPOLOGY_REPLICA="$REPLICA" \
       NAT_SIM_ARTIFACT_DIR="$ARTIFACT_DIR" \
       "$@" \
