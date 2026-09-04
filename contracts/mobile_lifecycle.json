@@ -39,10 +39,12 @@
     "deferred"
   ],
   "identity_fields": [
-    "app_epoch",
-    "event_loop_generation",
-    "daemon_process_id",
-    "daemon_revision",
+      "app_epoch",
+      "event_loop_generation",
+      "lifecycle_generation",
+      "daemon_process_id",
+      "runtime_incarnation",
+      "daemon_revision",
     "permission_request_id",
     "activity_incarnation",
     "engine_incarnation",

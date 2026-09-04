@@ -256,6 +256,9 @@ pub(super) struct RelaySupervisor {
     pub(super) relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     pub(super) relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     pub(super) inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+    /// Android's physical-network callback stream. `None` on desktop, where
+    /// the existing stable route monitor remains the authority.
+    pub(super) android_network_change_rx: Option<crate::AndroidNetworkChangeReceiver>,
     /// Watch flipped whenever the shared relay transport slot is set/cleared,
     /// so the outbound path can wait event-driven for relay availability.
     pub(super) relay_available_tx: watch::Sender<bool>,
@@ -428,6 +431,36 @@ impl RelaySupervisor {
         let mut pending_current_end: Option<Result<()>> = None;
         loop {
             tokio::select! {
+                hint = wait_for_android_network_change(self.android_network_change_rx.clone()), if self.android_network_change_rx.is_some() => {
+                    let Some(hint) = hint else {
+                        return Err(DaemonError::Relay(
+                            "Android network hint channel closed".to_string(),
+                        ));
+                    };
+                    connection_generation.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    current_transport.abort_writer();
+                    self.timeline.emit(
+                        "relay_transport_network_changed",
+                        Some("relay"),
+                        Some("physical_network_changed"),
+                        Some(format!(
+                            "endpoint={endpoint} connection_id={} kotlin_network_generation={} network_identity_hash={}",
+                            current_transport.connection_id(),
+                            hint.kotlin_network_generation,
+                            hint.network_identity_hash,
+                        )),
+                    );
+                    return Err(DaemonError::RelayRouteChanged {
+                        endpoint: endpoint.to_string(),
+                        signature: vec![format!(
+                            "android_network_identity_hash={}",
+                            hint.network_identity_hash,
+                        )],
+                    });
+                }
                 changed = route_monitor.wait_for_change(), if route_monitor.enabled() => {
                     connection_generation.fetch_add(
                         1,
@@ -707,6 +740,20 @@ impl RelaySupervisor {
         d.selected_error_count = d.selected_error_count.saturating_add(1);
         d.last_error = Some(format!("relay connection closed: reason={label}"));
         d.last_error_code = Some(label);
+    }
+}
+
+async fn wait_for_android_network_change(
+    receiver: Option<crate::AndroidNetworkChangeReceiver>,
+) -> Option<crate::AndroidNetworkChangeHint> {
+    let receiver = receiver?;
+    let mut receiver = receiver.lock().await;
+    loop {
+        match receiver.recv().await {
+            Ok(hint) => return Some(hint),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
     }
 }
 
@@ -2146,6 +2193,7 @@ mod tests {
             relay_available_tx,
             timeline: crate::connection_timeline::ConnectionTimeline::new("node-a", 0),
             inbound_tx,
+            android_network_change_rx: None,
             ticket_cache,
             relay_ticket: None,
             allow_insecure_plaintext: true,

@@ -51,6 +51,7 @@ class MobileLifecycleIdentity {
     this.appEpoch = 0,
     this.eventLoopGeneration = 0,
     this.daemonProcessId,
+    this.daemonRuntimeIncarnation,
     this.daemonRevision = 0,
     this.permissionRequestId,
     this.activityIncarnation,
@@ -71,6 +72,10 @@ class MobileLifecycleIdentity {
   final int appEpoch;
   final int eventLoopGeneration;
   final int? daemonProcessId;
+
+  /// Native bridge/runtime incarnation. This is stronger than PID/revision
+  /// when Android restarts the embedded daemon in the same process.
+  final int? daemonRuntimeIncarnation;
   final int daemonRevision;
   final int? permissionRequestId;
   final int? activityIncarnation;
@@ -92,6 +97,8 @@ class MobileLifecycleIdentity {
     int? eventLoopGeneration,
     int? daemonProcessId,
     bool clearDaemonProcessId = false,
+    int? daemonRuntimeIncarnation,
+    bool clearDaemonRuntimeIncarnation = false,
     int? daemonRevision,
     int? permissionRequestId,
     int? activityIncarnation,
@@ -114,6 +121,9 @@ class MobileLifecycleIdentity {
       daemonProcessId: clearDaemonProcessId
           ? null
           : daemonProcessId ?? this.daemonProcessId,
+      daemonRuntimeIncarnation: clearDaemonRuntimeIncarnation
+          ? null
+          : daemonRuntimeIncarnation ?? this.daemonRuntimeIncarnation,
       daemonRevision: daemonRevision ?? this.daemonRevision,
       permissionRequestId: permissionRequestId ?? this.permissionRequestId,
       activityIncarnation: activityIncarnation ?? this.activityIncarnation,
@@ -148,6 +158,7 @@ class MobileLifecycleIdentity {
     }
 
     add('daemon_process_id', daemonProcessId);
+    add('runtime_incarnation', daemonRuntimeIncarnation);
     add('permission_request_id', permissionRequestId);
     add('activity_incarnation', activityIncarnation);
     add('engine_incarnation', engineIncarnation);
@@ -193,6 +204,7 @@ class MobileLifecycleCoordinator {
   bool _permissionRevoked = false;
   bool _permissionPending = false;
   final _retiredDaemonProcessIds = <int>{};
+  final _retiredDaemonRuntimeIncarnations = <int>{};
   MobileLifecycleTransition? _lastTransition;
 
   MobileLifecycleIdentity get identity => _identity;
@@ -206,22 +218,14 @@ class MobileLifecycleCoordinator {
     if (_disposed) return _failed(MobileLifecycleEvent.appBackgrounded);
     if (!_foreground) return _duplicate(MobileLifecycleEvent.appBackgrounded);
     _foreground = false;
-    return _advance(
-      MobileLifecycleEvent.appBackgrounded,
-      appEpoch: _identity.appEpoch + 1,
-      eventLoopGeneration: _identity.eventLoopGeneration + 1,
-    );
+    return invalidateEventLoop(event: MobileLifecycleEvent.appBackgrounded);
   }
 
   MobileLifecycleTransition onAppResumed() {
     if (_disposed) return _failed(MobileLifecycleEvent.appResumed);
     if (_foreground) return _duplicate(MobileLifecycleEvent.appResumed);
     _foreground = true;
-    return _advance(
-      MobileLifecycleEvent.appResumed,
-      appEpoch: _identity.appEpoch + 1,
-      eventLoopGeneration: _identity.eventLoopGeneration + 1,
-    );
+    return invalidateEventLoop(event: MobileLifecycleEvent.appResumed);
   }
 
   MobileLifecycleTransition beginPermissionRequest() {
@@ -234,11 +238,10 @@ class MobileLifecycleCoordinator {
     final nextRequest = (_identity.permissionRequestId ?? 0) + 1;
     _permissionRevoked = false;
     _permissionPending = true;
-    return _advance(
-      MobileLifecycleEvent.vpnPermissionRequestStarted,
+    return invalidateEventLoop(
+      event: MobileLifecycleEvent.vpnPermissionRequestStarted,
+      advanceAppEpoch: true,
       permissionRequestId: nextRequest,
-      appEpoch: _identity.appEpoch + 1,
-      eventLoopGeneration: _identity.eventLoopGeneration + 1,
     );
   }
 
@@ -249,10 +252,9 @@ class MobileLifecycleCoordinator {
     }
     _permissionRevoked = true;
     _permissionPending = false;
-    return _advance(
-      MobileLifecycleEvent.vpnPermissionRevoked,
-      appEpoch: _identity.appEpoch + 1,
-      eventLoopGeneration: _identity.eventLoopGeneration + 1,
+    return invalidateEventLoop(
+      event: MobileLifecycleEvent.vpnPermissionRevoked,
+      advanceAppEpoch: true,
     );
   }
 
@@ -278,30 +280,63 @@ class MobileLifecycleCoordinator {
     }
     _permissionPending = false;
     if (!granted) return onPermissionRevoked();
-    return _advance(
-      event,
-      appEpoch: _identity.appEpoch + 1,
-      eventLoopGeneration: _identity.eventLoopGeneration + 1,
+    return invalidateEventLoop(
+      event: event,
+      advanceAppEpoch: true,
     );
   }
 
   MobileLifecycleTransition invalidateDiagnostics() {
-    if (_disposed) return _failed(MobileLifecycleEvent.bridgeDetached);
+    return invalidateEventLoop(event: MobileLifecycleEvent.bridgeDetached);
+  }
+
+  /// Invalidate work tied to the current event-loop generation. StatusStore
+  /// uses this same API for settings/URL changes and auto-refresh disable;
+  /// lifecycle transitions below use the same primitive as well. Keeping the
+  /// counter here makes the coordinator the single event-loop authority.
+  MobileLifecycleTransition invalidateEventLoop({
+    MobileLifecycleEvent event = MobileLifecycleEvent.bridgeDetached,
+    bool advanceAppEpoch = true,
+    int? daemonProcessId,
+    bool clearDaemonProcessId = false,
+    int? daemonRuntimeIncarnation,
+    bool clearDaemonRuntimeIncarnation = false,
+    int? daemonRevision,
+    int? permissionRequestId,
+    int? bridgeIncarnation,
+  }) {
+    if (_disposed) return _failed(event);
     return _advance(
-      MobileLifecycleEvent.bridgeDetached,
-      appEpoch: _identity.appEpoch + 1,
+      event,
+      appEpoch: advanceAppEpoch ? _identity.appEpoch + 1 : null,
       eventLoopGeneration: _identity.eventLoopGeneration + 1,
+      daemonProcessId: daemonProcessId,
+      clearDaemonProcessId: clearDaemonProcessId,
+      daemonRuntimeIncarnation: daemonRuntimeIncarnation,
+      clearDaemonRuntimeIncarnation: clearDaemonRuntimeIncarnation,
+      daemonRevision: daemonRevision,
+      permissionRequestId: permissionRequestId,
+      bridgeIncarnation: bridgeIncarnation,
     );
   }
 
   MobileLifecycleTransition observeDaemon({
     required int? processId,
+    int? runtimeIncarnation,
     required int revision,
   }) {
     if (_disposed) return _failed(MobileLifecycleEvent.nativeRuntimeStarted);
     final old = _identity;
     final sameProcess = old.daemonProcessId == processId;
-    if (sameProcess && revision < old.daemonRevision) {
+    final oldRuntime = old.daemonRuntimeIncarnation;
+    final runtimeChanged = oldRuntime != runtimeIncarnation;
+
+    // Android can replace the embedded Rust runtime without replacing the
+    // hosting process. The runtime incarnation is therefore the first
+    // identity fence: a newer bridge may legitimately start with a lower
+    // revision and uptime, while a late response from the retired bridge is
+    // stale even if its PID and revision look newer.
+    if (oldRuntime != null && runtimeIncarnation == null) {
       return _record(
         MobileLifecycleTransition(
           event: MobileLifecycleEvent.nativeRuntimeStarted,
@@ -311,7 +346,40 @@ class MobileLifecycleCoordinator {
         ),
       );
     }
-    if (sameProcess && revision == old.daemonRevision) {
+    if (runtimeIncarnation != null &&
+        _retiredDaemonRuntimeIncarnations.contains(runtimeIncarnation)) {
+      return _record(
+        MobileLifecycleTransition(
+          event: MobileLifecycleEvent.nativeRuntimeStarted,
+          outcome: MobileLifecycleOutcome.staleRejected,
+          oldIdentity: old,
+          newIdentity: old,
+        ),
+      );
+    }
+    if (oldRuntime != null &&
+        runtimeIncarnation != null &&
+        runtimeIncarnation < oldRuntime) {
+      return _record(
+        MobileLifecycleTransition(
+          event: MobileLifecycleEvent.nativeRuntimeStarted,
+          outcome: MobileLifecycleOutcome.staleRejected,
+          oldIdentity: old,
+          newIdentity: old,
+        ),
+      );
+    }
+    if (!runtimeChanged && sameProcess && revision < old.daemonRevision) {
+      return _record(
+        MobileLifecycleTransition(
+          event: MobileLifecycleEvent.nativeRuntimeStarted,
+          outcome: MobileLifecycleOutcome.staleRejected,
+          oldIdentity: old,
+          newIdentity: old,
+        ),
+      );
+    }
+    if (!runtimeChanged && sameProcess && revision == old.daemonRevision) {
       return _duplicate(MobileLifecycleEvent.nativeRuntimeStarted);
     }
     if (!sameProcess &&
@@ -329,13 +397,31 @@ class MobileLifecycleCoordinator {
     if (!sameProcess && old.daemonProcessId != null) {
       _retiredDaemonProcessIds.add(old.daemonProcessId!);
     }
+    if (oldRuntime != null && runtimeChanged) {
+      _retiredDaemonRuntimeIncarnations.add(oldRuntime);
+    }
     final daemonReplaced =
-        old.daemonProcessId != null && old.daemonProcessId != processId;
+        (old.daemonProcessId != null && old.daemonProcessId != processId) ||
+        runtimeChanged;
+    if (daemonReplaced) {
+      return invalidateEventLoop(
+        event: MobileLifecycleEvent.nativeRuntimeStarted,
+        advanceAppEpoch: false,
+        daemonProcessId: processId,
+        clearDaemonProcessId: processId == null && old.daemonProcessId != null,
+        daemonRuntimeIncarnation: runtimeIncarnation,
+        clearDaemonRuntimeIncarnation:
+            runtimeIncarnation == null && oldRuntime != null,
+        daemonRevision: revision,
+      );
+    }
     return _advance(
       MobileLifecycleEvent.nativeRuntimeStarted,
-      eventLoopGeneration: daemonReplaced ? old.eventLoopGeneration + 1 : null,
       daemonProcessId: processId,
       clearDaemonProcessId: processId == null && old.daemonProcessId != null,
+      daemonRuntimeIncarnation: runtimeIncarnation,
+      clearDaemonRuntimeIncarnation:
+          runtimeIncarnation == null && oldRuntime != null,
       daemonRevision: revision,
     );
   }
@@ -359,11 +445,10 @@ class MobileLifecycleCoordinator {
         ),
       );
     }
-    return _advance(
-      MobileLifecycleEvent.bridgeAttached,
+    return invalidateEventLoop(
+      event: MobileLifecycleEvent.bridgeAttached,
+      advanceAppEpoch: true,
       bridgeIncarnation: bridgeIncarnation,
-      appEpoch: _identity.appEpoch + 1,
-      eventLoopGeneration: _identity.eventLoopGeneration + 1,
     );
   }
 
@@ -379,11 +464,10 @@ class MobileLifecycleCoordinator {
 
   void dispose() {
     if (_disposed) return;
+    // Invalidate first so every in-flight operation observes the same
+    // generation fence; only then make future transitions fail closed.
+    invalidateEventLoop(event: MobileLifecycleEvent.bridgeDetached);
     _disposed = true;
-    _identity = _identity.copyWith(
-      appEpoch: _identity.appEpoch + 1,
-      eventLoopGeneration: _identity.eventLoopGeneration + 1,
-    );
   }
 
   MobileLifecycleTransition _advance(
@@ -392,6 +476,8 @@ class MobileLifecycleCoordinator {
     int? eventLoopGeneration,
     int? daemonProcessId,
     bool clearDaemonProcessId = false,
+    int? daemonRuntimeIncarnation,
+    bool clearDaemonRuntimeIncarnation = false,
     int? daemonRevision,
     int? permissionRequestId,
     int? bridgeIncarnation,
@@ -402,6 +488,8 @@ class MobileLifecycleCoordinator {
       eventLoopGeneration: eventLoopGeneration,
       daemonProcessId: daemonProcessId,
       clearDaemonProcessId: clearDaemonProcessId,
+      daemonRuntimeIncarnation: daemonRuntimeIncarnation,
+      clearDaemonRuntimeIncarnation: clearDaemonRuntimeIncarnation,
       daemonRevision: daemonRevision,
       permissionRequestId: permissionRequestId,
       bridgeIncarnation: bridgeIncarnation,

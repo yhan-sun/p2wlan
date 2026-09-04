@@ -94,13 +94,23 @@ jobs:
             echo "Flutter dependency resolution failed; writing a failing component report." >&2
             test_status="$dependency_status"
             mkdir -p "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR"
+            python3 - "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/execution-records.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps({"schema_version": 1, "records": []}) + "\n",
+              encoding="utf-8",
+          )
+          PY
             python3 scripts/mobile_lifecycle/component_report.py \
               --root . \
               --component flutter \
               --manifest scripts/mobile_lifecycle/manifests/flutter.json \
               --source-head-sha "$P2WLAN_EXACT_HEAD" \
               --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
-              --result fail \
+              --execution-records "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/execution-records.json" \
               --toolchain '{"runner":"flutter","dependency_resolution":"failed"}' \
               --output "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/flutter.json"
           fi
@@ -178,11 +188,6 @@ jobs:
           bash scripts/mobile_lifecycle/run_android_jvm_tests.sh
           test_status=$?
           set -e
-          if [[ "$test_status" -eq 0 ]]; then
-            result=pass
-          else
-            result=fail
-          fi
           mkdir -p "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR"
           python3 scripts/mobile_lifecycle/component_report.py \
             --root . \
@@ -190,7 +195,7 @@ jobs:
             --manifest scripts/mobile_lifecycle/manifests/android_jvm.json \
             --source-head-sha "$P2WLAN_EXACT_HEAD" \
             --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
-            --result "$result" \
+            --execution-records "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/android-execution-records.json" \
             --toolchain '{"runner":"gradle","task":":app:testDebugUnitTest","xml_root":"apps/flutter_client/build/app/test-results"}' \
             --output "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/android_jvm.json"
           exit "$test_status"
@@ -231,44 +236,74 @@ jobs:
         env:
           P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR: ${{ runner.temp }}/p2wlan-mobile-lifecycle-rust
         run: |
+          set -u
+          mkdir -p "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR"
+          evidence_output="$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/rust-test-output.log"
+          : > "$evidence_output"
+
+          run_cargo_test() {
+            set +e
+            cargo test "$@" 2>&1 | tee -a "$evidence_output"
+            local pipeline_status=("${PIPESTATUS[@]}")
+            local command_status="${pipeline_status[0]}"
+            local tee_status="${pipeline_status[1]}"
+            set -u
+            if [[ "$command_status" -ne 0 || "$tee_status" -ne 0 ]]; then
+              return 1
+            fi
+            return 0
+          }
+
           set +e
           cargo fmt --all -- --check
           format_status=$?
-          if [[ "$format_status" -eq 0 ]]; then
-            cargo test -p p2wlan-android-native --lib
-            bridge_status=$?
-          else
-            bridge_status="$format_status"
+          run_cargo_test -p p2wlan-android-native --lib
+          bridge_status=$?
+          run_cargo_test -p p2wlan-daemon control::websocket::route_tests::new_control_connection_survives_old_task_teardown --lib
+          control_status=$?
+          run_cargo_test -p p2wlan-daemon --lib candidate_refresh_generation_keeps_confirmed_relay_admission
+          path_status=$?
+
+          evidence_status=0
+          run_cargo_test -p p2wlan-android-native --lib lifecycle::tests -- --nocapture --test-threads=1 || evidence_status=1
+          run_cargo_test -p p2wlan-daemon mobile_lifecycle_evidence --lib -- --nocapture --test-threads=1 || evidence_status=1
+          run_cargo_test -p p2wlan-daemon control::websocket::route_tests::evidence_ml --lib -- --nocapture --test-threads=1 || evidence_status=1
+
+          records_status=0
+          python3 scripts/mobile_lifecycle/rust_test_records.py \
+            --test-output "$evidence_output" \
+            --manifest scripts/mobile_lifecycle/manifests/rust.json \
+            --output "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/execution-records.json"
+          records_status=$?
+          if [[ "$records_status" -ne 0 ]]; then
+            python3 - "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/execution-records.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps({"schema_version": 1, "records": []}) + "\n",
+              encoding="utf-8",
+          )
+          PY
           fi
-          if [[ "$bridge_status" -eq 0 ]]; then
-            cargo test -p p2wlan-daemon control::websocket::route_tests::new_control_connection_survives_old_task_teardown --lib
-            control_status=$?
-          else
-            control_status="$bridge_status"
-          fi
-          if [[ "$control_status" -eq 0 ]]; then
-            cargo test -p p2wlan-daemon --lib candidate_refresh_generation_keeps_confirmed_relay_admission
-            path_status=$?
-          else
-            path_status="$control_status"
-          fi
-          set -e
-          if [[ "$format_status" -eq 0 && "$bridge_status" -eq 0 && "$control_status" -eq 0 && "$path_status" -eq 0 ]]; then
+
+          if [[ "$format_status" -eq 0 && "$bridge_status" -eq 0 && "$control_status" -eq 0 && "$path_status" -eq 0 && "$evidence_status" -eq 0 && "$records_status" -eq 0 ]]; then
             result=pass
           else
             result=fail
           fi
-          mkdir -p "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR"
           python3 scripts/mobile_lifecycle/component_report.py \
             --root . \
             --component rust \
             --manifest scripts/mobile_lifecycle/manifests/rust.json \
             --source-head-sha "$P2WLAN_EXACT_HEAD" \
             --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
-            --result "$result" \
-            --toolchain '{"runner":"cargo","bridge_test":"cargo test -p p2wlan-android-native --lib","control_test":"new_control_connection_survives_old_task_teardown","path_test":"candidate_refresh_generation_keeps_confirmed_relay_admission"}' \
+            --execution-records "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/execution-records.json" \
+            --toolchain '{"runner":"cargo","evidence_tests":["cargo test -p p2wlan-android-native --lib lifecycle::tests -- --nocapture --test-threads=1","cargo test -p p2wlan-daemon mobile_lifecycle_evidence --lib -- --nocapture --test-threads=1","cargo test -p p2wlan-daemon control::websocket::route_tests::evidence_ml --lib -- --nocapture --test-threads=1"]}' \
             --output "$P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR/rust.json"
-          if [[ "$result" == pass ]]; then
+          report_status=$?
+          if [[ "$result" == pass && "$report_status" -eq 0 ]]; then
             exit 0
           fi
           exit 1
@@ -464,11 +499,22 @@ jobs:
           set -e
           exit "$aggregate_status"
 
+      - name: Hash aggregate lifecycle evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          aggregate="$RUNNER_TEMP/mobile-lifecycle-aggregate.json"
+          test -f "$aggregate"
+          sha256sum "$aggregate" > "$aggregate.sha256"
+
       - name: Upload aggregate lifecycle evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: mobile-lifecycle-aggregate
-          path: ${{ runner.temp }}/mobile-lifecycle-aggregate.json
+          path: |
+            ${{ runner.temp }}/mobile-lifecycle-aggregate.json
+            ${{ runner.temp }}/mobile-lifecycle-aggregate.json.sha256
           if-no-files-found: error
           retention-days: 14

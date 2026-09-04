@@ -67,58 +67,62 @@ void main() {
     },
   );
 
-  test('stable peer order puts online peers first and moves reconnected peers to the end', () async {
-    final fixture = await _loadFixture();
-    final stores = await _makeStores(DiagnosticsApi());
-    addTearDown(stores.dispose);
+  test(
+    'stable peer order puts online peers first and moves reconnected peers to the end',
+    () async {
+      final fixture = await _loadFixture();
+      final stores = await _makeStores(DiagnosticsApi());
+      addTearDown(stores.dispose);
 
-    final initial = stores.statusStore.stablePeerOrder(fixture.peers);
-    final firstOnline = initial.first;
-    expect(firstOnline.online, isTrue);
+      final initial = stores.statusStore.stablePeerOrder(fixture.peers);
+      final firstOnline = initial.first;
+      expect(firstOnline.online, isTrue);
 
-    final offlineRaw =
-        jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
-    final offlinePeers = [
-      for (final item in offlineRaw['peers'] as List<dynamic>)
-        Map<String, dynamic>.from(item as Map),
-    ];
-    final firstOffline = offlinePeers.firstWhere(
-      (item) => item['node_id'] == firstOnline.nodeId,
-    );
-    firstOffline
-      ..['online'] = false
-      ..['state'] = 'unknown'
-      ..['active_path'] = null
-      ..['current_path_selection'] = null;
-    final offlineSnapshot = DiagnosticsSnapshot.fromJson(
-      offlineRaw..['peers'] = offlinePeers,
-    );
-    final whileOffline = stores.statusStore.stablePeerOrder(
-      offlineSnapshot.peers,
-    );
-    expect(whileOffline.last.nodeId, firstOnline.nodeId);
+      final offlineRaw =
+          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+      final offlinePeers = [
+        for (final item in offlineRaw['peers'] as List<dynamic>)
+          Map<String, dynamic>.from(item as Map),
+      ];
+      final firstOffline = offlinePeers.firstWhere(
+        (item) => item['node_id'] == firstOnline.nodeId,
+      );
+      firstOffline
+        ..['online'] = false
+        ..['state'] = 'unknown'
+        ..['active_path'] = null
+        ..['current_path_selection'] = null;
+      final offlineSnapshot = DiagnosticsSnapshot.fromJson(
+        offlineRaw..['peers'] = offlinePeers,
+      );
+      final whileOffline = stores.statusStore.stablePeerOrder(
+        offlineSnapshot.peers,
+      );
+      expect(whileOffline.last.nodeId, firstOnline.nodeId);
 
-    final restoredRaw =
-        jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
-    final restoredPeers = [
-      for (final item in restoredRaw['peers'] as List<dynamic>)
-        Map<String, dynamic>.from(item as Map),
-    ];
-    final restored = stores.statusStore.stablePeerOrder(
-      DiagnosticsSnapshot.fromJson(restoredRaw..['peers'] = restoredPeers)
-          .peers,
-    );
-    final restoredOnline = restored
-        .where((peer) => peer.online && peer.path != 'offline')
-        .toList();
-    expect(restoredOnline.last.nodeId, firstOnline.nodeId);
-    expect(
-      restored
-          .skipWhile((peer) => peer.online && peer.path != 'offline')
-          .every((peer) => !peer.online || peer.path == 'offline'),
-      isTrue,
-    );
-  });
+      final restoredRaw =
+          jsonDecode(jsonEncode(fixture.raw)) as Map<String, dynamic>;
+      final restoredPeers = [
+        for (final item in restoredRaw['peers'] as List<dynamic>)
+          Map<String, dynamic>.from(item as Map),
+      ];
+      final restored = stores.statusStore.stablePeerOrder(
+        DiagnosticsSnapshot.fromJson(
+          restoredRaw..['peers'] = restoredPeers,
+        ).peers,
+      );
+      final restoredOnline = restored
+          .where((peer) => peer.online && peer.path != 'offline')
+          .toList();
+      expect(restoredOnline.last.nodeId, firstOnline.nodeId);
+      expect(
+        restored
+            .skipWhile((peer) => peer.online && peer.path != 'offline')
+            .every((peer) => !peer.online || peer.path == 'offline'),
+        isTrue,
+      );
+    },
+  );
 
   test('automatic refresh stays silent while work is in flight', () async {
     final fixture = await _loadFixture();
@@ -356,6 +360,50 @@ void main() {
   });
 
   test(
+    'same PID runtime replacement accepts lower revision then rejects late old snapshot',
+    () async {
+      final fixture = await _loadFixture();
+      final oldRuntime = _snapshotCopy(
+        fixture,
+        processId: 1234,
+        runtimeIncarnation: 4,
+        revision: 50,
+        uptimeMs: 10000,
+      );
+      final newRuntime = _snapshotCopy(
+        fixture,
+        processId: 1234,
+        runtimeIncarnation: 5,
+        revision: 1,
+        uptimeMs: 100,
+        peers: const <dynamic>[],
+      );
+      final lateOldRuntime = _snapshotCopy(
+        fixture,
+        processId: 1234,
+        runtimeIncarnation: 4,
+        revision: 51,
+        uptimeMs: 11000,
+      );
+      final api = _SwitchingDiagnosticsApi(
+        snapshot: newRuntime,
+        snapshots: [oldRuntime, newRuntime, lateOldRuntime],
+      );
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      await stores.statusStore.refresh();
+      await stores.statusStore.refresh();
+
+      expect(stores.statusStore.snapshot?.processId, 1234);
+      expect(stores.statusStore.snapshot?.runtimeIncarnation, 5);
+      expect(stores.statusStore.snapshot?.revision, 1);
+      expect(stores.statusStore.snapshot?.peers, isEmpty);
+    },
+  );
+
+  test(
     'startup settling never restores an older larger peer catalog',
     () async {
       final fixture = await _loadFixture();
@@ -505,6 +553,68 @@ void main() {
   );
 
   test(
+    'one event-loop generation fences disable/enable and dispose without a spin',
+    () async {
+      final fixture = await _loadFixture();
+      final api = _LifecycleDiagnosticsApi(snapshot: fixture);
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      stores.statusStore.setAutoRefresh(enabled: true);
+      await _waitUntil(() => api.eventRequests.length == 1);
+      final activeGeneration = stores.statusStore.eventLoopGeneration;
+
+      stores.statusStore.setAutoRefresh(enabled: false);
+      expect(stores.statusStore.eventLoopGeneration, activeGeneration + 1);
+      stores.statusStore.setAutoRefresh(enabled: true);
+      await _waitUntil(() => api.eventRequests.length == 2);
+      expect(
+        api.eventRequests,
+        hasLength(2),
+        reason: 'enable must create exactly one replacement long poll',
+      );
+
+      // Completing the request fenced by disable must not re-arm polling.
+      api.completeEventRequest(0, fixture);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(
+        api.eventRequests,
+        hasLength(2),
+        reason: 'a stale completion must be rejected without a microtask spin',
+      );
+
+      stores.statusStore.dispose();
+      api.completeEventRequest(1, fixture);
+      stores.statusStore.setAutoRefresh(
+        enabled: true,
+        refreshImmediately: true,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(api.eventRequests, hasLength(2));
+    },
+  );
+
+  test(
+    'rapid background/resume callbacks are idempotent at one lifecycle fence',
+    () async {
+      final fixture = await _loadFixture();
+      final api = _LifecycleDiagnosticsApi(snapshot: fixture);
+      final stores = await _makeStores(api);
+      addTearDown(stores.dispose);
+
+      await stores.statusStore.refresh();
+      final before = stores.statusStore.eventLoopGeneration;
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.paused);
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.paused);
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.resumed);
+      stores.statusStore.updateAppLifecycleState(AppLifecycleState.resumed);
+
+      expect(stores.statusStore.eventLoopGeneration, before + 2);
+    },
+  );
+
+  test(
     'event poll carries process identity and resets on daemon restart',
     () async {
       final fixture = await _loadFixture();
@@ -571,6 +681,7 @@ void main() {
 DiagnosticsSnapshot _snapshotCopy(
   DiagnosticsSnapshot source, {
   required int processId,
+  int? runtimeIncarnation,
   required int revision,
   required int uptimeMs,
   List<dynamic>? peers,
@@ -583,6 +694,9 @@ DiagnosticsSnapshot _snapshotCopy(
     ..['peer_snapshot_stale'] = false
     ..['peer_snapshot_age_ms'] = 0
     ..['uptime_ms'] = uptimeMs;
+  if (runtimeIncarnation != null) {
+    raw['runtime_incarnation'] = runtimeIncarnation;
+  }
   if (peers != null) raw['peers'] = peers;
   return DiagnosticsSnapshot.fromJson(raw);
 }
@@ -615,9 +729,11 @@ Future<void> _waitUntil(bool Function() predicate) async {
 }
 
 Future<DiagnosticsSnapshot> _loadFixture() async {
-  final raw = jsonDecode(
-    await File('test/fixtures/status_connected.json').readAsString(),
-  ) as Map<String, dynamic>;
+  final raw =
+      jsonDecode(
+            await File('test/fixtures/status_connected.json').readAsString(),
+          )
+          as Map<String, dynamic>;
   return DiagnosticsSnapshot.fromJson(raw);
 }
 

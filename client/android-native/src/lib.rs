@@ -9,7 +9,7 @@ pub mod lifecycle;
 
 #[cfg(target_os = "android")]
 mod android_bridge {
-    use super::lifecycle::OwnerId;
+    use super::lifecycle::{NetworkHintDecision, OwnerId, PhysicalNetworkHintAuthority};
 
     use std::os::fd::RawFd;
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -32,7 +32,7 @@ mod android_bridge {
     use rand::RngCore;
     use serde::Deserialize;
     use tokio::runtime::Builder;
-    use tokio::sync::watch;
+    use tokio::sync::{broadcast, watch};
 
     use p2pnet_daemon::config::{Config, ControlProxyMode};
     use p2pnet_daemon::Daemon;
@@ -92,6 +92,8 @@ mod android_bridge {
         shutdown_tx: watch::Sender<bool>,
         running: Arc<AtomicBool>,
         ready: Arc<AtomicBool>,
+        network_change_tx: broadcast::Sender<p2pnet_daemon::AndroidNetworkChangeHint>,
+        physical_network_authority: Arc<Mutex<PhysicalNetworkHintAuthority>>,
     }
 
     static RUNTIME: OnceLock<Mutex<Option<RuntimeHandle>>> = OnceLock::new();
@@ -528,6 +530,7 @@ mod android_bridge {
         tun_fd: jint,
         request: AndroidStartRequest,
         owner: OwnerId,
+        service_owner: u64,
     ) -> Result<(), String> {
         {
             let guard = runtime_slot()
@@ -563,8 +566,15 @@ mod android_bridge {
             .unwrap_or_else(|| config_path.with_file_name("p2wlan-daemon.log"));
         let running = Arc::new(AtomicBool::new(true));
         let ready = Arc::new(AtomicBool::new(false));
+        let (network_change_tx, _network_change_rx) = broadcast::channel(32);
+        let physical_network_authority = Arc::new(Mutex::new(PhysicalNetworkHintAuthority::new(
+            service_owner,
+            owner,
+        )));
         let running_for_thread = Arc::clone(&running);
         let ready_for_thread = Arc::clone(&ready);
+        let network_change_tx_for_thread = network_change_tx.clone();
+        let physical_network_authority_for_thread = Arc::clone(&physical_network_authority);
         // This channel acknowledges only that the runtime handle has been
         // installed. Actual daemon readiness is published separately through
         // `ready_for_thread` by Daemon::run after registration, TUN attachment,
@@ -592,11 +602,19 @@ mod android_bridge {
                             Daemon::new_with_android_tun_mode(config, tun_fd, tun_mode);
                         fd_owned_by_thread = false;
                         daemon.set_android_startup_ready(Arc::clone(&ready_for_thread));
+                        daemon.set_android_runtime_incarnation(owner.raw());
+                        daemon.set_android_network_change_sender(
+                            network_change_tx_for_thread.clone(),
+                        );
                         let handle = RuntimeHandle {
                             owner,
                             shutdown_tx: daemon.shutdown_sender(),
                             running: Arc::clone(&running_for_thread),
                             ready: Arc::clone(&ready_for_thread),
+                            network_change_tx: network_change_tx_for_thread.clone(),
+                            physical_network_authority: Arc::clone(
+                                &physical_network_authority_for_thread,
+                            ),
                         };
                         handle_tx
                             .send(Ok(handle))
@@ -700,6 +718,7 @@ mod android_bridge {
         mut env: JNIEnv<'_>,
         _object: JObject<'_>,
         service: JObject<'_>,
+        service_incarnation: jlong,
         tun_fd: jint,
         request_json: JString<'_>,
     ) -> jstring {
@@ -717,12 +736,21 @@ mod android_bridge {
                 Err("an existing Android P2WLAN daemon is still running".to_string())
             }
             Ok(request) => {
+                if service_incarnation <= 0 {
+                    close_raw_fd(tun_fd);
+                    return new_string_or_null(
+                        &mut env,
+                        Some("invalid Android service incarnation".to_string()),
+                    );
+                }
                 let runtime_owner = OwnerId::allocate();
                 register_owner(runtime_owner);
                 set_last_error(runtime_owner, None);
                 owner = Some(runtime_owner);
                 match install_android_socket_protector(&mut env, service, runtime_owner) {
-                    Ok(()) => start_runtime(tun_fd, request, runtime_owner),
+                    Ok(()) => {
+                        start_runtime(tun_fd, request, runtime_owner, service_incarnation as u64)
+                    }
                     Err(error) => {
                         close_raw_fd(tun_fd);
                         Err(error)
@@ -747,6 +775,133 @@ mod android_bridge {
             }
         }
         new_string_or_null(&mut env, result.err())
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeAdoptService(
+        mut env: JNIEnv<'_>,
+        _object: JObject<'_>,
+        service: JObject<'_>,
+        service_incarnation: jlong,
+        expected_bridge_incarnation: jlong,
+    ) -> jstring {
+        let _start_guard = start_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let decision = if service_incarnation <= 0 || expected_bridge_incarnation <= 0 {
+            NetworkHintDecision::Failed
+        } else {
+            let expected_owner = OwnerId::from_raw(expected_bridge_incarnation as u64);
+            let handle = runtime_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let Some(handle) = handle else {
+                return new_string_or_null(
+                    &mut env,
+                    Some(NetworkHintDecision::StaleRejected.wire_name().to_string()),
+                );
+            };
+            if !handle.running.load(Ordering::Acquire) || handle.owner != expected_owner {
+                NetworkHintDecision::StaleRejected
+            } else {
+                let mut authority = handle
+                    .physical_network_authority
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if expected_owner != authority.bridge_owner()
+                    || service_incarnation as u64 <= authority.service_owner()
+                {
+                    if expected_owner != authority.bridge_owner()
+                        || (service_incarnation as u64) < authority.service_owner()
+                    {
+                        NetworkHintDecision::StaleRejected
+                    } else {
+                        NetworkHintDecision::Duplicate
+                    }
+                } else {
+                    match install_android_socket_protector(&mut env, service, expected_owner) {
+                        Ok(()) => authority
+                            .rebind_service_owner(expected_owner, service_incarnation as u64),
+                        Err(error) => {
+                            set_last_error(handle.owner, Some(error));
+                            NetworkHintDecision::Failed
+                        }
+                    }
+                }
+            }
+        };
+        new_string_or_null(&mut env, Some(decision.wire_name().to_string()))
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_example_p2wlan_1flutter_1client_P2wlanNative_nativeNotifyPhysicalNetworkChanged(
+        mut env: JNIEnv<'_>,
+        _object: JObject<'_>,
+        service_incarnation: jlong,
+        expected_bridge_incarnation: jlong,
+        kotlin_network_generation: jlong,
+        network_identity_hash: JString<'_>,
+    ) -> jstring {
+        // Serialize callback admission with service adoption. Otherwise an
+        // old callback could win the authority mutex just before a new
+        // service owner is installed and its hint could be delivered after
+        // the owner transition. The callback is linearized either before the
+        // adoption (valid) or after it (stale), never in between.
+        let _start_guard = start_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let hash = match env.get_string(&network_identity_hash) {
+            Ok(value) => value.to_string_lossy().into_owned(),
+            Err(_) => {
+                return new_string_or_null(
+                    &mut env,
+                    Some(NetworkHintDecision::Failed.wire_name().to_string()),
+                );
+            }
+        };
+        let Some(handle) = runtime_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return new_string_or_null(
+                &mut env,
+                Some(NetworkHintDecision::StaleRejected.wire_name().to_string()),
+            );
+        };
+        let expected_owner = (expected_bridge_incarnation > 0)
+            .then(|| OwnerId::from_raw(expected_bridge_incarnation as u64));
+        let decision = if service_incarnation <= 0 || kotlin_network_generation <= 0 {
+            NetworkHintDecision::Failed
+        } else if !handle.running.load(Ordering::Acquire) || expected_owner != Some(handle.owner) {
+            NetworkHintDecision::StaleRejected
+        } else {
+            let mut authority = handle
+                .physical_network_authority
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let decision = authority.accept(
+                service_incarnation as u64,
+                handle.owner,
+                kotlin_network_generation as u64,
+                &hash,
+            );
+            if decision == NetworkHintDecision::Applied {
+                let hint = p2pnet_daemon::AndroidNetworkChangeHint {
+                    kotlin_network_generation: kotlin_network_generation as u64,
+                    network_identity_hash: hash,
+                };
+                if handle.network_change_tx.send(hint).is_err() {
+                    NetworkHintDecision::Failed
+                } else {
+                    decision
+                }
+            } else {
+                decision
+            }
+        };
+        new_string_or_null(&mut env, Some(decision.wire_name().to_string()))
     }
 
     #[no_mangle]

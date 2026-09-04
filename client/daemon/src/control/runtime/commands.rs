@@ -25,6 +25,14 @@ match cmd {
                                 }
                             }
                         }
+                        ControlCommand::NetworkChanged => {
+                            http.notify_network_changed();
+                            if let Some(task) = signal_ws_task.as_ref() {
+                                task.abort();
+                            }
+                            info!("Android physical network changed; restarting control registration and signaling transports");
+                            break;
+                        }
                         ControlCommand::CreateTunnel { protocol, local_port, remote_port } => {
                             let res = async {
                                 let current_http = http.current()?;

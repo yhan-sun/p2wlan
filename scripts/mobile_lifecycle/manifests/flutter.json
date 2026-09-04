@@ -1,86 +1,14 @@
 {
   "component": "flutter",
   "scenarios": [
-    {
-      "scenario_id": "ML-01",
-      "test_name": "StatusStore rejects a late background long-poll",
-      "events": ["app_backgrounded"],
-      "old_identity": {"app_epoch": 1, "event_loop_generation": 4},
-      "new_identity": {"app_epoch": 2, "event_loop_generation": 5},
-      "decision": "stale_rejected",
-      "invariants": {"old_callback_fenced": true}
-    },
-    {
-      "scenario_id": "ML-02",
-      "test_name": "StatusStore refreshes before reopening the event stream",
-      "events": ["app_resumed"],
-      "old_identity": {"app_epoch": 2, "event_loop_generation": 5, "daemon_revision": 8},
-      "new_identity": {"app_epoch": 3, "event_loop_generation": 6, "daemon_revision": 9},
-      "decision": "applied",
-      "invariants": {"resume_refresh_precedes_poll": true}
-    },
-    {
-      "scenario_id": "ML-03",
-      "test_name": "StatusStore adopts a replacement daemon process",
-      "events": ["native_runtime_stopped", "native_runtime_started"],
-      "old_identity": {"daemon_process_id": 41, "daemon_revision": 8, "bridge_incarnation": 4},
-      "new_identity": {"daemon_process_id": 42, "daemon_revision": 1, "bridge_incarnation": 5},
-      "decision": "applied",
-      "invariants": {"new_process_adopted": true}
-    },
-    {
-      "scenario_id": "ML-06",
-      "test_name": "StatusStore rejects a permission-revoked start completion",
-      "events": ["vpn_permission_revoked", "bridge_detached"],
-      "old_identity": {"app_epoch": 1, "permission_request_id": 7},
-      "new_identity": {"app_epoch": 2, "permission_request_id": 8},
-      "decision": "stale_rejected",
-      "invariants": {"pending_permission_invalidated": true}
-    },
-    {
-      "scenario_id": "ML-07",
-      "test_name": "StatusStore starts a fresh attempt after permission regrant",
-      "events": ["vpn_permission_granted", "native_runtime_started"],
-      "old_identity": {"app_epoch": 2, "permission_request_id": 8},
-      "new_identity": {"app_epoch": 3, "permission_request_id": 9},
-      "decision": "applied",
-      "invariants": {"new_permission_attempt": true}
-    },
-    {
-      "scenario_id": "ML-08",
-      "test_name": "StatusStore rejects a callback from a recreated engine",
-      "events": ["activity_recreated", "bridge_attached"],
-      "old_identity": {"app_epoch": 3, "activity_incarnation": 2},
-      "new_identity": {"app_epoch": 4, "activity_incarnation": 3},
-      "decision": "stale_rejected",
-      "invariants": {"old_engine_callback_rejected": true}
-    },
-    {
-      "scenario_id": "ML-10",
-      "test_name": "StatusStore refreshes after bridge reattachment",
-      "events": ["bridge_detached", "bridge_attached"],
-      "old_identity": {"bridge_incarnation": 4, "daemon_process_id": 41},
-      "new_identity": {"bridge_incarnation": 5, "daemon_process_id": 42},
-      "decision": "applied",
-      "invariants": {"bridge_identity_adopted": true}
-    },
-    {
-      "scenario_id": "ML-12",
-      "test_name": "StatusStore adopts status after control reconnect",
-      "events": ["control_disconnected", "control_reconnected"],
-      "old_identity": {"control_connection_generation": 8, "daemon_revision": 8},
-      "new_identity": {"control_connection_generation": 9, "daemon_revision": 9},
-      "decision": "applied",
-      "invariants": {"new_control_generation_adopted": true}
-    },
-    {
-      "scenario_id": "ML-18",
-      "test_name": "StatusStore treats duplicate lifecycle notifications idempotently",
-      "events": ["app_backgrounded", "app_backgrounded", "app_resumed", "app_resumed"],
-      "old_identity": {"app_epoch": 4, "event_loop_generation": 7},
-      "new_identity": {"app_epoch": 4, "event_loop_generation": 7},
-      "decision": "duplicate",
-      "invariants": {"duplicate_has_no_second_effect": true}
-    }
+    {"scenario_id": "ML-01", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-01 app-background-late-long-poll"},
+    {"scenario_id": "ML-02", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-02 app-resume-refresh-before-reconnect"},
+    {"scenario_id": "ML-03", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-03 daemon-process-recreation"},
+    {"scenario_id": "ML-06", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-06 vpn-permission-revoke"},
+    {"scenario_id": "ML-07", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-07 vpn-permission-regrant"},
+    {"scenario_id": "ML-08", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-08 activity-engine-recreation"},
+    {"scenario_id": "ML-10", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-10 native-bridge-reattachment"},
+    {"scenario_id": "ML-12", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-12 control-websocket-reconnect"},
+    {"scenario_id": "ML-18", "exact_test_id": "apps/flutter_client/test/mobile_lifecycle_evidence_test.dart::ML-18 duplicate-events-idempotent"}
   ]
 }

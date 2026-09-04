@@ -132,6 +132,7 @@ def aggregate(
         if not isinstance(scenarios, list) or not scenarios:
             raise EvidenceError(f"{component} report scenarios are empty")
         seen: set[str] = set()
+        seen_test_ids: set[str] = set()
         for scenario in scenarios:
             if not isinstance(scenario, dict):
                 raise EvidenceError(f"{component} scenario is not an object")
@@ -141,6 +142,16 @@ def aggregate(
             if scenario_id in seen:
                 raise EvidenceError(f"{component} repeats scenario {scenario_id}")
             seen.add(scenario_id)
+            exact_test_id = scenario.get("exact_test_id")
+            if not isinstance(exact_test_id, str) or not exact_test_id:
+                raise EvidenceError(f"{component}/{scenario_id} has no exact_test_id")
+            if exact_test_id in seen_test_ids:
+                raise EvidenceError(f"{component} repeats exact_test_id {exact_test_id}")
+            seen_test_ids.add(exact_test_id)
+            if scenario.get("executed") is not True:
+                raise EvidenceError(f"{component}/{scenario_id} was not executed")
+            if scenario.get("skipped") is not False:
+                raise EvidenceError(f"{component}/{scenario_id} was skipped")
             allowed = scenarios_by_id(contract)[scenario_id]["authoritative_components"]
             if component not in allowed:
                 raise EvidenceError(f"{component} is not authoritative for {scenario_id}")
@@ -152,6 +163,8 @@ def aggregate(
                 raise EvidenceError(f"{component}/{scenario_id} has invalid decision")
             if decision != scenarios_by_id(contract)[scenario_id]["required_decision"]:
                 raise EvidenceError(f"{component}/{scenario_id} has the wrong decision")
+            if scenario.get("observed_decision") != decision:
+                raise EvidenceError(f"{component}/{scenario_id} observed decision does not match")
             if scenario.get("result") != "pass":
                 raise EvidenceError(f"{component}/{scenario_id} is not passing")
             invariants = scenario.get("invariants")
@@ -162,6 +175,18 @@ def aggregate(
                 raise EvidenceError(f"{component}/{scenario_id} is missing a required invariant")
             old = _identity(scenario.get("old_identity"), identity_fields, f"{component}/{scenario_id}/old_identity")
             new = _identity(scenario.get("new_identity"), identity_fields, f"{component}/{scenario_id}/new_identity")
+            observed_old = _identity(
+                scenario.get("observed_old_identity"),
+                identity_fields,
+                f"{component}/{scenario_id}/observed_old_identity",
+            )
+            observed_new = _identity(
+                scenario.get("observed_new_identity"),
+                identity_fields,
+                f"{component}/{scenario_id}/observed_new_identity",
+            )
+            if observed_old != old or observed_new != new:
+                raise EvidenceError(f"{component}/{scenario_id} observed identities do not match")
             if old.get("trace_id") != trace_id or new.get("trace_id") != trace_id:
                 raise EvidenceError(f"{component}/{scenario_id} trace identity mismatch")
             if decision == "applied" and old == new and scenario_id not in {"ML-18"}:
@@ -204,6 +229,7 @@ def aggregate(
         "source_head_sha": source_head_sha,
         "workflow_sha": workflow_sha,
         "result": "pass",
+        "aggregate_artifact_id": "mobile-lifecycle-aggregate",
         "components": {component: reports[component] for component in COMPONENTS},
         "required_scenarios": sorted(by_scenario),
         "manual_device_matrix": {

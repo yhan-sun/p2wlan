@@ -695,6 +695,13 @@ impl ControlClient {
         let _ = self.cmd_tx.send(ControlCommand::PollPeersNow);
     }
 
+    /// Notify the existing control lifecycle that Android's physical network
+    /// changed. The loop rebuilds its pooled HTTP clients and reconnects the
+    /// optional signaling WebSocket through its normal registration path.
+    pub(crate) fn network_changed(&self) {
+        let _ = self.cmd_tx.send(ControlCommand::NetworkChanged);
+    }
+
     /// Shutdown the control client.
     pub async fn shutdown(&self) -> Result<()> {
         // Stop independent critical-lane endpoint work first. Otherwise an

@@ -32,13 +32,18 @@ internal object P2wlanNative {
         }
     }
 
-    fun start(service: P2wlanVpnService, tunFd: Int, requestJson: String): String? {
+    fun start(
+        service: P2wlanVpnService,
+        serviceIncarnation: Long,
+        tunFd: Int,
+        requestJson: String,
+    ): String? {
         if (!ensureLoaded()) {
             closeOwnedFd(tunFd)
             return loadError
         }
         return try {
-            val error = nativeStart(service, tunFd, requestJson)
+            val error = nativeStart(service, serviceIncarnation, tunFd, requestJson)
             loadError = error
             if (error != null) Log.e(TAG, error)
             error
@@ -47,6 +52,54 @@ internal object P2wlanNative {
             val message = formatError("Android 原生 daemon 启动失败", error)
             loadError = message
             Log.e(TAG, message, error)
+            message
+        }
+    }
+
+    /** Adopt a recreated Service object onto the still-running Rust bridge. */
+    fun adoptService(
+        service: P2wlanVpnService,
+        serviceIncarnation: Long,
+        expectedBridgeIncarnation: Long,
+    ): String? {
+        if (!ensureLoaded()) return loadError
+        return try {
+            val result = nativeAdoptService(
+                service,
+                serviceIncarnation,
+                expectedBridgeIncarnation,
+            )
+            if (result != null && result != MobileLifecycleOutcome.APPLIED.wireValue) {
+                Log.w(TAG, "Android native service adoption result=$result")
+            }
+            result
+        } catch (error: Throwable) {
+            val message = formatError("Android 原生 daemon 服务重新附着失败", error)
+            loadError = message
+            Log.w(TAG, message, error)
+            message
+        }
+    }
+
+    /** Forward one reducer-authorized physical-network edge to Rust. */
+    fun notifyPhysicalNetworkChanged(
+        serviceIncarnation: Long,
+        expectedBridgeIncarnation: Long,
+        kotlinNetworkGeneration: Long,
+        networkIdentityHash: String,
+    ): String? {
+        if (!ensureLoaded()) return loadError
+        return try {
+            nativeNotifyPhysicalNetworkChanged(
+                serviceIncarnation,
+                expectedBridgeIncarnation,
+                kotlinNetworkGeneration,
+                networkIdentityHash,
+            )
+        } catch (error: Throwable) {
+            val message = formatError("Android 物理网络变化通知 Rust 失败", error)
+            loadError = message
+            Log.w(TAG, message, error)
             message
         }
     }
@@ -134,8 +187,22 @@ internal object P2wlanNative {
 
     private external fun nativeStart(
         service: P2wlanVpnService,
+        serviceIncarnation: Long,
         tunFd: Int,
         requestJson: String,
+    ): String?
+
+    private external fun nativeAdoptService(
+        service: P2wlanVpnService,
+        serviceIncarnation: Long,
+        expectedBridgeIncarnation: Long,
+    ): String?
+
+    private external fun nativeNotifyPhysicalNetworkChanged(
+        serviceIncarnation: Long,
+        expectedBridgeIncarnation: Long,
+        kotlinNetworkGeneration: Long,
+        networkIdentityHash: String,
     ): String?
 
     private external fun nativeStop(expectedIncarnation: Long): Boolean

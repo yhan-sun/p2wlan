@@ -120,6 +120,13 @@ pub(super) struct SignalWebSocketTask {
     lifecycle: SignalConnectionLifecycle,
 }
 
+impl SignalWebSocketTask {
+    pub(super) fn abort(&self) {
+        self.lifecycle.close();
+        self.handle.abort();
+    }
+}
+
 impl Drop for SignalWebSocketTask {
     fn drop(&mut self) {
         self.lifecycle.close();
@@ -568,5 +575,32 @@ mod route_tests {
         assert!(connected.load(Ordering::Acquire));
         lifecycle.mark_disconnected(current);
         assert!(!connected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn evidence_ml12_control_reconnect() {
+        let connected = Arc::new(AtomicBool::new(false));
+        let lifecycle = SignalConnectionLifecycle::new(connected.clone());
+        let old = lifecycle.begin();
+        assert!(lifecycle.mark_connected(old));
+        let current = lifecycle.begin();
+        assert!(lifecycle.mark_connected(current));
+        assert!(connected.load(Ordering::Acquire));
+        println!(
+            "MOBILE_LIFECYCLE_RECORD {{\"scenario_id\":\"ML-12\",\"exact_test_id\":\"control::websocket::route_tests::evidence_ml12_control_reconnect\",\"executed\":true,\"skipped\":false,\"result\":\"pass\",\"events\":[\"control_disconnected\",\"control_reconnected\"],\"observed_old_identity\":{{\"control_connection_generation\":{old}}},\"observed_new_identity\":{{\"control_connection_generation\":{current}}},\"observed_decision\":\"applied\",\"invariants\":{{\"new_control_generation_adopted\":true}},\"execution_source\":\"rust_test_nocapture\"}}"
+        );
+    }
+
+    #[test]
+    fn evidence_ml13_stale_control_message() {
+        let connected = Arc::new(AtomicBool::new(false));
+        let lifecycle = SignalConnectionLifecycle::new(connected.clone());
+        let old = lifecycle.begin();
+        let current = lifecycle.begin();
+        assert!(!lifecycle.mark_connected(old));
+        assert!(lifecycle.mark_connected(current));
+        println!(
+            "MOBILE_LIFECYCLE_RECORD {{\"scenario_id\":\"ML-13\",\"exact_test_id\":\"control::websocket::route_tests::evidence_ml13_stale_control_message\",\"executed\":true,\"skipped\":false,\"result\":\"pass\",\"events\":[\"control_reconnected\"],\"observed_old_identity\":{{\"control_connection_generation\":{old}}},\"observed_new_identity\":{{\"control_connection_generation\":{current}}},\"observed_decision\":\"stale_rejected\",\"invariants\":{{\"old_control_message_rejected\":true}},\"execution_source\":\"rust_test_nocapture\"}}"
+        );
     }
 }

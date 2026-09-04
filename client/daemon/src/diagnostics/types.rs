@@ -87,6 +87,11 @@ impl MtuDiagnostics {
 pub struct DiagnosticsSnapshot {
     pub version: String,
     pub process_id: u32,
+    /// Additive native runtime identity. Android can replace the embedded
+    /// daemon without changing the hosting PID, so clients must compare this
+    /// before revision/uptime ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_incarnation: Option<u64>,
     pub node_id: String,
     pub virtual_ip: String,
     pub network_id: String,
@@ -189,6 +194,8 @@ pub struct PeerScopedDiagnosticsSnapshot {
 pub struct RuntimeDiagnosticsSnapshot {
     pub version: String,
     pub process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_incarnation: Option<u64>,
     pub node_id: String,
     pub virtual_ip: String,
     pub network_id: String,
@@ -407,6 +414,9 @@ pub struct DiagnosticsContext {
     /// `None` when the diagnostics endpoint is disabled; mutations then fail
     /// closed with 403.
     auth_token: Option<String>,
+    /// Native bridge/runtime identity when the daemon is embedded by Android.
+    /// Desktop daemons leave this absent and continue using PID/uptime.
+    pub(crate) runtime_incarnation: Option<u64>,
 }
 
 impl DiagnosticsContext {
@@ -428,6 +438,7 @@ impl DiagnosticsContext {
         status_events: Arc<StatusEventBus>,
         log_path: Option<std::path::PathBuf>,
         auth_token: Option<String>,
+        runtime_incarnation: Option<u64>,
     ) -> Self {
         Self {
             config,
@@ -447,6 +458,7 @@ impl DiagnosticsContext {
             peer_snapshot_cache: Arc::new(std::sync::Mutex::new(None)),
             log_path,
             auth_token,
+            runtime_incarnation,
         }
     }
 }

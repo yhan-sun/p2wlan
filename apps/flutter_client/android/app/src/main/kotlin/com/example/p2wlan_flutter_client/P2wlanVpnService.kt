@@ -134,8 +134,8 @@ class P2wlanVpnService : VpnService() {
         publishLifecycle(
             lifecycleCoordinator.serviceRecreated(serviceIncarnation),
         )
-        registerPhysicalNetworkCallback()
         adoptExistingNativeRuntime()
+        registerPhysicalNetworkCallback()
     }
 
     private fun isCurrentServiceOwner(): Boolean =
@@ -153,6 +153,16 @@ class P2wlanVpnService : VpnService() {
             if (!P2wlanNative.isRunning()) return
             val bridgeIncarnation = P2wlanNative.incarnation()
                 ?: throw IllegalStateException("live Rust runtime has no bridge incarnation")
+            val adoptionResult = P2wlanNative.adoptService(
+                this,
+                serviceIncarnation,
+                bridgeIncarnation,
+            )
+            if (adoptionResult != MobileLifecycleOutcome.APPLIED.wireValue &&
+                adoptionResult != MobileLifecycleOutcome.DUPLICATE.wireValue
+            ) {
+                throw IllegalStateException("Android native service owner was rejected: $adoptionResult")
+            }
             val transition = lifecycleCoordinator.attachBridge(bridgeIncarnation)
             if (transition.outcome != MobileLifecycleOutcome.APPLIED &&
                 transition.outcome != MobileLifecycleOutcome.DUPLICATE
@@ -263,7 +273,12 @@ class P2wlanVpnService : VpnService() {
             configureWifiLatencyMode(experiment.wifiLowLatencyRequested)
 
             val enrichedRequest = enrichRequest(request)
-            val nativeError = P2wlanNative.start(this, detachedFd, enrichedRequest.toString())
+            val nativeError = P2wlanNative.start(
+                this,
+                serviceIncarnation,
+                detachedFd,
+                enrichedRequest.toString(),
+            )
             // Ownership of the detached fd is transferred to P2wlanNative as
             // soon as nativeStart is invoked. Native startup/error paths (and
             // the Kotlin library-load fallback) close it; Kotlin must not
@@ -285,6 +300,10 @@ class P2wlanVpnService : VpnService() {
             nativeStartedAtElapsedMs = SystemClock.elapsedRealtime()
             nativeReadyObserved = false
             serviceRunning = true
+            // Capture this callback's bridge owner. A late callback from a
+            // previous bridge remains stale even if the service object itself
+            // is still alive.
+            registerPhysicalNetworkCallback()
             Log.i(
                 TAG,
                 "event=android_daemon_started " +
@@ -683,30 +702,48 @@ class P2wlanVpnService : VpnService() {
      */
     private fun registerPhysicalNetworkCallback() {
         val manager = getSystemService(ConnectivityManager::class.java) ?: return
+        unregisterPhysicalNetworkCallback()
+        val callbackServiceOwner = serviceIncarnation
+        val callbackBridgeOwner = ownedBridgeIncarnation
+        val forwarder = PhysicalNetworkCallbackForwarder(
+            callbackServiceIncarnation = callbackServiceOwner,
+            callbackBridgeIncarnation = callbackBridgeOwner,
+            currentServiceIncarnation = { currentServiceIncarnation },
+            currentBridgeIncarnation = { ownedBridgeIncarnation },
+            notifier = PhysicalNetworkChangeNotifier { serviceOwner, bridgeOwner, generation, hash ->
+                val result = P2wlanNative.notifyPhysicalNetworkChanged(
+                    serviceOwner,
+                    bridgeOwner,
+                    generation,
+                    hash,
+                )
+                MobileLifecycleOutcome.entries.firstOrNull { it.wireValue == result }
+                    ?: MobileLifecycleOutcome.FAILED
+            },
+            reducer = physicalNetworkReducer,
+        )
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                observePhysicalNetwork(network)
+                observePhysicalNetwork(network, forwarder)
             }
 
             override fun onCapabilitiesChanged(
                 network: Network,
                 networkCapabilities: NetworkCapabilities,
             ) {
-                observePhysicalNetwork(network)
+                observePhysicalNetwork(network, forwarder)
             }
 
             override fun onLinkPropertiesChanged(
                 network: Network,
                 linkProperties: android.net.LinkProperties,
             ) {
-                observePhysicalNetwork(network)
+                observePhysicalNetwork(network, forwarder)
             }
 
             override fun onLost(network: Network) {
-                val transition = physicalNetworkReducer.onLost(network.networkHandle)
+                val transition = forwarder.onLost(network.networkHandle)
                 if (transition.outcome == MobileLifecycleOutcome.APPLIED) {
-                    val lifecycle = lifecycleCoordinator.physicalNetworkChanged(transition.generation)
-                    publishLifecycle(lifecycle)
                     Log.i(TAG, "event=physical_network_lost generation=${transition.generation}")
                 }
             }
@@ -730,7 +767,10 @@ class P2wlanVpnService : VpnService() {
         }
     }
 
-    private fun observePhysicalNetwork(network: Network) {
+    private fun observePhysicalNetwork(
+        network: Network,
+        forwarder: PhysicalNetworkCallbackForwarder,
+    ) {
         if (!isCurrentServiceOwner()) return
         val manager = getSystemService(ConnectivityManager::class.java) ?: return
         val capabilities = manager.getNetworkCapabilities(network) ?: return
@@ -748,15 +788,23 @@ class P2wlanVpnService : VpnService() {
             captive = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL),
             interfaceIdentity = manager.getLinkProperties(network)?.interfaceName,
         )
-        val transition = physicalNetworkReducer.onAvailable(identity)
-        if (transition.outcome != MobileLifecycleOutcome.APPLIED) return
+        val transition = forwarder.onAvailable(identity)
+        if (transition.outcome != MobileLifecycleOutcome.APPLIED) {
+            Log.i(
+                TAG,
+                "event=physical_network_callback_ignored outcome=${transition.outcome.wireValue} " +
+                    "generation=${transition.generation}",
+            )
+            return
+        }
         val lifecycle = lifecycleCoordinator.physicalNetworkChanged(transition.generation)
         publishLifecycle(lifecycle)
         Log.i(
             TAG,
             "event=physical_network_changed generation=${transition.generation} " +
                 "transport=${transports.sorted().joinToString(",")} " +
-                "validated=${identity.validated} captive=${identity.captive}",
+                "validated=${identity.validated} captive=${identity.captive} " +
+                "network_identity_hash=${identity.identityHash()}",
         )
     }
 

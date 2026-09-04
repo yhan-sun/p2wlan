@@ -1,113 +1,17 @@
 {
   "component": "rust",
   "scenarios": [
-    {
-      "scenario_id": "ML-03",
-      "test_name": "runtime owner replacement adopts the new process",
-      "events": ["native_runtime_stopped", "native_runtime_started"],
-      "old_identity": {"daemon_process_id": 41, "bridge_incarnation": 4},
-      "new_identity": {"daemon_process_id": 42, "bridge_incarnation": 5},
-      "decision": "applied",
-      "invariants": {"new_process_adopted": true}
-    },
-    {
-      "scenario_id": "ML-04",
-      "test_name": "physical handoff advances the daemon network generation once",
-      "events": ["physical_network_changed", "candidate_refresh_started"],
-      "old_identity": {"network_generation": 11},
-      "new_identity": {"network_generation": 12},
-      "decision": "applied",
-      "invariants": {"single_network_generation_advance": true}
-    },
-    {
-      "scenario_id": "ML-05",
-      "test_name": "hotspot identity replacement advances the daemon generation once",
-      "events": ["physical_network_changed", "candidate_refresh_started"],
-      "old_identity": {"network_generation": 12},
-      "new_identity": {"network_generation": 13},
-      "decision": "applied",
-      "invariants": {"single_network_generation_advance": true}
-    },
-    {
-      "scenario_id": "ML-10",
-      "test_name": "JNI bridge incarnation is adopted by the runtime owner",
-      "events": ["bridge_detached", "bridge_attached"],
-      "old_identity": {"bridge_incarnation": 4},
-      "new_identity": {"bridge_incarnation": 5},
-      "decision": "applied",
-      "invariants": {"bridge_identity_adopted": true}
-    },
-    {
-      "scenario_id": "ML-11",
-      "test_name": "old runtime cannot clear a new socket protector",
-      "events": ["bridge_detached", "bridge_attached"],
-      "old_identity": {"bridge_incarnation": 4},
-      "new_identity": {"bridge_incarnation": 5},
-      "decision": "stale_rejected",
-      "invariants": {"old_bridge_cleanup_rejected": true}
-    },
-    {
-      "scenario_id": "ML-12",
-      "test_name": "new control WebSocket survives old task teardown",
-      "events": ["control_disconnected", "control_reconnected"],
-      "old_identity": {"control_connection_generation": 8},
-      "new_identity": {"control_connection_generation": 9},
-      "decision": "applied",
-      "invariants": {"new_control_generation_adopted": true}
-    },
-    {
-      "scenario_id": "ML-13",
-      "test_name": "stale control message is rejected by connection generation",
-      "events": ["control_reconnected"],
-      "old_identity": {"control_connection_generation": 8, "daemon_revision": 8},
-      "new_identity": {"control_connection_generation": 9, "daemon_revision": 9},
-      "decision": "stale_rejected",
-      "invariants": {"old_control_message_rejected": true}
-    },
-    {
-      "scenario_id": "ML-14",
-      "test_name": "stale candidate result is rejected after generation advance",
-      "events": ["candidate_refresh_started", "physical_network_changed"],
-      "old_identity": {"network_generation": 12, "candidate_epoch": 9},
-      "new_identity": {"network_generation": 13, "candidate_epoch": 10},
-      "decision": "stale_rejected",
-      "invariants": {"old_candidate_rejected": true}
-    },
-    {
-      "scenario_id": "ML-15",
-      "test_name": "stale socket publication is rejected after generation advance",
-      "events": ["physical_network_changed", "candidate_refresh_started"],
-      "old_identity": {"network_generation": 12, "socket_publication_generation": 21},
-      "new_identity": {"network_generation": 13, "socket_publication_generation": 22},
-      "decision": "stale_rejected",
-      "invariants": {"old_socket_publication_rejected": true}
-    },
-    {
-      "scenario_id": "ML-16",
-      "test_name": "relay remains committed during direct rediscovery and timeout",
-      "events": ["relay_retained", "candidate_refresh_started", "direct_reconfirmed"],
-      "old_identity": {"network_generation": 13, "relay_connection_id": 77, "direct_validation_owner": "probe-1"},
-      "new_identity": {"network_generation": 13, "relay_connection_id": 77, "direct_validation_owner": "probe-2"},
-      "decision": "applied",
-      "invariants": {"relay_retained_until_direct_commit": true, "relay_retained_on_timeout": true}
-    },
-    {
-      "scenario_id": "ML-17",
-      "test_name": "direct path commits only after current-generation confirmation",
-      "events": ["candidate_refresh_started", "direct_reconfirmed"],
-      "old_identity": {"network_generation": 13, "direct_validation_owner": "probe-2"},
-      "new_identity": {"network_generation": 13, "direct_validation_owner": "probe-3"},
-      "decision": "applied",
-      "invariants": {"direct_confirmed_current_generation": true}
-    },
-    {
-      "scenario_id": "ML-18",
-      "test_name": "duplicate generation events have no second side effect",
-      "events": ["physical_network_changed", "physical_network_changed", "control_reconnected", "control_reconnected"],
-      "old_identity": {"network_generation": 13, "control_connection_generation": 9},
-      "new_identity": {"network_generation": 13, "control_connection_generation": 9},
-      "decision": "duplicate",
-      "invariants": {"duplicate_has_no_second_effect": true}
-    }
+    {"scenario_id": "ML-03", "exact_test_id": "tests::mobile_lifecycle_evidence::ml03_runtime_owner_replacement"},
+    {"scenario_id": "ML-04", "exact_test_id": "tests::mobile_lifecycle_evidence::ml04_android_network_hint"},
+    {"scenario_id": "ML-05", "exact_test_id": "tests::mobile_lifecycle_evidence::ml05_hotspot_network_hint"},
+    {"scenario_id": "ML-10", "exact_test_id": "lifecycle::tests::evidence_ml10_bridge_incarnation_adoption"},
+    {"scenario_id": "ML-11", "exact_test_id": "lifecycle::tests::evidence_ml11_old_bridge_cleanup"},
+    {"scenario_id": "ML-12", "exact_test_id": "control::websocket::route_tests::evidence_ml12_control_reconnect"},
+    {"scenario_id": "ML-13", "exact_test_id": "control::websocket::route_tests::evidence_ml13_stale_control_message"},
+    {"scenario_id": "ML-14", "exact_test_id": "tests::mobile_lifecycle_evidence::ml14_stale_candidate_result"},
+    {"scenario_id": "ML-15", "exact_test_id": "tests::mobile_lifecycle_evidence::ml15_stale_socket_publication"},
+    {"scenario_id": "ML-16", "exact_test_id": "tests::mobile_lifecycle_evidence::ml16_relay_retention"},
+    {"scenario_id": "ML-17", "exact_test_id": "tests::mobile_lifecycle_evidence::ml17_direct_current_generation"},
+    {"scenario_id": "ML-18", "exact_test_id": "lifecycle::tests::physical_network_hint_is_owner_scoped_and_exactly_once"}
   ]
 }

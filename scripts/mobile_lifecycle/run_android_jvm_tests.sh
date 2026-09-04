@@ -3,8 +3,22 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ANDROID_DIR="$ROOT_DIR/apps/flutter_client/android"
+XML_ROOT="$ANDROID_DIR/../build/app/test-results"
+MANIFEST="$ROOT_DIR/scripts/mobile_lifecycle/manifests/android_jvm.json"
 ARTIFACT_DIR=${P2WLAN_MOBILE_LIFECYCLE_ARTIFACT_DIR:-"${RUNNER_TEMP:-/tmp}/p2wlan-mobile-lifecycle-android"}
+RECORDS="$ARTIFACT_DIR/android-execution-records.json"
 mkdir -p "$ARTIFACT_DIR"
+
+write_empty_records() {
+  python3 - "$RECORDS" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text(json.dumps({"schema_version": 1, "records": []}) + "\n", encoding="utf-8")
+PY
+}
 
 cd "$ANDROID_DIR"
 if [[ -x ./gradlew ]]; then
@@ -13,6 +27,7 @@ elif command -v gradle >/dev/null 2>&1; then
   command=(gradle --no-daemon :app:testDebugUnitTest)
 else
   echo "Android JVM lifecycle tests require ./gradlew or gradle on PATH" >&2
+  write_empty_records
   exit 127
 fi
 
@@ -25,7 +40,8 @@ set +e
 test_status=$?
 set -e
 
-python3 - "$ANDROID_DIR/../build/app/test-results" "$ARTIFACT_DIR/android-jvm-test-summary.json" "$test_status" <<'PY'
+set +e
+python3 - "$XML_ROOT" "$ARTIFACT_DIR/android-jvm-test-summary.json" "$test_status" <<'PY'
 import json
 import pathlib
 import sys
@@ -47,11 +63,13 @@ if xml_root.is_dir():
             root = ET.parse(path).getroot()
         except (OSError, ET.ParseError):
             continue
+
         def number(name: str) -> int:
             try:
                 return int(root.attrib.get(name, "0"))
             except ValueError:
                 return 0
+
         test_count += number("tests")
         failures += number("failures")
         errors += number("errors")
@@ -71,5 +89,27 @@ summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", en
 if command_status == 0 and (test_count == 0 or failures or errors or skipped):
     raise SystemExit("Android JVM task did not produce a non-skipped, passing test set")
 PY
+summary_status=$?
+set -e
 
-exit "$test_status"
+records_status=1
+if [[ "$test_status" -eq 0 && -d "$XML_ROOT" ]]; then
+  set +e
+  python3 "$ROOT_DIR/scripts/mobile_lifecycle/android_junit_records.py" \
+    --xml-root "$XML_ROOT" \
+    --manifest "$MANIFEST" \
+    --output "$RECORDS"
+  records_status=$?
+  set -e
+fi
+if [[ "$records_status" -ne 0 ]]; then
+  write_empty_records
+fi
+
+if [[ "$test_status" -ne 0 ]]; then
+  exit "$test_status"
+fi
+if [[ "$summary_status" -ne 0 ]]; then
+  exit 1
+fi
+exit "$records_status"

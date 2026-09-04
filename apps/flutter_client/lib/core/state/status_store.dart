@@ -86,7 +86,6 @@ class StatusStore extends ChangeNotifier {
   Timer? _timer;
   Timer? _staleTimer;
   Future<void>? _eventLoopFuture;
-  var _eventLoopGeneration = 0;
   var _disposed = false;
   DiagnosticsSnapshot? _snapshot;
   var _healthReachable = false;
@@ -148,6 +147,7 @@ class StatusStore extends ChangeNotifier {
   bool get daemonBusy => _daemonBusy;
   bool get autoRefreshEnabled => _autoRefreshEnabled;
   bool get appInForeground => _appInForeground;
+  int get eventLoopGeneration => lifecycleCoordinator.eventLoopGeneration;
   bool get snapshotStale => _snapshotStale;
   bool get statusSnapshotTimedOut => _statusSnapshotTimedOut;
 
@@ -299,7 +299,11 @@ class StatusStore extends ChangeNotifier {
     if (enabled) {
       _ensureEventLoop();
     } else {
-      _eventLoopGeneration += 1;
+      // The coordinator owns the only event-loop generation. Clearing the
+      // slot lets enable start a fresh poll immediately; the old future is
+      // still fenced by the coordinator generation when it completes.
+      lifecycleCoordinator.invalidateEventLoop();
+      _eventLoopFuture = null;
     }
     if (enabled && refreshImmediately) {
       unawaited(refreshUntilPeerCatalogSettled(silent: true));
@@ -314,12 +318,10 @@ class StatusStore extends ChangeNotifier {
         : lifecycleCoordinator.onAppBackgrounded();
     if (transition.outcome != MobileLifecycleOutcome.applied) return;
     _appInForeground = appInForeground;
-    _eventLoopGeneration = transition.newIdentity.eventLoopGeneration;
     if (!appInForeground) {
       // A long-poll request belongs to the physical network and app epoch in
       // which it started. Invalidate it before Android/iOS suspends sockets so
       // a late Wi-Fi/cellular response cannot mutate the resumed snapshot.
-      _eventLoopGeneration += 1;
       // Detach the slot immediately. The in-flight HTTP future is still
       // bounded by its request timeout, but its completion is generation-
       // fenced and `identical` will be false, so resume can start a fresh poll
@@ -353,7 +355,6 @@ class StatusStore extends ChangeNotifier {
           return;
         }
         appEpoch = lifecycleCoordinator.appEpoch;
-        _eventLoopGeneration = lifecycleCoordinator.eventLoopGeneration;
       }
     } catch (_) {
       // Android status is additive diagnostics. A temporarily unavailable
@@ -393,7 +394,7 @@ class StatusStore extends ChangeNotifier {
         _eventLoopFuture != null) {
       return;
     }
-    final generation = _eventLoopGeneration;
+    final generation = lifecycleCoordinator.eventLoopGeneration;
     final url = settingsStore.settings.diagnosticsUrl;
     late final Future<void> loop;
     loop = _runEventLoop(url, generation, lifecycleCoordinator.appEpoch);
@@ -402,12 +403,11 @@ class StatusStore extends ChangeNotifier {
       loop.whenComplete(() {
         if (identical(_eventLoopFuture, loop)) {
           _eventLoopFuture = null;
-          if (!_disposed &&
-              _autoRefreshEnabled &&
-              _appInForeground &&
-              _snapshot != null) {
-            scheduleMicrotask(_ensureEventLoop);
-          }
+          // A current loop normally remains alive until one of the shared
+          // invalidation fences changes. Do not schedule a microtask here:
+          // an immediate/empty test response must not turn completion into a
+          // zero-delay polling spin. The next refresh or explicit enable will
+          // re-arm the loop when the state is still eligible.
         }
       }),
     );
@@ -419,7 +419,7 @@ class StatusStore extends ChangeNotifier {
     while (!_disposed &&
         _autoRefreshEnabled &&
         _appInForeground &&
-        generation == _eventLoopGeneration &&
+        generation == lifecycleCoordinator.eventLoopGeneration &&
         lifecycleCoordinator.acceptsEventLoop(
           appEpoch: appEpoch,
           generation: generation,
@@ -435,7 +435,7 @@ class StatusStore extends ChangeNotifier {
         );
       } catch (_) {
         if (_disposed ||
-            generation != _eventLoopGeneration ||
+            generation != lifecycleCoordinator.eventLoopGeneration ||
             !lifecycleCoordinator.acceptsEventLoop(
               appEpoch: appEpoch,
               generation: generation,
@@ -447,7 +447,7 @@ class StatusStore extends ChangeNotifier {
       }
       if (_disposed ||
           !_autoRefreshEnabled ||
-          generation != _eventLoopGeneration ||
+          generation != lifecycleCoordinator.eventLoopGeneration ||
           !lifecycleCoordinator.acceptsEventLoop(
             appEpoch: appEpoch,
             generation: generation,
@@ -483,7 +483,7 @@ class StatusStore extends ChangeNotifier {
         final beforeRevision = current.revision;
         await _refreshAutomatically();
         if (_disposed ||
-            generation != _eventLoopGeneration ||
+            generation != lifecycleCoordinator.eventLoopGeneration ||
             !lifecycleCoordinator.acceptsEventLoop(
               appEpoch: appEpoch,
               generation: generation,
@@ -501,6 +501,11 @@ class StatusStore extends ChangeNotifier {
           // snapshot; the next long poll/refetch will converge.
           await Future<void>.delayed(const Duration(milliseconds: 250));
         }
+      } else {
+        // A machine-facing fake or a daemon that returns an empty poll
+        // immediately is still a valid response. Bound the retry cadence so
+        // an active loop cannot consume the microtask queue.
+        await Future<void>.delayed(const Duration(milliseconds: 250));
       }
     }
   }
@@ -665,6 +670,7 @@ class StatusStore extends ChangeNotifier {
         if (!acceptsLifecycle()) return;
         final daemonTransition = lifecycleCoordinator.observeDaemon(
           processId: snapshot.processId,
+          runtimeIncarnation: snapshot.runtimeIncarnation,
           revision: snapshot.revision,
         );
         if (daemonTransition.outcome == MobileLifecycleOutcome.staleRejected ||
@@ -674,10 +680,10 @@ class StatusStore extends ChangeNotifier {
           return;
         }
         if (daemonTransition.outcome == MobileLifecycleOutcome.applied) {
-          _eventLoopGeneration =
-              daemonTransition.newIdentity.eventLoopGeneration;
           if (daemonTransition.oldIdentity.daemonProcessId !=
-              snapshot.processId) {
+                  snapshot.processId ||
+              daemonTransition.oldIdentity.daemonRuntimeIncarnation !=
+                  snapshot.runtimeIncarnation) {
             // A process replacement invalidates the old event-loop slot even
             // when the replacement reports a lower revision. Its cursor must
             // be rebuilt from this committed snapshot.
@@ -842,6 +848,19 @@ class StatusStore extends ChangeNotifier {
         currentProcess != null &&
         candidateProcess != currentProcess) {
       return true;
+    }
+
+    // Android can replace the embedded Rust runtime while retaining the same
+    // OS process.  Runtime incarnation is authoritative for that case: the
+    // replacement may reset both revision and uptime, while a delayed
+    // response from the retired runtime must never be allowed to replace it.
+    final candidateRuntime = candidate.runtimeIncarnation;
+    final currentRuntime = current.runtimeIncarnation;
+    if (candidateRuntime != null && currentRuntime != null) {
+      if (candidateRuntime > currentRuntime) return true;
+      if (candidateRuntime < currentRuntime) return false;
+    } else if (currentRuntime != null && candidateRuntime == null) {
+      return false;
     }
 
     // PID reuse is possible. A lower uptime is affirmative evidence of a new
@@ -1079,7 +1098,8 @@ class StatusStore extends ChangeNotifier {
     if (nextDiagnosticsUrl == _lastDiagnosticsUrl) return;
     _lastDiagnosticsUrl = nextDiagnosticsUrl;
     _refreshGeneration += 1;
-    _eventLoopGeneration += 1;
+    lifecycleCoordinator.invalidateEventLoop();
+    _eventLoopFuture = null;
     _refreshPending = true;
     _healthReachable = false;
     _clearSnapshot();
@@ -1101,7 +1121,7 @@ class StatusStore extends ChangeNotifier {
     if (_disposed) return;
     _disposed = true;
     lifecycleCoordinator.dispose();
-    _eventLoopGeneration += 1;
+    _eventLoopFuture = null;
     _timer?.cancel();
     _staleTimer?.cancel();
     _automaticRefreshFuture = null;

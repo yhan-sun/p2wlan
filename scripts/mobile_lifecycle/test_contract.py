@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import unittest
 
-from contract import load_contract
+try:
+    from .contract import load_contract
+except ImportError:  # pragma: no cover - direct test execution
+    from contract import load_contract
 
 
 class ContractTest(unittest.TestCase):

@@ -172,6 +172,7 @@ enum ControlHttpLane {
 pub(super) struct RouteAwareControlHttpClient {
     state_rx: tokio::sync::watch::Receiver<ControlHttpPoolState>,
     lane: ControlHttpLane,
+    force_network_change_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 impl RouteAwareControlHttpClient {
@@ -189,6 +190,12 @@ impl RouteAwareControlHttpClient {
                     .unwrap_or_else(|| "control HTTP route is unavailable".to_string()),
             )
         })
+    }
+
+    pub(super) fn notify_network_changed(&self) {
+        if let Some(sender) = &self.force_network_change_tx {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -279,22 +286,26 @@ pub(super) fn route_aware_control_http_clients(
     mode: ControlProxyMode,
     server_url: &str,
 ) -> (RouteAwareControlHttpClient, RouteAwareControlHttpClient) {
+    let route_aware = mode == ControlProxyMode::Direct && !control_server_is_local(server_url);
     let initial_binding = control_route_binding(mode, Some(server_url));
     let initial_state = build_control_http_pools(mode, server_url, initial_binding.clone());
     if let Some(reason) = &initial_state.unavailable_reason {
         warn!("{reason}");
     }
     let (state_tx, state_rx) = tokio::sync::watch::channel(initial_state);
+    let (force_network_change_tx, mut force_network_change_rx) =
+        tokio::sync::mpsc::unbounded_channel::<()>();
     let primary = RouteAwareControlHttpClient {
         state_rx: state_rx.clone(),
         lane: ControlHttpLane::Primary,
+        force_network_change_tx: route_aware.then_some(force_network_change_tx.clone()),
     };
     let candidate = RouteAwareControlHttpClient {
         state_rx,
         lane: ControlHttpLane::Candidate,
+        force_network_change_tx: route_aware.then_some(force_network_change_tx.clone()),
     };
 
-    let route_aware = mode == ControlProxyMode::Direct && !control_server_is_local(server_url);
     if route_aware {
         let server_url = server_url.to_string();
         tokio::spawn(async move {
@@ -303,7 +314,15 @@ pub(super) fn route_aware_control_http_clients(
             let mut ticker = tokio::time::interval(CONTROL_ROUTE_POLL_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                let forced = tokio::select! {
+                    _ = ticker.tick() => false,
+                    forced = force_network_change_rx.recv() => {
+                        if forced.is_none() {
+                            return;
+                        }
+                        true
+                    }
+                };
                 if state_tx.is_closed() {
                     return;
                 }
@@ -313,7 +332,7 @@ pub(super) fn route_aware_control_http_clients(
                 })
                 .await
                 {
-                    Ok(binding) if !binding.signature.is_empty() => binding,
+                    Ok(binding) if forced || !binding.signature.is_empty() => binding,
                     Ok(_) => {
                         pending = None;
                         continue;
@@ -324,6 +343,21 @@ pub(super) fn route_aware_control_http_clients(
                         continue;
                     }
                 };
+                if forced {
+                    let replacement = build_control_http_pools(mode, &server_url, observed.clone());
+                    if let Some(reason) = &replacement.unavailable_reason {
+                        warn!("Control-plane HTTP pools forced to rebuild after Android network change; {reason}");
+                    } else {
+                        info!(
+                            "Rebuilt control-plane HTTP pools after Android physical network change; outbound_interface={:?}",
+                            observed.outbound_interface
+                        );
+                    }
+                    active_binding = observed;
+                    pending = None;
+                    state_tx.send_replace(replacement);
+                    continue;
+                }
                 let replacement =
                     observe_stable_route_change(&active_binding, &mut pending, observed.clone());
                 if let Some(binding) = replacement {

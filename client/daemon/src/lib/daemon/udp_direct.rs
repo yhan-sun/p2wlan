@@ -43,6 +43,16 @@ struct UdpDirectTaskContext {
     /// Daemon-wide shutdown signal.  UDP bind retry and every per-instance
     /// reader/worker observe this instead of making a failed bind permanent.
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    /// Android JNI hints are consumed by this existing transport supervisor.
+    android_network_change_rx: Option<AndroidNetworkChangeReceiver>,
+    /// Lets the binder skip its normal failure backoff after a physical
+    /// network hint has deliberately withdrawn the current socket.
+    android_network_change_observed: Arc<std::sync::atomic::AtomicU64>,
+}
+
+enum UdpDirectLifecycleSignal {
+    Stop,
+    NetworkChanged(AndroidNetworkChangeHint),
 }
 
 fn direct_socket_interface_for_bind(
@@ -134,6 +144,9 @@ where
         }
 
         let mut instance_ctx = ctx.clone();
+        let network_hint_before_instance = ctx
+            .android_network_change_observed
+            .load(std::sync::atomic::Ordering::Acquire);
         if had_live_udp_instance {
             let (resolved_stun, resolved_observers) = tokio::join!(
                 parse_stun_servers(&ctx.stun_server_specs, ctx.stun_timeout),
@@ -197,7 +210,16 @@ where
             return Ok(());
         }
 
-        if let Some(instance_runtime) = instance_runtime {
+        let network_hint_observed = ctx
+            .android_network_change_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+            != network_hint_before_instance;
+        if network_hint_observed {
+            // A callback-authorized physical handoff already withdrew the
+            // old publication. Rebind immediately; the normal exponential
+            // bind backoff is for faults, not an explicit network edge.
+            retry_delay = Duration::ZERO;
+        } else if let Some(instance_runtime) = instance_runtime {
             let reset_retry_delay =
                 udp_direct_retry_delay_after_instance(retry_delay, instance_runtime);
             if reset_retry_delay != retry_delay {
@@ -271,6 +293,8 @@ async fn run_udp_direct_instance(
         proxy_env,
         excluded_interfaces,
         shutdown_rx,
+        android_network_change_rx,
+        android_network_change_observed,
     } = ctx;
 
     let udp = if socket_pool_enabled {
@@ -426,7 +450,20 @@ async fn run_udp_direct_instance(
     // work entirely and let the common cleanup below withdraw only our owner.
     let initial_refresh_guard = tokio::select! {
         guard = candidate_refresh_lock.lock() => Some(guard),
-        _ = wait_for_udp_direct_stop(shutdown_rx.clone(), lease.shutdown_receiver()) => None,
+        lifecycle = wait_for_udp_direct_lifecycle(
+            shutdown_rx.clone(),
+            lease.shutdown_receiver(),
+            android_network_change_rx.clone(),
+        ) => {
+            if let UdpDirectLifecycleSignal::NetworkChanged(hint) = lifecycle {
+                record_android_network_change(
+                    &peers,
+                    &android_network_change_observed,
+                    &hint,
+                );
+            }
+            None
+        },
     };
     let outcome = if let Some(initial_refresh_guard) = initial_refresh_guard {
         let mut advertised_nat_type = "unknown".to_string();
@@ -702,7 +739,7 @@ async fn run_udp_direct_instance(
                     gateway_mapping_runtime,
                     gateway_mapping_diagnostics,
                     punch_deduplicator,
-                    control,
+                    control: control.clone(),
                     peers: peers.clone(),
                     probe_interval: udp_punch_interval,
                     punch_attempts: udp_punch_attempts,
@@ -711,7 +748,25 @@ async fn run_udp_direct_instance(
                 changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
                     Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
                 },
-                _ = wait_for_udp_direct_stop(shutdown_rx.clone(), lease.shutdown_receiver()) => Ok(()),
+                lifecycle = wait_for_udp_direct_lifecycle(
+                    shutdown_rx.clone(),
+                    lease.shutdown_receiver(),
+                    android_network_change_rx.clone(),
+                ) => match lifecycle {
+                    UdpDirectLifecycleSignal::Stop => Ok(()),
+                    UdpDirectLifecycleSignal::NetworkChanged(hint) => {
+                        record_android_network_change(
+                            &peers,
+                            &android_network_change_observed,
+                            &hint,
+                        );
+                        Err(DaemonError::Network(format!(
+                            "Android physical network changed; rebuilding direct UDP transport: kotlin_network_generation={} network_identity_hash={}",
+                            hint.kotlin_network_generation,
+                            hint.network_identity_hash,
+                        )))
+                    }
+                },
             }
         } else {
             let keepalive_udp = udp.clone();
@@ -740,7 +795,7 @@ async fn run_udp_direct_instance(
                     gateway_mapping_runtime,
                     gateway_mapping_diagnostics,
                     punch_deduplicator,
-                    control,
+                    control: control.clone(),
                     peers: peers.clone(),
                     probe_interval: udp_punch_interval,
                     punch_attempts: udp_punch_attempts,
@@ -749,7 +804,25 @@ async fn run_udp_direct_instance(
                 changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
                     Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
                 },
-                _ = wait_for_udp_direct_stop(shutdown_rx.clone(), lease.shutdown_receiver()) => Ok(()),
+                lifecycle = wait_for_udp_direct_lifecycle(
+                    shutdown_rx.clone(),
+                    lease.shutdown_receiver(),
+                    android_network_change_rx.clone(),
+                ) => match lifecycle {
+                    UdpDirectLifecycleSignal::Stop => Ok(()),
+                    UdpDirectLifecycleSignal::NetworkChanged(hint) => {
+                        record_android_network_change(
+                            &peers,
+                            &android_network_change_observed,
+                            &hint,
+                        );
+                        Err(DaemonError::Network(format!(
+                            "Android physical network changed; rebuilding direct UDP transport: kotlin_network_generation={} network_identity_hash={}",
+                            hint.kotlin_network_generation,
+                            hint.network_identity_hash,
+                        )))
+                    }
+                },
             }
         };
         initial_publication_worker.abort();
@@ -955,6 +1028,54 @@ async fn wait_for_udp_direct_stop(
         _ = wait_for_udp_direct_shutdown(daemon_shutdown_rx) => {},
         _ = wait_for_udp_direct_shutdown(instance_shutdown_rx) => {},
     }
+}
+
+async fn wait_for_udp_direct_lifecycle(
+    daemon_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    instance_shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    network_change_rx: Option<AndroidNetworkChangeReceiver>,
+) -> UdpDirectLifecycleSignal {
+    let Some(network_change_rx) = network_change_rx else {
+        wait_for_udp_direct_stop(daemon_shutdown_rx, instance_shutdown_rx).await;
+        return UdpDirectLifecycleSignal::Stop;
+    };
+    tokio::select! {
+        _ = wait_for_udp_direct_stop(daemon_shutdown_rx, instance_shutdown_rx) => {
+            UdpDirectLifecycleSignal::Stop
+        }
+        hint = async move {
+            let mut receiver = network_change_rx.lock().await;
+            loop {
+                match receiver.recv().await {
+                    Ok(hint) => break Some(hint),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
+                }
+            }
+        } => {
+            match hint {
+                Some(hint) => UdpDirectLifecycleSignal::NetworkChanged(hint),
+                None => UdpDirectLifecycleSignal::Stop,
+            }
+        }
+    }
+}
+
+fn record_android_network_change(
+    peers: &PeerManager,
+    observed: &std::sync::atomic::AtomicU64,
+    hint: &AndroidNetworkChangeHint,
+) {
+    observed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    peers.emit_timeline(
+        "physical_network_changed",
+        Some("direct"),
+        Some("physical_network_changed"),
+        Some(format!(
+            "kotlin_network_generation={} network_identity_hash={}",
+            hint.kotlin_network_generation, hint.network_identity_hash
+        )),
+    );
 }
 
 fn emit_dplpmtud_timeline(
@@ -1393,7 +1514,7 @@ async fn stop_peer_reflexive_signal_worker(mut worker: tokio::task::JoinHandle<(
 mod udp_direct_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{broadcast, mpsc, watch};
     use tokio::time::timeout;
 
     use super::*;
@@ -1499,6 +1620,10 @@ mod udp_direct_tests {
             proxy_env: crate::netenv::ProxyEnvironment::default(),
             excluded_interfaces: Vec::new(),
             shutdown_rx,
+            android_network_change_rx: None,
+            android_network_change_observed: Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            ),
         }
     }
 
@@ -1573,6 +1698,66 @@ mod udp_direct_tests {
             .expect("UDP supervisor task must not panic")
             .expect("UDP supervisor must exit cleanly");
         drop(candidate_guard);
+    }
+
+    #[tokio::test]
+    async fn android_network_hint_rebinds_udp_once_and_supersedes_old_publication() {
+        let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (network_tx, network_rx) = broadcast::channel(8);
+        let mut context = test_context(&daemon, shutdown_rx);
+        context.android_network_change_rx = Some(Arc::new(tokio::sync::Mutex::new(network_rx)));
+        let mut updates = daemon.udp_transport_publication.subscribe();
+
+        let worker = tokio::spawn(run_udp_direct_task_with_binder(
+            context,
+            |udp_bind, peers| async move { UdpTransport::bind(udp_bind, peers).await },
+        ));
+        timeout(Duration::from_secs(1), updates.changed())
+            .await
+            .expect("initial UDP publication did not arrive")
+            .expect("UDP publication sender closed");
+        let old_transport = updates
+            .borrow()
+            .clone()
+            .expect("initial UDP transport must be published");
+        let old_instance = old_transport.transport_instance_id();
+        let generation_before = daemon.peers.current_network_generation().await;
+
+        network_tx
+            .send(AndroidNetworkChangeHint {
+                kotlin_network_generation: 2,
+                network_identity_hash: "cellular-hash".to_string(),
+            })
+            .expect("the direct lifecycle receiver must remain subscribed");
+
+        // The old publication is withdrawn before the replacement is exposed.
+        timeout(Duration::from_secs(1), updates.changed())
+            .await
+            .expect("old UDP publication was not withdrawn")
+            .expect("UDP publication sender closed");
+        assert!(updates.borrow().is_none());
+        timeout(Duration::from_secs(1), updates.changed())
+            .await
+            .expect("replacement UDP publication did not arrive")
+            .expect("UDP publication sender closed");
+        let new_transport = updates
+            .borrow()
+            .clone()
+            .expect("replacement UDP transport must be published");
+        assert_ne!(old_instance, new_transport.transport_instance_id());
+        assert_eq!(
+            daemon.peers.current_network_generation().await,
+            generation_before + 1,
+            "one callback-authorized handoff must advance PeerManager once",
+        );
+
+        let _ = shutdown_tx.send(true);
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("UDP lifecycle did not stop")
+            .expect("UDP lifecycle task panicked")
+            .expect("UDP lifecycle did not exit cleanly");
     }
 
     #[test]

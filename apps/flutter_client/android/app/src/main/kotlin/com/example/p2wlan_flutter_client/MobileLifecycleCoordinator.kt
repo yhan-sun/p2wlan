@@ -1,5 +1,8 @@
 package com.example.p2wlan_flutter_client
 
+import java.security.MessageDigest
+import java.util.Locale
+
 /**
  * Platform-neutral lifecycle reducer used by both the Android host and JVM
  * tests. It owns Android attachment/permission identities only; Rust remains
@@ -412,7 +415,29 @@ internal data class PhysicalNetworkIdentity(
     val validated: Boolean,
     val captive: Boolean,
     val interfaceIdentity: String?,
-)
+) {
+    /** Stable, non-sensitive identity passed to the Rust lifecycle boundary. */
+    fun identityHash(): String {
+        val canonical = buildString {
+            append(networkHandle)
+            append('|')
+            transports.toList().sorted().joinTo(this, separator = ",")
+            append('|')
+            append(validated)
+            append('|')
+            append(captive)
+            append('|')
+            append(interfaceIdentity.orEmpty())
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(canonical.toByteArray(Charsets.UTF_8))
+        return buildString(digest.size * 2) {
+            digest.forEach { byte ->
+                append("%02x".format(Locale.ROOT, byte.toInt() and 0xff))
+            }
+        }
+    }
+}
 
 internal data class PhysicalNetworkTransition(
     val outcome: MobileLifecycleOutcome,
@@ -463,4 +488,109 @@ internal class PhysicalNetworkIdentityReducer {
 
     fun current(): PhysicalNetworkIdentity? = current
     fun generation(): Long = generation
+}
+
+/** JNI-shaped boundary used by the Android callback and JVM production-path tests. */
+internal fun interface PhysicalNetworkChangeNotifier {
+    fun notify(
+        serviceIncarnation: Long,
+        bridgeIncarnation: Long,
+        kotlinNetworkGeneration: Long,
+        networkIdentityHash: String,
+    ): MobileLifecycleOutcome
+}
+
+internal data class PhysicalNetworkCallbackResult(
+    val outcome: MobileLifecycleOutcome,
+    val generation: Long,
+    val oldIdentity: PhysicalNetworkIdentity?,
+    val newIdentity: PhysicalNetworkIdentity?,
+    val forwardedToRust: Boolean,
+)
+
+/**
+ * Captures the service/bridge owner at callback registration and forwards only
+ * reducer-authorized `onAvailable` edges to Rust. The Kotlin reducer remains a
+ * debounce/fencing boundary; Rust owns the dataplane generation and rebind.
+ */
+internal class PhysicalNetworkCallbackForwarder(
+    private val callbackServiceIncarnation: Long,
+    private val callbackBridgeIncarnation: Long,
+    private val currentServiceIncarnation: () -> Long,
+    private val currentBridgeIncarnation: () -> Long,
+    private val notifier: PhysicalNetworkChangeNotifier,
+    private val reducer: PhysicalNetworkIdentityReducer = PhysicalNetworkIdentityReducer(),
+) {
+    fun onAvailable(identity: PhysicalNetworkIdentity): PhysicalNetworkCallbackResult {
+        val ownerAccepted = callbackServiceIncarnation > 0L &&
+            callbackBridgeIncarnation > 0L &&
+            currentServiceIncarnation() == callbackServiceIncarnation &&
+            currentBridgeIncarnation() == callbackBridgeIncarnation
+        if (!ownerAccepted) {
+            return result(
+                MobileLifecycleOutcome.STALE_REJECTED,
+                reducer.generation(),
+                forwardedToRust = false,
+            )
+        }
+        val transition = reducer.onAvailable(identity)
+        if (transition.outcome != MobileLifecycleOutcome.APPLIED) {
+            return PhysicalNetworkCallbackResult(
+                transition.outcome,
+                transition.generation,
+                transition.oldIdentity,
+                transition.newIdentity,
+                forwardedToRust = false,
+            )
+        }
+        val rustOutcome = notifier.notify(
+            callbackServiceIncarnation,
+            callbackBridgeIncarnation,
+            transition.generation,
+            identity.identityHash(),
+        )
+        return PhysicalNetworkCallbackResult(
+            rustOutcome,
+            transition.generation,
+            transition.oldIdentity,
+            transition.newIdentity,
+            forwardedToRust = true,
+        )
+    }
+
+    /** Loss is retained as reducer state; the replacement `onAvailable` edge
+     * carries the single Rust generation advance for the handoff. */
+    fun onLost(networkHandle: Long): PhysicalNetworkCallbackResult {
+        val ownerAccepted = callbackServiceIncarnation > 0L &&
+            callbackBridgeIncarnation > 0L &&
+            currentServiceIncarnation() == callbackServiceIncarnation &&
+            currentBridgeIncarnation() == callbackBridgeIncarnation
+        if (!ownerAccepted) {
+            return result(
+                MobileLifecycleOutcome.STALE_REJECTED,
+                reducer.generation(),
+                forwardedToRust = false,
+            )
+        }
+        val transition = reducer.onLost(networkHandle)
+        return PhysicalNetworkCallbackResult(
+            transition.outcome,
+            transition.generation,
+            transition.oldIdentity,
+            transition.newIdentity,
+            forwardedToRust = false,
+        )
+    }
+
+    private fun result(
+        outcome: MobileLifecycleOutcome,
+        generation: Long,
+        forwardedToRust: Boolean,
+    ) = PhysicalNetworkCallbackResult(
+        outcome,
+        generation,
+        reducer.current(),
+        reducer.current(),
+        forwardedToRust,
+    )
 }
