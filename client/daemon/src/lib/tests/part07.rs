@@ -3928,6 +3928,25 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
             &result,
         )
         .await;
+        // This case validates production scheduler accounting, not peer
+        // convergence. Keep its targets on owned sink sockets so the
+        // synthetic NAT link cannot turn the metadata assertion into a
+        // competing Direct lifecycle transition.
+        let mut scheduler_targets = Vec::with_capacity(requested_level);
+        let mut scheduler_sinks = Vec::with_capacity(requested_level);
+        for _ in 0..requested_level {
+            let sink = UdpSocket::bind(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            ))
+            .await
+            .expect("bind isolated Birthday scheduler sink");
+            scheduler_targets.push(
+                sink.local_addr()
+                    .expect("isolated Birthday scheduler sink has an endpoint"),
+            );
+            scheduler_sinks.push(sink);
+        }
         let scheduler_report = harness
             .udp_a
             .punch_hard_hard_birthday_candidates_with_metadata(
@@ -3937,7 +3956,7 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
                     .iter()
                     .map(|socket| socket.socket_index)
                     .collect(),
-                result.candidate_endpoints.clone(),
+                scheduler_targets,
                 requested_level,
                 requested_level,
                 requested_level.min(crate::MAX_SIGNAL_CANDIDATES),
