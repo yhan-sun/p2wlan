@@ -1,0 +1,256 @@
+name: Cross-Task Integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/cross-task-integration-required.yml"
+      - "contracts/cross_task_integration.json"
+      - "scripts/cross_task_integration/**"
+      - "docs/cross-task-integration.md"
+      - "client/daemon/cross_task_integration_gate_version.txt"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/cross-task-integration-required.yml"
+      - "contracts/cross_task_integration.json"
+      - "scripts/cross_task_integration/**"
+      - "docs/cross-task-integration.md"
+      - "client/daemon/cross_task_integration_gate_version.txt"
+  workflow_dispatch:
+    inputs:
+      validation_sha:
+        description: Exact commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: cross-task-integration-${{ github.event.pull_request.number || inputs.validation_sha || github.ref }}
+  cancel-in-progress: true
+
+env:
+  P2WLAN_EXACT_HEAD: ${{ github.event.pull_request.head.sha || inputs.validation_sha || github.sha }}
+
+jobs:
+  contract:
+    name: Cross-task integration contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+      - name: Verify exact source checkout
+        run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
+      - name: Validate contract and fail-closed evidence tests
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/cross_task_integration/aggregate_evidence.py
+          python3 -m unittest discover \
+            -s scripts/cross_task_integration \
+            -p 'test_*.py'
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          value = json.loads(Path("contracts/cross_task_integration.json").read_text())
+          assert value["schema_version"] == 1
+          assert value["repository"] == "yhan-sun/p2wlan"
+          assert value["trigger_marker"] == "client/daemon/cross_task_integration_gate_version.txt"
+          names = [item["name"] for item in value["required_checks"]]
+          assert len(names) == len(set(names))
+          assert len(names) >= 17
+          marker = Path(value["trigger_marker"]).read_text().strip()
+          assert marker == "1"
+          PY
+
+  integration:
+    name: Exact-head permanent gate manifest
+    needs: contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.P2WLAN_EXACT_HEAD }}
+          fetch-depth: 1
+
+      - name: Verify exact source and workflow identity
+        id: identity
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$P2WLAN_EXACT_HEAD"
+          workflow_sha="$(git rev-parse "$actual:.github/workflows/cross-task-integration-required.yml")"
+          {
+            echo "source_head_sha=$actual"
+            echo "workflow_sha=$workflow_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for every permanent exact-head gate
+        id: poll
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          TARGET_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          SNAPSHOT_PATH: ${{ runner.temp }}/cross-task-integration/check-runs.json
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const contract = JSON.parse(fs.readFileSync('contracts/cross_task_integration.json', 'utf8'));
+            const requiredNames = contract.required_checks.map((item) => item.name);
+            const targetSha = process.env.TARGET_SHA;
+            const snapshotPath = process.env.SNAPSHOT_PATH;
+            fs.mkdirSync(path.dirname(snapshotPath), { recursive: true });
+
+            const deadline = Date.now() + 65 * 60 * 1000;
+            let lastSummary = '';
+            let finalChecks = [];
+            let finalResult = 'timeout';
+
+            while (Date.now() < deadline) {
+              const runs = await github.paginate(
+                github.rest.checks.listForRef,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: targetSha,
+                  per_page: 100,
+                  filter: 'latest',
+                },
+              );
+
+              const latest = new Map();
+              for (const run of runs) {
+                if (!requiredNames.includes(run.name)) continue;
+                const previous = latest.get(run.name);
+                const previousTime = new Date(previous?.started_at || 0).getTime();
+                const currentTime = new Date(run.started_at || 0).getTime();
+                if (!previous || currentTime > previousTime ||
+                    (currentTime === previousTime && run.id > previous.id)) {
+                  latest.set(run.name, run);
+                }
+              }
+
+              finalChecks = requiredNames
+                .filter((name) => latest.has(name))
+                .map((name) => {
+                  const run = latest.get(name);
+                  return {
+                    name,
+                    id: run.id,
+                    status: run.status,
+                    conclusion: run.conclusion,
+                    details_url: run.details_url || run.html_url,
+                    started_at: run.started_at,
+                    completed_at: run.completed_at,
+                  };
+                });
+
+              const summary = requiredNames.map((name) => {
+                const run = latest.get(name);
+                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}` : 'missing'}`;
+              }).join(', ');
+              if (summary !== lastSummary) {
+                core.info(`exact-head gate status for ${targetSha}: ${summary}`);
+                lastSummary = summary;
+              }
+
+              const failed = requiredNames.filter((name) => {
+                const run = latest.get(name);
+                return run && run.status === 'completed' && run.conclusion !== 'success';
+              });
+              if (failed.length > 0) {
+                finalResult = 'failure';
+                break;
+              }
+
+              const complete = requiredNames.every((name) => {
+                const run = latest.get(name);
+                return run && run.status === 'completed' && run.conclusion === 'success';
+              });
+              if (complete) {
+                finalResult = 'success';
+                break;
+              }
+
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+
+            fs.writeFileSync(
+              snapshotPath,
+              JSON.stringify(
+                {
+                  repository: `${context.repo.owner}/${context.repo.repo}`,
+                  source_head_sha: targetSha,
+                  poll_result: finalResult,
+                  checks: finalChecks,
+                },
+                null,
+                2,
+              ) + '\n',
+            );
+            core.setOutput('poll_result', finalResult);
+
+      - name: Build fail-closed integration manifest
+        id: aggregate
+        if: always()
+        env:
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          WORKFLOW_SHA: ${{ steps.identity.outputs.workflow_sha }}
+        run: |
+          set +e
+          python3 scripts/cross_task_integration/aggregate_evidence.py \
+            --contract contracts/cross_task_integration.json \
+            --snapshot "$RUNNER_TEMP/cross-task-integration/check-runs.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/cross-task-integration/cross-task-integration-manifest.json"
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Upload integration manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cross-task-integration-manifest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cross-task-integration/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce manifest and no skipped required gates
+        if: always()
+        env:
+          POLL_RESULT: ${{ steps.poll.outputs.poll_result }}
+          AGGREGATE_STATUS: ${{ steps.aggregate.outputs.status }}
+        run: |
+          set -euo pipefail
+          test "$POLL_RESULT" = "success"
+          test "$AGGREGATE_STATUS" = "0"
+
+  required:
+    name: Cross-Task Integration Required
+    if: always()
+    needs:
+      - contract
+      - integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce cross-task integration
+        env:
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: |
+          set -euo pipefail
+          test "$CONTRACT_RESULT" = "success"
+          test "$INTEGRATION_RESULT" = "success"
