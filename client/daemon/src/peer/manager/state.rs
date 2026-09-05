@@ -715,7 +715,7 @@ pub struct OutboundLossEvent {
 }
 
 /// Metadata changes observed while applying one control-plane peer snapshot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerUpdate {
     pub is_new: bool,
     pub virtual_ip_changed: bool,
@@ -724,6 +724,8 @@ pub struct PeerUpdate {
     /// The control-plane heartbeat advanced only user-visible liveness time;
     /// no identity, reachability, NAT, path or relay metadata changed.
     pub last_seen_only: bool,
+    pub previous_virtual_ip: Option<String>,
+    pub was_offline: bool,
 }
 
 fn derive_probe_mac_key(config: &Config, peer_public_key: &str) -> Option<ProbeMacKey> {

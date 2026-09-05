@@ -591,25 +591,22 @@ impl PeerManager {
         expected: PeerSessionGeneration,
         detail: &str,
     ) -> bool {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let (_epoch_guard, connections) = self.lock_epoch_and_connections_read().await;
         if self.current_network_generation_sync() != network_generation
             || !self.peer_session_is_current_sync(peer_id, expected)
         {
             return false;
         }
+        let Some(conn) = connections.get(peer_id) else {
+            return false;
+        };
+        if !conn.online
+            || conn.state == ConnectionState::Closed
+            || conn.state == ConnectionState::Direct
         {
-            let connections = self.connections.read().await;
-            let Some(conn) = connections.get(peer_id) else {
-                return false;
-            };
-            if !conn.online
-                || conn.state == ConnectionState::Closed
-                || conn.state == ConnectionState::Direct
-            {
-                return false;
-            }
+            return false;
         }
+        drop(connections);
         let mut epochs = self.recovery_epochs.write().await;
         let Some(state) = epochs.get_mut(peer_id) else {
             return false;

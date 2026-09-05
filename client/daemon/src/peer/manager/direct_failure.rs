@@ -11,8 +11,7 @@ impl PeerManager {
         node_id: &str,
         validation: DirectValidationIdentity,
     ) -> bool {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if validation.epoch.network_generation != self.current_network_generation_sync()
             || !self.peer_session_is_current_sync(
                 node_id,
@@ -21,7 +20,6 @@ impl PeerManager {
         {
             return false;
         }
-        let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
@@ -37,9 +35,7 @@ impl PeerManager {
         node_id: &str,
         validation: DirectValidationIdentity,
     ) -> bool {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
-        let mut conns = self.connections.write().await;
+        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
@@ -174,8 +170,7 @@ impl PeerManager {
     ) -> DirectFailureCommitOutcome {
         let reason = reason.into();
         let code = code.into();
-        let epoch_gate = self.network_epoch_gate();
-        let epoch_guard = epoch_gate.lock().await;
+        let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if generation != self.current_network_generation_sync()
             || !self.peer_session_is_current_sync(node_id, peer_session_generation)
         {
@@ -189,7 +184,6 @@ impl PeerManager {
         // scan at 96 ports forever.  Only true hard failures (send errors,
         // handshake timeouts) call `mark_recovery_relay_backoff` explicitly.
         let probed_sources = {
-            let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return DirectFailureCommitOutcome::Rejected;
             };
@@ -356,15 +350,13 @@ impl PeerManager {
             return false;
         };
         let reason = reason.into();
-        let epoch_gate = self.network_epoch_gate();
-        let epoch_guard = epoch_gate.lock().await;
+        let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if generation != self.current_network_generation_sync()
             || !self.peer_session_is_current_sync(node_id, peer_session_generation)
         {
             return false;
         }
         let probed_sources = {
-            let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
@@ -457,8 +449,7 @@ impl PeerManager {
         let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
             return false;
         };
-        let epoch_gate = self.network_epoch_gate();
-        let epoch_guard = epoch_gate.lock().await;
+        let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if generation != self.current_network_generation_sync()
             || !self.peer_session_is_current_sync(node_id, peer_session_generation)
         {
@@ -466,7 +457,6 @@ impl PeerManager {
         }
 
         let source = {
-            let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };

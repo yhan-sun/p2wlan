@@ -106,17 +106,45 @@ impl PeerManager {
         if self.peer_quarantined_sync(node_id) {
             return None;
         }
+
+        let (relay_safety_net, need_speculative_retirement) = {
+            let conns = self.connections.read().await;
+            let conn = conns.get(node_id)?;
+            if !conn.online {
+                return None;
+            }
+            if conn.state == ConnectionState::Direct {
+                if conn.has_speculative_pairs_to_retire(generation) {
+                    Some((false, true))
+                } else {
+                    None
+                }
+            } else {
+                let safety_net = matches!(
+                    conn.state,
+                    ConnectionState::Relay | ConnectionState::FallbackToRelay
+                ) || conn.active_path() == Some(NetworkPath::Relay);
+                Some((safety_net, false))
+            }
+        }?;
+
+        if need_speculative_retirement {
+            let mut conns = self.connections.write().await;
+            if let Some(conn) = conns.get_mut(node_id) {
+                conn.retire_speculative_pairs_when_direct_confirmed(generation);
+            }
+            return None;
+        }
+
         let recovery_stage = if self.recovery_epoch_active(node_id).await {
             Some(self.recovery_stage_for(node_id).await)
         } else {
             None
         };
-        // The relay safety net is read BEFORE the connection-map write guard:
-        // `has_relay_safety_net` takes the connection map read lock, which
-        // would deadlock while the write guard below is held.
-        let relay_safety_net = match recovery_stage {
-            Some(_) => self.has_relay_safety_net(node_id).await,
-            None => false,
+        let relay_safety_net = if recovery_stage.is_some() {
+            relay_safety_net
+        } else {
+            false
         };
         // Snapshot this independent ledger before taking the process-wide
         // connection write guard.  Awaiting it while that guard is held lets

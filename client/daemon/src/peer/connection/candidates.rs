@@ -601,6 +601,43 @@ impl PeerConnection {
     /// fails, the network generation changes, or the selected pair ages out,
     /// probing resumes and these pairs are re-expanded from the same
     /// candidates. Returns the number of pairs retired.
+    pub(crate) fn has_speculative_pairs_to_retire(&self, local_generation: u64) -> bool {
+        if self.state != ConnectionState::Direct
+            || self.direct_health.consecutive_failures != 0
+            || self
+                .direct_health
+                .success_age()
+                .is_none_or(|age| age > RELAY_PEER_CONFIRMATION_MAX_AGE)
+            || !self.candidate_pairs.iter().any(|pair| {
+                pair.local_generation == local_generation
+                    && self.pair_belongs_to_current_remote_epoch(pair)
+                    && pair.state == CandidatePairState::Selected
+                    && pair.consecutive_failures == 0
+                    && pair
+                        .success_age()
+                        .is_some_and(|age| age <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+            })
+        {
+            return false;
+        }
+
+        let remote_epoch = self.remote_candidate_epoch;
+        self.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == local_generation
+                && pair.remote_candidate_epoch == remote_epoch
+                && pair.state != CandidatePairState::Frozen
+                && pair.state != CandidatePairState::Selected
+                && pair.last_success_at.is_none()
+                && !is_low_latency_direct_endpoint(pair.remote_endpoint)
+                && matches!(
+                    pair.source,
+                    CandidatePairSource::Predicted
+                        | CandidatePairSource::Birthday
+                        | CandidatePairSource::StunObserved
+                )
+        })
+    }
+
     pub(super) fn retire_speculative_pairs_when_direct_confirmed(
         &mut self,
         local_generation: u64,

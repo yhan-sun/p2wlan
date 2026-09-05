@@ -1152,10 +1152,14 @@ impl PeerManager {
         // packet could observe generation N, then advance_network_generation
         // could clear N's state, and the packet could still write first_usable
         // for the retired generation afterwards.
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
-        self.record_verified_first_usable_in_epoch(node_id, generation, path, ingress_label)
-            .await
+        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
+        self.record_verified_first_usable_in_epoch(
+            &mut conns,
+            node_id,
+            generation,
+            path,
+            ingress_label,
+        )
     }
 
     /// Serial-inbound Direct business fast path. It preserves the same
@@ -1281,8 +1285,9 @@ impl PeerManager {
         recorded
     }
 
-    async fn record_verified_first_usable_in_epoch(
+    fn record_verified_first_usable_in_epoch(
         &self,
+        conns: &mut HashMap<String, PeerConnection>,
         node_id: &str,
         generation: u64,
         path: NetworkPath,
@@ -1303,9 +1308,7 @@ impl PeerManager {
             );
             return false;
         }
-        let (recorded, rejected_reason, fallback_reason) = {
-            let mut conns = self.connections.write().await;
-            match conns.get_mut(node_id) {
+        let (recorded, rejected_reason, fallback_reason) = match conns.get_mut(node_id) {
                 None => (false, Some("peer_missing"), None),
                 Some(conn) => {
                     // A WireGuard packet can race with the control-plane
@@ -1381,8 +1384,7 @@ impl PeerManager {
                         (conn.record_first_usable(path, generation), None, None)
                     }
                 }
-            }
-        };
+            };
         if let Some(reason_code) = rejected_reason {
             self.emit_timeline(
                 "first_usable_rejected",
@@ -1558,25 +1560,21 @@ impl PeerManager {
         relay_endpoint: &str,
         relay_connection_id: u64,
     ) -> Option<PeerSessionGeneration> {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let (_epoch_guard, conns) = self.lock_epoch_and_connections_read().await;
         if generation != self.current_network_generation_sync() {
             return None;
         }
         let peer_session_generation = self.peer_session_generation_sync(node_id)?;
-        let confirmed_on_transport =
-            self.connections
-                .read()
-                .await
-                .get(node_id)
-                .is_some_and(|conn| {
-                    conn.online
-                        && conn.state != ConnectionState::Closed
-                        && conn.relay_confirmed_at.is_some()
-                        && conn.relay_confirmed_generation == Some(generation)
-                        && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
-                        && conn.relay_confirmed_connection_id == Some(relay_connection_id)
-                });
+        let confirmed_on_transport = conns
+            .get(node_id)
+            .is_some_and(|conn| {
+                conn.online
+                    && conn.state != ConnectionState::Closed
+                    && conn.relay_confirmed_at.is_some()
+                    && conn.relay_confirmed_generation == Some(generation)
+                    && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
+                    && conn.relay_confirmed_connection_id == Some(relay_connection_id)
+            });
         if !confirmed_on_transport {
             return None;
         }
@@ -2178,15 +2176,13 @@ impl PeerManager {
         relay_connection_id: Option<u64>,
     ) -> bool {
         let (changed, exchange_confirmed, relay_endpoint) = {
-            let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
+            let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
             if generation != self.current_network_generation_sync() {
                 return false;
             }
             let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
                 return false;
             };
-            let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
@@ -2944,12 +2940,11 @@ impl PeerManager {
             true
         };
         if record_failure {
-            let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
+            let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
             let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
                 return;
             };
-            if let Some(conn) = self.connections.write().await.get_mut(node_id) {
+            if let Some(conn) = conns.get_mut(node_id) {
                 let relay_identity = RelayConnectionIdentity::new(
                     PathEpoch::new(
                         self.current_network_generation_sync(),
@@ -2981,11 +2976,9 @@ impl PeerManager {
     /// peer is usable over the relay again.
     pub(crate) async fn revoke_relay_peer_confirmation(&self, node_id: &str) -> bool {
         let (revoked, ready_cleared, previous_endpoint, previous_generation) = {
-            let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
+            let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
             let generation_now = self.current_network_generation_sync();
             let peer_session_generation = self.peer_session_generation_any_sync(node_id);
-            let mut conns = self.connections.write().await;
             match conns.get_mut(node_id) {
                 Some(conn)
                     if conn.relay_confirmed_at.is_some() || conn.relay_ready_at.is_some() =>
@@ -3188,10 +3181,9 @@ impl PeerManager {
         let code = code.into();
         let reason = reason.into();
         let (cancelled, cancelled_expectations, cancelled_path_commits) = {
-            let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
+            let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
             let mut peer_cancelled = Vec::new();
-            for conn in self.connections.write().await.values_mut() {
+            for conn in conns.values_mut() {
                 // A peer is bound to this relay either because its last traffic
                 // rode it (`relay_server`) or because its probe confirmation
                 // was earned on it (`relay_confirmed_endpoint`) — both must be

@@ -760,6 +760,13 @@ impl PendingHandshakeState {
                 continue;
             };
             let Some(mut reservation) = self.reservation_for_retry(&retry.identity) else {
+                tracing::debug!(
+                    peer_id = %peer_id,
+                    owner = retry.identity.reservation_owner,
+                    phase = ?retry.identity.phase,
+                    attempt = retry.identity.attempt,
+                    "initiator retry reservation could not be claimed; cancelled stale reservation"
+                );
                 self.cancel_reservation_if_current(&peer_id, retry.identity.reservation_owner);
                 continue;
             };

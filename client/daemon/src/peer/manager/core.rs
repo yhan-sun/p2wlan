@@ -802,6 +802,48 @@ impl PeerManager {
             .generation(node_id)
     }
 
+    /// Lock the network epoch gate and connection write lock in canonical order
+    /// without holding the epoch gate while waiting in Tokio's fair writer queue.
+    /// This prevents cyclic deadlocks between readers finishing epoch-fenced
+    /// transactions and writers queued behind them.
+    pub(crate) async fn lock_epoch_and_connections_write<'a>(
+        &'a self,
+    ) -> (
+        tokio::sync::MutexGuard<'a, ()>,
+        tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+    ) {
+        loop {
+            let epoch_guard = self.network_epoch_gate.lock().await;
+            match self.connections.try_write() {
+                Ok(connections) => return (epoch_guard, connections),
+                Err(_) => {
+                    drop(epoch_guard);
+                    drop(self.connections.write().await);
+                }
+            }
+        }
+    }
+
+    /// Lock the network epoch gate and connection read lock in canonical order
+    /// without holding the epoch gate while waiting in Tokio's reader queue behind queued writers.
+    pub(crate) async fn lock_epoch_and_connections_read<'a>(
+        &'a self,
+    ) -> (
+        tokio::sync::MutexGuard<'a, ()>,
+        tokio::sync::RwLockReadGuard<'a, HashMap<String, PeerConnection>>,
+    ) {
+        loop {
+            let epoch_guard = self.network_epoch_gate.lock().await;
+            match self.connections.try_read() {
+                Ok(connections) => return (epoch_guard, connections),
+                Err(_) => {
+                    drop(epoch_guard);
+                    drop(self.connections.read().await);
+                }
+            }
+        }
+    }
+
     /// Hold the connection writer for deterministic lock-contention tests.
     /// Production code never needs to expose this guard; the test-only helper
     /// makes it possible to prove timing-sensitive paths do not await this

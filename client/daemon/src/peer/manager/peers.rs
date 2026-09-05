@@ -326,21 +326,7 @@ impl PeerManager {
         candidate_generation: u64,
         sender_public_key: Option<&str>,
     ) -> RemoteCandidateIncarnationClaim {
-        let epoch_gate = self.network_epoch_gate();
-        let (_epoch_guard, mut connections) = loop {
-            let epoch_guard = epoch_gate.lock().await;
-            match self.connections.try_write() {
-                Ok(connections) => break (epoch_guard, connections),
-                Err(_) => {
-                    // A connection reader may itself be finishing an
-                    // epoch-fenced transaction. Never retain the epoch while
-                    // joining Tokio's fair writer queue: wait for one writer
-                    // turn without the epoch, then retry in canonical order.
-                    drop(epoch_guard);
-                    drop(self.connections.write().await);
-                }
-            }
-        };
+        let (_epoch_guard, mut connections) = self.lock_epoch_and_connections_write().await;
         self.claim_remote_candidate_incarnation_in_connection(
             node_id,
             candidate_generation,
@@ -483,24 +469,7 @@ impl PeerManager {
         reason: &str,
     ) -> bool {
         let had_relay_confirmation = {
-            let epoch_gate = self.network_epoch_gate();
-            let (_epoch_guard, mut connections) = loop {
-                let epoch_guard = epoch_gate.lock().await;
-                match self.connections.try_write() {
-                    Ok(connections) => break (epoch_guard, connections),
-                    Err(_) => {
-                        // Remote-incarnation cleanup already owns the peer's
-                        // adoption fence. A connection reader can still need
-                        // the epoch to retire its pre-cleanup observation, so
-                        // queueing the writer while retaining the epoch would
-                        // close a reader -> epoch -> writer -> reader cycle.
-                        // Wait fairly without epoch ownership and retry the
-                        // actual mutation in canonical order.
-                        drop(epoch_guard);
-                        drop(self.connections.write().await);
-                    }
-                }
-            };
+            let (_epoch_guard, mut connections) = self.lock_epoch_and_connections_write().await;
             let Some(conn) = connections.get_mut(node_id) else {
                 return false;
             };
@@ -580,8 +549,7 @@ impl PeerManager {
         // the generation snapshot and the connection mutation as one epoch
         // transaction; otherwise a public-key/session reset could be
         // published immediately before an old ACK commits.
-        let epoch_gate = self.network_epoch_gate();
-        let epoch_guard = epoch_gate.lock().await;
+        let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         let generation = self.current_network_generation_sync();
         // Un-quarantine evidence is computed under the connection lock but the
         // quarantine map is re-opened only AFTER the lock is dropped:
@@ -592,7 +560,6 @@ impl PeerManager {
         let mut cancel_heartbeat_after_lock = false;
         let mut revoke_relay_after_lock = false;
         let mut clear_hard_hard_after_lock = false;
-        let mut conns = self.connections.write().await;
         let mut ip_map = self.ip_to_node.write().await;
 
         let is_new = !conns.contains_key(&info.node_id);
@@ -620,6 +587,12 @@ impl PeerManager {
         let old_remote_relay_rtt_ms = conn.remote_relay_rtt_ms;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
+        let was_offline = !is_new && !old_online;
+        let previous_virtual_ip = if !is_new && !old_virtual_ip.is_empty() {
+            Some(old_virtual_ip.clone())
+        } else {
+            None
+        };
 
         if virtual_ip_changed
             && ip_map.get(&old_virtual_ip).map(String::as_str) == Some(info.node_id.as_str())
@@ -879,6 +852,8 @@ impl PeerManager {
             endpoint_changed,
             public_key_changed,
             last_seen_only,
+            previous_virtual_ip,
+            was_offline,
         }
     }
 
@@ -891,14 +866,8 @@ impl PeerManager {
     /// resets the fresh space.
     pub async fn remove_peer(&self, node_id: &str) {
         let (removed_virtual_ip, removed_relay_expectation) = {
-            let epoch_gate = self.network_epoch_gate();
-            let _epoch_guard = epoch_gate.lock().await;
-            // Snapshot the current runtime while the epoch fence is held, but
-            // before taking the connection writer.  Cancellation mutates the
-            // DPLPMTUD registry synchronously; awaiting its manager lock
-            // while `conns` is held would invert the diagnostics/transport
-            // lock order and extend the PeerLeft write critical section.
             let dplpmtud_runtime = self.dplpmtud_runtime.read().await.clone();
+            let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
             // PeerLeft is an authoritative quarantine lifecycle boundary.
             // Remove both the backoff metadata and the no-await dataplane
             // mirror under the same epoch used for membership removal, before
@@ -908,7 +877,6 @@ impl PeerManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
-            let mut conns = self.connections.write().await;
             if let Some(conn) = conns.get(node_id) {
                 self.remote_identity_ledger
                     .lock()
@@ -1031,13 +999,11 @@ impl PeerManager {
         expected: PeerSessionGeneration,
         state: ConnectionState,
     ) -> bool {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if !self.peer_session_is_current_sync(node_id, expected) {
             return false;
         }
         let updated = {
-            let mut conns = self.connections.write().await;
             let Some(conn) = conns.get_mut(node_id) else {
                 return false;
             };
@@ -1047,6 +1013,8 @@ impl PeerManager {
             conn.transition(state);
             true
         };
+        drop(conns);
+        drop(_epoch_guard);
         if updated
             && !matches!(
                 state,
@@ -1069,8 +1037,7 @@ impl PeerManager {
         observed_generation: u64,
         observed_commit_seq: Option<u64>,
     ) -> bool {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if self.current_network_generation_sync() != observed_generation
             || self.direct_commit_seq_sync(node_id) != observed_commit_seq
         {
@@ -1079,7 +1046,6 @@ impl PeerManager {
         let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
             return false;
         };
-        let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };

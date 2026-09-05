@@ -11,24 +11,23 @@ impl PeerManager {
     }
 
     /// Select the data path and include the local UDP endpoint in transition diagnostics.
-    pub async fn select_path_for_data_with_local_endpoint(
+    pub(crate) async fn select_path_for_data_with_local_endpoint(
         &self,
         node_id: &str,
         prefer_direct: bool,
         relay_available: bool,
         local_endpoint: Option<SocketAddr>,
     ) -> PathSelection {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         let generation = self.current_network_generation_sync();
-        self.select_path_for_data_with_local_endpoint_in_epoch(
+        self.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
+            &mut conns,
             node_id,
             prefer_direct,
             relay_available,
             local_endpoint,
             generation,
         )
-        .await
     }
 
     /// Select a path while the caller already owns the network epoch gate.
@@ -43,6 +42,25 @@ impl PeerManager {
         generation: u64,
     ) -> PathSelection {
         let mut conns = self.connections.write().await;
+        self.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
+            &mut conns,
+            node_id,
+            prefer_direct,
+            relay_available,
+            local_endpoint,
+            generation,
+        )
+    }
+
+    fn select_path_for_data_with_local_endpoint_in_epoch_with_conns(
+        &self,
+        conns: &mut HashMap<String, PeerConnection>,
+        node_id: &str,
+        prefer_direct: bool,
+        relay_available: bool,
+        local_endpoint: Option<SocketAddr>,
+        generation: u64,
+    ) -> PathSelection {
         match conns.get_mut(node_id) {
             Some(conn) => {
                 conn.expire_stale_trial_nominations(generation, local_endpoint);
@@ -118,25 +136,26 @@ impl PeerManager {
         generation: u64,
         relay_available: bool,
     ) -> bool {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
-        self.is_data_path_admitted_for_generation_in_epoch(node_id, generation, relay_available)
-            .await
+        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
+        if generation != self.current_network_generation_sync() {
+            return false;
+        }
+        self.is_data_path_admitted_for_generation_with_conns(
+            &mut conns,
+            node_id,
+            generation,
+            relay_available,
+        )
     }
 
-    /// Admission check for callers that already hold the network epoch gate.
-    pub(crate) async fn is_data_path_admitted_for_generation_in_epoch(
+    fn is_data_path_admitted_for_generation_with_conns(
         &self,
+        conns: &mut HashMap<String, PeerConnection>,
         node_id: &str,
         generation: u64,
         relay_available: bool,
     ) -> bool {
-        if generation != self.current_network_generation_sync() {
-            return false;
-        }
-        self.connections
-            .write()
-            .await
+        conns
             .get_mut(node_id)
             .map(|conn| {
                 if (relay_available || self.relay_first_required())
@@ -184,18 +203,18 @@ impl PeerManager {
         generation: u64,
         prefer_direct: bool,
     ) -> Option<ActivePathSnapshot> {
-        let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
-        self.active_direct_path_snapshot_in_epoch(node_id, generation, prefer_direct)
-            .await
+        let (_epoch_guard, connections) = self.lock_epoch_and_connections_read().await;
+        self.active_direct_path_snapshot_with_connections(
+            &connections,
+            node_id,
+            generation,
+            prefer_direct,
+        )
     }
 
-    /// Build the LAN Direct snapshot while the caller already owns the
-    /// network-epoch gate.  No network I/O or transport await is performed
-    /// while the gate is held; the only await is the short connection-map
-    /// read used to publish one coherent path state.
-    pub(crate) async fn active_direct_path_snapshot_in_epoch(
+    fn active_direct_path_snapshot_with_connections(
         &self,
+        connections: &HashMap<String, PeerConnection>,
         node_id: &str,
         generation: u64,
         prefer_direct: bool,
@@ -208,7 +227,6 @@ impl PeerManager {
         }
 
         let peer_session_generation = self.peer_session_generation_sync(node_id)?;
-        let connections = self.connections.read().await;
         let connection = connections.get(node_id)?;
         if !connection.online
             || connection.state != ConnectionState::Direct
