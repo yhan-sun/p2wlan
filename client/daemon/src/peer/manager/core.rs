@@ -651,9 +651,9 @@ impl PeerManager {
     }
 
     /// Cancel a peer's Direct-validation ownership after an accepted remote
-    /// candidate-set handover. The caller already holds `network_epoch_gate`,
-    /// so this helper deliberately does not acquire it again; that keeps the
-    /// candidate publication and validation cancellation one transaction.
+    /// candidate-set handover. Candidate publication releases the epoch gate
+    /// before awaiting this cancellation, keeping the publication transaction
+    /// bounded.
     pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(&self, peer_id: &str) {
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry
@@ -699,8 +699,8 @@ impl PeerManager {
         }
     }
 
-    /// Candidate publication already owns `network_epoch_gate`; do not acquire
-    /// it again here.
+    /// Candidate publication releases the epoch gate before awaiting this
+    /// cancellation, so DPLPMTUD peer cleanup does not block other epoch waiters.
     pub(crate) async fn cancel_dplpmtud_for_remote_candidate_change(
         &self,
         peer_id: &str,
@@ -800,6 +800,48 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .generation(node_id)
+    }
+
+    /// Lock the network epoch gate and connection write lock in canonical order
+    /// without holding the epoch gate while waiting in Tokio's fair writer queue.
+    /// This prevents cyclic deadlocks between readers finishing epoch-fenced
+    /// transactions and writers queued behind them.
+    pub(crate) async fn lock_epoch_and_connections_write<'a>(
+        &'a self,
+    ) -> (
+        tokio::sync::MutexGuard<'a, ()>,
+        tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+    ) {
+        loop {
+            let epoch_guard = self.network_epoch_gate.lock().await;
+            match self.connections.try_write() {
+                Ok(connections) => return (epoch_guard, connections),
+                Err(_) => {
+                    drop(epoch_guard);
+                    drop(self.connections.write().await);
+                }
+            }
+        }
+    }
+
+    /// Lock the network epoch gate and connection read lock in canonical order
+    /// without holding the epoch gate while waiting in Tokio's reader queue behind queued writers.
+    pub(crate) async fn lock_epoch_and_connections_read<'a>(
+        &'a self,
+    ) -> (
+        tokio::sync::MutexGuard<'a, ()>,
+        tokio::sync::RwLockReadGuard<'a, HashMap<String, PeerConnection>>,
+    ) {
+        loop {
+            let epoch_guard = self.network_epoch_gate.lock().await;
+            match self.connections.try_read() {
+                Ok(connections) => return (epoch_guard, connections),
+                Err(_) => {
+                    drop(epoch_guard);
+                    drop(self.connections.read().await);
+                }
+            }
+        }
     }
 
     /// Hold the connection writer for deterministic lock-contention tests.

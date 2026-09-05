@@ -2908,7 +2908,6 @@ impl Daemon {
                         // handshake arbiter across connection/session/UDP actor
                         // awaits; old work is cancelled synchronously in the
                         // pending store before it can publish into the new life.
-                        let previous = self.peers.get_connection(&peer_info.node_id).await;
                         let previous_peer_session_generation = self
                             .peers
                             .peer_session_generation_sync(&peer_info.node_id);
@@ -2969,8 +2968,8 @@ impl Daemon {
                                 .await;
                             }
                             if self.dns.is_enabled() {
-                                if let Some(previous) = previous.as_ref() {
-                                    self.dns.unregister(&previous.virtual_ip).await;
+                                if let Some(previous_virtual_ip) = update.previous_virtual_ip.as_ref() {
+                                    self.dns.unregister(previous_virtual_ip).await;
                                 } else {
                                     self.dns.unregister(&peer_info.virtual_ip).await;
                                 }
@@ -3036,10 +3035,10 @@ impl Daemon {
                                 }
                             }
                         }
-                        let was_offline = previous.as_ref().is_some_and(|peer| !peer.online);
+                        let was_offline = update.was_offline;
                         if (update.virtual_ip_changed || was_offline) && self.dns.is_enabled() {
-                            if let Some(previous) = previous {
-                                self.dns.unregister(&previous.virtual_ip).await;
+                            if let Some(previous_virtual_ip) = update.previous_virtual_ip.as_ref() {
+                                self.dns.unregister(previous_virtual_ip).await;
                             }
                             self.dns
                                 .register(

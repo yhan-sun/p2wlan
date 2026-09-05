@@ -971,5 +971,10 @@ impl Daemon {
                 self.start_hole_punch(&peer_id).await;
             }
         }
+        if reservation.disposition != HandshakeStartDisposition::RetryScheduled {
+            self.pending_handshakes
+                .lock()
+                .cancel_reservation_if_current(&peer_id, reservation.owner);
+        }
     }
 }

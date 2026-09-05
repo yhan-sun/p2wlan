@@ -433,6 +433,7 @@ impl PeerManager {
                 .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
         }
         drop(connections);
+        drop(_epoch_guard);
         if remote_transport_handover {
             // A changed authenticated candidate set is real transport
             // evidence, not ordinary freshness churn.  If the previous

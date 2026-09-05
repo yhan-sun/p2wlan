@@ -3639,12 +3639,11 @@ async fn hard_hard_birthday_production_cleanup_waits_for_udp_completion() {
         &record.session_id,
         &record.session_token,
     );
-    let reached = gate.reached.notified();
     harness
         .peers_b
         .clear_hard_hard_sessions(Some(HARD_HARD_A))
         .await;
-    timeout(Duration::from_secs(3), reached)
+    timeout(Duration::from_secs(3), gate.wait_for_reached())
         .await
         .expect("production cleanup must reach the pre-UDP test gate");
 
@@ -3669,9 +3668,8 @@ async fn hard_hard_birthday_production_cleanup_waits_for_udp_completion() {
         .await
         > 0);
 
-    let completed = gate.completed.notified();
-    gate.release.notify_waiters();
-    timeout(Duration::from_secs(5), completed)
+    gate.release();
+    timeout(Duration::from_secs(5), gate.wait_for_completed())
         .await
         .expect("production cleanup must publish completion after UDP cleanup");
     assert!(harness

@@ -467,11 +467,7 @@ function Invoke-ProductionCycle {
             'ctrl_c' { Send-ConsoleCtrlC -ProcessId $process.Id }
         }
         $stopRequested = $true
-        if ($Entrypoint -eq 'ctrl_c') {
-            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 5
-        } else {
-            $result = Wait-ProcessExited -Process $process -TimeoutSeconds 20
-        }
+        $result = Wait-ProcessExited -Process $process -TimeoutSeconds 20
         $processExited = $result.exited
         $exitCode = $result.exit_code
         if (-not $processExited) {

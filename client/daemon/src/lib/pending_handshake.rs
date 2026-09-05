@@ -407,6 +407,7 @@ impl PendingHandshakeState {
                 return None;
             }
         }
+        self.expire_initiator_retries(Instant::now());
         if self.starting.contains(peer_id) {
             if self.starting_network_generations.get(peer_id) != Some(&network_generation)
                 || self.starting_peer_session_generations.get(peer_id)
@@ -421,6 +422,15 @@ impl PendingHandshakeState {
                 // maintenance owner is allowed to finish only until the next
                 // short mutation turn; after that its cancellation receiver
                 // makes every slow continuation fail closed.
+                self.cancel_reservation(peer_id);
+            } else if owner_kind == HandshakeOwnerKind::MaintenanceInitiator
+                && !self.initiator_retries.contains_key(peer_id)
+                && self
+                    .starting_cancellations
+                    .get(peer_id)
+                    .is_some_and(|tx| *tx.borrow())
+            {
+                // A cancelled reservation with no pending retry must not lock out maintenance.
                 self.cancel_reservation(peer_id);
             } else {
                 return None;
@@ -739,21 +749,33 @@ impl PendingHandshakeState {
         now: Instant,
     ) -> Option<(HandshakeRetryIdentity, HandshakeStartReservation)> {
         self.expire_initiator_retries(now);
-        let peer_id = self
+        while let Some(peer_id) = self
             .initiator_retries
             .iter()
             .filter(|(_, retry)| retry.not_before <= now && retry.expires_at > now)
             .min_by_key(|(_, retry)| (retry.expires_at, retry.not_before))
-            .map(|(peer_id, _)| peer_id.clone())?;
-        let retry = self.initiator_retries.remove(&peer_id)?;
-        let Some(mut reservation) = self.reservation_for_retry(&retry.identity) else {
-            self.cancel_reservation_if_current(&peer_id, retry.identity.reservation_owner);
-            return None;
-        };
-        reservation.retry_phase = Some(retry.identity.phase);
-        reservation.retry_attempt = retry.identity.attempt;
-        reservation.retry_expires_at = Some(retry.expires_at);
-        Some((retry.identity, reservation))
+            .map(|(peer_id, _)| peer_id.clone())
+        {
+            let Some(retry) = self.initiator_retries.remove(&peer_id) else {
+                continue;
+            };
+            let Some(mut reservation) = self.reservation_for_retry(&retry.identity) else {
+                tracing::debug!(
+                    peer_id = %peer_id,
+                    owner = retry.identity.reservation_owner,
+                    phase = ?retry.identity.phase,
+                    attempt = retry.identity.attempt,
+                    "initiator retry reservation could not be claimed; cancelled stale reservation"
+                );
+                self.cancel_reservation_if_current(&peer_id, retry.identity.reservation_owner);
+                continue;
+            };
+            reservation.retry_phase = Some(retry.identity.phase);
+            reservation.retry_attempt = retry.identity.attempt;
+            reservation.retry_expires_at = Some(retry.expires_at);
+            return Some((retry.identity, reservation));
+        }
+        None
     }
 
     fn has_initiator_retries(&self) -> bool {

@@ -109,7 +109,7 @@ impl PeerManager {
         // guard through cancellation and relay-state revocation so an
         // unquarantine cannot publish between the isolation flag and cleanup.
         let epoch_gate = self.network_epoch_gate();
-        let _epoch_guard = epoch_gate.lock().await;
+        let mut epoch_guard = Some(epoch_gate.lock().await);
         let now = Instant::now();
         let mut fresh = false;
         let backoff;
@@ -170,7 +170,13 @@ impl PeerManager {
         {
             let generation = self.current_network_generation_sync();
             let peer_session_generation = self.peer_session_generation_any_sync(peer_id);
-            let mut conns = self.connections.write().await;
+            let mut conns = match self.connections.try_write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    epoch_guard = None;
+                    self.connections.write().await
+                }
+            };
             if let Some(conn) = conns.get_mut(peer_id) {
                 let relay_confirmed = conn.relay_confirmed_at.is_some();
                 let Some(peer_session_generation) = peer_session_generation else {
@@ -223,7 +229,7 @@ impl PeerManager {
                 }
             }
         }
-        drop(_epoch_guard);
+        drop(epoch_guard);
         if fresh {
             let consecutive = self.quarantine_consecutive(peer_id).await;
             info!(
