@@ -24,66 +24,65 @@ jobs:
 
           path = Path("client/daemon/src/lib/tests/part07.rs")
           text = path.read_text()
-          anchor = '''        install_direct_scheduler_birthday_session(
-              &harness.peers_a,
-              HARD_HARD_B,
-              &format!("level-{requested_level}"),
-              plan,
-              &result,
-          )
-          .await;
-          let scheduler_report = harness
-          '''
-          replacement = '''        install_direct_scheduler_birthday_session(
-              &harness.peers_a,
-              HARD_HARD_B,
-              &format!("level-{requested_level}"),
-              plan,
-              &result,
-          )
-          .await;
-          // This case validates production scheduler accounting, not peer
-          // convergence. Keep its targets on owned sink sockets so the
-          // synthetic NAT link cannot turn the metadata assertion into a
-          // competing Direct lifecycle transition.
-          let mut scheduler_targets = Vec::with_capacity(requested_level);
-          let mut scheduler_sinks = Vec::with_capacity(requested_level);
-          for _ in 0..requested_level {
-              let sink = UdpSocket::bind(SocketAddr::new(
-                  IpAddr::V4(Ipv4Addr::LOCALHOST),
-                  0,
-              ))
-              .await
-              .expect("bind isolated Birthday scheduler sink");
-              scheduler_targets.push(
-                  sink.local_addr()
-                      .expect("isolated Birthday scheduler sink has an endpoint"),
-              );
-              scheduler_sinks.push(sink);
-          }
-          let scheduler_report = harness
-          '''
-          if text.count(anchor) != 1:
-              raise SystemExit(f"expected one scheduler anchor, found {text.count(anchor)}")
-          text = text.replace(anchor, replacement, 1)
+          marker = "bind isolated Birthday scheduler sink"
+          if marker not in text:
+              test_start = text.index(
+                  'async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts()'
+              )
+              install_start = text.index(
+                  'install_direct_scheduler_birthday_session(', test_start
+              )
+              scheduler_start = text.index('let scheduler_report = harness', install_start)
+              indent = text[text.rfind('\n', 0, scheduler_start) + 1:scheduler_start]
+              block = (
+                  f'{indent}// This case validates production scheduler accounting, not peer\n'
+                  f'{indent}// convergence. Keep its targets on owned sink sockets so the\n'
+                  f'{indent}// synthetic NAT link cannot turn the metadata assertion into a\n'
+                  f'{indent}// competing Direct lifecycle transition.\n'
+                  f'{indent}let mut scheduler_targets = Vec::with_capacity(requested_level);\n'
+                  f'{indent}let mut scheduler_sinks = Vec::with_capacity(requested_level);\n'
+                  f'{indent}for _ in 0..requested_level {{\n'
+                  f'{indent}    let sink = UdpSocket::bind(SocketAddr::new(\n'
+                  f'{indent}        IpAddr::V4(Ipv4Addr::LOCALHOST),\n'
+                  f'{indent}        0,\n'
+                  f'{indent}    ))\n'
+                  f'{indent}    .await\n'
+                  f'{indent}    .expect("bind isolated Birthday scheduler sink");\n'
+                  f'{indent}    scheduler_targets.push(\n'
+                  f'{indent}        sink.local_addr()\n'
+                  f'{indent}            .expect("isolated Birthday scheduler sink has an endpoint"),\n'
+                  f'{indent}    );\n'
+                  f'{indent}    scheduler_sinks.push(sink);\n'
+                  f'{indent}}}\n'
+              )
+              text = text[:scheduler_start] + block + text[scheduler_start:]
 
-          targets = '''                result.candidate_endpoints.clone(),
-              requested_level,
-          '''
-          isolated = '''                scheduler_targets,
-              requested_level,
-          '''
-          if text.count(targets) != 1:
-              raise SystemExit(f"expected one scheduler target block, found {text.count(targets)}")
-          text = text.replace(targets, isolated, 1)
-          path.write_text(text)
+              scheduler_call = text.index(
+                  'punch_hard_hard_birthday_candidates_with_metadata(', scheduler_start
+              )
+              scheduler_end = text.index('let scheduler_birthday =', scheduler_call)
+              call_slice = text[scheduler_call:scheduler_end]
+              old = 'result.candidate_endpoints.clone(),'
+              if call_slice.count(old) != 1:
+                  raise SystemExit(
+                      f'expected one candidate target in first scheduler call, found {call_slice.count(old)}'
+                  )
+              call_slice = call_slice.replace(old, 'scheduler_targets,', 1)
+              text = text[:scheduler_call] + call_slice + text[scheduler_end:]
+              path.write_text(text)
           PY
+          cargo fmt --all
           git diff --check
-          cargo fmt --all -- --check
+          changed="$(git diff --name-only)"
+          test "$changed" = "client/daemon/src/lib/tests/part07.rs"
           git diff -- client/daemon/src/lib/tests/part07.rs
       - name: Commit generated patch
         shell: bash
         run: |
+          if git diff --quiet; then
+            echo 'source already patched'
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add client/daemon/src/lib/tests/part07.rs
