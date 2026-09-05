@@ -651,9 +651,9 @@ impl PeerManager {
     }
 
     /// Cancel a peer's Direct-validation ownership after an accepted remote
-    /// candidate-set handover. The caller already holds `network_epoch_gate`,
-    /// so this helper deliberately does not acquire it again; that keeps the
-    /// candidate publication and validation cancellation one transaction.
+    /// candidate-set handover. Candidate publication releases the epoch gate
+    /// before awaiting this cancellation, keeping the publication transaction
+    /// bounded.
     pub(crate) async fn cancel_direct_validation_for_remote_candidate_change(&self, peer_id: &str) {
         if let Some(registry) = self.direct_validation_registry.read().await.clone() {
             registry
@@ -699,8 +699,8 @@ impl PeerManager {
         }
     }
 
-    /// Candidate publication already owns `network_epoch_gate`; do not acquire
-    /// it again here.
+    /// Candidate publication releases the epoch gate before awaiting this
+    /// cancellation, so DPLPMTUD peer cleanup does not block other epoch waiters.
     pub(crate) async fn cancel_dplpmtud_for_remote_candidate_change(
         &self,
         peer_id: &str,
