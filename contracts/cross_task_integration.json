@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "repository": "yhan-sun/p2wlan",
+  "trigger_marker": "client/daemon/cross_task_integration_gate_version.txt",
+  "required_checks": [
+    {"name": "CI Required", "category": "repository"},
+    {"name": "Business MTU Budget Required", "category": "business_mtu"},
+    {"name": "DPLPMTUD Required", "category": "dplpmtud"},
+    {"name": "Path State Machine Required", "category": "path_state"},
+    {"name": "NAT Topology Required", "category": "direct_relay"},
+    {"name": "Windows Lifecycle Required", "category": "windows_lifecycle"},
+    {"name": "Mobile Lifecycle Required", "category": "mobile_lifecycle"},
+    {"name": "Path Observability Required", "category": "observability"},
+    {"name": "Security Audit Required", "category": "security"},
+    {"name": "Analyze and Test", "category": "flutter"},
+    {"name": "Android arm64 CI test APK", "category": "flutter_package"},
+    {"name": "iOS Compile", "category": "flutter_package"},
+    {"name": "Linux x64 Release Bundle", "category": "flutter_package"},
+    {"name": "macOS Release Apps", "category": "flutter_package"},
+    {"name": "Windows x64 Release Bundle", "category": "flutter_package"},
+    {"name": "macOS arm64 test DMG", "category": "package_test"},
+    {"name": "Android arm64 test APK", "category": "package_test"}
+  ]
+}
