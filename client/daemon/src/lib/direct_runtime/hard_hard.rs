@@ -4386,7 +4386,7 @@ mod hard_hard_tests {
     async fn wait_for_hard_hard_cleanup_gate(
         gate: &Arc<crate::peer::HardHardCleanupGate>,
     ) {
-        let reached = gate.reached.notified();
+        let reached = gate.wait_for_reached();
         tokio::pin!(reached);
         let watchdog = async {
             for _ in 0..512 {
@@ -4505,7 +4505,7 @@ mod hard_hard_tests {
             .await
             .is_empty());
 
-        gate.release.notify_waiters();
+        gate.release();
         wait_for_hard_hard_cleanup_completion(&completion).await;
         assert!(
             peers
@@ -4842,7 +4842,7 @@ mod hard_hard_tests {
                 .await,
             vec![identity.socket_index]
         );
-        gate.release.notify_waiters();
+        gate.release();
         wait_for_hard_hard_cleanup_completion(&completion).await;
         assert!(peers
             .hard_hard_session_snapshot_for_cleanup(

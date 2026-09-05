@@ -782,11 +782,7 @@ impl PeerManager {
         session_id: &str,
         session_token: &str,
     ) -> (Arc<HardHardCleanupGate>, HardHardCleanupGateGuard) {
-        let gate = Arc::new(HardHardCleanupGate {
-            reached: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-            completed: tokio::sync::Notify::new(),
-        });
+        let gate = Arc::new(HardHardCleanupGate::new());
         let mut slot = self
             .hard_hard_cleanup_gate
             .lock()
@@ -827,8 +823,8 @@ impl PeerManager {
             })
             .map(|registration| registration.gate.clone());
         if let Some(gate) = gate {
-            gate.reached.notify_one();
-            gate.release.notified().await;
+            gate.signal_reached();
+            gate.wait_for_release().await;
         }
     }
 
@@ -851,7 +847,7 @@ impl PeerManager {
             })
             .map(|registration| registration.gate.clone());
         if let Some(gate) = gate {
-            gate.completed.notify_one();
+            gate.signal_completed();
         }
     }
 

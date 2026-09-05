@@ -101,6 +101,110 @@ pub(crate) struct HardHardCleanupGate {
     pub(crate) reached: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
     pub(crate) completed: tokio::sync::Notify,
+    #[cfg(test)]
+    reached_flag: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    released_flag: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    completed_flag: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl HardHardCleanupGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            completed: tokio::sync::Notify::new(),
+            reached_flag: std::sync::atomic::AtomicBool::new(false),
+            released_flag: std::sync::atomic::AtomicBool::new(false),
+            completed_flag: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn signal_reached(&self) {
+        self.reached_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.reached.notify_one();
+        self.reached.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_reached(&self) {
+        loop {
+            if self
+                .reached_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            let notified = self.reached.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .reached_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.released_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.release.notify_one();
+        self.release.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_release(&self) {
+        loop {
+            if self
+                .released_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .released_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn signal_completed(&self) {
+        self.completed_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.completed.notify_one();
+        self.completed.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_completed(&self) {
+        loop {
+            if self
+                .completed_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            let notified = self.completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .completed_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,7 +235,7 @@ impl Drop for HardHardCleanupGateGuard {
         {
             *slot = self.previous.take();
         }
-        self.installed.release.notify_waiters();
+        self.installed.release();
     }
 }
 
