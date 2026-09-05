@@ -3928,7 +3928,7 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
             &result,
         )
         .await;
-                // This case validates production scheduler accounting, not peer
+        // This case validates production scheduler accounting, not peer
         // convergence. Keep its targets on owned sink sockets so the
         // synthetic NAT link cannot turn the metadata assertion into a
         // competing Direct lifecycle transition.
@@ -3947,7 +3947,7 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
             );
             scheduler_sinks.push(sink);
         }
-let scheduler_report = harness
+        let scheduler_report = harness
             .udp_a
             .punch_hard_hard_birthday_candidates_with_metadata(
                 HARD_HARD_B,
