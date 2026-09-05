@@ -1,0 +1,91 @@
+name: Temporary Hard-Hard fixture patch
+
+on:
+  push:
+    branches:
+      - tmp/hard-hard-fixture-patch-20260905
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: tmp/hard-hard-fixture-patch-20260905
+          fetch-depth: 1
+      - name: Patch isolated scheduler targets
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("client/daemon/src/lib/tests/part07.rs")
+          text = path.read_text()
+          anchor = '''        install_direct_scheduler_birthday_session(
+              &harness.peers_a,
+              HARD_HARD_B,
+              &format!("level-{requested_level}"),
+              plan,
+              &result,
+          )
+          .await;
+          let scheduler_report = harness
+          '''
+          replacement = '''        install_direct_scheduler_birthday_session(
+              &harness.peers_a,
+              HARD_HARD_B,
+              &format!("level-{requested_level}"),
+              plan,
+              &result,
+          )
+          .await;
+          // This case validates production scheduler accounting, not peer
+          // convergence. Keep its targets on owned sink sockets so the
+          // synthetic NAT link cannot turn the metadata assertion into a
+          // competing Direct lifecycle transition.
+          let mut scheduler_targets = Vec::with_capacity(requested_level);
+          let mut scheduler_sinks = Vec::with_capacity(requested_level);
+          for _ in 0..requested_level {
+              let sink = UdpSocket::bind(SocketAddr::new(
+                  IpAddr::V4(Ipv4Addr::LOCALHOST),
+                  0,
+              ))
+              .await
+              .expect("bind isolated Birthday scheduler sink");
+              scheduler_targets.push(
+                  sink.local_addr()
+                      .expect("isolated Birthday scheduler sink has an endpoint"),
+              );
+              scheduler_sinks.push(sink);
+          }
+          let scheduler_report = harness
+          '''
+          if text.count(anchor) != 1:
+              raise SystemExit(f"expected one scheduler anchor, found {text.count(anchor)}")
+          text = text.replace(anchor, replacement, 1)
+
+          targets = '''                result.candidate_endpoints.clone(),
+              requested_level,
+          '''
+          isolated = '''                scheduler_targets,
+              requested_level,
+          '''
+          if text.count(targets) != 1:
+              raise SystemExit(f"expected one scheduler target block, found {text.count(targets)}")
+          text = text.replace(targets, isolated, 1)
+          path.write_text(text)
+          PY
+          git diff --check
+          cargo fmt --all -- --check
+          git diff -- client/daemon/src/lib/tests/part07.rs
+      - name: Commit generated patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add client/daemon/src/lib/tests/part07.rs
+          git commit -m 'feat:隔离Hard-Hard生日调度测试目标'
+          git push origin HEAD:tmp/hard-hard-fixture-patch-20260905
