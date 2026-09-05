@@ -290,18 +290,22 @@ Future<bool> _loopbackPortReleased(int port) async {
 Future<bool> _descendantsGone(int rootPid) async {
   final script =
       r'''
-$all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-$frontier = [System.Collections.Generic.Queue[int]]::new()
-$frontier.Enqueue(__ROOT_PID__)
-$descendants = [System.Collections.Generic.HashSet[int]]::new()
-while ($frontier.Count -gt 0) {
-  $parent = $frontier.Dequeue()
-  foreach ($process in $all | Where-Object { [int]$_.ParentProcessId -eq $parent }) {
-    $child = [int]$process.ProcessId
-    if ($descendants.Add($child)) { $frontier.Enqueue($child) }
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+do {
+  $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+  $frontier = [System.Collections.Generic.Queue[int]]::new()
+  $frontier.Enqueue(__ROOT_PID__)
+  $descendants = [System.Collections.Generic.HashSet[int]]::new()
+  while ($frontier.Count -gt 0) {
+    $parent = $frontier.Dequeue()
+    foreach ($process in $all | Where-Object { [int]$_.ParentProcessId -eq $parent }) {
+      $child = [int]$process.ProcessId
+      if ($descendants.Add($child)) { $frontier.Enqueue($child) }
+    }
   }
-}
-if ($descendants.Count -eq 0) { exit 0 }
+  if ($descendants.Count -eq 0) { exit 0 }
+  Start-Sleep -Milliseconds 100
+} while ([DateTime]::UtcNow -lt $deadline)
 $descendants | ConvertTo-Json -Compress
 exit 1
 '''
