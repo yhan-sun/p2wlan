@@ -54,8 +54,13 @@ jobs:
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Cargo workspace tests
-        run: cargo test --workspace
+      - name: Cargo workspace tests except Hard-Hard E2E
+        env:
+          RUST_TEST_THREADS: "1"
+        run: cargo test --workspace -- --test-threads=1 --skip hard_hard_
+
+      - name: Hard-Hard E2E tests
+        run: cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
 
   windows_path_state_machine:
     name: Path state machine Windows tests
