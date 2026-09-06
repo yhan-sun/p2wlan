@@ -508,8 +508,38 @@ struct NatPacketLink {
     held_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
     held_punch_a_to_b: Arc<StdMutex<Vec<Vec<u8>>>>,
     held_punch_b_to_a: Arc<StdMutex<Vec<Vec<u8>>>>,
+    mtu: Arc<[NatMtuDirection; 2]>,
     route_dynamic_socket: bool,
     worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+// This userspace NAT link models IPv4 path MTUs, not the loopback interface
+// MTU. Observe the actual UDP payload after protocol framing/encryption and
+// account for the outer IPv4 and UDP headers separately in each direction.
+struct NatMtuDirection {
+    ip_mtu: AtomicU64,
+    max_udp_payload: AtomicU64,
+    oversize_drops: AtomicU64,
+}
+
+impl NatMtuDirection {
+    fn new() -> Self {
+        Self {
+            ip_mtu: AtomicU64::new(65_535),
+            max_udp_payload: AtomicU64::new(0),
+            oversize_drops: AtomicU64::new(0),
+        }
+    }
+
+    fn admit(&self, udp_payload: usize) -> bool {
+        let udp_payload = udp_payload as u64;
+        self.max_udp_payload.fetch_max(udp_payload, Ordering::Relaxed);
+        if udp_payload + 20 + 8 > self.ip_mtu.load(Ordering::Acquire) {
+            self.oversize_drops.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -597,6 +627,7 @@ impl NatPacketLink {
         let held_punch_b_to_a = Arc::new(StdMutex::new(Vec::new()));
         let a_to_b_routes = NatRouteTable::new();
         let b_to_a_routes = NatRouteTable::new();
+        let mtu = Arc::new([NatMtuDirection::new(), NatMtuDirection::new()]);
         let worker = Some(tokio::spawn(Self::run(
             a_public.clone(),
             b_public.clone(),
@@ -616,6 +647,7 @@ impl NatPacketLink {
             a_keys,
             a_to_b_routes.clone(),
             b_to_a_routes.clone(),
+            mtu.clone(),
             primary_a,
             route_dynamic_socket,
         )));
@@ -632,6 +664,7 @@ impl NatPacketLink {
             held_b_to_a,
             held_punch_a_to_b,
             held_punch_b_to_a,
+            mtu,
             route_dynamic_socket,
             worker,
         }
@@ -901,6 +934,7 @@ impl NatPacketLink {
         b_to_a_keys: TransportKeyPair,
         a_to_b_routes: NatRouteTable,
         b_to_a_routes: NatRouteTable,
+        mtu: Arc<[NatMtuDirection; 2]>,
         primary_a: Option<SocketAddr>,
         route_dynamic_socket: bool,
     ) {
@@ -910,6 +944,9 @@ impl NatPacketLink {
             tokio::select! {
                 result = a_public.recv_from(&mut a_buf) => {
                     let Ok((len, source)) = result else { return; };
+                    if !mtu[1].admit(len) {
+                        continue;
+                    }
                     if hold_ack.load(Ordering::Acquire)
                         && Self::is_authenticated_ack(&a_buf[..len])
                     {
@@ -949,6 +986,9 @@ impl NatPacketLink {
                 }
                 result = b_public.recv_from(&mut b_buf) => {
                     let Ok((len, source)) = result else { return; };
+                    if !mtu[0].admit(len) {
+                        continue;
+                    }
                     if hold_ack.load(Ordering::Acquire)
                         && Self::is_authenticated_ack(&b_buf[..len])
                     {
@@ -3026,11 +3066,18 @@ async fn dropped_fresh_reservation_refunds_after_epoch_lock_contention() {
 }
 
 async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
+    hard_hard_two_peer_success_with_stun_and_mtu(stun, [65_535, 65_535]).await;
+}
+
+async fn hard_hard_two_peer_success_with_stun_and_mtu(stun: HarnessStunProfile, mtu: [u64; 2]) {
     let _serial = HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
     let now = hard_hard_now_for_test();
     set_hard_hard_test_now_ms(Some(now));
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness_with_stun(true, false, false, stun).await;
+    for (direction, limit) in harness.link.mtu.iter().zip(mtu) {
+        direction.ip_mtu.store(limit, Ordering::Release);
+    }
     // Keep this scenario scoped to the production Hard-Hard path. The
     // peer-reflexive worker also owns an ordinary primary-socket fast punch;
     // under a loaded libtest runtime that independent path can legitimately
@@ -3168,6 +3215,19 @@ async fn hard_hard_two_peer_success_with_stun(stun: HarnessStunProfile) {
     );
     assert!(harness.udp_a.dynamic_socket_count().await >= 1);
     assert!(harness.udp_b.dynamic_socket_count().await >= 1);
+    for (index, direction) in harness.link.mtu.iter().enumerate() {
+        let largest = direction.max_udp_payload.load(Ordering::Relaxed);
+        assert!(largest > 0, "both peers must transmit real control datagrams");
+        assert!(largest + 28 <= mtu[index], "control traffic exceeded IPv4 path MTU");
+        assert_eq!(direction.oversize_drops.load(Ordering::Relaxed), 0);
+        println!(
+            "HARD_HARD_MTU direction={} ip_mtu={} udp_budget={} max_udp_payload={} oversize_drops=0 direct=true",
+            if index == 0 { "A->B" } else { "B->A" },
+            mtu[index],
+            mtu[index] - 28,
+            largest,
+        );
+    }
     for signals in [&harness.signals_a, &harness.signals_b] {
         assert!(signals.lock().unwrap().iter().any(|signal| {
             signal.session_id.is_some()
@@ -3189,6 +3249,11 @@ async fn hard_hard_two_peer_success_is_full_e2e_and_exact_socket() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_hard_two_peer_success_with_minimum_stun_capacity() {
     hard_hard_two_peer_success_with_stun(HarnessStunProfile::MINIMUM_CAPACITY).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_hard_asymmetric_mtu_500_900() {
+    hard_hard_two_peer_success_with_stun_and_mtu(HarnessStunProfile::FULL_CAPACITY, [500, 900]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4581,12 +4646,19 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
     // 3.5-second delay while the initiator captures zero, separating the two
     // authenticated-probe windows.
     let harness = build_two_peer_harness(true, false, false).await;
+    // Force the CI race: S1 has claimed its response owner, but its sweep
+    // admission resumes only after both network generations are retired.
+    // The old response must not start ordinary punching in S2's generation.
+    let response_gate = install_hard_hard_initiator_response_gate_for_test();
     harness.link.set_hold_ack(true);
     harness.validation_enabled_a.store(false, Ordering::Release);
     harness.validation_enabled_b.store(false, Ordering::Release);
 
     trigger_initial_offer(&harness).await;
     let response_s1 = wait_for_hard_hard_response_signal(&harness).await;
+    timeout(HARD_HARD_E2E_TIMEOUT, response_gate.reached.notified())
+        .await
+        .expect("S1 response must pause after claiming its owner and before entering its sweep");
     assert!(
         response_s1.punch_at_ms.is_some(),
         "S1 response must carry a canonical punch deadline"
@@ -4634,6 +4706,7 @@ async fn hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session() {
         .peers_b
         .advance_network_generation("phase_2_2_test_stale_ack_s1_cancel_b")
         .await;
+    response_gate.release.notify_one();
     wait_for_failed_attempt_cleanup(&harness).await;
     assert!(!harness.peers_a.is_direct(HARD_HARD_B).await);
     assert!(!harness.peers_b.is_direct(HARD_HARD_A).await);

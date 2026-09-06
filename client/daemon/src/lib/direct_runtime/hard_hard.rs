@@ -79,6 +79,35 @@ async fn pause_hard_hard_responder_after_measurement_for_test(
     }
     HardHardResponderMeasurementGateCompletion(gate)
 }
+
+#[cfg(test)]
+struct HardHardInitiatorResponseGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static HARD_HARD_INITIATOR_RESPONSE_GATE: std::sync::Mutex<Option<Arc<HardHardInitiatorResponseGate>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn install_hard_hard_initiator_response_gate_for_test() -> Arc<HardHardInitiatorResponseGate> {
+    let gate = Arc::new(HardHardInitiatorResponseGate {
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    *HARD_HARD_INITIATOR_RESPONSE_GATE.lock().unwrap() = Some(gate.clone());
+    gate
+}
+
+#[cfg(test)]
+async fn pause_hard_hard_initiator_response_for_test() {
+    let gate = HARD_HARD_INITIATOR_RESPONSE_GATE.lock().unwrap().take();
+    if let Some(gate) = gate {
+        gate.reached.notify_one();
+        gate.release.notified().await;
+    }
+}
 /// Until an initiator record is installed in the manager ledger, no other
 /// owner will cancel its shared handle when the short-lived punch permit is
 /// dropped.  Make every pre-ledger return (including cancellation/panic
@@ -2504,6 +2533,11 @@ pub(crate) async fn spawn_hard_hard_responder(
 
 /// Consume the reciprocal response at the initiator and sweep its measured
 /// socket toward the responder's fresh prediction window.
+///
+/// This response is bound to an already-measured initiator session. Losing
+/// any of its admission/ownership fences consumes the response; it must not
+/// fall back to an ordinary fresh punch which could acquire a newer network
+/// generation's owner and suppress that generation's real Hard-Hard retry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_hard_hard_initiator_response(
     udp: UdpTransport,
@@ -2524,7 +2558,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         return HardHardRemoteStart::Rejected;
     };
     let Some(current_plan) = peers.hard_hard_plan_for_peer(&peer_id).await else {
-        return HardHardRemoteStart::NotStarted;
+        return HardHardRemoteStart::Rejected;
     };
     let expected_plan = crate::peer::HardHardPlanSnapshot {
         local_network_generation: record.local_network_generation,
@@ -2586,10 +2620,10 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         return HardHardRemoteStart::Rejected;
     }
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
-        return HardHardRemoteStart::NotStarted;
+        return HardHardRemoteStart::Rejected;
     };
     let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
-        return HardHardRemoteStart::NotStarted;
+        return HardHardRemoteStart::Rejected;
     };
     let Some(session) = claim_hard_hard_initiator_response_session(
         &peers,
@@ -2602,8 +2636,10 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
     )
     .await
     else {
-        return HardHardRemoteStart::NotStarted;
+        return HardHardRemoteStart::Rejected;
     };
+    #[cfg(test)]
+    pause_hard_hard_initiator_response_for_test().await;
     let Some(record) = peers
         .hard_hard_begin_sweep(
             &peer_id,
@@ -2614,7 +2650,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         )
         .await
     else {
-        return HardHardRemoteStart::NotStarted;
+        return HardHardRemoteStart::Rejected;
     };
     if !udp
         .hard_hard_socket_identity_is_current(&record.fresh_socket)
@@ -2629,7 +2665,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
                 &record.session_token,
             )
             .await;
-        return HardHardRemoteStart::NotStarted;
+        return HardHardRemoteStart::Rejected;
     }
     let fresh_socket = record.fresh_socket.clone();
     let birthday_socket_indices = record
