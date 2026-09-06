@@ -1,77 +1,57 @@
-# Cross-task integration gate
+# Cross-task integration final-gate record
 
-Issue #28 is a verification-only phase. It adds no product behavior. The gate proves that the
-permanent Direct/Relay, Windows lifecycle, mobile lifecycle, path-state, DPLPMTUD/business-MTU,
-observability, security, CI, Flutter and package checks all complete successfully on one exact
-source SHA.
+Issue #28 was a verification-only phase. It added no product behavior. Its temporary automation proved that the permanent Direct/Relay, Windows lifecycle, mobile lifecycle, path-state, DPLPMTUD/business-MTU, observability, security, CI, Flutter and package checks all completed successfully on one exact source SHA.
 
-## Triggering every permanent gate
+## Final acceptance
 
-`client/daemon/cross_task_integration_gate_version.txt` is an inert tracked marker. The permanent
-path-filtered workflows already include `client/daemon/**` (or the broader `client/**`), while CI
-and Security Audit run for every pull request. Changing this marker on the integration PR therefore
-forces all required gates to materialize instead of treating a missing path-filtered workflow as an
-implicit pass.
+Issue #28 is complete and closed.
 
-The marker is not read by production code and carries no runtime behavior.
+- Initial cross-task integration merge: `83f1297953d3bf15d5eed6accd7e1333786f0cc7` (PR #61).
+- Final accepted `main` after the Hard-Hard regression repair: `34dd364427b2260c53f35628127de12a11a42f04` (PR #62).
+- Cross-Task Integration run: `34007731922`.
+- Exact-head manifest job: `101421473420`.
+- Artifact: `cross-task-integration-manifest-34007731922-2`.
+- Issue evidence: https://github.com/yhan-sun/p2wlan/issues/28#issuecomment-5556628615
 
-## Fail-closed manifest
+The downloaded machine-readable manifest reported:
 
-`Cross-Task Integration Required` polls check-runs for the exact PR head (or explicit dispatch SHA)
-and requires every check named in `contracts/cross_task_integration.json`.
+```text
+exact_head=true
+required_check_count=17
+observed_required_check_count=17
+no_skipped_required_gate=true
+result=pass
+```
 
-Missing, pending, cancelled, timed-out, failed or skipped required checks fail the integration gate.
-The generated `cross-task-integration-manifest.json` records:
+All 17 required checks completed successfully on the final accepted SHA:
 
-- source head SHA and integration workflow blob SHA;
-- workflow run ID/attempt and event type;
-- every required check-run ID, status, conclusion and details URL;
-- whether any required gate was skipped;
-- the final pass/fail decision and reasons.
+1. `CI Required`
+2. `Business MTU Budget Required`
+3. `DPLPMTUD Required`
+4. `Path State Machine Required`
+5. `NAT Topology Required`
+6. `Windows Lifecycle Required`
+7. `Mobile Lifecycle Required`
+8. `Path Observability Required`
+9. `Security Audit Required`
+10. `Analyze and Test`
+11. `Android arm64 CI test APK`
+12. `iOS Compile`
+13. `Linux x64 Release Bundle`
+14. `macOS Release Apps`
+15. `Windows x64 Release Bundle`
+16. `macOS arm64 test DMG`
+17. `Android arm64 test APK`
 
-The manifest is uploaded even for a failed integration run so the failure is auditable.
+## Hard-Hard final-gate regression
 
-## Release scope
+On `83f1297953d3bf15d5eed6accd7e1333786f0cc7`, Path State Machine run `33970243659`, job `101317343036`, exposed a stale-response race in `spawn_hard_hard_initiator_response`.
 
-This gate does not sign, tag, release or publish artifacts. Distribution and release verification
-remain in the later final-gate issues.
+A reciprocal response belongs to one measured initiator session. If its session, lifecycle, plan, recovery admission or exact socket fence is lost before the sweep starts, that response is consumed and must be rejected. Returning `HardHardRemoteStart::NotStarted` allowed ordinary fresh-punch fallback to acquire a newer network generation's punch owner and suppress that generation's legitimate Hard-Hard retry. PR #62 changed those fence-failure results to `HardHardRemoteStart::Rejected`.
 
-## Final-gate Hard-Hard regression
+The deterministic stale-response gate now advances both network generations while the old response is paused before `hard_hard_begin_sweep`, then verifies that the old response cannot consume the successor generation. `tests::hard_hard_asymmetric_mtu_500_900` additionally verifies complete Hard-Hard convergence through a userspace NAT link with independent IPv4 path-MTU limits of 500 and 900 bytes, zero oversize sends and authenticated Direct on both peers.
 
-On `83f1297953d3bf15d5eed6accd7e1333786f0cc7`, Path State Machine
-[run 33970243659, job 101317343036](https://github.com/yhan-sun/p2wlan/actions/runs/33970243659/job/101317343036)
-failed `tests::hard_hard_two_peer_stale_ack_cannot_resurrect_retired_session`:
-the initiator never received the second Hard-Hard response. The failing command
-was `cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1`.
-That revision has neither a `full` feature nor a `hard_hard_e2e` integration
-target or `linux_ac_test_harness.rs`.
-
-A reciprocal response belongs to one measured initiator session. If its
-session, lifecycle, plan, recovery admission, or exact socket is lost before
-the sweep starts, the response must be rejected. Treating that result as an
-unavailable optimization incorrectly permits ordinary fresh-punch fallback:
-after a network-generation change, the old response can acquire the new
-generation's punch owner and fold the real successor behind it. An incoming
-initiator offer whose responder cannot obtain a local STUN worker still uses
-the existing admitted fallback path.
-
-The stale-ACK E2E test pauses the reciprocal response after its punch claim and
-before `hard_hard_begin_sweep`, advances both network generations, and then
-releases the old response. It verifies that S1 ACKs cannot consume S2 pending
-transactions and that both S2 paths eventually commit Direct. This ordering
-reproduces the original failure without extending any timeout.
-
-`tests::hard_hard_asymmetric_mtu_500_900` additionally runs the complete existing
-Hard-Hard exact-socket convergence assertions through a userspace NAT link
-with independent IPv4 path-MTU limits. The A-to-B UDP payload budget is
-`500 - 20 - 8 = 472`; B-to-A is `900 - 20 - 8 = 872`. The link measures actual
-UDP payloads, including protocol/encryption overhead, rejects oversize
-datagrams, and requires zero oversize sends plus authenticated Direct on both
-peers. This is a modeled path-MTU test, not a change to the kernel loopback MTU
-or a DPLPMTUD convergence claim. Real Linux DF/EMSGSIZE coverage remains in
-`client/netbind/tests/no_fragment_netns.rs`.
-
-Targeted regression commands:
+Targeted regression commands remain:
 
 ```bash
 cargo test -p p2wlan-daemon --lib hard_hard_asymmetric_mtu_500_900 -- --nocapture --test-threads=1
@@ -79,6 +59,16 @@ cargo test -p p2wlan-daemon --lib tests::hard_hard_two_peer_stale_ack_cannot_res
 cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
 ```
 
-Completion still requires all 17 contract checks and the downloaded machine
-manifest to pass on the final post-merge `main` SHA. PR results alone do not
-close Issue #28.
+## Final Gate 09 retirement
+
+Issue #29 retires the temporary #28 orchestration after acceptance is recorded. The following verification-only implementation is removed from the live repository surface:
+
+- `.github/workflows/cross-task-integration-required.yml`
+- `contracts/cross_task_integration.json`
+- `scripts/cross_task_integration/aggregate_evidence.py`
+- `scripts/cross_task_integration/test_aggregate_evidence.py`
+- `client/daemon/cross_task_integration_gate_version.txt`
+
+The permanent required workflows and the product/test fixes introduced while satisfying #28 remain unchanged. Historical evidence is retained by the GitHub Actions run/artifact, Issue #28 closure comment and this document.
+
+Release versioning, release-candidate validation and publication remain owned by Final Gates #31, #32 and #33 respectively.
