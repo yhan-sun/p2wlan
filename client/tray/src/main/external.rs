@@ -95,8 +95,9 @@ fn copy_to_clipboard(value: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn tray_icon_image() -> Result<Icon, Box<dyn Error>> {
-    static TRAY_ICON_ICO: &[u8] =
-        include_bytes!("../../../../apps/flutter_client/assets/tray_icon.ico");
-    Ok(Icon::from_buffer(TRAY_ICON_ICO, None, None)?)
+fn tray_icon_image(running: bool) -> Result<Icon, Box<dyn Error>> {
+    static TRAY_ICON_OFF: &[u8] = include_bytes!("../../assets/tray_icon_off.ico");
+    static TRAY_ICON_ON: &[u8] = include_bytes!("../../assets/tray_icon_on.ico");
+    let buffer = if running { TRAY_ICON_ON } else { TRAY_ICON_OFF };
+    Ok(Icon::from_buffer(buffer, None, None)?)
 }
