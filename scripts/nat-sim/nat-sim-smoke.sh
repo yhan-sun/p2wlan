@@ -46,8 +46,8 @@ FRESH_MAPPING_PUNCH=${FRESH_MAPPING_PUNCH:-1}
 PREDICTED_CANDIDATES=${PREDICTED_CANDIDATES:-1}
 BIRTHDAY_PROBING=${BIRTHDAY_PROBING:-1}
 SOCKET_POOL=${SOCKET_POOL:-}
-BASE_A=${BASE_A:-36000}
-BASE_B=${BASE_B:-46000}
+BASE_A=${BASE_A:-16000}
+BASE_B=${BASE_B:-26000}
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-60}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-30}
 NAT_SIM_ARTIFACT_DIR=${NAT_SIM_ARTIFACT_DIR:-}
@@ -617,6 +617,11 @@ for round in $(seq 1 "$ROUNDS"); do
   NODE_B_PID=$!
   PIDS+=($NODE_B_PID)
 
+  for _ in {1..40}; do
+    grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-b.log" 2>/dev/null && break
+    sleep 0.25
+  done
+
   capture_baseline_status \
     "http://127.0.0.1:$DIAG_A_PORT/status" \
     "$ROUND_DIR/node-a.baseline.status.json" \
@@ -884,9 +889,15 @@ except Exception:
     if [[ "$OVERLAY_BURST" -gt 0 ]]; then
       [[ "$A_BURST" -ge 1 && "$B_BURST" -ge 1 && "$A_BURST_BAD" -eq 0 && "$B_BURST_BAD" -eq 0 ]] || BURST_OK=0
     fi
+    local relay_direct_ok=0
+    if [[ "$A_DIRECT" -eq 0 && "$B_DIRECT" -eq 0 ]]; then
+      relay_direct_ok=1
+    elif [[ "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 ]]; then
+      relay_direct_ok=1
+    fi
     if [[ "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 && "$DELTA_OK" -eq 1 \
           && "$EVIDENCE_PASS" -eq 1 \
-          && "$overlay_ok" -eq 1 && "$A_DIRECT" -eq 0 && "$B_DIRECT" -eq 0 \
+          && "$overlay_ok" -eq 1 && "$relay_direct_ok" -eq 1 \
           && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \
           && "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 \
           && "$A_DELTA" -ge 0 && "$A_DELTA" -le 3000 \

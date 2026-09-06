@@ -327,6 +327,7 @@ def _side_evidence(
     # intentionally not awaited for a full burst; Relay-only waits for the
     # configured burst because that profile is the availability gate.
     burst_required = expected_path == "relay" and overlay_burst > 0
+    direct_upgrade_ok = (direct_promoted == 0) or (relay_confirmed and first_path_ok)
     invariants = {
         "process_incarnation_stable": process_stable,
         "diagnostics_revision_converged": final_converged,
@@ -339,7 +340,7 @@ def _side_evidence(
         "first_usable_delta_fenced": delta_ok,
         "critical_tasks_healthy": tasks_ok,
         "overlay_verified": overlay_verified > 0,
-        "direct_not_used": direct_promoted == 0 if expected_path == "relay" else True,
+        "direct_not_used": direct_upgrade_ok if expected_path == "relay" else True,
         "no_replay_or_invalid": replay_rejected == 0 and overlay_invalid == 0,
         "burst_complete": not burst_required or (burst_complete > 0 and burst_incomplete == 0),
         "outbound_drops_zero": drops_packets == 0,

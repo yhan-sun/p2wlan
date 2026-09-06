@@ -501,8 +501,8 @@ def main() -> None:
     parser.add_argument("--block-direct", action="store_true")
     parser.add_argument("--seed", type=int, default=20260806)
     parser.add_argument("--observers", type=int, default=4)
-    parser.add_argument("--base-a", type=int, default=36000)
-    parser.add_argument("--base-b", type=int, default=46000)
+    parser.add_argument("--base-a", type=int, default=16000)
+    parser.add_argument("--base-b", type=int, default=26000)
     parser.add_argument("--trace-file", type=str)
     args = parser.parse_args()
 
