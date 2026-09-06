@@ -19,17 +19,18 @@ use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
 
-use tao::{
-    event::{Event, StartCause},
-    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
-};
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
-    Icon, TrayIcon, TrayIconBuilder,
+use trayicon::{Icon, MenuBuilder, TrayIcon, TrayIconBuilder};
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    window::WindowId,
 };
 
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+
 const STATUS_URL: &str = p2wlan_desktop_host::DEFAULT_DIAGNOSTICS_STATUS_URL;
-const COPY_PEER_IP_PREFIX: &str = "copy-peer-ip:";
 const DAEMON_NAME: &str = if cfg!(windows) {
     "p2wlan-daemon.exe"
 } else {
