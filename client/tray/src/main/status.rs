@@ -231,17 +231,19 @@ fn display_device_name(device_name: &str, node_id: &str) -> String {
 }
 
 fn build_tray_menu(state: &DaemonState) -> MenuBuilder<UserEvent> {
-    let online = state
-        .online
-        .map(|count| format!("{count} 台在线"))
-        .unwrap_or_else(|| "在线数 —".to_string());
+    let latency = format_tray_latency(state.latency_ms);
+    let speed = format_tray_rate(state.speed_bytes_per_second);
     let network = if state.running {
-        format!(
-            "{} · {} · {}",
-            state.virtual_ip,
-            online,
-            format_tray_latency(state.latency_ms)
-        )
+        match state.online {
+            Some(count) => format!(
+                "虚拟 IP：{} · 在线设备：{count} · 本端平均 RTT：{latency} · 速度：{speed}",
+                state.virtual_ip
+            ),
+            None => format!(
+                "虚拟 IP：{} · 在线设备：— · 本端平均 RTT：{latency} · 速度：{speed}",
+                state.virtual_ip
+            ),
+        }
     } else {
         "虚拟网络未启动".to_string()
     };
