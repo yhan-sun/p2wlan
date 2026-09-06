@@ -87,14 +87,42 @@ function Get-ProcessIdList {
 }
 
 function Get-DescendantProcessIds {
-    param([Parameter(Mandatory = $true)][int]$RootPid)
+    param(
+        [Parameter(Mandatory = $true)][int]$RootPid,
+        [DateTime]$MinCreationDate = [DateTime]::MinValue,
+        [DateTime]$MaxCreationDate = [DateTime]::MaxValue
+    )
     $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $rootCim = @($all | Where-Object { [int]$_.ProcessId -eq $RootPid }) | Select-Object -First 1
+    $effectiveMinDate = if ($rootCim -and $rootCim.CreationDate) {
+        $rootCim.CreationDate
+    } elseif ($MinCreationDate -gt [DateTime]::MinValue) {
+        $MinCreationDate
+    } else {
+        [DateTime]::MinValue
+    }
+    $effectiveMaxDate = if ($MaxCreationDate -lt [DateTime]::MaxValue) {
+        $MaxCreationDate
+    } else {
+        [DateTime]::MaxValue
+    }
+
     $children = [System.Collections.Generic.List[int]]::new()
     $frontier = [System.Collections.Generic.Queue[int]]::new()
     $frontier.Enqueue($RootPid)
     while ($frontier.Count -gt 0) {
         $parent = $frontier.Dequeue()
         foreach ($process in $all | Where-Object { [int]$_.ParentProcessId -eq $parent }) {
+            if ($effectiveMinDate -gt [DateTime]::MinValue) {
+                if (-not $process.CreationDate -or $process.CreationDate.ToUniversalTime() -lt $effectiveMinDate.ToUniversalTime().AddSeconds(-2)) {
+                    continue
+                }
+            }
+            if ($effectiveMaxDate -lt [DateTime]::MaxValue) {
+                if (-not $process.CreationDate -or $process.CreationDate.ToUniversalTime() -gt $effectiveMaxDate.ToUniversalTime().AddSeconds(2)) {
+                    continue
+                }
+            }
             $child = [int]$process.ProcessId
             if (-not $children.Contains($child)) {
                 $children.Add($child)
@@ -438,13 +466,16 @@ function Invoke-ProductionCycle {
         } else {
             $env:P2WLAN_DISABLE_TUN = '1'
         }
+        $processStartTime = [DateTime]::MinValue
         if ($Entrypoint -eq 'ctrl_c') {
             Add-ConsoleCtrlHelper
             $arguments = "--config `"$configPath`" --control http://127.0.0.1:1 --network windows-lifecycle --diagnostics-bind 127.0.0.1:$port --log-file `"$logPath`" --manual --interface p2wlan-lifecycle --address 10.20.0.1 --udp-bind 127.0.0.1:0 --stun none --socket-pool off"
             $ctrlCProcessId = [P2WlanLifecycleNative]::StartInNewConsole($DaemonPath, $arguments, (Split-Path -Parent $DaemonPath))
             $process = Get-Process -Id $ctrlCProcessId -ErrorAction Stop
+            $processStartTime = try { $process.StartTime } catch { [DateTime]::Now }
         } else {
             $process = Start-ProductionDaemon -ConfigPath $configPath -LogPath $logPath -DiagnosticsBind "127.0.0.1:$port"
+            $processStartTime = try { $process.StartTime } catch { [DateTime]::Now }
         }
         $token = Wait-DaemonReady -BaseUrl $baseUrl -AuthPath $authPath
         $startSucceeded = $true
@@ -460,7 +491,7 @@ function Invoke-ProductionCycle {
         if ($RealWintun -and -not $wintunObserved) {
             throw 'daemon became ready without an observable p2wlan-lifecycle Wintun adapter'
         }
-        $childPids = Get-DescendantProcessIds -RootPid $process.Id
+        $childPids = Get-DescendantProcessIds -RootPid $process.Id -MinCreationDate $processStartTime
         switch ($Entrypoint) {
             'diagnostics' { Stop-DiagnosticsDaemon -BaseUrl $baseUrl -Token $token }
             'cli' { Stop-CliDaemon -ConfigPath $configPath -StateDirectory $cycleRoot }
@@ -476,7 +507,8 @@ function Invoke-ProductionCycle {
         if ($exitCode -ne 0) {
             throw "daemon exited with code $exitCode after $Entrypoint"
         }
-        $childrenAfterExit = @(Get-DescendantProcessIds -RootPid $process.Id)
+        $processExitTime = [DateTime]::Now
+        $childrenAfterExit = @(Get-DescendantProcessIds -RootPid $process.Id -MinCreationDate $processStartTime -MaxCreationDate $processExitTime)
         $observedChildPids = @($childPids) + @($childrenAfterExit)
         $observedChildPids = @($observedChildPids | Sort-Object -Unique)
         $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds $observedChildPids
