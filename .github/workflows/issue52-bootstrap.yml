@@ -1,4 +1,4 @@
-name: Issue 52 Bootstrap
+name: Issue 52 Platform Check
 
 on:
   push:
@@ -6,11 +6,18 @@ on:
       - fix/remove-glib-rustsec-0429-20260906
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  tray-and-lock:
-    runs-on: ubuntu-latest
+  native-tray:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -18,10 +25,12 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Resolve and compile native tray
-        run: cargo check -p p2wlan-tray
+      - name: Test native tray
+        run: cargo test -p p2wlan-tray --locked
 
       - name: Verify vulnerable GTK dependency chain is gone
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           set -euo pipefail
           for package in glib gtk libappindicator tao tray-icon; do
@@ -32,15 +41,3 @@ jobs:
           done
           grep -q '^name = "trayicon"$' Cargo.lock
           grep -q '^name = "winit"$' Cargo.lock
-
-      - name: Commit Cargo-resolved lockfile
-        run: |
-          set -euo pipefail
-          if git diff --quiet -- Cargo.lock; then
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock
-          git commit -m "feat:同步无GTK托盘依赖锁文件"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
