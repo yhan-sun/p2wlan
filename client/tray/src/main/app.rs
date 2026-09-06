@@ -67,6 +67,10 @@ impl TrayApp {
             !self.last_state.running || self.last_state.busy,
         );
 
+        let icon = tray_icon_image(self.last_state.running)
+            .expect("static tray icon should be valid");
+        let _ = self.tray_icon.set_icon(&icon);
+
         let latency = format_tray_latency(self.last_state.latency_ms);
         let speed = format_tray_rate(self.last_state.speed_bytes_per_second);
         let title = tray_performance_title(&self.last_state);
@@ -168,7 +172,13 @@ impl TrayApp {
     }
 
     fn set_status(&mut self, text: impl AsRef<str>) {
-        let _ = self.tray_icon.set_tooltip(text.as_ref());
+        let text = text.as_ref();
+        self.last_state.status_label = text
+            .strip_prefix("状态：")
+            .unwrap_or(text)
+            .to_string();
+        self.apply_state();
+        let _ = self.tray_icon.set_tooltip(text);
     }
 
     fn refresh_state(&self) {
