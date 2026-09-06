@@ -14,6 +14,13 @@ This keeps the normal idle path small: users can close the Flutter frontend
 while the daemon keeps the tunnel up, with only this lightweight native tray
 process left for quick status and controls.
 
+## Backend
+
+The native tray uses `winit` for the cross-platform event loop and `trayicon`
+for the platform tray implementation. Windows and macOS use their native tray
+backends. Linux uses the StatusNotifier/KDE backend and does not pull the old
+GTK3/libappindicator tray dependency chain into the Rust dependency graph.
+
 ## Run
 
 ```bash
