@@ -32,21 +32,18 @@ skip the gate through path filters.
 - Machine-readable scanner output, stderr, exact exit status, tool version,
   vulnerability count and warning count are retained as evidence.
 
-The only current advisory exception is the exact ID `RUSTSEC-2024-0429`.
-`p2wlan-tray` reaches `glib 0.18.5` through the GTK3-only
-`tao`/`tray-icon`/`libappindicator` Linux backend, while the fixed `glib`
-release is not compatible with that backend. P2WLAN does not call
-`glib::VariantStrIter`; the residual risk is confined to transitive GTK3
-iterator behavior in the optional native tray process. The mitigation is to
-keep the tray opt-in, run the native tray and workspace tests, and revisit the
-exception when the tray stack has a GTK4-compatible backend. This is a
-temporary, non-broad exception tracked by Issue #52 and expires for review on
-2026-09-30; it must not be copied to another advisory. The machine-readable
-record is `security/advisory-exceptions.json`; the Rust report must be derived
-from both this metadata and `[advisories].ignore` in `deny.toml`.
-The Rust evidence preserves both input files, emits the complete
-`advisory_ignores` records, and the aggregate records the active exception
-count and advisory IDs after checking that the two inputs and the report agree.
+There are currently no active Rust advisory exceptions. Issue #52 retired the
+former exact `RUSTSEC-2024-0429` exemption by replacing the GTK3-bound
+`tao`/`tray-icon` backend in `p2wlan-tray` with the non-GTK
+`winit`/`trayicon` stack. The Rust dependency graph no longer carries the old
+`libappindicator`/GTK3/`glib 0.18.5` tray chain, and
+`security/advisory-exceptions.json` is intentionally empty.
+
+Future advisory exceptions, if any, remain exact-ID-only and require the same
+risk, mitigation, tracking issue and review-date metadata. The Rust evidence
+derives the active exception set from both `security/advisory-exceptions.json`
+and `[advisories].ignore` in `deny.toml` and fails closed if those inputs or the
+scanner reports disagree.
 
 ### Go dependency graph
 
