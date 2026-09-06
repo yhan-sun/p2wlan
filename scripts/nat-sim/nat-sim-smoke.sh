@@ -889,7 +889,7 @@ except Exception:
     if [[ "$OVERLAY_BURST" -gt 0 ]]; then
       [[ "$A_BURST" -ge 1 && "$B_BURST" -ge 1 && "$A_BURST_BAD" -eq 0 && "$B_BURST_BAD" -eq 0 ]] || BURST_OK=0
     fi
-    local relay_direct_ok=0
+    relay_direct_ok=0
     if [[ "$A_DIRECT" -eq 0 && "$B_DIRECT" -eq 0 ]]; then
       relay_direct_ok=1
     elif [[ "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 ]]; then
