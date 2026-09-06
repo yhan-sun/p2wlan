@@ -6,7 +6,7 @@ on:
       - fix/remove-glib-rustsec-0429-20260906
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   tray-and-lock:
@@ -19,8 +19,6 @@ jobs:
           toolchain: stable
 
       - name: Resolve and compile native tray
-        id: tray_check
-        continue-on-error: true
         run: cargo check -p p2wlan-tray
 
       - name: Verify vulnerable GTK dependency chain is gone
@@ -35,14 +33,14 @@ jobs:
           grep -q '^name = "trayicon"$' Cargo.lock
           grep -q '^name = "winit"$' Cargo.lock
 
-      - name: Upload resolved lockfile
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: issue52-cargo-lock
-          path: Cargo.lock
-          if-no-files-found: error
-
-      - name: Enforce tray compile result
-        if: steps.tray_check.outcome != 'success'
-        run: exit 1
+      - name: Commit Cargo-resolved lockfile
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- Cargo.lock; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "feat:同步无GTK托盘依赖锁文件"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
