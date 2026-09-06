@@ -90,7 +90,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Cargo workspace tests
-        run: cargo test --workspace --all-features
+        env:
+          RUST_TEST_THREADS: "1"
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features -- --test-threads=1 --skip hard_hard_ 2>&1 | tee /tmp/workspace-tests.log
+          ! grep -qE '0 tests, [1-9][0-9]* benchmarks' /tmp/workspace-tests.log
+
+      - name: Hard-hard E2E tests
+        run: cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
 
       - name: WireGuard sizing and inbound-control regression
         run: cargo test -p p2wlan-daemon --lib transport::tests -- --test-threads=1
