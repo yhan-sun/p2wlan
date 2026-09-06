@@ -23,7 +23,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .sender(move |event: &UserEvent| {
             let _ = menu_proxy.send_event(event.clone());
         })
-        .icon(tray_icon_image()?)
+        .icon(tray_icon_image(false)?)
         .title("P2WLAN")
         .tooltip("P2WLAN")
         .item_is_menu(true)
