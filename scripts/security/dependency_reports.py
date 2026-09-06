@@ -77,7 +77,7 @@ def _read_deny_config(path: Path) -> dict[str, Any]:
                 raise ValueError("invalid [advisories].ignore assignment")
             ignore_value = json.loads(value.strip())
     if ignore_value is None:
-        raise ValueError("missing [advisories].ignore")
+        ignore_value = []
     return {"advisories": {"ignore": ignore_value}}
 
 

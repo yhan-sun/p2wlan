@@ -606,7 +606,7 @@ class DependencyReportTests(unittest.TestCase):
         )
         return deny, metadata
 
-    def test_rust_report_reads_deny_and_emits_current_exception(self) -> None:
+    def test_rust_report_reads_repository_zero_exception_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             args = self.rust_args(
@@ -616,10 +616,9 @@ class DependencyReportTests(unittest.TestCase):
             )
             evidence = dependency_reports.rust_summary(args)
             self.assertEqual(evidence["result"], "pass")
-            self.assertEqual(evidence["advisory_exception_count"], 1)
-            self.assertEqual(evidence["advisory_exception_ids"], ["RUSTSEC-2024-0429"])
-            self.assertEqual(evidence["advisory_ignores"][0]["package"], "glib")
-            self.assertEqual(evidence["advisory_ignores"][0]["tracking_issue"], 52)
+            self.assertEqual(evidence["advisory_exception_count"], 0)
+            self.assertEqual(evidence["advisory_exception_ids"], [])
+            self.assertEqual(evidence["advisory_ignores"], [])
 
     def test_rust_deny_ignore_without_metadata_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
