@@ -3680,7 +3680,7 @@ async fn hard_hard_birthday_production_cleanup_waits_for_udp_completion() {
     harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
 
-    let record = timeout(Duration::from_secs(8), async {
+    let record = timeout(HARD_HARD_E2E_TIMEOUT, async {
         loop {
             if let Some(record) = harness.peers_b.hard_hard_session_for_test(HARD_HARD_A).await {
                 if record.state != peer::HardHardSessionState::Retiring
