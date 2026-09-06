@@ -4,16 +4,15 @@ struct TrafficSample {
 }
 
 struct TrayApp {
-    menu: TrayMenu,
-    tray_icon: TrayIcon,
+    tray_icon: TrayIcon<UserEvent>,
     last_state: DaemonState,
     previous_traffic: Option<TrafficSample>,
+    proxy: EventLoopProxy<UserEvent>,
+    refresh_in_flight: Arc<AtomicBool>,
 }
 
 impl TrayApp {
     fn apply_state_update(&mut self, mut state: DaemonState) {
-        // A background status response must not clear a local start/stop
-        // operation that is still in flight on the tray event loop.
         state.busy = self.last_state.busy;
         state.speed_bytes_per_second = self.update_traffic_rate(&state);
         self.last_state = state;
@@ -48,23 +47,28 @@ impl TrayApp {
     }
 
     fn apply_state(&mut self) {
+        let menu = build_tray_menu(&self.last_state);
+        if let Err(error) = self.tray_icon.set_menu(&menu) {
+            eprintln!("p2wlan-tray menu update failed: {error}");
+        }
+        for id in [
+            UserEvent::StatusInfo,
+            UserEvent::NetworkInfo,
+            UserEvent::NoDevices,
+        ] {
+            let _ = self.tray_icon.set_menu_item_disabled(id, true);
+        }
+        let _ = self.tray_icon.set_menu_item_disabled(
+            UserEvent::StartDaemon,
+            self.last_state.running || self.last_state.busy,
+        );
+        let _ = self.tray_icon.set_menu_item_disabled(
+            UserEvent::StopDaemon,
+            !self.last_state.running || self.last_state.busy,
+        );
+
         let latency = format_tray_latency(self.last_state.latency_ms);
         let speed = format_tray_rate(self.last_state.speed_bytes_per_second);
-        self.menu
-            .status
-            .set_text(format!("状态：{}", self.last_state.status_label));
-        self.menu.network.set_text(match self.last_state.online {
-            Some(count) => format!(
-                "虚拟 IP：{} · 在线设备：{count} · 本端平均 RTT：{latency} · 速度：{speed}",
-                self.last_state.virtual_ip,
-            ),
-            None => format!("虚拟 IP：— · 在线设备：— · 本端平均 RTT：{latency} · 速度：{speed}"),
-        });
-        self.menu.stop_daemon.set_enabled(self.last_state.running);
-        self.menu
-            .start_daemon
-            .set_enabled(!self.last_state.running && !self.last_state.busy);
-        rebuild_device_menu(&self.menu.devices, &self.last_state.devices);
         let title = tray_performance_title(&self.last_state);
         let tooltip = if self.last_state.running {
             format!(
@@ -74,14 +78,11 @@ impl TrayApp {
         } else {
             self.last_state.tooltip.clone()
         };
-        self.tray_icon.set_title(Some(title.as_str()));
-        let _ = self.tray_icon.set_tooltip(Some(tooltip.as_str()));
-        let _ = self.tray_icon.set_icon(Some(
-            tray_icon_image(self.last_state.running).expect("static tray icon should be valid"),
-        ));
+        let _ = self.tray_icon.set_title(&title);
+        let _ = self.tray_icon.set_tooltip(&tooltip);
     }
 
-    fn start_daemon(&mut self, proxy: EventLoopProxy<UserEvent>) {
+    fn start_daemon(&mut self) {
         if self.last_state.busy {
             return;
         }
@@ -89,6 +90,7 @@ impl TrayApp {
         self.last_state.status_label = "正在启动".to_string();
         self.apply_state();
         self.set_status("状态：正在启动");
+        let proxy = self.proxy.clone();
         thread::spawn(move || {
             let error = start_daemon().err().map(|error| error.to_string());
             let _ = proxy.send_event(UserEvent::DaemonActionFinished {
@@ -98,7 +100,7 @@ impl TrayApp {
         });
     }
 
-    fn stop_daemon(&mut self, proxy: EventLoopProxy<UserEvent>) {
+    fn stop_daemon(&mut self) {
         if self.last_state.busy {
             return;
         }
@@ -106,6 +108,7 @@ impl TrayApp {
         self.last_state.status_label = "正在停止".to_string();
         self.apply_state();
         self.set_status("状态：正在停止");
+        let proxy = self.proxy.clone();
         thread::spawn(move || {
             let error = stop_daemon().err().map(|error| error.to_string());
             let _ = proxy.send_event(UserEvent::DaemonActionFinished {
@@ -164,9 +167,47 @@ impl TrayApp {
         let _ = stop_daemon();
     }
 
-    fn set_status(&self, text: impl AsRef<str>) {
-        self.menu.status.set_text(text.as_ref());
-        let _ = self.tray_icon.set_tooltip(Some(text.as_ref()));
+    fn set_status(&mut self, text: impl AsRef<str>) {
+        let _ = self.tray_icon.set_tooltip(text.as_ref());
+    }
+
+    fn refresh_state(&self) {
+        spawn_state_refresh(self.proxy.clone(), self.refresh_in_flight.clone());
+    }
+}
+
+impl ApplicationHandler<UserEvent> for TrayApp {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        self.refresh_state();
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _event: WindowEvent,
+    ) {
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Refresh => self.refresh_state(),
+            UserEvent::State(state) => self.apply_state_update(state),
+            UserEvent::DaemonActionFinished { action, error } => {
+                self.finish_daemon_action(action, error);
+                self.refresh_state();
+            }
+            UserEvent::StartDaemon => self.start_daemon(),
+            UserEvent::StopDaemon => self.stop_daemon(),
+            UserEvent::OpenClient => self.open_client(),
+            UserEvent::OpenLogs => self.open_logs(),
+            UserEvent::CopyPeerIp(ip) => self.copy_peer_ip(&ip),
+            UserEvent::Quit => {
+                self.quit_p2wlan();
+                event_loop.exit();
+            }
+            UserEvent::StatusInfo | UserEvent::NetworkInfo | UserEvent::NoDevices => {}
+        }
     }
 }
 
