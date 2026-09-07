@@ -186,7 +186,7 @@ node_first_usable_delta_ms() {
 # First stable drop/cancel reason_code seen on a node's timeline (if any).
 node_failure_code() {
   local log="$1"
-  strip_ansi < "$log" | grep "relay_unavailable_or_first_packet_expired" | grep -oE 'reason_code=Some\("[A-Za-z0-9_]+"\)' | head -1 | sed -E 's/.*reason_code=Some\("([A-Za-z0-9_]+)"\).*/\1/' || true
+  strip_ansi < "$log" | grep "relay_unavailable_or_first_packet_expired" | grep -oE 'reason_code=(Some\()?"[A-Za-z0-9_]+"\)?' | head -1 | sed -E 's/.*reason_code=(Some\()?"([A-Za-z0-9_]+)"\)?.*/\2/' || true
 }
 
 # A structured timeline event and its human-readable log line are both

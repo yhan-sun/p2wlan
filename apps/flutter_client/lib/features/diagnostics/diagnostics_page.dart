@@ -18,6 +18,7 @@ import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
 import '../../shared/permission_copy.dart';
 import '../../shared/log_tail.dart';
+import '../../shared/log_presentation.dart';
 import '../../shared/widgets/info_card.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';

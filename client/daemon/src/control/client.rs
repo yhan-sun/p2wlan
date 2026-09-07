@@ -56,7 +56,17 @@ impl ControlClient {
             _relay_servers: config.relay.servers.clone(),
         }));
 
+        let runtime_enabled = enabled && has_control_credential(config);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_done_tx, shutdown_done_rx) = watch::channel(false);
+        let shutdown_lifecycle = runtime_enabled.then(|| {
+            Arc::new(ControlShutdown {
+                requested: shutdown_tx.clone(),
+                completed: shutdown_done_rx,
+            })
+        });
         let client = Self {
+            shutdown_lifecycle,
             event_tx: event_tx.clone(),
             cmd_tx,
             critical_offer_tx,
@@ -74,7 +84,7 @@ impl ControlClient {
             test_signal_generation: Arc::new(AtomicU64::new(0)),
         };
 
-        if enabled && has_control_credential(config) {
+        if runtime_enabled {
             // The ordinary and critical lanes read the same route-aware
             // primary pool. Candidate refresh has a separate pool to avoid
             // head-of-line blocking, but both pools are rebuilt atomically
@@ -90,7 +100,17 @@ impl ControlClient {
             let critical_relay_selection = relay_selection.clone();
             let critical_http = http.clone();
             let critical_health = health.clone();
-            tokio::spawn(async move {
+            let supervisor = ControlSupervisor {
+                shutdown_tx,
+                shutdown_rx: shutdown_rx.clone(),
+                done_tx: shutdown_done_tx,
+                auth_rx: critical_auth_rx.clone(),
+                http: http.clone(),
+                event_tx: event_tx.clone(),
+                health: health.clone(),
+                state: state.clone(),
+            };
+            let critical = async move {
                 run_critical_control_loop(
                     critical_http,
                     candidate_http,
@@ -102,10 +122,11 @@ impl ControlClient {
                     critical_event_tx,
                     critical_relay_selection,
                     critical_health,
+                    shutdown_rx,
                 )
                 .await;
-            });
-            tokio::spawn(async move {
+            };
+            let ordinary = async move {
                 run_control_loop(
                     config,
                     http,
@@ -119,7 +140,12 @@ impl ControlClient {
                     health,
                 )
                 .await;
-            });
+            };
+            let tasks = ControlRuntimeTasks {
+                ordinary: tokio::spawn(ordinary),
+                critical: tokio::spawn(critical),
+            };
+            tokio::spawn(supervisor.run(tasks));
         }
 
         (client, event_rx)
@@ -156,6 +182,7 @@ impl ControlClient {
             _relay_servers: Vec::new(),
         }));
         Self {
+            shutdown_lifecycle: None,
             event_tx,
             cmd_tx,
             critical_offer_tx,
@@ -703,25 +730,20 @@ impl ControlClient {
         let _ = self.cmd_tx.send(ControlCommand::NetworkChanged);
     }
 
-    /// Shutdown the control client.
+    /// Shutdown the control client without waiting behind ordinary HTTP work.
     pub async fn shutdown(&self) -> Result<()> {
-        // Stop independent critical-lane endpoint work first. Otherwise an
-        // in-flight critical heartbeat could race a successful presence
-        // release and immediately revive the lease.
+        if let Some(lifecycle) = self.shutdown_lifecycle.as_ref() {
+            return lifecycle.stop().await;
+        }
         let _ = self
             .critical_ctrl_tx
-            .send(CriticalControlCommand::Shutdown)
-            .await;
-
+            .try_send(CriticalControlCommand::Shutdown);
         let (response_tx, response_rx) = oneshot::channel();
         if self
             .cmd_tx
             .send(ControlCommand::Shutdown { response_tx })
             .is_ok()
         {
-            // The HTTP release itself is capped at one second. Keep a small
-            // decode/channel margin, but never make teardown depend on the
-            // control plane being reachable.
             let _ = timeout(Duration::from_millis(1_500), response_rx).await;
         }
         Ok(())

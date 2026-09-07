@@ -71,7 +71,13 @@ class DashboardPage extends StatelessWidget {
         final daemonAvailable =
             statusStore.daemonReachable || statusStore.statusReachable;
         final initialProbePending =
-            statusStore.lastFetchedAt == null && statusStore.refreshing;
+            statusStore.daemonStarting ||
+            (snapshot == null && statusStore.startupCatalogSettling) ||
+            (statusStore.lastFetchedAt == null && statusStore.refreshing);
+        final startupFailure =
+            !statusStore.daemonBusy && statusStore.lastDaemonFailureCode != null
+            ? statusStore.lastDaemonMessage
+            : null;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);
         final overviewPeers = _topOverviewPeers(
@@ -80,18 +86,22 @@ class DashboardPage extends StatelessWidget {
         final peerTransferRates = statusStore.snapshotStale
             ? const <String, int>{}
             : statusStore.peerTransferRatesBytesPerSecond;
-        final issueMessage = _dashboardIssueMessage(
-          strings: strings,
-          daemonAvailable: daemonAvailable,
-          snapshotStale: statusStore.snapshotStale,
-          statusReachable: statusStore.statusReachable,
-          statusError: statusStore.lastStatusError,
-          healthReachable: statusStore.healthReachable,
-          healthError: statusStore.lastHealthError,
-          error: statusStore.lastError,
-          snapshot: snapshot,
-          startupCatalogSettling: statusStore.startupCatalogSettling,
-        );
+        final issueMessage =
+            startupFailure ??
+            _dashboardIssueMessage(
+              strings: strings,
+              daemonAvailable: daemonAvailable,
+              snapshotStale: statusStore.snapshotStale,
+              statusReachable: statusStore.statusReachable,
+              statusError: statusStore.lastStatusError,
+              healthReachable: statusStore.healthReachable,
+              healthError: statusStore.lastHealthError,
+              error: statusStore.lastError,
+              snapshot: snapshot,
+              startupCatalogSettling:
+                  statusStore.startupCatalogSettling ||
+                  statusStore.daemonStarting,
+            );
         final manualCommand = settingsStore.settings.authToken.trim().isEmpty
             ? statusStore.lastDaemonManualCommand
             : null;
@@ -116,13 +126,14 @@ class DashboardPage extends StatelessWidget {
               _RemoteOnlyHero(onOpenDevices: onOpenDevices),
             if (capabilities.canActAsLocalVpnNode &&
                 issueMessage != null &&
-                daemonAvailable) ...[
+                (daemonAvailable || startupFailure != null)) ...[
               const SizedBox(height: AppTokens.space12),
               _HomeIssueBanner(
                 message: issueMessage,
                 tone:
-                    !statusStore.healthReachable &&
-                        statusStore.lastHealthError != null
+                    startupFailure != null ||
+                        (!statusStore.healthReachable &&
+                            statusStore.lastHealthError != null)
                     ? StatusTone.bad
                     : StatusTone.warn,
                 onOpenTroubleshooting: onOpenTroubleshooting,

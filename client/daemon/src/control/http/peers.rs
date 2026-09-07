@@ -30,7 +30,7 @@ pub(super) async fn poll_peers(
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("list nodes decode failed: {e}")))?;
 
-    info!(
+    debug!(
         "poll_peers: received {} nodes from control plane (self_node_id={})",
         body.nodes.len(),
         self_node_id
@@ -83,7 +83,7 @@ pub(super) async fn poll_peers(
         }
     }
 
-    info!(
+    debug!(
         "poll_peers: {} joined, {} updated, {} total known peers",
         joined.len(),
         updated.len(),

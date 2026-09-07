@@ -543,6 +543,7 @@ struct SignalResponse {
 /// signaling, peer discovery, and configuration updates.
 #[derive(Clone)]
 pub struct ControlClient {
+    shutdown_lifecycle: Option<Arc<ControlShutdown>>,
     /// Channel to send events to the daemon.
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     /// Channel to send commands to the background task.
@@ -629,8 +630,7 @@ const CRITICAL_SIGNAL_RETRY_DELAYS: [std::time::Duration; 2] = [
 /// retries.  A successful round must never become a 3 x 5 s retry sequence:
 /// the overall deadline is the binding constraint, per-attempt timeouts are
 /// only incidental.
-const CRITICAL_SIGNAL_OVERALL_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(8);
+const CRITICAL_SIGNAL_OVERALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Authentication identity published by the registration loop to the
 /// latency-sensitive worker.  The server-assigned node id is authoritative;

@@ -34,7 +34,9 @@ fn main() -> p2pnet_daemon::Result<()> {
 const WINDOWS_SHUTDOWN_DEADLINE_MS: u64 = 10_000;
 
 #[cfg(target_os = "windows")]
-async fn run_daemon(windows_signal: std::sync::Arc<WindowsLifecycleSignal>) -> p2pnet_daemon::Result<()> {
+async fn run_daemon(
+    windows_signal: std::sync::Arc<WindowsLifecycleSignal>,
+) -> p2pnet_daemon::Result<()> {
     run_daemon_inner(Some(windows_signal)).await
 }
 
@@ -59,7 +61,6 @@ async fn wait_for_windows_lifecycle_signal(
 async fn run_daemon_inner(
     #[cfg(target_os = "windows")] windows_signal: Option<std::sync::Arc<WindowsLifecycleSignal>>,
 ) -> p2pnet_daemon::Result<()> {
-
     // Parse arguments BEFORE any side effects (including logging setup)
     // This guarantees --help and --version exit cleanly without side effects.
     let cli = Cli::parse();
@@ -103,52 +104,32 @@ async fn run_daemon_inner(
         return Ok(());
     }
 
-    // Initialize logging
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if let Some(ref log_file) = cli.log_file {
-        if let Some(parent) = log_file.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+    let _logging_guard = if let Some(ref log_file) = cli.log_file {
+        let (writer, guard) =
+            p2pnet_daemon::diagnostics::logging::bounded_file_writer(log_file).map_err(|error| {
                 DaemonError::Config(format!(
-                    "failed to create log directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-            .map_err(|e| {
-                DaemonError::Config(format!(
-                    "failed to open log file {}: {e}",
+                    "failed to initialize bounded private log {}: {error}",
                     log_file.display()
                 ))
             })?;
-        restrict_log_file_permissions(log_file).map_err(|e| {
-            DaemonError::Config(format!(
-                "failed to protect log file {}: {e}",
-                log_file.display()
-            ))
-        })?;
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
+            .with_timer(p2pnet_daemon::diagnostics::logging::LocalTimer)
             .with_ansi(false)
-            .with_writer(move || {
-                file.try_clone()
-                    .expect("failed to clone daemon log file handle")
-            })
+            .with_writer(writer)
             .init();
+        Some(guard)
     } else {
-        // When stdout is redirected (harness logs, service managers), emit
-        // plain text: ANSI escape codes corrupt line-oriented parsers that
-        // grep `re.match`-style at the start of a log line.
         use std::io::IsTerminal;
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
+            .with_timer(p2pnet_daemon::diagnostics::logging::LocalTimer)
             .with_ansi(std::io::stdout().is_terminal())
             .init();
-    }
+        None
+    };
 
     info!("P2WLAN daemon starting...");
     info!("Platform: {}", std::env::consts::OS);
@@ -165,9 +146,7 @@ async fn run_daemon_inner(
                 return Err(daemon_error);
             }
         };
-        info!(
-            "[startup] elevated token verified: windows_elevated={windows_elevated}"
-        );
+        info!("[startup] elevated token verified: windows_elevated={windows_elevated}");
         if !windows_elevated && std::env::var("P2WLAN_DISABLE_TUN").as_deref() != Ok("1") {
             let error = DaemonError::Network(
                 "DAEMON_NOT_ELEVATED: Windows TUN requires an elevated administrator token, but p2wlan-daemon is running without elevation.".to_string(),
@@ -420,12 +399,18 @@ async fn print_status(
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
-        .map_err(|error| DaemonError::Network(format!("failed to create diagnostics client: {error}")))?;
+        .map_err(|error| {
+            DaemonError::Network(format!("failed to create diagnostics client: {error}"))
+        })?;
 
     let body = 'request: {
         for attempt in 0..2 {
-            let token = std::fs::read_to_string(&auth_path)
-                .map_err(|_| DaemonError::Network("diagnostics session token file is missing; daemon session may have changed".to_string()))?;
+            let token = std::fs::read_to_string(&auth_path).map_err(|_| {
+                DaemonError::Network(
+                    "diagnostics session token file is missing; daemon session may have changed"
+                        .to_string(),
+                )
+            })?;
             let token = token.trim();
             if token.is_empty() {
                 return Err(DaemonError::Network(
@@ -569,11 +554,14 @@ fn read_launch_token_stdin() -> p2pnet_daemon::Result<String> {
                     "stdin launch token exceeds the 16 KiB limit".to_string(),
                 ));
             }
-            let value = String::from_utf8(std::mem::take(&mut bytes))
-                .map_err(|_| DaemonError::Config("stdin launch token is not valid UTF-8".to_string()))?;
+            let value = String::from_utf8(std::mem::take(&mut bytes)).map_err(|_| {
+                DaemonError::Config("stdin launch token is not valid UTF-8".to_string())
+            })?;
             let token = value.trim();
             if token.is_empty() {
-                return Err(DaemonError::Config("stdin launch token is empty".to_string()));
+                return Err(DaemonError::Config(
+                    "stdin launch token is empty".to_string(),
+                ));
             }
             Ok(token.to_string())
         });

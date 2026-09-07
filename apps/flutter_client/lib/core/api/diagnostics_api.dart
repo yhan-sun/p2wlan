@@ -187,6 +187,12 @@ class DiagnosticsApi {
       ]).timeout(_speedTestTimeout);
     } catch (_) {
       activeRequest?.abort();
+      if (generation != _speedTestGeneration) {
+        throw const DiagnosticsApiException(
+          'Speed test cancelled',
+          reasonCode: 'speedtest_cancelled',
+        );
+      }
       rethrow;
     } finally {
       if (generation == _speedTestGeneration) {

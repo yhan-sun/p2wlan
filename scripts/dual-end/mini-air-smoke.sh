@@ -1097,7 +1097,7 @@ try:
     with open(log_file, encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if re.search(pattern, line):
-                match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)", line)
+                match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))", line)
                 if match:
                     ts = datetime.datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
                     print(int(ts.timestamp() * 1000))
@@ -1111,7 +1111,7 @@ PY
 log_first_event_path() {
   local log_file=$1
   local pattern=$2
-  grep -E -m1 -- "$pattern" "$log_file" 2>/dev/null | sed -n 's/.*path=Some("\([^"]*\)").*/\1/p'
+  grep -E -m1 -- "$pattern" "$log_file" 2>/dev/null | sed -nE 's/.*path=(Some\()?"([^"[:space:]]+)"\)?.*/\2/p'
 }
 
 # The value of a `Some(N)` numeric structured field on the FIRST log line

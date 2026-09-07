@@ -137,11 +137,9 @@ class _NetworkHero extends StatelessWidget {
             ),
             const SizedBox(width: AppTokens.space8),
             StatusBadge(
-              label: _networkStatusLabel(
-                strings,
-                status,
-                canControlLocalDaemon,
-              ),
+              label: initialProbePending
+                  ? (strings.isZh ? '连接中' : 'Connecting')
+                  : _networkStatusLabel(strings, status, canControlLocalDaemon),
               tone: _networkStatusTone(status),
             ),
           ],
@@ -206,7 +204,9 @@ class _NetworkHero extends StatelessWidget {
           ),
         ] else ...[
           Text(
-            showStartGuide
+            initialProbePending
+                ? (strings.isZh ? '正在连接 P2WLAN' : 'Connecting to P2WLAN')
+                : showStartGuide
                 ? strings.homeStoppedTitle
                 : strings.homeUnavailableTitle,
             style: TextStyle(
@@ -218,7 +218,11 @@ class _NetworkHero extends StatelessWidget {
           ),
           const SizedBox(height: AppTokens.space6),
           Text(
-            showStartGuide
+            initialProbePending
+                ? (strings.isZh
+                      ? '正在等待本地网络服务就绪；如出现系统授权，请完成授权。'
+                      : 'Waiting for the local network service. Complete the system permission prompt if shown.')
+                : showStartGuide
                 ? strings.homeStoppedDetail
                 : strings.homeUnavailableDetail,
             maxLines: 2,

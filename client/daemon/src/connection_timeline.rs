@@ -318,13 +318,7 @@ impl ConnectionTimeline {
             path = path,
             reason_code = reason_code,
             detail = detail,
-            "{event} run_id={:?} corr_id={} t_ms={} path={:?} reason_code={:?} detail={:?}",
-            self.run_id,
-            self.correlation_id,
-            at_ms,
-            path,
-            reason_code,
-            detail,
+            "{event}",
         );
     }
 
@@ -349,13 +343,7 @@ impl ConnectionTimeline {
             path = path,
             reason_code = reason_code,
             detail = detail,
-            "{event} run_id={:?} corr_id={} t_ms={} path={:?} reason_code={:?} detail={:?}",
-            self.run_id,
-            self.correlation_id,
-            at_ms,
-            path,
-            reason_code,
-            detail,
+            "{event}",
         );
     }
 

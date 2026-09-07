@@ -89,6 +89,7 @@ use websocket::{run_signal_websocket, signal_websocket_url};
 
 include!("control/types.rs");
 
+include!("control/shutdown.rs");
 include!("control/client.rs");
 include!("control/client/test_handlers.rs");
 include!("control/runtime.rs");

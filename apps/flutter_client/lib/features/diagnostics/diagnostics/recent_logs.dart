@@ -16,6 +16,9 @@ class _RecentLogsPanel extends StatefulWidget {
 
 class _RecentLogsPanelState extends State<_RecentLogsPanel> {
   late Future<DiagnosticsLogPreview> _previewFuture;
+  var _level = LogLevelFilter.information;
+  var _collapseRepeats = true;
+  var _search = '';
 
   @override
   void initState() {
@@ -81,7 +84,13 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
                   : 'No daemon log file found yet: ${preview.path}',
             );
           }
-          final safeContent = redactSensitive(preview.content);
+          final safeContent = presentDaemonLogs(
+            redactSensitive(preview.content),
+            filter: _level,
+            search: _search,
+            collapseRepeats: _collapseRepeats,
+            isZh: strings.isZh,
+          );
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -108,6 +117,66 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
                 ],
               ),
               const SizedBox(height: AppTokens.space10),
+              Wrap(
+                spacing: 12,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  DropdownButton<LogLevelFilter>(
+                    key: const Key('daemon-log-level-filter'),
+                    value: _level,
+                    items: [
+                      DropdownMenuItem(
+                        value: LogLevelFilter.information,
+                        child: Text(
+                          strings.isZh ? '信息及以上' : 'Information and above',
+                        ),
+                      ),
+                      DropdownMenuItem(
+                        value: LogLevelFilter.warnings,
+                        child: Text(
+                          strings.isZh ? '警告和错误' : 'Warnings and errors',
+                        ),
+                      ),
+                      DropdownMenuItem(
+                        value: LogLevelFilter.all,
+                        child: Text(strings.isZh ? '全部级别' : 'All levels'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) setState(() => _level = value);
+                    },
+                  ),
+                  FilterChip(
+                    label: Text(
+                      strings.isZh ? '合并连续重复' : 'Collapse consecutive repeats',
+                    ),
+                    selected: _collapseRepeats,
+                    onSelected: (value) =>
+                        setState(() => _collapseRepeats = value),
+                  ),
+                ],
+              ),
+              TextField(
+                key: const Key('daemon-log-search'),
+                decoration: InputDecoration(
+                  isDense: true,
+                  prefixIcon: const Icon(Icons.search, size: 18),
+                  hintText: strings.isZh
+                      ? '按模块、节点或原因筛选'
+                      : 'Filter by module, peer or reason',
+                ),
+                onChanged: (value) => setState(() => _search = value),
+              ),
+              const SizedBox(height: AppTokens.space8),
+              Text(
+                strings.isZh ? '时间按系统本地时区显示，并保留时区偏移；原始日志未被改写。' : 'Times use the system local time zone with explicit offsets; original logs are unchanged.',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: themeTextSecondary(context),
+                ),
+              ),
+              const SizedBox(height: AppTokens.space10),
               Container(
                 width: double.infinity,
                 constraints: const BoxConstraints(maxHeight: 280),
@@ -121,7 +190,11 @@ class _RecentLogsPanelState extends State<_RecentLogsPanel> {
                   child: SingleChildScrollView(
                     scrollDirection: Axis.horizontal,
                     child: Text(
-                      safeContent,
+                      safeContent.isEmpty
+                          ? (strings.isZh
+                                ? '没有匹配的日志'
+                                : 'No matching log entries')
+                          : safeContent,
                       style: const TextStyle(
                         color: AppTokens.colorConsoleText,
                         fontFamily: 'monospace',

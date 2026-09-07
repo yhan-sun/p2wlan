@@ -508,22 +508,32 @@ mod android_bridge {
     /// `tracing` records would disappear, leaving the user with an empty local
     /// log when the VPN failed during startup.
     fn init_logging(path: &Path) {
-        static LOGGING: OnceLock<()> = OnceLock::new();
-        LOGGING.get_or_init(|| {
-            let Ok(file) = open_private_append(path) else {
-                return;
-            };
-            let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .with_ansi(false)
-                .with_writer(move || {
-                    file.try_clone()
-                        .expect("failed to clone Android daemon log file handle")
-                })
-                .try_init();
-        });
+        static LOGGING: OnceLock<
+            Mutex<Option<p2pnet_daemon::diagnostics::logging::LogWorkerGuard>>,
+        > = OnceLock::new();
+        let mut installed = LOGGING
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if installed.is_some() {
+            return;
+        }
+        let Ok((writer, guard)) = p2pnet_daemon::diagnostics::logging::bounded_file_writer(path)
+        else {
+            return;
+        };
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        if tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_timer(p2pnet_daemon::diagnostics::logging::LocalTimer)
+            .with_ansi(false)
+            .with_writer(writer)
+            .try_init()
+            .is_ok()
+        {
+            *installed = Some(guard);
+        }
     }
 
     fn start_runtime(

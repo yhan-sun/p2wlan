@@ -29,6 +29,7 @@ async fn run_critical_control_loop(
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
     health: Option<Arc<crate::tasks::HealthState>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let answer_permits = Arc::new(Semaphore::new(CRITICAL_ANSWER_MAX_INFLIGHT));
     let offer_permits = Arc::new(Semaphore::new(CRITICAL_OFFER_MAX_INFLIGHT));
@@ -44,6 +45,11 @@ async fn run_critical_control_loop(
     loop {
         tokio::select! {
             biased;
+            _ = control_shutdown_requested(&mut shutdown_rx) => break,
+            Some(_) = answers.join_next(), if !answers.is_empty() => {}
+            Some(_) = offers.join_next(), if !offers.is_empty() => {}
+            Some(_) = ctrls.join_next(), if !ctrls.is_empty() => {}
+            Some(_) = candidate_tasks.join_next(), if !candidate_tasks.is_empty() => {}
             Some(command) = answer_rx.recv() => {
                 answers.spawn(run_critical_answer_command(
                     http.clone(),
@@ -78,11 +84,7 @@ async fn run_critical_control_loop(
                         ));
                     }
                     CriticalControlCommand::Shutdown => {
-                        answers.abort_all();
-                        offers.abort_all();
-                        ctrls.abort_all();
-                        candidate_tasks.abort_all();
-                        return;
+                        break;
                     }
                 }
             }
@@ -177,7 +179,14 @@ async fn run_critical_control_loop(
         }
     }
 
+    answers.abort_all();
+    offers.abort_all();
+    ctrls.abort_all();
     candidate_tasks.abort_all();
+    while answers.join_next().await.is_some() {}
+    while offers.join_next().await.is_some() {}
+    while ctrls.join_next().await.is_some() {}
+    while candidate_tasks.join_next().await.is_some() {}
 }
 
 fn spawn_candidate_offer_worker(
@@ -292,12 +301,8 @@ async fn run_candidate_offer_worker(
                 // not prove that the server did not accept its POST; starting
                 // a new future here can therefore duplicate a candidate
                 // publication that already reached the control plane.
-                let request = send_prepared_signal(
-                    &current_http,
-                    &auth.base_url,
-                    &auth.token,
-                    &payload,
-                );
+                let request =
+                    send_prepared_signal(&current_http, &auth.base_url, &auth.token, &payload);
                 tokio::pin!(request);
                 loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -353,7 +358,7 @@ async fn run_candidate_offer_worker(
                         }
                     }
                 }
-            },
+            }
         };
         let result = match result {
             CandidateOfferAttempt::Completed(_)

@@ -25,6 +25,8 @@ use crate::tasks::{HealthState, TaskManager};
 use crate::traversal_history::TraversalHistoryDiagnostics;
 use crate::udp::{UdpSocketPoolMemberDiagnostics, UdpTransport};
 
+pub mod logging;
+
 include!("diagnostics/types.rs");
 include!("diagnostics/mtu.rs");
 include!("diagnostics/event_bus.rs");

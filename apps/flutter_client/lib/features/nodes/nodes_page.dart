@@ -30,6 +30,10 @@ part 'nodes/peer_detail.dart';
 part 'nodes/peer_dialogs.dart';
 part 'nodes/helpers.dart';
 part 'nodes/speed_test.dart';
+part 'nodes/speed_test_telemetry.dart';
+part 'nodes/speed_test_desktop.dart';
+part 'nodes/speed_test_desktop_chart.dart';
+part 'nodes/speed_test_mobile.dart';
 part 'nodes/remote_only.dart';
 
 enum _NodesLayout { compact, medium, expanded }

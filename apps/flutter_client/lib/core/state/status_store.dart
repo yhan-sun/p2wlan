@@ -276,7 +276,6 @@ class StatusStore extends ChangeNotifier {
     _appInForeground = appInForeground;
     if (!appInForeground) {
       _eventLoopFuture = null;
-      cancelSpeedTest();
     }
     _schedulePolling();
     if (_autoRefreshEnabled && appInForeground) {
@@ -549,7 +548,8 @@ class StatusStore extends ChangeNotifier {
           _clearSnapshot();
         }
         _routeHealthy = false;
-        _lastHealthError = diagnosticsApi.healthFailureFor(url)?.toString() ??
+        _lastHealthError =
+            diagnosticsApi.healthFailureFor(url)?.toString() ??
             'GET /health is offline or unreadable';
         _lastStatusError = 'GET /status skipped because /health is offline';
         _lastError = _lastHealthError;
@@ -801,7 +801,9 @@ class StatusStore extends ChangeNotifier {
         final delay = startupCatalogRefreshInterval > remaining
             ? remaining
             : startupCatalogRefreshInterval;
-        await Future<void>.delayed(delay > Duration.zero ? delay : Duration.zero);
+        await Future<void>.delayed(
+          delay > Duration.zero ? delay : Duration.zero,
+        );
         if (_disposed || generation != _refreshGeneration) return;
         await refresh(silent: silent);
         refreshCount += 1;
@@ -867,7 +869,9 @@ class StatusStore extends ChangeNotifier {
     _lastSpeedTestResult = null;
     _lastSpeedTestError = null;
     notifyListeners();
-    bool acceptsSession() => !_disposed && runId == _speedTestRunId &&
+    bool acceptsSession() =>
+        !_disposed &&
+        runId == _speedTestRunId &&
         url == settingsStore.settings.diagnosticsUrl;
     try {
       final result = await diagnosticsApi.runSpeedTest(
@@ -915,10 +919,12 @@ class StatusStore extends ChangeNotifier {
       final snapshot = await diagnosticsApi.fetchStatus(
         settingsStore.settings.diagnosticsUrl,
       );
-      if (_disposed || generation != _refreshGeneration ||
+      if (_disposed ||
+          generation != _refreshGeneration ||
           runId != _speedTestRunId ||
           !_snapshotCanReplace(snapshot, current) ||
-          (current?.processId != null && snapshot.processId != current?.processId) ||
+          (current?.processId != null &&
+              snapshot.processId != current?.processId) ||
           snapshot.peerSnapshotStale) {
         return null;
       }
@@ -926,7 +932,8 @@ class StatusStore extends ChangeNotifier {
         if (nodeId.isNotEmpty && candidate.nodeId.trim() == nodeId) {
           return candidate;
         }
-        if (nodeId.isEmpty && virtualIp.isNotEmpty &&
+        if (nodeId.isEmpty &&
+            virtualIp.isNotEmpty &&
             candidate.virtualIp.trim() == virtualIp) {
           return candidate;
         }

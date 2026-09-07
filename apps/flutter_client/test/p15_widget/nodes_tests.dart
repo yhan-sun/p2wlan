@@ -389,6 +389,37 @@ void _registerNodesTests() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'Nodes does not offer Direct-only speed tests for relay devices',
+    (tester) async {
+      tester.view.physicalSize = const Size(800, 1200);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final snapshot = (await tester.runAsync(_loadFixtureSnapshot))!;
+      final api = _FakeDiagnosticsApi(health: true, snapshot: snapshot);
+      final stores = (await tester.runAsync(() => _makeStores(api: api)))!;
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      await tester.pumpWidget(
+        _TestApp(
+          child: NodesPage(
+            settingsStore: stores.settingsStore,
+            statusStore: stores.statusStore,
+          ),
+        ),
+      );
+      await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const Key('node-detail-speedtest-peer-relay-002')),
+        findsNothing,
+      );
+      expect(api.speedTestCount, 0);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('Nodes runs a ten-second speed test for the selected device', (
     tester,
   ) async {
@@ -424,10 +455,10 @@ void _registerNodesTests() {
     );
 
     // Actions live inside the explicitly opened detail surface.
-    await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
+    await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
     final speedTestAction = find.byKey(
-      const Key('node-detail-speedtest-peer-relay-002'),
+      const Key('node-detail-speedtest-peer-direct-001'),
     );
     await tester.ensureVisible(speedTestAction);
     await tester.pumpAndSettle();
@@ -452,7 +483,7 @@ void _registerNodesTests() {
       find.descendant(of: speedDialog, matching: find.text('Upload speed')),
       findsOneWidget,
     );
-    expect(find.text('relay-nas'), findsWidgets);
+    expect(find.text('direct-laptop'), findsWidgets);
 
     await tester.tap(find.byKey(const Key('node-speedtest-start')));
     await tester.pump();
@@ -463,7 +494,7 @@ void _registerNodesTests() {
     expect(
       find.descendant(
         of: find.byKey(const Key('node-speedtest-dialog')),
-        matching: find.text('43 ms'),
+        matching: find.text('24 ms'),
       ),
       findsOneWidget,
     );
@@ -525,10 +556,10 @@ void _registerNodesTests() {
       ),
     );
 
-    await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
+    await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
     final speedTestAction = find.byKey(
-      const Key('node-detail-speedtest-peer-relay-002'),
+      const Key('node-detail-speedtest-peer-direct-001'),
     );
     await tester.ensureVisible(speedTestAction);
     await tester.pumpAndSettle();
@@ -587,12 +618,12 @@ void _registerNodesTests() {
       ),
     );
 
-    await tester.tap(find.byKey(const Key('node-row-peer-relay-002')));
+    await tester.tap(find.byKey(const Key('node-row-peer-direct-001')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('nodes-mobile-detail')), findsOneWidget);
 
     final speedTestAction = find.byKey(
-      const Key('node-detail-speedtest-peer-relay-002'),
+      const Key('node-detail-speedtest-peer-direct-001'),
     );
     await tester.ensureVisible(speedTestAction);
     await tester.tap(speedTestAction);

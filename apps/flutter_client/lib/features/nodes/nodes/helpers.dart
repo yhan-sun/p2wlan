@@ -10,7 +10,14 @@ bool _peerIsOffline(PeerSnapshot peer) =>
     !peer.online || peer.path == 'offline';
 
 bool _canRunSpeedTest(PeerSnapshot peer) =>
-    peer.online && peer.virtualIp.trim().isNotEmpty;
+    peer.online &&
+    peer.activePath == 'direct' &&
+    peer.path == 'direct' &&
+    peer.virtualIp.trim().isNotEmpty;
+
+String _speedTestUnavailableMessage(AppStrings strings) => strings.isZh
+    ? '测速需要已确认的直连路径和有效虚拟 IP；中继或离线设备暂不支持。'
+    : 'Speed tests require a confirmed direct path and a virtual IP; relay and offline devices are not supported.';
 
 String _connectionLabel(AppStrings strings, PeerSnapshot peer) {
   if (_peerIsOffline(peer)) return strings.offline;

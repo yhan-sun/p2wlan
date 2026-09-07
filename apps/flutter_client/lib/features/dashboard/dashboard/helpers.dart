@@ -160,10 +160,10 @@ String? _dashboardIssueMessage({
 }) {
   // Stopped / offline / stale are first-class states handled by the hero
   // itself; the banner exists only for real network problems.
+  if (startupCatalogSettling) return null;
   if (!daemonAvailable) return null;
   if (snapshotStale) return null;
   if (!statusReachable && statusError != null) {
-    if (startupCatalogSettling) return null;
     return strings.statusMessage(statusError) ?? statusError;
   }
   if (!healthReachable && healthError != null) {

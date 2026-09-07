@@ -152,6 +152,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify log format compatibility
+        run: |
+          python3 scripts/dual-end/test-log-format-compatibility.py
+          python3 scripts/dual-end/test-production-availability-parser.py
+          bash -n scripts/dual-end/mini-air-smoke.sh
+          bash -n scripts/nat-sim/nat-sim-smoke.sh
       - name: Assert web GUI dependencies are absent
         run: |
           test ! -e package.json
