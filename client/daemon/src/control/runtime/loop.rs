@@ -48,6 +48,12 @@ async fn run_control_loop(
                 .await;
                 match registration {
                     Ok((node_id, virtual_ip, cidr, server_relay_servers, relay_catalog)) => {
+                        let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                            base_url: base_url.clone(),
+                            token: token.clone(),
+                            self_node_id: node_id.clone(),
+                            signal_signing_identity: signal_signing_identity.clone(),
+                        }));
                         if let Some(health) = health.as_ref() {
                             health.mark_device_lease_success().await;
                         }

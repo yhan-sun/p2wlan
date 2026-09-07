@@ -378,9 +378,9 @@ fn open_private_log(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000);
+        options.append(false).write(true).custom_flags(0x00200000);
     }
-    let file = options.open(path)?;
+    let mut file = options.open(path)?;
     let metadata = file.metadata()?;
     #[cfg(windows)]
     {
@@ -403,6 +403,7 @@ fn open_private_log(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    file.seek(SeekFrom::End(0))?;
     Ok(file)
 }
 
@@ -420,6 +421,7 @@ fn trim_oversized_log(file: &mut File, max_bytes: u64) -> io::Result<u64> {
         .map(|position| position + 1)
         .unwrap_or(tail.len());
     file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     file.write_all(&tail[start..])?;
     Ok((tail.len() - start) as u64)
 }
@@ -518,6 +520,8 @@ impl RollingFile {
             self.rotate()?;
         }
         if let Some(file) = self.file.as_mut() {
+            #[cfg(windows)]
+            file.seek(SeekFrom::End(0))?;
             if let Err(error) = file.write_all(bytes) {
                 self.length = file
                     .metadata()
@@ -622,6 +626,29 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() <= 128);
         assert!(std::fs::metadata(archive_path(&path, 1)).unwrap().len() <= 128);
         drop(file);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn trimming_preserves_complete_tail_then_appends_without_sparse_gaps() {
+        let path = temp_log();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = (0..100)
+            .map(|index| format!("entry-{index:03}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &original).unwrap();
+        let mut file = RollingFile::open(&path, 128, 2).unwrap();
+        let trimmed = std::fs::read_to_string(&path).unwrap();
+        assert!(original.ends_with(&trimmed));
+        assert!(!trimmed.is_empty());
+        assert!(!trimmed.contains('\0'));
+        file.write_record(b"last\n").unwrap();
+        file.flush().unwrap();
+        drop(file);
+        let retained = std::fs::read_to_string(&path).unwrap();
+        assert!(retained.ends_with("last\n"));
+        assert!(!retained.contains('\0'));
+        assert!(retained.len() <= 128);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

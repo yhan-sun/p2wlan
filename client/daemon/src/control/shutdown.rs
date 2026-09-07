@@ -78,6 +78,20 @@ impl ControlSupervisor {
             _ = &mut tasks.ordinary => (true, false),
             _ = &mut tasks.critical => (false, true),
         };
+        let registration_unknown = self.auth_rx.borrow().is_none();
+        if !ordinary_completed && registration_unknown {
+            let _ = timeout(Duration::from_millis(200), async {
+                loop {
+                    if self.auth_rx.borrow_and_update().is_some() {
+                        break;
+                    }
+                    if self.auth_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
         self.shutdown_tx.send_replace(true);
         tasks.ordinary.abort();
         let ordinary_quiesced = ordinary_completed
@@ -197,6 +211,49 @@ mod shutdown_reliability_tests {
         assert!(!client.state.read().await.registered);
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_briefly_for_an_already_accepted_registration_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (response_tx, response_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.read(&mut chunk).await.unwrap();
+            accepted_tx.send(()).unwrap();
+            response_rx.await.unwrap();
+            let body = r#"{"success":true,"node_id":"registered-node","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).await.unwrap();
+            drop(stream);
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let n = stream.read(&mut chunk).await.unwrap();
+                let line = String::from_utf8_lossy(&chunk[..n]);
+                if line.starts_with("POST /api/v1/devices/registered-node/offline ") {
+                    let body = r#"{"success":true}"#;
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    break;
+                }
+            }
+        });
+        let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+        config.control.auth_token = "test-token".into();
+        config.node.ed25519_private_key.clear();
+        config.node.ed25519_public_key.clear();
+        let (client, _events) = ControlClient::new(
+            &config, true, None, None, ConnectionTimeline::new("test-node", 0),
+        );
+        timeout(Duration::from_secs(2), accepted_rx).await.unwrap().unwrap();
+        client.shutdown_lifecycle.as_ref().unwrap().requested.send_replace(true);
+        tokio::task::yield_now().await;
+        response_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), client.shutdown()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
     }
 
     #[tokio::test]
