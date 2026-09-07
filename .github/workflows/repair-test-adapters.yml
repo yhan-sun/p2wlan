@@ -1,0 +1,88 @@
+name: Repair Test Adapters
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/repair-test-adapters.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  adapters:
+    if: github.event.pull_request.number == 69 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'feat/reliability-diagnostics-speedtest-20260907'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+      - name: Complete six test adapters and store immutable source blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, re, subprocess, urllib.request
+          root = pathlib.Path('apps/flutter_client/test')
+          expected = {
+              'desktop_tray_controller_test.dart': ('cc5153b04b3986e719adfeb49280fff8c6bac860', 1),
+              'login_page_test.dart': ('e106bfd56ca3aff1b8dbd23d23142e92e05dc80d', 1),
+              'onboarding_page_test.dart': ('d96e16e0f3d1ffe53c363cf71552bfe729321938', 2),
+              'p15_widget/helpers.dart': ('cd7338f9cfa3225744e1ebdfe55eaa70d8a083ac', 1),
+              'status_store_test.dart': ('95f2763f19fc907eb9358f1c1da0697438fa5e60', 1),
+          }
+          def blob_hash(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          files = []
+          for name, (sha, count) in expected.items():
+              path = root / name
+              original = path.read_bytes()
+              assert blob_hash(original) == sha, str(path)
+              text, changes = re.subn(r'(class \w+ implements DiagnosticsApi \{\n)',
+                  r'\1  @override\n  void cancelSpeedTest() {}\n\n  @override\n  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;\n\n', original.decode())
+              assert changes == count, str(path)
+              path.write_text(text)
+              files.append(str(path))
+          subprocess.run(['dart', 'format', *files], check=True)
+          entries = []
+          for path in files:
+              data = pathlib.Path(path).read_bytes()
+              payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
+              req = urllib.request.Request('https://api.github.com/repos/yhan-sun/p2wlan/git/blobs', data=payload, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+              })
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  sha = json.load(response)['sha']
+              assert sha == blob_hash(data)
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+          result = {
+              'parent': subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode().strip(),
+              'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}']).decode().strip(),
+              'entries': entries,
+          }
+          pathlib.Path('/tmp/test-adapters.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: test-adapters-${{ github.event.pull_request.head.sha }}
+          path: /tmp/test-adapters.json
+          retention-days: 7
+      - name: Analyze and run all Flutter tests
+        working-directory: apps/flutter_client
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
