@@ -12,44 +12,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  toolchains:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: '1.26.6'
           cache-dependency-path: server/go.sum
-      - name: Format room source and capture diff
+      - name: Prepare offline compiler and dependency bundles
         run: |
-          gofmt -w server/database/rooms*.go server/api/room*.go
-          git diff --binary > /tmp/friend-rooms-format.patch
-          tar --exclude=.git -czf /tmp/p2wlan-source.tar.gz .
-          git rev-parse HEAD > /tmp/source-head.txt
-      - name: Go vet
-        working-directory: server
-        run: go vet ./... 2>&1 | tee /tmp/go-vet.log
-      - name: Go tests with race detector
-        working-directory: server
-        run: go test -race ./... -count=1 2>&1 | tee /tmp/go-test.log
-      - name: Vendor test dependencies
-        if: always()
-        working-directory: server
-        run: |
-          go mod vendor
-          tar -czf /tmp/go-vendor.tar.gz vendor
-      - name: Upload source and test evidence
+          set -euo pipefail
+          mkdir -p /tmp/room-tools
+          rustc --version > /tmp/room-tools/versions.txt
+          cargo --version >> /tmp/room-tools/versions.txt
+          go version >> /tmp/room-tools/versions.txt
+          cargo vendor --locked --versioned-dirs /tmp/room-vendor > /tmp/room-tools/cargo-config.toml
+          tar -C /tmp -czf /tmp/room-tools/rust-vendor.tar.gz room-vendor
+          SYSROOT="$(rustc --print sysroot)"
+          tar -C "$SYSROOT" --exclude=share/doc --exclude=share/man -czf /tmp/room-tools/rust-toolchain.tar.gz .
+          tar -C "$(go env GOROOT)" --exclude=doc --exclude=test -czf /tmp/room-tools/go-toolchain.tar.gz .
+      - name: Upload isolated offline tools
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: friend-rooms-evidence-${{ github.sha }}
-          path: |
-            /tmp/p2wlan-source.tar.gz
-            /tmp/source-head.txt
-            /tmp/friend-rooms-format.patch
-            /tmp/go-vendor.tar.gz
-            /tmp/go-vet.log
-            /tmp/go-test.log
+          name: friend-rooms-offline-tools-${{ github.sha }}
+          path: /tmp/room-tools/
+          compression-level: 0
           retention-days: 1
