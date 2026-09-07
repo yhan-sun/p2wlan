@@ -34,11 +34,31 @@ jobs:
           FLUTTER_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v flutter)")")")"
           flutter --version > /tmp/flutter-tools/versions.txt
           tar -C "$FLUTTER_ROOT" --exclude=examples --exclude=dev --exclude=.git --exclude=bin/cache/artifacts/engine/android-arm --exclude=bin/cache/artifacts/engine/android-arm-profile --exclude=bin/cache/artifacts/engine/android-arm-release --exclude=bin/cache/artifacts/engine/android-arm64 --exclude=bin/cache/artifacts/engine/android-arm64-profile --exclude=bin/cache/artifacts/engine/android-arm64-release --exclude=bin/cache/artifacts/engine/android-x64 --exclude=bin/cache/artifacts/engine/android-x64-profile --exclude=bin/cache/artifacts/engine/android-x64-release --exclude=bin/cache/artifacts/engine/android-x86 -czf /tmp/flutter-tools/flutter-sdk.tar.gz .
+          split -b 200M /tmp/flutter-tools/flutter-sdk.tar.gz /tmp/flutter-tools/sdk.part.
           tar -C "${PUB_CACHE:-$HOME/.pub-cache}" -czf /tmp/flutter-tools/pub-cache.tar.gz .
-      - name: Upload test environment
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: friend-rooms-flutter-tools-${{ github.sha }}
-          path: /tmp/flutter-tools/
+          name: friend-rooms-flutter-sdk-aa-${{ github.sha }}
+          path: /tmp/flutter-tools/sdk.part.aa
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: friend-rooms-flutter-sdk-ab-${{ github.sha }}
+          path: /tmp/flutter-tools/sdk.part.ab
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: friend-rooms-flutter-sdk-ac-${{ github.sha }}
+          path: /tmp/flutter-tools/sdk.part.ac
+          compression-level: 0
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: friend-rooms-flutter-pub-${{ github.sha }}
+          path: |
+            /tmp/flutter-tools/pub-cache.tar.gz
+            /tmp/flutter-tools/versions.txt
           compression-level: 0
           retention-days: 1
