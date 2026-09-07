@@ -177,6 +177,9 @@ pub fn clear_android_socket_protector() {
 pub async fn bind_udp(addr: SocketAddr, interface: Option<&str>) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     protect_android_socket(&socket)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
     if let Some(interface) = normalized_interface(interface) {
         bind_socket_to_interface(&socket, addr.is_ipv4(), interface)?;
     }
@@ -542,6 +545,9 @@ fn read_windows_option<S: UdpSocketRaw>(socket: &S, level: i32, option: i32) -> 
 pub async fn connect_tcp_addr(addr: SocketAddr, interface: Option<&str>) -> io::Result<TcpStream> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     protect_android_socket(&socket)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
     if !addr.ip().is_loopback() {
         if let Some(interface) = normalized_interface(interface) {
             bind_socket_to_interface(&socket, addr.is_ipv4(), interface)?;
@@ -796,5 +802,63 @@ mod tests {
             .unwrap()
             .map(|index| index.get());
         assert_eq!(actual, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn ipv6_socket_is_configured_strictly_only_v6() {
+        let socket = bind_udp("[::1]:0".parse().unwrap(), None).await.unwrap();
+        let sock_ref = socket2::SockRef::from(&socket);
+        assert!(
+            sock_ref.only_v6().unwrap(),
+            "IPv6 UDP socket must have IPV6_V6ONLY explicitly set to true"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv4_and_ipv6_sockets_bind_independently_on_same_port() {
+        let v4 = bind_udp("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let v6_res = bind_udp(format!("[::1]:{port}").parse().unwrap(), None).await;
+        if let Ok(v6) = v6_res {
+            assert_eq!(v6.local_addr().unwrap().port(), port);
+            assert!(socket2::SockRef::from(&v6).only_v6().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv4_mapped_ipv6_fails_on_ipv6_only_socket() {
+        let v6_server = bind_udp("[::1]:0".parse().unwrap(), None).await.unwrap();
+        let server_port = v6_server.local_addr().unwrap().port();
+
+        let v6_client = bind_udp("[::1]:0".parse().unwrap(), None).await.unwrap();
+        let mapped_addr: SocketAddr = format!("[::ffff:127.0.0.1]:{server_port}").parse().unwrap();
+        let send_result = v6_client.send_to(b"test", mapped_addr).await;
+        assert!(
+            send_result.is_err(),
+            "IPv4-mapped address must not be reachable via an IPv6-only socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn address_family_mismatch_send_fails_safely() {
+        let v4_client = bind_udp("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let v6_target: SocketAddr = "[::1]:9999".parse().unwrap();
+        let v4_to_v6 = v4_client.send_to(b"payload", v6_target).await;
+        assert!(
+            v4_to_v6.is_err(),
+            "IPv4 socket cannot send to IPv6 destination"
+        );
+
+        let v6_client = bind_udp("[::1]:0".parse().unwrap(), None).await.unwrap();
+        let v4_target: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let v6_to_v4 = v6_client.send_to(b"payload", v4_target).await;
+        assert!(
+            v6_to_v4.is_err(),
+            "IPv6 socket cannot send to IPv4 destination"
+        );
     }
 }

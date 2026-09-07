@@ -145,8 +145,18 @@ fn test_candidate_host_ip_filter() {
         224, 0, 0, 1
     ))));
     assert!(!is_candidate_host_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    assert!(!is_candidate_host_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     assert!(!is_candidate_host_ip(IpAddr::V6(
         "fe80::1".parse().unwrap()
+    )));
+    assert!(!is_candidate_host_ip(IpAddr::V6(
+        "ff02::1".parse().unwrap()
+    )));
+    assert!(is_candidate_host_ip(IpAddr::V6(
+        "240e:34c:13d:3c6a::1".parse().unwrap()
+    )));
+    assert!(is_candidate_host_ip(IpAddr::V6(
+        "fd00::1".parse().unwrap()
     )));
     assert!(is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(
         192, 168, 2, 4
