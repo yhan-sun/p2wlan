@@ -1,0 +1,50 @@
+name: Repair CI Cleanup
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/repair-ci-cleanup.yml']
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  superseded-runs:
+    if: github.event.pull_request.number == 69 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'feat/reliability-diagnostics-speedtest-20260907'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel only superseded runs owned by PR 69
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.parse, urllib.error
+          base = 'https://api.github.com/repos/yhan-sun/p2wlan'
+          branch = 'feat/reliability-diagnostics-speedtest-20260907'
+          def call(path, post=False):
+              request = urllib.request.Request(base + path, data=b'' if post else None, headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request,timeout=30) as response:
+                  data=response.read()
+                  return json.loads(data) if data else {}
+          cancelled=[]
+          for page in range(1,6):
+              data=call('/actions/runs?'+urllib.parse.urlencode({'branch':branch,'event':'pull_request','per_page':100,'page':page}))
+              runs=data['workflow_runs']
+              for run in runs:
+                  if run['id'] in [int(os.environ['RUN_ID']),34083225615] or run['head_sha']==os.environ['HEAD_SHA'] or run['status']=='completed': continue
+                  if run['head_branch'] != branch or run['head_repository']['full_name'] != 'yhan-sun/p2wlan': continue
+                  if not any(pr['number']==69 for pr in run.get('pull_requests',[])): continue
+                  try:
+                      call('/actions/runs/'+str(run['id'])+'/cancel',post=True)
+                      cancelled.append({'id':run['id'],'name':run['name'],'head':run['head_sha']})
+                  except urllib.error.HTTPError as error:
+                      if error.code not in [409,422]: raise
+              if len(runs)<100:break
+          print(json.dumps({'cancelled_superseded_runs':cancelled},indent=2))
+          PY
