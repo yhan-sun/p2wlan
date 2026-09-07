@@ -209,12 +209,12 @@ extension _SettingsPageActions on _SettingsPageState {
     try {
       final stopped = await widget.statusStore.stopDaemon();
       if (!stopped.ok) {
-        _showSnackBar(stopped.message);
+        _showSnackBar(strings.tunnelRestartFailed);
         return;
       }
       final started = await widget.statusStore.startDaemon();
       if (!started.ok) {
-        _showSnackBar(started.message);
+        _showSnackBar(strings.tunnelRestartFailed);
         return;
       }
       if (mounted) _updateState(() => _restartRequired = false);

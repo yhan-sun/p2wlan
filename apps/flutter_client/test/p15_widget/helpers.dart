@@ -74,6 +74,12 @@ class _Stores {
 }
 
 class _FakeDiagnosticsApi implements DiagnosticsApi {
+  @override
+  void cancelSpeedTest() {}
+
+  @override
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
+
   _FakeDiagnosticsApi({
     required this.health,
     this.snapshot,

@@ -16,6 +16,12 @@ import 'package:p2wlan_flutter_client/features/onboarding/onboarding_page.dart';
 
 class _OfflineDiagnosticsApi implements DiagnosticsApi {
   @override
+  void cancelSpeedTest() {}
+
+  @override
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
+
+  @override
   Future<bool> fetchHealth(String diagnosticsUrl) async => false;
 
   @override
@@ -68,6 +74,12 @@ class _OfflineDiagnosticsApi implements DiagnosticsApi {
 
 /// A diagnostics API that reports the daemon as already running.
 class _RunningDiagnosticsApi implements DiagnosticsApi {
+  @override
+  void cancelSpeedTest() {}
+
+  @override
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
+
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async => true;
 

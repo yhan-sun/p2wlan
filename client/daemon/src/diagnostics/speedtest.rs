@@ -233,6 +233,11 @@ async fn receive_speedtest_payload(stream: &mut TcpStream, duration: Duration) -
     let mut bytes = 0u64;
     let deadline = tokio::time::Instant::now() + duration + SPEEDTEST_TRANSFER_GRACE;
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DaemonError::Network(
+                "speedtest upload exceeded total deadline".to_string(),
+            ));
+        }
         let n = tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await
             .map_err(|_| DaemonError::Network("speedtest upload exceeded total deadline".to_string()))?
             .map_err(|e| DaemonError::Network(format!("speedtest upload read failed: {e}")))?;
@@ -496,6 +501,24 @@ mod speedtest_reliability_tests {
         let result = timeout(Duration::from_secs(4), receive_speedtest_payload(&mut server, Duration::from_millis(100)))
             .await.unwrap();
         assert!(result.unwrap_err().to_string().contains("total deadline"));
+    }
+
+    #[tokio::test]
+    async fn upload_receiver_bounds_a_continuous_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let writer = tokio::spawn(async move {
+            let payload = vec![0u8; SPEEDTEST_BUFFER_SIZE];
+            while client.write_all(&payload).await.is_ok() {}
+        });
+        let result = timeout(
+            Duration::from_secs(4),
+            receive_speedtest_payload(&mut server, Duration::from_millis(100)),
+        ).await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("total deadline"));
+        drop(server);
+        timeout(Duration::from_secs(1), writer).await.unwrap().unwrap();
     }
 
     #[tokio::test]

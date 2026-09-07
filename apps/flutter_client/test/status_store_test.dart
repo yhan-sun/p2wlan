@@ -799,6 +799,12 @@ class _LifecycleDiagnosticsApi extends _SwitchingDiagnosticsApi {
 }
 
 class _SwitchingDiagnosticsApi implements DiagnosticsApi {
+  @override
+  void cancelSpeedTest() {}
+
+  @override
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
+
   _SwitchingDiagnosticsApi({
     required this.snapshot,
     this.oldHealth,

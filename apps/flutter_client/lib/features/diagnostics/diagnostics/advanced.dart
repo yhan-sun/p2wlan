@@ -191,7 +191,10 @@ class _RuntimeDetailsPanel extends StatelessWidget {
       if (statusStore.lastError != null)
         _KvRow(
           label: strings.lastError,
-          value: redactSensitive(statusStore.lastError!),
+          value: redactSensitive(
+            strings.statusMessage(statusStore.lastError) ??
+                statusStore.lastError!,
+          ),
         ),
       if (health?.reason != null)
         _KvRow(

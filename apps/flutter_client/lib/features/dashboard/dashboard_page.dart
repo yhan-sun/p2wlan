@@ -6,10 +6,12 @@ import '../../app/app_strings.dart';
 import '../../app/app_tokens.dart';
 import '../../app/p2wlan_colors.dart';
 import '../../core/capabilities/platform_capabilities.dart';
+import '../../core/daemon/daemon_controller.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/formatters.dart';
+import '../../shared/permission_copy.dart';
 import '../../shared/widgets/page_scaffold.dart';
 import '../../shared/widgets/status_badge.dart';
 import '../../shared/widgets/device_type_icon.dart';
@@ -76,7 +78,17 @@ class DashboardPage extends StatelessWidget {
             (statusStore.lastFetchedAt == null && statusStore.refreshing);
         final startupFailure =
             !statusStore.daemonBusy && statusStore.lastDaemonFailureCode != null
-            ? statusStore.lastDaemonMessage
+            ? daemonStartupFailurePresentation(
+                strings,
+                DaemonCommandResult(
+                  ok: false,
+                  message: '',
+                  failureCode: statusStore.lastDaemonFailureCode,
+                ),
+              )
+            : !statusStore.daemonBusy &&
+                  statusStore.lastError == 'daemon_operation_failed'
+            ? strings.daemonOperationFailed
             : null;
         final peers = snapshot?.peers ?? const <PeerSnapshot>[];
         final counts = _countPeers(peers);

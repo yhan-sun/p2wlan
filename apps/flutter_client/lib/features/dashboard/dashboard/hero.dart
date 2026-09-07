@@ -93,6 +93,9 @@ class _NetworkHero extends StatelessWidget {
     final strings = AppStringsScope.of(context);
     final theme = Theme.of(context);
     final hasSnapshot = snapshot != null;
+    final startupPending =
+        initialProbePending &&
+        (daemonBusy || status == _NetworkStatus.unavailable);
 
     final showStop =
         canControlLocalDaemon &&
@@ -137,7 +140,7 @@ class _NetworkHero extends StatelessWidget {
             ),
             const SizedBox(width: AppTokens.space8),
             StatusBadge(
-              label: initialProbePending
+              label: startupPending
                   ? (strings.isZh ? '连接中' : 'Connecting')
                   : _networkStatusLabel(strings, status, canControlLocalDaemon),
               tone: _networkStatusTone(status),
@@ -204,7 +207,7 @@ class _NetworkHero extends StatelessWidget {
           ),
         ] else ...[
           Text(
-            initialProbePending
+            startupPending
                 ? (strings.isZh ? '正在连接 P2WLAN' : 'Connecting to P2WLAN')
                 : showStartGuide
                 ? strings.homeStoppedTitle
@@ -218,7 +221,7 @@ class _NetworkHero extends StatelessWidget {
           ),
           const SizedBox(height: AppTokens.space6),
           Text(
-            initialProbePending
+            startupPending
                 ? (strings.isZh
                       ? '正在等待本地网络服务就绪；如出现系统授权，请完成授权。'
                       : 'Waiting for the local network service. Complete the system permission prompt if shown.')

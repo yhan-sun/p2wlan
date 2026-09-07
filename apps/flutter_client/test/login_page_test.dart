@@ -683,6 +683,12 @@ class _Stores {
 
 class _OfflineDiagnosticsApi implements DiagnosticsApi {
   @override
+  void cancelSpeedTest() {}
+
+  @override
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;
+
+  @override
   Future<bool> fetchHealth(String diagnosticsUrl) async => false;
 
   @override

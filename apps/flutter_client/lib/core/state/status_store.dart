@@ -975,14 +975,14 @@ class StatusStore extends ChangeNotifier {
       _lastDaemonMessage = result.message;
       _lastDaemonManualCommand = result.manualCommand;
       _lastDaemonFailureCode = result.failureCode;
-      if (!result.ok) _lastError = result.message;
+      if (!result.ok) _lastError = 'daemon_operation_failed';
       if (result.ok && settlePeerCatalog) {
         await refreshUntilPeerCatalogSettled();
       } else {
         await refresh();
       }
       if (_disposed) return result;
-      if (!result.ok) _lastError = result.message;
+      if (!result.ok) _lastError = 'daemon_operation_failed';
       if (result.ok && Platform.isAndroid) {
         final assignedVirtualIp = _snapshot?.virtualIp.trim() ?? '';
         if (settingsStore.settings.virtualIp.trim().isEmpty &&
@@ -993,10 +993,10 @@ class StatusStore extends ChangeNotifier {
         }
       }
       return result;
-    } catch (error) {
-      final result = DaemonCommandResult(
+    } catch (_) {
+      const result = DaemonCommandResult(
         ok: false,
-        message: 'Daemon operation failed: $error',
+        message: 'daemon_operation_failed',
       );
       if (!_disposed) {
         _lastDaemonMessage = result.message;
@@ -1014,7 +1014,7 @@ class StatusStore extends ChangeNotifier {
 
   bool _shouldSettlePeerCatalog() {
     final settings = settingsStore.settings;
-    return _daemonStarting ||
+    return (_daemonStarting && _snapshot == null) ||
         (!settings.manualMode && settings.authToken.trim().isNotEmpty);
   }
 

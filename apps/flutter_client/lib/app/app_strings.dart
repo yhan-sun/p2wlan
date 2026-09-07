@@ -1179,7 +1179,12 @@ class AppStrings {
     };
   }
 
+  String get daemonOperationFailed => isZh
+      ? '本地网络服务操作失败，请查看诊断日志后重试。'
+      : 'The local network service operation failed. Check diagnostics and try again.';
+
   String? statusMessage(String? message) {
+    if (message == 'daemon_operation_failed') return daemonOperationFailed;
     if (message == null || !isZh) return message;
     if (message == 'GET /health is offline or unreadable') {
       return 'GET /health 离线或不可读';
