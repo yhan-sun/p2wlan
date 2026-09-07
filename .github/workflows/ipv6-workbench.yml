@@ -1,0 +1,27 @@
+name: IPv6 Branch Workbench
+
+on:
+  push:
+    branches: [feat/ipv6-underlay]
+    paths:
+      - .github/workflows/ipv6-workbench.yml
+      - scripts/ipv6-workbench.patch
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.ref == 'refs/heads/feat/ipv6-underlay'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Export tracked source only
+        run: git archive --format=tar.gz HEAD -o /tmp/p2wlan-source.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ipv6-source-${{ github.sha }}
+          path: /tmp/p2wlan-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
