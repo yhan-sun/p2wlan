@@ -25,46 +25,53 @@ jobs:
           channel: stable
           flutter-version-file: .fvmrc
           cache: true
-      - name: Complete six test adapters and store immutable source blobs
+      - name: Prepare hash-verified regression fixes as immutable source blobs
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, re, subprocess, urllib.request
-          root = pathlib.Path('apps/flutter_client/test')
-          expected = {
-              'desktop_tray_controller_test.dart': ('cc5153b04b3986e719adfeb49280fff8c6bac860', 1),
-              'login_page_test.dart': ('e106bfd56ca3aff1b8dbd23d23142e92e05dc80d', 1),
-              'onboarding_page_test.dart': ('d96e16e0f3d1ffe53c363cf71552bfe729321938', 2),
-              'p15_widget/helpers.dart': ('cd7338f9cfa3225744e1ebdfe55eaa70d8a083ac', 1),
-              'status_store_test.dart': ('95f2763f19fc907eb9358f1c1da0697438fa5e60', 1),
-          }
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/yhan-sun/p2wlan'
+          def request(endpoint, data=None):
+              body = None if data is None else json.dumps(data).encode()
+              req = urllib.request.Request(api + endpoint, data=body, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
+              })
+              with urllib.request.urlopen(req, timeout=60) as response: return json.load(response)
           def blob_hash(data):
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          files = []
-          for name, (sha, count) in expected.items():
-              path = root / name
-              original = path.read_bytes()
-              assert blob_hash(original) == sha, str(path)
-              text, changes = re.subn(r'(class \w+ implements DiagnosticsApi \{\n)',
-                  r'\1  @override\n  void cancelSpeedTest() {}\n\n  @override\n  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) => null;\n\n', original.decode())
-              assert changes == count, str(path)
-              path.write_text(text)
-              files.append(str(path))
-          subprocess.run(['dart', 'format', *files], check=True)
+          def blob(sha):
+              data = base64.b64decode(request('/git/blobs/' + sha)['content'])
+              assert blob_hash(data) == sha
+              return data
+          edits = {}
+          for entry in json.loads(blob('fc01d87580f094230a951f0d944acf72021f94df')):
+              path = pathlib.Path(entry['path'])
+              assert str(path).startswith(('apps/flutter_client/', 'client/daemon/src/diagnostics/'))
+              source = path.read_bytes()
+              assert blob_hash(source) == entry['source_sha'], str(path)
+              text = source.decode()
+              result = ''.join(op if isinstance(op, str) else text[op[0]:op[1]] for op in entry['ops']).encode()
+              assert blob_hash(result) == entry['sha'], str(path)
+              edits[str(path)] = result
+          prepared = {
+              'apps/flutter_client/test/desktop_tray_controller_test.dart': '2b32617ad6f0dee757e3cd46ee163585c04ad5a1',
+              'apps/flutter_client/test/login_page_test.dart': '10351242deeb0a099c7ee126394317f76a0efb39',
+              'apps/flutter_client/test/onboarding_page_test.dart': '6e050b541d4a81bbe16bc65d704d7bf984543c4d',
+              'apps/flutter_client/test/p15_widget/helpers.dart': 'cd0fde15d96666a68e61eb092fc71ab5b7bf407d',
+              'apps/flutter_client/test/status_store_test.dart': '9b7d81f84c92c8bdc3cb6cc3d1742de8c3d88737',
+              'apps/flutter_client/test/startup_regression_test.dart': '66ecb63579035ecd1cea0ff1e6714bfc55ae7fd0',
+          }
+          for path, sha in prepared.items(): edits[path] = blob(sha)
+          for path, data in edits.items(): pathlib.Path(path).write_bytes(data)
+          subprocess.run(['dart', 'format', *[p for p in edits if p.endswith('.dart')]], check=True)
           entries = []
-          for path in files:
+          for path in edits:
               data = pathlib.Path(path).read_bytes()
-              payload = json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}).encode()
-              req = urllib.request.Request('https://api.github.com/repos/yhan-sun/p2wlan/git/blobs', data=payload, headers={
-                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                  'Accept': 'application/vnd.github+json',
-                  'Content-Type': 'application/json',
-              })
-              with urllib.request.urlopen(req, timeout=30) as response:
-                  sha = json.load(response)['sha']
+              sha = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
               assert sha == blob_hash(data)
               entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
           result = {
