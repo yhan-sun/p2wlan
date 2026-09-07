@@ -7,50 +7,89 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
-  failure-evidence:
+  regression:
     if: github.event.pull_request.number == 69 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'feat/reliability-diagnostics-speedtest-20260907'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      actions: read
     steps:
-      - name: Extract failure context from completed regression jobs
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Prepare verified boundary fixes and immutable source objects
         env:
           GH_TOKEN: ${{ github.token }}
+          MATRIX_OS: ${{ matrix.os }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os, pathlib, re, urllib.request, urllib.error, urllib.parse
-          output = pathlib.Path('/tmp/p2wlan-failures')
-          output.mkdir()
-          class NoRedirect(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, req, fp, code, msg, headers, newurl): return None
-          opener = urllib.request.build_opener(NoRedirect)
-          for job in [101619029567, 101619029499]:
-              url = f'https://api.github.com/repos/yhan-sun/p2wlan/actions/jobs/{job}/logs'
-              request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              try:
-                  with opener.open(request, timeout=30) as response: data = response.read()
-              except urllib.error.HTTPError as error:
-                  if error.code not in [301, 302, 303, 307, 308]: raise
-                  location = error.headers['Location']
-                  assert urllib.parse.urlparse(location).scheme == 'https'
-                  with urllib.request.urlopen(urllib.request.Request(location), timeout=60) as response: data = response.read()
-              text = data.decode('utf-8', errors='replace')
-              lines = text.splitlines()
-              keep = set(range(max(0, len(lines)-130), len(lines)))
-              for index, line in enumerate(lines):
-                  if re.search(r'FAILED|panicked at|failures:|test result: FAILED|assertion.*failed', line):
-                      keep.update(range(max(0,index-3), min(len(lines),index+18)))
-              report = '\n'.join(lines[index] for index in sorted(keep))
-              (output / f'job-{job}.txt').write_text(report)
-              print(f'===== JOB {job}: {len(lines)} total log lines =====')
-              print(report)
+          python - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          api = 'https://api.github.com/repos/yhan-sun/p2wlan'
+          def request(endpoint, data=None):
+              req = urllib.request.Request(api + endpoint, data=None if data is None else json.dumps(data).encode(), headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
+              })
+              with urllib.request.urlopen(req, timeout=60) as response: return json.load(response)
+          def bh(data): return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          data = base64.b64decode(request('/git/blobs/c0477847d1332a44ae44b02564e6baa44d1d0629')['content'])
+          assert bh(data) == 'c0477847d1332a44ae44b02564e6baa44d1d0629'
+          entries = json.loads(data)
+          for entry in entries:
+              path = entry['path']
+              assert path in ['client/daemon/src/control/shutdown.rs', 'client/daemon/src/control/runtime/loop.rs', 'client/daemon/src/diagnostics/logging.rs']
+              original = subprocess.check_output(['git', 'show', 'HEAD:' + path])
+              assert bh(original) == entry['source_sha'], path
+              source = original.decode()
+              content = ''.join(op if isinstance(op, str) else source[op[0]:op[1]] for op in entry['ops']).encode()
+              assert bh(content) == entry['sha'], path
+              pathlib.Path(path).write_bytes(content)
+          subprocess.run(['cargo', 'fmt', '--all'], check=True)
+          result = []
+          for entry in entries:
+              path = entry['path']; content = pathlib.Path(path).read_bytes()
+              sha = bh(content)
+              if os.environ['MATRIX_OS'] == 'ubuntu-latest':
+                  saved = request('/git/blobs', {'content': base64.b64encode(content).decode(), 'encoding': 'base64'})['sha']
+                  assert saved == sha
+              result.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+          print(json.dumps(result, indent=2))
+          pathlib.Path('boundary-manifest.json').write_text(json.dumps(result, indent=2))
           PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - name: Rust daemon full general regressions and CLI tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p p2wlan-daemon --lib -- --test-threads=1 --skip hard_hard_ > rust-regressions.log 2>&1 || {
+            tail -n 180 rust-regressions.log
+            exit 1
+          }
+          tail -n 5 rust-regressions.log
+          cargo test -p p2wlan --bin p2wlan log_follow_tests -- --test-threads=1 > cli-regression.log 2>&1 || {
+            cat cli-regression.log
+            exit 1
+          }
+          tail -n 10 cli-regression.log
+      - name: Upload regression evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: p2wlan-rust-failure-evidence
-          path: /tmp/p2wlan-failures/
+          name: boundary-regressions-${{ matrix.os }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            boundary-manifest.json
+            rust-regressions.log
+            cli-regression.log
           retention-days: 7
