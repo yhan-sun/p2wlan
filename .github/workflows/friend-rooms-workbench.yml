@@ -3,28 +3,53 @@ name: Friend Rooms Workbench
 on:
   push:
     branches: [feat/friend-rooms]
-    paths:
-      - '.github/workflows/friend-rooms-workbench.yml'
-      - 'scripts/friend-rooms/**'
 
 permissions:
   contents: read
 
+concurrency:
+  group: friend-rooms-workbench-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  source:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Archive tracked source
-        run: |
-          git archive --format=tar.gz --output=/tmp/p2wlan-source.tar.gz HEAD
-          git rev-parse HEAD > /tmp/source-head.txt
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          name: friend-rooms-source-${{ github.sha }}
+          go-version: '1.26.6'
+          cache-dependency-path: server/go.sum
+      - name: Format room source and capture diff
+        run: |
+          gofmt -w server/database/rooms*.go server/api/room*.go
+          git diff --binary > /tmp/friend-rooms-format.patch
+          tar --exclude=.git -czf /tmp/p2wlan-source.tar.gz .
+          git rev-parse HEAD > /tmp/source-head.txt
+      - name: Go vet
+        working-directory: server
+        run: go vet ./... 2>&1 | tee /tmp/go-vet.log
+      - name: Go tests with race detector
+        working-directory: server
+        run: go test -race ./... -count=1 2>&1 | tee /tmp/go-test.log
+      - name: Vendor test dependencies
+        if: always()
+        working-directory: server
+        run: |
+          go mod vendor
+          tar -czf /tmp/go-vendor.tar.gz vendor
+      - name: Upload source and test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: friend-rooms-evidence-${{ github.sha }}
           path: |
             /tmp/p2wlan-source.tar.gz
             /tmp/source-head.txt
+            /tmp/friend-rooms-format.patch
+            /tmp/go-vendor.tar.gz
+            /tmp/go-vet.log
+            /tmp/go-test.log
           retention-days: 1
