@@ -14,8 +14,6 @@ jobs:
     if: github.event.pull_request.number == 69 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'feat/reliability-diagnostics-speedtest-20260907'
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -29,7 +27,7 @@ jobs:
           channel: stable
           flutter-version-file: .fvmrc
           cache: true
-      - name: Restore hash-verified repair objects and publish immutable tree only
+      - name: Restore hash-verified repair objects for review
         env:
           GH_TOKEN: ${{ github.token }}
           REPAIR_HEAD: ${{ github.event.pull_request.head.sha }}
@@ -42,12 +40,10 @@ jobs:
           out = pathlib.Path('/tmp/p2wlan-complete-repair')
           out.mkdir()
           api = 'https://api.github.com/repos/yhan-sun/p2wlan'
-          def request(endpoint, data=None):
-              body = None if data is None else json.dumps(data).encode()
-              req = urllib.request.Request(api + endpoint, data=body, headers={
+          def request(endpoint):
+              req = urllib.request.Request(api + endpoint, headers={
                   'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
                   'Accept': 'application/vnd.github+json',
-                  'Content-Type': 'application/json',
               })
               for attempt in range(4):
                   try:
@@ -92,8 +88,7 @@ jobs:
               target.parent.mkdir(parents=True, exist_ok=True)
               target.write_bytes(content)
           (root / '.github/workflows/repair-workbench.yml').unlink()
-          dart_paths = [path for path in changed if path.endswith('.dart')]
-          subprocess.run(['dart', 'format', *dart_paths], check=True)
+          subprocess.run(['dart', 'format', *[p for p in changed if p.endswith('.dart')]], check=True)
           subprocess.run(['cargo', 'fmt', '--all'], check=True)
           subprocess.run(['git', 'add', '-A'], check=True)
           diff = subprocess.check_output(['git', 'diff', '--cached', '--name-only', '-z']).decode().split('\0')
@@ -104,24 +99,19 @@ jobs:
                   assert path == '.github/workflows/repair-workbench.yml'
                   tree.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': None})
                   continue
-              data = target.read_bytes()
-              sha = request('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
-              assert sha == hash_blob(data)
+              sha = hash_blob(target.read_bytes())
               mode = '100755' if target.stat().st_mode & 0o111 else '100644'
               tree.append({'path': path, 'mode': mode, 'type': 'blob', 'sha': sha})
           parent = subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode().strip()
           assert parent == os.environ['REPAIR_HEAD']
           base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}']).decode().strip()
-          result = request('/git/trees', {'base_tree': base_tree, 'tree': tree})
-          manifest = {'parent': parent, 'base_tree': base_tree, 'tree': result['sha'], 'entries': tree}
+          manifest = {'parent': parent, 'base_tree': base_tree, 'entries': tree}
           (out / 'TREE.json').write_text(json.dumps(manifest, indent=2))
           (out / 'repair.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
           with tarfile.open(out / 'source.tar.gz', 'w:gz') as archive:
               for path in subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0'):
                   if path: archive.add(path, arcname=path, recursive=False)
-          print('REPAIR_TREE=' + result['sha'])
-          print('REPAIR_PARENT=' + parent)
-          print('CHANGED_FILES=' + str(len(tree)))
+          print(json.dumps(manifest, indent=2))
           PY
       - name: Upload reviewed-source candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -136,6 +126,7 @@ jobs:
           cargo test -p p2wlan-daemon --lib diagnostics:: -- --test-threads=1
           cargo test -p p2wlan-daemon --lib shutdown_reliability_tests -- --test-threads=1
       - name: Flutter regression tests
+        if: always()
         working-directory: apps/flutter_client
         shell: bash
         run: |
@@ -144,6 +135,7 @@ jobs:
           flutter analyze
           flutter test test/reliability_regression_test.dart test/log_presentation_test.dart
       - name: Log parser compatibility
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
