@@ -1,0 +1,41 @@
+name: Repair Workbench
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/repair-workbench.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  formatter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+      - name: Prepare reproducible offline formatting workbench
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/p2wlan-repair-workbench
+          git archive HEAD -o /tmp/p2wlan-repair-workbench/source.tar
+          git rev-parse HEAD > /tmp/p2wlan-repair-workbench/COMMIT
+          tar -C "$FLUTTER_ROOT/bin/cache" -czf /tmp/p2wlan-repair-workbench/dart-sdk-linux-x64.tar.gz dart-sdk
+          dart format apps/flutter_client/lib/core/api/diagnostics_api.dart apps/flutter_client/lib/core/state/status_store.dart
+          git diff --binary > /tmp/p2wlan-repair-workbench/format.patch
+          cd /tmp/p2wlan-repair-workbench
+          sha256sum source.tar dart-sdk-linux-x64.tar.gz format.patch > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-repair-workbench-${{ github.event.pull_request.head.sha }}
+          path: /tmp/p2wlan-repair-workbench/
+          retention-days: 1

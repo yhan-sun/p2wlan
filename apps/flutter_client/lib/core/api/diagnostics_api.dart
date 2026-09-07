@@ -13,25 +13,13 @@ class DiagnosticsApi {
        _authTokenReader = authTokenReader ?? readDiagnosticsAuthToken {
     _client
       ..connectionTimeout = _requestTimeout
-      // Every accepted diagnostics URL is loopback-only. Dart's HttpClient
-      // otherwise inherits http_proxy/https_proxy from the launch shell,
-      // which can send 127.0.0.1 health checks to a proxy and make a healthy
-      // daemon look stuck until the startup timeout kills it.
       ..findProxy = null;
   }
 
   static const _requestTimeout = Duration(milliseconds: 3500);
-  // A full snapshot may briefly contend with a network handover.  Keep the
-  // health probe fast, but give `/status` enough time to retry the structured
-  // snapshot-timeout response instead of turning a live daemon into a network
-  // error in the UI.
   static const _statusTimeout = Duration(seconds: 8);
   static const _speedTestTimeout = Duration(seconds: 45);
-  // The daemon holds `/events` for up to ~25s (long-poll); give it margin.
   static const _eventsTimeout = Duration(seconds: 30);
-  // `/health` becomes public as soon as the daemon binds, while the
-  // per-process diagnostics token may be written a moment later. Give that
-  // startup hand-off a short quiet retry window before surfacing HTTP 401.
   static const _authRetryDelays = [
     Duration(milliseconds: 100),
     Duration(milliseconds: 200),
@@ -40,6 +28,13 @@ class DiagnosticsApi {
 
   final HttpClient _client;
   final Future<String?> Function() _authTokenReader;
+  final _healthFailures = <String, DiagnosticsApiException>{};
+  HttpClientRequest? _speedTestRequest;
+  Completer<void>? _speedTestCancellation;
+  var _speedTestGeneration = 0;
+
+  DiagnosticsApiException? healthFailureFor(String diagnosticsUrl) =>
+      _healthFailures[diagnosticsUrl];
 
   Future<bool> fetchHealth(String diagnosticsUrl) async {
     try {
@@ -47,9 +42,37 @@ class DiagnosticsApi {
         _endpoint(diagnosticsUrl, '/health'),
         'text/plain',
         authorize: false,
-      );
-      return body.trim().isNotEmpty;
-    } catch (_) {
+      ).timeout(_requestTimeout);
+      if (body.trim() != 'ok') {
+        throw const DiagnosticsApiException(
+          'GET /health returned an unexpected response',
+          reasonCode: 'health_invalid_response',
+        );
+      }
+      _healthFailures.remove(diagnosticsUrl);
+      return true;
+    } catch (error) {
+      final failure = switch (error) {
+        TimeoutException() => const DiagnosticsApiException(
+          'GET /health timed out while waiting for the local service',
+          reasonCode: 'health_timeout',
+        ),
+        SocketException() => const DiagnosticsApiException(
+          'GET /health could not connect to the local service',
+          reasonCode: 'health_connection_failed',
+        ),
+        DiagnosticsApiException() => error,
+        FormatException() => const DiagnosticsApiException(
+          'The local diagnostics address is invalid',
+          reasonCode: 'health_invalid_address',
+        ),
+        _ => const DiagnosticsApiException(
+          'GET /health failed while reading the local service response',
+          reasonCode: 'health_read_failed',
+        ),
+      };
+      if (_healthFailures.length >= 8) _healthFailures.clear();
+      _healthFailures[diagnosticsUrl] = failure;
       return false;
     }
   }
@@ -90,43 +113,101 @@ class DiagnosticsApi {
     required String peerVirtualIp,
     Duration duration = const Duration(seconds: 10),
   }) async {
-    final request = await _client
-        .postUrl(
-          _endpoint(
-            diagnosticsUrl,
-            '/speedtest',
-            queryParameters: {
-              'peer': peerVirtualIp,
-              'duration_ms': duration.inMilliseconds.toString(),
-            },
-          ),
-        )
-        .timeout(_requestTimeout);
-    request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-    await _authorize(request);
-    request.headers.contentLength = 0;
-    final response = await _closeRequest(request, _speedTestTimeout);
-    final body = await utf8.decodeStream(response).timeout(_speedTestTimeout);
-    final decoded = _tryJsonObject(body);
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      final message = decoded?['error']?.toString();
-      throw DiagnosticsApiException(
-        message == null || message.isEmpty
-            ? 'POST /speedtest returned HTTP ${response.statusCode}'
-            : message,
-      );
-    }
-    if (decoded == null) {
+    if (_speedTestCancellation != null) {
       throw const DiagnosticsApiException(
-        'Diagnostics endpoint /speedtest did not return a JSON object',
+        'A speed test is already running',
+        reasonCode: 'speedtest_busy',
       );
     }
-    return SpeedTestResult.fromJson(decoded);
+    final generation = ++_speedTestGeneration;
+    final cancellation = Completer<void>();
+    _speedTestCancellation = cancellation;
+    HttpClientRequest? activeRequest;
+    void verifySession() {
+      if (generation != _speedTestGeneration) {
+        activeRequest?.abort();
+        throw const DiagnosticsApiException(
+          'Speed test cancelled',
+          reasonCode: 'speedtest_cancelled',
+        );
+      }
+    }
+
+    Future<SpeedTestResult> perform() async {
+      final request = await _client
+          .postUrl(
+            _endpoint(
+              diagnosticsUrl,
+              '/speedtest',
+              queryParameters: {
+                'peer': peerVirtualIp,
+                'duration_ms': duration.inMilliseconds.toString(),
+              },
+            ),
+          )
+          .timeout(_requestTimeout);
+      activeRequest = request;
+      verifySession();
+      _speedTestRequest = request;
+      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      await _authorize(request).timeout(_requestTimeout);
+      verifySession();
+      request.headers.contentLength = 0;
+      final response = await _closeRequest(request, _speedTestTimeout);
+      final body = await utf8.decodeStream(response).timeout(_speedTestTimeout);
+      verifySession();
+      final decoded = _tryJsonObject(body);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final message = decoded?['error']?.toString();
+        throw DiagnosticsApiException(
+          message == null || message.isEmpty
+              ? 'POST /speedtest returned HTTP ${response.statusCode}'
+              : message,
+          statusCode: response.statusCode,
+          reasonCode: decoded?['reason_code']?.toString(),
+        );
+      }
+      if (decoded == null) {
+        throw const DiagnosticsApiException(
+          'Diagnostics endpoint /speedtest did not return a JSON object',
+        );
+      }
+      return SpeedTestResult.fromJson(decoded);
+    }
+
+    try {
+      return await Future.any<SpeedTestResult>([
+        perform(),
+        cancellation.future.then<SpeedTestResult>((_) {
+          throw const DiagnosticsApiException(
+            'Speed test cancelled',
+            reasonCode: 'speedtest_cancelled',
+          );
+        }),
+      ]).timeout(_speedTestTimeout);
+    } catch (_) {
+      activeRequest?.abort();
+      rethrow;
+    } finally {
+      if (generation == _speedTestGeneration) {
+        _speedTestGeneration += 1;
+        _speedTestRequest = null;
+        _speedTestCancellation = null;
+      }
+    }
   }
 
-  /// Long-poll the status event stream. Returns the current `revision` and the
-  /// events with `seq > since`. Blocks up to `timeout` when no new events are
-  /// available, so callers treat an empty list as "no change yet".
+  void cancelSpeedTest() {
+    _speedTestGeneration += 1;
+    final cancellation = _speedTestCancellation;
+    _speedTestCancellation = null;
+    _speedTestRequest?.abort();
+    _speedTestRequest = null;
+    if (cancellation != null && !cancellation.isCompleted) {
+      cancellation.complete();
+    }
+  }
+
   Future<EventsResponse> fetchEvents(
     String diagnosticsUrl, {
     int since = 0,
@@ -149,8 +230,6 @@ class DiagnosticsApi {
     return EventsResponse.fromJson(decoded);
   }
 
-  /// Paged peer list. `cursor` is the `node_id` to start after (omit for the
-  /// first page). Returns the page plus `total` and the `next_cursor`.
   Future<PeersPageResponse> fetchPeers(
     String diagnosticsUrl, {
     String? cursor,
@@ -171,8 +250,6 @@ class DiagnosticsApi {
     return PeersPageResponse.fromJson(decoded);
   }
 
-  /// Bounded tail of the daemon's own log file (last `lines`, within
-  /// `maxBytes`). Returns an empty string when the daemon has no log file.
   Future<String> fetchLogTail(
     String diagnosticsUrl, {
     int lines = 120,
@@ -191,8 +268,6 @@ class DiagnosticsApi {
     );
   }
 
-  /// Authoritative overlay-route state (read-only). Maps to the daemon's
-  /// `POST /routes/verify`.
   Future<RoutesResponse> verifyRoutes(String diagnosticsUrl) async {
     final request = await _client
         .postUrl(_endpoint(diagnosticsUrl, '/routes/verify'))
@@ -216,8 +291,6 @@ class DiagnosticsApi {
     return RoutesResponse.fromJson(decoded);
   }
 
-  /// Repair the overlay route in place (no daemon/TUN/session restart). Maps to
-  /// the daemon's `POST /routes/repair`.
   Future<RouteRepairResponse> repairRoutes(String diagnosticsUrl) async {
     final request = await _client
         .postUrl(_endpoint(diagnosticsUrl, '/routes/repair'))
@@ -254,9 +327,6 @@ class DiagnosticsApi {
     );
   }
 
-  /// Attach the per-process diagnostics mutation token when the daemon has
-  /// published one. Read fresh on every call: after a daemon restart the token
-  /// is regenerated, and a stale cached value would be rejected with 403.
   Future<void> _authorize(HttpClientRequest request) async {
     final token = await _authTokenReader();
     if (token != null && token.isNotEmpty) {
@@ -273,15 +343,19 @@ class DiagnosticsApi {
     for (var attempt = 0; attempt <= _authRetryDelays.length; attempt++) {
       final request = await _client.getUrl(uri).timeout(timeout);
       request.headers.set(HttpHeaders.acceptHeader, accept);
-      if (authorize) await _authorize(request);
-      final response = await _closeRequest(request, timeout);
-      final body = await utf8.decodeStream(response).timeout(timeout);
+      HttpClientResponse response;
+      String body;
+      try {
+        if (authorize) await _authorize(request).timeout(timeout);
+        response = await _closeRequest(request, timeout);
+        body = await utf8.decodeStream(response).timeout(timeout);
+      } catch (_) {
+        request.abort();
+        rethrow;
+      }
       if (authorize &&
           response.statusCode == HttpStatus.unauthorized &&
           attempt < _authRetryDelays.length) {
-        // A daemon restart rotates the local session token. Re-read the file
-        // after a short delay before surfacing the session-change error to the
-        // caller; this also covers the initial token-file write race.
         await Future<void>.delayed(_authRetryDelays[attempt]);
         continue;
       }
@@ -289,10 +363,6 @@ class DiagnosticsApi {
         final error = _tryJsonObject(body);
         final reasonCode = error?['reason_code']?.toString();
         final serverMessage = error?['error']?.toString();
-        // The daemon deliberately uses a structured 503 when a complete
-        // snapshot cannot be materialized before its lock budget expires.
-        // Retry that condition once; it is not equivalent to /health being
-        // offline.
         if (reasonCode == 'status_snapshot_timeout' && attempt == 0) {
           await Future<void>.delayed(const Duration(milliseconds: 120));
           continue;
@@ -323,9 +393,6 @@ class DiagnosticsApi {
     );
   }
 
-  /// Unlike [Future.timeout], aborting the request also closes the underlying
-  /// socket. This prevents a non-responsive local proxy or endpoint from
-  /// leaving one established connection behind on every status poll.
   Future<HttpClientResponse> _closeRequest(
     HttpClientRequest request,
     Duration timeout,
@@ -342,6 +409,8 @@ class DiagnosticsApi {
   }
 
   void close() {
+    cancelSpeedTest();
+    _healthFailures.clear();
     _client.close(force: true);
   }
 }
