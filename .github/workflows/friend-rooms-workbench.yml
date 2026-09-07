@@ -1,0 +1,30 @@
+name: Friend Rooms Workbench
+
+on:
+  push:
+    branches: [feat/friend-rooms]
+    paths:
+      - '.github/workflows/friend-rooms-workbench.yml'
+      - 'scripts/friend-rooms/**'
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Archive tracked source
+        run: |
+          git archive --format=tar.gz --output=/tmp/p2wlan-source.tar.gz HEAD
+          git rev-parse HEAD > /tmp/source-head.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: friend-rooms-source-${{ github.sha }}
+          path: |
+            /tmp/p2wlan-source.tar.gz
+            /tmp/source-head.txt
+          retention-days: 1
