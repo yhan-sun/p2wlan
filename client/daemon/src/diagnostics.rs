@@ -29,6 +29,7 @@ include!("diagnostics/types.rs");
 include!("diagnostics/mtu.rs");
 include!("diagnostics/event_bus.rs");
 include!("diagnostics/speedtest.rs");
+include!("diagnostics/http_request.rs");
 include!("diagnostics/server.rs");
 include!("diagnostics/snapshot.rs");
 include!("diagnostics/response.rs");

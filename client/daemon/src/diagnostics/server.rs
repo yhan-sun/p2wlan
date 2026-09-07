@@ -56,7 +56,7 @@ pub async fn run_diagnostics_server_with_retry_ready(
     let mut ready_tx = ready_tx;
     let mut attempt = 0usize;
     loop {
-        if *shutdown_rx.borrow() {
+        if *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err() {
             return Ok(());
         }
 
@@ -80,20 +80,18 @@ pub async fn run_diagnostics_server_with_retry_ready(
                     return Err(err);
                 }
                 attempt = attempt.saturating_add(1);
-                warn!(
-                    "Diagnostics endpoint start failed on {bind} (attempt {attempt}); retrying in {} ms: {err}",
-                    DIAGNOSTICS_BIND_RETRY_INTERVAL.as_millis()
-                );
+                if attempt == 1 || attempt.is_power_of_two() {
+                    warn!(
+                        "Diagnostics endpoint start failed on {bind} (attempt {attempt}); retrying in {} ms: {err}",
+                        DIAGNOSTICS_BIND_RETRY_INTERVAL.as_millis()
+                    );
+                }
             }
         }
 
         tokio::select! {
             _ = sleep(DIAGNOSTICS_BIND_RETRY_INTERVAL) => {}
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    return Ok(());
-                }
-            }
+            _ = diagnostics_shutdown(&mut shutdown_rx) => return Ok(()),
         }
     }
 }
@@ -101,41 +99,51 @@ pub async fn run_diagnostics_server_with_retry_ready(
 async fn serve_diagnostics(
     listener: TcpListener,
     context: DiagnosticsContext,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut shutdown_rx = shutdown_rx;
-    loop {
+    let mut tasks = tokio::task::JoinSet::new();
+    let result = loop {
         tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!("Diagnostics server received shutdown signal");
-                    break;
+            biased;
+            _ = diagnostics_shutdown(&mut shutdown_rx) => break Ok(()),
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(err)) = completed {
+                    debug!("diagnostics task failed: {err}");
                 }
             }
-            result = listener.accept() => {
-                let (stream, _remote_addr) = result
-                    .map_err(|e| DaemonError::Network(format!("diagnostics accept failed: {e}")))?;
-
+            accepted = listener.accept() => {
+                let (stream, _) = match accepted {
+                    Ok(value) => value,
+                    Err(err) => break Err(DaemonError::Network(format!("diagnostics accept failed: {err}"))),
+                };
+                if tasks.len() >= DIAGNOSTICS_MAX_CONNECTIONS {
+                    drop(stream);
+                    continue;
+                }
                 let context = context.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, context).await {
-                        debug!("diagnostics request failed: {err}");
+                tasks.spawn(async move {
+                    match timeout(Duration::from_secs(65), handle_connection(stream, context)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => debug!("diagnostics request failed: {err}"),
+                        Err(_) => debug!("diagnostics request exceeded total deadline"),
                     }
                 });
             }
         }
-    }
-    Ok(())
+    };
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    result
 }
 
 async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -> Result<()> {
-    let mut buffer = [0u8; 1024];
-    let n = timeout(Duration::from_secs(3), stream.read(&mut buffer))
-        .await
-        .map_err(|_| DaemonError::Network("diagnostics request timed out".to_string()))?
-        .map_err(|e| DaemonError::Network(format!("diagnostics read failed: {e}")))?;
-
-    let request = String::from_utf8_lossy(&buffer[..n]);
+    let request = match read_diagnostics_head(&mut stream).await {
+        Ok(request) => request,
+        Err((status, message)) => {
+            write_response(&mut stream, status, "text/plain", message, None).await?;
+            return Ok(());
+        }
+    };
     // Native clients only (Flutter / tray / CLI): no browser origin is ever
     // allowed. No web origin is trusted, so CORS headers are never emitted.
     let cors_origin = no_browser_cors(&request);
@@ -224,7 +232,15 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             }
         }
         ("POST", "/speedtest") => {
-            match run_speedtest_from_query(context, query).await {
+            let shutdown_rx = context.shutdown_tx.subscribe();
+            let Some(result) = until_diagnostics_client_disconnect(
+                &mut stream,
+                shutdown_rx,
+                run_speedtest_from_query(context, query),
+            ).await else {
+                return Ok(());
+            };
+            match result {
                 Ok(result) => {
                     let body = serde_json::to_string_pretty(&result)?;
                     write_response(&mut stream, 200, "application/json", &body, cors_origin)
@@ -450,7 +466,7 @@ async fn write_unauthorized(stream: &mut TcpStream, cors_origin: Option<&str>) -
 /// Extract a `Bearer <token>` value from the request's `Authorization` header,
 /// if present.
 fn bearer_token(request: &str) -> Option<&str> {
-    request.lines().find_map(|line| {
+    request.lines().take_while(|line| !line.is_empty()).find_map(|line| {
         let (name, value) = line.split_once(':')?;
         if !name.eq_ignore_ascii_case("authorization") {
             return None;
@@ -492,7 +508,7 @@ async fn bounded_log_tail(
             .await
             .map_err(|e| format!("failed to seek log file: {e}"))?;
     }
-    file.read_to_end(&mut buf)
+    file.take(max_bytes).read_to_end(&mut buf)
         .await
         .map_err(|e| format!("failed to read log file: {e}"))?;
     let text = String::from_utf8_lossy(&buf);
@@ -506,6 +522,7 @@ fn speedtest_error_status(message: &str) -> u16 {
     } else if message.contains("offline")
         || message.contains("confirmed direct")
         || message.contains("current catalog")
+        || message.contains("already running")
     {
         409
     } else {
