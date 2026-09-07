@@ -10,18 +10,82 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ipv6-workbench
+  cancel-in-progress: false
+
 jobs:
-  snapshot:
-    if: github.ref == 'refs/heads/feat/ipv6-underlay'
+  validate:
+    if: github.ref == 'refs/heads/feat/ipv6-underlay' && github.repository == 'yhan-sun/p2wlan'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 35
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Export tracked source only
-        run: git archive --format=tar.gz HEAD -o /tmp/p2wlan-source.tar.gz
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - name: Check work packet
+        id: packet
+        run: |
+          if test -f scripts/ipv6-workbench.patch; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust
+        if: steps.packet.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          name: ipv6-source-${{ github.sha }}
-          path: /tmp/p2wlan-source.tar.gz
+          components: rustfmt, clippy
+      - name: Apply source patch on IPv6 branch only
+        if: steps.packet.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/feat/ipv6-underlay
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib, subprocess
+          lines = pathlib.Path('scripts/ipv6-workbench.patch').read_text().splitlines()
+          patch = gzip.decompress(base64.b64decode(''.join(lines[1:]), validate=True))
+          assert hashlib.sha256(patch).hexdigest() == lines[0], 'patch checksum mismatch'
+          path = pathlib.Path('/tmp/ipv6.patch')
+          path.write_bytes(patch)
+          stats = subprocess.check_output(['git', 'apply', '--numstat', str(path)], text=True)
+          for line in stats.splitlines():
+              filename = line.split('\t', 2)[2]
+              assert filename.startswith(('client/', 'docs/')) and '..' not in pathlib.PurePosixPath(filename).parts, filename
+          subprocess.run(['git', 'apply', '--check', str(path)], check=True)
+          subprocess.run(['git', 'apply', str(path)], check=True)
+          PY
+          cargo fmt --all
+          git rm scripts/ipv6-workbench.patch
+          git add client docs
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat:接入独立IPv6底层传输并保持IPv4虚拟网络'
+          git push origin HEAD:refs/heads/feat/ipv6-underlay
+          git rev-parse HEAD | tee /tmp/ipv6-tested-commit.txt
+      - name: Clippy for affected Rust packages
+        if: steps.packet.outputs.present == 'true'
+        run: cargo clippy -p p2wlan-daemon -p p2pnet-netbind -p p2pnet-nat --all-targets --all-features -- -D warnings
+      - name: IPv6 underlay regression tests
+        if: steps.packet.outputs.present == 'true'
+        run: cargo test -p p2wlan-daemon -p p2pnet-netbind -p p2pnet-nat ipv6_underlay -- --test-threads=1
+      - name: NAT and socket regression suites
+        if: steps.packet.outputs.present == 'true'
+        run: cargo test -p p2pnet-netbind -p p2pnet-nat -- --test-threads=1
+      - name: Daemon general regression suite
+        if: steps.packet.outputs.present == 'true'
+        run: cargo test -p p2wlan-daemon -- --test-threads=1 --skip hard_hard_
+      - name: Export exact source and identity
+        if: always()
+        run: |
+          git rev-parse HEAD > /tmp/ipv6-tested-commit.txt
+          git archive --format=tar.gz HEAD -o /tmp/p2wlan-source.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ipv6-source-${{ github.run_id }}
+          path: |
+            /tmp/p2wlan-source.tar.gz
+            /tmp/ipv6-tested-commit.txt
           retention-days: 1
           if-no-files-found: error
