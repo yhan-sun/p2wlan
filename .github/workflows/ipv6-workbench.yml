@@ -41,9 +41,12 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/feat/ipv6-underlay
           python3 - <<'PY'
-          import base64, gzip, hashlib, pathlib, subprocess
+          import base64, gzip, hashlib, pathlib, re, subprocess
           lines = pathlib.Path('scripts/ipv6-workbench.patch').read_text().splitlines()
-          patch = gzip.decompress(base64.b64decode(''.join(lines[1:]), validate=True))
+          parts = lines[1:]
+          assert parts and all(re.fullmatch(r'scripts/ipv6-workbench-part-[0-9]{2}\.txt', name) for name in parts)
+          encoded = ''.join(pathlib.Path(name).read_text().strip() for name in parts)
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
           assert hashlib.sha256(patch).hexdigest() == lines[0], 'patch checksum mismatch'
           path = pathlib.Path('/tmp/ipv6.patch')
           path.write_bytes(patch)
@@ -53,10 +56,12 @@ jobs:
               assert filename.startswith(('client/', 'docs/')) and '..' not in pathlib.PurePosixPath(filename).parts, filename
           subprocess.run(['git', 'apply', '--check', str(path)], check=True)
           subprocess.run(['git', 'apply', str(path)], check=True)
+          subprocess.run(['git', 'rm', '--', 'scripts/ipv6-workbench.patch', *parts], check=True)
           PY
           cargo fmt --all
-          git rm scripts/ipv6-workbench.patch
-          git add client docs
+          git add client
+          git add -u docs
+          git add -f docs/ipv6-underlay.md
           git diff --cached --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -65,7 +70,7 @@ jobs:
           git rev-parse HEAD | tee /tmp/ipv6-tested-commit.txt
       - name: Clippy for affected Rust packages
         if: steps.packet.outputs.present == 'true'
-        run: cargo clippy -p p2wlan-daemon -p p2pnet-netbind -p p2pnet-nat --all-targets --all-features -- -D warnings
+        run: cargo clippy -p p2wlan-daemon -p p2wlan-cli -p p2pnet-netbind -p p2pnet-nat --all-targets --all-features -- -D warnings
       - name: IPv6 underlay regression tests
         if: steps.packet.outputs.present == 'true'
         run: cargo test -p p2wlan-daemon -p p2pnet-netbind -p p2pnet-nat ipv6_underlay -- --test-threads=1
