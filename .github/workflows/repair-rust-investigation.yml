@@ -1,0 +1,56 @@
+name: Repair Rust Investigation
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/repair-rust-investigation.yml']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  failure-evidence:
+    if: github.event.pull_request.number == 69 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'feat/reliability-diagnostics-speedtest-20260907'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Extract failure context from completed regression jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, re, urllib.request, urllib.error, urllib.parse
+          output = pathlib.Path('/tmp/p2wlan-failures')
+          output.mkdir()
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl): return None
+          opener = urllib.request.build_opener(NoRedirect)
+          for job in [101619029567, 101619029499]:
+              url = f'https://api.github.com/repos/yhan-sun/p2wlan/actions/jobs/{job}/logs'
+              request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              try:
+                  with opener.open(request, timeout=30) as response: data = response.read()
+              except urllib.error.HTTPError as error:
+                  if error.code not in [301, 302, 303, 307, 308]: raise
+                  location = error.headers['Location']
+                  assert urllib.parse.urlparse(location).scheme == 'https'
+                  with urllib.request.urlopen(urllib.request.Request(location), timeout=60) as response: data = response.read()
+              text = data.decode('utf-8', errors='replace')
+              lines = text.splitlines()
+              keep = set(range(max(0, len(lines)-130), len(lines)))
+              for index, line in enumerate(lines):
+                  if re.search(r'FAILED|panicked at|failures:|test result: FAILED|assertion.*failed', line):
+                      keep.update(range(max(0,index-3), min(len(lines),index+18)))
+              report = '\n'.join(lines[index] for index in sorted(keep))
+              (output / f'job-{job}.txt').write_text(report)
+              print(f'===== JOB {job}: {len(lines)} total log lines =====')
+              print(report)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p2wlan-rust-failure-evidence
+          path: /tmp/p2wlan-failures/
+          retention-days: 7
