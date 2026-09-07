@@ -1676,12 +1676,17 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
-        let (socket_index, socket) = match self.socket_for_peer(Some(&packet.peer_id)).await {
+        let (socket_index, socket) = match self
+            .socket_for_peer_endpoint(Some(&packet.peer_id), Some(endpoint))
+            .await
+        {
             Some(resolved) => resolved,
-            None => return Err(DaemonError::Network(format!(
-                "no UDP socket available for peer {}",
-                packet.peer_id
-            ))),
+            None => {
+                return Err(DaemonError::Network(format!(
+                    "no UDP socket available for peer {} (endpoint {})",
+                    packet.peer_id, endpoint
+                )))
+            }
         };
         self.send_encrypted_packet_on_socket(&socket, socket_index, packet, endpoint)
             .await

@@ -190,10 +190,16 @@ impl CandidatePair {
         }
     }
 
-    pub(super) fn record_probing(&mut self, local_endpoint: Option<SocketAddr>) {
-        if local_endpoint.is_some() {
-            self.local_endpoint = local_endpoint;
+    fn set_matching_local_endpoint(&mut self, local_endpoint: Option<SocketAddr>) {
+        if let Some(endpoint) = local_endpoint {
+            if endpoint.is_ipv4() == self.remote_endpoint.is_ipv4() {
+                self.local_endpoint = Some(endpoint);
+            }
         }
+    }
+
+    pub(super) fn record_probing(&mut self, local_endpoint: Option<SocketAddr>) {
+        self.set_matching_local_endpoint(local_endpoint);
         self.last_probe_at = Some(Instant::now());
         self.probe_count = self.probe_count.saturating_add(1);
         if !matches!(
@@ -211,9 +217,7 @@ impl CandidatePair {
         local_endpoint: Option<SocketAddr>,
     ) {
         let now = Instant::now();
-        if local_endpoint.is_some() {
-            self.local_endpoint = local_endpoint;
-        }
+        self.set_matching_local_endpoint(local_endpoint);
         if self.first_success_at.is_none() {
             self.first_success_at = Some(now);
         }
@@ -293,9 +297,7 @@ impl CandidatePair {
     }
 
     pub(super) fn nominate(&mut self, local_endpoint: Option<SocketAddr>) -> bool {
-        if local_endpoint.is_some() {
-            self.local_endpoint = local_endpoint;
-        }
+        self.set_matching_local_endpoint(local_endpoint);
         if !matches!(
             self.state,
             CandidatePairState::Probing
@@ -341,9 +343,7 @@ impl CandidatePair {
         reason: impl Into<String>,
         local_endpoint: Option<SocketAddr>,
     ) {
-        if local_endpoint.is_some() {
-            self.local_endpoint = local_endpoint;
-        }
+        self.set_matching_local_endpoint(local_endpoint);
         self.last_failure_at = Some(Instant::now());
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.failure_count = self.failure_count.saturating_add(1);

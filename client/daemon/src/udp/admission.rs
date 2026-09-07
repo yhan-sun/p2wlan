@@ -490,14 +490,24 @@ impl UdpTransport {
         use_candidate: bool,
         purpose: PendingProbePurpose,
     ) -> Result<ProbeSendResult> {
-        let (actual_index, socket, _lease) = self
-            .socket_for_index_or_dynamic(socket_index, peer_id)
-            .await
-            .ok_or_else(|| {
-                DaemonError::Network(format!(
-                    "UDP socket pool member {socket_index} is unavailable"
-                ))
+        let (actual_index, socket, _lease) = if peer_addr.is_ipv6() {
+            let socket = self.ipv6_socket.clone().ok_or_else(|| {
+                DaemonError::Network("IPv6 UDP socket is unavailable".to_string())
             })?;
+            (
+                IPV6_SOCKET_INDEX,
+                socket,
+                DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
+            )
+        } else {
+            self.socket_for_index_or_dynamic(socket_index, peer_id)
+                .await
+                .ok_or_else(|| {
+                    DaemonError::Network(format!(
+                        "UDP socket pool member {socket_index} is unavailable"
+                    ))
+                })?
+        };
         // The pending probe records the ACTUAL sending socket: when the
         // requested dynamic socket was detached concurrently, the resolver
         // falls back to the peer's pool socket and the ACK will arrive there.
@@ -532,6 +542,15 @@ impl UdpTransport {
         socket_index: usize,
         peer_id: Option<&str>,
     ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
+        if socket_index == IPV6_SOCKET_INDEX {
+            return self.ipv6_socket.clone().map(|socket| {
+                (
+                    IPV6_SOCKET_INDEX,
+                    socket,
+                    DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
+                )
+            });
+        }
         if socket_index < DYNAMIC_SOCKET_INDEX_BASE {
             let socket = self.active_sockets().get(socket_index)?.clone();
             // Pool sockets need no lease; hand out a never-blocking lease for

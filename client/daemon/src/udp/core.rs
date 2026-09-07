@@ -77,6 +77,8 @@ type RemoteIncarnationCleanupGateSlot =
 
 static NEXT_UDP_TRANSPORT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
+pub const IPV6_SOCKET_INDEX: usize = 2048;
+
 /// Sends encrypted WireGuard packets over direct UDP endpoints.
 #[derive(Clone)]
 pub struct UdpTransport {
@@ -90,6 +92,8 @@ pub struct UdpTransport {
     /// for bounded symmetric-NAT traversal experiments.
     socket: Arc<UdpSocket>,
     sockets: Arc<Vec<Arc<UdpSocket>>>,
+    pub(crate) ipv6_socket: Option<Arc<UdpSocket>>,
+    ipv6_socket_diagnostics: Arc<Mutex<Option<UdpSocketPoolMemberDiagnostics>>>,
     /// Physical interface used to bypass a foreign system TUN. `None` keeps
     /// ordinary multi-interface routing when no capture route is present.
     outbound_interface: Option<Arc<str>>,
@@ -249,6 +253,46 @@ impl UdpTransport {
             .map_err(|e| {
                 DaemonError::Network(format!("failed to bind UDP socket at {bind_addr}: {e}"))
             })?;
+        let socket_arc = Arc::new(socket);
+        let (primary_socket, ipv6_socket, ipv6_socket_diagnostics) = if bind_addr.is_ipv6() {
+            let diag = Arc::new(Mutex::new(Some(UdpSocketPoolMemberDiagnostics {
+                socket_index: IPV6_SOCKET_INDEX,
+                ..Default::default()
+            })));
+            (socket_arc.clone(), Some(socket_arc), diag)
+        } else {
+            let ipv6_bind_addr = if bind_addr.ip().is_loopback() {
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                    socket_arc.local_addr().map(|a| a.port()).unwrap_or(0),
+                )
+            } else {
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    socket_arc.local_addr().map(|a| a.port()).unwrap_or(0),
+                )
+            };
+            let v6_socket = match p2pnet_netbind::bind_udp(ipv6_bind_addr, outbound_interface.as_deref()).await {
+                Ok(s) => Some(Arc::new(s)),
+                Err(err) => {
+                    let fallback_addr = SocketAddr::new(ipv6_bind_addr.ip(), 0);
+                    match p2pnet_netbind::bind_udp(fallback_addr, outbound_interface.as_deref()).await {
+                        Ok(s) => Some(Arc::new(s)),
+                        Err(fallback_err) => {
+                            debug!("IPv6 UDP socket bind failed (running IPv4-only): {err}, fallback: {fallback_err}");
+                            None
+                        }
+                    }
+                }
+            };
+            let diag = Arc::new(Mutex::new(v6_socket.as_ref().map(|_| {
+                UdpSocketPoolMemberDiagnostics {
+                    socket_index: IPV6_SOCKET_INDEX,
+                    ..Default::default()
+                }
+            })));
+            (socket_arc, v6_socket, diag)
+        };
         let network_epoch_gate = peers.network_epoch_gate();
 
         let direct_validation = DirectValidationRegistry::new();
@@ -262,8 +306,10 @@ impl UdpTransport {
 
         Ok(Self {
             transport_instance_id: NEXT_UDP_TRANSPORT_INSTANCE.fetch_add(1, Ordering::Relaxed),
-            socket: Arc::new(socket),
+            socket: primary_socket,
             sockets: Arc::new(Vec::new()),
+            ipv6_socket,
+            ipv6_socket_diagnostics,
             outbound_interface: outbound_interface.map(Arc::<str>::from),
             peers,
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
@@ -329,6 +375,23 @@ impl UdpTransport {
     /// Interface currently enforced for public UDP egress, if any.
     pub fn outbound_interface(&self) -> Option<&str> {
         self.outbound_interface.as_deref()
+    }
+
+    pub fn ipv6_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.ipv6_socket.clone()
+    }
+
+    pub fn ipv6_local_addr(&self) -> Option<SocketAddr> {
+        self.ipv6_socket.as_ref().and_then(|s| s.local_addr().ok())
+    }
+
+    pub fn with_ipv6_socket(mut self, ipv6_socket: Arc<UdpSocket>) -> Self {
+        self.ipv6_socket = Some(ipv6_socket);
+        self.ipv6_socket_diagnostics = Arc::new(Mutex::new(Some(UdpSocketPoolMemberDiagnostics {
+            socket_index: IPV6_SOCKET_INDEX,
+            ..Default::default()
+        })));
+        self
     }
 
     /// Stable identity for this concrete UDP publication. It is diagnostic
@@ -485,7 +548,7 @@ impl UdpTransport {
         }
 
         let Some((socket_index, socket, lease)) = self
-            .resolve_send_socket_with_lease(peer_id)
+            .resolve_send_socket_with_lease_for_endpoint(peer_id, Some(expected_endpoint))
             .await
         else {
             return DirectBusinessBudgetGate::ManagedPending {
@@ -1060,6 +1123,11 @@ impl UdpTransport {
         sockets
     }
 
+    /// Return the diagnostics for the dedicated IPv6 underlay socket, if bound.
+    pub async fn ipv6_socket_diagnostics(&self) -> Option<UdpSocketPoolMemberDiagnostics> {
+        self.ipv6_socket_diagnostics.lock().await.clone()
+    }
+
     /// Aggregate receive-side probe counters across every bound UDP socket.
     ///
     /// The direct probe loops use this around a punch burst to distinguish
@@ -1068,7 +1136,11 @@ impl UdpTransport {
     pub async fn probe_rx_snapshot(&self) -> UdpProbeRxSnapshot {
         let pool = self.socket_pool_diagnostics.lock().await.clone();
         let dynamic = self.dynamic_socket_diagnostics.lock().await.clone();
-        pool.into_iter().chain(dynamic.into_values()).fold(
+        let ipv6 = self.ipv6_socket_diagnostics.lock().await.clone();
+        pool.into_iter()
+            .chain(dynamic.into_values())
+            .chain(ipv6)
+            .fold(
             UdpProbeRxSnapshot::default(),
             |mut snapshot, member| {
                 snapshot.known_peer_ip_datagrams_received = snapshot
@@ -1183,6 +1255,12 @@ impl UdpTransport {
         socket_index: usize,
         update: impl FnOnce(&mut UdpSocketPoolMemberDiagnostics),
     ) {
+        if socket_index == IPV6_SOCKET_INDEX {
+            if let Some(metrics) = self.ipv6_socket_diagnostics.lock().await.as_mut() {
+                update(metrics);
+            }
+            return;
+        }
         if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
             if let Some(metrics) = self
                 .dynamic_socket_diagnostics
@@ -1216,6 +1294,14 @@ impl UdpTransport {
         socket_index: usize,
         update: impl FnOnce(&mut UdpSocketPoolMemberDiagnostics),
     ) {
+        if socket_index == IPV6_SOCKET_INDEX {
+            if let Ok(mut diagnostics) = self.ipv6_socket_diagnostics.try_lock() {
+                if let Some(metrics) = diagnostics.as_mut() {
+                    update(metrics);
+                }
+            }
+            return;
+        }
         if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
             if let Ok(mut diagnostics) = self.dynamic_socket_diagnostics.try_lock() {
                 if let Some(metrics) = diagnostics.get_mut(&socket_index) {
@@ -1321,6 +1407,18 @@ impl UdpTransport {
             .map(|socket| (index, socket))
     }
 
+    /// Resolve the UDP socket for a peer when the remote endpoint may be IPv6.
+    pub async fn socket_for_peer_endpoint(
+        &self,
+        peer_id: Option<&str>,
+        endpoint: Option<SocketAddr>,
+    ) -> Option<(usize, Arc<UdpSocket>)> {
+        if endpoint.is_some_and(|ep| ep.is_ipv6()) {
+            return self.ipv6_socket.clone().map(|s| (IPV6_SOCKET_INDEX, s));
+        }
+        self.socket_for_peer(peer_id).await
+    }
+
     /// Resolve the exact socket that received an authenticated direct packet.
     ///
     /// A response to a hole-punch validation request must leave through the
@@ -1336,6 +1434,9 @@ impl UdpTransport {
         peer_id: &str,
         socket_index: usize,
     ) -> Option<Arc<UdpSocket>> {
+        if socket_index == IPV6_SOCKET_INDEX {
+            return self.ipv6_socket.clone();
+        }
         if socket_index < self.socket_count() {
             return self.active_sockets().get(socket_index).cloned();
         }
@@ -2624,7 +2725,7 @@ impl UdpTransport {
             .request_endpoint()
             .expect("Direct validation send identity has an endpoint");
         let (socket_index, socket, lease) = self
-            .resolve_send_socket_with_lease(peer_id)
+            .resolve_send_socket_with_lease_for_endpoint(peer_id, Some(endpoint))
             .await
             .ok_or(DirectValidationSendError::NoSocket)?;
         let registered = self
@@ -2688,6 +2789,23 @@ impl UdpTransport {
         }
         expectation.sent_at = Some(Instant::now());
         true
+    }
+
+    pub(crate) async fn resolve_send_socket_with_lease_for_endpoint(
+        &self,
+        peer_id: &str,
+        endpoint: Option<SocketAddr>,
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
+        if endpoint.is_some_and(|ep| ep.is_ipv6()) {
+            return self.ipv6_socket.clone().map(|socket| {
+                (
+                    IPV6_SOCKET_INDEX,
+                    socket,
+                    DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
+                )
+            });
+        }
+        self.resolve_send_socket_with_lease(peer_id).await
     }
 
     /// Resolve the socket for a direct-validation send under ONE

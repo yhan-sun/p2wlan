@@ -5,7 +5,7 @@
 //! `PeerManager` and sends the encrypted datagram to that socket address.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex,

@@ -145,13 +145,40 @@ impl UdpTransport {
             });
         }
 
-        match readers.join_next().await {
+        let ipv6_handle = if let Some(v6_socket) = self.ipv6_socket.clone() {
+            let is_same_as_primary = self.socket.local_addr().ok() == v6_socket.local_addr().ok()
+                && self.socket.local_addr().is_ok_and(|a| a.is_ipv6());
+            if !is_same_as_primary {
+                let transport = self.clone();
+                let inbound_tx = inbound_tx.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(error) = transport
+                        .run_inbound_socket(IPV6_SOCKET_INDEX, v6_socket, inbound_tx)
+                        .await
+                    {
+                        warn!("IPv6 UDP socket reader exited: {error}");
+                    }
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let result = match readers.join_next().await {
             Some(Ok(result)) => result,
             Some(Err(error)) => Err(DaemonError::Network(format!(
                 "UDP socket reader task failed: {error}"
             ))),
             None => Ok(()),
+        };
+
+        if let Some(handle) = ipv6_handle {
+            handle.abort();
         }
+
+        result
     }
 
     async fn run_inbound_socket(

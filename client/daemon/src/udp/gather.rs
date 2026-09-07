@@ -50,6 +50,13 @@ impl UdpTransport {
             .await
             .map_err(|e| DaemonError::Network(format!("ICE candidate gathering failed: {e}")))?;
 
+        if let Some(ipv6_socket) = self.ipv6_socket.as_ref() {
+            if let Ok(ipv6_report) = gather_candidate_report(ipv6_socket, &config).await {
+                self.append_ipv6_candidates(&mut report, ipv6_report.candidates)
+                    .await;
+            }
+        }
+
         self.set_socket_pool_active(socket_pool_is_eligible(&report));
         self.append_pool_socket_candidates_direct(&mut report, &config)
             .await;
@@ -81,11 +88,63 @@ impl UdpTransport {
             self.peers.gather_host_candidates().await,
             observations,
         );
+
+        if let Some(ipv6_socket) = self.ipv6_socket.as_ref() {
+            if let Ok(ipv6_local_addr) = ipv6_socket.local_addr() {
+                let mut v6_observations = Vec::new();
+                for server in &stun_servers {
+                    if server.is_ipv6() {
+                        v6_observations.push(
+                            self.query_stun_live_on_socket(ipv6_socket, *server, stun_timeout)
+                                .await,
+                        );
+                    }
+                }
+                let ipv6_report = candidate_report_from_observations(
+                    ipv6_local_addr,
+                    self.peers.gather_host_candidates().await,
+                    v6_observations,
+                );
+                self.append_ipv6_candidates(&mut report, ipv6_report.candidates)
+                    .await;
+            }
+        }
+
         self.set_socket_pool_active(socket_pool_is_eligible(&report));
         self.append_pool_socket_candidates_live(&mut report, &stun_servers, stun_timeout)
             .await;
         self.filter_predicted_candidates(&mut report).await;
         Ok(report)
+    }
+
+    async fn append_ipv6_candidates(
+        &self,
+        report: &mut CandidateGatherReport,
+        candidates: Vec<p2pnet_nat::IceCandidate>,
+    ) {
+        let mut discovered_stun_mappings = 0u64;
+        for candidate in candidates {
+            let is_stun = candidate.source == p2pnet_nat::CandidateSource::StunObserved;
+            let endpoint = candidate.endpoint.to_string();
+            if !report
+                .candidates
+                .iter()
+                .any(|existing| existing.endpoint.to_string() == endpoint)
+            {
+                if is_stun {
+                    discovered_stun_mappings = discovered_stun_mappings.saturating_add(1);
+                }
+                report.candidates.push(candidate);
+            }
+        }
+        if discovered_stun_mappings > 0 {
+            self.update_socket_diagnostics(IPV6_SOCKET_INDEX, |metrics| {
+                metrics.stun_mappings_discovered = metrics
+                    .stun_mappings_discovered
+                    .saturating_add(discovered_stun_mappings);
+            })
+            .await;
+        }
     }
 
     /// The static-STUN ablation must remove predicted candidates after every

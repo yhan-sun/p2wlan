@@ -571,7 +571,9 @@ async fn try_lan_direct_fast_path(
             return FastPathAttempt::Fallback(packet);
         };
         let socket_lookup_started = Instant::now();
-        let socket = udp.socket_for_peer(Some(peer_id)).await;
+        let socket = udp
+            .socket_for_peer_endpoint(Some(peer_id), Some(path.endpoint))
+            .await;
         let socket_lookup_completed = Instant::now();
         let cache_socket_lookup_us = socket_lookup_completed
             .duration_since(socket_lookup_started)

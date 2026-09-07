@@ -124,6 +124,31 @@ impl UdpTransport {
             }
         }
 
+        if let Some(ipv6_socket) = self.ipv6_socket.as_ref() {
+            if let Ok(ipv6_local_addr) = ipv6_socket.local_addr() {
+                let ipv6_servers = stun_servers
+                    .iter()
+                    .copied()
+                    .filter(|server| server.is_ipv6())
+                    .collect::<Vec<_>>();
+                let v6_observations = join_all(ipv6_servers.into_iter().map(|server| {
+                    let socket = ipv6_socket.clone();
+                    async move {
+                        self.query_stun_live_on_socket(&socket, server, stun_timeout)
+                            .await
+                    }
+                }))
+                .await;
+                let ipv6_report = candidate_report_from_observations(
+                    ipv6_local_addr,
+                    self.peers.gather_host_candidates().await,
+                    v6_observations,
+                );
+                self.append_ipv6_candidates(&mut report, ipv6_report.candidates)
+                    .await;
+            }
+        }
+
         // The live gather uses the reader-owned STUN waiter registry instead
         // of reading the UDP socket directly. That means it cannot reuse the
         // ICE module's standalone active-probe helper; run the same bounded
