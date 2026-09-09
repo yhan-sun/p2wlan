@@ -119,7 +119,7 @@ impl Daemon {
             phase,
             Instant::now(),
         );
-        let Some((identity, revision)) = scheduled else {
+        let Some((identity, revision, wake_after)) = scheduled else {
             // Capacity, TTL, or an ownership mismatch cannot leave a prepared
             // reservation with no progress edge.  Cancel only the exact owner;
             // a replacement lifecycle remains untouched.
@@ -159,6 +159,18 @@ impl Daemon {
             )),
         );
         self.handshake_retry_kick_tx.send_replace(revision);
+        // The periodic retry tick is a safety net, but a dedicated delayed
+        // wake makes the exact backoff deadline independent of control-event
+        // traffic.  This is especially important when a candidate-only signal
+        // is being applied at the same time and the serial event loop has no
+        // idle control event to wake it.
+        let retry_kick = self.handshake_retry_kick_tx.clone();
+        tokio::spawn(async move {
+            if !wake_after.is_zero() {
+                tokio::time::sleep(wake_after).await;
+            }
+            retry_kick.send_replace(revision);
+        });
         true
     }
 

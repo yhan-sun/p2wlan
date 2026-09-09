@@ -3489,6 +3489,16 @@ impl Daemon {
                             if let Some(receipt) = delivery_receipt.as_ref() {
                                 receipt.complete(candidate_signal_outcome);
                             }
+                            // This branch continues the receiver loop before the
+                            // common post-event drain.  Revisit the retry ledger
+                            // here so a prepared encrypted offer that became
+                            // ready during candidate admission is not left
+                            // waiting for an unrelated control event.
+                            daemon.drain_initiator_retry_ledger(&mut retry_work);
+                            daemon.drain_deferred_initiator_handshakes(
+                                &mut slow_work,
+                                &mut deferred_initiators,
+                            );
                             continue;
                         }
 

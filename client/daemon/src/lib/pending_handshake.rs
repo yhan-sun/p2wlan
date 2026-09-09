@@ -638,7 +638,7 @@ impl PendingHandshakeState {
         reservation: &HandshakeStartReservation,
         phase: InitiatorRetryPhase,
         now: Instant,
-    ) -> Option<(HandshakeRetryIdentity, u64)> {
+    ) -> Option<(HandshakeRetryIdentity, u64, Duration)> {
         if self.starting_ids.get(peer_id).copied() != Some(reservation.owner)
             || self.starting_network_generations.get(peer_id)
                 != Some(&reservation.network_generation)
@@ -709,7 +709,7 @@ impl PendingHandshakeState {
             },
         );
         self.retry_revision = self.retry_revision.wrapping_add(1);
-        Some((identity, self.retry_revision))
+        Some((identity, self.retry_revision, backoff))
     }
 
     fn expire_initiator_retries(&mut self, now: Instant) {

@@ -70,11 +70,14 @@ pub(crate) const OUTBOUND_DELIVERY_DEADLINE: Duration = Duration::from_secs(3);
 pub(crate) const OUTBOUND_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 /// Per-peer pending queue bounds.  A not-yet-usable peer cannot build
 /// unbounded memory pressure while it waits for a path.
-// A 256-packet overlay burst exactly fills this business queue. Control and
+// A relay validation round can contain one 256-packet request burst and the
+// matching 256-packet echo burst.  The flush task owns part of the FIFO while
+// new TUN packets continue arriving, so the live ingress queue needs room for
+// the complete bidirectional burst without evicting its tail. Control and
 // handshake packets use a separate lane, so they consume none of this bound.
 // The independent 2 MiB cap prevents a peer from filling the limit with
 // maximum-size IP packets.
-const MAX_PENDING_PACKETS_PER_PEER: usize = 256;
+const MAX_PENDING_PACKETS_PER_PEER: usize = 512;
 const MAX_PENDING_BYTES_PER_PEER: usize = 2 * 1024 * 1024;
 /// Maximum packets sent from ONE peer's queue in a single flush pass. Flushes
 /// for different peers run concurrently; this bound still prevents one

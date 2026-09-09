@@ -3660,7 +3660,7 @@ fn exact_handshake_retry_has_strict_ttl_and_all_lifecycle_cancellations_are_term
         .claim_ready_initiator_retry(now + Duration::from_millis(12))
         .expect("the merged retry must become ready deterministically");
     assert_eq!(claimed_identity.attempt, 2);
-    let (rescheduled_identity, _) = ttl_state
+    let (rescheduled_identity, _, _) = ttl_state
         .schedule_initiator_retry(
             "peer-retry-ttl",
             &claimed_reservation,
@@ -7660,9 +7660,9 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
 
     // Keep the overflow count below the independently bounded diagnostic
     // event ledger. The structural counter remains authoritative; this load
-    // still crosses the exact 256-packet queue cap by 44 entries and lets the
+    // still crosses the exact 512-packet queue cap by 44 entries and lets the
     // test compare every retained per-drop event byte-for-byte.
-    let total = 300usize;
+    let total = 556usize;
     let packet_len = Ipv4Packet::build_icmp_echo_request(
         "10.20.0.1".parse().unwrap(),
         "10.20.0.2".parse().unwrap(),
@@ -7692,7 +7692,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
     // Wait for the worker to drain the input and the overflow counters to
     // reach their FINAL value (the first overflow drop lands while later
     // packets are still in flight).
-    let expected_dropped = (total - 256) as u64;
+    let expected_dropped = (total - 512) as u64;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (dropped, bytes) = loop {
         let stats = peers.outbound_loss_stats().await;
@@ -7713,7 +7713,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
 
     assert_eq!(
         dropped, expected_dropped,
-        "exactly the packets beyond the 256-per-peer bound must be counted"
+        "exactly the packets beyond the 512-per-peer bound must be counted"
     );
     assert_eq!(
         bytes,

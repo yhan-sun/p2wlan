@@ -565,6 +565,23 @@ struct LeasedSignalDelivery {
     prepared: PreparedSignalDelivery,
 }
 
+async fn wait_for_signal_application(
+    waiter: SignalDeliveryWaiter,
+    signal_id: &str,
+    from_node_id: &str,
+    signal_seq: Option<u64>,
+) -> SignalApplyOutcome {
+    match tokio::time::timeout(SIGNAL_APPLICATION_TIMEOUT, waiter.wait()).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            warn!(
+                "Control signal {signal_id} from {from_node_id} at sequence {signal_seq:?} did not reach the daemon state machine within {SIGNAL_APPLICATION_TIMEOUT:?}; leaving its lease for ordered redelivery"
+            );
+            SignalApplyOutcome::Retry
+        }
+    }
+}
+
 /// Apply one leased server batch in response order without blocking the
 /// heartbeat/roster polling loop.  ACKs are deliberately emitted one row at a
 /// time: if an ACK is ambiguous, later rows stay unacknowledged and the
@@ -615,7 +632,13 @@ fn spawn_signal_application_lane(
                                 delivery.signal_id, delivery.from_node_id, delivery.signal_seq
                             );
                             application_waiter = Some(waiter.clone());
-                            waiter.wait().await
+                            wait_for_signal_application(
+                                waiter,
+                                &delivery.signal_id,
+                                &delivery.from_node_id,
+                                delivery.signal_seq,
+                            )
+                            .await
                         }
                         TrackedSignalApplication::Start { receipt, waiter } => {
                             application_waiter = Some(waiter.clone());
@@ -639,7 +662,13 @@ fn spawn_signal_application_lane(
                                 );
                                 break;
                             }
-                            waiter.wait().await
+                            wait_for_signal_application(
+                                waiter,
+                                &delivery.signal_id,
+                                &delivery.from_node_id,
+                                delivery.signal_seq,
+                            )
+                            .await
                         }
                     }
                 }

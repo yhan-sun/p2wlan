@@ -466,8 +466,13 @@ pub struct PeerManager {
     local_mtu_feedback_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
     local_mtu_feedback_limiter:
         Arc<std::sync::Mutex<crate::business_mtu::LocalMtuFeedbackRateLimiter>>,
-    /// Virtual IP → node ID mapping for routing.
+    /// Virtual IP → node ID mapping for control-plane updates.
     ip_to_node: Arc<RwLock<HashMap<String, String>>>,
+    /// Lock-free latest-value routing index consumed by the dataplane. The
+    /// authoritative map above is updated under the lifecycle transaction;
+    /// this snapshot lets every TUN packet resolve its destination without
+    /// joining Tokio's fair async-lock queue.
+    ip_to_node_snapshot: tokio::sync::watch::Sender<Arc<HashMap<String, String>>>,
     /// Monotonic local network generation. Incremented when local UDP candidates change.
     network_generation: Arc<RwLock<u64>>,
     /// Lock-free mirror of `network_generation`, updated in the same critical

@@ -143,7 +143,14 @@ async fn capture_stable_peer_snapshot(
     direct_retry_after: Duration,
     udp_local_endpoint: Option<std::net::SocketAddr>,
 ) -> StablePeerSnapshot {
-    const MAX_CAPTURE_ATTEMPTS: usize = 8;
+    // A status request commonly races the final peer/path event of a NAT
+    // validation burst.  Yielding alone is not enough here: Tokio's fair
+    // RwLock can keep a reader contended for several scheduler turns while a
+    // short lifecycle writer drains.  Retry for a small bounded window before
+    // falling back to the validated cache, keeping /status responsive while
+    // making normal transient contention converge to a fresh snapshot.
+    const MAX_CAPTURE_ATTEMPTS: usize = 32;
+    const CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(2);
 
     for attempt in 0..MAX_CAPTURE_ATTEMPTS {
         let revision_before = context.status_events.current_seq();
@@ -155,13 +162,8 @@ async fn capture_stable_peer_snapshot(
                 "initial_read",
                 attempt,
             );
-            return cached_or_best_effort_peer_snapshot(
-                context,
-                relay_connected,
-                direct_retry_after,
-                udp_local_endpoint,
-            )
-            .await;
+            tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
+            continue;
         };
         let mut node_ids: Vec<_> = connections_before
             .into_iter()
@@ -197,7 +199,7 @@ async fn capture_stable_peer_snapshot(
                 "peer_diagnostic_read",
                 attempt,
             );
-            tokio::task::yield_now().await;
+            tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
             continue;
         }
         peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
@@ -209,13 +211,8 @@ async fn capture_stable_peer_snapshot(
                 "validation_read",
                 attempt,
             );
-            return cached_or_best_effort_peer_snapshot(
-                context,
-                relay_connected,
-                direct_retry_after,
-                udp_local_endpoint,
-            )
-            .await;
+            tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
+            continue;
         };
         let revision_after = context.status_events.current_seq();
         let generation_after = context.peers.current_network_generation_sync();
@@ -223,7 +220,7 @@ async fn capture_stable_peer_snapshot(
             || generation_before != generation_after
             || !peer_snapshot_core_matches(&peers, &live_after)
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
             continue;
         }
 

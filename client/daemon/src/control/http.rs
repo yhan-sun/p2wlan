@@ -41,6 +41,11 @@ pub(super) const PRESENCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// of its short receive-only key lifetime. Delivery remains ambiguous on
 /// timeout, so the daemon retains staged state for authenticated confirmation.
 const SIGNAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// A leased signal must not hold its sender's ordered ACK lane forever when
+/// the daemon state machine is wedged.  Keep this below the server lease so a
+/// timed-out row can be redelivered before its lease expires and later rows
+/// cannot be blocked behind a permanently pending receipt.
+const SIGNAL_APPLICATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn signal_poll_timeout(wait_ms: u64) -> Duration {
     CONTROL_REQUEST_TIMEOUT.saturating_add(Duration::from_millis(wait_ms))

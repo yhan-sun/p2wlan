@@ -31,6 +31,8 @@ impl PeerManager {
         let (dplpmtud_capability_tx, _) =
             tokio::sync::watch::channel(Arc::new(HashMap::new()));
         let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
+        let (ip_to_node_snapshot, _) =
+            tokio::sync::watch::channel(Arc::new(HashMap::<String, String>::new()));
         let (local_mtu_feedback_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -51,6 +53,7 @@ impl PeerManager {
                 crate::business_mtu::LocalMtuFeedbackRateLimiter::default(),
             )),
             ip_to_node: Arc::new(RwLock::new(HashMap::new())),
+            ip_to_node_snapshot,
             network_generation: Arc::new(RwLock::new(0)),
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             network_generation_handshake_cancel_hook: Arc::new(std::sync::Mutex::new(None)),

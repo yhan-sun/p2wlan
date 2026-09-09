@@ -50,15 +50,25 @@ impl PeerManager {
 
     /// Record bytes sent to a peer.
     pub async fn record_sent(&self, node_id: &str, n: u64) {
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.record_sent(n);
+        // Traffic counters are advisory diagnostics.  Never enqueue a writer
+        // from the dataplane: Tokio's fair RwLock keeps later try-only relay
+        // confirmation commits contended while this low-value update waits
+        // behind a lifecycle transaction.
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_sent(n);
+            }
         }
     }
 
     /// Record bytes received from a peer.
     pub async fn record_received(&self, node_id: &str, n: u64) {
-        if let Some(conn) = self.connections.write().await.get_mut(node_id) {
-            conn.record_received(n);
+        // See `record_sent`: a dropped counter sample is preferable to
+        // parking the single dataplane task behind a fair writer queue.
+        if let Ok(mut connections) = self.connections.try_write() {
+            if let Some(conn) = connections.get_mut(node_id) {
+                conn.record_received(n);
+            }
         }
     }
 

@@ -875,6 +875,11 @@ impl PeerManager {
         }
 
         ip_map.insert(info.virtual_ip.clone(), info.node_id.clone());
+        // Publish the complete routing index after the authoritative map has
+        // been updated. Dataplane lookups consume this immutable snapshot and
+        // therefore never wait behind this control-plane writer.
+        self.ip_to_node_snapshot
+            .send_replace(Arc::new(ip_map.clone()));
         // Publish membership only after the connection is fully initialized.
         // Readers of the no-await mirror may then safely dispatch candidate
         // work without mistaking an in-progress PeerJoined for a ready peer.
@@ -1027,6 +1032,8 @@ impl PeerManager {
         if let Some(virtual_ip) = removed_virtual_ip {
             let mut ip_map = self.ip_to_node.write().await;
             ip_map.remove(&virtual_ip);
+            self.ip_to_node_snapshot
+                .send_replace(Arc::new(ip_map.clone()));
         }
         self.cancel_relay_backoff_heartbeat(node_id);
         self.clear_relay_not_found_grace(node_id).await;
@@ -1046,7 +1053,10 @@ impl PeerManager {
 
     /// Look up the node ID for a virtual IP.
     pub async fn resolve_virtual_ip(&self, virtual_ip: &str) -> Option<String> {
-        self.ip_to_node.read().await.get(virtual_ip).cloned()
+        self.ip_to_node_snapshot
+            .borrow()
+            .get(virtual_ip)
+            .cloned()
     }
 
     /// Update a peer's connection state.
