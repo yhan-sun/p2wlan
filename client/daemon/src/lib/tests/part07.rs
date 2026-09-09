@@ -3589,6 +3589,12 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
     .await;
     harness.link.set_drop_a_to_b(true);
     harness.link.set_drop_b_to_a(true);
+    // High-entropy candidates intentionally include the public endpoints that
+    // the synthetic NAT owns.  Hold authenticated Punch packets as well as
+    // dropping forwarded traffic so this no-collision fixture cannot race a
+    // direct winner through the link's dynamic-socket fallback before either
+    // birthday sweep reaches its terminal failure state.
+    harness.link.set_hold_authenticated_punch(true);
     trigger_initial_offer(&harness).await;
 
     // Do not let the initial "not active and no sockets" state satisfy the

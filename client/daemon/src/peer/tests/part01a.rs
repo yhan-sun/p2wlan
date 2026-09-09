@@ -177,6 +177,80 @@ async fn staged_probe_binding_keeps_outbound_old_until_authenticated_promotion()
 }
 
 #[tokio::test]
+async fn same_key_rejoin_clears_stale_probe_bindings_before_new_handshake() {
+    let config = test_config();
+    let manager = PeerManager::new(config.clone());
+    let remote_identity = NodeIdentity::generate();
+    let remote_public_key = hex::encode(remote_identity.public_key());
+    let mut peer = test_peer("peer-probe-rejoin", "8.8.8.8:12297".parse().unwrap());
+    peer.public_key = remote_public_key.clone();
+    manager.add_peer(&peer).await;
+    let base_key = derive_probe_mac_key(&config, &remote_public_key).unwrap();
+
+    let mut offline = peer.clone();
+    offline.online = false;
+    manager.add_peer(&offline).await;
+
+    // A late worker from the retired incarnation may still have staged a
+    // replacement after the offline snapshot was published.  Recreate both
+    // the active and bounded pending state to make the rejoin fence explicit.
+    assert!(
+        manager
+            .set_probe_session_binding(
+                "peer-probe-rejoin",
+                Some("stale-session".to_string()),
+                Some([7u8; 32]),
+            )
+            .await
+    );
+    for index in 0..5 {
+        assert_eq!(
+            manager
+                .stage_probe_session_binding(
+                    "peer-probe-rejoin",
+                    format!("stale-token-{index}"),
+                    Some(format!("stale-pending-{index}")),
+                    Some([index as u8; 32]),
+                    false,
+                )
+                .await,
+            ProbeBindingStage::Staged
+        );
+    }
+
+    let update = manager.add_peer(&peer).await;
+    assert!(update.was_offline);
+    assert_eq!(
+        manager.probe_session_id_for_peer("peer-probe-rejoin").await,
+        None,
+        "a same-key rejoin must not retain the retired session id"
+    );
+    assert_eq!(
+        manager.probe_key_for_peer("peer-probe-rejoin").await,
+        Some(base_key),
+        "the rejoin must fall back to the identity-bound base key"
+    );
+    assert_eq!(
+        manager.probe_keys_for_peer("peer-probe-rejoin").await,
+        vec![base_key],
+        "all pending and overlap keys from the retired incarnation must be gone"
+    );
+    assert_eq!(
+        manager
+            .stage_probe_session_binding(
+                "peer-probe-rejoin",
+                "fresh-token".to_string(),
+                Some("fresh-session".to_string()),
+                Some([9u8; 32]),
+                false,
+            )
+            .await,
+        ProbeBindingStage::Staged,
+        "the replacement handshake must have a fresh staging budget"
+    );
+}
+
+#[tokio::test]
 async fn multiple_probe_tokens_are_retained_until_exact_token_promotion() {
     let manager = PeerManager::new(test_config());
     let remote_identity = NodeIdentity::generate();

@@ -628,6 +628,21 @@ impl PeerManager {
             cancel_heartbeat_after_lock = true;
             clear_hard_hard_after_lock = true;
         }
+        // A same-key peer restart is still a new transport incarnation.  The
+        // control plane deliberately keeps the connection entry while a peer
+        // is offline, so `public_key_changed` cannot identify this boundary.
+        // Clear every session-bound path artifact before publishing the new
+        // online generation; otherwise a late task from the old incarnation
+        // can leave an active/pending Probe-v2 binding behind.  Five such
+        // pending bindings exhaust the bounded staging queue and make the
+        // first offer of the replacement incarnation fail with `Busy`.
+        // `reset_for_peer_session` retains the remote candidate high-water and
+        // replay floor, which must continue fencing delayed old signals.
+        if was_offline && info.online && !public_key_changed {
+            conn.reset_for_peer_session();
+            cancel_heartbeat_after_lock = true;
+            clear_hard_hard_after_lock = true;
+        }
         // The remote fresh-prediction space is bound to the peer's identity
         // (public key): a rejoin with a NEW key — including a PeerLeft
         // followed by `add_peer` with `is_new == true` — must not inherit the

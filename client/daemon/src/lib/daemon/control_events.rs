@@ -2997,9 +2997,12 @@ impl Daemon {
                             .peers
                             .peer_session_generation_sync(&peer_info.node_id);
                         let update = self.peers.add_peer(&peer_info).await;
+                        let peer_rejoined = update.was_offline && peer_info.online;
                         match previous_peer_session_generation {
                             Some(previous_generation)
-                                if !peer_info.online || update.public_key_changed =>
+                                if !peer_info.online
+                                    || update.public_key_changed
+                                    || peer_rejoined =>
                             {
                                 self.punch_attempts
                                     .retire_peer_session(&peer_info.node_id, previous_generation);
@@ -3068,26 +3071,41 @@ impl Daemon {
                             }
                             continue;
                         }
-                        if update.public_key_changed {
+                        if update.public_key_changed || peer_rejoined {
                             remove_deferred_initiator_handshake(
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
+                            let (reason, caller) = if peer_rejoined {
+                                ("peer_rejoined", "control_events.peer_updated_rejoined")
+                            } else {
+                                (
+                                    "public_key_changed",
+                                    "control_events.peer_updated_public_key",
+                                )
+                            };
                             self.clear_peer_handshake_lifecycle(
                                 &peer_info.node_id,
-                                "public_key_changed",
+                                reason,
                             );
                             self.transport
                                 .remove_session_with_reason(
                                     &peer_info.node_id,
-                                    "public_key_changed",
-                                    "control_events.peer_updated_public_key",
+                                    reason,
+                                    caller,
                                 )
                                 .await;
-                            info!(
-                                "Peer {} public key changed; discarded the old WireGuard session",
-                                peer_info.node_id
-                            );
+                            if peer_rejoined {
+                                info!(
+                                    "Peer {} rejoined after going offline; discarded the old WireGuard session and UDP lifecycle",
+                                    peer_info.node_id
+                                );
+                            } else {
+                                info!(
+                                    "Peer {} public key changed; discarded the old WireGuard session",
+                                    peer_info.node_id
+                                );
+                            }
                             // A changed public key is a new peer incarnation: the
                             // old punch owner, pending probe ownership, fresh
                             // model and every dynamic socket belong to the old
@@ -3097,12 +3115,12 @@ impl Daemon {
                                 self.punch_attempts.cancel(&peer_info.node_id);
                             }
                             self.peers
-                                .clear_fresh_mapping(&peer_info.node_id, "public_key_changed")
+                                .clear_fresh_mapping(&peer_info.node_id, reason)
                                 .await;
                             if let Some(udp) = self.udp_transport.read().await.clone() {
                                 udp.cleanup_peer_lifecycle(
                                     &peer_info.node_id,
-                                    "public_key_changed",
+                                    reason,
                                     false,
                                 )
                                 .await;
