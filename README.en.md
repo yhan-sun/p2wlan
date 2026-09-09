@@ -1,8 +1,11 @@
+<p align="center">
+  <img src="assets/readme/hero.webp" width="100%" alt="P2WLAN — connect remote devices as if they were on the same LAN" />
+</p>
+
 <div align="center">
-  <img src="assets/p2wlan_icon.svg" width="88" alt="P2WLAN icon" />
   <h1>P2WLAN</h1>
-  <p><strong>Connect devices across different networks as if they were on the same LAN.</strong></p>
-  <p>Automatic virtual LAN · P2P first · Relay fallback · Cross-platform · Self-hostable</p>
+  <p><strong>Connect remote devices as if they were on the same LAN.</strong></p>
+  <p>P2P first · NAT traversal · Relay fallback · Cross-platform · Rooms · Self-hostable</p>
 
   <p>
     <a href="README.md">简体中文</a>
@@ -12,6 +15,7 @@
   <p>
     <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>Download</strong></a>
     · <a href="#quick-start">Quick Start</a>
+    · <a href="#use-cases">Use Cases</a>
     · <a href="#how-it-works">How It Works</a>
     · <a href="#self-hosting">Self-hosting</a>
   </p>
@@ -25,36 +29,55 @@
 
 ## What is P2WLAN?
 
-P2WLAN is an open-source, P2P-first, self-hostable virtual LAN. Each device gets a private virtual IP, so ordinary applications such as `ping`, SSH, RDP, databases, and web services can communicate without maintaining separate public ports and routes.
+P2WLAN is an open-source, P2P-first, self-hostable virtual LAN. It gives devices private virtual IP addresses so machines on home broadband, mobile networks, campus networks, cloud servers, and other remote networks can communicate as if they were on the same LAN.
 
-When a connection is established, P2WLAN prefers a local or public UDP direct path. If the network does not allow a direct path, it automatically falls back to an encrypted relay.
+When establishing a connection, P2WLAN prefers **LAN Direct / public UDP P2P**. If NAT, firewalls, or the current network prevent a direct path, it automatically falls back to an **Encrypted Relay**. Applications keep using the same virtual IP, without requiring a separate public port, DDNS entry, or custom route for every device.
 
-> **Preview:** P2WLAN is intended for real-network testing, self-hosting, and development validation. It has not received an independent security audit and is not an official WireGuard implementation or a WireGuard interoperability solution.
+> [!IMPORTANT]
+> P2WLAN is currently a **Preview** project intended for real-network testing, self-hosting, and development validation. It has not completed an independent security audit. P2WLAN is not an official WireGuard implementation and does not claim WireGuard interoperability.
 
-## Why P2WLAN
+## At a glance
 
 | Capability | What it means |
 | --- | --- |
-| **P2P First** | Prefer LAN and public UDP direct paths before using a relay. |
-| **NAT Traversal** | Probe network conditions and attempt UDP P2P connectivity; complex NAT environments are not guaranteed to succeed. |
-| **End-to-End Encryption** | Device traffic is carried in encrypted sessions; relays forward ciphertext only. |
-| **Automatic Relay Fallback** | If Direct cannot be confirmed, traffic can move to Relay without changing the application endpoint. |
-| **Cross-platform** | Flutter clients cover desktop and mobile preview targets; the Rust daemon / CLI also supports servers and headless environments. |
-| **Self-hosted** | The Control Plane, SQLite database, and Relay can run on your own Linux server. |
+| **P2P First** | Prefer local and public UDP direct paths before using a relay. |
+| **NAT Traversal** | Probe network conditions and attempt UDP hole punching; complex NAT environments are not guaranteed to succeed. |
+| **Relay Fallback** | Automatically move to an encrypted relay when Direct is unavailable. |
+| **End-to-End Encryption** | Peer traffic is carried in encrypted sessions; relays forward ciphertext only. |
+| **Rooms** | Organize a fixed or temporary group of devices for game sessions, collaboration, or private services. |
+| **Cross-platform** | GUI clients cover Windows, macOS, Linux, and mobile preview targets; CLI / daemon builds support servers and headless systems. |
+| **Self-hosted** | Run the Control Plane, SQLite database, and Relay on infrastructure you control. |
+
+## Screenshots
+
+<p align="center">
+  <img src="assets/readme/screens.webp" width="100%" alt="P2WLAN network dashboard, device list, rooms, and a Minecraft room" />
+</p>
+
+The client surfaces network health, peer availability, rooms, active paths, and end-to-end latency in one place. Device names and values shown in the screenshots are demo data.
 
 ## Use Cases
 
-- Remote access to computers, cloud instances, NAS, and HomeLab machines
-- SSH / RDP / web administration / database access
-- Connecting development devices across regions or cloud providers
-- Linking devices across home broadband, mobile hotspots, campus networks, and other different networks
-- Running the Control Plane and Relay on infrastructure you control
+P2WLAN provides a virtual layer-3 network rather than defining what must run on top of it. If an application communicates over IP, it can usually use the P2WLAN virtual network in the same way it would use a normal private LAN.
+
+| Scenario | Example |
+| --- | --- |
+| **NAS / HomeLab** | Reach NAS administration pages, home servers, VMs, and internal services without exposing each one through a public port. |
+| **Minecraft** | Put friends' computers in the same room and connect to a self-hosted Minecraft server through its virtual IP. |
+| **Terraria** | Place players on different real networks into one virtual network for multiplayer sessions. |
+| **Self-hosted services** | Reach web apps, APIs, databases, admin panels, and game servers that should stay private. |
+| **Remote development** | SSH, RDP, database access, development machines, and cross-region testing. |
+| **Cross-region networking** | Link home broadband, mobile hotspots, campus networks, cloud instances, and different cloud providers. |
+
+### Rooms: organize who should be connected
+
+Rooms are useful when a network needs its own boundary: a Minecraft survival server, a temporary game session, a set of NAS maintenance devices, or a development environment. The client can present members, availability, virtual IPs, active paths, and latency without mixing every device into a single view.
 
 ## Quick Start
 
-**1. Download**
+### 1. Download
 
-Get the latest release from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases).
+Get the latest build from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases).
 
 | Platform | Release artifact | Status |
 | --- | --- | --- |
@@ -66,24 +89,24 @@ Get the latest release from [GitHub Releases](https://github.com/yhan-sun/p2wlan
 | Android 7.0+ (API 24+) arm64 | `p2wlan-flutter-android-arm64-release.apk` | Preview |
 | iOS 15+ arm64 | `p2wlan-flutter-ios-arm64-unsigned.ipa` | Experimental, requires signing |
 
-**2. Sign in**
+### 2. Sign in
 
-Open the client and sign in. On servers or headless systems, use the CLI:
+Open the GUI and sign in. Servers and headless systems can use the CLI:
 
 ```bash
 p2wlan login -u you@example.com
 ```
 
-**3. Start the virtual network**
+### 3. Start the virtual network
 
-Start the network from the client, or run:
+Start networking from the client, or run:
 
 ```bash
 p2wlan up
 p2wlan status
 ```
 
-**4. Use the virtual IP**
+### 4. Use the virtual IP
 
 Once the peer is connected, use its P2WLAN virtual IP like any other private address:
 
@@ -92,7 +115,9 @@ ping 10.20.0.5
 ssh user@10.20.0.5
 ```
 
-**5. Check the connection path**
+The same applies to game servers, NAS services, web panels, databases, and other IP-based applications: connect to the peer's virtual IP and the service port.
+
+### 5. Check the connection path
 
 The client shows the active peer path. For CLI diagnostics:
 
@@ -101,7 +126,7 @@ p2wlan doctor
 p2wlan logs -f
 ```
 
-For Linux CLI installation, the repository also provides an installer:
+The repository also includes a Linux CLI installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
@@ -110,22 +135,26 @@ sudo sh /tmp/p2wlan-install.sh
 
 ## How It Works
 
-P2WLAN separates connection control from data transport. The Control Plane handles identity, devices, virtual IPs, and signaling. The Rust daemon owns the local virtual interface, encrypted data plane, and path selection. A Relay is used only when needed and forwards ciphertext.
+P2WLAN separates connection control from data transport:
+
+- **Control Plane** handles identity, devices, virtual IPs, credentials, and signaling.
+- **Rust daemon** manages the virtual interface, routing, peers, NAT traversal, encrypted data plane, and path selection.
+- **Relay** participates only when Direct is unavailable and forwards ciphertext.
 
 ```mermaid
 flowchart LR
     A[Device A] <-->|"LAN Direct / UDP P2P"| B[Device B]
-    A -->|"Control Plane: auth / signaling"| C[Control Plane]
-    B -->|"Control Plane: auth / signaling"| C
+    A -->|"Auth / signaling"| C[Control Plane]
+    B -->|"Auth / signaling"| C
     A -.->|"Direct unavailable"| R[Encrypted Relay]
     R -.-> B
 ```
 
-The connection strategy can be summarized as:
+The path strategy can be summarized as:
 
 **LAN Direct → Public UDP Direct → Encrypted Relay**
 
-Direct connectivity depends on both real network environments. NAT, CGNAT, firewalls, or cloud security groups can prevent direct connectivity; Relay provides the fallback path when it is available.
+Direct connectivity depends on both real network environments. NAT, CGNAT, firewalls, and cloud security groups may prevent a direct path. Relay is the fallback path, not a guarantee that P2P will succeed across every NAT topology.
 
 ## Connection Status
 
@@ -133,18 +162,18 @@ Direct connectivity depends on both real network environments. NAT, CGNAT, firew
 | --- | --- |
 | **LAN Direct** | Direct communication over the local network. |
 | **Direct** | P2P communication over public UDP. |
-| **Relay** | Ciphertext is forwarded through an encrypted relay path. |
-| **Connecting** | A connection path is being established or confirmed. |
-| **Offline** | The peer is offline or no usable path is currently confirmed. |
+| **Relay** | Encrypted traffic is forwarded through a Relay. |
+| **Connecting** | A path is being established or confirmed. |
+| **Offline** | The peer is offline or no usable path is currently available. |
 
 ## Architecture
 
 | Component | Technology | Responsibility |
 | --- | --- | --- |
-| GUI | Flutter | Sign-in, device management, connection status, and diagnostics. |
-| Data Plane / Daemon | Rust | TUN, routing, peers, NAT traversal, encrypted sessions, and relay fallback. |
-| Virtual interface | macOS `utun` / Windows Wintun / Linux TUN | Provides a normal layer-3 virtual network interface to applications. |
-| Control Plane | Go + SQLite | Authentication, device registry, virtual IPs, credentials, signaling, and relay information. |
+| GUI | Flutter | Sign-in, device / room management, connection status, and diagnostics. |
+| Data Plane / Daemon | Rust | TUN, routing, peers, NAT traversal, encrypted sessions, and Relay fallback. |
+| Virtual interface | macOS `utun` / Windows Wintun / Linux TUN | Provides a standard layer-3 virtual network interface to applications. |
+| Control Plane | Go + SQLite | Authentication, device registry, virtual IPs, credentials, signaling, and Relay information. |
 | Relay | Go | Relay connections, ticket validation, and ciphertext forwarding. |
 
 P2WLAN uses a self-contained **WireGuard-like Noise** data plane with X25519, ChaCha20-Poly1305, BLAKE2s, and related primitives. **P2WLAN is not an official WireGuard implementation and does not claim WireGuard interoperability.**
@@ -159,7 +188,7 @@ go build -o p2wlan-control .
 go build -o p2wlan-relay ./relay
 ```
 
-For production deployment, configure HTTPS/WSS, the database, authentication secrets, and relay addresses according to the current code under [`server/`](server/). The project homepage intentionally does not duplicate the full production configuration.
+Production deployment also requires HTTPS/WSS, database, authentication secrets, and Relay addresses to be configured according to the current code. This README keeps only the high-level entry point; use the implementation under [`server/`](server/) as the source of truth for deployment details.
 
 ## Security Boundaries
 
@@ -167,16 +196,14 @@ For production deployment, configure HTTPS/WSS, the database, authentication sec
 - Relays forward ciphertext and do not decrypt private payloads.
 - Relays may still observe connection metadata such as node identifiers, timing, and packet sizes.
 - The project is in **Preview** and has **not completed an independent security audit**.
-- P2P connectivity is not guaranteed across arbitrary NAT environments; relay availability also depends on the Control Plane and Relay being reachable.
-- For sensitive production environments, perform your own security assessment before deployment.
+- P2P connectivity is not guaranteed across arbitrary NAT environments; Relay availability also depends on the Control Plane and Relay being reachable.
+- Perform your own security assessment before sensitive production deployment.
 
 ## Developers
 
-Flutter development and releases use Flutter 3.47.2 with Dart 3.13.2. The
-repository-root `.fvmrc` is the version source for local FVM, CI, and release
-workflows.
+Flutter development and releases use **Flutter 3.47.2 / Dart 3.13.2**. The repository-root `.fvmrc` is the version source for local FVM, CI, and release workflows.
 
-The repository is organized by responsibility:
+Repository structure:
 
 - [`apps/flutter_client/`](apps/flutter_client/) — Flutter client
 - [`client/daemon/`](client/daemon/) — Rust daemon
@@ -186,7 +213,7 @@ The repository is organized by responsibility:
 - [`server/`](server/) — Go Control Plane
 - [`server/relay/`](server/relay/) — Go Relay
 
-Implementation details should be confirmed from source, tests, and CI rather than duplicated as internal state-machine documentation on the project homepage.
+Prefer source, tests, and CI as the source of truth for implementation details.
 
 ## License
 
