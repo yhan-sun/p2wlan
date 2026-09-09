@@ -597,6 +597,12 @@ impl Daemon {
             info!("Android daemon startup completed; VPN dataplane is ready");
         }
 
+        // Signal leasing is gated until this point so an offer/answer cannot
+        // be held by the server while startup is still constructing the
+        // daemon's control-event consumer.  Mark the edge immediately before
+        // entering the consumer loop; any queued roster events are then
+        // drained in order and the first signal is applied without lease HOL.
+        self.control.mark_event_loop_ready();
         self.run_control_event_loop(&mut relay_started, network_inbound_tx.clone())
             .await;
 

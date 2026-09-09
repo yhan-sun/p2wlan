@@ -80,6 +80,7 @@ impl ControlClient {
         let (candidate_offer_tx, candidate_offer_rx) =
             mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
         let (critical_auth_tx, critical_auth_rx) = watch::channel(None);
+        let event_loop_ready = Arc::new(AtomicBool::new(false));
 
         let state = Arc::new(RwLock::new(ClientState {
             room_authorization: Arc::new(crate::rooms::RoomAuthorization::new(&config.network.network_id)),
@@ -101,6 +102,7 @@ impl ControlClient {
         let critical_lifecycle_tx = cmd_tx.clone();
         let client = Self {
             shutdown_lifecycle,
+            event_loop_ready: event_loop_ready.clone(),
             event_tx: event_tx.clone(),
             cmd_tx: cmd_tx.clone(),
             critical_offer_tx,
@@ -179,6 +181,7 @@ impl ControlClient {
                     critical_auth_tx,
                     health,
                     advertised_snapshot,
+                    event_loop_ready,
                 )
                 .await;
             };
@@ -248,6 +251,7 @@ impl ControlClient {
         }));
         Self {
             shutdown_lifecycle: None,
+            event_loop_ready: Arc::new(AtomicBool::new(false)),
             event_tx,
             cmd_tx,
             critical_offer_tx,
@@ -264,6 +268,15 @@ impl ControlClient {
             #[cfg(test)]
             test_signal_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Allow the ordinary control runtime to start leasing signal rows only
+    /// after the daemon has installed its main event consumer.  This closes
+    /// the startup race where a first offer was leased before the state
+    /// machine could apply it, causing ordered redelivery to wait for the
+    /// server lease timeout.
+    pub(crate) fn mark_event_loop_ready(&self) {
+        self.event_loop_ready.store(true, Ordering::Release);
     }
 
     /// Install a test-only in-process signaling forwarder. The adapter is

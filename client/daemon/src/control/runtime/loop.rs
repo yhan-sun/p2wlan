@@ -11,6 +11,7 @@ async fn run_control_loop(
     critical_auth_tx: watch::Sender<Option<CriticalControlAuth>>,
     health: Option<Arc<crate::tasks::HealthState>>,
     advertised_snapshot: Arc<std::sync::Mutex<AdvertisedEndpointSnapshot>>,
+    event_loop_ready: Arc<AtomicBool>,
 ) {
     let base_url = normalize_http_base_url(&config.control.server_url);
 
@@ -301,6 +302,11 @@ async fn run_control_loop(
             }
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
+        // Do not lease the first signal until the daemon's main consumer is
+        // ready.  A leased signal delivered during startup cannot be applied;
+        // the server's ordered lease would then fence every later signal for
+        // its full TTL, making a healthy relay handshake appear to stall.
+        wait_for_event_loop_ready(&event_loop_ready).await;
         let initial_signal_poll = async {
             let current_http = http.current()?;
             poll_signals(
@@ -677,4 +683,14 @@ async fn run_control_loop(
         // brief pause before re-register to avoid hammering a restarting server
         tokio::time::sleep(Duration::from_secs(1)).await;
     } // end outer loop — will hit the `return` inside on Shutdown, or loop around
+}
+
+/// Wait for `Daemon::run` to install its control-event consumer.  Do not read
+/// the command channel here: commands can carry response senders and must
+/// remain queued for the normal polling loop rather than being consumed and
+/// dropped while startup is still in progress.
+async fn wait_for_event_loop_ready(ready: &Arc<AtomicBool>) {
+    while !ready.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

@@ -560,6 +560,15 @@ struct SignalResponse {
 #[derive(Clone)]
 pub struct ControlClient {
     shutdown_lifecycle: Option<Arc<ControlShutdown>>,
+    /// Set by the daemon after its main control-event consumer is ready.
+    ///
+    /// Registration and peer-roster polling may run during daemon startup,
+    /// but signal polling must wait for this edge.  Otherwise the first
+    /// leased offer/answer can be delivered while `Daemon::run` is still
+    /// waiting for `Registered` or bringing up the dataplane.  The server's
+    /// ordered lease then fences later signals until it expires, adding a
+    /// multi-second delay to an otherwise healthy relay handshake.
+    event_loop_ready: Arc<AtomicBool>,
     /// Channel to send events to the daemon.
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     /// Channel to send commands to the background task.
