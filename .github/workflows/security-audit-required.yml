@@ -343,12 +343,49 @@ jobs:
           evidence="$RUNNER_TEMP/security-release"
           assets="$RUNNER_TEMP/security-release-assets"
           mkdir -p "$evidence" "$assets"
-          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$evidence/releases.json"
-          jq -e 'map(select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")))) | sort_by(.published_at // .created_at) | last' \
-            "$evidence/releases.json" >"$evidence/release.json"
-          test -s "$evidence/release.json"
+          # A release workflow uploads platform assets from independent jobs.
+          # GitHub can briefly expose the release while only a subset of those
+          # assets is visible through the API.  Wait for the complete required
+          # asset set before downloading; otherwise this audit races a healthy
+          # release and reports a false failure.
+          required_patterns=(
+            'android-arm64.*\\.apk$'
+            'ios-arm64.*\\.ipa$'
+            'flutter-linux-x64.*\\.tar\\.gz$'
+            'macos-arm64.*\\.dmg$'
+            'macos-x64.*\\.dmg$'
+            'windows-x64.*\\.(exe|zip)$'
+            'linux-arm64-cli.*\\.tar\\.gz$'
+            'linux-x64-cli.*\\.tar\\.gz$'
+          )
+          max_attempts=30
+          sleep_seconds=10
+          ready=0
+          for attempt in $(seq 1 "$max_attempts"); do
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$evidence/releases.json"
+            jq -e 'map(select(.draft == false and .prerelease == false and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")))) | sort_by(.published_at // .created_at) | last' \
+              "$evidence/releases.json" >"$evidence/release.json"
+            test -s "$evidence/release.json"
+            tag="$(jq -er '.tag_name' "$evidence/release.json")"
+            names="$(jq -r '.assets[]? | select(.state == "uploaded") | .name' "$evidence/release.json")"
+            ready=1
+            missing=()
+            for pattern in "${required_patterns[@]}"; do
+              if ! grep -Eq "$pattern" <<<"$names"; then
+                ready=0
+                missing+=("$pattern")
+              fi
+            done
+            if [[ "$ready" -eq 1 ]]; then
+              echo "Release $tag exposes all required assets on attempt $attempt."
+              break
+            fi
+            echo "Release $tag is still missing ${#missing[@]} required asset class(es) on attempt $attempt; retrying in ${sleep_seconds}s." >&2
+            if [[ "$attempt" -lt "$max_attempts" ]]; then
+              sleep "$sleep_seconds"
+            fi
+          done
           release_id="$(jq -er '.id' "$evidence/release.json")"
-          tag="$(jq -er '.tag_name' "$evidence/release.json")"
           test -n "$release_id"
           test -n "$tag"
           gh release download "$tag" \
@@ -356,6 +393,7 @@ jobs:
             --dir "$assets" \
             --clobber
           gh version >"$evidence/gh-version.txt"
+          set +e
           python3 scripts/security/verify_release_assets.py \
             --release-json "$evidence/release.json" \
             --assets-dir "$assets" \
@@ -363,6 +401,7 @@ jobs:
             --workflow-sha "$P2WLAN_WORKFLOW_SHA" \
             --repository "$GITHUB_REPOSITORY" \
             --output "$evidence/release-assets.json"
+          verify_status=$?
           python3 scripts/security/credential_scan.py \
             --root "$assets" \
             --head-sha "$P2WLAN_EXACT_HEAD" \
@@ -371,6 +410,10 @@ jobs:
             --component release_asset_plaintext_scan \
             --scan-binary \
             --output "$evidence/release-asset-credential-scan.json"
+          scan_status=$?
+          set -e
+          test "$verify_status" -eq 0
+          test "$scan_status" -eq 0
 
       - name: Upload release verification evidence
         if: always()
