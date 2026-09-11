@@ -42,6 +42,11 @@ func (l *relayTicketRateLimiter) allow(deviceID string) bool {
 	defer l.mu.Unlock()
 
 	now := time.Now()
+	for id, bucket := range l.buckets {
+		if !now.Before(bucket.reset) {
+			delete(l.buckets, id)
+		}
+	}
 	b, ok := l.buckets[deviceID]
 	if !ok || now.After(b.reset) {
 		l.buckets[deviceID] = &ticketRateBucket{count: 1, reset: now.Add(l.window)}
@@ -153,12 +158,20 @@ func (s *Server) CreateRelayTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scope, err := s.db.RelayForwardingScope(device)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]interface{}{
+			"error": "relay authorization unavailable",
+		})
+		return
+	}
+
 	// ---- Sign ticket ----
 	now := time.Now()
 	tokenStr, expiresAt, err := s.relayTicketSigner.SignTicket(
 		device.ID,
 		deviceClaims.CredentialID,
-		device.NetworkID,
+		scope,
 		device.ID, // node_id = device_id in current model
 		descriptor.Audience,
 		descriptor.Region,

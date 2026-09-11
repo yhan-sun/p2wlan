@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -119,7 +120,10 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 				if !ok || p.revoked.Load() {
 					return
 				}
-				if err := writeFull(conn, frame); err != nil {
+				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				err := writeFull(conn, frame)
+				p.releaseFrame(frame)
+				if err != nil {
 					p.writeFailed.Store(true)
 					setCloseCause("write_failed")
 					_ = conn.Close()
@@ -202,6 +206,12 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 		// Verify the ticket
 		claims, err := s.verifyTicket(ticket)
 		if err != nil {
+			if errors.Is(err, errRevocationFeedUnavailable) {
+				setCloseCause("revocation_feed_unavailable")
+				_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+				_ = writeFull(conn, errorFrame(503, "relay authorization temporarily unavailable"))
+				return
+			}
 			s.recordAuthFailure(source)
 			setCloseCause("auth_ticket_rejected")
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
@@ -237,6 +247,15 @@ func (s *RelayServer) handleConn(conn net.Conn) {
 
 		// Register with network binding
 		if !s.registerAuthenticated(p, claims) {
+			s.revocationMu.RLock()
+			feedReady := s.revocationFeedUsableLocked(time.Now())
+			s.revocationMu.RUnlock()
+			if !feedReady {
+				setCloseCause("revocation_feed_unavailable")
+				_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+				_ = writeFull(conn, errorFrame(503, "relay authorization temporarily unavailable"))
+				return
+			}
 			s.recordAuthFailure(source)
 			setCloseCause("auth_revoked_at_register")
 			return

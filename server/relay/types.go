@@ -82,9 +82,14 @@ type RelayServer struct {
 	// Online control-plane revocation feed snapshot.
 	revocationMu               sync.RWMutex
 	revocationVersion          int64
+	revocationCursor           int64
+	revocationThrough          int64
+	revocationLastSuccess      time.Time
+	revocationSyncMu           sync.Mutex
 	onlineRevokedTicketJTIs    map[string]struct{}
 	onlineRevokedDeviceIDs     map[string]struct{}
 	onlineRevokedCredentialIDs map[string]struct{}
+	revocationObservedAt       map[revocationIdentity]time.Time
 }
 
 type relayStats struct {
@@ -122,6 +127,10 @@ type RelayStatsSnapshot struct {
 	ForwardErrorsTotal             uint64                      `json:"forward_errors_total"`
 	RevocationRefreshesTotal       uint64                      `json:"revocation_refreshes_total"`
 	RevocationRefreshFailuresTotal uint64                      `json:"revocation_refresh_failures_total"`
+	RevocationVersion              int64                       `json:"revocation_version"`
+	RevocationCursor               int64                       `json:"revocation_cursor"`
+	RevocationReady                bool                        `json:"revocation_ready"`
+	RevocationLastSuccessUnix      int64                       `json:"revocation_last_success_unix"`
 	AuthFailureSources             []AuthFailureSourceSnapshot `json:"auth_failure_sources,omitempty"`
 }
 
@@ -144,6 +153,10 @@ type relayTicketClaims struct {
 }
 
 type relayRevocationFeedSnapshot struct {
+	ProtocolVersion      int      `json:"protocol_version,omitempty"`
+	After                int64    `json:"after,omitempty"`
+	NextCursor           int64    `json:"next_cursor,omitempty"`
+	HasMore              bool     `json:"has_more,omitempty"`
 	GeneratedAt          string   `json:"generated_at"`
 	Version              int64    `json:"version"`
 	RevokedDeviceIDs     []string `json:"revoked_device_ids"`

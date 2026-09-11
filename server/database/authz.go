@@ -278,50 +278,42 @@ func (db *DB) RecordRelayTicketRevocation(jti string) error {
 
 // RelayRevocationSnapshot returns all relay revocation tombstones.
 func (db *DB) RelayRevocationSnapshot() (*RelayRevocationSnapshot, error) {
-	rows, err := db.Query(`SELECT kind, value, created_at FROM relay_revocations ORDER BY kind, value`)
+	if err := db.PruneRelayRevocations(time.Now()); err != nil {
+		return nil, err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	snapshot := emptyRevocations()
+	if err := tx.QueryRow(`SELECT revision FROM relay_revocation_clock WHERE id=1`).Scan(&snapshot.Version); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(`SELECT kind,value FROM relay_revocations ORDER BY kind,value`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	snapshot := &RelayRevocationSnapshot{
-		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
-		RevokedDeviceIDs:     []string{},
-		RevokedCredentialIDs: []string{},
-		RevokedJTIs:          []string{},
-	}
-	var maxCreatedAt int64
-	var tombstoneCount int64
 	for rows.Next() {
 		var kind, value string
-		var createdAt int64
-		if err := rows.Scan(&kind, &value, &createdAt); err != nil {
+		if err := rows.Scan(&kind, &value); err != nil {
 			return nil, err
 		}
-		if createdAt > maxCreatedAt {
-			maxCreatedAt = createdAt
-		}
-		tombstoneCount++
-		switch kind {
-		case RelayRevocationDeviceID:
-			snapshot.RevokedDeviceIDs = append(snapshot.RevokedDeviceIDs, value)
-		case RelayRevocationCredentialID:
-			snapshot.RevokedCredentialIDs = append(snapshot.RevokedCredentialIDs, value)
-		case RelayRevocationJTI:
-			snapshot.RevokedJTIs = append(snapshot.RevokedJTIs, value)
+		if err := appendRevocation(&snapshot, kind, value); err != nil {
+			return nil, err
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	// Tombstones are append-only. Include the row count so two revocations
-	// created in the same Unix second still advance the snapshot version; using
-	// only MAX(created_at) allowed a relay to mistake a newer snapshot for the
-	// same generation and made rollback protection impossible.
-	if tombstoneCount > 0 {
-		snapshot.Version = maxCreatedAt*1_000_000 + tombstoneCount
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
-	return snapshot, nil
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
 }
 
 // hashToken returns a SHA-256 hash of an opaque credential token.

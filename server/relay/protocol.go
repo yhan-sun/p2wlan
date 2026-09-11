@@ -76,10 +76,7 @@ func parseAuthRegister(payload []byte) (nodeID, ticket string, err error) {
 }
 
 func queue(p *peer, frame []byte) {
-	select {
-	case p.send <- frame:
-	case <-p.done:
-	default:
+	if !p.enqueue(frame) {
 		_ = p.conn.Close()
 	}
 }

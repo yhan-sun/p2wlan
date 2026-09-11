@@ -27,7 +27,10 @@ type peer struct {
 	// writeFailed is set when the per-peer writer goroutine fails to write a
 	// frame; handleConn's deferred close logging uses it as the disconnect
 	// cause when a write failure raced the read loop's classification.
-	writeFailed atomic.Bool
+	writeFailed    atomic.Bool
+	queueMu        sync.Mutex
+	queuedBytes    int
+	queuedBySource map[string]int
 }
 
 type hub struct {
@@ -122,18 +125,17 @@ func (h *hub) forward(srcNetwork, srcID, dstID string, data []byte, maxFramePayl
 		}
 	}
 	select {
-	case dst.send <- frame:
-		if h.debugFrames {
-			log.Printf("event=relay_forward_enqueued src=%s dst=%s bytes=%d wire_fp=%s", srcID, dstID, len(data), opaqueFrameFingerprint(data))
-		}
-		return 0, ""
 	case <-dst.done:
 		return 404, "peer disconnected: " + dstID
 	default:
-		// slow consumer backpressure: close target connection
-		_ = dst.conn.Close()
+	}
+	if !dst.enqueue(frame) {
 		return 4008, "peer backpressure: " + dstID
 	}
+	if h.debugFrames {
+		log.Printf("event=relay_forward_enqueued src=%s dst=%s bytes=%d wire_fp=%s", srcID, dstID, len(data), opaqueFrameFingerprint(data))
+	}
+	return 0, ""
 }
 
 // opaqueFrameFingerprint correlates an encrypted frame across local relay

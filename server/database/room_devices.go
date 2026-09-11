@@ -179,7 +179,7 @@ func (db *DB) ChangeRoomDeviceAccess(actor, room, id, action string) ([]string, 
 		}
 	case "unblock":
 		if state != "blocked" {
-			return nil, ErrRoomConflict
+			return nil, ErrRoomDeviceStateConflict
 		}
 		if actor != owner && blockedBy != actor {
 			return nil, ErrRoomAccess
@@ -191,7 +191,7 @@ func (db *DB) ChangeRoomDeviceAccess(actor, room, id, action string) ([]string, 
 			return nil, ErrRoomAccess
 		}
 		if state != "pending" {
-			return nil, ErrRoomConflict
+			return nil, ErrRoomDeviceStateConflict
 		}
 		next = "paused"
 	default:

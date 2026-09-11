@@ -14,11 +14,20 @@ import 'room_connection_preferences.dart';
 enum RoomConnectionPhase { starting, running, unavailable, stopping, failed }
 
 class ParallelRoomPlan {
-  ParallelRoomPlan(AppSettings account, this.room, {this.automatic = false}) {
+  ParallelRoomPlan(
+    AppSettings account,
+    this.room, {
+    this.automatic = false,
+    int? diagnosticsPort,
+  }) {
     final selected = selectRoomSettings(account, room);
     profileId = roomProfileId(selected);
     final port =
-        40000 + int.parse(profileId.substring(0, 8), radix: 16) % 20000;
+        diagnosticsPort ??
+        (40000 + int.parse(profileId.substring(0, 8), radix: 16) % 20000);
+    if (port < 40000 || port >= 60000) {
+      throw ArgumentError.value(port, 'diagnosticsPort');
+    }
     settings = selected.copyWith(
       diagnosticsUrl: 'http://127.0.0.1:$port/status',
       tunInterface: 'p2r${profileId.substring(0, 12)}',
@@ -39,6 +48,10 @@ abstract interface class RoomRuntime {
   Future<DaemonCommandResult> stop();
   Future<DiagnosticsSnapshot> status();
   void close();
+}
+
+abstract interface class RoomControlStatus {
+  String? get controlWarning;
 }
 
 class ParallelRoomSession {
@@ -324,6 +337,11 @@ class ParallelRooms extends ChangeNotifier {
     bool automatic,
   ) async {
     if (!_accepts(epoch, credentials)) return _fail('登录状态已变化，已取消连接');
+    var account = readSettings();
+    final initialPlan = ParallelRoomPlan(account, room, automatic: automatic);
+    final preference = await preferences.read(initialPlan.profileId);
+    if (!_accepts(epoch, credentials)) return _fail('登录状态已变化，已取消连接');
+    account = readSettings();
     if (_sessions.values.any(
       (entry) => _credentialKey(entry.plan.settings) != credentials,
     )) {
@@ -337,8 +355,25 @@ class ParallelRooms extends ChangeNotifier {
     if (_sessions.length >= maxConnections) {
       return _fail('已达到并行房间上限 $maxConnections');
     }
-    final account = readSettings();
-    final plan = ParallelRoomPlan(account, room, automatic: automatic);
+    var plan = ParallelRoomPlan(
+      account,
+      room,
+      automatic: automatic,
+      diagnosticsPort: preference.diagnosticsPort,
+    );
+    final firstPort = Uri.parse(plan.settings.diagnosticsUrl).port;
+    for (
+      var attempt = 0;
+      _portConflict(plan, account) && attempt < 32;
+      attempt++
+    ) {
+      plan = ParallelRoomPlan(
+        account,
+        room,
+        automatic: automatic,
+        diagnosticsPort: 40000 + (firstPort - 40000 + attempt + 1) % 20000,
+      );
+    }
     final conflict = _conflict(plan, account);
     if (conflict != null) return _fail(conflict);
     final entry = ParallelRoomSession(plan, runtimeFactory(plan));
@@ -352,7 +387,11 @@ class ParallelRooms extends ChangeNotifier {
     _notify();
     DaemonCommandResult started;
     try {
-      if (!automatic) await preferences.update(plan.profileId, wanted: true);
+      await preferences.update(
+        plan.profileId,
+        wanted: automatic ? null : true,
+        diagnosticsPort: Uri.parse(plan.settings.diagnosticsUrl).port,
+      );
       started = _accepts(epoch, credentials)
           ? await entry.runtime.start()
           : _fail('登录状态已变化，连接已取消');
@@ -391,6 +430,14 @@ class ParallelRooms extends ChangeNotifier {
       return _fail(entry.message ?? '房间进程已启动，但地址或路由尚未就绪；可重试状态检查或断开');
     }
     return started;
+  }
+
+  bool _portConflict(ParallelRoomPlan plan, AppSettings account) {
+    final port = Uri.parse(plan.settings.diagnosticsUrl).port;
+    return Uri.tryParse(account.diagnosticsUrl)?.port == port ||
+        _sessions.values.any(
+          (entry) => Uri.parse(entry.plan.settings.diagnosticsUrl).port == port,
+        );
   }
 
   String? _conflict(ParallelRoomPlan plan, AppSettings account) {
@@ -539,15 +586,31 @@ class ParallelRooms extends ChangeNotifier {
         !_recovering.add(room.id)) {
       return;
     }
+    final epoch = _epoch;
     try {
       await _enqueue(room.id, () async {
-        if (_sessions.containsKey(room.id) ||
+        if (epoch != _epoch ||
+            _sessions.containsKey(room.id) ||
             _stoppingAll != null ||
             connectionsPaused) {
           return _ok();
         }
         final account = readSettings();
-        final plan = ParallelRoomPlan(account, room);
+        final initial = ParallelRoomPlan(account, room);
+        final preference = await preferences.read(initial.profileId);
+        if (_credentialKey(account) != _credentialKey(readSettings()) ||
+            _stoppingAll != null ||
+            connectionsPaused ||
+            _disposed ||
+            epoch != _epoch ||
+            _sessions.containsKey(room.id)) {
+          return _ok();
+        }
+        final plan = ParallelRoomPlan(
+          account,
+          room,
+          diagnosticsPort: preference.diagnosticsPort,
+        );
         if (_conflict(plan, account) != null ||
             _sessions.length >= maxConnections) {
           return _ok();
@@ -617,12 +680,16 @@ class ParallelRooms extends ChangeNotifier {
       }
       entry.snapshot = snapshot;
       entry.phase = RoomConnectionPhase.running;
-      entry.message = null;
+      final runtime = entry.runtime;
+      entry.message = runtime is RoomControlStatus
+          ? (runtime as RoomControlStatus).controlWarning
+          : null;
       _rememberRoom(
         entry.plan,
         snapshot: snapshot,
         replaceSnapshot: true,
         phase: entry.phase,
+        message: entry.message,
       );
     } catch (error) {
       if (error is RoomConnectionStopped &&

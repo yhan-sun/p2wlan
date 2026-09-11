@@ -111,6 +111,58 @@ void main() {
   });
 
   test(
+    'room diagnostics collision chooses and persists an independent port',
+    () async {
+      final firstRoom = room(1);
+      final initial = ParallelRoomPlan(settings, firstRoom);
+      final primaryPort = Uri.parse(initial.settings.diagnosticsUrl).port;
+      settings = settings.copyWith(
+        diagnosticsUrl: initial.settings.diagnosticsUrl,
+      );
+      expect((await manager.connect(firstRoom)).ok, isTrue);
+      final allocated = manager.session(firstRoom.id)!.plan;
+      final chosen = Uri.parse(allocated.settings.diagnosticsUrl).port;
+      expect(chosen, isNot(primaryPort));
+      expect(
+        (await manager.connectionPreference(firstRoom)).diagnosticsPort,
+        chosen,
+      );
+      final secondRoom = room(2);
+      final secondProfile = ParallelRoomPlan(settings, secondRoom).profileId;
+      await manager.preferences.update(secondProfile, diagnosticsPort: chosen);
+      expect((await manager.connect(secondRoom)).ok, isTrue);
+      expect(
+        Uri.parse(manager.session(secondRoom.id)!.plan.settings.diagnosticsUrl)
+            .port,
+        isNot(chosen),
+      );
+      expect(runtimes[firstRoom.id]!.stops, 0);
+      await manager.disconnect(firstRoom.id);
+      expect((await manager.connect(firstRoom)).ok, isTrue);
+      expect(
+        Uri.parse(manager.session(firstRoom.id)!.plan.settings.diagnosticsUrl)
+            .port,
+        chosen,
+      );
+    },
+  );
+
+  test(
+    'recovery uses the stored port rather than rehashing a running profile',
+    () async {
+      final profile = ParallelRoomPlan(settings, room(1)).profileId;
+      await manager.preferences.update(profile, diagnosticsPort: 45678);
+      configure = (runtime) => runtime.present = true;
+      await manager.recover(room(1));
+      expect(
+        manager.session(room(1).id)!.plan.settings.diagnosticsUrl,
+        'http://127.0.0.1:45678/status',
+      );
+      expect(runtimes[room(1).id]!.starts, 0);
+    },
+  );
+
+  test(
     'two rooms run concurrently without changing primary settings',
     () async {
       final original = settings;

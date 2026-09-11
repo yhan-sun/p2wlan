@@ -26,6 +26,12 @@ var (
 	ErrRoomRateLimit = errors.New("too many room join attempts")
 )
 
+var (
+	ErrRoomIPConflict          = fmt.Errorf("%w: room address unavailable", ErrRoomConflict)
+	ErrRoomDeviceStateConflict = fmt.Errorf("%w: room device state changed", ErrRoomConflict)
+	ErrRoomInviteLimit         = fmt.Errorf("%w: room invite limit reached", ErrRoomConflict)
+)
+
 const RoomAuthorizationLeaseSeconds = 30
 const roomSubnetQuarantineSeconds = 300
 const roomColumns = `r.network_id, r.room_code, n.name, n.cidr, r.owner_id, r.join_locked, r.revision, r.created_at`
@@ -576,7 +582,7 @@ func (db *DB) CreateRoomInvite(userID, roomID string, ttlSeconds int64, maxUses 
 		return nil, "", err
 	}
 	if count >= 32 {
-		return nil, "", ErrRoomConflict
+		return nil, "", ErrRoomInviteLimit
 	}
 	digest := sha256.Sum256([]byte(token))
 	invite := &RoomInvite{ID: id, ExpiresAt: now + ttlSeconds, MaxUses: maxUses, CreatedAt: now}
@@ -790,41 +796,49 @@ func (db *DB) DeleteRoom(actorID, roomID string) ([]string, error) {
 }
 
 func (db *DB) AssignRoomDeviceIP(actorID, roomID, deviceID, ip string) error {
+	_, err := db.AssignRoomDeviceIPIfChanged(actorID, roomID, deviceID, ip)
+	return err
+}
+
+func (db *DB) AssignRoomDeviceIPIfChanged(actorID, roomID, deviceID, ip string) (bool, error) {
 	tx, err := db.beginRoomWrite()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	if err := roomOwner(tx, actorID, roomID); err != nil {
-		return err
+		return false, err
 	}
 	var currentIP string
 	if err := tx.QueryRow(`SELECT virtual_ip FROM devices WHERE id = ? AND network_id = ?`, deviceID, roomID).Scan(&currentIP); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrRoomAccess
+			return false, ErrRoomAccess
 		}
-		return err
+		return false, err
 	}
 	if ip == "" {
-		return ErrRoomInvalid
+		return false, ErrRoomInvalid
 	}
 	reserved, err := db.reserveVirtualIP(tx, roomID, ip, deviceID)
 	if err != nil {
-		return fmt.Errorf("%w: %s", ErrRoomConflict, err)
+		return false, fmt.Errorf("%w: %s", ErrRoomIPConflict, err)
 	}
 	if reserved == currentIP {
-		return tx.Commit()
+		return false, tx.Commit()
 	}
 	if err := revokeRoomDeviceTx(tx, deviceID, false); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(`UPDATE devices SET virtual_ip = ? WHERE id = ?`, reserved, deviceID); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := tx.Exec(`UPDATE rooms SET revision = revision + 1 WHERE network_id = ?`, roomID); err != nil {
-		return err
+		return false, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (db *DB) DeleteRoomDevice(actorID, roomID, deviceID string) error {

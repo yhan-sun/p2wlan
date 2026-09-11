@@ -49,6 +49,18 @@ func getDurationEnv(key string, fallback time.Duration) (time.Duration, error) {
 	return d, nil
 }
 
+func getBoolEnv(key string, fallback bool) (bool, error) {
+	raw, exists := os.LookupEnv(key)
+	if !exists {
+		return fallback, nil
+	}
+	value, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return false, fmt.Errorf("invalid boolean for %s", key)
+	}
+	return value, nil
+}
+
 func parseConfig(args []string) (*RelayConfig, error) {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
 
@@ -89,12 +101,27 @@ func parseConfig(args []string) (*RelayConfig, error) {
 		return nil, err
 	}
 
+	bools := make(map[string]bool)
+	for key, fallback := range map[string]bool{
+		"RELAY_REQUIRE_AUTH":             true,
+		"RELAY_ALLOW_LEGACY_UNAUTH":      false,
+		"RELAY_ALLOW_INSECURE_PLAINTEXT": false,
+		"RELAY_METRICS_ALLOW_PUBLIC":     false,
+		"RELAY_DEBUG_FRAMES":             false,
+	} {
+		value, err := getBoolEnv(key, fallback)
+		if err != nil {
+			return nil, err
+		}
+		bools[key] = value
+	}
+
 	bind := fs.String("bind", getenv("RELAY_BIND", ":18081"), "TCP listen address")
 	udpObserverBind := fs.String("udp-observer-bind", getenv("RELAY_UDP_OBSERVER_BIND", ""), "Optional UDP observer/STUN bind address")
 	metricsBind := fs.String("metrics-bind", getenv("RELAY_METRICS_BIND", ""), "Optional read-only metrics HTTP listen address (empty disables)")
-	metricsAllowPublic := fs.Bool("metrics-allow-public", getenv("RELAY_METRICS_ALLOW_PUBLIC", "false") == "true", "Explicitly allow the metrics endpoint on a public/wildcard bind (default: loopback/private only)")
+	metricsAllowPublic := fs.Bool("metrics-allow-public", bools["RELAY_METRICS_ALLOW_PUBLIC"], "Explicitly allow the metrics endpoint on a public/wildcard bind (default: loopback/private only)")
 	forwardDelay := fs.Duration("forward-delay", getEnvDurationMs("RELAY_FORWARD_DELAY_MS", 0), "Artificial per-frame forwarding delay in ms (diagnostics: slow-relay tests)")
-	debugFrames := fs.Bool("debug-frames", getenv("RELAY_DEBUG_FRAMES", "false") == "true", "Log opaque encrypted frame fingerprints (diagnostics only)")
+	debugFrames := fs.Bool("debug-frames", bools["RELAY_DEBUG_FRAMES"], "Log opaque encrypted frame fingerprints (diagnostics only)")
 	sendQueue := fs.Int("send-queue", envSendQueue, "Send queue capacity")
 	registerTimeout := fs.Duration("register-timeout", envRegisterTimeout, "Register timeout")
 	idleTimeout := fs.Duration("idle-timeout", envIdleTimeout, "Idle timeout")
@@ -103,11 +130,11 @@ func parseConfig(args []string) (*RelayConfig, error) {
 	authFailureLimit := fs.Int("auth-failure-limit", envAuthFailureLimit, "Authentication failures allowed per source per window (0 disables)")
 	authFailureWindow := fs.Duration("auth-failure-window", envAuthFailureWindow, "Authentication failure rate-limit window")
 	// A2 flags
-	requireAuth := fs.Bool("require-auth", getenv("RELAY_REQUIRE_AUTH", "true") == "true", "Require authenticated registration")
-	allowLegacy := fs.Bool("allow-legacy-unauthenticated", getenv("RELAY_ALLOW_LEGACY_UNAUTH", "false") == "true", "Allow legacy unauthenticated registration")
+	requireAuth := fs.Bool("require-auth", bools["RELAY_REQUIRE_AUTH"], "Require authenticated registration")
+	allowLegacy := fs.Bool("allow-legacy-unauthenticated", bools["RELAY_ALLOW_LEGACY_UNAUTH"], "Allow legacy unauthenticated registration")
 	tlsCert := fs.String("tls-cert", getenv("RELAY_TLS_CERT", ""), "TLS certificate chain PEM file")
 	tlsKey := fs.String("tls-key", getenv("RELAY_TLS_KEY", ""), "TLS private key PEM file")
-	allowPlaintext := fs.Bool("allow-insecure-plaintext", getenv("RELAY_ALLOW_INSECURE_PLAINTEXT", "false") == "true", "Allow plaintext TCP (development only)")
+	allowPlaintext := fs.Bool("allow-insecure-plaintext", bools["RELAY_ALLOW_INSECURE_PLAINTEXT"], "Allow plaintext TCP (development only)")
 	ticketKeyring := fs.String("ticket-keyring", getenv("RELAY_TICKET_KEYRING_JSON", ""), "Ticket verification keyring JSON")
 	relayAudience := fs.String("relay-audience", getenv("RELAY_AUDIENCE", ""), "This relay's audience ID")
 	relayRegion := fs.String("relay-region", getenv("RELAY_REGION", ""), "This relay's region label")

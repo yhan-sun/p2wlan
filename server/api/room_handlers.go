@@ -79,6 +79,12 @@ func roomError(w http.ResponseWriter, err error) {
 		status, code, message = http.StatusForbidden, "room_join", database.ErrRoomJoin.Error()
 	case errors.Is(err, database.ErrRoomExhausted):
 		status, code, message = http.StatusConflict, "room_exhausted", database.ErrRoomExhausted.Error()
+	case errors.Is(err, database.ErrRoomIPConflict):
+		status, code, message = http.StatusConflict, "room_ip_conflict", "room address unavailable"
+	case errors.Is(err, database.ErrRoomDeviceStateConflict):
+		status, code, message = http.StatusConflict, "room_device_state_conflict", "room device state changed"
+	case errors.Is(err, database.ErrRoomInviteLimit):
+		status, code, message = http.StatusConflict, "room_invite_limit", "room invite limit reached"
 	case errors.Is(err, database.ErrRoomConflict):
 		status, code, message = http.StatusConflict, "room_conflict", database.ErrRoomConflict.Error()
 	case errors.Is(err, database.ErrRoomRateLimit):
@@ -271,12 +277,15 @@ func (s *Server) AssignRoomDeviceIP(w http.ResponseWriter, r *http.Request) {
 	if !roomBody(w, r, &req) {
 		return
 	}
-	if err := s.db.AssignRoomDeviceIP(actor, r.PathValue("room"), r.PathValue("device"), req.IP); err != nil {
+	changed, err := s.db.AssignRoomDeviceIPIfChanged(actor, r.PathValue("room"), r.PathValue("device"), req.IP)
+	if err != nil {
 		roomError(w, err)
 		return
 	}
-	s.roomChanged(r.PathValue("room"), []string{r.PathValue("device")})
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "reconnect_required": true})
+	if changed {
+		s.roomChanged(r.PathValue("room"), []string{r.PathValue("device")})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "changed": changed, "reconnect_required": changed})
 }
 
 func (s *Server) DeleteRoomDevice(w http.ResponseWriter, r *http.Request) {

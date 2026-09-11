@@ -5,7 +5,7 @@ import '../models/diagnostics_models.dart';
 import 'parallel_rooms.dart';
 import 'room_api.dart';
 
-class DesktopRoomRuntime implements RoomRuntime {
+class DesktopRoomRuntime implements RoomRuntime, RoomControlStatus {
   DesktopRoomRuntime(
     this.plan, {
     DiagnosticsApi? diagnosticsApi,
@@ -99,6 +99,9 @@ class DesktopRoomRuntime implements RoomRuntime {
   }
 
   DateTime? _lastAccessCheck;
+  String? _controlWarning;
+  @override
+  String? get controlWarning => _controlWarning;
 
   Future<void> _requestAccess({required bool resume}) async {
     if (!plan.room.deviceControls) return;
@@ -143,15 +146,21 @@ class DesktopRoomRuntime implements RoomRuntime {
         now.difference(_lastAccessCheck!) < const Duration(seconds: 2)) {
       return;
     }
-    final identity = await _daemon.roomDeviceIdentity(plan.settings);
-    if (identity == null) return;
-    final api =
-        controlApiFactory?.call() ??
-        RoomApi(
-          server: plan.settings.controlServer,
-          token: plan.settings.authToken,
-        );
+    _lastAccessCheck = now;
+    RoomApi? api;
     try {
+      final identity = await _daemon.roomDeviceIdentity(plan.settings);
+      if (identity == null) {
+        _controlWarning = '无法读取本机设备身份；房间访问仍由本地服务校验。';
+        return;
+      }
+      api =
+          controlApiFactory?.call() ??
+          RoomApi(
+            server: plan.settings.controlServer,
+            token: plan.settings.authToken,
+            requestTimeout: const Duration(seconds: 2),
+          );
       final roster = await api.roster(plan.room.id);
       for (final access in roster.deviceAccess) {
         if (access['public_key'] != identity['public_key']) continue;
@@ -163,14 +172,20 @@ class DesktopRoomRuntime implements RoomRuntime {
           });
         }
       }
-      _lastAccessCheck = now;
+      _controlWarning = null;
+    } on RoomConnectionStopped {
+      rethrow;
     } on RoomException catch (error) {
       if (error.code == 'room_access') {
         throw const RoomConnectionStopped('该账号已退出或被移出房间，本机连接已停止');
       }
-      rethrow;
+      _controlWarning = error.code == 'auth_expired'
+          ? '登录已过期，暂时无法管理房间，请重新登录。'
+          : '暂时无法从控制服务器同步房间权限；本地连接状态独立检查，授权过期后会暂停通信。';
+    } catch (_) {
+      _controlWarning = '暂时无法从控制服务器同步房间权限；本地连接状态独立检查，授权过期后会暂停通信。';
     } finally {
-      api.close();
+      api?.close();
     }
   }
 

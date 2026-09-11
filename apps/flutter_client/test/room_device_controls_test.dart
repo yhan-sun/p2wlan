@@ -26,6 +26,7 @@ class Control extends RoomApi {
   Control()
     : super(server: 'https://control.example', token: fixtures.token('member'));
   String state = 'allowed';
+  RoomException? rosterFailure;
   bool? resume;
   @override
   Future<Map<String, dynamic>> request(
@@ -42,20 +43,24 @@ class Control extends RoomApi {
   }
 
   @override
-  Future<RoomRoster> roster(String id) async => RoomRoster.fromJson({
-    'room': {
-      'id': id,
-      'room_code': '12345678',
-      'name': 'Room',
-      'cidr': '10.21.1.0/24',
-      'owner_id': 'owner',
-      'role': 'member',
-      'device_controls_version': 1,
-    },
-    'device_access': [
-      {'public_key': 'local-key', 'state': state},
-    ],
-  });
+  Future<RoomRoster> roster(String id) async {
+    if (rosterFailure != null) throw rosterFailure!;
+    return RoomRoster.fromJson({
+      'room': {
+        'id': id,
+        'room_code': '12345678',
+        'name': 'Room',
+        'cidr': '10.21.1.0/24',
+        'owner_id': 'owner',
+        'role': 'member',
+        'device_controls_version': 1,
+      },
+      'device_access': [
+        {'public_key': 'local-key', 'state': state},
+      ],
+    });
+  }
+
   @override
   void close() {}
 }
@@ -122,13 +127,19 @@ void main() {
       );
       final first = preferences();
       await Future.wait([
-        first.update('account-a-room-a', autoConnect: true, wanted: true),
+        first.update(
+          'account-a-room-a',
+          autoConnect: true,
+          wanted: true,
+          diagnosticsPort: 45001,
+        ),
         first.update('account-a-room-a', wanted: false),
       ]);
       final restarted = preferences();
       final saved = await restarted.read('account-a-room-a');
       expect(saved.autoConnect, isTrue);
       expect(saved.wanted, isFalse);
+      expect(saved.diagnosticsPort, 45001);
       expect((await restarted.read('account-b-room-a')).autoConnect, isFalse);
       expect((await restarted.read('account-a-room-b')).wanted, isFalse);
       await restarted.update('account-a-room-a', wanted: true);
@@ -185,6 +196,42 @@ void main() {
     manager.dispose();
     api.close();
   });
+  test('control timeout does not hide fresh local daemon and routes', () async {
+    control.rosterFailure = const RoomException('temporary timeout');
+    expect((await manager.connect(room)).ok, isTrue);
+    final session = manager.session(room.id)!;
+    expect(session.phase, RoomConnectionPhase.running);
+    expect(session.snapshot?.virtualIp, '10.21.1.2');
+    expect(session.message, contains('控制服务器'));
+    expect(daemon.stops, 0);
+  });
+
+  test('expired GUI login is separate from a healthy room runtime', () async {
+    control.rosterFailure = const RoomException(
+      'login expired',
+      code: 'auth_expired',
+    );
+    expect((await manager.connect(room)).ok, isTrue);
+    final session = manager.session(room.id)!;
+    expect(session.phase, RoomConnectionPhase.running);
+    expect(session.message, contains('重新登录'));
+    expect(session.snapshot, isNotNull);
+  });
+
+  test(
+    'an explicit membership denial still stops a recovered runtime',
+    () async {
+      daemon.running = true;
+      control.rosterFailure = const RoomException(
+        'membership revoked',
+        code: 'room_access',
+      );
+      await manager.recover(room);
+      expect(manager.sessions, isEmpty);
+      expect(daemon.stops, 1);
+    },
+  );
+
   test(
     'new installation does not opt into automatic room connection',
     () async {

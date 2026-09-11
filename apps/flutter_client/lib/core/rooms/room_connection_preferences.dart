@@ -7,9 +7,11 @@ class RoomConnectionPreference {
   const RoomConnectionPreference({
     this.autoConnect = false,
     this.wanted = false,
+    this.diagnosticsPort,
   });
   final bool autoConnect;
   final bool wanted;
+  final int? diagnosticsPort;
 }
 
 /// Local installation only. Profile IDs scope preferences to server/account/room.
@@ -36,13 +38,23 @@ class RoomConnectionPreferences {
         return _values[profile] = RoomConnectionPreference(
           autoConnect: json['auto_connect'] == true,
           wanted: json['wanted'] == true,
+          diagnosticsPort: _storedPort(json['diagnostics_port']),
         );
       }
     }
     return const RoomConnectionPreference();
   }
 
-  Future<void> update(String profile, {bool? autoConnect, bool? wanted}) {
+  Future<void> update(
+    String profile, {
+    bool? autoConnect,
+    bool? wanted,
+    int? diagnosticsPort,
+  }) {
+    if (diagnosticsPort != null &&
+        (diagnosticsPort < 40000 || diagnosticsPort >= 60000)) {
+      throw ArgumentError.value(diagnosticsPort, 'diagnosticsPort');
+    }
     final previous = _writes[profile];
     final next = () async {
       await previous;
@@ -57,6 +69,7 @@ class RoomConnectionPreferences {
           old = RoomConnectionPreference(
             autoConnect: json['auto_connect'] == true,
             wanted: json['wanted'] == true,
+            diagnosticsPort: _storedPort(json['diagnostics_port']),
           );
         }
       }
@@ -64,6 +77,7 @@ class RoomConnectionPreferences {
       final value = RoomConnectionPreference(
         autoConnect: autoConnect ?? old.autoConnect,
         wanted: wanted ?? old.wanted,
+        diagnosticsPort: diagnosticsPort ?? old.diagnosticsPort,
       );
       if (persistent) {
         final dir = _directoryForProfile(profile);
@@ -73,6 +87,8 @@ class RoomConnectionPreferences {
           jsonEncode({
             'auto_connect': value.autoConnect,
             'wanted': value.wanted,
+            if (value.diagnosticsPort != null)
+              'diagnostics_port': value.diagnosticsPort,
           }),
           flush: true,
         );
@@ -85,4 +101,12 @@ class RoomConnectionPreferences {
       if (identical(_writes[profile], next)) _writes.remove(profile);
     });
   }
+}
+
+int? _storedPort(Object? value) {
+  if (value == null) return null;
+  if (value is! int || value < 40000 || value >= 60000) {
+    throw const FormatException('Invalid room diagnostics port');
+  }
+  return value;
 }

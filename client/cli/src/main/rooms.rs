@@ -889,11 +889,7 @@ async fn leave_room(config_path: &Path, config: &Config, selector: &str) -> Resu
     Ok(())
 }
 
-async fn delete_room(
-    config_path: &Path,
-    config: &Config,
-    selector: &str,
-) -> Result<(), String> {
+async fn delete_room(config_path: &Path, config: &Config, selector: &str) -> Result<(), String> {
     let response = room_control_request(config, reqwest::Method::GET, "", None).await?;
     let user_id = response
         .get("user_id")
@@ -962,7 +958,8 @@ fn prepare_room_config(
     profile: &str,
     path: &Path,
 ) -> Result<Config, String> {
-    let mut room_config = if path.exists() {
+    let existing_profile = path.exists();
+    let mut room_config = if existing_profile {
         load_config(path)?
     } else {
         Config::generate_default(&main.control.server_url, &room.id)
@@ -993,7 +990,10 @@ fn prepare_room_config(
     room_config.relay = main.relay.clone();
     room_config.port_mappings.clear();
     room_config.diagnostics.enabled = true;
-    room_config.diagnostics.bind = room_diagnostics_bind(profile);
+    room_config.diagnostics.bind = room_diagnostics_bind_with_existing(
+        profile,
+        existing_profile.then_some(room_config.diagnostics.bind.as_str()),
+    )?;
     room_config.diagnostics.log_path = None;
     room_config.diagnostics.auth_token = None;
     room_config.diagnostics.auth_token_path = None;
@@ -1018,7 +1018,27 @@ fn room_config_path_for(main_config_path: &Path, profile: &str) -> PathBuf {
 }
 
 fn room_state_dir_for_config(main_config_path: &Path, profile: &str) -> PathBuf {
-    state_dir_for_config(main_config_path).join("rooms").join(profile)
+    state_dir_for_config(main_config_path)
+        .join("rooms")
+        .join(profile)
+}
+
+fn room_diagnostics_bind_with_existing(
+    profile: &str,
+    existing: Option<&str>,
+) -> Result<String, String> {
+    let Some(existing) = existing else {
+        return Ok(room_diagnostics_bind(profile));
+    };
+    let address = existing
+        .parse::<SocketAddr>()
+        .map_err(|_| "本地房间诊断地址无效".to_string())?;
+    if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        || !(40000..60000).contains(&address.port())
+    {
+        return Err("本地房间诊断地址必须使用 127.0.0.1 和 40000–59999 端口".to_string());
+    }
+    Ok(address.to_string())
 }
 
 fn room_diagnostics_bind(profile: &str) -> String {
@@ -1136,6 +1156,22 @@ fn validate_path_segment(label: &str, value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod room_tests {
+    #[test]
+    fn preserves_desktop_allocated_room_diagnostics_port() {
+        let profile = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            super::room_diagnostics_bind_with_existing(profile, Some("127.0.0.1:45678")).unwrap(),
+            "127.0.0.1:45678"
+        );
+        assert_eq!(
+            super::room_diagnostics_bind_with_existing(profile, None).unwrap(),
+            super::room_diagnostics_bind(profile)
+        );
+        for invalid in ["0.0.0.0:45678", "127.0.0.1:80", "broken", "[::1]:45678"] {
+            assert!(super::room_diagnostics_bind_with_existing(profile, Some(invalid)).is_err());
+        }
+    }
+
     #[test]
     fn profile_id_matches_the_desktop_shape() {
         let actual = super::room_profile_id(

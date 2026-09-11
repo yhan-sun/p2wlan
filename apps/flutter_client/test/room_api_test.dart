@@ -205,6 +205,59 @@ void main() {
     });
 
     test(
+      'conflict errors retain operation-specific codes and safe messages',
+      () async {
+        var code = 'room_device_state_conflict';
+        var status = 409;
+        server.listen((request) async {
+          await request.drain<void>();
+          request.response.statusCode = status;
+          request.response.headers.contentType = ContentType.json;
+          request.response.write(jsonEncode({'error_code': code}));
+          await request.response.close();
+        });
+        for (final value in [
+          'room_device_state_conflict',
+          'room_invite_limit',
+          'room_conflict',
+        ]) {
+          code = value;
+          await expectLater(
+            api.request('POST', [roomId, 'invites']),
+            throwsA(
+              isA<RoomException>()
+                  .having((e) => e.code, 'code', value)
+                  .having((e) => e.message, 'message', isNot(contains('IP'))),
+            ),
+          );
+        }
+        code = 'room_ip_conflict';
+        await expectLater(
+          api.request('PATCH', [roomId, 'devices', 'device']),
+          throwsA(
+            isA<RoomException>().having(
+              (e) => e.message,
+              'message',
+              contains('IP'),
+            ),
+          ),
+        );
+        status = 401;
+        code = '';
+        await expectLater(
+          api.list(),
+          throwsA(
+            isA<RoomException>().having(
+              (e) => e.message,
+              'message',
+              contains('登录'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test(
       'create and join use only explicit account credentials and body secrets',
       () async {
         final requests = <Map<String, dynamic>>[];

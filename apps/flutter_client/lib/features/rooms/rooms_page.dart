@@ -12,6 +12,7 @@ import '../../core/models/diagnostics_models.dart';
 import '../../app/app_strings.dart';
 import '../nodes/nodes_page.dart';
 import '../../core/rooms/room_profiles.dart';
+import '../../core/rooms/room_connectivity.dart';
 import '../../core/rooms/parallel_rooms.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
@@ -60,6 +61,7 @@ class _RoomsPageState extends State<RoomsPage> {
   bool _busy = false;
   bool _refreshing = false;
   Timer? _timer;
+  Duration? _scheduledInterval;
   final _roomViewRevision = ValueNotifier<int>(0);
   int _generation = 0;
 
@@ -115,13 +117,17 @@ class _RoomsPageState extends State<RoomsPage> {
   }
 
   void _scheduleTimer() {
-    _timer?.cancel();
     if (!mounted) return;
     final hasTransitional = _hasTransitionalConnection();
     final interval = hasTransitional
         ? const Duration(milliseconds: 500)
         : const Duration(seconds: 5);
+    if (_timer?.isActive == true && _scheduledInterval == interval) return;
+    _timer?.cancel();
+    _scheduledInterval = interval;
     _timer = Timer(interval, () {
+      _timer = null;
+      _scheduledInterval = null;
       if (!mounted) return;
       if (!_busy && !_refreshing) {
         unawaited(_refresh(silent: true).whenComplete(_scheduleTimer));
@@ -324,45 +330,8 @@ class _RoomsPageState extends State<RoomsPage> {
           : (session == null ? '未连接' : '连接中');
     }
 
-    final onlinePeers = currentSnapshot.peers.where((p) => p.online).toList();
-    if (onlinePeers.isEmpty) {
-      return '等待好友';
-    }
-
-    if (onlinePeers.any((p) => p.isDirectVerified)) {
-      return '已直连';
-    }
-
-    final hasRelay = onlinePeers.any((p) => p.isRelayVerified);
-    final isProbing = onlinePeers.any(
-      (p) =>
-          p.path == 'probing' ||
-          p.path == 'direct_trial' ||
-          p.probeLatencyMs != null ||
-          p.state.toLowerCase().contains('punch') ||
-          p.state.toLowerCase().contains('prob'),
-    );
-
-    if (hasRelay && isProbing) {
-      return '中继可用 · 直连探测';
-    }
-    if (hasRelay) {
-      return '中继可用';
-    }
-
-    final isHandshaking = onlinePeers.any(
-      (p) =>
-          p.state.toLowerCase().contains('handshake') ||
-          p.state.toLowerCase().contains('connect'),
-    );
-    if (isHandshaking) {
-      return '建立加密会话';
-    }
-    if (isProbing) {
-      return '直连探测';
-    }
-
-    return '已连接';
+    if (currentSnapshot.peerSnapshotStale) return '状态待更新';
+    return RoomConnectivitySummary.fromPeers(currentSnapshot.peers).label;
   }
 
   String _message(Object error) =>
@@ -389,7 +358,6 @@ class _RoomsPageState extends State<RoomsPage> {
       if (mounted && _sameSession) {
         setState(() => _operationError = _message(error));
       }
-      return;
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -709,13 +677,24 @@ class _RoomsPageState extends State<RoomsPage> {
       ),
     ], description: 'IP 不得与其他设备重复。保存后旧连接和凭证将被撤销，该设备需要重新连接房间。');
     if (values == null || !mounted) return;
+    if (values[0].trim() == device['virtual_ip']) {
+      _notify('地址未变化，无需重新连接');
+      return;
+    }
     await _run(() async {
-      await _api.request(
+      final result = await _api.request(
         'PATCH',
         [room.id, 'devices', device['id'] as String],
         {'virtual_ip': values[0].trim()},
       );
-    }, success: 'IP 已分配，请让该设备重新连接房间');
+      if (mounted && _sameSession) {
+        _notify(
+          result['reconnect_required'] == false
+              ? '地址未变化，无需重新连接'
+              : 'IP 已分配，请让该设备重新连接房间',
+        );
+      }
+    });
   }
 
   Future<void> _deleteDevice(
@@ -1004,6 +983,25 @@ class _RoomsPageState extends State<RoomsPage> {
                     ),
                   ],
                 ),
+                if (_roomSnapshot(room) case final snapshot?) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    snapshot.peerSnapshotStale
+                        ? '链路信息待更新'
+                        : RoomConnectivitySummary.fromPeers(snapshot.peers)
+                              .details,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+                if (session?.message case final message?) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    message,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
               ],
             ),
           ),
@@ -1561,6 +1559,24 @@ class _RoomsPageState extends State<RoomsPage> {
                 ),
                 const SizedBox(height: 8),
                 SelectableText('房间号 ${room.code}  ·  ${room.cidr}'),
+                if (_roomSnapshot(room) case final snapshot?) ...[
+                  const SizedBox(height: 8),
+                  Text('本机 IP：${snapshot.virtualIp}'),
+                  if (!snapshot.peerSnapshotStale)
+                    Text(
+                      RoomConnectivitySummary.fromPeers(snapshot.peers).details,
+                    ),
+                ],
+                if (connection?.message case final message?) ...[
+                  const SizedBox(height: 8),
+                  Semantics(liveRegion: true, child: Text(message)),
+                ],
+                const SizedBox(height: 8),
+                Text(
+                  _parallel.supported
+                      ? '本机已连接 ${_parallel.activeConnections}/${_parallel.maxConnections} 个房间；各房间独立运行。'
+                      : '此平台使用单活动网络，连接本房间将断开当前网络。',
+                ),
                 const SizedBox(height: 16),
                 Wrap(
                   spacing: 8,

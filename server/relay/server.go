@@ -112,7 +112,17 @@ func (s *RelayServer) Stats() RelayStatsSnapshot {
 	if s.hub != nil {
 		registeredPeers = s.hub.count()
 	}
+	s.revocationMu.RLock()
+	revVersion, revCursor := s.revocationVersion, s.revocationCursor
+	revReady := s.revocationFeedUsableLocked(time.Now())
+	var revSuccess int64
+	if !s.revocationLastSuccess.IsZero() {
+		revSuccess = s.revocationLastSuccess.Unix()
+	}
+	s.revocationMu.RUnlock()
 	return RelayStatsSnapshot{
+		RevocationVersion: revVersion, RevocationCursor: revCursor,
+		RevocationReady: revReady, RevocationLastSuccessUnix: revSuccess,
 		ActiveConnections:               atomic.LoadInt64(&s.activeConnections),
 		RegisteredPeers:                 registeredPeers,
 		AcceptedConnectionsTotal:        atomic.LoadUint64(&s.stats.acceptedConnectionsTotal),
@@ -164,8 +174,8 @@ func (s *RelayServer) Serve() {
 			atomic.AddInt64(&s.activeConnections, -1)
 			atomic.AddUint64(&s.stats.rejectedConnectionsTotal, 1)
 			s.mu.Unlock()
-			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-			_, _ = conn.Write(errorFrame(4005, "connection limit exceeded"))
+			// A first TLS Write starts a handshake. Never perform it in the
+			// accept loop, especially when the server has no free worker.
 			_ = conn.Close()
 			continue
 		}

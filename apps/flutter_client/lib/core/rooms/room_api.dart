@@ -190,14 +190,19 @@ List<Map<String, dynamic>> _objects(Object? value) =>
     (value as List? ?? const []).map(_object).toList(growable: false);
 
 class RoomApi {
-  RoomApi({required String server, required this.token, HttpClient? client})
-    : server = roomControlServer(server),
-      _client = client ?? HttpClient() {
+  RoomApi({
+    required String server,
+    required this.token,
+    HttpClient? client,
+    this.requestTimeout = const Duration(seconds: 12),
+  }) : server = roomControlServer(server),
+       _client = client ?? HttpClient() {
     _client.connectionTimeout = const Duration(seconds: 8);
   }
   final String server;
   final String token;
   final HttpClient _client;
+  final Duration requestTimeout;
   String userId = '';
 
   Future<Map<String, dynamic>> request(
@@ -208,7 +213,7 @@ class RoomApi {
     if (token.trim().isEmpty) throw const RoomException('请先登录');
     HttpClientRequest? active;
     var expired = false;
-    final timer = Timer(const Duration(seconds: 12), () {
+    final timer = Timer(requestTimeout, () {
       expired = true;
       active?.abort(const RoomException('房间服务请求超时，请刷新后确认操作结果'));
     });
@@ -219,7 +224,7 @@ class RoomApi {
           request.abort();
           throw TimeoutException('room request expired');
         }
-      }).timeout(const Duration(seconds: 12));
+      }).timeout(requestTimeout);
     } on RoomException {
       rethrow;
     } on TimeoutException {
@@ -266,22 +271,30 @@ class RoomApi {
       if (response.statusCode >= 200 && response.statusCode < 300) rethrow;
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw RoomException(switch (json['error_code']) {
-        'room_device_blocked' => '此设备已被禁止连接该房间，请解除限制后重试',
-        'room_device_pending' => '此设备正在等待房主审批，请批准后在本机重新连接',
-        'room_device_paused' => '此设备已被远程断开，请在本机手动连接',
-        'room_exists' => '每个账号最多创建一个房间',
-        'room_join' => '无法加入：房间号、密码或邀请无效，房间已锁定，或账号已被封禁',
-        'room_access' => '无权操作该房间，或你已不再是成员',
-        'room_invalid' => '输入无效，请检查名称、密码、IP 或邀请设置',
-        'room_conflict' => '该 IP 已被占用，请选择其他地址',
-        'room_exhausted' => '服务器没有可用子网或房间 IP，请联系管理员',
-        'room_rate_limit' => '加入尝试过于频繁，请一分钟后重试',
-        _ when response.statusCode == 401 => '登录状态已失效，请重新登录',
-        _ when response.statusCode == 404 || response.statusCode == 426 =>
-          '当前服务器不支持好友房间，请升级服务器',
-        _ => '房间操作失败，请刷新后确认状态',
-      }, code: json['error_code'] as String?);
+      throw RoomException(
+        switch (json['error_code']) {
+          'room_device_blocked' => '此设备已被禁止连接该房间，请解除限制后重试',
+          'room_device_pending' => '此设备正在等待房主审批，请批准后在本机重新连接',
+          'room_device_paused' => '此设备已被远程断开，请在本机手动连接',
+          'room_exists' => '每个账号最多创建一个房间',
+          'room_join' => '无法加入：房间号、密码或邀请无效，房间已锁定，或账号已被封禁',
+          'room_access' => '无权操作该房间，或你已不再是成员',
+          'room_invalid' => '输入无效，请检查名称、密码、IP 或邀请设置',
+          'room_ip_conflict' => '该 IP 无法分配，请检查网段或选择未占用的地址',
+          'room_device_state_conflict' => '此设备状态已变化，申请可能已被处理，请查看最新状态',
+          'room_invite_limit' => '有效邀请已达上限，请先撤销不再使用的邀请',
+          'room_conflict' => '操作与当前房间状态冲突，请刷新后重试',
+          'room_exhausted' => '服务器没有可用子网或房间 IP，请联系管理员',
+          'room_rate_limit' => '加入尝试过于频繁，请一分钟后重试',
+          _ when response.statusCode == 401 => '登录状态已失效，请重新登录',
+          _ when response.statusCode == 404 || response.statusCode == 426 =>
+            '当前服务器不支持好友房间，请升级服务器',
+          _ => '房间操作失败，请刷新后确认状态',
+        },
+        code:
+            json['error_code'] as String? ??
+            (response.statusCode == 401 ? 'auth_expired' : null),
+      );
     }
     return json;
   }

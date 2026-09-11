@@ -41,8 +41,10 @@ class _FakeRoomApi extends RoomApi {
   bool deviceOnline = true;
   String? joinError;
   final calls = <String>[];
+  int listCalls = 0;
   @override
   Future<List<FriendRoom>> list() async {
+    listCalls++;
     userId = role == 'owner' ? 'owner' : 'member';
     return empty
         ? []
@@ -123,6 +125,16 @@ class _FakeRoomApi extends RoomApi {
   }
 }
 
+class _PulsingStatusStore extends StatusStore {
+  _PulsingStatusStore({
+    required super.parallelRooms,
+    required super.settingsStore,
+    required super.diagnosticsApi,
+    super.enableFreshnessTimer = false,
+  });
+  void pulse() => notifyListeners();
+}
+
 class _RoomRuntime implements RoomRuntime {
   _RoomRuntime(this.snapshot) {
     instances.add(this);
@@ -185,6 +197,7 @@ void main() {
     bool enterRoom = true,
     bool enableDaemonPolling = false,
     bool controls = false,
+    void Function(VoidCallback)? onStatusPulse,
   }) async {
     final dir = await tester.runAsync(
       () => Directory.systemTemp.createTemp('p2wlan-rooms-ui-'),
@@ -214,12 +227,13 @@ void main() {
     if (snapshot != null) {
       await parallel.connect(FriendRoom.fromJson(_room(role)));
     }
-    final status = StatusStore(
+    final status = _PulsingStatusStore(
       parallelRooms: parallel,
       settingsStore: settings,
       diagnosticsApi: DiagnosticsApi(),
       enableFreshnessTimer: false,
     );
+    onStatusPulse?.call(status.pulse);
     final api = _FakeRoomApi(role: role, empty: empty, controls: controls);
     addTearDown(() {
       api.close();
@@ -252,6 +266,51 @@ void main() {
     }
     return api;
   }
+
+  testWidgets(
+    'stable room refresh is not starved by one-second status notifications',
+    (tester) async {
+      late VoidCallback pulse;
+      final api = await pump(
+        tester,
+        enterRoom: false,
+        onStatusPulse: (value) => pulse = value,
+      );
+      final before = api.listCalls;
+      for (var second = 0; second < 16; second++) {
+        pulse();
+        await tester.pump(const Duration(seconds: 1));
+        await tester.pump();
+      }
+      expect(api.listCalls - before, greaterThanOrEqualTo(3));
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'saving the existing IP does not issue a mutation or ask for reconnect',
+    (tester) async {
+      final api = await pump(tester, controls: true);
+      final menu = find.byTooltip('管理设备');
+      await tester.ensureVisible(menu);
+      await tester.tap(menu);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('分配 IP'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, '确认'));
+      await tester.pumpAndSettle();
+      expect(
+        api.calls.where(
+          (call) => call.startsWith('PATCH') && call.contains('/devices/'),
+        ),
+        isEmpty,
+      );
+      expect(find.text('地址未变化，无需重新连接'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
 
   testWidgets(
     'member can remotely disconnect only their device with an explicit scope',
@@ -422,6 +481,10 @@ void main() {
     'roster-only device details open without fabricated live measurements',
     (tester) async {
       await pump(tester, role: 'member');
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('room-device-device-1')),
+      );
+      await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey('room-device-device-1')));
       await tester.pumpAndSettle();
       expect(find.byType(Dialog), findsOneWidget);
@@ -506,7 +569,7 @@ void main() {
   ) async {
     await pump(tester, snapshot: _snapshot(stale: true));
     expect(find.text('18 ms'), findsNothing);
-    expect(find.text('状态待更新'), findsOneWidget);
+    expect(find.text('状态待更新'), findsNWidgets(2));
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -650,11 +713,12 @@ void main() {
   testWidgets('connection phase displays fine-grained status labels', (
     tester,
   ) async {
-    // 1. Direct confirmed
+    // One confirmed Direct plus one unconfirmed online peer is only partial.
     final directSnap = _snapshot(verified: true);
     await pump(tester, snapshot: directSnap, enterRoom: false);
     await tester.pumpAndSettle();
-    expect(find.text('已直连'), findsWidgets);
+    expect(find.text('部分连通'), findsWidgets);
+    expect(find.text('已直连'), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
 
     // 2. Waiting for peer

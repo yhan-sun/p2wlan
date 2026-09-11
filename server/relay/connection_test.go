@@ -155,17 +155,9 @@ func TestMaxConnections(t *testing.T) {
 	}
 	defer conn2.Close()
 
-	buf := make([]byte, 100)
-	n, err := conn2.Read(buf)
-	if err != nil && err != io.EOF {
-		t.Fatalf("read: %v", err)
-	}
-	if n < frameHeader {
-		t.Fatalf("expected error frame, got %d bytes", n)
-	}
-	code := binary.BigEndian.Uint16(buf[8:10])
-	if code != 4005 {
-		t.Errorf("expected code 4005 (max connections), got %d", code)
+	_ = conn2.SetReadDeadline(time.Now().Add(time.Second))
+	if n, err := conn2.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("excess connection must close before protocol work: n=%d err=%v", n, err)
 	}
 }
 
@@ -274,9 +266,9 @@ func TestRelayStatsTrackRegistrationLimitsAndForwarding(t *testing.T) {
 		t.Fatalf("dial extra: %v", err)
 	}
 	defer extra.Close()
-	typ, payload = readTestFrame(t, extra)
-	if typ != msgError || binary.BigEndian.Uint16(payload[:2]) != 4005 {
-		t.Fatalf("expected connection-limit error, got type=%d payload=%v", typ, payload)
+	_ = extra.SetReadDeadline(time.Now().Add(time.Second))
+	if n, err := extra.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("excess connection must close without a protocol response: n=%d err=%v", n, err)
 	}
 
 	forward := func(dst string, data []byte) []byte {

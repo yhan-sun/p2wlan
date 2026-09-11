@@ -122,6 +122,13 @@ func (s *RelayServer) verifyTicket(tokenStr string) (*relayTicketClaims, error) 
 		return nil, fmt.Errorf("invalid ticket claims")
 	}
 
+	s.revocationMu.RLock()
+	feedReady := s.revocationFeedUsableLocked(time.Now())
+	s.revocationMu.RUnlock()
+	if !feedReady {
+		return nil, errRevocationFeedUnavailable
+	}
+
 	// Validate required claims
 	if claims.DeviceID == "" {
 		return nil, fmt.Errorf("missing device_id")
@@ -161,6 +168,11 @@ func (s *RelayServer) verifyTicket(tokenStr string) (*relayTicketClaims, error) 
 	}
 	if claims.NotBefore == nil {
 		return nil, fmt.Errorf("missing nbf")
+	}
+	if claims.IssuedAt.After(time.Now().Add(clockSkew)) ||
+		!claims.ExpiresAt.After(claims.IssuedAt.Time) ||
+		claims.ExpiresAt.Sub(claims.IssuedAt.Time) > 15*time.Minute {
+		return nil, fmt.Errorf("invalid ticket lifetime")
 	}
 	// Audience must be single value, not array
 	if len(claims.Audience) != 1 {
