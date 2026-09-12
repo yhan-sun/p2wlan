@@ -542,6 +542,9 @@ def main() -> None:
             print("STUN_B=" + ",".join(f"{host}:{port}" for host, port in observer_b), flush=True)
             print("BASE_A=%d" % args.base_a, flush=True)
             print("BASE_B=%d" % args.base_b, flush=True)
+            # Harness-verifiable banner: relay-only topologies assert the
+            # Direct blackhole is actually active before they verify.
+            print("BLOCK_DIRECT=%d" % (1 if args.block_direct else 0), flush=True)
             await asyncio.Event().wait()
         finally:
             await nat_a.close()

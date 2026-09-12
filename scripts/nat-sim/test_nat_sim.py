@@ -42,6 +42,21 @@ AGGREGATE_EVIDENCE = importlib.util.module_from_spec(AGGREGATE_SPEC)
 AGGREGATE_SPEC.loader.exec_module(AGGREGATE_EVIDENCE)
 
 
+READINESS_PATH = Path(__file__).with_name("daemon_readiness.py")
+READINESS_SPEC = importlib.util.spec_from_file_location("p2wlan_daemon_readiness", READINESS_PATH)
+assert READINESS_SPEC is not None
+assert READINESS_SPEC.loader is not None
+READINESS = importlib.util.module_from_spec(READINESS_SPEC)
+READINESS_SPEC.loader.exec_module(READINESS)
+
+TRANSIENT_PATH = Path(__file__).with_name("transient.py")
+TRANSIENT_SPEC = importlib.util.spec_from_file_location("p2wlan_transient", TRANSIENT_PATH)
+assert TRANSIENT_SPEC is not None
+assert TRANSIENT_SPEC.loader is not None
+TRANSIENT = importlib.util.module_from_spec(TRANSIENT_SPEC)
+TRANSIENT_SPEC.loader.exec_module(TRANSIENT)
+
+
 class CaptureProtocol(asyncio.DatagramProtocol):
     def __init__(self):
         self.received = asyncio.Queue()
@@ -772,6 +787,268 @@ class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # source (the peer-endpoint fallback requires a real peer socket).
         non_strict = NAT_SIM.Nat("B", "127.0.0.1", 1, 8, unused_udp_port())
         self.assertFalse(non_strict.inbound_allowed(mapping, ("127.0.0.1", 2999)))
+
+
+class DaemonReadinessTests(unittest.TestCase):
+    """Regression tests for the bounded daemon readiness gate.
+
+    The status collector must never run before the daemon publishes its
+    diagnostics token; these tests pin the poll-based wait, its hard bound,
+    its fail-fast on a dead process, and the failure diagnostics bundle.
+    """
+
+    def _waiter(self, token_path: Path, alive=True, appear_after_calls=0, timeout_s=1.0,
+                log_path: Path | None = None, runtime_dir: Path | None = None):
+        state = {"sleeps": 0}
+
+        def fake_sleep(_seconds):
+            state["sleeps"] += 1
+            if state["sleeps"] >= appear_after_calls > 0 and not token_path.exists():
+                token_path.write_text("tokensecret", encoding="utf-8")
+
+        ticks = {"now": 0.0}
+
+        def fake_monotonic():
+            return ticks["now"]
+
+        def fake_advance(_seconds):
+            ticks["now"] += 0.25
+
+        def fake_sleep_advancing(seconds):
+            fake_sleep(seconds)
+            fake_advance(seconds)
+
+        if alive:
+            alive_fn = lambda _pid: True  # noqa: E731
+        else:
+            alive_fn = lambda _pid: False  # noqa: E731
+        return READINESS.wait_for_token(
+            token_path=token_path,
+            pid=4242,
+            timeout_s=timeout_s,
+            poll_s=0.25,
+            log_path=log_path,
+            runtime_dir=runtime_dir,
+            sleep=fake_sleep_advancing if appear_after_calls else fake_advance,
+            monotonic=fake_monotonic,
+            alive=alive_fn,
+        )
+
+    def test_token_published_mid_wait_reaches_token_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "p2wlan-daemon.diag-auth"
+            record = self._waiter(token, alive=True, appear_after_calls=3, timeout_s=10.0)
+            self.assertEqual(record["result"], "ready")
+            self.assertEqual(record["state"], "TOKEN_READY")
+            self.assertGreaterEqual(record["polls"], 3)
+
+    def test_timeout_is_bounded_and_carries_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            runtime.mkdir()
+            (runtime / "config.json").write_text("{}", encoding="utf-8")
+            log = Path(tmp) / "node.log"
+            log.write_text("line one\nERROR: bootstrap stalled\n", encoding="utf-8")
+            token = runtime / "p2wlan-daemon.diag-auth"
+            record = self._waiter(token, alive=True, timeout_s=1.0,
+                                  log_path=log, runtime_dir=runtime)
+            self.assertEqual(record["result"], "timeout")
+            self.assertEqual(record["state"], "STARTING")
+            self.assertFalse(record["token_present"])
+            self.assertEqual(record["pid"], 4242)
+            self.assertTrue(record["process_alive"])
+            self.assertLessEqual(record["waited_ms"], 2000)
+            names = [entry["name"] for entry in record["runtime_dir_listing"]]
+            self.assertIn("config.json", names)
+            self.assertIn("ERROR: bootstrap stalled", record["log_error_lines"])
+
+    def test_dead_process_fails_fast_without_burning_the_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "p2wlan-daemon.diag-auth"
+            record = self._waiter(token, alive=False, timeout_s=30.0)
+            self.assertEqual(record["result"], "process_exited")
+            self.assertEqual(record["state"], "STARTING")
+            self.assertFalse(record["process_alive"])
+            self.assertLessEqual(record["waited_ms"], 500)
+
+    def test_record_never_contains_token_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "p2wlan-daemon.diag-auth"
+            token.write_text("tokensecret", encoding="utf-8")
+            record = READINESS.wait_for_token(
+                token_path=token,
+                pid=None,
+                timeout_s=0.1,
+                poll_s=0.05,
+                log_path=None,
+                runtime_dir=None,
+                sleep=lambda _s: None,
+                monotonic=lambda: 0.0,
+                alive=lambda _pid: True,
+            )
+            self.assertEqual(record["result"], "ready")
+            self.assertNotIn("tokensecret", json.dumps(record))
+
+    def test_state_machine_never_regresses(self):
+        advance = READINESS.advance
+        self.assertIs(
+            advance(READINESS.DaemonReadyState.TOKEN_READY, process_alive=False, token_present=True),
+            READINESS.DaemonReadyState.TOKEN_READY,
+        )
+        self.assertIs(
+            advance(READINESS.DaemonReadyState.STARTING, process_alive=True, token_present=True),
+            READINESS.DaemonReadyState.TOKEN_READY,
+        )
+        self.assertIs(
+            advance(READINESS.DaemonReadyState.TOKEN_READY, process_alive=True, token_present=False),
+            READINESS.DaemonReadyState.TOKEN_READY,
+        )
+        self.assertIs(
+            advance(
+                READINESS.DaemonReadyState.STATUS_READY,
+                process_alive=True,
+                token_present=True,
+                status_ok=True,
+                verification_running=True,
+            ),
+            READINESS.DaemonReadyState.RUNNING,
+        )
+
+
+class TransientClassifierTests(unittest.TestCase):
+    """Golden tests against the real CI failure signatures.
+
+    Retry is default-deny: only the whitelisted startup-race and data-plane
+    stall classes are retryable, and a retry must still pass the full strict
+    gate.  The fixtures below are the actual gate lines observed in runs
+    34629151902 (relay stall), 34438801146 (direct window expiry) and
+    34642802490 (startup token race).
+    """
+
+    STALL_LOG = (
+        "[nat-sim] ROUND 1: FAIL relay_first_evidence overlay_ok=0 a_direct=0 b_direct=0 "
+        "a_overlay=67 b_overlay=2 a_relay_confirmed=1 b_relay_confirmed=1 "
+        "a_ingress=relay:tcp://127.0.0.1:43801 b_ingress=relay:tcp://127.0.0.1:43801 "
+        "a_delta_ms=177 b_delta_ms=3 sum_delta_ms=180 drops_a=1 drops_b=0 replay_a=0 replay_b=0 "
+        "invalid_a=0 invalid_b=0 burst_a=0 burst_b=0 burst_bad_a=2 burst_bad_b=2 "
+        "status_http_200_a=156/156 status_http_200_b=156/156 status_always_200_a=1 "
+        "status_always_200_b=1 task_health_a=1 task_health_b=1 elapsed_ms=107801 "
+        "failure_reason=none (strict relay-first evidence required)\n"
+        "[nat-sim] RESULT: FAIL\n"
+    )
+
+    def test_relay_data_plane_stall_is_retryable(self):
+        verdict = TRANSIENT.classify_attempt(self.STALL_LOG, None, 1)
+        self.assertTrue(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "relay_data_plane_stall")
+
+    def test_final_verdict_line_wins_over_early_delta_line(self):
+        # A relay round that never confirmed emits an early FAIL (missing
+        # delta) and then the comprehensive gate line.  The classifier must
+        # read the FINAL verdict, not the early line.
+        log = (
+            "[nat-sim] ROUND 1: FAIL reason_code=relay_confirmation_missing a_delta=-1 b_delta=-1\n"
+            "[nat-sim] ROUND 1: FAIL relay_first_evidence overlay_ok=0 a_direct=0 b_direct=0 "
+            "a_relay_confirmed=0 b_relay_confirmed=0 a_delta_ms=-1 b_delta_ms=-1 drops_a=0 drops_b=0 "
+            "replay_a=0 replay_b=0 invalid_a=0 invalid_b=0 burst_a=0 burst_b=0 burst_bad_a=0 "
+            "burst_bad_b=0 status_http_200_a=40/40 status_http_200_b=40/40 status_always_200_a=1 "
+            "status_always_200_b=1 task_health_a=1 task_health_b=1 elapsed_ms=115000 "
+            "failure_reason=none (strict relay-first evidence required)\n"
+            "[nat-sim] RESULT: FAIL\n"
+        )
+        verdict = TRANSIENT.classify_attempt(log, None, 1)
+        self.assertTrue(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "relay_data_plane_stall")
+
+    def test_startup_token_race_is_retryable(self):
+        log = (
+            "[nat-sim] FAIL reason_code=status_auth_token_missing path=/tmp/node-b-runtime/p2wlan-daemon.diag-auth\n"
+            "[nat-sim] FAIL reason_code=baseline_status_not_available side=b file=/tmp/round-1/node-b.baseline.status.json\n"
+            "[nat-sim] RESULT: FAIL\n"
+        )
+        verdict = TRANSIENT.classify_attempt(log, None, 1)
+        self.assertTrue(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "startup_readiness_race")
+
+    def test_direct_window_expiry_with_healthy_counters_is_retryable(self):
+        log = (
+            "[nat-sim] ROUND 1: FAIL reason_code=first_usable_never_observed a_direct=0 b_direct=0 "
+            "a_overlay=0 b_overlay=0 drops_a=0 drops_b=0 replay_a=0 replay_b=0 invalid_a=0 "
+            "invalid_b=0 elapsed_ms=108755 failure_reason=none\n"
+            "[nat-sim] RESULT: FAIL\n"
+        )
+        verdict = TRANSIENT.classify_attempt(log, None, 1)
+        self.assertTrue(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "topology_window_expired")
+
+    def test_replay_is_never_retryable(self):
+        verdict = TRANSIENT.classify_attempt(self.STALL_LOG.replace("replay_a=0", "replay_a=1"), None, 1)
+        self.assertFalse(verdict["retryable"])
+
+    def test_status_not_always_200_is_never_retryable(self):
+        verdict = TRANSIENT.classify_attempt(
+            self.STALL_LOG.replace("status_always_200_a=1", "status_always_200_a=0"), None, 1
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "control_plane_unhealthy")
+
+    def test_task_health_failure_is_never_retryable(self):
+        verdict = TRANSIENT.classify_attempt(
+            self.STALL_LOG.replace("task_health_a=1", "task_health_a=0"), None, 1
+        )
+        self.assertFalse(verdict["retryable"])
+
+    def test_daemon_exit_is_never_retryable(self):
+        verdict = TRANSIENT.classify_attempt(
+            self.STALL_LOG + "[nat-sim] ROUND 1: FAIL (daemon exited unexpectedly)\n", None, 1
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "hard_log_marker")
+
+    def test_blackhole_violation_is_never_retryable(self):
+        verdict = TRANSIENT.classify_attempt(self.STALL_LOG.replace("a_direct=0", "a_direct=3"), None, 1)
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "blackhole_violated")
+
+    def test_second_attempt_is_never_retried_again(self):
+        verdict = TRANSIENT.classify_attempt(self.STALL_LOG, None, 2)
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "retry_budget_exhausted")
+
+    def test_unrecognized_failure_is_never_retryable(self):
+        verdict = TRANSIENT.classify_attempt("[nat-sim] RESULT: FAIL\n", None, 1)
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "unrecognized_failure")
+
+    def test_complete_round_with_delta_slo_miss_is_never_retryable(self):
+        log = (
+            "[nat-sim] ROUND 1: FAIL relay_first_evidence overlay_ok=1 a_direct=0 b_direct=0 "
+            "a_delta_ms=4100 b_delta_ms=3 drops_a=0 drops_b=0 replay_a=0 replay_b=0 "
+            "invalid_a=0 invalid_b=0 burst_a=2 burst_b=2 burst_bad_a=0 burst_bad_b=0 "
+            "status_always_200_a=1 status_always_200_b=1 task_health_a=1 task_health_b=1\n"
+            "[nat-sim] RESULT: FAIL\n"
+        )
+        verdict = TRANSIENT.classify_attempt(log, None, 1)
+        self.assertFalse(verdict["retryable"])
+
+    def test_evidence_hard_reason_vetoes_log_classification(self):
+        verdict = TRANSIENT.classify_attempt(
+            self.STALL_LOG, {"decision": {"reason_code": "evidence_parser_loss"}}, 1
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "hard_evidence_reason")
+
+    def test_revision_snapshot_race_on_failed_attempt_does_not_veto_retry(self):
+        # A fail-direction diagnostics snapshot race under runner load must not
+        # block the bounded retry; the log's health markers decide instead.
+        # A passing attempt still has to satisfy revision convergence.
+        verdict = TRANSIENT.classify_attempt(
+            self.STALL_LOG,
+            {"decision": {"reason_code": "diagnostics_revision_not_converged"}},
+            1,
+        )
+        self.assertTrue(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "relay_data_plane_stall")
 
 
 if __name__ == "__main__":

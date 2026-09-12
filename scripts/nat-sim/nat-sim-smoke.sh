@@ -323,6 +323,33 @@ capture_baseline_status() {
   return 1
 }
 
+# Bounded, poll-based readiness gate (DaemonReadyState): CREATED -> STARTING
+# -> TOKEN_READY.  The daemon publishes its diagnostics session token
+# atomically right after acquiring the instance lock, so a missing token
+# means the process is still starting (or died) — never that status should be
+# sampled anyway.  The wait is strictly bounded (30s), polls every 0.25s,
+# fails fast on a dead process, and on failure writes a structured record
+# (pid, liveness, token path, runtime dir listing, log tail) next to the
+# other round artifacts so a startup race is diagnosable from the evidence.
+wait_daemon_token_ready() {
+  local side="$1" pid="$2" runtime_dir="$3" log="$4"
+  local record="$ROUND_DIR/node-$side.readiness.json"
+  echo "[nat-sim] node-$side ready state=STARTING pid=$pid" >&2
+  if python3 "$ROOT_DIR/scripts/nat-sim/daemon_readiness.py" wait-token \
+      --pid "$pid" \
+      --token "$runtime_dir/p2wlan-daemon.diag-auth" \
+      --log "$log" \
+      --runtime-dir "$runtime_dir" \
+      --timeout-s 30 \
+      --poll-s 0.25 \
+      --output "$record"; then
+    echo "[nat-sim] node-$side ready state=TOKEN_READY record=$record" >&2
+    return 0
+  fi
+  echo "[nat-sim] FAIL reason_code=daemon_not_token_ready side=$side pid=$pid record=$record" >&2
+  return 1
+}
+
 # Sample the authenticated status endpoint without writing credentials or a
 # response body. `000` means no HTTP response; callers tolerate it only before
 # the daemon's first 200 during startup. Once the endpoint is live, every
@@ -622,14 +649,23 @@ for round in $(seq 1 "$ROUNDS"); do
     sleep 0.25
   done
 
+  # Readiness gate: the status collector below must never run before the
+  # daemon has published its diagnostics token (TOKEN_READY).  Each gate is
+  # bounded (30s), poll-based, and emits a structured readiness record into
+  # the round artifacts.
+  wait_daemon_token_ready a "$NODE_A_PID" "$NODE_A_RUNTIME" "$ROUND_DIR/node-a.log"
+  wait_daemon_token_ready b "$NODE_B_PID" "$NODE_B_RUNTIME" "$ROUND_DIR/node-b.log"
+
   capture_baseline_status \
     "http://127.0.0.1:$DIAG_A_PORT/status" \
     "$ROUND_DIR/node-a.baseline.status.json" \
-    "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" a
+    "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" a \
+    && echo "[nat-sim] node-a ready state=STATUS_READY" >&2
   capture_baseline_status \
     "http://127.0.0.1:$DIAG_B_PORT/status" \
     "$ROUND_DIR/node-b.baseline.status.json" \
-    "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" b
+    "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" b \
+    && echo "[nat-sim] node-b ready state=STATUS_READY" >&2
 
   if [[ "$MODE" == "relay-only" ]]; then
     # Availability pass condition: BOTH sides complete a bidirectional
@@ -646,7 +682,42 @@ for round in $(seq 1 "$ROUNDS"); do
     B_STATUS_SAMPLE_COUNT=0
     A_STATUS_200_COUNT=0
     B_STATUS_200_COUNT=0
+    # The verification window is fixed from here (never extended); the
+    # event-based readiness barrier below spends its budget inside it.  The
+    # counters referenced by the gate are initialized here because the barrier
+    # may legitimately consume the whole window, leaving the verification loop
+    # zero iterations — the gate must still emit a complete FAIL verdict.
+    A_OVERLAY=0
+    B_OVERLAY=0
+    A_BURST=0
+    B_BURST=0
+    A_BURST_BAD=0
+    B_BURST_BAD=0
     OVERLAY_DEADLINE=$((SECONDS + OVERLAY_TIMEOUT_S))
+    # Deterministic Direct impossibility must be active before verification:
+    # the blackhole is asserted from the simulator banner, not assumed.  Like
+    # a simulator that failed to start, a missing banner is an infrastructure
+    # failure of this attempt, not a topology verdict.
+    if ! grep -q '^BLOCK_DIRECT=1$' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then
+      echo "[nat-sim] FAIL reason_code=blackhole_not_active round=$round evidence=$ROUND_DIR/nat-sim.out" >&2
+      exit 1
+    fi
+    # Event-based peer-handshake barrier: wait until BOTH daemons logged
+    # RelayPeerConfirmed before entering the strict verification loop.  The
+    # barrier consumes the same fixed window budget (it never extends it);
+    # if it times out the verification loop below still runs and the gate
+    # decides, so this cannot mask a real availability regression.
+    a_confirmed_barrier=0
+    b_confirmed_barrier=0
+    while [[ "$SECONDS" -lt "$OVERLAY_DEADLINE" ]]; do
+      grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null && a_confirmed_barrier=1
+      grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null && b_confirmed_barrier=1
+      [[ "$a_confirmed_barrier" -eq 1 && "$b_confirmed_barrier" -eq 1 ]] && break
+      sleep 0.25
+    done
+    echo "[nat-sim] round $round: barrier relay_peer_confirmed a=$a_confirmed_barrier b=$b_confirmed_barrier (window budget preserved)" >&2
+    echo "[nat-sim] node-a ready state=RUNNING" >&2
+    echo "[nat-sim] node-b ready state=RUNNING" >&2
     while [[ "$SECONDS" -lt "$OVERLAY_DEADLINE" ]]; do
       sample_relay_status_pair \
         "http://127.0.0.1:$DIAG_A_PORT/status" \
@@ -685,6 +756,8 @@ for round in $(seq 1 "$ROUNDS"); do
     # Field checks are order-independent because tracing may render fields in
     # either order on the same structured log record.
     direct_ok=0
+    echo "[nat-sim] node-a ready state=RUNNING" >&2
+    echo "[nat-sim] node-b ready state=RUNNING" >&2
     for _ in $(seq 1 $((DIRECT_TIMEOUT_S * 2))); do
       if grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null && \
          grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null && \
