@@ -176,6 +176,36 @@ class StopTrafficCoverageTests(unittest.TestCase):
         self.assertEqual(probe.wait_for_reply(timeout_s=1)['result'], 'reply')
         probe.wait(timeout_s=1)
 
+    def test_completed_sample_notification_does_not_skip_probe_interval(self) -> None:
+        interval_s = 0.03
+        first_probe_started = threading.Event()
+        release_first_probe = threading.Event()
+        call_count = 0
+
+        def controlled_probe() -> int:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                first_probe_started.set()
+                if not release_first_probe.wait(timeout=1):
+                    return 1
+            return 0
+
+        probe = linux_netns.ContinuousTrafficProbe(
+            controlled_probe, count=2, interval_s=interval_s, max_workers=1,
+        )
+        probe.start()
+        self.assertTrue(first_probe_started.wait(timeout=1))
+        self.assertTrue(probe._interval_waiting.wait(timeout=1))
+        release_first_probe.set()
+        evidence = probe.wait(timeout_s=1)
+        first, second = evidence['samples']
+
+        self.assertGreaterEqual(
+            second['started_monotonic_ns'] - first['started_monotonic_ns'],
+            int(interval_s * 0.5 * 1_000_000_000),
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

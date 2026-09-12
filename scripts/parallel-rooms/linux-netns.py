@@ -88,6 +88,7 @@ class ContinuousTrafficProbe:
         self.samples: list[dict[str, Any]] = []
         self.error: str | None = None
         self._condition = threading.Condition()
+        self._interval_waiting = threading.Event()
         self._thread: threading.Thread | None = None
         self._immediate_probe_requested = False
         self._cancelled = False
@@ -110,9 +111,17 @@ class ContinuousTrafficProbe:
             self._condition.notify_all()
 
     def _wait_for_next_probe(self) -> bool:
+        deadline_ns = time.monotonic_ns() + int(self.interval_s * 1_000_000_000)
         with self._condition:
-            if not self._immediate_probe_requested and not self._cancelled:
-                self._condition.wait(timeout=self.interval_s)
+            while not self._immediate_probe_requested and not self._cancelled:
+                remaining_ns = deadline_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    break
+                self._interval_waiting.set()
+                try:
+                    self._condition.wait(timeout=remaining_ns / 1_000_000_000)
+                finally:
+                    self._interval_waiting.clear()
             if self._cancelled:
                 return False
             self._immediate_probe_requested = False
@@ -206,6 +215,7 @@ class ContinuousTrafficProbe:
                 'finished_monotonic_ns': self.finished_monotonic_ns,
                 'expected_count': self.count,
                 'completed_count': len(self.samples),
+                'interval_ms': round(self.interval_s * 1000),
                 'max_workers': self.max_workers,
                 'error': self.error,
                 'samples': [dict(sample) for sample in sorted(self.samples, key=lambda item: item['sequence'])],
