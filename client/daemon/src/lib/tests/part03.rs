@@ -2030,7 +2030,10 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
     let control = daemon.control.clone();
     let health = daemon.health.clone();
     let peers = daemon.peers.clone();
+    let timeline = daemon.timeline.clone();
     let shutdown = daemon.shutdown_sender();
+    let (peer_add_started_tx, mut peer_add_started_rx) = mpsc::unbounded_channel();
+    peers.install_peer_add_wait_observer_for_test(peer_add_started_tx);
     control
         .event_sender()
         .send(ControlEvent::PeerOffer {
@@ -2061,6 +2064,43 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
             .await;
     });
 
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if timeline.snapshot().events.iter().any(|event| {
+                event.event == "peer_offer_candidate_retry"
+                    && event
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("peer=peer-connection-writer-blocked-offer"))
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary candidate worker did not exercise the non-queuing contention path");
+    let heartbeat = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: hex::encode(peer_identity.public_key()),
+        endpoint: String::new(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 9,
+        relay_rtt_ms: None,
+    };
+    control
+        .event_sender()
+        .send(ControlEvent::PeerUpdated(heartbeat.clone()))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), peer_add_started_rx.recv())
+        .await
+        .expect("PeerUpdated did not enter the real peer update path")
+        .expect("peer update observer closed");
+
     tokio::time::timeout(Duration::from_millis(250), async {
         loop {
             // ControlHealthy is API evidence, not a device-lease renewal.
@@ -2074,6 +2114,20 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
     .expect("ControlHealthy must pass a candidate offer blocked on the connection writer");
 
     drop(connection_guard);
+    tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|connection| connection.last_seen == heartbeat.last_seen)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary candidate contention must not keep PeerUpdated queued behind its worker");
     tokio::time::timeout(Duration::from_millis(500), async {
         loop {
             let installed = peers
@@ -2091,6 +2145,177 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
 
     let _ = shutdown.send(true);
     tokio::time::timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+#[tokio::test]
+async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer() {
+    let config = Config::generate_default("http://127.0.0.1:1", "fresh-candidate-event-loop").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-fresh-candidate-event-loop";
+    let peer_identity = NodeIdentity::generate();
+    let peer_info = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        public_key: hex::encode(peer_identity.public_key()),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    daemon.peers.add_peer(&peer_info).await;
+
+    let mut initiator = HandshakeInitiator::new(
+        daemon.local_identity().unwrap(),
+        peer_identity.public_key(),
+        None,
+    );
+    let initiation = initiator.create_initiation().unwrap();
+    let mut responder = HandshakeResponder::new(peer_identity.clone(), None);
+    let (response, _) = responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    daemon
+        .pending_handshakes
+        .lock()
+        .insert(peer_id.to_string(), initiator, None, None);
+
+    // The fresh-candidate worker's first production operation awaits this
+    // connection-map reader. Its transaction gate is the exact point reached
+    // immediately before that lock await, so observing it held proves the
+    // worker has been polled into the blocked read path.
+    let connection_guard = daemon.peers.connection_map_for_test().write_owned().await;
+    let fresh_candidate = "198.51.100.44:43444".to_string();
+    let sources = HashMap::from([(
+        fresh_candidate.clone(),
+        fresh_prediction_source_label(FreshPredictionId {
+            boot_epoch: 1_742_987_654_322,
+            generation: 1,
+        }),
+    )]);
+    let control = daemon.control.clone();
+    let peers = daemon.peers.clone();
+    let transport = daemon.transport.clone();
+    let shutdown = daemon.shutdown_sender();
+    let (peer_add_started_tx, mut peer_add_started_rx) = mpsc::unbounded_channel();
+    peers.install_peer_add_wait_observer_for_test(peer_add_started_tx);
+    let (fresh_transaction_started_tx, mut fresh_transaction_started_rx) =
+        mpsc::unbounded_channel();
+    peers.install_remote_fresh_transaction_observer_for_test(fresh_transaction_started_tx);
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec![fresh_candidate],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: sources,
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    timeout(Duration::from_secs(1), fresh_transaction_started_rx.recv())
+        .await
+        .expect("fresh candidate worker did not enter the production transaction")
+        .expect("fresh transaction observer closed");
+
+    let mut heartbeat = peer_info;
+    heartbeat.last_seen = 7;
+    control
+        .event_sender()
+        .send(ControlEvent::PeerUpdated(heartbeat))
+        .unwrap();
+    timeout(Duration::from_secs(1), peer_add_started_rx.recv())
+        .await
+        .expect("PeerUpdated did not enter the real PeerManager::add_peer path");
+    drop(connection_guard);
+
+    let update_result = timeout(Duration::from_millis(300), async {
+        loop {
+            if peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|connection| connection.last_seen == 7)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if update_result.is_err() {
+        loop_task.abort();
+        let _ = loop_task.await;
+        panic!("PeerUpdated waited behind a fresh candidate task the loop could not poll");
+    }
+
+    let answer_receipt = control::SignalDeliveryReceipt::pending();
+    control
+        .event_sender()
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: "fresh-candidate-following-answer".to_string(),
+            signal_seq: Some(2),
+            signal_type: "peer_answer".to_string(),
+            event: Box::new(ControlEvent::PeerAnswer {
+                from_node_id: peer_id.to_string(),
+                candidates: Vec::new(),
+                session_id: None,
+                probe_ephemeral_public_key: None,
+                candidate_sources: HashMap::new(),
+                candidate_generation: 2,
+                candidates_expires_at_ms: None,
+                handshake_response: response.to_bytes(),
+                punch_at_ms: None,
+                punch_at_server_ms: None,
+                sender_public_key: Some(hex::encode(peer_identity.public_key())),
+            }),
+            receipt: answer_receipt.clone(),
+        })
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        while !transport.has_session(peer_id).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued handshake answer was not consumed after PeerUpdated");
+    assert_eq!(
+        timeout(Duration::from_secs(1), answer_receipt.wait())
+            .await
+            .expect("answer receipt did not reach a terminal application result"),
+        control::SignalApplyOutcome::Applied
+    );
+    let fresh_id = FreshPredictionId {
+        boot_epoch: 1_742_987_654_322,
+        generation: 1,
+    };
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers.remote_fresh_snapshot_for(peer_id, fresh_id).await.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fresh candidate retry did not atomically commit its candidate snapshot");
+
+    let _ = shutdown.send(true);
+    timeout(Duration::from_secs(1), loop_task)
         .await
         .expect("control event loop did not stop")
         .expect("control event loop task panicked");

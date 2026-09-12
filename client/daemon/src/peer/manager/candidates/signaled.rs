@@ -45,6 +45,7 @@ impl PeerManager {
                 None,
                 true,
                 false,
+                None,
             )
             .await
         {
@@ -81,6 +82,7 @@ impl PeerManager {
                 sender_public_key,
                 false,
                 false,
+                None,
             )
             .await
         {
@@ -116,6 +118,7 @@ impl PeerManager {
             sender_public_key,
             false,
             true,
+            None,
         )
         .await
     }
@@ -131,6 +134,7 @@ impl PeerManager {
         sender_public_key: Option<&str>,
         retire_hard_hard: bool,
         non_queuing: bool,
+        fresh_commit_id: Option<crate::FreshPredictionId>,
     ) -> CandidateSetTryApplyOutcome {
         let epoch_gate = self.network_epoch_gate();
         let (_epoch_guard, mut connections) = loop {
@@ -176,6 +180,15 @@ impl PeerManager {
                 None,
                 "ignored candidate signal bound to a retired sender public key",
             );
+            return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredStale);
+        }
+        if fresh_commit_id.is_some_and(|id| {
+            self.remote_fresh_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(node_id)
+                .is_some_and(|current| id <= *current)
+        }) {
             return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::IgnoredStale);
         }
         let valid_candidates = candidates
@@ -431,6 +444,25 @@ impl PeerManager {
             conn.endpoint = valid_candidates
                 .iter()
                 .find_map(|candidate| candidate.parse::<SocketAddr>().ok());
+        }
+        if let Some(id) = fresh_commit_id {
+            // The caller owns `remote_fresh_transaction_gate`, and this
+            // function still holds both the peer epoch and connection writer.
+            // A successful candidate mutation therefore cannot race either a
+            // newer fresh commit or an identity reset before snapshot publish.
+            let committed = self.commit_remote_fresh_prediction_while_peer_locked_sync(
+                node_id,
+                id,
+                candidates,
+                candidate_sources,
+                candidates_expires_at_ms,
+            );
+            debug_assert!(committed, "fresh candidate commit lost its serialized identity");
+            if !committed {
+                return CandidateSetTryApplyOutcome::Completed(
+                    CandidateSetApplyResult::IgnoredStale,
+                );
+            }
         }
         drop(connections);
         drop(_epoch_guard);

@@ -555,6 +555,8 @@ impl PeerManager {
 
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
+        #[cfg(test)]
+        self.notify_peer_add_wait_started_for_test();
         // Control-plane incarnation updates are another writer of the same
         // relay/session state that network handover invalidates. Serialize
         // the generation snapshot and the connection mutation as one epoch
