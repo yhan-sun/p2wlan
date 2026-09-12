@@ -14,8 +14,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 HTTP_HELPER = r'''
@@ -67,6 +68,245 @@ def verify_same_profile_restart(
         raise RuntimeError('same-profile restart changed network identity')
 
 
+class ContinuousTrafficProbe:
+    """Run a bounded sequence of individually timestamped real ping probes."""
+
+    def __init__(
+        self,
+        probe_once: Callable[[], int],
+        *,
+        count: int = 40,
+        interval_s: float = 0.2,
+        max_workers: int = 6,
+    ) -> None:
+        self.probe_once = probe_once
+        self.count = count
+        self.interval_s = interval_s
+        self.max_workers = max_workers
+        self.started_monotonic_ns: int | None = None
+        self.finished_monotonic_ns: int | None = None
+        self.samples: list[dict[str, Any]] = []
+        self.error: str | None = None
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._immediate_probe_requested = False
+        self._cancelled = False
+        self._done = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError('traffic probe already started')
+        self.started_monotonic_ns = time.monotonic_ns()
+        self._thread = threading.Thread(
+            target=self._run,
+            name='parallel-rooms-traffic-probe',
+            daemon=True,
+        )
+        self._thread.start()
+
+    def request_immediate_probe(self) -> None:
+        with self._condition:
+            self._immediate_probe_requested = True
+            self._condition.notify_all()
+
+    def _wait_for_next_probe(self) -> bool:
+        with self._condition:
+            if not self._immediate_probe_requested and not self._cancelled:
+                self._condition.wait(timeout=self.interval_s)
+            if self._cancelled:
+                return False
+            self._immediate_probe_requested = False
+            return True
+
+    def _run_one(self, sequence: int) -> None:
+        started_ns = time.monotonic_ns()
+        returncode: int | None = None
+        sample_error: str | None = None
+        try:
+            returncode = int(self.probe_once())
+        except Exception as error:  # retain failures as evidence instead of losing the sample
+            sample_error = redact_text(f'{type(error).__name__}: {error}')[:300]
+        finished_ns = time.monotonic_ns()
+        sample = {
+            'sequence': sequence,
+            'result': 'reply' if returncode == 0 else 'no_reply',
+            'returncode': returncode,
+            'started_monotonic_ns': started_ns,
+            'finished_monotonic_ns': finished_ns,
+        }
+        if sample_error is not None:
+            sample['error'] = sample_error
+        with self._condition:
+            self.samples.append(sample)
+            self._condition.notify_all()
+
+    def _run(self) -> None:
+        futures: list[concurrent.futures.Future[None]] = []
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers,
+                thread_name_prefix='parallel-rooms-ping',
+            ) as pool:
+                for sequence in range(1, self.count + 1):
+                    if sequence > 1 and not self._wait_for_next_probe():
+                        break
+                    futures.append(pool.submit(self._run_one, sequence))
+                for future in futures:
+                    future.result()
+        except Exception as error:
+            self.error = redact_text(f'{type(error).__name__}: {error}')[:300]
+        finally:
+            with self._condition:
+                self.finished_monotonic_ns = time.monotonic_ns()
+                self._done = True
+                self._condition.notify_all()
+
+    def wait_for_reply(self, timeout_s: float = 20) -> dict[str, Any]:
+        if self.started_monotonic_ns is None:
+            raise RuntimeError('traffic probe has not started')
+        deadline_ns = self.started_monotonic_ns + int(timeout_s * 1_000_000_000)
+        with self._condition:
+            while True:
+                for sample in self.samples:
+                    if sample['result'] == 'reply':
+                        return dict(sample)
+                if self._done:
+                    raise RuntimeError('traffic probe ended before an echo reply was observed')
+                remaining_s = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+                if remaining_s <= 0:
+                    raise TimeoutError('traffic probe produced no confirmed echo reply')
+                self._condition.wait(timeout=remaining_s)
+
+    def wait(self, timeout_s: float = 20) -> dict[str, Any]:
+        if self._thread is None or self.started_monotonic_ns is None:
+            raise RuntimeError('traffic probe has not started')
+        deadline_ns = self.started_monotonic_ns + int(timeout_s * 1_000_000_000)
+        self._thread.join(timeout=max(0, (deadline_ns - time.monotonic_ns()) / 1_000_000_000))
+        if self._thread.is_alive():
+            self.cancel()
+            self._thread.join()
+            raise TimeoutError('traffic probe exceeded the existing 20-second command budget')
+        return self.snapshot()
+
+    def cancel(self) -> None:
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            return
+        self.cancel()
+        self._thread.join()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                'started_monotonic_ns': self.started_monotonic_ns,
+                'finished_monotonic_ns': self.finished_monotonic_ns,
+                'expected_count': self.count,
+                'completed_count': len(self.samples),
+                'max_workers': self.max_workers,
+                'error': self.error,
+                'samples': [dict(sample) for sample in sorted(self.samples, key=lambda item: item['sequence'])],
+            }
+
+
+def validate_stop_traffic_coverage(
+    probe: dict[str, Any],
+    *,
+    shutdown_started_ns: int,
+    process_exited_ns: int,
+    expected_count: int = 40,
+) -> None:
+    started_ns = probe.get('started_monotonic_ns')
+    finished_ns = probe.get('finished_monotonic_ns')
+    samples = probe.get('samples')
+    if probe.get('error'):
+        raise RuntimeError('traffic probe scheduler failed')
+    if not isinstance(started_ns, int) or started_ns >= shutdown_started_ns:
+        raise RuntimeError('traffic probe did not start before shutdown')
+    if process_exited_ns <= shutdown_started_ns:
+        raise RuntimeError('shutdown and process-exit timestamps are contradictory')
+    if not isinstance(finished_ns, int) or finished_ns <= process_exited_ns:
+        raise RuntimeError('traffic probe ended before room process exit')
+    if (
+        probe.get('expected_count') != expected_count
+        or probe.get('completed_count') != expected_count
+        or not isinstance(samples, list)
+        or len(samples) != expected_count
+    ):
+        raise RuntimeError('traffic probe evidence is incomplete')
+    if [sample.get('sequence') for sample in samples] != list(range(1, expected_count + 1)):
+        raise RuntimeError('traffic probe sequence evidence is incomplete')
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise RuntimeError('traffic probe sample evidence is malformed')
+        sample_started_ns = sample.get('started_monotonic_ns')
+        sample_finished_ns = sample.get('finished_monotonic_ns')
+        sample_returncode = sample.get('returncode')
+        if (
+            not isinstance(sample_started_ns, int)
+            or not isinstance(sample_finished_ns, int)
+            or sample_finished_ns < sample_started_ns
+            or not isinstance(sample_returncode, int)
+            or sample.get('result') not in {'reply', 'no_reply'}
+            or (sample.get('result') == 'reply') != (sample_returncode == 0)
+        ):
+            raise RuntimeError('traffic probe sample evidence is malformed')
+    if finished_ns < max(sample['finished_monotonic_ns'] for sample in samples):
+        raise RuntimeError('traffic probe completion predates a sample result')
+    if not any(sample.get('result') == 'reply' for sample in samples):
+        raise RuntimeError('traffic probe did not receive an echo reply')
+
+    before = [
+        sample for sample in samples
+        if sample.get('result') == 'reply'
+        and sample['finished_monotonic_ns'] < shutdown_started_ns
+    ]
+    if not before:
+        raise RuntimeError('traffic probe has no confirmed response before shutdown')
+
+    during = [
+        sample for sample in samples
+        if sample['started_monotonic_ns'] <= process_exited_ns
+        and sample['finished_monotonic_ns'] >= shutdown_started_ns
+    ]
+    if not during:
+        raise RuntimeError('traffic probe has no sample covering shutdown')
+    if any(sample.get('result') != 'reply' for sample in during):
+        raise RuntimeError('other-room traffic failed during shutdown')
+    if not any(
+        sample.get('result') == 'reply'
+        and sample['finished_monotonic_ns'] <= process_exited_ns
+        for sample in during
+    ):
+        raise RuntimeError('traffic probe has no confirmed response before room process exit')
+
+    started_during = [
+        sample for sample in samples
+        if shutdown_started_ns <= sample['started_monotonic_ns'] <= process_exited_ns
+    ]
+    if not started_during:
+        raise RuntimeError('traffic probe did not start a sample during shutdown')
+    if any(sample.get('result') != 'reply' for sample in started_during):
+        raise RuntimeError('other-room traffic failed during shutdown')
+    if not any(
+        sample.get('result') == 'reply'
+        and sample['finished_monotonic_ns'] <= process_exited_ns
+        for sample in started_during
+    ):
+        raise RuntimeError('no shutdown-period probe received a response before room process exit')
+
+    after = [
+        sample for sample in samples
+        if sample.get('result') == 'reply'
+        and sample['started_monotonic_ns'] > process_exited_ns
+    ]
+    if not after:
+        raise RuntimeError('traffic probe has no confirmed response after room process exit')
+
+
 def run(args: list[str], *, check: bool = True, **kwargs: Any) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, text=True, capture_output=True, check=check, timeout=20, **kwargs)
 
@@ -85,6 +325,8 @@ class Lab:
         self.logs: list[Any] = []
         self.daemons: dict[str, dict[str, Any]] = {}
         self.daemon_history: dict[str, list[dict[str, Any]]] = {}
+        self.traffic_probe: ContinuousTrafficProbe | None = None
+        self.stop_traffic_evidence: dict[str, Any] = {}
         self.run_id = 'parallel-' + secrets.token_hex(6)
         self.debug_dir = Path(args.debug_dir).resolve() if args.debug_dir else None
         if self.debug_dir is not None:
@@ -401,12 +643,23 @@ class Lab:
                     os.chmod(destination, 0o644)
 
     def capture_failure(self, error: Exception) -> None:
+        self.capture_stop_traffic_evidence()
+        if self.traffic_probe is not None:
+            self.evidence['checks'].setdefault('one_room_stop_preserves_other_traffic', False)
         self.evidence['failure_type'] = type(error).__name__
         self.evidence['failure_stage'] = self.last_predicate
         self.evidence['last_predicate_exception'] = self.last_predicate
         self.evidence['failure_detail'] = redact_text(str(error))[:300]
         self.capture_stage('failure')
         self.preserve_logs()
+
+    def capture_stop_traffic_evidence(self) -> None:
+        if self.traffic_probe is None:
+            return
+        self.evidence['one_room_stop_traffic'] = {
+            **self.stop_traffic_evidence,
+            'probe': self.traffic_probe.snapshot(),
+        }
 
     def ping(self, label: str, address: str, count: int = 2) -> bool:
         return self.cmd(label, ['ping', '-n', '-c', str(count), '-i', '0.2', '-W', '1', address], check=False).returncode == 0
@@ -456,14 +709,67 @@ class Lab:
         self.check('independent_node_ids', snapshots['a1']['node_id'] != snapshots['a2']['node_id'])
         other = self.daemons['a2']['process']
         first = self.daemons['a1']
+        auth = (first['directory'] / 'p2wlan-daemon.diag-auth').read_text().strip()
+        pre_restart_status = self.status('a1')
+        self.capture_stage('a1_pre_restart', successful=True)
+
+        # Complete the expensive pre-stop diagnostics before starting the finite
+        # traffic probe. Each one-shot result carries its own sequence and monotonic
+        # interval, while the fixed worker cap preserves the original 5 Hz cadence.
+        self.traffic_probe = ContinuousTrafficProbe(
+            lambda: self.cmd(
+                'a', ['ping', '-n', '-c', '1', '-i', '0.2', '-W', '1', ips['c2']], check=False,
+            ).returncode,
+        )
+        self.last_predicate = {
+            'label': 'one_room_stop_preserves_other_traffic',
+            'outcome': 'waiting_for_confirmed_probe_reply',
+        }
+        self.traffic_probe.start()
+        self.traffic_probe.wait_for_reply()
+        self.last_predicate = {
+            'label': 'one_room_stop_preserves_other_traffic',
+            'outcome': 'waiting_for_shutdown',
+        }
+        self.capture_stop_traffic_evidence()
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            uninterrupted = pool.submit(self.ping, 'a', ips['c2'], 40)
-            auth = (first['directory'] / 'p2wlan-daemon.diag-auth').read_text().strip()
-            pre_restart_status = self.status('a1')
-            self.capture_stage('a1_pre_restart', successful=True)
-            self.http('a', '/shutdown', token=auth, method='POST', port=41001)
-            first['process'].wait(timeout=15)
-            self.check('one_room_stop_preserves_other_traffic', uninterrupted.result())
+            self.stop_traffic_evidence['shutdown_started_monotonic_ns'] = time.monotonic_ns()
+            self.last_predicate = {
+                'label': 'one_room_stop_preserves_other_traffic',
+                'outcome': 'shutdown_in_progress',
+                'shutdown_started_monotonic_ns': self.stop_traffic_evidence['shutdown_started_monotonic_ns'],
+            }
+            shutdown_request = pool.submit(
+                self.http, 'a', '/shutdown', token=auth, method='POST', port=41001,
+            )
+            self.traffic_probe.request_immediate_probe()
+            self.capture_stop_traffic_evidence()
+            shutdown_request.result()
+            self.stop_traffic_evidence['shutdown_request_completed_monotonic_ns'] = time.monotonic_ns()
+        first['process'].wait(timeout=15)
+        self.stop_traffic_evidence['daemon_process_exited_monotonic_ns'] = time.monotonic_ns()
+        self.stop_traffic_evidence['daemon_process_returncode'] = first['process'].returncode
+        self.last_predicate = {
+            'label': 'one_room_stop_preserves_other_traffic',
+            'outcome': 'waiting_for_post_exit_probe_results',
+            'daemon_process_exited_monotonic_ns': self.stop_traffic_evidence['daemon_process_exited_monotonic_ns'],
+        }
+        self.capture_stop_traffic_evidence()
+        probe_evidence = self.traffic_probe.wait(timeout_s=20)
+        self.capture_stop_traffic_evidence()
+        validate_stop_traffic_coverage(
+            probe_evidence,
+            shutdown_started_ns=self.stop_traffic_evidence['shutdown_started_monotonic_ns'],
+            process_exited_ns=self.stop_traffic_evidence['daemon_process_exited_monotonic_ns'],
+            expected_count=40,
+        )
+        self.last_predicate = {
+            'label': 'one_room_stop_preserves_other_traffic',
+            'outcome': 'passed',
+            'probe_count': 40,
+        }
+        self.check('one_room_stop_preserves_other_traffic', True)
         self.check('other_process_unchanged', other.poll() is None and self.status('a2')['process_id'] == snapshots['a2']['process_id'])
         routes = json.loads(self.cmd('a', ['ip', '-j', '-4', 'route', 'show', 'exact', rooms[1]['cidr']]).stdout)
         self.check('stopped_room_route_removed', not routes)
@@ -485,6 +791,8 @@ class Lab:
         self.capture_stage('all_assertions_passed', successful=True)
 
     def close(self) -> None:
+        if self.traffic_probe is not None:
+            self.traffic_probe.close()
         for process in reversed(self.processes):
             if process.poll() is None:
                 process.terminate()
