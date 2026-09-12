@@ -28,6 +28,9 @@ EXPECTED_TOPOLOGIES = {
 EXPECTED_TEST_ID = re.compile(
     r"^nat-sim-smoke\.sh::(direct-cold-start|relay-blackhole)::replica-([1-5])::round-1$"
 )
+EXPECTED_SCENARIO_ID = re.compile(
+    r"^(direct-cold-start|relay-blackhole):replica-([1-5]):round-1$"
+)
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -42,6 +45,19 @@ def _read_records(root: Path) -> list[tuple[Path, dict[str, Any]]]:
             raise ValueError(f"record_not_object:{path}")
         records.append((path, value))
     return records
+
+
+def _read_attempt_histories(root: Path) -> list[tuple[Path, dict[str, Any]]]:
+    histories: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(root.rglob("nat-attempts.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid_attempt_history_json:{path}:{exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"attempt_history_not_object:{path}")
+        histories.append((path, value))
+    return histories
 
 
 def _require_bool(value: Any, name: str) -> None:
@@ -128,6 +144,7 @@ def validate_record(
     record: dict[str, Any],
     source_head_sha: str,
     workflow_sha: str,
+    allow_failure: bool = False,
 ) -> tuple[str, str, int]:
     if not isinstance(source_head_sha, str) or SHA1.fullmatch(source_head_sha) is None:
         raise ValueError("source_head_sha_invalid")
@@ -147,7 +164,8 @@ def validate_record(
         raise ValueError("test_not_executed")
     if record.get("skipped") is not False:
         raise ValueError("test_skipped")
-    if record.get("result") != "pass":
+    record_result = record.get("result")
+    if record_result not in {"pass", "fail"}:
         raise ValueError("record_not_pass")
 
     topology = record.get("topology")
@@ -171,6 +189,19 @@ def validate_record(
         raise ValueError("exact_test_id_invalid")
     if match.group(1) != topology or int(match.group(2)) != replica:
         raise ValueError("exact_test_id_scenario_mismatch")
+
+    if record_result == "fail":
+        if not allow_failure:
+            raise ValueError("record_not_pass")
+        decision = record.get("decision")
+        if (
+            not isinstance(decision, dict)
+            or decision.get("result") != "fail"
+            or not isinstance(decision.get("reason_code"), str)
+            or not decision["reason_code"]
+        ):
+            raise ValueError("failure_record_decision_invalid")
+        return expected_scenario, exact_test_id, replica
 
     observed = record.get("observed")
     collector = record.get("collector")
@@ -207,16 +238,34 @@ def validate_record(
     return expected_scenario, exact_test_id, replica
 
 
-def validate_attempt_history(history: Any, record: dict[str, Any]) -> dict[str, Any]:
+def validate_attempt_history(
+    history: Any,
+    record: dict[str, Any] | None,
+    source_head_sha: str,
+    workflow_sha: str,
+) -> dict[str, Any]:
     if (
         not isinstance(history, dict)
         or type(history.get("schema_version")) is not int
         or history["schema_version"] != ATTEMPT_SCHEMA_VERSION
     ):
         raise ValueError("attempt_history_schema_invalid")
-    for field in ("scenario_id", "source_head_sha", "workflow_sha"):
-        if history.get(field) != record.get(field):
+    for field, expected in (
+        ("source_head_sha", source_head_sha),
+        ("workflow_sha", workflow_sha),
+    ):
+        if history.get(field) != expected:
             raise ValueError(f"attempt_history_{field}_mismatch")
+    scenario_id = history.get("scenario_id")
+    match = EXPECTED_SCENARIO_ID.fullmatch(scenario_id) if isinstance(scenario_id, str) else None
+    if match is None:
+        raise ValueError("attempt_history_scenario_id_invalid")
+    topology, replica_text = match.groups()
+    replica = int(replica_text)
+    if replica not in EXPECTED_TOPOLOGIES.get(topology, set()):
+        raise ValueError("attempt_history_scenario_not_expected")
+    if record is not None and scenario_id != record.get("scenario_id"):
+        raise ValueError("attempt_history_scenario_id_mismatch")
     attempts = history.get("attempts")
     if not isinstance(attempts, list) or not attempts:
         raise ValueError("attempt_history_missing")
@@ -264,13 +313,36 @@ def validate_attempt_history(history: Any, record: dict[str, Any]) -> dict[str, 
         elif not attempt["business_validation_started"]:
             raise ValueError("successful_attempt_business_phase_missing")
 
-    if final.get("result") != "pass":
-        raise ValueError("attempt_final_result_not_pass")
     if type(final.get("attempt")) is not int or final["attempt"] != len(attempts):
         raise ValueError("attempt_final_index_mismatch")
+    last = attempts[-1]
+    final_result = final.get("result")
+    if final_result == "fail":
+        if record is not None and record.get("result") != "fail":
+            raise ValueError("attempt_history_failed_record_pass")
+        reason_code = final.get("reason_code")
+        if not isinstance(reason_code, str) or not reason_code:
+            raise ValueError("attempt_final_failure_reason_missing")
+        if last["exit_code"] == 0:
+            raise ValueError("attempt_final_failure_exit_conflict")
+        if last["classification"].get("reason") != reason_code:
+            raise ValueError("attempt_final_failure_reason_mismatch")
+        return {
+            "first_attempt_pass": attempts[0]["exit_code"] == 0,
+            "attempt_count": len(attempts),
+            "diagnostic_retry_count": len(attempts) - 1,
+            "recovered": False,
+            "final_result": "fail",
+            "final_reason_code": reason_code,
+        }
+    if final_result != "pass":
+        raise ValueError("attempt_final_result_invalid")
+    if record is None:
+        raise ValueError("attempt_pass_evidence_missing")
+    if record.get("result") != "pass":
+        raise ValueError("attempt_pass_failure_record_conflict")
     if final.get("reason_code") is not None:
         raise ValueError("attempt_final_reason_conflict")
-    last = attempts[-1]
     if last["exit_code"] != 0 or last.get("evidence_path") != "nat-evidence.json":
         raise ValueError("attempt_final_evidence_not_successful")
     if previous_failures:
@@ -284,13 +356,26 @@ def validate_attempt_history(history: Any, record: dict[str, Any]) -> dict[str, 
         "attempt_count": len(attempts),
         "diagnostic_retry_count": len(attempts) - 1,
         "recovered": any(attempt["exit_code"] != 0 for attempt in attempts[:-1]),
+        "final_result": "pass",
+        "final_reason_code": None,
     }
+
+
+def _artifact_relative_path(path: Path, input_root: Path | None) -> str:
+    if input_root is None:
+        return path.name
+    try:
+        return path.relative_to(input_root).as_posix()
+    except ValueError as exc:
+        raise ValueError("artifact_path_outside_input_root") from exc
 
 
 def aggregate_records(
     records: list[tuple[Path, dict[str, Any]]],
     source_head_sha: str,
     workflow_sha: str,
+    attempt_histories: list[tuple[Path, dict[str, Any]]] | None = None,
+    input_root: Path | None = None,
 ) -> dict[str, Any]:
     expected = {
         f"{topology}:replica-{replica}:round-1"
@@ -298,62 +383,114 @@ def aggregate_records(
         for replica in replicas
     }
     seen: dict[str, tuple[Path, str]] = {}
-    validated: list[dict[str, Any]] = []
-    attempt_stats: list[dict[str, Any]] = []
+    validated: dict[str, tuple[Path, dict[str, Any], str]] = {}
     for path, record in records:
-        scenario, exact_test_id, _ = validate_record(record, source_head_sha, workflow_sha)
-        manifest_path = path.with_name("nat-attempts.json")
-        try:
-            history = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"attempt_history_missing_or_invalid:{manifest_path}:{exc}") from exc
-        attempt_stats.append(validate_attempt_history(history, record))
+        scenario, exact_test_id, _ = validate_record(
+            record, source_head_sha, workflow_sha, allow_failure=True
+        )
         if scenario in seen:
             previous_path, previous_test_id = seen[scenario]
             raise ValueError(
                 f"duplicate_conflicting_record:{scenario}:{previous_path}:{path}:{previous_test_id}:{exact_test_id}"
             )
         seen[scenario] = (path, exact_test_id)
-        validated.append(record)
+        validated[scenario] = (path, record, exact_test_id)
 
-    missing = sorted(expected - set(seen))
+    if attempt_histories is None:
+        attempt_histories = []
+        for path, _, _ in validated.values():
+            manifest_path = path.with_name("nat-attempts.json")
+            try:
+                history = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"attempt_history_missing_or_invalid:{manifest_path}:{exc}") from exc
+            if not isinstance(history, dict):
+                raise ValueError(f"attempt_history_not_object:{manifest_path}")
+            attempt_histories.append((manifest_path, history))
+
+    histories_by_scenario: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for path, history in attempt_histories:
+        scenario = history.get("scenario_id")
+        match = EXPECTED_SCENARIO_ID.fullmatch(scenario) if isinstance(scenario, str) else None
+        if match is None:
+            raise ValueError(f"attempt_history_scenario_id_invalid:{path}")
+        topology, replica_text = match.groups()
+        if int(replica_text) not in EXPECTED_TOPOLOGIES.get(topology, set()):
+            raise ValueError(f"attempt_history_scenario_not_expected:{path}")
+        if scenario not in expected:
+            raise ValueError(f"unknown_attempt_scenario:{scenario}")
+        if scenario in histories_by_scenario:
+            raise ValueError(f"duplicate_attempt_history:{scenario}")
+        histories_by_scenario[scenario] = (path, history)
+
+    missing = sorted(expected - set(histories_by_scenario))
     if missing:
         raise ValueError("missing_scenario:" + ",".join(missing))
-    extra = sorted(set(seen) - expected)
-    if extra:
-        raise ValueError("unknown_scenario:" + ",".join(extra))
-    validated.sort(key=lambda record: (record["topology"], record["replica"], record["round"]))
+    scenario_reports: list[dict[str, Any]] = []
+    attempt_stats: list[dict[str, Any]] = []
+    for scenario in sorted(expected):
+        manifest_path, history = histories_by_scenario[scenario]
+        evidence_entry = validated.get(scenario)
+        record = evidence_entry[1] if evidence_entry is not None else None
+        stats = validate_attempt_history(history, record, source_head_sha, workflow_sha)
+        attempt_stats.append(stats)
+        scenario_match = EXPECTED_SCENARIO_ID.fullmatch(scenario)
+        assert scenario_match is not None
+        topology, replica_text = scenario_match.groups()
+        replica = int(replica_text)
+        exact_test_id = (
+            evidence_entry[2]
+            if evidence_entry is not None
+            else f"nat-sim-smoke.sh::{topology}::replica-{replica}::round-1"
+        )
+        attempt = {
+            "scenario_id": scenario,
+            "exact_test_id": exact_test_id,
+            "topology": topology,
+            "replica": replica,
+            "round": 1,
+            "result": stats["final_result"],
+            "evidence_path": (
+                _artifact_relative_path(evidence_entry[0], input_root)
+                if evidence_entry is not None
+                else None
+            ),
+            "evidence_result": record.get("result") if record is not None else None,
+            "evidence_reason_code": (
+                record.get("decision", {}).get("reason_code")
+                if record is not None and isinstance(record.get("decision"), dict)
+                else None
+            ),
+            "attempt_manifest_path": _artifact_relative_path(manifest_path, input_root),
+            "attempts": history["attempts"],
+            "final_adjudication": history["final_adjudication"],
+        }
+        scenario_reports.append(attempt)
+
+    final_failure_count = sum(stat["final_result"] == "fail" for stat in attempt_stats)
+    first_attempt_pass_count = sum(stat["first_attempt_pass"] for stat in attempt_stats)
     aggregate: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "repository": REPOSITORY,
         "source_head_sha": source_head_sha,
         "workflow_sha": workflow_sha,
-        "result": "pass",
+        "result": "fail" if final_failure_count else "pass",
         "executed_record_count": len(validated),
-        "relay_replica_count": sum(record["topology"] == "relay-blackhole" for record in validated),
+        "executed_scenario_count": len(scenario_reports),
+        "relay_replica_count": sum(report["topology"] == "relay-blackhole" for report in scenario_reports),
         "attempt_stats": {
             "scenario_count": len(attempt_stats),
-            "first_attempt_pass_count": sum(stat["first_attempt_pass"] for stat in attempt_stats),
+            "first_attempt_pass_count": first_attempt_pass_count,
             "first_attempt_pass_rate": (
-                sum(stat["first_attempt_pass"] for stat in attempt_stats) / len(attempt_stats)
+                first_attempt_pass_count / len(attempt_stats)
                 if attempt_stats
                 else 0.0
             ),
             "diagnostic_retry_count": sum(stat["diagnostic_retry_count"] for stat in attempt_stats),
             "recovery_count": sum(stat["recovered"] for stat in attempt_stats),
-            "final_failure_count": 0,
+            "final_failure_count": final_failure_count,
         },
-        "records": [
-            {
-                "scenario_id": record["scenario_id"],
-                "exact_test_id": record["exact_test_id"],
-                "topology": record["topology"],
-                "replica": record["replica"],
-                "round": record["round"],
-                "result": record["result"],
-            }
-            for record in validated
-        ],
+        "records": scenario_reports,
     }
     canonical = json.dumps(aggregate, sort_keys=True, separators=(",", ":")).encode("utf-8")
     aggregate["aggregate_digest"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
@@ -371,10 +508,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    result = aggregate_records(_read_records(Path(args.input_root)), args.source_head_sha, args.workflow_sha)
+    input_root = Path(args.input_root)
+    result = aggregate_records(
+        _read_records(input_root),
+        args.source_head_sha,
+        args.workflow_sha,
+        _read_attempt_histories(input_root),
+        input_root,
+    )
     Path(args.output).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result, sort_keys=True))
-    return 0
+    return 0 if result["result"] == "pass" else 1
 
 
 if __name__ == "__main__":

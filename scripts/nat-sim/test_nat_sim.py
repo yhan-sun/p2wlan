@@ -314,6 +314,12 @@ class NatEvidenceContractTests(unittest.TestCase):
             records.append((path, json.loads(path.read_text(encoding="utf-8"))))
         return records
 
+    def _all_attempt_histories(self, root: Path) -> list[tuple[Path, dict]]:
+        histories = []
+        for path in sorted(root.rglob("nat-attempts.json")):
+            histories.append((path, json.loads(path.read_text(encoding="utf-8"))))
+        return histories
+
     @staticmethod
     def _remove_first_usable(status: dict, clear_relay_business: bool = False) -> dict:
         value = copy.deepcopy(status)
@@ -570,6 +576,163 @@ class NatEvidenceContractTests(unittest.TestCase):
             self.assertEqual(aggregate["attempt_stats"]["recovery_count"], 0)
             self.assertEqual(aggregate["attempt_stats"]["final_failure_count"], 0)
             self.assertTrue(aggregate["aggregate_digest"].startswith("sha256:"))
+
+    def test_barrier_failure_without_business_evidence_is_included_in_final_aggregate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in (1, 2, 3, 5):
+                self._write_record(root, "relay-blackhole", replica)
+
+            failed_dir = root / "record-relay-blackhole-4"
+            failed_dir.mkdir()
+            (failed_dir / "nat-attempts.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "scenario_id": "relay-blackhole:replica-4:round-1",
+                        "source_head_sha": self.SOURCE_SHA,
+                        "workflow_sha": self.WORKFLOW_SHA,
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "exit_code": 1,
+                                "business_validation_started": True,
+                                "reason_codes": ["relay_peer_confirmation_timeout"],
+                                "evidence_path": None,
+                                "readiness_paths": ["relay-barrier.readiness.json"],
+                                "classification": {
+                                    "retryable": False,
+                                    "reason": "barrier_timeout",
+                                },
+                                "infrastructure_evidence": None,
+                            }
+                        ],
+                        "final_adjudication": {
+                            "result": "fail",
+                            "attempt": 1,
+                            "reason_code": "barrier_timeout",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output_path = root / "aggregate.json"
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(AGGREGATE_PATH),
+                    "--input-root",
+                    str(root),
+                    "--source-head-sha",
+                    self.SOURCE_SHA,
+                    "--workflow-sha",
+                    self.WORKFLOW_SHA,
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            aggregate = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(aggregate["result"], "fail")
+            self.assertEqual(aggregate["attempt_stats"]["scenario_count"], 6)
+            self.assertEqual(aggregate["attempt_stats"]["first_attempt_pass_count"], 5)
+            self.assertAlmostEqual(aggregate["attempt_stats"]["first_attempt_pass_rate"], 5 / 6)
+            self.assertEqual(aggregate["attempt_stats"]["diagnostic_retry_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["recovery_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["final_failure_count"], 1)
+            failed = next(
+                item for item in aggregate["records"] if item["scenario_id"] == "relay-blackhole:replica-4:round-1"
+            )
+            self.assertEqual(failed["result"], "fail")
+            self.assertIsNone(failed["evidence_path"])
+            self.assertEqual(failed["attempts"][0]["exit_code"], 1)
+            self.assertEqual(
+                failed["attempts"][0]["reason_codes"], ["relay_peer_confirmation_timeout"]
+            )
+            self.assertEqual(
+                failed["final_adjudication"]["reason_code"], "barrier_timeout"
+            )
+
+    def test_business_failure_evidence_is_included_as_final_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+
+            scenario_dir = root / "record-relay-blackhole-2"
+            evidence_path = scenario_dir / "nat-evidence.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["result"] = "fail"
+            evidence["decision"] = {
+                "result": "fail",
+                "reason_code": "relay_business_gate_failed",
+                "observed_decision": "business_validation_failed",
+            }
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+            manifest_path = scenario_dir / "nat-attempts.json"
+            history = json.loads(manifest_path.read_text(encoding="utf-8"))
+            history["attempts"][0].update(
+                {
+                    "exit_code": 1,
+                    "business_validation_started": True,
+                    "reason_codes": ["relay_business_gate_failed"],
+                    "classification": {
+                        "retryable": False,
+                        "reason": "business_validation_failed",
+                    },
+                }
+            )
+            history["final_adjudication"] = {
+                "result": "fail",
+                "attempt": 1,
+                "reason_code": "business_validation_failed",
+            }
+            manifest_path.write_text(json.dumps(history), encoding="utf-8")
+
+            output_path = root / "aggregate.json"
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(AGGREGATE_PATH),
+                    "--input-root",
+                    str(root),
+                    "--source-head-sha",
+                    self.SOURCE_SHA,
+                    "--workflow-sha",
+                    self.WORKFLOW_SHA,
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            aggregate = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(aggregate["result"], "fail")
+            self.assertEqual(aggregate["attempt_stats"]["first_attempt_pass_count"], 5)
+            self.assertEqual(aggregate["attempt_stats"]["diagnostic_retry_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["recovery_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["final_failure_count"], 1)
+            failed = next(
+                item for item in aggregate["records"] if item["scenario_id"] == "relay-blackhole:replica-2:round-1"
+            )
+            self.assertEqual(failed["result"], "fail")
+            self.assertTrue(failed["evidence_path"].endswith("nat-evidence.json"))
+            self.assertEqual(failed["evidence_result"], "fail")
+            self.assertEqual(failed["evidence_reason_code"], "relay_business_gate_failed")
+            self.assertEqual(failed["attempts"][0]["exit_code"], 1)
+            self.assertEqual(
+                failed["final_adjudication"]["reason_code"], "business_validation_failed"
+            )
 
     def test_missing_replica_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
