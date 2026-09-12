@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
 # Stable CI entry point for the deterministic NAT simulator.
 #
-# Success profiles run with a BOUNDED retry for environment transients only:
-# attempt 1 runs the full strict gate; if it fails, scripts/nat-sim/transient.py
-# classifies the failure from the retained attempt log/evidence.  Only
-# whitelisted transient signatures (startup readiness races, data-plane stalls
-# with a fully healthy control plane) get exactly one fresh attempt, and that
-# attempt must pass the same strict gate with its own genuine evidence — the
-# retry can never skip a check or manufacture a pass.  Any hard signature
-# (replay/invalid, schema misses, task health, daemon exit, blackhole
-# violation, SLO miss) or an unrecognized failure fails the job immediately.
-# Attempt-1 evidence is retained under the uploaded artifact (its
-# nat-evidence.json is renamed to *.attempt-N-failed.json so the aggregator
-# only ever consumes the passing attempt's record).
+# Each topology profile has one authoritative attempt. A follow-up diagnostic
+# run is not allowed to erase a business-validation failure, and readiness
+# failures remain failures unless positive pre-business infrastructure
+# evidence is available. Every attempt is recorded next to its evidence.
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -24,10 +16,6 @@ REPLICA=${NAT_TOPOLOGY_REPLICA:-1}
 EXPECTED_HEAD_SHA=${NAT_TOPOLOGY_HEAD_SHA:-}
 ARTIFACT_PARENT=${NAT_TOPOLOGY_ARTIFACT_ROOT:-${RUNNER_TEMP:-/tmp}}
 ARTIFACT_DIR="$ARTIFACT_PARENT/p2wlan-nat-topology-${RUN_ID}-${RUN_ATTEMPT}-${PROFILE}-${REPLICA}"
-MAX_ATTEMPTS=2
-# A retry is only started when this much wall clock remains; a first attempt
-# that burned its whole hang-guard budget is not followed by a second one.
-RETRY_BUDGET_S=${NAT_CI_RETRY_BUDGET_S:-900}
 RUN_NAME="nat-ci-${PROFILE}-${RUN_ID}-${RUN_ATTEMPT}-${REPLICA}"
 
 if ! [[ "$REPLICA" =~ ^[1-9][0-9]*$ ]]; then
@@ -114,58 +102,108 @@ run_smoke() {
   echo "[nat-ci] profile=$PROFILE PASS expected_failure_status=$status"
 }
 
-# Preserve a failed attempt's evidence before retrying.  The record JSON is
-# renamed so aggregate_evidence.py (which walks for nat-evidence.json and
-# rejects duplicate scenario records) only consumes the passing attempt,
-# while every log, counter and timeline of the failed attempt stays in the
-# uploaded artifact.
-preserve_failed_attempt_evidence() {
-  local attempt_dir=$1 attempt=$2
-  local evidence
-  for evidence in "$attempt_dir"/round-*/nat-evidence.json; do
-    [[ -f "$evidence" ]] || continue
-    mv "$evidence" "${evidence%.json}.attempt-${attempt}-failed.json"
-  done
+write_attempt_manifest() {
+  local attempt_dir="$1" attempt_log="$2" exit_code="$3" topology="$4" classification_path="$5"
+  local output_dir="$attempt_dir/round-1"
+  local manifest_path="$attempt_dir/nat-attempts.json"
+  if [[ -d "$output_dir" ]]; then manifest_path="$output_dir/nat-attempts.json"; fi
+  mkdir -p "$(dirname "$manifest_path")"
+  python3 - "$attempt_dir" "$attempt_log" "$exit_code" "$topology" "$REPLICA" \
+    "$ACTUAL_HEAD_SHA" "$WORKFLOW_SHA" "$classification_path" "$manifest_path" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+attempt_dir, log_path, exit_text, topology, replica_text, head_sha, workflow_sha, classification_path, manifest_path = sys.argv[1:]
+root = Path(attempt_dir)
+manifest = Path(manifest_path)
+round_dir = manifest.parent
+evidence = round_dir / "nat-evidence.json"
+marker = round_dir / "business-validation.started"
+readiness = sorted(path.name for path in round_dir.glob("*.readiness.json"))
+try:
+    log = Path(log_path).read_text(encoding="utf-8", errors="replace")
+except OSError:
+    log = ""
+reason_codes = list(dict.fromkeys(re.findall(r"(?:^|\s)reason_code=([A-Za-z0-9_]+)", log)))
+exit_code = int(exit_text)
+if exit_code == 0:
+    classification = {"retryable": False, "reason": "accepted"}
+else:
+    try:
+        classification = json.loads(Path(classification_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        classification = {"retryable": False, "reason": "classification_unavailable"}
+scenario_id = f"{topology}:replica-{int(replica_text)}:round-1"
+record = {
+    "schema_version": 1,
+    "scenario_id": scenario_id,
+    "source_head_sha": head_sha,
+    "workflow_sha": workflow_sha,
+    "attempts": [
+        {
+            "attempt": 1,
+            "exit_code": exit_code,
+            "business_validation_started": marker.is_file(),
+            "reason_codes": reason_codes,
+            "evidence_path": "nat-evidence.json" if evidence.is_file() else None,
+            "readiness_paths": readiness,
+            "classification": {
+                "retryable": classification.get("retryable") is True,
+                "reason": str(classification.get("reason", "classification_unavailable")),
+            },
+            "infrastructure_evidence": None,
+        }
+    ],
+    "final_adjudication": {
+        "result": "pass" if exit_code == 0 else "fail",
+        "attempt": 1,
+        "reason_code": None if exit_code == 0 else str(classification.get("reason", "attempt_failed")),
+    },
+}
+manifest.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(record["final_adjudication"], sort_keys=True))
+PY
 }
 
-# Success profiles: bounded retry for whitelisted environment transients.
-run_with_bounded_retry() {
-  local attempt attempt_dir attempt_log rc classification
-  for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-    attempt_dir="${ARTIFACT_DIR}-attempt-${attempt}"
-    attempt_log="${attempt_dir}.log"
-    rc=0
-    run_smoke success "$attempt_dir" "$attempt_log" "$@" || rc=$?
-    if [[ "$rc" -eq 0 ]]; then
-      if [[ "$attempt" -gt 1 ]]; then
-        echo "[nat-ci] profile=$PROFILE PASS after bounded retry attempt=${attempt}/${MAX_ATTEMPTS} (first-attempt evidence retained under ${ARTIFACT_DIR}-attempt-1)"
-      fi
-      return 0
-    fi
-    if [[ "$attempt" -ge "$MAX_ATTEMPTS" ]]; then
-      return "$rc"
-    fi
-    if [[ "$SECONDS" -ge "$RETRY_BUDGET_S" ]]; then
-      echo "[nat-ci] profile=$PROFILE retry skipped: retry budget ${RETRY_BUDGET_S}s exhausted after ${SECONDS}s" >&2
-      return "$rc"
-    fi
-    classification=$(python3 "$ROOT_DIR/scripts/nat-sim/transient.py" classify \
+run_single_attempt() {
+  local attempt_dir="${ARTIFACT_DIR}-attempt-1"
+  local attempt_log="${attempt_dir}.log"
+  local topology classification_path evidence_path marker rc classification_status
+  local -a readiness_args=()
+  case "$PROFILE" in
+    direct) topology=direct-cold-start ;;
+    relay) topology=relay-blackhole ;;
+    *) echo "unsupported attempt profile=$PROFILE" >&2; return 2 ;;
+  esac
+  classification_path="$attempt_dir/retry-classification.json"
+  evidence_path="$attempt_dir/round-1/nat-evidence.json"
+  marker="$attempt_dir/round-1/business-validation.started"
+
+  rc=0
+  run_smoke success "$attempt_dir" "$attempt_log" "$@" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    for readiness_file in "$attempt_dir"/round-1/*.readiness.json; do
+      [[ -f "$readiness_file" ]] && readiness_args+=(--readiness "$readiness_file")
+    done
+    classification_status=0
+    python3 "$ROOT_DIR/scripts/nat-sim/transient.py" classify \
+      --profile "$topology" \
       --log "$attempt_log" \
-      --evidence "$attempt_dir/round-1/nat-evidence.json" \
-      --attempt "$attempt" \
-      --output "$attempt_dir/retry-classification.json") || true
-    if ! python3 - "$attempt_dir/retry-classification.json" <<'PY'
-import json, sys
-sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("retryable") is True else 1)
-PY
-    then
-      echo "[nat-ci] profile=$PROFILE failure is not retryable: $classification" >&2
-      return "$rc"
-    fi
-    echo "[nat-ci] profile=$PROFILE attempt=${attempt} failed with a whitelisted environment transient; starting bounded retry (attempt=$((attempt + 1))/${MAX_ATTEMPTS}): $classification" >&2
-    preserve_failed_attempt_evidence "$attempt_dir" "$attempt"
-  done
-  return 1
+      --evidence "$evidence_path" \
+      --business-started "$marker" \
+      --attempt 1 \
+      --output "$classification_path" \
+      "${readiness_args[@]}" || classification_status=$?
+    echo "[nat-ci] profile=$PROFILE failure classification_exit=$classification_status record=$classification_path" >&2
+  fi
+
+  write_attempt_manifest "$attempt_dir" "$attempt_log" "$rc" "$topology" "$classification_path"
+  local first_attempt_pass=0 final_failures=1
+  if [[ "$rc" -eq 0 ]]; then first_attempt_pass=1; final_failures=0; fi
+  echo "[nat-ci] profile=$PROFILE attempt_stats first_attempt_pass=$first_attempt_pass diagnostic_retries=0 recovery_count=0 final_failure_count=$final_failures"
+  return "$rc"
 }
 
 case "$PROFILE" in
@@ -178,7 +216,7 @@ case "$PROFILE" in
       -v 2>&1 | tee "${ARTIFACT_DIR}-attempt-1.log"
     ;;
   direct)
-    run_with_bounded_retry \
+    run_single_attempt \
       MODE=direct \
       STEP_A=1 STEP_B=1 \
       CONSUME_A=0 CONSUME_B=0 \
@@ -188,7 +226,7 @@ case "$PROFILE" in
       OVERLAY_BURST=32
     ;;
   relay)
-    run_with_bounded_retry \
+    run_single_attempt \
       MODE=relay-only \
       STEP_A=1 STEP_B=1 \
       CONSUME_A=0 CONSUME_B=0 \

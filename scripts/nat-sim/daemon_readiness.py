@@ -62,6 +62,7 @@ def advance(
     token_present: bool,
     status_ok: bool = False,
     verification_running: bool = False,
+    peers_confirmed: bool = False,
 ) -> DaemonReadyState:
     """Pure transition function: the furthest state the observed signals allow.
 
@@ -77,7 +78,7 @@ def advance(
         candidate = DaemonReadyState.TOKEN_READY
         if status_ok:
             candidate = DaemonReadyState.STATUS_READY
-            if verification_running:
+            if verification_running and peers_confirmed:
                 candidate = DaemonReadyState.RUNNING
     if STATE_ORDER[candidate] > STATE_ORDER[state]:
         return candidate
@@ -154,9 +155,12 @@ def build_diagnostics(
     except OSError:
         token_present = False
     record: dict[str, Any] = {
+        "schema_version": 1,
+        "stage": "token",
         "state": state.value,
         "target": "TOKEN_READY",
         "result": result,
+        "business_validation_started": False,
         "pid": pid,
         "process_alive": alive(pid),
         "token_path": str(token_path),
@@ -202,7 +206,8 @@ def wait_for_token(
         state = advance(
             state, process_alive=bool(alive_now), token_present=_token_present(token_path)
         )
-        if state is DaemonReadyState.TOKEN_READY:
+        now = monotonic()
+        if state is DaemonReadyState.TOKEN_READY and now < deadline:
             return _record(
                 result="ready",
                 state=state,
@@ -226,7 +231,6 @@ def wait_for_token(
                 runtime_dir=runtime_dir,
                 alive=alive,
             )
-        now = monotonic()
         if now >= deadline:
             return _record(
                 result="timeout",
@@ -268,6 +272,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     command = parser.add_subparsers(dest="command", required=True)
     wait = command.add_parser("wait-token", help="wait for the diagnostics token (TOKEN_READY)")
     wait.add_argument("--pid", type=int, default=None)
+    wait.add_argument("--side", choices=("a", "b"), default=None)
     # --token-file carries the token FILE PATH (never the secret itself);
     # the credential-scan argv rule permits exactly this transport form.
     wait.add_argument("--token-file", required=True)
@@ -275,6 +280,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     wait.add_argument("--runtime-dir", default=None)
     wait.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
     wait.add_argument("--poll-s", type=float, default=DEFAULT_POLL_S)
+    wait.add_argument("--business-started", default=None, help="business-validation marker path")
     wait.add_argument("--output", required=True, help="readiness record JSON path")
     return parser.parse_args(argv)
 
@@ -289,6 +295,10 @@ def main(argv: list[str] | None = None) -> int:
         log_path=Path(args.log) if args.log else None,
         runtime_dir=Path(args.runtime_dir) if args.runtime_dir else None,
     )
+    if args.side:
+        record["side"] = args.side
+    if args.business_started:
+        record["business_validation_started"] = Path(args.business_started).is_file()
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")

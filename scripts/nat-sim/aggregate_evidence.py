@@ -19,6 +19,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+ATTEMPT_SCHEMA_VERSION = 1
 REPOSITORY = "yhan-sun/p2wlan"
 EXPECTED_TOPOLOGIES = {
     "direct-cold-start": {1},
@@ -67,28 +68,30 @@ def _require_pass_side(
     final_identity = process_identity.get("final")
     if not isinstance(baseline_identity, dict) or not isinstance(final_identity, dict):
         raise ValueError(f"{label}_process_identity_shape_invalid")
-    if not isinstance(baseline_identity.get("process_id"), int):
+    if type(baseline_identity.get("process_id")) is not int:
         raise ValueError(f"{label}_baseline_process_identity_missing")
-    if not isinstance(final_identity.get("process_id"), int):
+    if type(final_identity.get("process_id")) is not int:
         raise ValueError(f"{label}_final_process_identity_missing")
     if baseline_identity["process_id"] != final_identity["process_id"]:
         raise ValueError(f"{label}_process_identity_changed")
-    if not isinstance(final_identity.get("revision"), int):
+    if type(final_identity.get("revision")) is not int:
         raise ValueError(f"{label}_final_revision_missing")
     if final_identity.get("captured_revision") != final_identity.get("revision"):
         raise ValueError(f"{label}_final_revision_not_captured")
     if final_identity.get("peer_snapshot_stale") is not False:
         raise ValueError(f"{label}_peer_snapshot_stale")
-    if first.get("path") != expected_path:
+    path = first.get("path")
+    if not isinstance(path, str) or path != expected_path:
         raise ValueError(f"{label}_first_usable_path_mismatch")
     for field in ("first_usable_at_ms", "transition_revision", "delta_ms"):
-        if not isinstance(first.get(field), int) or first[field] < 0:
+        if type(first.get(field)) is not int or first[field] < 0:
             raise ValueError(f"{label}_{field}_missing")
     if first["transition_revision"] == 0:
         raise ValueError(f"{label}_transition_revision_missing")
     if first["delta_ms"] > 3000:
         raise ValueError(f"{label}_delta_exceeded")
-    if first.get("source") not in {"persistent_summary", "event"}:
+    source = first.get("source")
+    if not isinstance(source, str) or source not in {"persistent_summary", "event"}:
         raise ValueError(f"{label}_collector_source_invalid")
     if not isinstance(first.get("baseline_after_transition"), bool):
         raise ValueError(f"{label}_baseline_order_missing")
@@ -130,7 +133,7 @@ def validate_record(
         raise ValueError("source_head_sha_invalid")
     if not isinstance(workflow_sha, str) or SHA1.fullmatch(workflow_sha) is None:
         raise ValueError("workflow_sha_invalid")
-    if record.get("schema_version") != SCHEMA_VERSION:
+    if type(record.get("schema_version")) is not int or record["schema_version"] != SCHEMA_VERSION:
         raise ValueError("unknown_schema_version")
     if record.get("repository") != REPOSITORY:
         raise ValueError("repository_mismatch")
@@ -150,7 +153,12 @@ def validate_record(
     topology = record.get("topology")
     replica = record.get("replica")
     round_number = record.get("round")
-    if topology not in EXPECTED_TOPOLOGIES or not isinstance(replica, int) or not isinstance(round_number, int):
+    if (
+        not isinstance(topology, str)
+        or topology not in EXPECTED_TOPOLOGIES
+        or type(replica) is not int
+        or type(round_number) is not int
+    ):
         raise ValueError("scenario_identity_invalid")
     if replica not in EXPECTED_TOPOLOGIES[topology] or round_number != 1:
         raise ValueError("scenario_not_expected")
@@ -199,6 +207,86 @@ def validate_record(
     return expected_scenario, exact_test_id, replica
 
 
+def validate_attempt_history(history: Any, record: dict[str, Any]) -> dict[str, Any]:
+    if (
+        not isinstance(history, dict)
+        or type(history.get("schema_version")) is not int
+        or history["schema_version"] != ATTEMPT_SCHEMA_VERSION
+    ):
+        raise ValueError("attempt_history_schema_invalid")
+    for field in ("scenario_id", "source_head_sha", "workflow_sha"):
+        if history.get(field) != record.get(field):
+            raise ValueError(f"attempt_history_{field}_mismatch")
+    attempts = history.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError("attempt_history_missing")
+    final = history.get("final_adjudication")
+    if not isinstance(final, dict):
+        raise ValueError("attempt_final_adjudication_missing")
+
+    previous_failures: list[dict[str, Any]] = []
+    for index, attempt in enumerate(attempts, start=1):
+        if not isinstance(attempt, dict):
+            raise ValueError("attempt_record_invalid")
+        if type(attempt.get("attempt")) is not int or attempt["attempt"] != index:
+            raise ValueError("attempt_sequence_invalid")
+        if type(attempt.get("exit_code")) is not int:
+            raise ValueError("attempt_exit_code_invalid")
+        if not isinstance(attempt.get("business_validation_started"), bool):
+            raise ValueError("attempt_business_phase_missing")
+        reason_codes = attempt.get("reason_codes")
+        readiness_paths = attempt.get("readiness_paths")
+        if not isinstance(reason_codes, list) or any(not isinstance(value, str) for value in reason_codes):
+            raise ValueError("attempt_reason_codes_invalid")
+        if not isinstance(readiness_paths, list) or any(not isinstance(value, str) for value in readiness_paths):
+            raise ValueError("attempt_readiness_paths_invalid")
+        evidence_path = attempt.get("evidence_path")
+        if evidence_path is not None and (not isinstance(evidence_path, str) or evidence_path.startswith("/")):
+            raise ValueError("attempt_evidence_path_invalid")
+        classification = attempt.get("classification")
+        if not isinstance(classification, dict) or not isinstance(classification.get("retryable"), bool):
+            raise ValueError("attempt_classification_invalid")
+        if not isinstance(classification.get("reason"), str):
+            raise ValueError("attempt_classification_reason_invalid")
+        infrastructure = attempt.get("infrastructure_evidence")
+        if attempt["exit_code"] != 0:
+            if attempt["business_validation_started"]:
+                previous_failures.append(attempt)
+            elif not (
+                classification["retryable"] is True
+                and classification["reason"] == "pre_business_infrastructure_failure"
+                and isinstance(infrastructure, dict)
+                and infrastructure.get("verified") is True
+                and isinstance(infrastructure.get("stage"), str)
+                and infrastructure["stage"] in {"nat_simulator", "control_server", "runner_process"}
+            ):
+                previous_failures.append(attempt)
+        elif not attempt["business_validation_started"]:
+            raise ValueError("successful_attempt_business_phase_missing")
+
+    if final.get("result") != "pass":
+        raise ValueError("attempt_final_result_not_pass")
+    if type(final.get("attempt")) is not int or final["attempt"] != len(attempts):
+        raise ValueError("attempt_final_index_mismatch")
+    if final.get("reason_code") is not None:
+        raise ValueError("attempt_final_reason_conflict")
+    last = attempts[-1]
+    if last["exit_code"] != 0 or last.get("evidence_path") != "nat-evidence.json":
+        raise ValueError("attempt_final_evidence_not_successful")
+    if previous_failures:
+        if any(attempt["business_validation_started"] for attempt in previous_failures):
+            raise ValueError("business_failure_masked_by_later_attempt")
+        raise ValueError("unverified_prebusiness_retry")
+    if record.get("result") != "pass":
+        raise ValueError("attempt_history_record_result_mismatch")
+    return {
+        "first_attempt_pass": attempts[0]["exit_code"] == 0,
+        "attempt_count": len(attempts),
+        "diagnostic_retry_count": len(attempts) - 1,
+        "recovered": any(attempt["exit_code"] != 0 for attempt in attempts[:-1]),
+    }
+
+
 def aggregate_records(
     records: list[tuple[Path, dict[str, Any]]],
     source_head_sha: str,
@@ -211,8 +299,15 @@ def aggregate_records(
     }
     seen: dict[str, tuple[Path, str]] = {}
     validated: list[dict[str, Any]] = []
+    attempt_stats: list[dict[str, Any]] = []
     for path, record in records:
         scenario, exact_test_id, _ = validate_record(record, source_head_sha, workflow_sha)
+        manifest_path = path.with_name("nat-attempts.json")
+        try:
+            history = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"attempt_history_missing_or_invalid:{manifest_path}:{exc}") from exc
+        attempt_stats.append(validate_attempt_history(history, record))
         if scenario in seen:
             previous_path, previous_test_id = seen[scenario]
             raise ValueError(
@@ -236,6 +331,18 @@ def aggregate_records(
         "result": "pass",
         "executed_record_count": len(validated),
         "relay_replica_count": sum(record["topology"] == "relay-blackhole" for record in validated),
+        "attempt_stats": {
+            "scenario_count": len(attempt_stats),
+            "first_attempt_pass_count": sum(stat["first_attempt_pass"] for stat in attempt_stats),
+            "first_attempt_pass_rate": (
+                sum(stat["first_attempt_pass"] for stat in attempt_stats) / len(attempt_stats)
+                if attempt_stats
+                else 0.0
+            ),
+            "diagnostic_retry_count": sum(stat["diagnostic_retry_count"] for stat in attempt_stats),
+            "recovery_count": sum(stat["recovered"] for stat in attempt_stats),
+            "final_failure_count": 0,
+        },
         "records": [
             {
                 "scenario_id": record["scenario_id"],
