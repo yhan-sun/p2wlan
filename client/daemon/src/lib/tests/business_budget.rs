@@ -271,6 +271,41 @@ async fn business_budget_install_confirmed_direct(
     (identity, lease)
 }
 
+/// Commit the encrypted Direct validation and install its DPLPMTUD worker
+/// lease while the authoritative business budget stays unconfirmed. This is
+/// the exact state a Relay→Direct make-before-break handover must tolerate.
+async fn business_budget_commit_direct_with_worker(
+    peers: &Arc<PeerManager>,
+    udp: &UdpTransport,
+    peer_id: &str,
+    remote_endpoint: SocketAddr,
+    validation_owner: u64,
+    request_id: u16,
+) -> (
+    crate::dplpmtud::DplpmtudPathIdentity,
+    crate::dplpmtud::DplpmtudWorkerLease,
+) {
+    let identity = business_budget_commit_direct(
+        peers,
+        udp,
+        peer_id,
+        remote_endpoint,
+        validation_owner,
+        request_id,
+    )
+    .await;
+    let peer_session_generation = peers
+        .peer_session_generation_sync(peer_id)
+        .expect("make-before-break peer must have a session generation");
+    assert!(udp.mark_peer_dplpmtud_supported(peer_id, peer_session_generation));
+    let lease = udp
+        .dplpmtud_runtime()
+        .install_path(identity.clone(), true, tokio::time::Instant::now())
+        .worker
+        .expect("managed Direct peer must own a DPLPMTUD worker lease");
+    (identity, lease)
+}
+
 fn business_budget_ipv6_packet(total_len: usize, next_header: u8) -> Vec<u8> {
     assert!((40..=40 + u16::MAX as usize).contains(&total_len));
     let source: Ipv6Addr = "fd00::1".parse().unwrap();
@@ -1242,4 +1277,498 @@ async fn direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb() 
     forwarder.abort();
     let _ = worker.await;
     let _ = forwarder.await;
+}
+
+async fn business_budget_assert_no_deadline_expiry(timeline: &ConnectionTimeline) {
+    assert!(
+        !timeline.snapshot().events.iter().any(|event| {
+            event.reason_code.as_deref()
+                == Some(crate::network_outbound::REASON_OUTBOUND_DELIVERY_DEADLINE)
+        }),
+        "business must never die on the outbound delivery deadline while a confirmed Relay exists"
+    );
+}
+
+/// Relay is usable and confirmed, the encrypted Direct validation already
+/// committed, but the authoritative business proof (confirmed DPLPMTUD
+/// budget) is still missing. The confirmed Relay must keep carrying business
+/// (make-before-break), and the first budget-confirmed packet must switch
+/// the same queue to Direct without any pending/drop event in between.
+#[tokio::test]
+async fn direct_business_commit_keeps_confirmed_relay_carrier_until_budget_confirms() {
+    const UDP_OWNER: u64 = 711;
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct_endpoint = receiver.local_addr().unwrap();
+    peers
+        .add_peer(&business_budget_peer("node-b", "10.20.0.2", direct_endpoint))
+        .await;
+    let peer_session_generation = peers
+        .peer_session_generation_sync("node-b")
+        .expect("relay make-before-break peer session");
+    peers.mark_dplpmtud_capable_sync("node-b", peer_session_generation);
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    udp.set_inbound_publication_owner(UDP_OWNER);
+    let (identity, lease) = business_budget_commit_direct_with_worker(
+        &peers,
+        &udp,
+        "node-b",
+        direct_endpoint,
+        811,
+        813,
+    )
+    .await;
+    let runtime = udp.dplpmtud_runtime();
+    assert!(
+        !udp.direct_business_budget_ready_for_peer("node-b"),
+        "the fixture must start with the authoritative business proof missing"
+    );
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let (_relay_available_tx, relay_available_rx) = watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        Arc::new(RwLock::new(Some(udp.clone()))),
+        Arc::new(RwLock::new(Some(relay_a))),
+        relay_available_rx,
+        RelayStartupWait { timeout: None },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    // Phase 1: business enters while Direct is committed but not yet
+    // business-ready. The confirmed Relay must carry it.
+    let packet_one = business_budget_ipv4_packet(256, 31);
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet_one.clone(),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let relayed = timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .expect("business must ride the confirmed Relay while the Direct budget is pending")
+        .unwrap();
+    match relayed {
+        RelayMessage::Data { from_node, data } => {
+            assert_eq!(from_node, "node-a");
+            assert_eq!(
+                remote_session.decrypt_from_bytes(&data).unwrap(),
+                packet_one,
+                "the peer must observe the real business ingress decrypted over Relay"
+            );
+        }
+        other => panic!("expected relayed business data, got {other:?}"),
+    }
+    let mut wire = vec![0u8; 2048];
+    assert!(
+        timeout(Duration::from_millis(150), receiver.recv_from(&mut wire))
+            .await
+            .is_err(),
+        "no Direct business datagram may be emitted while the budget is pending"
+    );
+    assert!(
+        !timeline.snapshot().events.iter().any(|event| {
+            event.event == "direct_business_budget_pending"
+        }),
+        "make-before-break must keep the queue flushable instead of parking it behind the budget"
+    );
+    business_budget_assert_no_deadline_expiry(&timeline).await;
+
+    // Phase 2: the authoritative Direct business proof lands. The same queue
+    // must switch to Direct without any pending/drop event in between.
+    business_budget_confirm_base(&runtime, &identity, &lease, tokio::time::Instant::now());
+    assert!(udp.direct_business_budget_ready_for_peer("node-b"));
+    let packet_two = business_budget_ipv4_packet(256, 32);
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet_two.clone(),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let (sent, _) = timeout(Duration::from_secs(2), receiver.recv_from(&mut wire))
+        .await
+        .expect("the first budget-confirmed business packet must hand off to Direct")
+        .unwrap();
+    assert!(sent > 0);
+    assert_eq!(
+        remote_session.decrypt_from_bytes(&wire[..sent]).unwrap(),
+        packet_two,
+        "the peer must observe the real business ingress decrypted over Direct"
+    );
+    business_budget_assert_no_deadline_expiry(&timeline).await;
+
+    let connection = peers.get_connection("node-b").await.unwrap();
+    assert_eq!(connection.active_path(), Some(peer::NetworkPath::Direct));
+    assert_eq!(connection.state, ConnectionState::Direct);
+    assert_eq!(connection.relay_server, Some(relay_endpoint.clone()));
+    let committed = peers
+        .committed_business_path_snapshot_sync("node-b")
+        .expect("committed business path must exist");
+    assert!(matches!(
+        committed.active,
+        crate::peer::ActiveBusinessPath::Direct(_)
+    ));
+
+    worker.abort();
+    forwarder.abort();
+    let _ = worker.await;
+    let _ = forwarder.await;
+    runtime.cancel_peer(
+        "node-b",
+        "make_before_break_test_complete",
+        tokio::time::Instant::now(),
+    );
+    server.shutdown().await;
+}
+
+/// Variant A: Direct validation completes later. While Relay is already
+/// usable and Direct is not business-ready yet, business must keep flowing
+/// through Relay — including packets that entered after the Direct commit.
+#[tokio::test]
+async fn relay_carries_business_when_direct_validation_completes_after_ingress() {
+    const UDP_OWNER: u64 = 721;
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct_endpoint = receiver.local_addr().unwrap();
+    peers
+        .add_peer(&business_budget_peer("node-b", "10.20.0.2", direct_endpoint))
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    udp.set_inbound_publication_owner(UDP_OWNER);
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let (_relay_available_tx, relay_available_rx) = watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        Arc::new(RwLock::new(Some(udp.clone()))),
+        Arc::new(RwLock::new(Some(relay_a))),
+        relay_available_rx,
+        RelayStartupWait { timeout: None },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    // First business packet before any Direct evidence exists.
+    let packet_one = business_budget_ipv4_packet(256, 41);
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet_one.clone(),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let relayed_one = timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .expect("pre-Direct business must ride the confirmed Relay")
+        .unwrap();
+    match relayed_one {
+        RelayMessage::Data { from_node, data } => {
+            assert_eq!(from_node, "node-a");
+            assert_eq!(remote_session.decrypt_from_bytes(&data).unwrap(), packet_one);
+        }
+        other => panic!("expected relayed business data, got {other:?}"),
+    }
+
+    // The encrypted Direct validation completes only now (budget pending).
+    let peer_session_generation = peers
+        .peer_session_generation_sync("node-b")
+        .expect("late validation peer session");
+    peers.mark_dplpmtud_capable_sync("node-b", peer_session_generation);
+    let (_identity, _lease) = business_budget_commit_direct_with_worker(
+        &peers,
+        &udp,
+        "node-b",
+        direct_endpoint,
+        821,
+        823,
+    )
+    .await;
+    assert!(!udp.direct_business_budget_ready_for_peer("node-b"));
+
+    // Business that enters after the commit must still be delivered.
+    let packet_two = business_budget_ipv4_packet(256, 42);
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet_two.clone(),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let relayed_two = timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .expect("post-commit business must keep riding Relay until Direct is business-ready")
+        .unwrap();
+    match relayed_two {
+        RelayMessage::Data { from_node, data } => {
+            assert_eq!(from_node, "node-a");
+            assert_eq!(remote_session.decrypt_from_bytes(&data).unwrap(), packet_two);
+        }
+        other => panic!("expected relayed business data, got {other:?}"),
+    }
+    let mut wire = vec![0u8; 2048];
+    assert!(timeout(Duration::from_millis(150), receiver.recv_from(&mut wire)).await.is_err());
+    business_budget_assert_no_deadline_expiry(&timeline).await;
+
+    let committed = peers
+        .committed_business_path_snapshot_sync("node-b")
+        .expect("committed business path must exist");
+    assert!(matches!(
+        committed.active,
+        crate::peer::ActiveBusinessPath::Direct(_)
+    ));
+    assert_eq!(
+        peers
+            .get_connection("node-b")
+            .await
+            .unwrap()
+            .active_path(),
+        Some(peer::NetworkPath::Direct)
+    );
+
+    worker.abort();
+    forwarder.abort();
+    let _ = worker.await;
+    let _ = forwarder.await;
+    udp.dplpmtud_runtime().cancel_peer(
+        "node-b",
+        "late_validation_test_complete",
+        tokio::time::Instant::now(),
+    );
+    server.shutdown().await;
+}
+
+/// Variant B: Direct degrades right after the switch. Revoking the confirmed
+/// budget must hand business back to the confirmed Relay instead of parking
+/// the queue behind a budget that Direct can no longer publish.
+#[tokio::test]
+async fn direct_budget_invalidation_falls_back_to_confirmed_relay_without_pending() {
+    const UDP_OWNER: u64 = 731;
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct_endpoint = receiver.local_addr().unwrap();
+    peers
+        .add_peer(&business_budget_peer("node-b", "10.20.0.2", direct_endpoint))
+        .await;
+    let peer_session_generation = peers
+        .peer_session_generation_sync("node-b")
+        .expect("degradation peer session");
+    peers.mark_dplpmtud_capable_sync("node-b", peer_session_generation);
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    udp.set_inbound_publication_owner(UDP_OWNER);
+    let (identity, lease) = business_budget_commit_direct_with_worker(
+        &peers,
+        &udp,
+        "node-b",
+        direct_endpoint,
+        831,
+        833,
+    )
+    .await;
+    let runtime = udp.dplpmtud_runtime();
+    business_budget_confirm_base(&runtime, &identity, &lease, tokio::time::Instant::now());
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let (_relay_available_tx, relay_available_rx) = watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        Arc::new(RwLock::new(Some(udp.clone()))),
+        Arc::new(RwLock::new(Some(relay_a))),
+        relay_available_rx,
+        RelayStartupWait { timeout: None },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    // The first packet rides the fully business-ready Direct path.
+    let packet_one = business_budget_ipv4_packet(256, 51);
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet_one.clone(),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let mut wire = vec![0u8; 2048];
+    let (sent, _) = timeout(Duration::from_secs(2), receiver.recv_from(&mut wire))
+        .await
+        .expect("business-ready Direct must hand the first packet to UDP")
+        .unwrap();
+    assert_eq!(
+        remote_session.decrypt_from_bytes(&wire[..sent]).unwrap(),
+        packet_one
+    );
+
+    // Immediate Direct degradation: the confirmed budget is invalidated while
+    // the committed path still names Direct.
+    let token = business_budget_token(&runtime, "node-b", UDP_OWNER);
+    assert!(udp.invalidate_direct_business_budget(&token));
+    assert!(!udp.direct_business_budget_ready_for_peer("node-b"));
+
+    let packet_two = business_budget_ipv4_packet(256, 52);
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet_two.clone(),
+            trace: None,
+        })
+        .await
+        .unwrap();
+    let relayed = timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .expect("degraded Direct must fall back to the confirmed Relay")
+        .unwrap();
+    match relayed {
+        RelayMessage::Data { from_node, data } => {
+            assert_eq!(from_node, "node-a");
+            assert_eq!(
+                remote_session.decrypt_from_bytes(&data).unwrap(),
+                packet_two,
+                "the peer must observe the fallback business ingress decrypted over Relay"
+            );
+        }
+        other => panic!("expected relayed business data, got {other:?}"),
+    }
+    business_budget_assert_no_deadline_expiry(&timeline).await;
+    assert!(
+        !timeline.snapshot().events.iter().any(|event| {
+            event.event == "direct_business_budget_pending"
+                && event.detail.as_deref().is_some_and(|detail| {
+                    detail.contains("queued_bytes=")
+                })
+        }),
+        "the fallback must not park the queue behind the revoked budget"
+    );
+
+    worker.abort();
+    forwarder.abort();
+    let _ = worker.await;
+    let _ = forwarder.await;
+    runtime.cancel_peer(
+        "node-b",
+        "degradation_test_complete",
+        tokio::time::Instant::now(),
+    );
+    server.shutdown().await;
 }

@@ -793,21 +793,6 @@ impl PeerManager {
         }
     }
 
-    /// Candidate publication releases the epoch gate before awaiting this
-    /// cancellation, so DPLPMTUD peer cleanup does not block other epoch waiters.
-    pub(crate) async fn cancel_dplpmtud_for_remote_candidate_change(
-        &self,
-        peer_id: &str,
-    ) {
-        if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
-            runtime.cancel_peer(
-                peer_id,
-                "remote_candidate_generation_changed",
-                tokio::time::Instant::now(),
-            );
-        }
-    }
-
     /// Exact no-await fence used immediately before a Probe send and while an
     /// ACK is consumed.  The state-machine snapshot is the active-path
     /// authority; the Direct-pair mirror additionally binds the local socket

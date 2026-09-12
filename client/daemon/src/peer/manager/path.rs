@@ -27,12 +27,16 @@ impl PeerManager {
             relay_available,
             local_endpoint,
             generation,
+            false,
         )
     }
 
     /// Select a path while the caller already owns the network epoch gate.
     /// This is used by the outbound counter/send transaction; taking the
     /// public wrapper there would attempt to lock the same async mutex twice.
+    /// `force_relay` implements the Relay make-before-break handover: a
+    /// confirmed Relay keeps carrying business while the committed Direct
+    /// path is still waiting for its authoritative business budget.
     pub(crate) async fn select_path_for_data_with_local_endpoint_in_epoch(
         &self,
         node_id: &str,
@@ -40,6 +44,7 @@ impl PeerManager {
         relay_available: bool,
         local_endpoint: Option<SocketAddr>,
         generation: u64,
+        force_relay: bool,
     ) -> PathSelection {
         let mut conns = self.connections.write().await;
         self.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
@@ -49,9 +54,11 @@ impl PeerManager {
             relay_available,
             local_endpoint,
             generation,
+            force_relay,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_path_for_data_with_local_endpoint_in_epoch_with_conns(
         &self,
         conns: &mut HashMap<String, PeerConnection>,
@@ -60,9 +67,24 @@ impl PeerManager {
         relay_available: bool,
         local_endpoint: Option<SocketAddr>,
         generation: u64,
+        force_relay: bool,
     ) -> PathSelection {
         match conns.get_mut(node_id) {
             Some(conn) => {
+                if force_relay {
+                    // Make-before-break evidence: the committed Direct path is
+                    // not business-ready yet, so the same plaintext rides the
+                    // confirmed Relay instead of parking behind a budget that
+                    // only the Direct commit can publish.
+                    let mut selection = PathSelection::relay(
+                        crate::network_outbound::REASON_DIRECT_BUDGET_PENDING,
+                        "Direct business budget is pending; confirmed Relay carries business until the authoritative Direct commit",
+                    );
+                    selection.relay_server = conn.relay_server.clone();
+                    conn.record_path_selection_event(generation, &selection, local_endpoint);
+                    conn.last_path_selection = Some(selection.clone());
+                    return selection;
+                }
                 conn.expire_stale_trial_nominations(generation, local_endpoint);
                 let policy = self
                     .config

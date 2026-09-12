@@ -478,8 +478,14 @@ impl PeerManager {
                 .await;
             self.cancel_direct_validation_for_remote_candidate_change(node_id)
                 .await;
-            self.cancel_dplpmtud_for_remote_candidate_change(node_id)
-                .await;
+            // DPLPMTUD is deliberately NOT cancelled here. Its worker
+            // re-validates the committed pair on every loop iteration via
+            // `dplpmtud_path_is_current_sync`; when a handover really moves
+            // the committed epoch, the mirror check retires the old worker
+            // and reconciliation respawns it under the new identity. An
+            // unconditional cancel would revoke an already-confirmed budget
+            // on mere candidate churn and leave business blocked while the
+            // replacement worker re-measures.
             if retire_hard_hard {
                 // Candidate handover retires the complete direct transport
                 // context. Control-event ingress applies the candidate set

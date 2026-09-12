@@ -2114,6 +2114,15 @@ impl DplpmtudRuntime {
 
     /// Consume an ACK while the caller holds the upper lifecycle/epoch fence.
     /// Contention fails closed instead of awaiting a lower registry lock.
+    ///
+    /// The ACK is WireGuard-authenticated and its token echoes the exact
+    /// outstanding probe (nonce and path cookie), so the reply's UDP source
+    /// is not required to equal the validation-time
+    /// `authenticated_remote_endpoint`: behind an address/port-dependent NAT
+    /// the peer's reply leaves through a different mapping than the one the
+    /// encrypted validation commit observed, and pinning it here rejected
+    /// every legitimate ACK. The local endpoint and socket identity stay
+    /// pinned so the measurement remains bound to the probed local path.
     pub(crate) fn try_accept_ack(
         &self,
         peer_id: &str,
@@ -2137,8 +2146,7 @@ impl DplpmtudRuntime {
             && token.direct_validation_owner_token == current_path.direct_validation_owner_token
             && token.direct_validation_request_id == current_path.direct_validation_request_id
             && token.outer_ip_family == current_path.outer_ip_family;
-        let exact_ingress = ingress.remote_endpoint == current_path.authenticated_remote_endpoint
-            && ingress.local_endpoint == current_path.local_endpoint
+        let exact_ingress = ingress.local_endpoint == current_path.local_endpoint
             && ingress.socket == current_path.socket;
         let worker_is_current = entry.worker_running && entry.worker_owner_token.is_some();
         let decision = if !worker_is_current
@@ -4118,13 +4126,12 @@ mod tests {
                 },
                 exact_ingress,
             ),
-            (
-                token,
-                DplpmtudAckIngress {
-                    remote_endpoint: "127.0.0.1:42999".parse().unwrap(),
-                    ..exact_ingress
-                },
-            ),
+            // The reply's UDP source is deliberately absent from the stale
+            // dimensions: behind an address/port-dependent NAT the peer's ACK
+            // leaves through a different mapping than the validation commit
+            // observed, so `try_accept_ack` no longer pins it. The remapped
+            // source is accepted by
+            // `ack_from_peer_reply_mapping_is_accepted_on_the_probed_local_socket`.
             (
                 token,
                 DplpmtudAckIngress {
@@ -4209,6 +4216,56 @@ mod tests {
             runtime.timeout_probe(&plan, plan.deadline + Duration::from_millis(1)),
             DplpmtudTransitionDecision::Applied
         );
+    }
+
+    /// The peer's DPLPMTUD ACK legitimately leaves through a different NAT
+    /// mapping than the one the encrypted validation commit observed (an
+    /// address/port-dependent NAT re-maps per destination). The ACK stays
+    /// WireGuard-authenticated and echoes the outstanding probe, so a reply
+    /// whose source endpoint differs from `authenticated_remote_endpoint`
+    /// must still be accepted when it arrives on the probed local socket.
+    #[test]
+    fn ack_from_peer_reply_mapping_is_accepted_on_the_probed_local_socket() {
+        let now = Instant::now();
+        let runtime = DplpmtudRuntime::new();
+        let identity = test_identity("peer");
+        let lease = runtime
+            .install_path(identity.clone(), true, now)
+            .worker
+            .unwrap();
+        let plan = runtime
+            .schedule_probe("peer", &identity, lease.worker_owner_token, now)
+            .unwrap();
+        assert!(runtime.begin_probe_send(&plan, now));
+        runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
+        let remapped_peer_endpoint: SocketAddr = "127.0.0.1:64001".parse().unwrap();
+        assert_ne!(
+            remapped_peer_endpoint, identity.authenticated_remote_endpoint,
+            "the fixture must model a genuinely re-mapped reply source"
+        );
+        assert_eq!(
+            runtime.try_accept_ack(
+                "peer",
+                &identity,
+                plan.wire_token,
+                DplpmtudAckIngress {
+                    remote_endpoint: remapped_peer_endpoint,
+                    local_endpoint: identity.local_endpoint,
+                    socket: identity.socket,
+                },
+                now + Duration::from_millis(2),
+            ),
+            DplpmtudTransitionDecision::Applied
+        );
+        assert_eq!(
+            runtime
+                .snapshots()
+                .remove("peer")
+                .unwrap()
+                .confirmed_udp_datagram_size,
+            Some(plan.probe_identity.candidate_udp_datagram_size.0),
+        );
+        runtime.close("shutdown", now + Duration::from_millis(3));
     }
 
     #[test]
