@@ -337,7 +337,7 @@ wait_daemon_token_ready() {
   echo "[nat-sim] node-$side ready state=STARTING pid=$pid" >&2
   if python3 "$ROOT_DIR/scripts/nat-sim/daemon_readiness.py" wait-token \
       --pid "$pid" \
-      --token "$runtime_dir/p2wlan-daemon.diag-auth" \
+      --token-file "$runtime_dir/p2wlan-daemon.diag-auth" \
       --log "$log" \
       --runtime-dir "$runtime_dir" \
       --timeout-s 30 \

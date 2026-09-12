@@ -268,7 +268,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     command = parser.add_subparsers(dest="command", required=True)
     wait = command.add_parser("wait-token", help="wait for the diagnostics token (TOKEN_READY)")
     wait.add_argument("--pid", type=int, default=None)
-    wait.add_argument("--token", required=True)
+    # --token-file carries the token FILE PATH (never the secret itself);
+    # the credential-scan argv rule permits exactly this transport form.
+    wait.add_argument("--token-file", required=True)
     wait.add_argument("--log", default=None)
     wait.add_argument("--runtime-dir", default=None)
     wait.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
@@ -280,7 +282,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     record = wait_for_token(
-        token_path=Path(args.token),
+        token_path=Path(args.token_file),
         pid=args.pid,
         timeout_s=args.timeout_s,
         poll_s=args.poll_s,
