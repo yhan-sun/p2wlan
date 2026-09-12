@@ -2189,6 +2189,7 @@ async fn inject_candidate_offer(
         .send(ControlEvent::DeliveredSignal {
             signal_id: format!("hard-hard-test-signal-{signal_seq}"),
             signal_seq: Some(signal_seq),
+            signal_type: "peer_offer".to_string(),
             event: Box::new(ControlEvent::PeerOffer {
                 from_node_id: signal.from_node_id.clone(),
                 candidates: signal.candidates.clone(),

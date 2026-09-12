@@ -18,10 +18,10 @@ use crate::config::{Config, ControlProxyMode};
 use crate::error::{DaemonError, Result};
 
 use super::{
-    ClientState, ControlErrorResponse, ControlEvent, CreateTunnelResponse, EndpointUpdateResponse,
-    FetchRelayTicketResponse, ListNodesResponse, ListSignalsResponse, PeerInfo,
-    RegisterDeviceResponse, RelayCatalogEntry, SignalApplyOutcome, SignalCreateResponse,
-    SignalDeliveryReceipt, SignalDeliveryWaiter, SignalResponse,
+    bounded_signal_log_value, ClientState, ControlErrorResponse, ControlEvent,
+    CreateTunnelResponse, EndpointUpdateResponse, FetchRelayTicketResponse, ListNodesResponse,
+    ListSignalsResponse, PeerInfo, RegisterDeviceResponse, RelayCatalogEntry, SignalApplyOutcome,
+    SignalCreateResponse, SignalDeliveryReceipt, SignalDeliveryWaiter, SignalResponse,
 };
 
 /// Candidate-set revisions must be strictly increasing within a daemon.  Wall

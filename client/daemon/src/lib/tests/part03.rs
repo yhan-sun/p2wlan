@@ -2483,6 +2483,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
         .send(ControlEvent::DeliveredSignal {
             signal_id: "candidate-before-handshake".to_string(),
             signal_seq: Some(1),
+            signal_type: "peer_offer".to_string(),
             event: Box::new(ControlEvent::PeerOffer {
                 from_node_id: peer_id.to_string(),
                 candidates: vec!["198.51.100.80:48000".to_string()],
@@ -2534,6 +2535,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
         .send(ControlEvent::DeliveredSignal {
             signal_id: "handshake-after-candidate".to_string(),
             signal_seq: Some(2),
+            signal_type: "peer_offer".to_string(),
             event: Box::new(ControlEvent::PeerOffer {
                 from_node_id: peer_id.to_string(),
                 candidates: vec!["198.51.100.80:48000".to_string()],
@@ -2575,6 +2577,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
         .send(ControlEvent::DeliveredSignal {
             signal_id: "post-handshake-marker".to_string(),
             signal_seq: Some(3),
+            signal_type: "test_marker".to_string(),
             event: Box::new(ControlEvent::ServerError {
                 code: 4999,
                 message: "candidate HOL regression marker".to_string(),

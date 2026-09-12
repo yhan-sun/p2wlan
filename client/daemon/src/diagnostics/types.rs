@@ -178,6 +178,9 @@ pub struct PeerScopedDiagnosticsSnapshot {
     pub node_id: String,
     pub network_id: String,
     pub network_generation: u64,
+    /// Current process-local lifecycle generation of this remote peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_session_generation: Option<u64>,
     pub network_peer_count: usize,
     pub captured_at_ms: u64,
     pub peer: Option<PeerDiagnostics>,

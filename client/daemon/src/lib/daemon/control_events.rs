@@ -1379,6 +1379,9 @@ impl Daemon {
     ) {
         loop {
             let peer_id = work.from_node_id.clone();
+            if let Some(receipt) = work.delivery_receipt.as_ref() {
+                receipt.record_phase("worker_started", "peer_reflexive");
+            }
             if *reservation.cancellation.borrow() {
                 work.complete_delivery(control::SignalApplyOutcome::Retry);
                 return;
@@ -1432,6 +1435,9 @@ impl Daemon {
         cancellation: &mut tokio::sync::watch::Receiver<bool>,
     ) {
         let peer_id = offer.from_node_id.clone();
+        if let Some(receipt) = offer.delivery_receipt.as_ref() {
+            receipt.record_phase("worker_started", "responder_offer");
+        }
         let lifecycle_is_current = || {
             offer
                 .peer_session_generation
@@ -2744,15 +2750,36 @@ impl Daemon {
                             warn!("Control event channel closed");
                             break;
                         };
-                        let (event, mut signal_delivery_receipt) = match event {
+                        let (event, mut signal_delivery_receipt, signal_context) = match event {
                             ControlEvent::DeliveredSignal {
                                 event,
                                 receipt,
-                                signal_id: _,
-                                signal_seq: _,
-                            } => (*event, Some(receipt)),
-                            event => (event, None),
+                                signal_id,
+                                signal_seq,
+                                signal_type,
+                            } => (
+                                *event,
+                                Some(receipt),
+                                Some((
+                                    control::bounded_signal_log_value(&signal_id),
+                                    signal_seq,
+                                    control::bounded_signal_log_value(&signal_type),
+                                )),
+                            ),
+                            event => (event, None, None),
                         };
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=dequeued id={} type={} seq={:?} network_generation={}",
+                                signal_id,
+                                signal_type,
+                                signal_seq,
+                                self.peers.current_network_generation_sync()
+                            );
+                        }
+                        if let Some(receipt) = signal_delivery_receipt.as_ref() {
+                            receipt.record_phase("dequeued", "control_event_loop");
+                        }
                         match event {
                     ControlEvent::Registered {
                         node_id,
@@ -2996,7 +3023,22 @@ impl Daemon {
                         let previous_peer_session_generation = self
                             .peers
                             .peer_session_generation_sync(&peer_info.node_id);
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=peer_manager_add_peer",
+                                signal_id, signal_type, signal_seq
+                            );
+                        }
                         let update = self.peers.add_peer(&peer_info).await;
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=state_committed id={} type={} seq={:?} commit=peer_updated peer_session_generation={:?}",
+                                signal_id,
+                                signal_type,
+                                signal_seq,
+                                self.peers.peer_session_generation_sync(&peer_info.node_id).map(|generation| generation.value())
+                            );
+                        }
                         let peer_rejoined = update.was_offline && peer_info.online;
                         match previous_peer_session_generation {
                             Some(previous_generation)
@@ -3316,6 +3358,9 @@ impl Daemon {
                         sender_public_key,
                     } => {
                         let delivery_receipt = signal_delivery_receipt.take();
+                        if let Some(receipt) = delivery_receipt.as_ref() {
+                            receipt.record_phase("dispatch_started", "peer_offer");
+                        }
                         let network_generation = self.peers.current_network_generation_sync();
                         info!(
                             "Received peer offer from {} ({} candidates)",
@@ -3479,6 +3524,11 @@ impl Daemon {
                                 control::SignalApplyOutcome::Retry
                             }
                         };
+                        if candidate_signal_outcome == control::SignalApplyOutcome::Applied {
+                            if let Some(receipt) = delivery_receipt.as_ref() {
+                                receipt.record_phase("work_admitted", "candidate_offer");
+                            }
+                        }
 
                         if handshake_init.is_empty() {
                             // The exact candidate payload is now owned locally. ACK its
@@ -3538,6 +3588,9 @@ impl Daemon {
                             })
                         };
                         if let Some((reservation, offer)) = admitted {
+                            if let Some(receipt) = delivery_receipt.as_ref() {
+                                receipt.record_phase("work_admitted", "responder_offer");
+                            }
                             self.timeline.emit(
                                 "peer_offer_responder_work_admitted",
                                 None,
@@ -3556,6 +3609,9 @@ impl Daemon {
                                 daemon.run_responder_offer_worker(offer, reservation).await;
                             }));
                         } else {
+                            if let Some(receipt) = delivery_receipt.as_ref() {
+                                receipt.record_phase("work_coalesced", "responder_offer");
+                            }
                             self.timeline.emit(
                                 "peer_offer_responder_work_coalesced",
                                 None,
@@ -3587,6 +3643,12 @@ impl Daemon {
                     } => {
                         let answer_delivery_receipt = signal_delivery_receipt.take();
                         let mut answer_signal_outcome = control::SignalApplyOutcome::Applied;
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=dispatch_started id={} type={} seq={:?} peer={} stage=peer_answer",
+                                signal_id, signal_type, signal_seq, from_node_id
+                            );
+                        }
                         info!(
                             "Received peer answer from {} ({} candidates)",
                             from_node_id,
@@ -3628,6 +3690,15 @@ impl Daemon {
                         // remote daemon restarted. Fence the retired transport but
                         // preserve the exact local initiator that this answer is
                         // about to complete.
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=remote_incarnation_reset",
+                                signal_id, signal_type, signal_seq
+                            );
+                        }
+                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                            receipt.record_phase("waiting_for_resource", "remote_incarnation_reset");
+                        }
                         let remote_incarnation_reset = match self
                             .reset_peer_for_remote_incarnation_if_needed_for_identity(
                                 &from_node_id,
@@ -3668,12 +3739,30 @@ impl Daemon {
                             }
                             _ => false,
                         };
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=resource_ready id={} type={} seq={:?} resource=remote_incarnation_reset",
+                                signal_id, signal_type, signal_seq
+                            );
+                        }
+                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                            receipt.record_phase("resource_ready", "remote_incarnation_reset");
+                        }
                         // Consume the WireGuard answer before candidate refresh or
                         // fresh-mapping work. Those paths may perform HTTP/STUN
                         // I/O and must remain a background upgrade; delaying the
                         // answer here leaves the responder staged but prevents
                         // the initiator from ever publishing its active session.
                         if !handshake_response.is_empty() {
+                            if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                                info!(
+                                    "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=wireguard_answer_commit",
+                                    signal_id, signal_type, signal_seq
+                                );
+                            }
+                            if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                receipt.record_phase("waiting_for_resource", "wireguard_answer_commit");
+                            }
                             self.peers
                                 .record_direct_event(
                                     &from_node_id,
@@ -3709,10 +3798,40 @@ impl Daemon {
                                     warn!("Failed to handle peer answer from {from_node_id}: {err}");
                                 }
                             }
+                            if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                                info!(
+                                    "Control signal phase=state_committed id={} type={} seq={:?} commit=wireguard_answer outcome={:?}",
+                                    signal_id, signal_type, signal_seq, answer_signal_outcome
+                                );
+                            }
+                            if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                receipt.record_phase(
+                                    match answer_signal_outcome {
+                                        control::SignalApplyOutcome::Applied => "state_committed",
+                                        control::SignalApplyOutcome::TerminalRejected => {
+                                            "terminal_rejected"
+                                        }
+                                        control::SignalApplyOutcome::Retry => "retry_decided",
+                                        control::SignalApplyOutcome::Pending => unreachable!(
+                                            "answer disposition must be terminal before receipt"
+                                        ),
+                                    },
+                                    "wireguard_answer",
+                                );
+                            }
                         }
                         // Fresh-prediction verification happens after the
                         // handshake transaction and before candidate state is
                         // used for background punching (see the offer path).
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=candidate_refresh",
+                                signal_id, signal_type, signal_seq
+                            );
+                        }
+                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                            receipt.record_phase("waiting_for_resource", "candidate_refresh");
+                        }
                         let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
                             .fresh_prediction_transaction(
                                 &from_node_id,
@@ -3723,6 +3842,15 @@ impl Daemon {
                                 sender_public_key.as_deref(),
                             )
                             .await;
+                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                            info!(
+                                "Control signal phase=state_committed id={} type={} seq={:?} commit=candidate_refresh result={:?}",
+                                signal_id, signal_type, signal_seq, candidate_apply_result
+                            );
+                        }
+                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                            receipt.record_phase("state_evaluated", "candidate_refresh");
+                        }
                         if !handshake_response.is_empty()
                             && answer_signal_outcome == control::SignalApplyOutcome::Applied
                         {
@@ -3842,6 +3970,9 @@ impl Daemon {
                             }
                         };
                         if let Some((reservation, work)) = admitted {
+                            if let Some(receipt) = work.delivery_receipt.as_ref() {
+                                receipt.record_phase("work_admitted", "peer_reflexive");
+                            }
                             slow_work.push(Box::pin(async move {
                                 daemon.run_peer_reflexive_worker(work, reservation).await;
                             }));

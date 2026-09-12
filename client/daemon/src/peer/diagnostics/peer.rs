@@ -47,6 +47,15 @@ pub struct PeerDiagnostics {
     pub direct: PathHealthDiagnostics,
     pub relay: PathHealthDiagnostics,
     pub direct_generation: u64,
+    /// Last accepted wire candidate generation from this peer. It is a
+    /// diagnostic revision only; lifecycle and replay fences remain enforced
+    /// by the peer manager.
+    #[serde(default)]
+    pub remote_candidate_generation: u64,
+    /// Process-local epoch advanced whenever the accepted remote candidate
+    /// set changes or the peer incarnation is reset.
+    #[serde(default)]
+    pub remote_candidate_epoch: u64,
     /// Relay endpoint whose ingress carried the confirming forced-relay probe
     /// ACK, when RelayPeerConfirmed (never from a local connect / queued
     /// registration).
@@ -468,6 +477,8 @@ impl PeerDiagnostics {
             direct: PathHealthDiagnostics::from(&conn.direct_health),
             relay: PathHealthDiagnostics::from(&conn.relay_health),
             direct_generation: conn.direct_generation,
+            remote_candidate_generation: conn.last_candidate_generation(),
+            remote_candidate_epoch: conn.remote_candidate_epoch(),
             relay_confirmed_endpoint: conn.relay_confirmed_endpoint.clone(),
             relay_confirmed_generation: conn.relay_confirmed_generation,
             relay_confirmed_connection_id: conn.relay_confirmed_connection_id,
