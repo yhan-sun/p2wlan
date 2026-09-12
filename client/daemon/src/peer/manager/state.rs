@@ -446,6 +446,9 @@ pub struct PeerManager {
     #[cfg(test)]
     remote_fresh_transaction_started_test_tx:
         Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+    #[cfg(test)]
+    candidate_postprocess_lock_wait_test_tx:
+        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
     /// Last complete diagnostics snapshot.  Diagnostics must never turn a
     /// contended connection writer into a false empty roster; the snapshot is
     /// only a fallback while the live lock is unavailable.

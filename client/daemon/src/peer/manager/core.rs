@@ -47,6 +47,8 @@ impl PeerManager {
             peer_add_wait_started_test_tx: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             remote_fresh_transaction_started_test_tx: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            candidate_postprocess_lock_wait_test_tx: Arc::new(std::sync::Mutex::new(None)),
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             committed_business_path_change_tx,
@@ -989,6 +991,29 @@ impl PeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
         {
+            let _ = sender.send(());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_candidate_postprocess_lock_wait_observer_for_test(
+        &self,
+        sender: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        *self
+            .candidate_postprocess_lock_wait_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_candidate_postprocess_lock_wait_for_test(&self) {
+        let sender = self
+            .candidate_postprocess_lock_wait_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(sender) = sender {
             let _ = sender.send(());
         }
     }

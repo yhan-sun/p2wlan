@@ -475,23 +475,64 @@ impl Daemon {
         fresh_prediction: Option<FreshPredictionId>,
         frozen_targets: Option<Vec<SocketAddr>>,
     ) {
+        let _ = self
+            .start_hole_punch_at_with_lock_policy(
+                node_id,
+                punch_at_ms,
+                fresh_prediction,
+                frozen_targets,
+                false,
+            )
+            .await;
+    }
+
+    /// Candidate work is polled cooperatively by the control-event loop. It
+    /// must report connection-map contention to its bounded owner instead of
+    /// queueing a lock waiter that can block an inline PeerUpdated commit.
+    async fn start_hole_punch_at_for_candidate_work(
+        &self,
+        node_id: &str,
+        punch_at_ms: Option<u64>,
+        fresh_prediction: Option<FreshPredictionId>,
+        frozen_targets: Option<Vec<SocketAddr>>,
+    ) -> HolePunchStartOutcome {
+        self.start_hole_punch_at_with_lock_policy(
+            node_id,
+            punch_at_ms,
+            fresh_prediction,
+            frozen_targets,
+            true,
+        )
+        .await
+    }
+
+    async fn start_hole_punch_at_with_lock_policy(
+        &self,
+        node_id: &str,
+        punch_at_ms: Option<u64>,
+        fresh_prediction: Option<FreshPredictionId>,
+        frozen_targets: Option<Vec<SocketAddr>>,
+        non_queuing_peer_commit: bool,
+    ) -> HolePunchStartOutcome {
         let Some(udp) = self.udp_transport.read().await.clone() else {
             debug!("UDP transport is not ready; skipping hole punch for {node_id}");
-            return;
+            return HolePunchStartOutcome::NotReady;
         };
 
-        let Some(_conn) = self.peers.get_connection(node_id).await else {
+        if !non_queuing_peer_commit && self.peers.get_connection(node_id).await.is_none() {
             debug!("No peer connection for {node_id}; skipping hole punch");
-            return;
-        };
-        let observed_generation = self.peers.current_network_generation().await;
+            return HolePunchStartOutcome::PeerMissing;
+        }
+        let observed_generation = self.peers.current_network_generation_sync();
         let observed_commit_seq = self.peers.direct_commit_seq_sync(node_id);
 
-        if self.peers.should_defer_relay_assisted_punch(node_id).await {
+        if !non_queuing_peer_commit
+            && self.peers.should_defer_relay_assisted_punch(node_id).await
+        {
             debug!(
                 "Skipping relay-assisted punch for {node_id}: healthy confirmed Direct path is active"
             );
-            return;
+            return HolePunchStartOutcome::HealthyDirect;
         }
 
         if self
@@ -510,7 +551,7 @@ impl Daemon {
                 )
                 .await;
             debug!("Local UDP candidates are not ready; delaying hole punch for {node_id}");
-            return;
+            return HolePunchStartOutcome::NotReady;
         }
 
         // The UDP supervisor publishes a provisional host-only snapshot as
@@ -538,27 +579,46 @@ impl Daemon {
             debug!(
                 "Initial UDP candidate snapshot is provisional; delaying hole punch for {node_id}"
             );
-            return;
+            return HolePunchStartOutcome::NotReady;
         }
 
-        if !self
+        let begin_outcome = if non_queuing_peer_commit {
+            self.peers.try_begin_hole_punch_if_current(
+                node_id,
+                observed_generation,
+                observed_commit_seq,
+            )
+        } else if self
             .peers
             .begin_hole_punch_if_current(node_id, observed_generation, observed_commit_seq)
             .await
         {
-            self.peers
-                .record_direct_event(
-                    node_id,
-                    "hole_punch_start_skipped_stale_state",
-                    None,
-                    None,
-                    None,
-                    format!(
-                        "state/generation/commit changed before punch start; observed_generation={observed_generation} observed_direct_commit_seq={observed_commit_seq:?}"
-                    ),
-                )
-                .await;
-            return;
+            HolePunchStartOutcome::Started
+        } else {
+            HolePunchStartOutcome::Stale
+        };
+        match begin_outcome {
+            HolePunchStartOutcome::Started => {}
+            HolePunchStartOutcome::ContendedEpoch
+            | HolePunchStartOutcome::ContendedConnections
+            | HolePunchStartOutcome::PeerMissing
+            | HolePunchStartOutcome::HealthyDirect => return begin_outcome,
+            HolePunchStartOutcome::Stale => {
+                self.peers
+                    .record_direct_event(
+                        node_id,
+                        "hole_punch_start_skipped_stale_state",
+                        None,
+                        None,
+                        None,
+                        format!(
+                            "state/generation/commit changed before punch start; observed_generation={observed_generation} observed_direct_commit_seq={observed_commit_seq:?}"
+                        ),
+                    )
+                    .await;
+                return HolePunchStartOutcome::Stale;
+            }
+            HolePunchStartOutcome::NotReady => unreachable!("begin never returns NotReady"),
         }
 
         let peer_id = node_id.to_string();
@@ -580,6 +640,7 @@ impl Daemon {
             frozen_targets,
         )
         .await;
+        HolePunchStartOutcome::Started
     }
 }
 

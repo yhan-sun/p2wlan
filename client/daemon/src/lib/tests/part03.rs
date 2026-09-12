@@ -2152,10 +2152,24 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
 
 #[tokio::test]
 async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer() {
-    let config = Config::generate_default("http://127.0.0.1:1", "fresh-candidate-event-loop").unwrap();
+    let mut control_capture = start_handshake_control_capture().await;
+    let mut config =
+        Config::generate_default(&control_capture.base_url, "fresh-candidate-event-loop").unwrap();
+    config.control.auth_token = "fresh-candidate-event-loop-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    config.network.punch_attempts = 1;
     let daemon = Daemon::new(config);
+    timeout(Duration::from_secs(2), control_capture.wait_registered())
+        .await
+        .expect("control capture did not register the daemon");
     let peer_id = "peer-fresh-candidate-event-loop";
-    let peer_identity = NodeIdentity::generate();
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
     let peer_info = control::PeerInfo {
         node_id: peer_id.to_string(),
         public_key: hex::encode(peer_identity.public_key()),
@@ -2164,6 +2178,15 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
         ..control::PeerInfo::default()
     };
     daemon.peers.add_peer(&peer_info).await;
+
+    let udp = crate::udp::UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    let local_candidate = udp.local_addr().unwrap().to_string();
+    *daemon.udp_transport.write().await = Some(udp);
+    daemon
+        .publish_candidate_snapshot(vec![local_candidate], HashMap::new(), Vec::new())
+        .await;
 
     let mut initiator = HandshakeInitiator::new(
         daemon.local_identity().unwrap(),
@@ -2175,49 +2198,33 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
     let (response, _) = responder
         .consume_initiation_and_respond(&initiation)
         .unwrap();
+    let (active_session, _) = part03_establish_sessions();
     daemon
-        .pending_handshakes
-        .lock()
-        .insert(peer_id.to_string(), initiator, None, None);
+        .transport
+        .install_active_session(peer_id, Some("preexisting-active-session".to_string()), active_session)
+        .await;
 
-    // The fresh-candidate worker's first production operation awaits this
-    // connection-map reader. Its transaction gate is the exact point reached
-    // immediately before that lock await, so observing it held proves the
-    // worker has been polled into the blocked read path.
-    let connection_guard = daemon.peers.connection_map_for_test().write_owned().await;
-    let fresh_candidate = "198.51.100.44:43444".to_string();
-    let sources = HashMap::from([(
-        fresh_candidate.clone(),
-        fresh_prediction_source_label(FreshPredictionId {
-            boot_epoch: 1_742_987_654_322,
-            generation: 1,
-        }),
-    )]);
+    let mut remote_initiator = HandshakeInitiator::new(
+        peer_identity.clone(),
+        daemon.local_identity().unwrap().public_key(),
+        None,
+    );
+    let remote_initiation = remote_initiator.create_initiation().unwrap();
+    let responder_cache_token = "candidate-postprocess-cache-replay".to_string();
+    let responder_probe_public_key = hex::encode(DhKeyPair::generate().public_key());
+
     let control = daemon.control.clone();
     let peers = daemon.peers.clone();
     let transport = daemon.transport.clone();
+    let pending_handshakes = daemon.pending_handshakes.clone();
+    let timeline = daemon.timeline.clone();
+    let candidate_postprocess_slot = daemon.candidate_postprocess_test_gate.clone();
     let shutdown = daemon.shutdown_sender();
     let (peer_add_started_tx, mut peer_add_started_rx) = mpsc::unbounded_channel();
     peers.install_peer_add_wait_observer_for_test(peer_add_started_tx);
     let (fresh_transaction_started_tx, mut fresh_transaction_started_rx) =
         mpsc::unbounded_channel();
     peers.install_remote_fresh_transaction_observer_for_test(fresh_transaction_started_tx);
-    control
-        .event_sender()
-        .send(ControlEvent::PeerOffer {
-            from_node_id: peer_id.to_string(),
-            candidates: vec![fresh_candidate],
-            session_id: None,
-            probe_ephemeral_public_key: None,
-            candidate_sources: sources,
-            candidate_generation: 1,
-            candidates_expires_at_ms: None,
-            handshake_init: Vec::new(),
-            punch_at_ms: None,
-            punch_at_server_ms: None,
-            sender_public_key: Some(hex::encode(peer_identity.public_key())),
-        })
-        .unwrap();
 
     let (network_tx, _network_rx) = mpsc::channel(8);
     let mut relay_started = false;
@@ -2228,22 +2235,161 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
             .await;
     });
 
+    // First apply this WireGuard offer so the duplicate below takes the real
+    // responder-cache replay path before candidate post-processing contends.
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: Vec::new(),
+            session_id: Some(responder_cache_token.clone()),
+            probe_ephemeral_public_key: Some(responder_probe_public_key.clone()),
+            candidate_sources: HashMap::new(),
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            handshake_init: remote_initiation.to_bytes(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let completed = timeline.snapshot().events.iter().any(|event| {
+                event.event == "peer_offer_responder_handler_completed"
+                    && event
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("session_fp="))
+            });
+            let candidate_work_active = pending_handshakes
+                .lock()
+                .has_candidate_offer_work_for_test(peer_id);
+            if transport.has_session(peer_id).await && completed && !candidate_work_active {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "initial responder transaction did not commit and release its candidate owner: {:#?}",
+            timeline.snapshot().events
+        )
+    });
+
+    // The duplicate keeps the same session token and initiation, so the real
+    // responder worker must stage its cached answer while the candidate worker
+    // pauses after its fresh-candidate commit.
+    let postprocess_gate = Arc::new(CandidatePostprocessTestGate::new());
+    *candidate_postprocess_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((peer_id.to_string(), postprocess_gate.clone()));
+    let fresh_candidate = "198.51.100.44:43444".to_string();
+    let fresh_id = FreshPredictionId {
+        boot_epoch: 1_742_987_654_322,
+        generation: 2,
+    };
+    let sources = HashMap::from([(
+        fresh_candidate.clone(),
+        fresh_prediction_source_label(fresh_id),
+    )]);
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec![fresh_candidate],
+            session_id: Some(responder_cache_token),
+            probe_ephemeral_public_key: Some(responder_probe_public_key),
+            candidate_sources: sources,
+            candidate_generation: 2,
+            candidates_expires_at_ms: None,
+            handshake_init: remote_initiation.to_bytes(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+
     timeout(Duration::from_secs(1), fresh_transaction_started_rx.recv())
         .await
         .expect("fresh candidate worker did not enter the production transaction")
         .expect("fresh transaction observer closed");
 
+    timeout(Duration::from_secs(1), postprocess_gate.reached.notified())
+        .await
+        .expect("candidate transaction did not reach deferred punch preparation");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let events = timeline.snapshot().events;
+            let cached_hit = events.iter().any(|event| {
+                event.event == "peer_offer_responder_cache_lookup"
+                    && event.detail.as_deref().is_some_and(|detail| detail.contains("cache=hit"))
+            });
+            let cached_answer = events.iter().any(|event| {
+                event.event == "peer_answer_staged"
+                    && event.detail.as_deref().is_some_and(|detail| {
+                        detail.contains("cached_replay=true") && detail.contains("had_active=true")
+                    })
+            });
+            let completed_handlers = events
+                .iter()
+                .filter(|event| event.event == "peer_offer_responder_handler_completed")
+                .count();
+            if cached_hit && cached_answer && completed_handlers >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("duplicate responder did not complete the cached answer replay before PeerUpdated");
+    let connection_guard = peers.connection_map_for_test().write_owned().await;
+    let (postprocess_wait_tx, mut postprocess_wait_rx) = mpsc::unbounded_channel();
+    peers.install_candidate_postprocess_lock_wait_observer_for_test(postprocess_wait_tx);
+    postprocess_gate.release.wait().await;
+    timeout(Duration::from_secs(1), postprocess_wait_rx.recv())
+        .await
+        .expect("candidate post-processing did not attempt the contended connection lock")
+        .expect("candidate post-process lock observer closed");
+
     let mut heartbeat = peer_info;
     heartbeat.last_seen = 7;
+    let peer_updated_receipt = control::SignalDeliveryReceipt::pending();
     control
         .event_sender()
-        .send(ControlEvent::PeerUpdated(heartbeat))
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: "candidate-peer-updated-after-cache".to_string(),
+            signal_seq: Some(8),
+            signal_type: "peer_updated".to_string(),
+            event: Box::new(ControlEvent::PeerUpdated(heartbeat)),
+            receipt: peer_updated_receipt.clone(),
+        })
         .unwrap();
     timeout(Duration::from_secs(1), peer_add_started_rx.recv())
         .await
         .expect("PeerUpdated did not enter the real PeerManager::add_peer path");
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if timeline.snapshot().events.iter().any(|event| {
+                event.event == "peer_update_lock_wait_started"
+                    && event.reason_code.as_deref() == Some("connections_write")
+                    && event.detail.as_deref().is_some_and(|detail| {
+                        detail.contains("signal_seq=8")
+                            && detail.contains("signal_type=peer_updated")
+                    })
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PeerUpdated lock wait did not expose its exact resource and signal correlation");
     drop(connection_guard);
-
     let update_result = timeout(Duration::from_millis(300), async {
         loop {
             if peers
@@ -2262,13 +2408,52 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
         let _ = loop_task.await;
         panic!("PeerUpdated waited behind a fresh candidate task the loop could not poll");
     }
+    assert_eq!(
+        timeout(Duration::from_secs(1), peer_updated_receipt.wait())
+            .await
+            .expect("PeerUpdated receipt was not applied after releasing the writer"),
+        control::SignalApplyOutcome::Applied
+    );
+    let peer_update_events = timeline.snapshot().events;
+    let wait_detail = peer_update_events
+        .iter()
+        .find(|event| {
+            event.event == "peer_update_lock_wait_started"
+                && event.reason_code.as_deref() == Some("connections_write")
+        })
+        .and_then(|event| event.detail.as_deref())
+        .expect("PeerUpdated connection-writer wait correlation disappeared");
+    let attempt = wait_detail
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("attempt="))
+        .expect("PeerUpdated lock diagnostic omitted its attempt id");
+    for event_name in [
+        "peer_update_lock_acquired",
+        "peer_update_lock_released",
+        "peer_update_commit_complete",
+        "peer_update_postcommit_cleanup_completed",
+    ] {
+        assert!(
+            peer_update_events.iter().any(|event| {
+                event.event == event_name
+                    && event
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains(&format!("attempt={attempt} ")))
+            }),
+            "missing {event_name} for PeerUpdated attempt {attempt}"
+        );
+    }
 
     let answer_receipt = control::SignalDeliveryReceipt::pending();
+    pending_handshakes
+        .lock()
+        .insert(peer_id.to_string(), initiator, None, None);
     control
         .event_sender()
         .send(ControlEvent::DeliveredSignal {
             signal_id: "fresh-candidate-following-answer".to_string(),
-            signal_seq: Some(2),
+            signal_seq: Some(9),
             signal_type: "peer_answer".to_string(),
             event: Box::new(ControlEvent::PeerAnswer {
                 from_node_id: peer_id.to_string(),
@@ -2299,10 +2484,6 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
             .expect("answer receipt did not reach a terminal application result"),
         control::SignalApplyOutcome::Applied
     );
-    let fresh_id = FreshPredictionId {
-        boot_epoch: 1_742_987_654_322,
-        generation: 1,
-    };
     timeout(Duration::from_secs(1), async {
         loop {
             if peers.remote_fresh_snapshot_for(peer_id, fresh_id).await.is_some() {
@@ -2314,11 +2495,97 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
     .await
     .expect("fresh candidate retry did not atomically commit its candidate snapshot");
 
+    timeout(Duration::from_secs(1), postprocess_gate.completed.notified())
+        .await
+        .expect("candidate post-processing did not finish after the receipt was applied");
+
+    // A second post-commit owner is cancelled by the authoritative PeerLeft
+    // while its non-queuing punch preparation observes a held connection
+    // writer. The owner must leave through its lifecycle token and shutdown
+    // must not inherit a queued reader/writer from that worker.
+    let cancelled_postprocess_gate = Arc::new(CandidatePostprocessTestGate::new());
+    *candidate_postprocess_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
+        peer_id.to_string(),
+        cancelled_postprocess_gate.clone(),
+    ));
+    let cancelled_fresh_id = FreshPredictionId {
+        boot_epoch: fresh_id.boot_epoch,
+        generation: 3,
+    };
+    let cancelled_candidate = "198.51.100.45:43445".to_string();
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec![cancelled_candidate.clone()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::from([(
+                cancelled_candidate.clone(),
+                fresh_prediction_source_label(cancelled_fresh_id),
+            )]),
+            candidate_generation: 3,
+            candidates_expires_at_ms: None,
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+    timeout(Duration::from_secs(1), fresh_transaction_started_rx.recv())
+        .await
+        .expect("cancellable candidate transaction was not admitted")
+        .expect("fresh transaction observer closed");
+    timeout(
+        Duration::from_secs(1),
+        cancelled_postprocess_gate.reached.notified(),
+    )
+    .await
+    .expect("cancellable candidate transaction did not reach post-processing");
+    let cancellation_connection_guard = peers.connection_map_for_test().write_owned().await;
+    let (cancel_wait_tx, mut cancel_wait_rx) = mpsc::unbounded_channel();
+    peers.install_candidate_postprocess_lock_wait_observer_for_test(cancel_wait_tx);
+    cancelled_postprocess_gate.release.wait().await;
+    timeout(Duration::from_secs(1), cancel_wait_rx.recv())
+        .await
+        .expect("cancellable candidate did not observe the held connection writer")
+        .expect("candidate lock observer closed");
+    control
+        .event_sender()
+        .send(ControlEvent::PeerLeft(peer_id.to_string()))
+        .unwrap();
+    drop(cancellation_connection_guard);
+    timeout(Duration::from_secs(1), async {
+        while peers.peer_exists_sync(peer_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("PeerLeft did not retire the lifecycle that owns candidate post-processing");
+    timeout(
+        Duration::from_secs(1),
+        cancelled_postprocess_gate.completed.notified(),
+    )
+    .await
+    .expect("cancelled candidate post-processing did not release its owner");
+    assert!(
+        !pending_handshakes
+            .lock()
+            .has_candidate_offer_work_for_test(peer_id),
+        "PeerLeft left a candidate work owner behind"
+    );
     let _ = shutdown.send(true);
     timeout(Duration::from_secs(1), loop_task)
         .await
         .expect("control event loop did not stop")
         .expect("control event loop task panicked");
+    control_capture.stop().await;
+    assert!(
+        peers.connection_map_for_test().try_write().is_ok(),
+        "candidate worker left a connection-map waiter after shutdown"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

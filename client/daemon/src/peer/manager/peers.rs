@@ -1,3 +1,200 @@
+static NEXT_PEER_UPDATE_LOCK_ATTEMPT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+enum PeerUpdateLockResource {
+    NetworkEpochGate,
+    ConnectionsWrite,
+    IpToNodeWrite,
+}
+
+impl PeerUpdateLockResource {
+    const ALL: [Self; 3] = [
+        Self::NetworkEpochGate,
+        Self::ConnectionsWrite,
+        Self::IpToNodeWrite,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::NetworkEpochGate => 0,
+            Self::ConnectionsWrite => 1,
+            Self::IpToNodeWrite => 2,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NetworkEpochGate => "network_epoch_gate",
+            Self::ConnectionsWrite => "connections_write",
+            Self::IpToNodeWrite => "ip_to_node_write",
+        }
+    }
+}
+
+struct PeerUpdateLockTrace<'a> {
+    manager: &'a PeerManager,
+    context: String,
+    wait_started: [Option<Instant>; 3],
+    observed_contention: [bool; 3],
+    held: [bool; 3],
+}
+
+impl<'a> PeerUpdateLockTrace<'a> {
+    fn new(
+        manager: &'a PeerManager,
+        node_id: &str,
+        network_generation: u64,
+        peer_session_generation: Option<u64>,
+        signal_context: Option<(&str, Option<u64>, &str)>,
+    ) -> Self {
+        let attempt = NEXT_PEER_UPDATE_LOCK_ATTEMPT.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let peer_fingerprint =
+            crate::transport::wire_fingerprint(node_id.as_bytes());
+        let (signal_fingerprint, signal_sequence, signal_type) = signal_context
+            .map(|(signal_id, sequence, signal_type)| {
+                (
+                    format!("{:016x}", crate::transport::wire_fingerprint(signal_id.as_bytes())),
+                    sequence.map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    signal_type.to_string(),
+                )
+            })
+            .unwrap_or_else(|| ("none".to_string(), "none".to_string(), "none".to_string()));
+        Self {
+            manager,
+            context: format!(
+                "attempt={attempt} peer_fp={peer_fingerprint:016x} network_generation={network_generation} peer_session_generation={} signal_fp={signal_fingerprint} signal_seq={signal_sequence} signal_type={signal_type}",
+                peer_session_generation.map_or_else(|| "none".to_string(), |value| value.to_string())
+            ),
+            wait_started: [None; 3],
+            observed_contention: [false; 3],
+            held: [false; 3],
+        }
+    }
+
+    fn wait_started(&mut self, resource: PeerUpdateLockResource, queue: &'static str, held: &'static str) {
+        let index = resource.index();
+        if self.wait_started[index].is_some() || self.observed_contention[index] {
+            return;
+        }
+        self.wait_started[index] = Some(Instant::now());
+        self.manager.emit_timeline(
+            "peer_update_lock_wait_started",
+            None,
+            Some(resource.name()),
+            Some(format!(
+                "{} resource={} phase=waiting queue={} held={}",
+                self.context,
+                resource.name(),
+                queue,
+                held
+            )),
+        );
+    }
+
+    fn acquired(&mut self, resource: PeerUpdateLockResource) {
+        let index = resource.index();
+        self.held[index] = true;
+        if let Some(started) = self.wait_started[index].take() {
+            self.observed_contention[index] = true;
+            self.manager.emit_timeline(
+                "peer_update_lock_acquired",
+                None,
+                Some(resource.name()),
+                Some(format!(
+                    "{} resource={} phase=acquired wait_ms={}",
+                    self.context,
+                    resource.name(),
+                    started.elapsed().as_millis()
+                )),
+            );
+        }
+    }
+
+    fn queue_probe_acquired(&self, resource: PeerUpdateLockResource) {
+        self.manager.emit_timeline(
+            "peer_update_lock_queue_probe_acquired",
+            None,
+            Some(resource.name()),
+            Some(format!(
+                "{} resource={} phase=fair_writer_queue_probe_acquired", self.context, resource.name()
+            )),
+        );
+    }
+
+    fn queue_probe_released(&self, resource: PeerUpdateLockResource) {
+        self.manager.emit_timeline(
+            "peer_update_lock_queue_probe_released",
+            None,
+            Some(resource.name()),
+            Some(format!(
+                "{} resource={} phase=fair_writer_queue_probe_released", self.context, resource.name()
+            )),
+        );
+    }
+
+    fn released(&mut self, resource: PeerUpdateLockResource) {
+        let index = resource.index();
+        if !self.held[index] {
+            return;
+        }
+        self.held[index] = false;
+        if self.observed_contention[index] {
+            self.manager.emit_timeline(
+                "peer_update_lock_released",
+                None,
+                Some(resource.name()),
+                Some(format!(
+                    "{} resource={} phase=released", self.context, resource.name()
+                )),
+            );
+        }
+    }
+
+    fn emit_peer_update_phase(&self, event: &'static str, phase: &'static str) {
+        if !self.observed_contention.into_iter().any(|observed| observed) {
+            return;
+        }
+        self.manager.emit_timeline(
+            event,
+            None,
+            None,
+            Some(format!("{} phase={phase}", self.context)),
+        );
+    }
+}
+
+impl Drop for PeerUpdateLockTrace<'_> {
+    fn drop(&mut self) {
+        let held = PeerUpdateLockResource::ALL
+            .into_iter()
+            .filter(|resource| self.held[resource.index()])
+            .map(PeerUpdateLockResource::name)
+            .collect::<Vec<_>>()
+            .join(",");
+        for resource in PeerUpdateLockResource::ALL {
+            let Some(started) = self.wait_started[resource.index()].take() else {
+                continue;
+            };
+            self.manager.emit_timeline(
+                "peer_update_lock_wait_cancelled",
+                None,
+                Some(resource.name()),
+                Some(format!(
+                    "{} resource={} phase=cancelled wait_ms={} held={}",
+                    self.context,
+                    resource.name(),
+                    started.elapsed().as_millis(),
+                    if held.is_empty() { "none" } else { &held }
+                )),
+            );
+        }
+    }
+}
+
 fn normalize_probe_session_id(session_id: Option<String>) -> Option<String> {
     session_id.and_then(|value| {
         let trimmed = value.trim();
@@ -553,16 +750,76 @@ impl PeerManager {
         .await
     }
 
+    async fn lock_peer_update_resources<'a>(
+        &'a self,
+        trace: &mut PeerUpdateLockTrace<'_>,
+    ) -> (
+        tokio::sync::MutexGuard<'a, ()>,
+        tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+    ) {
+        loop {
+            let epoch_guard = match self.network_epoch_gate.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    trace.wait_started(
+                        PeerUpdateLockResource::NetworkEpochGate,
+                        "mutex_wait",
+                        "none",
+                    );
+                    let guard = self.network_epoch_gate.lock().await;
+                    trace.acquired(PeerUpdateLockResource::NetworkEpochGate);
+                    guard
+                }
+            };
+            match self.connections.try_write() {
+                Ok(connections) => {
+                    trace.acquired(PeerUpdateLockResource::NetworkEpochGate);
+                    trace.acquired(PeerUpdateLockResource::ConnectionsWrite);
+                    return (epoch_guard, connections);
+                }
+                Err(_) => {
+                    drop(epoch_guard);
+                    trace.released(PeerUpdateLockResource::NetworkEpochGate);
+                    trace.wait_started(
+                        PeerUpdateLockResource::ConnectionsWrite,
+                        "fair_writer_queue_probe",
+                        "none",
+                    );
+                    let queue_probe = self.connections.write().await;
+                    trace.queue_probe_acquired(PeerUpdateLockResource::ConnectionsWrite);
+                    drop(queue_probe);
+                    trace.queue_probe_released(PeerUpdateLockResource::ConnectionsWrite);
+                }
+            }
+        }
+    }
+
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
+        self.add_peer_with_signal_context(info, None).await
+    }
+
+    pub(crate) async fn add_peer_with_signal_context(
+        &self,
+        info: &PeerInfo,
+        signal_context: Option<(&str, Option<u64>, &str)>,
+    ) -> PeerUpdate {
         #[cfg(test)]
         self.notify_peer_add_wait_started_for_test();
+        let mut lock_trace = PeerUpdateLockTrace::new(
+            self,
+            &info.node_id,
+            self.current_network_generation_sync(),
+            self.peer_session_generation_sync(&info.node_id)
+                .map(|generation| generation.value()),
+            signal_context,
+        );
         // Control-plane incarnation updates are another writer of the same
         // relay/session state that network handover invalidates. Serialize
         // the generation snapshot and the connection mutation as one epoch
         // transaction; otherwise a public-key/session reset could be
         // published immediately before an old ACK commits.
-        let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
+        let (epoch_guard, mut conns) = self.lock_peer_update_resources(&mut lock_trace).await;
         let generation = self.current_network_generation_sync();
         // Un-quarantine evidence is computed under the connection lock but the
         // quarantine map is re-opened only AFTER the lock is dropped:
@@ -573,7 +830,22 @@ impl PeerManager {
         let mut cancel_heartbeat_after_lock = false;
         let mut revoke_relay_after_lock = false;
         let mut clear_hard_hard_after_lock = false;
-        let mut ip_map = self.ip_to_node.write().await;
+        let mut ip_map = match self.ip_to_node.try_write() {
+            Ok(ip_map) => {
+                lock_trace.acquired(PeerUpdateLockResource::IpToNodeWrite);
+                ip_map
+            }
+            Err(_) => {
+                lock_trace.wait_started(
+                    PeerUpdateLockResource::IpToNodeWrite,
+                    "fair_writer_queue",
+                    "network_epoch_gate,connections_write",
+                );
+                let ip_map = self.ip_to_node.write().await;
+                lock_trace.acquired(PeerUpdateLockResource::IpToNodeWrite);
+                ip_map
+            }
+        };
 
         let is_new = !conns.contains_key(&info.node_id);
 
@@ -911,11 +1183,15 @@ impl PeerManager {
                 info.node_id
             );
         }
+        lock_trace.emit_peer_update_phase("peer_update_commit_complete", "state_committed");
         #[cfg(test)]
         pause_after_peer_membership_publish_for_test(&info.node_id).await;
         drop(conns);
         drop(ip_map);
         drop(epoch_guard);
+        lock_trace.released(PeerUpdateLockResource::IpToNodeWrite);
+        lock_trace.released(PeerUpdateLockResource::ConnectionsWrite);
+        lock_trace.released(PeerUpdateLockResource::NetworkEpochGate);
         if clear_hard_hard_after_lock {
             self.clear_hard_hard_sessions(Some(&info.node_id)).await;
         }
@@ -934,6 +1210,10 @@ impl PeerManager {
         if let Some(reason) = recovery_reopen_reason_after_lock {
             self.recovery_reopen_on_evidence(&info.node_id, reason).await;
         }
+        lock_trace.emit_peer_update_phase(
+            "peer_update_postcommit_cleanup_completed",
+            "postcommit_cleanup_completed",
+        );
         PeerUpdate {
             is_new,
             virtual_ip_changed,
@@ -1050,6 +1330,8 @@ impl PeerManager {
 
     /// Get a peer connection by node ID.
     pub async fn get_connection(&self, node_id: &str) -> Option<PeerConnection> {
+        #[cfg(test)]
+        self.notify_candidate_postprocess_lock_wait_for_test();
         self.connections.read().await.get(node_id).cloned()
     }
 
@@ -1131,19 +1413,68 @@ impl PeerManager {
         observed_commit_seq: Option<u64>,
     ) -> bool {
         let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
+        self.begin_hole_punch_if_current_locked(
+            node_id,
+            observed_generation,
+            observed_commit_seq,
+            &mut conns,
+        ) == HolePunchStartOutcome::Started
+    }
+
+    /// Try to commit punch preparation without entering either fair lock
+    /// queue. Cooperative candidate work must not leave a granted-but-unpolled
+    /// connection waiter ahead of an inline PeerUpdated commit.
+    pub(crate) fn try_begin_hole_punch_if_current(
+        &self,
+        node_id: &str,
+        observed_generation: u64,
+        observed_commit_seq: Option<u64>,
+    ) -> HolePunchStartOutcome {
+        let epoch_guard = match self.network_epoch_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                #[cfg(test)]
+                self.notify_candidate_postprocess_lock_wait_for_test();
+                return HolePunchStartOutcome::ContendedEpoch;
+            }
+        };
+        let mut conns = match self.connections.try_write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                drop(epoch_guard);
+                #[cfg(test)]
+                self.notify_candidate_postprocess_lock_wait_for_test();
+                return HolePunchStartOutcome::ContendedConnections;
+            }
+        };
+        self.begin_hole_punch_if_current_locked(
+            node_id,
+            observed_generation,
+            observed_commit_seq,
+            &mut conns,
+        )
+    }
+
+    fn begin_hole_punch_if_current_locked(
+        &self,
+        node_id: &str,
+        observed_generation: u64,
+        observed_commit_seq: Option<u64>,
+        conns: &mut HashMap<String, PeerConnection>,
+    ) -> HolePunchStartOutcome {
         if self.current_network_generation_sync() != observed_generation
             || self.direct_commit_seq_sync(node_id) != observed_commit_seq
         {
-            return false;
+            return HolePunchStartOutcome::Stale;
         }
         let Some(peer_session_generation) = self.peer_session_generation_sync(node_id) else {
-            return false;
+            return HolePunchStartOutcome::PeerMissing;
         };
         let Some(conn) = conns.get_mut(node_id) else {
-            return false;
+            return HolePunchStartOutcome::PeerMissing;
         };
         if conn.state == ConnectionState::Direct && conn.direct_is_healthy_confirmed() {
-            return false;
+            return HolePunchStartOutcome::HealthyDirect;
         }
         let epoch = PathEpoch::new(
             observed_generation,
@@ -1156,11 +1487,16 @@ impl PeerManager {
         } else {
             PathEvent::DirectRetryScheduled { epoch, attempt }
         };
-        conn.commit_path_transition(
+        if conn.commit_path_transition(
             event,
             |_| {},
         )
         .accepted()
+        {
+            HolePunchStartOutcome::Started
+        } else {
+            HolePunchStartOutcome::Stale
+        }
     }
 
     /// Record a direct traversal timeline event for diagnostics.
