@@ -1518,7 +1518,7 @@ async fn encrypt_then_send(
         lock_wait_ms = emit_lock_wait_ms,
         "business packet acquired its per-peer WireGuard counter-ordering lock"
     );
-    let (encrypted, direct_business_plan) = {
+    let (encrypted, direct_business_plan, force_relay) = {
         let epoch_gate = peers.network_epoch_gate();
         let epoch_gate_wait_started = Instant::now();
         let _epoch_guard = epoch_gate.lock().await;
@@ -1558,8 +1558,10 @@ async fn encrypt_then_send(
                 relay_available || relay_expected,
                 udp_local_endpoint,
                 current_generation,
+                false,
             )
             .await;
+        let mut force_relay = false;
         let direct_business_plan = if selection.path == Some(NetworkPath::Direct)
             && selection.direct_confirmed
         {
@@ -1571,12 +1573,30 @@ async fn encrypt_then_send(
                     {
                         DirectBusinessBudgetGate::Unmanaged => None,
                         DirectBusinessBudgetGate::ManagedPending { reason } => {
-                            return EncryptSendOutcome::BudgetPending {
-                                packet: retry_packet,
-                                reason: format!(
-                                    "Direct DPLPMTUD budget pending before encryption: {reason}"
-                                ),
-                            };
+                            // Make-before-break: the encrypted Direct commit
+                            // exists, but its authoritative business proof
+                            // (confirmed budget) does not. A confirmed Relay
+                            // must keep carrying business instead of parking
+                            // the queue behind a budget only the Direct
+                            // commit can publish.
+                            if !relay_make_before_break_fallback(
+                                peers,
+                                &retry_packet.peer_id,
+                                current_generation,
+                                relay_available,
+                                reason,
+                            )
+                            .await
+                            {
+                                return EncryptSendOutcome::BudgetPending {
+                                    packet: retry_packet,
+                                    reason: format!(
+                                        "Direct DPLPMTUD budget pending before encryption: {reason}"
+                                    ),
+                                };
+                            }
+                            force_relay = true;
+                            None
                         }
                         DirectBusinessBudgetGate::Ready(prepared) => {
                             let Some(inner_len) =
@@ -1626,11 +1646,23 @@ async fn encrypt_then_send(
                     }
                 }
                 _ => {
-                    return EncryptSendOutcome::BudgetPending {
-                        packet: retry_packet,
-                        reason: "Direct selected without a published UDP endpoint/socket"
-                            .to_string(),
-                    };
+                    if !relay_make_before_break_fallback(
+                        peers,
+                        &retry_packet.peer_id,
+                        current_generation,
+                        relay_available,
+                        "Direct selected without a published UDP endpoint/socket",
+                    )
+                    .await
+                    {
+                        return EncryptSendOutcome::BudgetPending {
+                            packet: retry_packet,
+                            reason: "Direct selected without a published UDP endpoint/socket"
+                                .to_string(),
+                        };
+                    }
+                    force_relay = true;
+                    None
                 }
             }
         } else {
@@ -1677,7 +1709,7 @@ async fn encrypt_then_send(
                 epoch_gate_acquired.elapsed(),
             );
         }
-        (result, direct_business_plan)
+        (result, direct_business_plan, force_relay)
     };
     let encrypt_completed = Instant::now();
     if let Some(plan) = direct_business_plan.as_ref() {
@@ -1743,6 +1775,7 @@ async fn encrypt_then_send(
         sampled_trace.as_ref().map(|trace| trace.sampled),
         direct_business_plan.as_ref(),
         complete_inner_ip_packet_len(&retry_packet.packet).unwrap_or(retry_packet.packet.len()),
+        force_relay,
     )
     .await;
     let transport_handoff_completed = Instant::now();
@@ -1930,7 +1963,14 @@ async fn start_ready_peer_flushes(
                 )
                 .await
             {
-                if direct_business_budget_ready_for_active_path(peers, peer_id, udp_transport).await
+                if direct_business_budget_ready_for_active_path(
+                    peers,
+                    peer_id,
+                    udp_transport,
+                    generation,
+                    relay_available,
+                )
+                .await
                 {
                     ready.push(peer_id.clone());
                 } else {
@@ -2001,6 +2041,8 @@ async fn direct_business_budget_ready_for_active_path(
     peers: &PeerManager,
     peer_id: &str,
     udp_transport: &RwLock<Option<UdpTransport>>,
+    generation: u64,
+    relay_available: bool,
 ) -> bool {
     let Some(committed) = peers.committed_business_path_snapshot_sync(peer_id) else {
         return true;
@@ -2008,12 +2050,53 @@ async fn direct_business_budget_ready_for_active_path(
     match committed.active {
         // Relay is fully isolated: do not even inspect a Direct publication.
         ActiveBusinessPath::Relay(_) | ActiveBusinessPath::Unavailable => true,
-        ActiveBusinessPath::Direct(_) => udp_transport
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|udp| udp.direct_business_budget_ready_for_peer(peer_id)),
+        ActiveBusinessPath::Direct(_) => {
+            let budget_ready = udp_transport
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|udp| udp.direct_business_budget_ready_for_peer(peer_id));
+            if budget_ready {
+                return true;
+            }
+            // Make-before-break: while the committed Direct path is still
+            // waiting for its authoritative business proof, a confirmed
+            // Relay keeps carrying business. The queue stays flushable so
+            // the first budget-confirmed packet switches it to Direct.
+            relay_available
+                && peers
+                    .is_relay_peer_confirmed_for_generation(peer_id, generation)
+                    .await
+        }
     }
+}
+
+/// Decide (and record) whether this plaintext may ride the confirmed Relay
+/// while the committed Direct path is not business-ready yet. Returns false
+/// when no confirmed Relay exists, leaving the bounded Pending semantics in
+/// place instead of silently dropping the make-before-break guarantee.
+async fn relay_make_before_break_fallback(
+    peers: &PeerManager,
+    peer_id: &str,
+    generation: u64,
+    relay_available: bool,
+    reason: &str,
+) -> bool {
+    let usable = relay_available
+        && peers
+            .is_relay_peer_confirmed_for_generation(peer_id, generation)
+            .await;
+    if usable {
+        peers.emit_timeline(
+            "direct_business_budget_relay_fallback",
+            Some("direct"),
+            Some(REASON_DIRECT_BUDGET_PENDING),
+            Some(format!(
+                "peer={peer_id} generation={generation} reason={reason} fallback=relay make_before_break=true"
+            )),
+        );
+    }
+    usable
 }
 
 /// Flush one peer's queue. This is the sole owner of that peer's queue while
@@ -2672,6 +2755,7 @@ async fn send_encrypted_packet_bounded(
     sampled: Option<bool>,
     direct_business_plan: Option<&DirectBusinessSendPlan>,
     inner_ip_packet_len: usize,
+    force_relay: bool,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
     // The same snapshot is passed into the send operation, so a supervisor
@@ -2712,6 +2796,7 @@ async fn send_encrypted_packet_bounded(
             sampled,
             direct_business_plan,
             inner_ip_packet_len,
+            force_relay,
         ),
     )
     .await
@@ -2771,6 +2856,7 @@ async fn send_encrypted_packet_once(
     sampled: Option<bool>,
     direct_business_plan: Option<&DirectBusinessSendPlan>,
     inner_ip_packet_len: usize,
+    force_relay: bool,
 ) -> SendOutcome {
     let profiler = global_dataplane_profiler();
     // Take one path/generation snapshot atomically. Managed Direct keeps this
@@ -2815,6 +2901,7 @@ async fn send_encrypted_packet_once(
             relay_available,
             relay_expected,
             udp_local_endpoint,
+            force_relay,
         )
         .await;
         debug!(
@@ -3139,6 +3226,7 @@ async fn select_outbound_path(
     relay_available: bool,
     relay_expected: bool,
     udp_local_endpoint: Option<SocketAddr>,
+    force_relay: bool,
 ) -> PathSelection {
     // Queue admission already treats a configured relay as an active
     // relay-first gate before the transport object is published.  The
@@ -3155,6 +3243,7 @@ async fn select_outbound_path(
             relay_for_selection,
             udp_local_endpoint,
             peers.current_network_generation_sync(),
+            force_relay,
         )
         .await;
     debug!(
@@ -3441,7 +3530,8 @@ mod tests {
             wire_bytes: vec![0; 32],
             is_business: true,
         };
-        let selection = select_outbound_path(&packet, &manager, true, false, true, None).await;
+        let selection =
+            select_outbound_path(&packet, &manager, true, false, true, None, false).await;
         assert_eq!(selection.path, Some(NetworkPath::Direct));
         assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
         assert!(selection.direct_confirmed);

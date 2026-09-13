@@ -1333,6 +1333,11 @@ impl PendingHandshakeState {
             .is_some_and(|worker| worker.owner == owner && !*worker.cancellation.borrow())
     }
 
+    #[cfg(test)]
+    fn has_candidate_offer_work_for_test(&self, peer_id: &str) -> bool {
+        self.candidate_offer_workers.contains_key(peer_id)
+    }
+
     fn remote_incarnation_reset_in_progress(&self, peer_id: &str) -> Option<u64> {
         self.remote_incarnation_resets.get(peer_id).copied()
     }

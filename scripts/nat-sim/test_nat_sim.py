@@ -2,11 +2,15 @@
 """Regression tests for the deterministic dual-NAT simulator."""
 
 import asyncio
+import contextlib
 import copy
 import importlib.util
+import io
 import json
+import os
 import socket
 import struct
+import subprocess
 import tempfile
 import unittest
 from argparse import Namespace
@@ -40,6 +44,21 @@ assert AGGREGATE_SPEC is not None
 assert AGGREGATE_SPEC.loader is not None
 AGGREGATE_EVIDENCE = importlib.util.module_from_spec(AGGREGATE_SPEC)
 AGGREGATE_SPEC.loader.exec_module(AGGREGATE_EVIDENCE)
+
+
+READINESS_PATH = Path(__file__).with_name("daemon_readiness.py")
+READINESS_SPEC = importlib.util.spec_from_file_location("p2wlan_daemon_readiness", READINESS_PATH)
+assert READINESS_SPEC is not None
+assert READINESS_SPEC.loader is not None
+READINESS = importlib.util.module_from_spec(READINESS_SPEC)
+READINESS_SPEC.loader.exec_module(READINESS)
+
+TRANSIENT_PATH = Path(__file__).with_name("transient.py")
+TRANSIENT_SPEC = importlib.util.spec_from_file_location("p2wlan_transient", TRANSIENT_PATH)
+assert TRANSIENT_SPEC is not None
+assert TRANSIENT_SPEC.loader is not None
+TRANSIENT = importlib.util.module_from_spec(TRANSIENT_SPEC)
+TRANSIENT_SPEC.loader.exec_module(TRANSIENT)
 
 
 class CaptureProtocol(asyncio.DatagramProtocol):
@@ -217,6 +236,34 @@ class NatEvidenceContractTests(unittest.TestCase):
         (output_dir / "nat-evidence.json").write_text(
             json.dumps(record), encoding="utf-8"
         )
+        (output_dir / "nat-attempts.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "scenario_id": record["scenario_id"],
+                    "source_head_sha": self.SOURCE_SHA,
+                    "workflow_sha": self.WORKFLOW_SHA,
+                    "attempts": [
+                        {
+                            "attempt": 1,
+                            "exit_code": 0,
+                            "business_validation_started": True,
+                            "reason_codes": [],
+                            "evidence_path": "nat-evidence.json",
+                            "readiness_paths": [],
+                            "classification": {"retryable": False, "reason": "accepted"},
+                            "infrastructure_evidence": None,
+                        }
+                    ],
+                    "final_adjudication": {
+                        "result": "pass",
+                        "attempt": 1,
+                        "reason_code": None,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         return record
 
     def _build_record(
@@ -266,6 +313,12 @@ class NatEvidenceContractTests(unittest.TestCase):
         for path in sorted(root.rglob("nat-evidence.json")):
             records.append((path, json.loads(path.read_text(encoding="utf-8"))))
         return records
+
+    def _all_attempt_histories(self, root: Path) -> list[tuple[Path, dict]]:
+        histories = []
+        for path in sorted(root.rglob("nat-attempts.json")):
+            histories.append((path, json.loads(path.read_text(encoding="utf-8"))))
+        return histories
 
     @staticmethod
     def _remove_first_usable(status: dict, clear_relay_business: bool = False) -> dict:
@@ -518,7 +571,168 @@ class NatEvidenceContractTests(unittest.TestCase):
             )
             self.assertEqual(aggregate["result"], "pass")
             self.assertEqual(aggregate["relay_replica_count"], 5)
+            self.assertEqual(aggregate["attempt_stats"]["first_attempt_pass_count"], 6)
+            self.assertEqual(aggregate["attempt_stats"]["diagnostic_retry_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["recovery_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["final_failure_count"], 0)
             self.assertTrue(aggregate["aggregate_digest"].startswith("sha256:"))
+
+    def test_barrier_failure_without_business_evidence_is_included_in_final_aggregate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in (1, 2, 3, 5):
+                self._write_record(root, "relay-blackhole", replica)
+
+            failed_dir = root / "record-relay-blackhole-4"
+            failed_dir.mkdir()
+            (failed_dir / "nat-attempts.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "scenario_id": "relay-blackhole:replica-4:round-1",
+                        "source_head_sha": self.SOURCE_SHA,
+                        "workflow_sha": self.WORKFLOW_SHA,
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "exit_code": 1,
+                                "business_validation_started": True,
+                                "reason_codes": ["relay_peer_confirmation_timeout"],
+                                "evidence_path": None,
+                                "readiness_paths": ["relay-barrier.readiness.json"],
+                                "classification": {
+                                    "retryable": False,
+                                    "reason": "barrier_timeout",
+                                },
+                                "infrastructure_evidence": None,
+                            }
+                        ],
+                        "final_adjudication": {
+                            "result": "fail",
+                            "attempt": 1,
+                            "reason_code": "barrier_timeout",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output_path = root / "aggregate.json"
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(AGGREGATE_PATH),
+                    "--input-root",
+                    str(root),
+                    "--source-head-sha",
+                    self.SOURCE_SHA,
+                    "--workflow-sha",
+                    self.WORKFLOW_SHA,
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            aggregate = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(aggregate["result"], "fail")
+            self.assertEqual(aggregate["attempt_stats"]["scenario_count"], 6)
+            self.assertEqual(aggregate["attempt_stats"]["first_attempt_pass_count"], 5)
+            self.assertAlmostEqual(aggregate["attempt_stats"]["first_attempt_pass_rate"], 5 / 6)
+            self.assertEqual(aggregate["attempt_stats"]["diagnostic_retry_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["recovery_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["final_failure_count"], 1)
+            failed = next(
+                item for item in aggregate["records"] if item["scenario_id"] == "relay-blackhole:replica-4:round-1"
+            )
+            self.assertEqual(failed["result"], "fail")
+            self.assertIsNone(failed["evidence_path"])
+            self.assertEqual(failed["attempts"][0]["exit_code"], 1)
+            self.assertEqual(
+                failed["attempts"][0]["reason_codes"], ["relay_peer_confirmation_timeout"]
+            )
+            self.assertEqual(
+                failed["final_adjudication"]["reason_code"], "barrier_timeout"
+            )
+
+    def test_business_failure_evidence_is_included_as_final_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+
+            scenario_dir = root / "record-relay-blackhole-2"
+            evidence_path = scenario_dir / "nat-evidence.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["result"] = "fail"
+            evidence["decision"] = {
+                "result": "fail",
+                "reason_code": "relay_business_gate_failed",
+                "observed_decision": "business_validation_failed",
+            }
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+            manifest_path = scenario_dir / "nat-attempts.json"
+            history = json.loads(manifest_path.read_text(encoding="utf-8"))
+            history["attempts"][0].update(
+                {
+                    "exit_code": 1,
+                    "business_validation_started": True,
+                    "reason_codes": ["relay_business_gate_failed"],
+                    "classification": {
+                        "retryable": False,
+                        "reason": "business_validation_failed",
+                    },
+                }
+            )
+            history["final_adjudication"] = {
+                "result": "fail",
+                "attempt": 1,
+                "reason_code": "business_validation_failed",
+            }
+            manifest_path.write_text(json.dumps(history), encoding="utf-8")
+
+            output_path = root / "aggregate.json"
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(AGGREGATE_PATH),
+                    "--input-root",
+                    str(root),
+                    "--source-head-sha",
+                    self.SOURCE_SHA,
+                    "--workflow-sha",
+                    self.WORKFLOW_SHA,
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            aggregate = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(aggregate["result"], "fail")
+            self.assertEqual(aggregate["attempt_stats"]["first_attempt_pass_count"], 5)
+            self.assertEqual(aggregate["attempt_stats"]["diagnostic_retry_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["recovery_count"], 0)
+            self.assertEqual(aggregate["attempt_stats"]["final_failure_count"], 1)
+            failed = next(
+                item for item in aggregate["records"] if item["scenario_id"] == "relay-blackhole:replica-2:round-1"
+            )
+            self.assertEqual(failed["result"], "fail")
+            self.assertTrue(failed["evidence_path"].endswith("nat-evidence.json"))
+            self.assertEqual(failed["evidence_result"], "fail")
+            self.assertEqual(failed["evidence_reason_code"], "relay_business_gate_failed")
+            self.assertEqual(failed["attempts"][0]["exit_code"], 1)
+            self.assertEqual(
+                failed["final_adjudication"]["reason_code"], "business_validation_failed"
+            )
 
     def test_missing_replica_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -594,7 +808,41 @@ class NatEvidenceContractTests(unittest.TestCase):
             (duplicate_dir / "nat-evidence.json").write_text(
                 original.read_text(encoding="utf-8"), encoding="utf-8"
             )
+            (duplicate_dir / "nat-attempts.json").write_text(
+                (original.parent / "nat-attempts.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             with self.assertRaisesRegex(ValueError, "duplicate_conflicting_record"):
+                AGGREGATE_EVIDENCE.aggregate_records(
+                    self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+    def test_business_failure_cannot_be_hidden_by_later_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_record(root, "direct-cold-start", 1)
+            for replica in range(1, 6):
+                self._write_record(root, "relay-blackhole", replica)
+            evidence_path = root / "record-relay-blackhole-1" / "nat-evidence.json"
+            manifest_path = evidence_path.with_name("nat-attempts.json")
+            history = json.loads(manifest_path.read_text(encoding="utf-8"))
+            successful = copy.deepcopy(history["attempts"][0])
+            failed = copy.deepcopy(successful)
+            failed.update(
+                {
+                    "attempt": 1,
+                    "exit_code": 1,
+                    "business_validation_started": True,
+                    "reason_codes": ["overlay_verification_failed"],
+                    "evidence_path": "attempt-1/round-1/nat-evidence.json",
+                    "classification": {"retryable": False, "reason": "business_validation_failed"},
+                }
+            )
+            successful["attempt"] = 2
+            history["attempts"] = [failed, successful]
+            history["final_adjudication"]["attempt"] = 2
+            manifest_path.write_text(json.dumps(history), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "business_failure_masked_by_later_attempt"):
                 AGGREGATE_EVIDENCE.aggregate_records(
                     self._all_records(root), self.SOURCE_SHA, self.WORKFLOW_SHA
                 )
@@ -772,6 +1020,606 @@ class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # source (the peer-endpoint fallback requires a real peer socket).
         non_strict = NAT_SIM.Nat("B", "127.0.0.1", 1, 8, unused_udp_port())
         self.assertFalse(non_strict.inbound_allowed(mapping, ("127.0.0.1", 2999)))
+
+
+class DaemonReadinessTests(unittest.TestCase):
+    """Regression tests for the bounded daemon readiness gate.
+
+    The status collector must never run before the daemon publishes its
+    diagnostics token; these tests pin the poll-based wait, its hard bound,
+    its fail-fast on a dead process, and the failure diagnostics bundle.
+    """
+
+    def _waiter(self, token_path: Path, alive=True, appear_after_calls=0, timeout_s=1.0,
+                log_path: Path | None = None, runtime_dir: Path | None = None):
+        state = {"sleeps": 0}
+
+        def fake_sleep(_seconds):
+            state["sleeps"] += 1
+            if state["sleeps"] >= appear_after_calls > 0 and not token_path.exists():
+                token_path.write_text("tokensecret", encoding="utf-8")
+
+        ticks = {"now": 0.0}
+
+        def fake_monotonic():
+            return ticks["now"]
+
+        def fake_advance(_seconds):
+            ticks["now"] += 0.25
+
+        def fake_sleep_advancing(seconds):
+            fake_sleep(seconds)
+            fake_advance(seconds)
+
+        if alive:
+            alive_fn = lambda _pid: True  # noqa: E731
+        else:
+            alive_fn = lambda _pid: False  # noqa: E731
+        return READINESS.wait_for_token(
+            token_path=token_path,
+            pid=4242,
+            timeout_s=timeout_s,
+            poll_s=0.25,
+            log_path=log_path,
+            runtime_dir=runtime_dir,
+            sleep=fake_sleep_advancing if appear_after_calls else fake_advance,
+            monotonic=fake_monotonic,
+            alive=alive_fn,
+        )
+
+    def test_token_published_mid_wait_reaches_token_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "p2wlan-daemon.diag-auth"
+            record = self._waiter(token, alive=True, appear_after_calls=3, timeout_s=10.0)
+            self.assertEqual(record["result"], "ready")
+            self.assertEqual(record["state"], "TOKEN_READY")
+            self.assertGreaterEqual(record["polls"], 3)
+
+    def test_timeout_is_bounded_and_carries_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            runtime.mkdir()
+            (runtime / "config.json").write_text("{}", encoding="utf-8")
+            log = Path(tmp) / "node.log"
+            log.write_text("line one\nERROR: bootstrap stalled\n", encoding="utf-8")
+            token = runtime / "p2wlan-daemon.diag-auth"
+            record = self._waiter(token, alive=True, timeout_s=1.0,
+                                  log_path=log, runtime_dir=runtime)
+            self.assertEqual(record["result"], "timeout")
+            self.assertEqual(record["state"], "STARTING")
+            self.assertFalse(record["token_present"])
+            self.assertEqual(record["pid"], 4242)
+            self.assertTrue(record["process_alive"])
+            self.assertLessEqual(record["waited_ms"], 2000)
+            names = [entry["name"] for entry in record["runtime_dir_listing"]]
+            self.assertIn("config.json", names)
+            self.assertIn("ERROR: bootstrap stalled", record["log_error_lines"])
+
+    def test_dead_process_fails_fast_without_burning_the_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "p2wlan-daemon.diag-auth"
+            record = self._waiter(token, alive=False, timeout_s=30.0)
+            self.assertEqual(record["result"], "process_exited")
+            self.assertEqual(record["state"], "STARTING")
+            self.assertFalse(record["process_alive"])
+            self.assertLessEqual(record["waited_ms"], 500)
+
+    def test_record_never_contains_token_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "p2wlan-daemon.diag-auth"
+            token.write_text("tokensecret", encoding="utf-8")
+            record = READINESS.wait_for_token(
+                token_path=token,
+                pid=None,
+                timeout_s=0.1,
+                poll_s=0.05,
+                log_path=None,
+                runtime_dir=None,
+                sleep=lambda _s: None,
+                monotonic=lambda: 0.0,
+                alive=lambda _pid: True,
+            )
+            self.assertEqual(record["result"], "ready")
+            self.assertNotIn("tokensecret", json.dumps(record))
+
+    def test_cli_records_the_daemon_side_for_attempt_correlation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token = root / "p2wlan-daemon.diag-auth"
+            output = root / "readiness.json"
+            token.write_text("tokensecret", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = READINESS.main(
+                    [
+                        "wait-token",
+                        "--pid",
+                        str(os.getpid()),
+                        "--side",
+                        "b",
+                        "--token-file",
+                        str(token),
+                        "--output",
+                        str(output),
+                    ]
+                )
+            record = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(status, 0)
+            self.assertEqual(record["side"], "b")
+
+    def test_state_machine_never_regresses(self):
+        advance = READINESS.advance
+        self.assertIs(
+            advance(READINESS.DaemonReadyState.TOKEN_READY, process_alive=False, token_present=True),
+            READINESS.DaemonReadyState.TOKEN_READY,
+        )
+        self.assertIs(
+            advance(READINESS.DaemonReadyState.STARTING, process_alive=True, token_present=True),
+            READINESS.DaemonReadyState.TOKEN_READY,
+        )
+        self.assertIs(
+            advance(READINESS.DaemonReadyState.TOKEN_READY, process_alive=True, token_present=False),
+            READINESS.DaemonReadyState.TOKEN_READY,
+        )
+        self.assertIs(
+            advance(
+                READINESS.DaemonReadyState.STATUS_READY,
+                process_alive=True,
+                token_present=True,
+                status_ok=True,
+                verification_running=True,
+                peers_confirmed=True,
+            ),
+            READINESS.DaemonReadyState.RUNNING,
+        )
+
+    def test_running_requires_peer_confirmation(self):
+        state = READINESS.advance(
+            READINESS.DaemonReadyState.STATUS_READY,
+            process_alive=True,
+            token_present=True,
+            status_ok=True,
+            verification_running=True,
+            peers_confirmed=False,
+        )
+        self.assertIs(state, READINESS.DaemonReadyState.STATUS_READY)
+
+
+class BaselineShellCallChainTests(unittest.TestCase):
+    def test_failed_baseline_saves_diagnostic_and_skips_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sentinel = Path(directory) / "verification-ran"
+            diagnostic = Path(directory) / "baseline-diagnostic.json"
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(Path(__file__).with_name("test_baseline_gate.sh")),
+                    str(sentinel),
+                    str(diagnostic),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(diagnostic.is_file())
+            self.assertFalse(sentinel.exists())
+
+
+class TransientClassifierTests(unittest.TestCase):
+    """Regressions for fail-closed classification and full-attempt priority."""
+
+    _DEFAULT = object()
+
+    STALL_LOG = (
+        "[nat-sim] ROUND 1: FAIL reason_code=relay_business_gate_failed relay_first_evidence "
+        "overlay_ok=0 a_direct=0 b_direct=0 a_overlay=67 b_overlay=2 "
+        "a_relay_confirmed=1 b_relay_confirmed=1 "
+        "a_ingress=relay:tcp://127.0.0.1:43801 b_ingress=relay:tcp://127.0.0.1:43801 "
+        "a_delta_ms=177 b_delta_ms=3 sum_delta_ms=180 drops_a=0 drops_b=0 "
+        "replay_a=0 replay_b=0 invalid_a=0 invalid_b=0 burst_a=0 burst_b=0 "
+        "burst_bad_a=2 burst_bad_b=2 status_http_200_a=156/156 status_http_200_b=156/156 "
+        "status_always_200_a=1 status_always_200_b=1 task_health_a=1 task_health_b=1 "
+        "elapsed_ms=107801 failure_reason=none\n"
+    )
+
+    @staticmethod
+    def _ready_records():
+        records = []
+        for side, pid in (("a", 101), ("b", 202)):
+            records.append(
+                {
+                    "schema_version": 1,
+                    "stage": "token",
+                    "side": side,
+                    "state": "TOKEN_READY",
+                    "result": "ready",
+                    "business_validation_started": True,
+                    "pid": pid,
+                    "process_alive": True,
+                    "token_present": True,
+                }
+            )
+            records.append(
+                {
+                    "schema_version": 1,
+                    "stage": "baseline",
+                    "side": side,
+                    "state": "STATUS_READY",
+                    "result": "ready",
+                    "business_validation_started": True,
+                    "pid": pid,
+                    "process_alive": True,
+                    "token_present": True,
+                    "http_status": 200,
+                    "attempts": 1,
+                }
+            )
+        records.append(
+            {
+                "schema_version": 1,
+                "stage": "barrier",
+                "state": "RUNNING",
+                "result": "ready",
+                "business_validation_started": True,
+                "pid_a": 101,
+                "pid_b": 202,
+                "process_alive_a": True,
+                "process_alive_b": True,
+                "relay_peer_confirmed_a": True,
+                "relay_peer_confirmed_b": True,
+                "http_status_a": 200,
+                "http_status_b": 200,
+                "task_health_a": True,
+                "task_health_b": True,
+            }
+        )
+        return records
+
+    @staticmethod
+    def _failed_evidence(reason="relay_business_gate_failed"):
+        topology = "relay-blackhole"
+        return {
+            "schema_version": 1,
+            "repository": "yhan-sun/p2wlan",
+            "source_head_sha": "1" * 40,
+            "workflow_sha": "2" * 40,
+            "topology": topology,
+            "replica": 1,
+            "round": 1,
+            "scenario_id": f"{topology}:replica-1:round-1",
+            "exact_test_id": f"nat-sim-smoke.sh::{topology}::replica-1::round-1",
+            "executed": True,
+            "skipped": False,
+            "result": "fail",
+            "observed": {"a": {}, "b": {}},
+            "collector": {"revision_converged": False},
+            "invariants": {"a": {}, "b": {}},
+            "decision": {
+                "result": "fail",
+                "reason_code": reason,
+                "observed_decision": "first_usable_not_accepted",
+            },
+        }
+
+    @classmethod
+    def _direct_failed_evidence(cls):
+        evidence = cls._failed_evidence(reason="business_validation_failed")
+        evidence["topology"] = "direct-cold-start"
+        evidence["scenario_id"] = "direct-cold-start:replica-1:round-1"
+        evidence["exact_test_id"] = "nat-sim-smoke.sh::direct-cold-start::replica-1::round-1"
+        return evidence
+
+    def _classify(self, log=None, evidence=_DEFAULT, readiness=None, **kwargs):
+        return TRANSIENT.classify_attempt(
+            self.STALL_LOG if log is None else log,
+            self._failed_evidence() if evidence is self._DEFAULT else evidence,
+            1,
+            profile="relay-blackhole",
+            readiness=self._ready_records() if readiness is None else readiness,
+            business_started=True,
+            **kwargs,
+        )
+
+    def test_data_plane_stall_is_never_retryable_after_business_started(self):
+        verdict = self._classify()
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "business_validation_failed")
+
+    def test_overlay_failure_without_required_health_evidence_is_hard(self):
+        verdict = self._classify(
+            log="ROUND 1: FAIL overlay_ok=0",
+            evidence=None,
+            readiness=None,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertIn(verdict["reason"], {"gate_line_reason_missing", "profile_fields_missing:overlay_ok"})
+
+    def test_profile_missing_required_fields_is_hard(self):
+        verdict = self._classify(
+            log="ROUND 1: FAIL reason_code=relay_business_gate_failed overlay_ok=0",
+            evidence=None,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertTrue(verdict["reason"].startswith("profile_fields_missing:"))
+
+    def test_invalid_replay_type_is_not_treated_as_a_missing_field(self):
+        verdict = self._classify(log=self.STALL_LOG.replace("replay_a=0", "replay_a=INVALID"))
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "profile_field_type_invalid:replay_a")
+
+    def test_direct_profile_requires_its_full_typed_summary_contract(self):
+        line = (
+            "ROUND 1: FAIL reason_code=business_validation_failed a_direct=0 b_direct=0 "
+            "a_overlay=0 b_overlay=0 a_relay_confirmed=1 b_relay_confirmed=1 "
+            "a_ingress=none b_ingress=none a_delta_ms=0 b_delta_ms=0 sum_delta_ms=0 "
+            "drops_a=0 drops_b=0 replay_a=0 replay_b=0 invalid_a=0 invalid_b=0 elapsed_ms=100"
+        )
+        verdict = TRANSIENT.classify_attempt(
+            line.replace("replay_a=0", "replay_a=INVALID"),
+            self._direct_failed_evidence(),
+            1,
+            profile="direct-cold-start",
+            readiness=self._ready_records(),
+            business_started=True,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "profile_field_type_invalid:replay_a")
+
+        missing = TRANSIENT.classify_attempt(
+            line.replace("a_overlay=0 ", ""),
+            self._direct_failed_evidence(),
+            1,
+            profile="direct-cold-start",
+            readiness=self._ready_records(),
+            business_started=True,
+        )
+        self.assertFalse(missing["retryable"])
+        self.assertTrue(missing["reason"].startswith("profile_fields_missing:"))
+
+    def test_hard_failure_earlier_in_attempt_wins_over_later_summary(self):
+        log = (
+            "ROUND 1: FAIL reason_code=relay_first_slo_exceeded\n"
+            + self.STALL_LOG
+        )
+        verdict = self._classify(log=log)
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "hard_line_reason")
+
+    def test_hard_failure_outweighs_later_unknown_reason_and_damaged_evidence(self):
+        log = (
+            "ROUND 1: FAIL reason_code=relay_first_slo_exceeded\n"
+            "[nat-sim] FAIL reason_code=not_a_known_reason\n"
+        )
+        verdict = self._classify(
+            log=log,
+            evidence=None,
+            readiness_errors=["node-a.readiness.json:JSONDecodeError"],
+            evidence_error="nat-evidence.json:JSONDecodeError",
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "hard_line_reason")
+        self.assertEqual(verdict["signature"]["hard_reason_codes"], ["relay_first_slo_exceeded"])
+
+    def test_hard_evidence_reason_outweighs_later_readiness_summary(self):
+        evidence = self._failed_evidence(reason="relay_first_slo_exceeded")
+        timeout = {
+            "schema_version": 1,
+            "stage": "token",
+            "state": "STARTING",
+            "result": "timeout",
+            "business_validation_started": True,
+            "side": "a",
+            "pid": 404,
+            "process_alive": True,
+            "token_present": False,
+        }
+        verdict = TRANSIENT.classify_attempt(
+            "[nat-sim] FAIL reason_code=daemon_readiness_timeout",
+            evidence,
+            1,
+            profile="relay-blackhole",
+            readiness=[timeout],
+            business_started=True,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "hard_evidence_reason")
+
+    def test_process_exit_readiness_wins_over_later_not_ready_text(self):
+        process_exit = {
+            "schema_version": 1,
+            "stage": "token",
+            "state": "STARTING",
+            "result": "process_exited",
+            "business_validation_started": False,
+            "side": "a",
+            "pid": 404,
+            "process_alive": False,
+            "token_present": False,
+        }
+        verdict = self._classify(
+            log="[nat-sim] FAIL reason_code=daemon_not_token_ready",
+            evidence=None,
+            readiness=[process_exit],
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "process_exited")
+
+    def test_missing_evidence_never_allows_overlay_failure_retry(self):
+        verdict = self._classify(evidence=None)
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "evidence_missing")
+
+    def test_corrupt_evidence_json_is_hard(self):
+        verdict = self._classify(evidence=None, evidence_error="nat-evidence.json:JSONDecodeError")
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "evidence_corrupt")
+
+    def test_unknown_failure_reason_is_hard(self):
+        verdict = self._classify(log=self.STALL_LOG.replace("relay_business_gate_failed", "mystery_failure"))
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "unknown_failure_reason")
+
+    def test_structured_startup_timeout_is_not_process_exit_or_retry(self):
+        timeout = {
+            "schema_version": 1,
+            "stage": "token",
+            "state": "STARTING",
+            "result": "timeout",
+            "business_validation_started": False,
+            "side": "a",
+            "pid": 404,
+            "process_alive": True,
+            "token_present": False,
+        }
+        verdict = TRANSIENT.classify_attempt(
+            "[nat-sim] FAIL reason_code=daemon_readiness_timeout",
+            None,
+            1,
+            profile="relay-blackhole",
+            readiness=[timeout],
+            business_started=False,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "readiness_not_ready")
+
+    def test_barrier_timeout_is_hard_and_structured(self):
+        barrier = {
+            "schema_version": 1,
+            "stage": "barrier",
+            "state": "STATUS_READY",
+            "result": "barrier_timeout",
+            "business_validation_started": True,
+            "pid_a": 101,
+            "pid_b": 202,
+            "process_alive_a": True,
+            "process_alive_b": True,
+            "relay_peer_confirmed_a": True,
+            "relay_peer_confirmed_b": False,
+            "http_status_a": 200,
+            "http_status_b": 200,
+            "task_health_a": True,
+            "task_health_b": True,
+        }
+        verdict = TRANSIENT.classify_attempt(
+            "[nat-sim] FAIL reason_code=relay_peer_confirmation_timeout",
+            None,
+            1,
+            profile="relay-blackhole",
+            readiness=[barrier],
+            business_started=True,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "barrier_timeout")
+
+    def test_structured_barrier_timeout_is_not_misreported_as_missing_evidence(self):
+        records = self._ready_records()
+        barrier = records[-1]
+        barrier.update(
+            {
+                "state": "STATUS_READY",
+                "result": "barrier_timeout",
+                "relay_peer_confirmed_b": False,
+                "reason_code": "relay_peer_confirmation_timeout",
+            }
+        )
+        verdict = self._classify(
+            log="ROUND 1: FAIL reason_code=relay_peer_confirmation_timeout stage=barrier",
+            evidence=None,
+            evidence_error="nat-evidence.json:missing",
+            readiness=records,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "barrier_timeout")
+
+    def test_barrier_http_and_task_failures_remain_observable(self):
+        cases = (
+            ("http_failure", "readiness_http_failure", {"http_status_a": 503, "reason_code": "status_unavailable"}),
+            ("task_failed", "readiness_task_failure", {"task_health_a": False, "reason_code": "critical_tasks_unhealthy"}),
+        )
+        for result, expected, updates in cases:
+            with self.subTest(result=result):
+                records = self._ready_records()
+                records[-1].update({"state": "STATUS_READY", "result": result, **updates})
+                verdict = TRANSIENT.classify_attempt(
+                    "",
+                    self._failed_evidence(),
+                    1,
+                    profile="relay-blackhole",
+                    readiness=records,
+                    business_started=True,
+                )
+                self.assertFalse(verdict["retryable"])
+                self.assertEqual(verdict["reason"], expected)
+
+    def test_non_string_readiness_discriminator_is_corrupt_not_a_crash(self):
+        readiness = self._ready_records()
+        readiness[0]["stage"] = ["token"]
+        verdict = self._classify(readiness=readiness)
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "readiness_evidence_corrupt")
+
+    def test_non_string_evidence_result_is_corrupt_not_a_crash(self):
+        evidence = self._failed_evidence()
+        evidence["result"] = ["fail"]
+        verdict = self._classify(evidence=evidence)
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "evidence_schema_invalid")
+
+    def test_contradictory_process_exit_record_is_corrupt(self):
+        contradictory = {
+            "schema_version": 1,
+            "stage": "token",
+            "state": "TOKEN_READY",
+            "result": "process_exited",
+            "business_validation_started": False,
+            "side": "a",
+            "pid": 404,
+            "process_alive": True,
+            "token_present": True,
+        }
+        verdict = TRANSIENT.classify_attempt(
+            "[nat-sim] FAIL reason_code=daemon_not_token_ready",
+            None,
+            1,
+            profile="relay-blackhole",
+            readiness=[contradictory],
+            business_started=False,
+        )
+        self.assertFalse(verdict["retryable"])
+        self.assertEqual(verdict["reason"], "readiness_evidence_corrupt")
+
+    def test_cli_rejects_damaged_json_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "attempt.log"
+            evidence = root / "nat-evidence.json"
+            output = root / "classification.json"
+            log.write_text("[nat-sim] RESULT: FAIL\n", encoding="utf-8")
+            evidence.write_text("{broken", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = TRANSIENT.main(
+                    [
+                        "classify",
+                        "--profile",
+                        "relay-blackhole",
+                        "--log",
+                        str(log),
+                        "--evidence",
+                        str(evidence),
+                        "--output",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(status, 1)
+            self.assertEqual(json.loads(output.read_text())["reason"], "evidence_corrupt")
+
+    def test_second_attempt_cannot_clear_first_business_failure(self):
+        first = {"exit_code": 1, "business_validation_started": True}
+        second = {"exit_code": 0, "business_validation_started": True}
+        self.assertNotEqual(first["exit_code"], 0)
+        self.assertEqual(second["exit_code"], 0)
+        self.assertTrue(first["business_validation_started"])
+        self.assertTrue(second["business_validation_started"])
 
 
 if __name__ == "__main__":

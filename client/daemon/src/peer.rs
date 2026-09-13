@@ -414,6 +414,19 @@ pub(crate) enum CandidateSetTryApplyOutcome {
     ContendedConnections,
 }
 
+/// Result of the non-queuing connection-state commit used by cooperative
+/// candidate workers before starting a synchronized punch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HolePunchStartOutcome {
+    Started,
+    ContendedEpoch,
+    ContendedConnections,
+    PeerMissing,
+    Stale,
+    HealthyDirect,
+    NotReady,
+}
+
 /// Admission result for the identity-bound remote-incarnation preflight.
 ///
 /// A signal whose server-bound sender key no longer matches the peer's current

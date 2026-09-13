@@ -391,6 +391,8 @@ fn peer_snapshot_core_matches(
             peer.relay.success_count.hash(&mut hasher);
             peer.relay.failure_count.hash(&mut hasher);
             peer.direct_generation.hash(&mut hasher);
+            peer.remote_candidate_generation.hash(&mut hasher);
+            peer.remote_candidate_epoch.hash(&mut hasher);
             peer.relay_ready_generation.hash(&mut hasher);
             peer.relay_ready_endpoint.hash(&mut hasher);
             peer.relay_ready_connection_id.hash(&mut hasher);
@@ -438,6 +440,8 @@ fn peer_snapshot_core_matches(
             peer.relay_health.success_count.hash(&mut hasher);
             peer.relay_health.failure_count.hash(&mut hasher);
             peer.direct_generation.hash(&mut hasher);
+            peer.last_candidate_generation().hash(&mut hasher);
+            peer.remote_candidate_epoch().hash(&mut hasher);
             peer.relay_ready_generation.hash(&mut hasher);
             peer.relay_ready_endpoint.hash(&mut hasher);
             peer.relay_ready_connection_id.hash(&mut hasher);
@@ -484,6 +488,10 @@ async fn build_peer_scoped_snapshot(
         node_id: context.config.node.node_id.clone(),
         network_id: context.config.network.network_id.clone(),
         network_generation,
+        peer_session_generation: context
+            .peers
+            .peer_session_generation_sync(peer_id)
+            .map(|generation| generation.value()),
         network_peer_count,
         captured_at_ms,
         peer,

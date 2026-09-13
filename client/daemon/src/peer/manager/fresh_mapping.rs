@@ -90,6 +90,19 @@ pub(crate) enum RemoteFreshTransactionOutcome {
     Superseded,
 }
 
+/// Result of a fresh candidate transaction which never joins either
+/// writer-preferred lock queue. The bounded per-peer candidate owner keeps
+/// the exact signal and applies its existing cancellable contention cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFreshTryTransactionOutcome {
+    Committed,
+    NotApplied(CandidateSetApplyResult),
+    Superseded,
+    ContendedTransaction,
+    ContendedEpoch,
+    ContendedConnections,
+}
+
 /// The immutable candidate snapshot one fresh-prediction identity was
 /// committed with.  Bound to the identity at commit time: an idempotent
 /// retry of the same identity can only ever punch toward this snapshot, and a
@@ -378,6 +391,8 @@ impl PeerManager {
         sender_public_key: Option<&str>,
     ) -> RemoteFreshTransactionOutcome {
         let _transaction = self.remote_fresh_transaction_gate.lock().await;
+        #[cfg(test)]
+        self.notify_remote_fresh_transaction_started_for_test();
         if self
             .remote_fresh_generations
             .lock()
@@ -415,6 +430,111 @@ impl PeerManager {
             self.rollback_remote_fresh_apply(peer_id, id).await;
             RemoteFreshTransactionOutcome::Superseded
         }
+    }
+
+    /// Apply and commit a fresh prediction without joining the connection-map
+    /// lock queue. This path is used by the cooperative candidate worker: a
+    /// queued lock waiter cannot be depended on by the same event loop while
+    /// that loop is executing an inline control-event branch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_apply_and_commit_remote_fresh_prediction_for_identity(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidate_generation: u64,
+        candidates_expires_at_ms: Option<u64>,
+        sender_public_key: Option<&str>,
+    ) -> RemoteFreshTryTransactionOutcome {
+        let Ok(_transaction) = self.remote_fresh_transaction_gate.try_lock() else {
+            return RemoteFreshTryTransactionOutcome::ContendedTransaction;
+        };
+        #[cfg(test)]
+        self.notify_remote_fresh_transaction_started_for_test();
+        if self
+            .remote_fresh_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(peer_id)
+            .is_some_and(|current| id <= *current)
+        {
+            return RemoteFreshTryTransactionOutcome::Superseded;
+        }
+
+        match self
+            .add_candidates_with_metadata_for_identity_with_hard_hard_retire(
+                peer_id,
+                candidates,
+                candidate_sources,
+                candidate_generation,
+                candidates_expires_at_ms,
+                sender_public_key,
+                false,
+                true,
+                Some(id),
+            )
+            .await
+        {
+            CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::Applied) => {
+                RemoteFreshTryTransactionOutcome::Committed
+            }
+            CandidateSetTryApplyOutcome::Completed(result) => {
+                RemoteFreshTryTransactionOutcome::NotApplied(result)
+            }
+            CandidateSetTryApplyOutcome::ContendedEpoch => {
+                RemoteFreshTryTransactionOutcome::ContendedEpoch
+            }
+            CandidateSetTryApplyOutcome::ContendedConnections => {
+                RemoteFreshTryTransactionOutcome::ContendedConnections
+            }
+        }
+    }
+
+    /// Commit a fresh snapshot while the caller holds the peer epoch and the
+    /// connection-map writer used to apply the matching candidate revision.
+    /// This keeps identity reset, candidate mutation, and fresh high-water
+    /// publication in one lifecycle transaction.
+    pub(crate) fn commit_remote_fresh_prediction_while_peer_locked_sync(
+        &self,
+        peer_id: &str,
+        id: crate::FreshPredictionId,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        candidates_expires_at_ms: Option<u64>,
+    ) -> bool {
+        let mut high_water = self
+            .remote_fresh_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if high_water.get(peer_id).is_some_and(|current| id <= *current) {
+            return false;
+        }
+        high_water.insert(peer_id.to_string(), id);
+
+        let payload_hash =
+            fresh_payload_hash(candidates, candidate_sources, candidates_expires_at_ms);
+        let fresh_label = crate::fresh_prediction_source_label(id);
+        let fresh_candidates = candidates
+            .iter()
+            .filter(|candidate| candidate_sources.get(*candidate) == Some(&fresh_label))
+            .cloned()
+            .collect();
+        let mut snapshots = self
+            .remote_fresh_snapshots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        snapshots.retain(|(owner, snapshot_id), _| owner != peer_id || *snapshot_id == id);
+        snapshots.insert(
+            (peer_id.to_string(), id),
+            FreshPredictionSnapshot {
+                candidates: candidates.to_vec(),
+                fresh_candidates,
+                payload_hash,
+                candidates_expires_at_ms,
+            },
+        );
+        true
     }
 
     /// Apply the fresh signal's candidates and record the apply so the

@@ -2,6 +2,31 @@
 type ResponderPostAnswerTestGateSlot =
     Arc<std::sync::Mutex<Option<(String, Arc<ResponderPostAnswerTestGate>)>>>;
 
+#[cfg(test)]
+type CandidatePostprocessTestGateSlot =
+    Arc<std::sync::Mutex<Option<(String, Arc<CandidatePostprocessTestGate>)>>>;
+
+/// Deterministically pauses a candidate owner after its candidate transaction
+/// commits and before deferred punch preparation starts.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct CandidatePostprocessTestGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Barrier,
+    pub(crate) completed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl CandidatePostprocessTestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Barrier::new(2),
+            completed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 /// The main daemon orchestrator.
 ///
 /// Holds all subsystems and coordinates their lifecycle.
@@ -26,6 +51,8 @@ pub struct Daemon {
     handshake_arbiter: HandshakeArbiter,
     #[cfg(test)]
     responder_post_answer_test_gate: ResponderPostAnswerTestGateSlot,
+    #[cfg(test)]
+    candidate_postprocess_test_gate: CandidatePostprocessTestGateSlot,
     /// Local UDP candidate endpoints advertised in signaling messages.
     local_candidates: Arc<RwLock<Vec<String>>>,
     /// Local-only source metadata keyed by candidate endpoint string.
@@ -263,6 +290,8 @@ impl Daemon {
             handshake_arbiter: HandshakeArbiter::new(timeline.clone()),
             #[cfg(test)]
             responder_post_answer_test_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            candidate_postprocess_test_gate: Arc::new(std::sync::Mutex::new(None)),
             local_candidates: Arc::new(RwLock::new(Vec::new())),
             local_candidate_sources: Arc::new(RwLock::new(HashMap::new())),
             local_network_identity: Arc::new(RwLock::new(Vec::new())),

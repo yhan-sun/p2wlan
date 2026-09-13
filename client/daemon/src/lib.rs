@@ -140,9 +140,10 @@ use p2pnet_wireguard::{
 };
 use peer::{
     CandidateSetApplyResult, ConnectionState, DirectProbeTargetSet, HardHardSessionRecord,
-    HardHardSessionState, PeerManager, PeerSessionGeneration, PendingProbeBindingCommitOutcome,
-    PendingRecoveryTarget, ProbeBindingStage, RecoveryAdmission, DIRECT_RETRY_BASE_INTERVAL,
-    REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT, RECOVERY_EPOCH_ACK_FEEDBACK_WINDOW,
+    HardHardSessionState, HolePunchStartOutcome, PeerManager, PeerSessionGeneration,
+    PendingProbeBindingCommitOutcome, PendingRecoveryTarget, ProbeBindingStage, RecoveryAdmission,
+    DIRECT_RETRY_BASE_INTERVAL, REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT,
+    RECOVERY_EPOCH_ACK_FEEDBACK_WINDOW,
 };
 use port_mapping::PortMappingManager;
 #[cfg(test)]

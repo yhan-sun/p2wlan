@@ -282,6 +282,10 @@ impl PeerConnection {
         self.remote_candidate_epoch
     }
 
+    pub(crate) fn last_candidate_generation(&self) -> u64 {
+        self.last_candidate_generation
+    }
+
     pub(crate) fn remote_nat_profile_matches_candidate_epoch(&self) -> bool {
         self.remote_nat_profile_candidate_epoch == Some(self.remote_candidate_epoch)
     }

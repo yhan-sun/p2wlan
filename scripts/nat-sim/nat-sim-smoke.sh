@@ -18,6 +18,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/diagnostics-auth.sh"
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+source "$ROOT_DIR/scripts/nat-sim/baseline_gate.sh"
 # The standalone local control DB provisions only `default`; the real dual-end
 # harness uses NETWORK_ID explicitly and requires a provisioned test network.
 NETWORK_ID=${NETWORK_ID:-default}
@@ -50,6 +51,10 @@ BASE_A=${BASE_A:-16000}
 BASE_B=${BASE_B:-26000}
 DIRECT_TIMEOUT_S=${DIRECT_TIMEOUT_S:-60}
 OVERLAY_TIMEOUT_S=${OVERLAY_TIMEOUT_S:-30}
+ROUND_TIMEOUT_S=${ROUND_TIMEOUT_S:-$((DIRECT_TIMEOUT_S + OVERLAY_TIMEOUT_S))}
+# Keep the final authenticated status and relay metrics samples inside the
+# same round deadline instead of starting them after validation has expired.
+FINALIZE_BUDGET_S=15
 NAT_SIM_ARTIFACT_DIR=${NAT_SIM_ARTIFACT_DIR:-}
 NAT_TOPOLOGY_HEAD_SHA=${NAT_TOPOLOGY_HEAD_SHA:-$(git -C "$ROOT_DIR" rev-parse HEAD)}
 NAT_TOPOLOGY_WORKFLOW_SHA=${NAT_TOPOLOGY_WORKFLOW_SHA:-$(git -C "$ROOT_DIR" rev-parse "$NAT_TOPOLOGY_HEAD_SHA:.github/workflows/nat-topology-gate.yml")}
@@ -87,6 +92,58 @@ RELAY_FAILOVER=${RELAY_FAILOVER:-0}
 STATUS_FAILURE_INJECTION=${STATUS_FAILURE_INJECTION:-0}
 METRICS_FAILURE_INJECTION=${METRICS_FAILURE_INJECTION:-0}
 STATUS_SCHEMA_INJECTION=${STATUS_SCHEMA_INJECTION:-0}
+
+if ! [[ "$ROUND_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[nat-sim] ROUND_TIMEOUT_S must be a positive integer" >&2
+  exit 2
+fi
+
+ROUND_DEADLINE=0
+WORK_DEADLINE=0
+deadline_remaining_s() {
+  local remaining=$((ROUND_DEADLINE - SECONDS))
+  if (( remaining > 0 )); then
+    echo "$remaining"
+  else
+    echo 0
+  fi
+}
+
+work_remaining_s() {
+  local remaining=$((WORK_DEADLINE - SECONDS))
+  if (( remaining > 0 )); then
+    echo "$remaining"
+  else
+    echo 0
+  fi
+}
+
+deadline_pause() {
+  local interval=${1:-0.25} target_deadline=${2:-$WORK_DEADLINE}
+  if (( target_deadline > WORK_DEADLINE )); then target_deadline=$WORK_DEADLINE; fi
+  (( SECONDS < target_deadline )) || return 1
+  sleep "$interval"
+  (( SECONDS < target_deadline ))
+}
+
+stage_deadline() {
+  local budget=$1 deadline
+  deadline=$((SECONDS + budget))
+  if (( WORK_DEADLINE < SECONDS )); then
+    WORK_DEADLINE=$SECONDS
+  fi
+  if (( deadline > WORK_DEADLINE )); then
+    deadline=$WORK_DEADLINE
+  fi
+  echo "$deadline"
+}
+
+deadline_curl_timeout() {
+  local remaining=$((WORK_DEADLINE - SECONDS))
+  if (( remaining > 5 )); then remaining=5; fi
+  if (( remaining < 1 )); then remaining=1; fi
+  echo "$remaining"
+}
 
 if ! [[ "$NAT_SEED_BASE" =~ ^[0-9]+$ ]]; then
   echo "[nat-sim] NAT_SEED_BASE must be a non-negative integer" >&2
@@ -232,31 +289,51 @@ node_post_failover_relay_ingress() {
 # incomplete schema is an acceptance failure.  In particular, this function
 # never writes `{}` as a substitute for missing status/metrics evidence.
 fetch_required_json() {
-  local url="$1" output="$2" kind="$3" token_file="${4:-}"
+  local url="$1" output="$2" kind="$3" token_file="${4:-}" max_time="${5:-5}"
+  local curl_status=0 validation_error
+  local round_remaining
+  round_remaining=$(deadline_remaining_s)
+  if (( round_remaining > 0 && max_time > round_remaining )); then
+    max_time=$round_remaining
+  elif (( round_remaining == 0 )); then
+    max_time=1
+  fi
+  FETCH_REASON_CODE=""
+  FETCH_HTTP_STATUS=000
   if [[ "$kind" == "status" && "$STATUS_FAILURE_INJECTION" == "1" ]]; then
+    FETCH_REASON_CODE=status_http_500_injected
+    FETCH_HTTP_STATUS=500
     echo "[nat-sim] FAIL reason_code=status_http_500_injected url=$url" >&2
     return 1
   fi
   if [[ "$kind" == "metrics" && "$METRICS_FAILURE_INJECTION" == "1" ]]; then
+    FETCH_REASON_CODE=metrics_http_500_injected
+    FETCH_HTTP_STATUS=500
     echo "[nat-sim] FAIL reason_code=metrics_http_500_injected url=$url" >&2
     return 1
   fi
-  local curl_status=0
   if [[ "$kind" == "status" ]]; then
     if [[ -z "$token_file" || ! -s "$token_file" ]]; then
+      FETCH_REASON_CODE=status_auth_token_missing
       echo "[nat-sim] FAIL reason_code=status_auth_token_missing path=${token_file:-missing}" >&2
       return 1
     fi
-    DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
-      p2wlan_diagnostics_curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
+    FETCH_HTTP_STATUS=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
+      p2wlan_diagnostics_curl -fsS --max-time "$max_time" -w '%{http_code}' \
+      "$url" -o "$output" 2>/dev/null) || curl_status=$?
   else
-    curl -fsS --max-time 5 "$url" -o "$output" || curl_status=$?
+    FETCH_HTTP_STATUS=$(curl -fsS --max-time "$max_time" -w '%{http_code}' \
+      "$url" -o "$output" 2>/dev/null) || curl_status=$?
+  fi
+  if ! [[ "$FETCH_HTTP_STATUS" =~ ^[0-9]{3}$ ]]; then
+    FETCH_HTTP_STATUS=000
   fi
   if [[ "$curl_status" -ne 0 ]]; then
-    echo "[nat-sim] FAIL reason_code=${kind}_unavailable url=$url" >&2
+    FETCH_REASON_CODE="${kind}_unavailable"
+    echo "[nat-sim] FAIL reason_code=$FETCH_REASON_CODE http_status=$FETCH_HTTP_STATUS url=$url" >&2
     return 1
   fi
-  if ! python3 - "$output" "$kind" "$STATUS_SCHEMA_INJECTION" <<'PY'
+  if validation_error=$(python3 - "$output" "$kind" "$STATUS_SCHEMA_INJECTION" <<'PY'
 import json
 import sys
 
@@ -301,25 +378,178 @@ elif kind == "metrics":
     if "auth_failure_sources" in value:
         raise SystemExit("metrics_schema_contains_source_identifiers")
 PY
-  then
-    echo "[nat-sim] FAIL reason_code=${kind}_schema_invalid file=$output" >&2
+  2>&1); then
+    :
+  else
+    FETCH_REASON_CODE="${kind}_schema_invalid"
+    echo "[nat-sim] FAIL reason_code=$FETCH_REASON_CODE detail=$validation_error file=$output" >&2
     return 1
   fi
+}
+
+# Persist a machine-readable baseline outcome alongside the status JSON. The
+# record deliberately excludes the diagnostics token itself.
+write_baseline_readiness() {
+  local side="$1" pid="$2" token_file="$3" result="$4" reason="$5" http="$6" attempts="$7" path="$8"
+  local alive=false token_present=false
+  kill -0 "$pid" 2>/dev/null && alive=true
+  [[ -s "$token_file" ]] && token_present=true
+  python3 - "$side" "$pid" "$result" "$reason" "$http" "$attempts" "$alive" "$token_present" \
+    "$ROUND_DIR/business-validation.started" "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+side, pid, result, reason, http, attempts, alive, token_present, marker, path = sys.argv[1:]
+record = {
+    "schema_version": 1,
+    "stage": "baseline",
+    "side": side,
+    "state": "STATUS_READY" if result == "ready" else "TOKEN_READY",
+    "target": "STATUS_READY",
+    "result": result,
+    "business_validation_started": Path(marker).is_file(),
+    "pid": int(pid),
+    "process_alive": alive == "true",
+    "token_present": token_present == "true",
+    "http_status": int(http) if http.isdigit() else 0,
+    "attempts": int(attempts),
+    "reason_code": reason or None,
+}
+output = Path(path)
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+write_process_exit_readiness() {
+  local side="$1" pid="$2" token_file="$3" path="$4"
+  local token_present=false
+  [[ -s "$token_file" ]] && token_present=true
+  python3 - "$side" "$pid" "$token_present" "$ROUND_DIR/business-validation.started" "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+side, pid, token_present, marker, path = sys.argv[1:]
+record = {
+    "schema_version": 1,
+    "stage": "token",
+    "side": side,
+    "state": "RUNNING",
+    "target": "process_alive",
+    "result": "process_exited",
+    "business_validation_started": Path(marker).is_file(),
+    "pid": int(pid),
+    "process_alive": False,
+    "token_present": token_present == "true",
+}
+output = Path(path)
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 }
 
 # Establish the per-daemon baseline before the topology wait begins. The
 # baseline is a daemon-local (process id, revision, monotonic uptime) fence;
 # it is not a wall-clock sample and is never reconstructed after the fact.
 capture_baseline_status() {
-  local url="$1" output="$2" token_file="$3" side="$4"
-  for _ in {1..120}; do
-    if fetch_required_json "$url" "$output" status "$token_file"; then
+  local url="$1" output="$2" token_file="$3" side="$4" pid="$5"
+  local baseline_deadline attempts=0 last_reason=baseline_status_not_available
+  local last_http=000 result timeout_s readiness_path="$ROUND_DIR/node-$side.baseline.readiness.json"
+  baseline_deadline=$(stage_deadline 30)
+
+  while (( SECONDS < baseline_deadline && SECONDS < ROUND_DEADLINE )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      result=process_exited
+      last_reason=daemon_process_exited
+      write_baseline_readiness "$side" "$pid" "$token_file" "$result" "$last_reason" "$last_http" "$attempts" "$readiness_path"
+      echo "[nat-sim] FAIL reason_code=daemon_process_exited side=$side pid=$pid stage=baseline record=$readiness_path" >&2
+      return 1
+    fi
+    timeout_s=$((baseline_deadline - SECONDS))
+    if (( timeout_s > ROUND_DEADLINE - SECONDS )); then
+      timeout_s=$((ROUND_DEADLINE - SECONDS))
+    fi
+    if (( timeout_s > 5 )); then timeout_s=5; fi
+    if (( timeout_s <= 0 )); then break; fi
+    attempts=$((attempts + 1))
+    if fetch_required_json "$url" "$output" status "$token_file" "$timeout_s"; then
+      write_baseline_readiness "$side" "$pid" "$token_file" ready "" "$FETCH_HTTP_STATUS" "$attempts" "$readiness_path"
       echo "[nat-sim] baseline captured side=$side file=$output" >&2
       return 0
     fi
-    sleep 0.25
+    last_reason=${FETCH_REASON_CODE:-baseline_status_not_available}
+    last_http=${FETCH_HTTP_STATUS:-000}
+    if [[ "$last_reason" == status_schema_invalid || "$last_reason" == status_http_500_injected ]]; then
+      result=schema_invalid
+      [[ "$last_reason" == status_http_500_injected ]] && result=http_failure
+      write_baseline_readiness "$side" "$pid" "$token_file" "$result" "$last_reason" "$last_http" "$attempts" "$readiness_path"
+      return 1
+    fi
+    if (( SECONDS < baseline_deadline && SECONDS < ROUND_DEADLINE )); then
+      deadline_pause 0.25 "$baseline_deadline" || break
+    fi
   done
-  echo "[nat-sim] FAIL reason_code=baseline_status_not_available side=$side file=$output" >&2
+
+  result=timeout
+  if [[ "$last_reason" == status_schema_invalid ]]; then result=schema_invalid; fi
+  if [[ "$last_reason" == status_unavailable || "$last_reason" == status_auth_token_missing ]]; then
+    result=http_failure
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    result=process_exited
+    last_reason=daemon_process_exited
+  fi
+  write_baseline_readiness "$side" "$pid" "$token_file" "$result" "$last_reason" "$last_http" "$attempts" "$readiness_path"
+  echo "[nat-sim] FAIL reason_code=baseline_status_not_available side=$side file=$output stage=baseline record=$readiness_path" >&2
+  return 1
+}
+
+# Bounded, poll-based readiness gate (DaemonReadyState): CREATED -> STARTING
+# -> TOKEN_READY.  The daemon publishes its diagnostics session token
+# atomically right after acquiring the instance lock, so a missing token
+# means the process is still starting (or died) — never that status should be
+# sampled anyway.  The wait is strictly bounded (30s), polls every 0.25s,
+# fails fast on a dead process, and on failure writes a structured record
+# (pid, liveness, token path, runtime dir listing, log tail) next to the
+# other round artifacts so a startup race is diagnosable from the evidence.
+wait_daemon_token_ready() {
+  local side="$1" pid="$2" runtime_dir="$3" log="$4"
+  local record="$ROUND_DIR/node-$side.readiness.json"
+  local timeout_s
+  timeout_s=$(work_remaining_s)
+  if (( timeout_s > 30 )); then timeout_s=30; fi
+  if (( timeout_s < 0 )); then timeout_s=0; fi
+  echo "[nat-sim] node-$side ready state=STARTING pid=$pid" >&2
+  if python3 "$ROOT_DIR/scripts/nat-sim/daemon_readiness.py" wait-token \
+      --pid "$pid" \
+      --side "$side" \
+      --token-file "$runtime_dir/p2wlan-daemon.diag-auth" \
+      --log "$log" \
+      --runtime-dir "$runtime_dir" \
+      --business-started "$ROUND_DIR/business-validation.started" \
+      --timeout-s "$timeout_s" \
+      --poll-s 0.25 \
+      --output "$record"; then
+    echo "[nat-sim] node-$side ready state=TOKEN_READY record=$record" >&2
+    return 0
+  fi
+  local readiness_result=invalid
+  if [[ -f "$record" ]]; then
+    readiness_result=$(python3 - "$record" <<'PY'
+import json
+import sys
+try:
+    print(json.load(open(sys.argv[1], encoding="utf-8")).get("result", "invalid"))
+except Exception:
+    print("invalid")
+PY
+)
+  fi
+  local failure_code=daemon_readiness_timeout
+  [[ "$readiness_result" == process_exited ]] && failure_code=daemon_process_exited
+  echo "[nat-sim] FAIL reason_code=$failure_code side=$side pid=$pid readiness_result=$readiness_result record=$record" >&2
   return 1
 }
 
@@ -328,10 +558,10 @@ capture_baseline_status() {
 # the daemon's first 200 during startup. Once the endpoint is live, every
 # sample through the Relay burst must remain 200.
 status_http_code() {
-  local url="$1" token_file="$2" code
+  local url="$1" token_file="$2" timeout_s="${3:-2}" code
   code=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
     p2wlan_diagnostics_curl \
-      -sS --connect-timeout 0.2 --max-time 2 \
+      -sS --connect-timeout 0.2 --max-time "$timeout_s" \
       -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
   if ! [[ "$code" =~ ^[0-9]{3}$ ]]; then
     code=000
@@ -372,13 +602,15 @@ record_relay_status_code() {
 # code/timestamp stream is retained as acceptance evidence.
 sample_relay_status_pair() {
   local a_url="$1" a_token_file="$2" b_url="$3" b_token_file="$4"
+  local timeout_s
+  timeout_s=$(deadline_curl_timeout)
   local a_code_file="$ROUND_DIR/.status-a-code"
   local b_code_file="$ROUND_DIR/.status-b-code"
   local a_pid b_pid a_code b_code
 
-  status_http_code "$a_url" "$a_token_file" >"$a_code_file" &
+  status_http_code "$a_url" "$a_token_file" "$timeout_s" >"$a_code_file" &
   a_pid=$!
-  status_http_code "$b_url" "$b_token_file" >"$b_code_file" &
+  status_http_code "$b_url" "$b_token_file" "$timeout_s" >"$b_code_file" &
   b_pid=$!
   wait "$a_pid"
   wait "$b_pid"
@@ -416,13 +648,153 @@ print(1 if ok else 0)
 PY
 }
 
-cleanup() {
+write_barrier_readiness() {
+  local result="$1" a_confirmed="$2" b_confirmed="$3" a_alive="$4" b_alive="$5"
+  local a_http="$6" b_http="$7" a_tasks="$8" b_tasks="$9" reason="${10}"
+  local path="$ROUND_DIR/relay-barrier.readiness.json"
+  python3 - "$result" "$NODE_A_PID" "$NODE_B_PID" "$a_confirmed" "$b_confirmed" "$a_alive" "$b_alive" \
+    "$a_http" "$b_http" "$a_tasks" "$b_tasks" "$reason" \
+    "$ROUND_DIR/business-validation.started" "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+result, pid_a, pid_b, a_confirmed, b_confirmed, a_alive, b_alive, a_http, b_http, a_tasks, b_tasks, reason, marker, path = sys.argv[1:]
+record = {
+    "schema_version": 1,
+    "stage": "barrier",
+    "state": "RUNNING" if result == "ready" else "STATUS_READY",
+    "target": "RUNNING" if result == "ready" else "STATUS_READY",
+    "result": result,
+    "business_validation_started": Path(marker).is_file(),
+    "pid_a": int(pid_a),
+    "pid_b": int(pid_b),
+    "process_alive_a": a_alive == "true",
+    "process_alive_b": b_alive == "true",
+    "relay_peer_confirmed_a": a_confirmed == "true",
+    "relay_peer_confirmed_b": b_confirmed == "true",
+    "http_status_a": int(a_http) if a_http.isdigit() else 0,
+    "http_status_b": int(b_http) if b_http.isdigit() else 0,
+    "task_health_a": a_tasks == "true",
+    "task_health_b": b_tasks == "true",
+    "reason_code": reason or None,
+}
+output = Path(path)
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+wait_for_relay_confirmation_barrier() {
+  local deadline="$1" a_http=000 b_http=000 a_alive=false b_alive=false
+  local a_confirmed=false b_confirmed=false a_tasks=false b_tasks=false
+  local result=barrier_timeout reason=relay_peer_confirmation_timeout
+  local request_timeout
+  while (( SECONDS < deadline )); do
+    if kill -0 "$NODE_A_PID" 2>/dev/null; then a_alive=true; else a_alive=false; fi
+    if kill -0 "$NODE_B_PID" 2>/dev/null; then b_alive=true; else b_alive=false; fi
+    if [[ "$a_alive" != true || "$b_alive" != true ]]; then
+      result=process_exited
+      reason=daemon_process_exited
+      break
+    fi
+
+    request_timeout=$((deadline - SECONDS))
+    if (( request_timeout > ROUND_DEADLINE - SECONDS )); then
+      request_timeout=$((ROUND_DEADLINE - SECONDS))
+    fi
+    if (( request_timeout > 5 )); then request_timeout=5; fi
+    if (( request_timeout < 1 )); then request_timeout=1; fi
+    if fetch_required_json \
+        "http://127.0.0.1:$DIAG_A_PORT/status" \
+        "$ROUND_DIR/node-a.barrier.status.json" status \
+        "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" "$request_timeout"; then
+      a_http=$FETCH_HTTP_STATUS
+      if [[ "$(node_task_health_ok "$ROUND_DIR/node-a.barrier.status.json")" == 1 ]]; then
+        a_tasks=true
+      else
+        result=task_failed
+        reason=critical_tasks_unhealthy
+        break
+      fi
+    else
+      a_http=${FETCH_HTTP_STATUS:-000}
+      result=http_failure
+      reason=${FETCH_REASON_CODE:-status_unavailable}
+      [[ "$reason" == status_schema_invalid ]] && result=schema_invalid
+      break
+    fi
+
+    request_timeout=$((deadline - SECONDS))
+    if (( request_timeout > ROUND_DEADLINE - SECONDS )); then
+      request_timeout=$((ROUND_DEADLINE - SECONDS))
+    fi
+    if (( request_timeout > 5 )); then request_timeout=5; fi
+    if (( request_timeout < 1 )); then request_timeout=1; fi
+    if fetch_required_json \
+        "http://127.0.0.1:$DIAG_B_PORT/status" \
+        "$ROUND_DIR/node-b.barrier.status.json" status \
+        "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" "$request_timeout"; then
+      b_http=$FETCH_HTTP_STATUS
+      if [[ "$(node_task_health_ok "$ROUND_DIR/node-b.barrier.status.json")" == 1 ]]; then
+        b_tasks=true
+      else
+        result=task_failed
+        reason=critical_tasks_unhealthy
+        break
+      fi
+    else
+      b_http=${FETCH_HTTP_STATUS:-000}
+      result=http_failure
+      reason=${FETCH_REASON_CODE:-status_unavailable}
+      [[ "$reason" == status_schema_invalid ]] && result=schema_invalid
+      break
+    fi
+
+    grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null && a_confirmed=true
+    grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null && b_confirmed=true
+    if (( SECONDS >= deadline )); then
+      result=barrier_timeout
+      reason=relay_peer_confirmation_timeout
+      break
+    fi
+    if [[ "$a_confirmed" == true && "$b_confirmed" == true ]]; then
+      result=ready
+      reason=""
+      break
+    fi
+    deadline_pause 0.25 "$deadline" || break
+  done
+
+  if kill -0 "$NODE_A_PID" 2>/dev/null; then a_alive=true; else a_alive=false; fi
+  if kill -0 "$NODE_B_PID" 2>/dev/null; then b_alive=true; else b_alive=false; fi
+  if [[ "$a_alive" != true || "$b_alive" != true ]]; then
+    result=process_exited
+    reason=daemon_process_exited
+  fi
+  write_barrier_readiness "$result" "$a_confirmed" "$b_confirmed" "$a_alive" "$b_alive" \
+    "$a_http" "$b_http" "$a_tasks" "$b_tasks" "$reason"
+  BARRIER_RESULT="$result"
+  BARRIER_REASON="$reason"
+  BARRIER_A_CONFIRMED="$a_confirmed"
+  BARRIER_B_CONFIRMED="$b_confirmed"
+  BARRIER_A_HTTP="$a_http"
+  BARRIER_B_HTTP="$b_http"
+}
+
+stop_round_processes() {
+  local pid
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" 2>/dev/null || true
   done
   for pid in "${PIDS[@]:-}"; do
     wait "$pid" 2>/dev/null || true
   done
+  PIDS=()
+}
+
+cleanup() {
+  stop_round_processes
   echo "[nat-sim] artifacts retained: $BASE_DIR" >&2
 }
 trap cleanup EXIT
@@ -447,6 +819,9 @@ overall=0
 round_num=0
 for round in $(seq 1 "$ROUNDS"); do
   round_num=$round
+  ROUND_DEADLINE=$((SECONDS + ROUND_TIMEOUT_S))
+  WORK_DEADLINE=$((ROUND_DEADLINE - FINALIZE_BUDGET_S))
+  if (( WORK_DEADLINE < SECONDS )); then WORK_DEADLINE=$SECONDS; fi
   ROUND_DIR="$BASE_DIR/round-$round"
   NODE_A_RUNTIME="$ROUND_DIR/node-a-runtime"
   NODE_B_RUNTIME="$ROUND_DIR/node-b-runtime"
@@ -454,7 +829,7 @@ for round in $(seq 1 "$ROUNDS"); do
   NAT_SEED=$((NAT_SEED_BASE + round))
   ROUND_RUN_ID="${NAT_SIM_RUN_ID}-round-${round}"
 
-  echo "[nat-sim] round $round: starting NAT simulator (mode=$MODE step_a=$STEP_A step_b=$STEP_B consume_a=$CONSUME_A consume_b=$CONSUME_B loss=$LOSS reorder=$REORDER strict_filtering=$STRICT_FILTERING seed=$NAT_SEED)"
+  echo "[nat-sim] round $round: starting NAT simulator (mode=$MODE step_a=$STEP_A step_b=$STEP_B consume_a=$CONSUME_A consume_b=$CONSUME_B loss=$LOSS reorder=$REORDER strict_filtering=$STRICT_FILTERING seed=$NAT_SEED round_timeout_s=$ROUND_TIMEOUT_S)"
   REORDER_FLAG=""
   if [[ "$REORDER" == "1" ]]; then REORDER_FLAG="--reorder"; fi
   STRICT_FILTERING_FLAG=""
@@ -477,12 +852,12 @@ for round in $(seq 1 "$ROUNDS"); do
   PIDS+=($NAT_PID)
   for _ in {1..40}; do
     grep -q 'STUN_A=' "$ROUND_DIR/nat-sim.out" 2>/dev/null && break
-    sleep 0.25
+    deadline_pause 0.25 || break
   done
   STUN_A=$(sed -n 's/^STUN_A=//p' "$ROUND_DIR/nat-sim.out")
   STUN_B=$(sed -n 's/^STUN_B=//p' "$ROUND_DIR/nat-sim.out")
   if [[ -z "$STUN_A" || -z "$STUN_B" ]]; then
-    echo "[nat-sim] round $round: NAT simulator failed to start" >&2
+    echo "[nat-sim] round $round: FAIL reason_code=test_harness_startup_failure stage=nat_simulator" >&2
     exit 1
   fi
 
@@ -529,21 +904,24 @@ for round in $(seq 1 "$ROUNDS"); do
   PIDS+=($SERVER_PID)
 
   for _ in {1..40}; do
-    curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 0.25
+    if curl -fsS --max-time "$(deadline_curl_timeout)" "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then break; fi
+    deadline_pause 0.25 || break
   done
-  curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null
+  if ! curl -fsS --max-time "$(deadline_curl_timeout)" "http://127.0.0.1:$PORT/health" >/dev/null; then
+    echo "[nat-sim] FAIL reason_code=test_harness_startup_failure stage=control_server" >&2
+    exit 1
+  fi
 
   REGISTER_JSON=""
   for _ in {1..20}; do
-    REGISTER_JSON=$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/register" \
+    REGISTER_JSON=$(curl -fsS --max-time "$(deadline_curl_timeout)" -X POST "http://127.0.0.1:$PORT/api/v1/register" \
       -H 'Content-Type: application/json' \
       -d '{"email":"smoke@example.com","password":"passw0rd"}' 2>/dev/null) && break
-    sleep 0.5
+    deadline_pause 0.5 || break
   done
   TOKEN=$(printf '%s' "$REGISTER_JSON" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
   if [[ -z "$TOKEN" ]]; then
-    echo "[nat-sim] round $round: failed to parse auth token" >&2
+    echo "[nat-sim] round $round: FAIL reason_code=test_harness_startup_failure stage=registration" >&2
     exit 1
   fi
 
@@ -596,7 +974,7 @@ for round in $(seq 1 "$ROUNDS"); do
 
   for _ in {1..40}; do
     grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null && break
-    sleep 0.25
+    deadline_pause 0.25 || break
   done
 
   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
@@ -617,19 +995,35 @@ for round in $(seq 1 "$ROUNDS"); do
   NODE_B_PID=$!
   PIDS+=($NODE_B_PID)
 
+  # Both daemons were launched with --validate-overlay, so business
+  # verification is considered active from this point onward. Any later data
+  # plane failure is a business failure and cannot be auto-retried away.
+  : >"$ROUND_DIR/business-validation.started"
+
   for _ in {1..40}; do
     grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-b.log" 2>/dev/null && break
-    sleep 0.25
+    deadline_pause 0.25 || break
   done
 
-  capture_baseline_status \
+  # Readiness gate: the status collector below must never run before the
+  # daemon has published its diagnostics token (TOKEN_READY).  Each gate is
+  # bounded (30s), poll-based, and emits a structured readiness record into
+  # the round artifacts.
+  wait_daemon_token_ready a "$NODE_A_PID" "$NODE_A_RUNTIME" "$ROUND_DIR/node-a.log"
+  wait_daemon_token_ready b "$NODE_B_PID" "$NODE_B_RUNTIME" "$ROUND_DIR/node-b.log"
+
+  if ! capture_baseline_pair \
     "http://127.0.0.1:$DIAG_A_PORT/status" \
     "$ROUND_DIR/node-a.baseline.status.json" \
-    "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" a
-  capture_baseline_status \
+    "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" a "$NODE_A_PID" \
     "http://127.0.0.1:$DIAG_B_PORT/status" \
     "$ROUND_DIR/node-b.baseline.status.json" \
-    "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" b
+    "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" b "$NODE_B_PID"; then
+    echo "[nat-sim] ROUND $round: FAIL reason_code=baseline_status_not_available stage=baseline" >&2
+    overall=1
+    stop_round_processes
+    continue
+  fi
 
   if [[ "$MODE" == "relay-only" ]]; then
     # Availability pass condition: BOTH sides complete a bidirectional
@@ -638,15 +1032,50 @@ for round in $(seq 1 "$ROUNDS"); do
     # When OVERLAY_BURST is set, the round additionally waits for the burst to
     # complete on both sides.
     overlay_ok=0
-    A_STATUS_SEEN_200=0
-    B_STATUS_SEEN_200=0
+    # Both authenticated baselines succeeded; a subsequent HTTP failure during
+    # the barrier or verification window is therefore a real control-plane
+    # failure, not pre-readiness noise.
+    A_STATUS_SEEN_200=1
+    B_STATUS_SEEN_200=1
     A_STATUS_ALWAYS_200=1
     B_STATUS_ALWAYS_200=1
     A_STATUS_SAMPLE_COUNT=0
     B_STATUS_SAMPLE_COUNT=0
     A_STATUS_200_COUNT=0
     B_STATUS_200_COUNT=0
-    OVERLAY_DEADLINE=$((SECONDS + OVERLAY_TIMEOUT_S))
+    # The verification window is fixed from here (never extended); the
+    # event-based readiness barrier below spends its budget inside it.  The
+    # counters referenced by the gate are initialized here because the barrier
+    # may legitimately consume the whole window, leaving the verification loop
+    # zero iterations — the gate must still emit a complete FAIL verdict.
+    A_OVERLAY=0
+    B_OVERLAY=0
+    A_BURST=0
+    B_BURST=0
+    A_BURST_BAD=0
+    B_BURST_BAD=0
+    OVERLAY_DEADLINE=$(stage_deadline "$OVERLAY_TIMEOUT_S")
+    # Deterministic Direct impossibility must be active before verification:
+    # the blackhole is asserted from the simulator banner, not assumed.  Like
+    # a simulator that failed to start, a missing banner is an infrastructure
+    # failure of this attempt, not a topology verdict.
+    if ! grep -q '^BLOCK_DIRECT=1$' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then
+      echo "[nat-sim] FAIL reason_code=blackhole_not_active round=$round evidence=$ROUND_DIR/nat-sim.out" >&2
+      exit 1
+    fi
+    # Event-based peer-handshake barrier: require both confirmations while
+    # continuing to observe process liveness, authenticated HTTP status and
+    # critical task health. A timeout or failed observation ends the attempt.
+    wait_for_relay_confirmation_barrier "$OVERLAY_DEADLINE"
+    if [[ "$BARRIER_RESULT" != ready ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=${BARRIER_REASON:-relay_peer_confirmation_timeout} stage=barrier relay_peer_confirmed_a=$BARRIER_A_CONFIRMED relay_peer_confirmed_b=$BARRIER_B_CONFIRMED http_a=$BARRIER_A_HTTP http_b=$BARRIER_B_HTTP" >&2
+      overall=1
+      stop_round_processes
+      continue
+    fi
+    echo "[nat-sim] round $round: barrier relay_peer_confirmed a=$BARRIER_A_CONFIRMED b=$BARRIER_B_CONFIRMED http_a=$BARRIER_A_HTTP http_b=$BARRIER_B_HTTP (window budget preserved)" >&2
+    echo "[nat-sim] node-a ready state=RUNNING" >&2
+    echo "[nat-sim] node-b ready state=RUNNING" >&2
     while [[ "$SECONDS" -lt "$OVERLAY_DEADLINE" ]]; do
       sample_relay_status_pair \
         "http://127.0.0.1:$DIAG_A_PORT/status" \
@@ -668,7 +1097,7 @@ for round in $(seq 1 "$ROUNDS"); do
           break
         fi
       fi
-      sleep 0.5
+      deadline_pause 0.5 "$OVERLAY_DEADLINE" || break
     done
     A_DIRECT=$(grep -c '→ direct' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
     B_DIRECT=$(grep -c '→ direct' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
@@ -685,7 +1114,17 @@ for round in $(seq 1 "$ROUNDS"); do
     # Field checks are order-independent because tracing may render fields in
     # either order on the same structured log record.
     direct_ok=0
-    for _ in $(seq 1 $((DIRECT_TIMEOUT_S * 2))); do
+    DIRECT_DEADLINE=$(stage_deadline "$DIRECT_TIMEOUT_S")
+    wait_for_relay_confirmation_barrier "$DIRECT_DEADLINE"
+    if [[ "$BARRIER_RESULT" != ready ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=${BARRIER_REASON:-relay_peer_confirmation_timeout} stage=barrier relay_peer_confirmed_a=$BARRIER_A_CONFIRMED relay_peer_confirmed_b=$BARRIER_B_CONFIRMED http_a=$BARRIER_A_HTTP http_b=$BARRIER_B_HTTP" >&2
+      overall=1
+      stop_round_processes
+      continue
+    fi
+    echo "[nat-sim] node-a ready state=RUNNING" >&2
+    echo "[nat-sim] node-b ready state=RUNNING" >&2
+    while (( SECONDS < DIRECT_DEADLINE )); do
       if grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-a.log" 2>/dev/null && \
          grep -q 'event="relay_peer_confirmed"' "$ROUND_DIR/node-b.log" 2>/dev/null && \
          grep -q 'event="direct_promoted"' "$ROUND_DIR/node-a.log" 2>/dev/null && \
@@ -695,7 +1134,7 @@ for round in $(seq 1 "$ROUNDS"); do
         direct_ok=1
         break
       fi
-      sleep 0.5
+      deadline_pause 0.5 "$DIRECT_DEADLINE" || break
     done
     overlay_ok=0
     A_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
@@ -911,7 +1350,33 @@ except Exception:
           && "$BURST_OK" -eq 1 ]]; then
       echo "[nat-sim] ROUND $round: PASS relay_first_evidence overlay_ok=1 a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT task_leak_a=$((1 - A_TASKS_OK)) task_leak_b=$((1 - B_TASKS_OK)) elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
     else
-      echo "[nat-sim] ROUND $round: FAIL relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT status_always_200_a=$A_STATUS_ALWAYS_200 status_always_200_b=$B_STATUS_ALWAYS_200 task_health_a=$A_TASKS_OK task_health_b=$B_TASKS_OK elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= 3000ms, zero drops/replay/invalid, burst complete, status always HTTP 200, no supervised task exit)"
+      RELAY_REASON=relay_business_gate_failed
+      if [[ "$A_DIRECT" -ne 0 || "$B_DIRECT" -ne 0 ]]; then
+        RELAY_REASON=relay_direct_violation
+      elif [[ "$A_RELAY_CONFIRMED" -lt 1 || "$B_RELAY_CONFIRMED" -lt 1 ]]; then
+        RELAY_REASON=relay_confirmation_missing
+      elif [[ "$a_relay_first" -ne 1 || "$b_relay_first" -ne 1 ]]; then
+        RELAY_REASON=first_usable_path_mismatch
+      elif [[ "$DELTA_OK" -ne 1 || "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 ]]; then
+        RELAY_REASON=first_usable_delta_missing
+      elif [[ "$A_DELTA" -gt 3000 || "$B_DELTA" -gt 3000 ]]; then
+        RELAY_REASON=relay_first_slo_exceeded
+      elif [[ "$A_DROPS" -ne 0 || "$B_DROPS" -ne 0 ]]; then
+        RELAY_REASON=outbound_drop
+      elif [[ "$A_REPLAY" -ne 0 || "$B_REPLAY" -ne 0 ]]; then
+        RELAY_REASON=replay_detected
+      elif [[ "$A_INVALID" -ne 0 || "$B_INVALID" -ne 0 ]]; then
+        RELAY_REASON=overlay_invalid
+      elif [[ "$A_TASKS_OK" -ne 1 || "$B_TASKS_OK" -ne 1 ]]; then
+        RELAY_REASON=critical_tasks_unhealthy
+      elif [[ "$A_STATUS_ALWAYS_200" -ne 1 || "$B_STATUS_ALWAYS_200" -ne 1 ]]; then
+        RELAY_REASON=status_http_failure
+      elif [[ "$BURST_OK" -ne 1 ]]; then
+        RELAY_REASON=overlay_burst_incomplete
+      elif [[ "$overlay_ok" -ne 1 ]]; then
+        RELAY_REASON=overlay_verification_failed
+      fi
+      echo "[nat-sim] ROUND $round: FAIL reason_code=$RELAY_REASON relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT status_always_200_a=$A_STATUS_ALWAYS_200 status_always_200_b=$B_STATUS_ALWAYS_200 task_health_a=$A_TASKS_OK task_health_b=$B_TASKS_OK elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= 3000ms, zero drops/replay/invalid, burst complete, status always HTTP 200, no supervised task exit)"
       overall=1
     fi
   else
@@ -1010,7 +1475,7 @@ except Exception:
     B_BEFORE=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
     kill "${RELAY_PIDS[0]}" 2>/dev/null || true
     wait "${RELAY_PIDS[0]}" 2>/dev/null || true
-    sleep 1
+    deadline_pause 1 || true
     KEYRING_JSON="{\"relay-sim\":\"$RELAY_PUB\"}"
     RELAY_AUDIENCE="relay-sim" RELAY_REGION="local" "$BASE_DIR/relay-server" \
       -bind "127.0.0.1:$RELAY_PORT" \
@@ -1021,14 +1486,14 @@ except Exception:
     RELAY_PIDS[0]=$!
     PIDS+=($!)
     recovered=0
-    for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 4))); do
+    while (( SECONDS < OVERLAY_DEADLINE )); do
       A_AFTER=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
       B_AFTER=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
       if [[ "$A_AFTER" -gt "$A_BEFORE" && "$B_AFTER" -gt "$B_BEFORE" ]]; then
         recovered=1
         break
       fi
-      sleep 0.5
+      deadline_pause 0.5 "$OVERLAY_DEADLINE" || break
     done
     if [[ "$recovered" -eq 1 ]]; then
       echo "[nat-sim] ROUND $round: PASS relay_kill_restart_recovery overlay_before=$A_BEFORE after_a=$A_AFTER"
@@ -1067,7 +1532,7 @@ except Exception:
         overall=1
       else
         re_confirmed=0
-        for _ in $(seq 1 $((OVERLAY_TIMEOUT_S * 4))); do
+        while (( SECONDS < OVERLAY_DEADLINE )); do
           A_REPLACEMENT=$(node_replacement_relay_endpoint "$ROUND_DIR/node-a.log" "$ACTIVE_ENDPOINT")
           B_REPLACEMENT=$(node_replacement_relay_endpoint "$ROUND_DIR/node-b.log" "$ACTIVE_ENDPOINT")
           A_POST_INGRESS=$(node_post_failover_relay_ingress "$ROUND_DIR/node-a.log" "$A_FAILOVER_START_LINE" "$ACTIVE_ENDPOINT")
@@ -1077,7 +1542,7 @@ except Exception:
             re_confirmed=1
             break
           fi
-          sleep 0.5
+          deadline_pause 0.5 "$OVERLAY_DEADLINE" || break
         done
         if [[ "$re_confirmed" -eq 1 ]]; then
           echo "[nat-sim] ROUND $round: PASS relay_failover_reconfirmed active=$ACTIVE_ENDPOINT replacement=$A_REPLACEMENT post_ingress_a=$A_POST_INGRESS post_ingress_b=$B_POST_INGRESS"
@@ -1089,9 +1554,16 @@ except Exception:
     fi
   fi
 
-  # Also check for daemon crashes / socket leaks before tearing down.
-  if ! kill -0 "$NODE_A_PID" 2>/dev/null || ! kill -0 "$NODE_B_PID" 2>/dev/null; then
-    echo "[nat-sim] ROUND $round: FAIL (daemon exited unexpectedly)"
+  # Also check for daemon crashes before tearing down and preserve structured
+  # process-exit evidence so the classifier does not infer lifecycle from text.
+  if ! kill -0 "$NODE_A_PID" 2>/dev/null; then
+    write_process_exit_readiness a "$NODE_A_PID" "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" "$ROUND_DIR/node-a.final.readiness.json"
+    echo "[nat-sim] ROUND $round: FAIL reason_code=daemon_process_exited side=a stage=final"
+    overall=1
+  fi
+  if ! kill -0 "$NODE_B_PID" 2>/dev/null; then
+    write_process_exit_readiness b "$NODE_B_PID" "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" "$ROUND_DIR/node-b.final.readiness.json"
+    echo "[nat-sim] ROUND $round: FAIL reason_code=daemon_process_exited side=b stage=final"
     overall=1
   fi
 

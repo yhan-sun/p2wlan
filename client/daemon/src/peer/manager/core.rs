@@ -43,6 +43,12 @@ impl PeerManager {
             relay_probe_snapshot_test_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             hard_hard_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            peer_add_wait_started_test_tx: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            remote_fresh_transaction_started_test_tx: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            candidate_postprocess_lock_wait_test_tx: Arc::new(std::sync::Mutex::new(None)),
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             committed_business_path_change_tx,
@@ -787,21 +793,6 @@ impl PeerManager {
         }
     }
 
-    /// Candidate publication releases the epoch gate before awaiting this
-    /// cancellation, so DPLPMTUD peer cleanup does not block other epoch waiters.
-    pub(crate) async fn cancel_dplpmtud_for_remote_candidate_change(
-        &self,
-        peer_id: &str,
-    ) {
-        if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
-            runtime.cancel_peer(
-                peer_id,
-                "remote_candidate_generation_changed",
-                tokio::time::Instant::now(),
-            );
-        }
-    }
-
     /// Exact no-await fence used immediately before a Probe send and while an
     /// ACK is consumed.  The state-machine snapshot is the active-path
     /// authority; the Direct-pair mirror additionally binds the local socket
@@ -941,6 +932,75 @@ impl PeerManager {
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, PeerConnection>> {
         self.connections.write().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_peer_add_wait_observer_for_test(
+        &self,
+        sender: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        *self
+            .peer_add_wait_started_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_peer_add_wait_started_for_test(&self) {
+        if let Some(sender) = self
+            .peer_add_wait_started_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            let _ = sender.send(());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_remote_fresh_transaction_observer_for_test(
+        &self,
+        sender: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        *self
+            .remote_fresh_transaction_started_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_remote_fresh_transaction_started_for_test(&self) {
+        if let Some(sender) = self
+            .remote_fresh_transaction_started_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            let _ = sender.send(());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_candidate_postprocess_lock_wait_observer_for_test(
+        &self,
+        sender: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        *self
+            .candidate_postprocess_lock_wait_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_candidate_postprocess_lock_wait_for_test(&self) {
+        let sender = self
+            .candidate_postprocess_lock_wait_test_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
     }
 
     /// Hold a connection reader while a second task queues a writer.  This

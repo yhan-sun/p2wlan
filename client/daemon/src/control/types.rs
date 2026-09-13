@@ -203,6 +203,31 @@ pub enum SignalApplyOutcome {
 #[derive(Debug, Clone)]
 pub struct SignalDeliveryReceipt {
     outcome: watch::Sender<SignalApplyOutcome>,
+    context: Option<Arc<SignalDeliveryContext>>,
+}
+
+#[derive(Debug)]
+struct SignalDeliveryContext {
+    signal_id: String,
+    signal_seq: Option<u64>,
+    signal_type: String,
+    from_node_id: String,
+}
+
+/// Keep control-signal correlation fields useful in logs without allowing a
+/// malformed server value to create unbounded or multiline log records.
+pub(crate) fn bounded_signal_log_value(value: &str) -> String {
+    value
+        .chars()
+        .take(96)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || "-_.:".contains(character) {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Receive-only side retained by the control delivery lane. Keeping this
@@ -217,7 +242,42 @@ pub(crate) struct SignalDeliveryWaiter {
 impl SignalDeliveryReceipt {
     pub fn pending() -> Self {
         let (outcome, _receiver) = watch::channel(SignalApplyOutcome::Pending);
-        Self { outcome }
+        Self {
+            outcome,
+            context: None,
+        }
+    }
+
+    pub(crate) fn pending_for_signal(
+        signal_id: String,
+        signal_seq: Option<u64>,
+        signal_type: String,
+        from_node_id: String,
+    ) -> Self {
+        let (outcome, _receiver) = watch::channel(SignalApplyOutcome::Pending);
+        Self {
+            outcome,
+            context: Some(Arc::new(SignalDeliveryContext {
+                signal_id,
+                signal_seq,
+                signal_type,
+                from_node_id,
+            })),
+        }
+    }
+
+    pub(crate) fn record_phase(&self, phase: &str, stage: &str) {
+        if let Some(context) = self.context.as_ref() {
+            tracing::info!(
+                "Control signal phase={} id={} from={} type={} seq={:?} stage={}",
+                phase,
+                bounded_signal_log_value(&context.signal_id),
+                bounded_signal_log_value(&context.from_node_id),
+                bounded_signal_log_value(&context.signal_type),
+                context.signal_seq,
+                stage
+            );
+        }
     }
 
     pub fn complete(&self, outcome: SignalApplyOutcome) {
@@ -225,13 +285,32 @@ impl SignalDeliveryReceipt {
         // Delivery has exactly one terminal disposition. Multiple cleanup
         // paths may retain a clone of the receipt, so a late cancellation must
         // never overwrite an earlier successful commit (or vice versa).
-        self.outcome.send_if_modified(|current| {
+        let committed = self.outcome.send_if_modified(|current| {
             if *current != SignalApplyOutcome::Pending {
                 return false;
             }
             *current = outcome;
             true
         });
+        if committed {
+            let phase = match outcome {
+                SignalApplyOutcome::Applied => "state_committed",
+                SignalApplyOutcome::TerminalRejected => "terminal_rejected",
+                SignalApplyOutcome::Retry => "retry_decided",
+                SignalApplyOutcome::Pending => unreachable!("pending is not a terminal outcome"),
+            };
+            self.record_phase(phase, "application_receipt");
+            if let Some(context) = self.context.as_ref() {
+                tracing::info!(
+                    "Control signal phase=application_result id={} from={} type={} seq={:?} outcome={:?}",
+                    bounded_signal_log_value(&context.signal_id),
+                    bounded_signal_log_value(&context.from_node_id),
+                    bounded_signal_log_value(&context.signal_type),
+                    context.signal_seq,
+                    outcome
+                );
+            }
+        }
     }
 
     pub fn current(&self) -> SignalApplyOutcome {
@@ -277,6 +356,7 @@ pub enum ControlEvent {
     DeliveredSignal {
         signal_id: String,
         signal_seq: Option<u64>,
+        signal_type: String,
         event: Box<ControlEvent>,
         receipt: SignalDeliveryReceipt,
     },
