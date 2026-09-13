@@ -9,21 +9,129 @@ concurrency:
   group: room-connectivity-workbench-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  source:
+  validate:
     if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/work/room-connectivity-20260913'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Apply hash-verified repair to exact baseline
+        run: python3 .room-connectivity-workbench/apply.py
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+      - name: Format only repair paths and export reviewed patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, hashlib
+          from pathlib import Path
+          temp = Path(os.environ['RUNNER_TEMP'])
+          paths = json.loads((temp / 'repair-files.json').read_text())
+          rust = [p for p in paths if p.endswith('.rs')]
+          dart = [p for p in paths if p.endswith('.dart')]
+          subprocess.run(['rustfmt', '--edition', '2021', '--config', 'skip_children=true', *rust], check=True)
+          subprocess.run(['dart', 'format', *dart], check=True)
+          subprocess.run(['git', 'add', '-f', '--', *paths], check=True)
+          patch = subprocess.check_output(['git', 'diff', '--cached', '--binary'])
+          (temp / 'normalized.patch').write_bytes(patch)
+          (temp / 'normalized.sha256').write_text(hashlib.sha256(patch).hexdigest())
+          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+          subprocess.run(['git', 'diff', '--cached', '--stat'], check=True)
+          PY
+      - name: Flutter analysis and room regressions
+        working-directory: apps/flutter_client
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test test/room_connectivity_test.dart test/room_dataplane_test.dart test/rooms_page_test.dart test/parallel_rooms_test.dart test/room_route_inventory_test.dart
+      - name: Rust room packet and lifecycle regressions
+        run: |
+          cargo test --locked -p p2wlan-daemon --lib room_ -- --test-threads=1
+          cargo test --locked -p p2wlan-daemon --lib firewall_contract_tests -- --test-threads=1
+          cargo test --locked -p p2wlan-daemon --lib dataplane:: -- --test-threads=1
+      - name: Rust daemon clippy
+        run: cargo clippy --locked -p p2wlan-daemon --all-targets --all-features -- -D warnings
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: normalized-room-repair
+          path: |
+            ${{ runner.temp }}/normalized.patch
+            ${{ runner.temp }}/normalized.sha256
+            ${{ runner.temp }}/repair-files.json
+          retention-days: 3
+  firewall:
+    if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/work/room-connectivity-20260913'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Apply identical hash-verified patch
+        run: python .room-connectivity-workbench/apply.py
+      - name: Exercise actual Windows firewall filters with production script
+        shell: pwsh
+        run: ./scripts/room-connectivity/windows-firewall.ps1
+  publish:
+    needs: [validate, firewall]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: d100ea89f3cd4aa5ec75105220dcc419ff9b8bfc
-          persist-credentials: false
-      - name: Archive exact repair baseline
-        run: |
-          test "$(git rev-parse HEAD)" = d100ea89f3cd4aa5ec75105220dcc419ff9b8bfc
-          git archive --format=tar.gz HEAD -o "${RUNNER_TEMP}/room-connectivity-baseline.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: room-connectivity-baseline
-          path: ${{ runner.temp }}/room-connectivity-baseline.tar.gz
-          retention-days: 1
+          name: normalized-room-repair
+          path: ${{ runner.temp }}/validated
+      - name: Commit validated production paths to isolated result branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=d100ea89f3cd4aa5ec75105220dcc419ff9b8bfc
+          RESULT=work/room-connectivity-result-20260913
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$BASE"
+          if [ -n "$(git ls-remote origin refs/heads/$RESULT)" ]; then
+            git fetch origin "refs/heads/$RESULT"
+            git checkout --detach FETCH_HEAD
+            git merge-base --is-ancestor "$BASE" HEAD
+            git restore --source "$BASE" --staged --worktree -- .
+          fi
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          directory = Path(os.environ['RUNNER_TEMP']) / 'validated'
+          patch = directory / 'normalized.patch'
+          assert hashlib.sha256(patch.read_bytes()).hexdigest() == (directory / 'normalized.sha256').read_text().strip()
+          subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
+          subprocess.run(['git', 'apply', str(patch)], check=True)
+          subprocess.run(['git', 'reset'], check=True)
+          paths = [p for p in json.loads((directory / 'repair-files.json').read_text()) if not p.startswith('.github/')]
+          assert paths and all(p.startswith(('client/daemon/', 'apps/flutter_client/', 'scripts/room-connectivity/', 'docs/room-connectivity-')) for p in paths)
+          subprocess.run(['git', 'add', '-f', '--', *paths], check=True)
+          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat:修复房间直连不通和数据面状态失真'
+          git push origin "HEAD:refs/heads/$RESULT"
+          echo "Validated production commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
