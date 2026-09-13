@@ -327,6 +327,10 @@ extension DaemonControllerPids on DaemonController {
     return name.isEmpty ? null : name;
   }
 
+  @visibleForTesting
+  Future<String?> windowsProcessNameForTesting(int processId) =>
+      _windowsProcessName(processId);
+
   Future<bool> _terminatePid(int pid, {bool allowElevation = true}) async {
     if (!await _processLooksLikeDaemon(pid)) return false;
     if (Platform.isWindows) {

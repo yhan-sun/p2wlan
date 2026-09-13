@@ -54,4 +54,31 @@ void main() {
     expect(result.exitCode, 0, reason: result.stderr.toString());
     expect(result.stdout.toString().trim(), 'P2WLAN-中文路径-✓');
   }, skip: !Platform.isWindows);
+
+  test('trusted fresh child resolves identity via Get-Process', () async {
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
+    final windir = Platform.environment['WINDIR']?.trim();
+    final powershell = windir == null || windir.isEmpty
+        ? 'powershell.exe'
+        : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    final child = await Process.start(powershell, [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      'Start-Sleep -Seconds 30',
+    ], mode: ProcessStartMode.normal);
+    try {
+      final name = await controller.windowsProcessNameForTesting(child.pid);
+      expect(name, 'powershell.exe', reason: 'OS-returned pid=${child.pid}');
+    } finally {
+      child.kill(ProcessSignal.sigkill);
+      await child.exitCode.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => -1,
+      );
+    }
+  }, skip: !Platform.isWindows);
 }

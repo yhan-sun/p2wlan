@@ -169,6 +169,10 @@ jobs:
           P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
         run: flutter test test/windows_daemon_lifecycle_integration_test.dart
 
+      - name: Run Flutter Windows PID identity regression
+        working-directory: apps/flutter_client
+        run: flutter test test/windows_pid_identity_test.dart
+
       - name: Build Flutter Windows release bundle
         working-directory: apps/flutter_client
         shell: bash
