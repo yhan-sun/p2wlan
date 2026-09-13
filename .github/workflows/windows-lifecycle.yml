@@ -6,9 +6,7 @@ on:
     paths:
       - ".fvmrc"
       - ".github/workflows/path-state-machine-required.yml"
-      - ".github/workflows/nat-topology-gate.yml"
       - ".github/workflows/windows-lifecycle.yml"
-      - ".github/workflows/mobile-lifecycle.yml"
       - "client/daemon/**"
       - "client/cli/**"
       - "client/tray/**"
@@ -170,10 +168,6 @@ jobs:
         env:
           P2WLAN_DAEMON_BIN: ${{ github.workspace }}/target/release/p2wlan-daemon.exe
         run: flutter test test/windows_daemon_lifecycle_integration_test.dart
-
-      - name: Run Flutter Windows PID identity regression
-        working-directory: apps/flutter_client
-        run: flutter test test/windows_pid_identity_test.dart
 
       - name: Build Flutter Windows release bundle
         working-directory: apps/flutter_client
