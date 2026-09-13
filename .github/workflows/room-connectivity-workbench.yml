@@ -1,0 +1,29 @@
+name: Room connectivity workbench
+on:
+  push:
+    branches: [work/room-connectivity-20260913]
+    paths: [.github/workflows/room-connectivity-workbench.yml, .room-connectivity-workbench/**]
+permissions:
+  contents: read
+concurrency:
+  group: room-connectivity-workbench-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  source:
+    if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/work/room-connectivity-20260913'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: d100ea89f3cd4aa5ec75105220dcc419ff9b8bfc
+          persist-credentials: false
+      - name: Archive exact repair baseline
+        run: |
+          test "$(git rev-parse HEAD)" = d100ea89f3cd4aa5ec75105220dcc419ff9b8bfc
+          git archive --format=tar.gz HEAD -o "${RUNNER_TEMP}/room-connectivity-baseline.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: room-connectivity-baseline
+          path: ${{ runner.temp }}/room-connectivity-baseline.tar.gz
+          retention-days: 1
