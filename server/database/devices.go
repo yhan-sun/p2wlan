@@ -430,7 +430,10 @@ func (db *DB) registerDeviceWithOptions(userID, networkID, publicKey, deviceName
 	if len(idSuffix) > 16 {
 		idSuffix = idSuffix[:16]
 	}
-	id := fmt.Sprintf("node-%s-%d", idSuffix, time.Now().UnixNano())
+	id, err := roomRandomID("node-"+idSuffix+"-", 16)
+	if err != nil {
+		return nil, fmt.Errorf("generate device ID: %w", err)
+	}
 	now := time.Now().Unix()
 
 	virtualIP, err := db.reserveVirtualIP(tx, networkID, requestedVirtualIP, "")

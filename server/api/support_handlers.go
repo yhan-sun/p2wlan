@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
+	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
 )
 
 const (
@@ -361,7 +362,7 @@ func persistSupportLogBundle(directory, uploadID string, bundle storedSupportLog
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(directory, ".p2wlan-log-*.tmp")
+	tmp, err := privatefile.CreateTemp(directory)
 	if err != nil {
 		return err
 	}

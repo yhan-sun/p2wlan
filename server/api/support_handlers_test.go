@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
+	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
 )
 
 func TestUploadSupportLogsStoresCompressedPrivateBundle(t *testing.T) {
@@ -73,12 +74,8 @@ func TestUploadSupportLogsStoresCompressedPrivateBundle(t *testing.T) {
 	if len(entries) != 1 || filepath.Ext(entries[0].Name()) != ".gz" {
 		t.Fatalf("expected one gzip upload, got %+v", entries)
 	}
-	info, err := entries[0].Info()
-	if err != nil {
-		t.Fatalf("Info: %v", err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("upload permissions = %o, want 600", info.Mode().Perm())
+	if err := privatefile.Verify(filepath.Join(directory, entries[0].Name())); err != nil {
+		t.Fatalf("upload access is not private: %v", err)
 	}
 
 	storedFile, err := os.Open(filepath.Join(directory, entries[0].Name()))

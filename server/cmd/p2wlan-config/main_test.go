@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
 )
 
 func envFile(t *testing.T, path string) map[string]string {
@@ -34,6 +36,11 @@ func TestGenerateMatchingSecureConfiguration(t *testing.T) {
 			o := options{output: out, mode: mode, endpoint: "tls://localhost:18081", dev: true, controlPort: 18080, metricsPort: 18082}
 			if err := generate(o); err != nil {
 				t.Fatal(err)
+			}
+			for _, name := range []string{"control.env", "relay.env", "tls.key"} {
+				if err := privatefile.Verify(filepath.Join(out, name)); err != nil {
+					t.Fatalf("generated %s is not private: %v", name, err)
+				}
 			}
 			c, r := envFile(t, filepath.Join(out, "control.env")), envFile(t, filepath.Join(out, "relay.env"))
 			if len(c["JWT_SECRET"]) != 64 || len(c["RELAY_REVOCATION_FEED_TOKEN"]) != 64 || c["RELAY_REVOCATION_FEED_TOKEN"] != r["RELAY_REVOCATION_FEED_TOKEN"] {

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
 	"math/big"
 	"net"
 	"net/url"
@@ -179,7 +180,7 @@ func generate(o options) (err error) {
 	}
 	compose := fmt.Sprintf("P2WLAN_UID=%d\nP2WLAN_GID=%d\nCONTROL_PORT=%d\nRELAY_PORT=%d\nMETRICS_PORT=%d\nRELAY_PUBLISH_HOST=127.0.0.1\n", uid, gid, o.controlPort, n, o.metricsPort)
 	for name, data := range map[string][]byte{"control.env": []byte(control), "relay.env": []byte(relay), "compose.env": []byte(compose), "tls.crt": certPEM, "tls.key": keyPEM} {
-		if err = os.WriteFile(filepath.Join(out, name), data, 0600); err != nil {
+		if err = privatefile.WriteNew(filepath.Join(out, name), data); err != nil {
 			return err
 		}
 	}

@@ -63,7 +63,10 @@ type NetworkMembership struct {
 
 // CreateChallenge generates a new device challenge.
 func (db *DB) CreateChallenge(deviceID string, challenge []byte, expiresAt int64) (*DeviceChallenge, error) {
-	id := fmt.Sprintf("challenge-%d", time.Now().UnixNano())
+	id, err := roomRandomID("challenge-", 16)
+	if err != nil {
+		return nil, fmt.Errorf("generate challenge ID: %w", err)
+	}
 	now := time.Now().Unix()
 	// Challenges are short-lived one-time records.  Prune terminal rows for
 	// this device on the write path so repeated enrollment/credential refresh
@@ -74,7 +77,7 @@ func (db *DB) CreateChallenge(deviceID string, challenge []byte, expiresAt int64
 		WHERE device_id = ? AND (consumed = 1 OR expires_at < ?)`, deviceID, now); err != nil {
 		return nil, fmt.Errorf("prune device challenges: %w", err)
 	}
-	_, err := db.Exec(`INSERT INTO device_challenges (id, device_id, challenge, expires_at, consumed, created_at)
+	_, err = db.Exec(`INSERT INTO device_challenges (id, device_id, challenge, expires_at, consumed, created_at)
         VALUES (?, ?, ?, ?, 0, ?)`, id, deviceID, challenge, expiresAt, now)
 	if err != nil {
 		return nil, err
@@ -146,11 +149,14 @@ func (db *DB) CreateDeviceCredential(deviceID string, ttlSec int64) (*DeviceCred
 	}
 	rawToken := "dc-" + hex.EncodeToString(rawBytes)
 	hash := hashToken(rawToken)
-	id := fmt.Sprintf("cred-%d", time.Now().UnixNano())
+	id, err := roomRandomID("cred-", 16)
+	if err != nil {
+		return nil, "", fmt.Errorf("generate credential ID: %w", err)
+	}
 	now := time.Now().Unix()
 	expires := now + ttlSec
 
-	_, err := db.Exec(`INSERT INTO device_credentials (id, device_id, token_hash, expires_at, revoked, created_at)
+	_, err = db.Exec(`INSERT INTO device_credentials (id, device_id, token_hash, expires_at, revoked, created_at)
 		VALUES (?, ?, ?, ?, 0, ?)`, id, deviceID, hash, expires, now)
 	if err != nil {
 		return nil, "", err

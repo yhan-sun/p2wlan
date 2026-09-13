@@ -203,3 +203,9 @@ control.example.com {
 已有部署升级不要重新运行配置生成器覆盖密钥。保存现有 JWT/票据签名私钥和撤权 token；修正必需变量，增加 loopback metrics，再升级 Control/Relay 二进制。所有路径变更先停服务并备份数据库及 WAL，验证权限后启动。证书续期和票据密钥轮换是两个不同流程。系统包上传、版本切换及受控 staging 见 [server-deployment.md](server-deployment.md)。
 
 参考：[Go 发布记录](https://go.dev/doc/devel/release)、[Go Linux 基线](https://go.dev/wiki/Linux)、[SQLite 错误码](https://www.sqlite.org/rescode.html)、[Compose 环境文件](https://docs.docker.com/reference/compose-file/services/#env_file)。本文的自动化验收不代替用户原故障机或公网双端验证。
+
+## Windows 原生存储与身份
+
+注册用户、网络成员、设备挑战、设备凭证及隧道的内部 ID 使用随机标识，不依赖 Windows 时钟分辨率；同一时刻批量注册不会因时间戳相同覆盖或丢失成员关系。用户与默认成员关系在同一事务内提交，成员关系失败时整个注册回滚。重复加入返回数据库里的实际角色，不会把重复请求误当作提权。
+
+配置工具生成的文件及新上传的支持日志在 Windows 上以受保护的 DACL 创建，只授予运行账号和 SYSTEM 访问；在写入任何内容之前验证 ACL，不能用 `chmod 0600` 冒充 NTFS 权限。Unix 仍使用 `0600`。这不追溯修改旧支持日志，也不替代整个部署目录的管理；旧配置/数据库及备份仍应放在只允许服务账号和管理员访问的本机目录，不要使用公开共享目录。

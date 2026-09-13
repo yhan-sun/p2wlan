@@ -32,10 +32,22 @@ type Network struct {
 
 // CreateUser inserts a new user.
 func (db *DB) CreateUser(email, passwordHash string) (*User, error) {
-	id := fmt.Sprintf("user-%d", time.Now().UnixNano())
+	id, err := roomRandomID("user-", 16)
+	if err != nil {
+		return nil, fmt.Errorf("generate user ID: %w", err)
+	}
+	membershipID, err := roomRandomID("mem-", 16)
+	if err != nil {
+		return nil, fmt.Errorf("generate membership ID: %w", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	now := time.Now().Unix()
 
-	_, err := db.Exec(`INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)`,
+	_, err = tx.Exec(`INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)`,
 		id, email, passwordHash, now)
 	if err != nil {
 		return nil, err
@@ -45,7 +57,13 @@ func (db *DB) CreateUser(email, passwordHash string) (*User, error) {
 	// register without a migration. Membership grants network registration
 	// access; it does not grant visibility or management rights over another
 	// account's devices.
-	db.CreateNetworkMembership(id, "default", "member")
+	if _, err := tx.Exec(`INSERT INTO network_memberships (id, user_id, network_id, role, created_at)
+		VALUES (?, ?, 'default', 'member', ?)`, membershipID, id, now); err != nil {
+		return nil, fmt.Errorf("create default membership: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return &User{ID: id, Email: email, PasswordHash: passwordHash, CreatedAt: now}, nil
 }
 
