@@ -72,18 +72,21 @@ jobs:
           VERSION: ${{ startsWith(github.ref, 'refs/tags/server-v') && github.ref_name || format('server-dev-{0}', github.sha) }}
         run: |
           set -euo pipefail
+          SOURCE_SHA=$(git rev-parse HEAD)
+          if [[ "$VERSION" == server-dev-* ]]; then VERSION="server-dev-$SOURCE_SHA"; fi
           rm -rf dist
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath \
-            -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$GITHUB_SHA" \
+            -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$SOURCE_SHA" \
             -o dist/p2wlan-control .
           CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath \
-            -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$GITHUB_SHA" \
+            -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$SOURCE_SHA" \
             -o dist/p2wlan-relay ./relay
-          chmod 0755 dist/p2wlan-control dist/p2wlan-relay
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -o dist/p2wlan-config ./cmd/p2wlan-config
+          chmod 0755 dist/p2wlan-control dist/p2wlan-relay dist/p2wlan-config
           {
             echo "version=$VERSION"
-            echo "commit=$GITHUB_SHA"
+            echo "commit=$SOURCE_SHA"
             echo "arch=$GOARCH"
             go version
             go version -m dist/p2wlan-control
@@ -91,11 +94,11 @@ jobs:
           } > dist/BUILD-METADATA.txt
           (
             cd dist
-            sha256sum p2wlan-control p2wlan-relay > SHA256SUMS
+            sha256sum p2wlan-control p2wlan-relay p2wlan-config > SHA256SUMS
           )
           install -m 0755 ../scripts/p2wlan-server ../scripts/install-server.sh ../scripts/deploy-server.sh dist/
           tar -C dist -czf "p2wlan-server-linux-${{ matrix.arch }}.tar.gz" \
-            p2wlan-control p2wlan-relay p2wlan-server install-server.sh deploy-server.sh BUILD-METADATA.txt SHA256SUMS
+            p2wlan-control p2wlan-relay p2wlan-config p2wlan-server install-server.sh deploy-server.sh BUILD-METADATA.txt SHA256SUMS
           sha256sum "p2wlan-server-linux-${{ matrix.arch }}.tar.gz" > \
             "p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256"
 
