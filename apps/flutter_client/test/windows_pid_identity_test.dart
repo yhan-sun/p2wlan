@@ -44,18 +44,14 @@ void main() {
     );
   });
 
-  test(
-    'Windows PowerShell helper preserves Unicode output',
-    () async {
-      final api = DiagnosticsApi(authTokenReader: () async => null);
-      addTearDown(api.close);
-      final controller = DaemonController(diagnosticsApi: api);
-      final result = await controller.runWindowsPowerShellForTesting(
-        "Write-Output 'P2WLAN-中文路径-✓'",
-      );
-      expect(result.exitCode, 0, reason: result.stderr.toString());
-      expect(result.stdout.toString().trim(), 'P2WLAN-中文路径-✓');
-    },
-    skip: !Platform.isWindows,
-  );
+  test('Windows PowerShell helper preserves Unicode output', () async {
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
+    final result = await controller.runWindowsPowerShellForTesting(
+      "Write-Output 'P2WLAN-中文路径-✓'",
+    );
+    expect(result.exitCode, 0, reason: result.stderr.toString());
+    expect(result.stdout.toString().trim(), 'P2WLAN-中文路径-✓');
+  }, skip: !Platform.isWindows);
 }
