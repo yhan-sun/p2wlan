@@ -614,11 +614,14 @@ class DaemonController {
           stdinToken: tokenFile == null && !useManualMode ? authToken : null,
         );
         launchPid = process.pid;
-        if (Platform.isWindows &&
-            !await _waitForWindowsChildIdentity(launchPid)) {
-          throw StateError(
-            'PID_MARKER_FAILED: Windows daemon PID did not resolve to p2wlan-daemon.',
-          );
+        if (Platform.isWindows) {
+          _launchedProcessId = launchPid;
+          if (!await _waitForWindowsChildIdentity(launchPid)) {
+            _launchedProcessId = null;
+            throw StateError(
+              'PID_MARKER_FAILED: Windows daemon PID did not resolve to p2wlan-daemon.',
+            );
+          }
         }
         await _writePidMarker(pidPath, launchPid);
         if (Platform.isWindows) {
