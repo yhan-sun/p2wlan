@@ -1,0 +1,117 @@
+name: Self-hosted Server
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'deploy/selfhost/**'
+      - 'scripts/selfhost/**'
+      - 'scripts/p2wlan-server'
+      - 'docs/self-hosting.md'
+      - '.github/workflows/selfhost.yml'
+      - '.github/workflows/build-server.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'deploy/selfhost/**'
+      - 'scripts/selfhost/**'
+      - 'scripts/p2wlan-server'
+      - '.github/workflows/selfhost.yml'
+      - '.github/workflows/build-server.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: selfhost-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    name: Native selfhost (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Record exact source
+        shell: bash
+        run: git rev-parse HEAD HEAD^{tree}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: Vet and full server tests
+        shell: bash
+        working-directory: server
+        run: |
+          set -euo pipefail
+          go vet ./...
+          if [ "$RUNNER_OS" = Linux ]; then
+            go test -race ./... -count=1
+          else
+            go test ./... -count=1
+          fi
+      - name: Build real native binaries and run authenticated two-process smoke
+        shell: bash
+        working-directory: server
+        run: |
+          set -euo pipefail
+          suffix=
+          if [ "$RUNNER_OS" = Windows ]; then suffix=.exe; fi
+          mkdir -p "$RUNNER_TEMP/selfhost-bin"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/selfhost-bin/p2wlan-control$suffix" .
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/selfhost-bin/p2wlan-relay$suffix" ./relay
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/selfhost-bin/p2wlan-config$suffix" ./cmd/p2wlan-config
+          go run ../scripts/selfhost/smoke.go --bin-dir "$RUNNER_TEMP/selfhost-bin"
+      - name: Manager and source contracts
+        if: runner.os == 'Linux'
+        run: |
+          bash -n scripts/p2wlan-server
+          python3 scripts/selfhost/test_manager.py
+          python3 scripts/selfhost/test_contract.py
+  docker:
+    name: Docker selfhost and static server compatibility
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: Generate private loopback-only test deployment
+        run: |
+          set -euo pipefail
+          go run ./server/cmd/p2wlan-config/main.go --mode docker --output deploy/selfhost/config --dev-localhost
+      - name: Build actual image and start documented Compose topology
+        run: |
+          set -euo pipefail
+          docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml config --quiet
+          docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml up -d --build --wait --wait-timeout 90
+          docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml exec -T relay curl -fsS --max-time 5 http://127.0.0.1:18082/readyz
+      - name: SQLite volume survives a container restart
+        run: python3 scripts/selfhost/test_compose_persistence.py
+      - name: Verify static ELF and Ubuntu 20.04 server loader compatibility
+        working-directory: server
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/static-bin"
+          for role in control relay; do
+            package=.
+            if [ "$role" = relay ]; then package=./relay; fi
+            CGO_ENABLED=0 go build -o "$RUNNER_TEMP/static-bin/p2wlan-$role" "$package"
+            if readelf -l "$RUNNER_TEMP/static-bin/p2wlan-$role" | grep -q INTERP; then
+              echo 'unexpected dynamic loader dependency' >&2; exit 1
+            fi
+            docker run --rm -v "$RUNNER_TEMP/static-bin:/opt/p2wlan:ro" ubuntu:20.04 "/opt/p2wlan/p2wlan-$role" --version
+          done
+      - name: Always clean test containers
+        if: always()
+        run: docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml down --remove-orphans
