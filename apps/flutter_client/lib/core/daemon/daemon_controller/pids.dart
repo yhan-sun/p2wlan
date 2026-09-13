@@ -21,8 +21,7 @@ bool trustedWindowsDaemonIdentityMatches({
   required int? authenticatedProcessId,
   required String? processName,
 }) {
-  final trusted =
-      pid == launchedProcessId || pid == authenticatedProcessId;
+  final trusted = pid == launchedProcessId || pid == authenticatedProcessId;
   if (!trusted || processName == null) return false;
   return processName.toLowerCase() ==
       '${DaemonController.daemonBinaryName}.exe';
