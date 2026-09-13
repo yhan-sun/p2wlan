@@ -8,3 +8,5 @@ part 'diagnostics_models/path_observability.dart';
 part 'diagnostics_models/speed_test.dart';
 part 'diagnostics_models/json_helpers.dart';
 part 'diagnostics_models/responses.dart';
+
+part 'diagnostics_models/room_dataplane.dart';

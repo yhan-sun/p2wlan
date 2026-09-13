@@ -167,10 +167,7 @@ impl Daemon {
 
         info!(
             "[startup] initializing TUN: interface={} address={} netmask={} mtu={}",
-            self.config.network.interface,
-            virtual_ip,
-            netmask,
-            self.config.network.mtu
+            self.config.network.interface, virtual_ip, netmask, self.config.network.mtu
         );
         // Initialize TUN using the resolved IP details
         let tun = self.init_tun_with(&virtual_ip, &netmask, self.config.network.mtu)?;
@@ -227,7 +224,9 @@ impl Daemon {
         if let Err(error) = self.route_manager.add_cidr_route(&cidr) {
             error!("[route] install failed for {cidr}: {error}");
             self.route_manager.cleanup();
-            return Err(DaemonError::Network(format!("route install failed: {error}")));
+            return Err(DaemonError::Network(format!(
+                "route install failed: {error}"
+            )));
         }
         info!("[route] installed {cidr}");
 
@@ -457,10 +456,10 @@ impl Daemon {
                 self.config.diagnostics.log_path.clone(),
                 self.config.diagnostics.auth_token.clone(),
                 runtime_incarnation,
-            );
+            )
+            .with_room_authorization(self.control.room_authorization().await);
             let shutdown_rx = self.shutdown_rx.clone();
-            let (diagnostics_ready_tx, diagnostics_ready_rx) =
-                tokio::sync::oneshot::channel();
+            let (diagnostics_ready_tx, diagnostics_ready_rx) = tokio::sync::oneshot::channel();
             self.task_manager
                 .spawn("diagnostics", false, async move {
                     if let Err(err) = run_diagnostics_server_with_retry_ready(
@@ -507,10 +506,7 @@ impl Daemon {
         let local_candidate_sources = self.local_candidate_sources.clone();
         let udp_direct_context = UdpDirectTaskContext {
             udp_bind,
-            fresh_mapping_harness_loopback: self
-                .config
-                .network
-                .fresh_mapping_harness_loopback,
+            fresh_mapping_harness_loopback: self.config.network.fresh_mapping_harness_loopback,
             peers: self.peers.clone(),
             control: self.control.clone(),
             local_candidates: self.local_candidates.clone(),
@@ -544,9 +540,7 @@ impl Daemon {
             excluded_interfaces,
             shutdown_rx: self.shutdown_rx.clone(),
             android_network_change_rx: self.android_network_change_direct_rx.clone(),
-            android_network_change_observed: Arc::new(
-                std::sync::atomic::AtomicU64::new(0),
-            ),
+            android_network_change_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         self.task_manager
             .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))

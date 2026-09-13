@@ -27,3 +27,8 @@ include!("dataplane/profiling.rs");
 mod tests {
     include!("dataplane/tests.rs");
 }
+
+#[cfg(test)]
+mod room_connectivity_tests {
+    include!("dataplane/room_connectivity_tests.rs");
+}

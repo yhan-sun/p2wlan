@@ -30,6 +30,7 @@ class DiagnosticsSnapshot {
     this.networkGeneration = 0,
     this.uptimeMs = 0,
     this.readyPhase = 'unknown',
+    this.roomDataPlane,
   });
 
   final JsonMap raw;
@@ -74,10 +75,12 @@ class DiagnosticsSnapshot {
   final List<PeerSnapshot> peers;
   final PeerManagerStatsSnapshot stats;
   final HealthSnapshot health;
+  final RoomDataPlaneSnapshot? roomDataPlane;
 
   factory DiagnosticsSnapshot.fromJson(JsonMap json) {
     return DiagnosticsSnapshot(
       raw: json,
+      roomDataPlane: RoomDataPlaneSnapshot.parse(json['room_dataplane']),
       contractVersion: _contractVersion(json),
       version: _string(json['version']),
       processId: _intOrNull(json['process_id']),

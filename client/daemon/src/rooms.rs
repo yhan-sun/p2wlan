@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 pub struct RoomAuthorization {
     enabled: bool,
     snapshot: Mutex<Option<RoomSnapshot>>,
+    traffic: Mutex<RoomTrafficLedger>,
 }
 
 #[derive(Debug)]
@@ -49,6 +50,7 @@ impl RoomAuthorization {
         Self {
             enabled: network_id.starts_with("room-"),
             snapshot: Mutex::new(None),
+            traffic: Mutex::new(RoomTrafficLedger::default()),
         }
     }
 
@@ -120,6 +122,14 @@ impl RoomAuthorization {
             }
             None => Arc::new(AtomicBool::new(true)),
         };
+        if snapshot
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(&old.live, &live))
+        {
+            if let Ok(mut traffic) = self.traffic.lock() {
+                traffic.peers.clear();
+            }
+        }
         *snapshot = Some(RoomSnapshot {
             live,
             local_ip: local_ip.to_owned(),
@@ -167,6 +177,8 @@ impl RoomAuthorization {
         })
     }
 }
+
+include!("rooms/diagnostics.rs");
 
 fn room_address(value: &str) -> Option<Ipv4Addr> {
     let address = value.parse::<Ipv4Addr>().ok()?;
@@ -271,4 +283,22 @@ mod send_permit_tests {
         drop(auth);
         assert!(!fresh.is_valid());
     }
+}
+
+pub(crate) fn registration_requires_room_restart(
+    config: &crate::config::Config,
+    node_id: Option<&str>,
+    virtual_ip: &str,
+    cidr: Option<&str>,
+) -> bool {
+    config.network.network_id.starts_with("room-")
+        && (node_id.is_some_and(|id| id != config.node.node_id)
+            || virtual_ip != config.network.virtual_ip
+            || cidr.is_some_and(|cidr| cidr != config.network.cidr))
+}
+
+#[cfg(test)]
+mod connectivity_tests {
+    use super::*;
+    include!("rooms/connectivity_tests.rs");
 }

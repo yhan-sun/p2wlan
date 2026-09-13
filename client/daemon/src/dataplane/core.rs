@@ -47,6 +47,7 @@ pub struct DataPlane<T> {
     local_node_id: Option<String>,
     overlay_v4: Option<Ipv4Cidr>,
     room_authorization: Option<Arc<crate::rooms::RoomAuthorization>>,
+    local_source_addresses: std::collections::HashSet<Ipv4Addr>,
     #[cfg(target_os = "android")]
     tun_turnaround: TunTurnaroundCorrelator,
 }
@@ -70,6 +71,7 @@ where
                 local_node_id: None,
                 overlay_v4: None,
                 room_authorization: None,
+                local_source_addresses: std::collections::HashSet::new(),
                 #[cfg(target_os = "android")]
                 tun_turnaround: TunTurnaroundCorrelator::default(),
             },
@@ -103,6 +105,7 @@ where
                 local_node_id: None,
                 overlay_v4: None,
                 room_authorization: None,
+                local_source_addresses: std::collections::HashSet::new(),
                 #[cfg(target_os = "android")]
                 tun_turnaround: TunTurnaroundCorrelator::default(),
             },
@@ -111,13 +114,44 @@ where
         )
     }
 
-    pub fn with_room_authorization(mut self, authorization: Arc<crate::rooms::RoomAuthorization>) -> Self {
+    pub fn with_room_authorization(
+        mut self,
+        authorization: Arc<crate::rooms::RoomAuthorization>,
+    ) -> Self {
         self.room_authorization = Some(authorization);
         self
     }
 
+    pub fn with_local_source_addresses(
+        mut self,
+        addresses: impl IntoIterator<Item = Ipv4Addr>,
+    ) -> Self {
+        self.local_source_addresses = addresses.into_iter().collect();
+        self
+    }
+
+    fn record_room_drop(
+        &self,
+        reason: crate::rooms::RoomDropReason,
+        direction: &str,
+        peer_id: &str,
+        src: &str,
+        dst: &str,
+    ) {
+        if let Some(auth) = self.room_authorization.as_ref() {
+            auth.record_drop(reason, direction, peer_id, src, dst);
+        }
+    }
+
     fn room_allows(&self, peer_id: &str, peer_ip: &str, local_ip: &str) -> bool {
-        self.room_authorization.as_ref().is_none_or(|authorization| authorization.allows(peer_id, peer_ip, local_ip))
+        let Some(auth) = self.room_authorization.as_ref() else {
+            return true;
+        };
+        if let Some(reason) = auth.denial_reason(peer_id, peer_ip, local_ip) {
+            auth.record_drop(reason, "rx", peer_id, peer_ip, local_ip);
+            return false;
+        }
+        true
     }
 
     /// Attach the live ACL used for both outbound and inbound overlay traffic.
@@ -242,11 +276,9 @@ where
         IpPacket::new(packet).map_err(|error| {
             DaemonError::Network(format!("invalid locally generated MTU feedback: {error}"))
         })?;
-        let written = self
-            .tun
-            .write(packet)
-            .await
-            .map_err(|error| DaemonError::Network(format!("local MTU feedback TUN write failed: {error}")))?;
+        let written = self.tun.write(packet).await.map_err(|error| {
+            DaemonError::Network(format!("local MTU feedback TUN write failed: {error}"))
+        })?;
         if written != packet.len() {
             return Err(DaemonError::Network(format!(
                 "short local MTU feedback TUN write: wrote {written} of {} bytes",
@@ -327,15 +359,14 @@ where
 
         let Some(peer_id) = self.peers.resolve_virtual_ip(&dst_ip).await else {
             trace!("Dropping packet for unknown virtual IP {dst_ip} ({protocol})");
+            self.record_room_drop(
+                crate::rooms::RoomDropReason::UnknownVirtualIp,
+                "tx",
+                "",
+                &src_ip,
+                &dst_ip,
+            );
             return Ok(());
-        };
-
-        let room_authorization = match self.room_authorization.as_ref().filter(|auth| auth.enabled()) {
-            Some(auth) => match auth.send_permit(&peer_id, &dst_ip, &src_ip) {
-                Some(permit) => Some(permit),
-                None => return Ok(()),
-            },
-            None => None,
         };
 
         let routed_packet = if src_ip == self.tun.address() {
@@ -355,6 +386,25 @@ where
             }
         };
 
+        let normalized_src_ip = parsed.src_addr_string();
+        let room_authorization = match self
+            .room_authorization
+            .as_ref()
+            .filter(|auth| auth.enabled())
+        {
+            Some(auth) => match auth.send_permit(&peer_id, &dst_ip, &normalized_src_ip) {
+                Some(permit) => Some(permit),
+                None => {
+                    let reason = auth
+                        .denial_reason(&peer_id, &dst_ip, &normalized_src_ip)
+                        .unwrap_or(crate::rooms::RoomDropReason::AuthorizationChanged);
+                    auth.record_drop(reason, "tx", &peer_id, &normalized_src_ip, &dst_ip);
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+
         if !self
             .acl_allows(
                 self.local_node_id.as_deref().unwrap_or("local"),
@@ -364,6 +414,13 @@ where
             .await
         {
             warn!("ACL denied outbound {protocol} packet to peer {peer_id}");
+            self.record_room_drop(
+                crate::rooms::RoomDropReason::AclDenied,
+                "tx",
+                &peer_id,
+                &normalized_src_ip,
+                &dst_ip,
+            );
             return Ok(());
         }
 
@@ -373,7 +430,17 @@ where
             "tx_tun_to_route_ready_us",
             route_ready.duration_since(tun_read_completed),
         );
-        if room_authorization.as_ref().is_some_and(|permit| !permit.is_valid()) {
+        if room_authorization
+            .as_ref()
+            .is_some_and(|permit| !permit.is_valid())
+        {
+            self.record_room_drop(
+                crate::rooms::RoomDropReason::AuthorizationChanged,
+                "tx",
+                &peer_id,
+                &normalized_src_ip,
+                &dst_ip,
+            );
             return Ok(());
         }
         let mut routed = OutboundPacket {
@@ -404,12 +471,29 @@ where
                 .max_capacity()
                 .saturating_sub(self.outbound_tx.capacity()) as u64,
         );
-        let slot = self.outbound_tx.reserve().await
+        let slot = self
+            .outbound_tx
+            .reserve()
+            .await
             .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()))?;
-        if routed.room_authorization.as_ref().is_some_and(|permit| !permit.is_valid()) {
+        if routed
+            .room_authorization
+            .as_ref()
+            .is_some_and(|permit| !permit.is_valid())
+        {
+            self.record_room_drop(
+                crate::rooms::RoomDropReason::AuthorizationChanged,
+                "tx",
+                &peer_id,
+                &normalized_src_ip,
+                &dst_ip,
+            );
             return Ok(());
         }
         slot.send(routed);
+        if let Some(auth) = self.room_authorization.as_ref() {
+            auth.record_packet(&peer_id, false);
+        }
         let queue_wait = queue_started.elapsed();
         profiler.record(sampled, "tx_outbound_queue_wait_us", queue_wait);
         // Preserve the Phase 4 name for existing log consumers while the new
@@ -477,6 +561,13 @@ where
             return Ok(());
         }
         if dst_ip != self.tun.address() {
+            self.record_room_drop(
+                crate::rooms::RoomDropReason::UnexpectedDestination,
+                "rx",
+                &packet.peer_id,
+                &src_ip,
+                &dst_ip,
+            );
             warn!(
                 "Dropping inbound packet from peer {} for unexpected destination {}; local TUN address is {}",
                 packet.peer_id,
@@ -519,6 +610,13 @@ where
             )
             .await
         {
+            self.record_room_drop(
+                crate::rooms::RoomDropReason::AclDenied,
+                "rx",
+                &packet.peer_id,
+                &src_ip,
+                &dst_ip,
+            );
             warn!(
                 "ACL denied inbound {protocol} packet from peer {}",
                 packet.peer_id
@@ -625,6 +723,9 @@ where
             }
         }
 
+        if let Some(auth) = self.room_authorization.as_ref() {
+            auth.record_packet(&packet.peer_id, true);
+        }
         self.peers
             .record_received(&packet.peer_id, inbound_packet.len() as u64)
             .await;
@@ -662,6 +763,29 @@ where
         protocol: impl std::fmt::Display,
     ) -> Option<Vec<u8>> {
         let local_ip = self.tun.address();
+        if self
+            .room_authorization
+            .as_ref()
+            .is_some_and(|auth| auth.enabled())
+        {
+            let address = src_ip.parse::<Ipv4Addr>().ok();
+            let overlay_source = address.is_some_and(|ip| {
+                let octets = ip.octets();
+                (octets[0] == 10 && matches!(octets[1], 20 | 21))
+                    || self.overlay_v4.is_some_and(|cidr| cidr.contains(ip))
+            });
+            let reason = if overlay_source {
+                Some(crate::rooms::RoomDropReason::OverlaySourceRejected)
+            } else if address.is_none_or(|ip| !self.local_source_addresses.contains(&ip)) {
+                Some(crate::rooms::RoomDropReason::SourceNotLocal)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                self.record_room_drop(reason, "tx", "", src_ip, dst_ip);
+                return None;
+            }
+        }
         match normalize_overlay_source(packet, src_ip, local_ip, self.overlay_v4) {
             SourceNormalization::Normalized(normalized) => {
                 debug!(
@@ -676,6 +800,13 @@ where
                 None
             }
             SourceNormalization::Unsupported => {
+                self.record_room_drop(
+                    crate::rooms::RoomDropReason::SourceNormalizationFailed,
+                    "tx",
+                    "",
+                    src_ip,
+                    dst_ip,
+                );
                 warn!(
                     "Dropping outbound {protocol} packet with unexpected source IP {src_ip}; local TUN address is {local_ip}"
                 );

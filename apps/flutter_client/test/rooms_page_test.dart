@@ -168,7 +168,7 @@ DiagnosticsSnapshot _snapshot({bool stale = false, bool verified = true}) =>
       'peer_snapshot_stale': stale,
       'peers': [
         {
-          'node_id': 'remote',
+          'node_id': 'device-1',
           'device_name': '好友电脑',
           'virtual_ip': '10.21.1.3',
           'online': true,
@@ -266,6 +266,45 @@ void main() {
     }
     return api;
   }
+
+  testWidgets('room roster readdress cannot borrow an old Direct label', (
+    tester,
+  ) async {
+    final mismatched = DiagnosticsSnapshot.fromJson({
+      ..._snapshot().raw,
+      'peers': [
+        {
+          'node_id': 'device-1',
+          'virtual_ip': '10.21.1.9',
+          'device_name': '好友电脑',
+          'online': true,
+          'active_path': 'direct',
+          'state': 'direct',
+          'direct': {'latency_ms': 18, 'last_success_age_ms': 0},
+        },
+      ],
+    });
+    await pump(tester, role: 'member', snapshot: mismatched);
+    final card = find.byKey(const ValueKey('room-device-device-1'));
+    await tester.ensureVisible(card);
+    await tester.pumpAndSettle();
+    expect(find.descendant(of: card, matching: find.text('直连')), findsNothing);
+    expect(
+      find.descendant(of: card, matching: find.text('18 ms')),
+      findsNothing,
+    );
+    expect(
+      find.descendant(of: card, matching: find.text('地址待同步')),
+      findsWidgets,
+    );
+    await tester.tap(card);
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(of: find.byType(Dialog), matching: find.text('18 ms')),
+      findsNothing,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   testWidgets(
     'stable room refresh is not starved by one-second status notifications',
@@ -569,7 +608,9 @@ void main() {
   ) async {
     await pump(tester, snapshot: _snapshot(stale: true));
     expect(find.text('18 ms'), findsNothing);
-    expect(find.text('状态待更新'), findsNWidgets(2));
+    expect(find.text('状态待更新'), findsNWidgets(4));
+    expect(find.text('直连'), findsNothing);
+    expect(find.text('近期已收房间数据'), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -717,8 +758,8 @@ void main() {
     final directSnap = _snapshot(verified: true);
     await pump(tester, snapshot: directSnap, enterRoom: false);
     await tester.pumpAndSettle();
-    expect(find.text('部分连通'), findsWidgets);
-    expect(find.text('已直连'), findsNothing);
+    expect(find.text('部分链路已建立'), findsWidgets);
+    expect(find.text('直连已建立'), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
 
     // 2. Waiting for peer
@@ -740,7 +781,7 @@ void main() {
       'node_id': 'local',
       'peers': [
         {
-          'node_id': 'remote',
+          'node_id': 'device-1',
           'device_name': '好友电脑',
           'virtual_ip': '10.21.1.3',
           'online': true,
@@ -760,7 +801,7 @@ void main() {
       'node_id': 'local',
       'peers': [
         {
-          'node_id': 'remote',
+          'node_id': 'device-1',
           'device_name': '好友电脑',
           'virtual_ip': '10.21.1.3',
           'online': true,
@@ -773,7 +814,7 @@ void main() {
     });
     await pump(tester, snapshot: relaySnap, enterRoom: false);
     await tester.pumpAndSettle();
-    expect(find.text('中继可用'), findsWidgets);
+    expect(find.text('中继已建立'), findsWidgets);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -786,7 +827,7 @@ void main() {
       'node_id': 'local',
       'peers': [
         {
-          'node_id': 'remote',
+          'node_id': 'device-1',
           'online': true,
           'active_path': 'relay',
           'state': 'connecting',
@@ -795,7 +836,7 @@ void main() {
     });
     expect(snap.peers.single.isRelayVerified, isFalse);
     await pump(tester, snapshot: snap, enterRoom: false);
-    final readyLabels = find.textContaining('中继可用').evaluate().length;
+    final readyLabels = find.textContaining('中继已建立').evaluate().length;
     await tester.pumpWidget(const SizedBox.shrink());
     expect(
       readyLabels,

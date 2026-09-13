@@ -107,28 +107,57 @@ fn windows_interface_alias_eq(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_icmp_echo_rule_name(destination_prefix: &str, interface: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "p2wlan-icmpv4-v2\0{}\0{}",
+        destination_prefix,
+        interface.trim().to_ascii_lowercase()
+    );
+    format!(
+        "P2WLAN-ICMPv4-{}",
+        hex::encode(Sha256::digest(identity.as_bytes()))
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_icmp_echo_firewall_script(destination_prefix: &str, interface: &str) -> String {
+    format!(
+        "$name = '{}'\n$cidr = '{}'\n$interface = '{}'\n{}",
+        ps_quote(&windows_icmp_echo_rule_name(destination_prefix, interface)),
+        ps_quote(destination_prefix),
+        ps_quote(interface),
+        include_str!("icmp_echo.ps1"),
+    )
+}
+
 #[cfg(target_os = "windows")]
-fn windows_ensure_icmp_echo_firewall_rule(destination_prefix: &str) {
-    const RULE_NAME: &str = "p2wlan Overlay ICMPv4 Echo Request";
-    let output = windows_powershell_output(&format!(
-        "$ErrorActionPreference = 'Stop'; $name = '{}'; $cidr = '{}'; $rule = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -eq $rule) {{ New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -LocalAddress $cidr -RemoteAddress $cidr -Profile Any | Out-Null }} else {{ Enable-NetFirewallRule -DisplayName $name | Out-Null }}",
-        ps_quote(RULE_NAME),
-        ps_quote(destination_prefix)
-    ), std::time::Duration::from_secs(8));
+fn windows_ensure_icmp_echo_firewall_rule(destination_prefix: &str, interface: &str) {
+    let output = windows_powershell_output(
+        &windows_icmp_echo_firewall_script(destination_prefix, interface),
+        std::time::Duration::from_secs(8),
+    );
 
     match output {
         Ok(output) if output.status.success() => {
-            info!("Windows firewall rule ensured for ICMPv4 echo on overlay {destination_prefix}");
+            info!("Windows firewall rule ensured for ICMPv4 echo on {interface} ({destination_prefix})");
         }
         Ok(output) => {
             warn!(
-                "Could not ensure Windows firewall ICMPv4 echo rule for {destination_prefix}: {}",
+                event = "overlay_icmp_firewall_failed",
+                interface,
+                cidr = destination_prefix,
+                "Could not ensure Windows firewall ICMPv4 echo rule: {}",
                 powershell_failure_detail(&output)
             );
         }
         Err(err) => {
             warn!(
-                "Could not run Windows firewall ICMPv4 echo rule command for {destination_prefix}: {err}"
+                event = "overlay_icmp_firewall_failed",
+                interface,
+                cidr = destination_prefix,
+                "Could not run Windows firewall ICMPv4 echo rule command: {err}"
             );
         }
     }
@@ -272,7 +301,7 @@ fn command_failure_detail(output: &std::process::Output) -> String {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn ps_quote(value: &str) -> String {
     value.replace('\'', "''")
 }

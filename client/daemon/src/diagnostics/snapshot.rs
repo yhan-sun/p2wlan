@@ -68,6 +68,10 @@ async fn build_snapshot(context: DiagnosticsContext) -> DiagnosticsSnapshot {
         .min(u64::MAX as u128) as u64;
 
     DiagnosticsSnapshot {
+        room_dataplane: context
+            .room_authorization
+            .as_ref()
+            .and_then(|auth| auth.diagnostics(&context.config.network.virtual_ip)),
         version: env!("CARGO_PKG_VERSION").to_string(),
         process_id: std::process::id(),
         runtime_incarnation: context.runtime_incarnation,

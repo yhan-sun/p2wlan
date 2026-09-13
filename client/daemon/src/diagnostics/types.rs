@@ -85,6 +85,8 @@ impl MtuDiagnostics {
 /// Runtime diagnostics snapshot returned by the local endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_dataplane: Option<crate::rooms::RoomDataPlaneDiagnostics>,
     pub version: String,
     pub process_id: u32,
     /// Additive native runtime identity. Android can replace the embedded
@@ -385,6 +387,7 @@ pub struct PermissionPreflightResponse {
 /// Shared state needed to build diagnostics responses.
 #[derive(Clone)]
 pub struct DiagnosticsContext {
+    room_authorization: Option<Arc<crate::rooms::RoomAuthorization>>,
     config: Arc<Config>,
     peers: Arc<PeerManager>,
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
@@ -423,6 +426,14 @@ pub struct DiagnosticsContext {
 }
 
 impl DiagnosticsContext {
+    pub(crate) fn with_room_authorization(
+        mut self,
+        authorization: Arc<crate::rooms::RoomAuthorization>,
+    ) -> Self {
+        self.room_authorization = Some(authorization);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: Arc<Config>,
@@ -444,6 +455,7 @@ impl DiagnosticsContext {
         runtime_incarnation: Option<u64>,
     ) -> Self {
         Self {
+            room_authorization: None,
             config,
             peers,
             udp_transport,
