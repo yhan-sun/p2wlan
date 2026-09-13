@@ -2,9 +2,14 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $template = Get-Content (Join-Path $root 'client/daemon/src/route/windows/icmp_echo.ps1') -Raw
-$adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
-if ($null -eq $adapter) { throw 'No active adapter for the native firewall regression' }
-$interface = $adapter.Name
+$candidates = @(foreach ($candidate in (Get-NetIPInterface -AddressFamily IPv4 | Where-Object ConnectionState -eq 'Connected')) {
+    $addresses = @(Get-NetIPAddress -InterfaceIndex $candidate.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -ne '0.0.0.0' })
+    if ($addresses.Count -gt 0) { $candidate }
+})
+$adapter = $candidates | Sort-Object InterfaceMetric, InterfaceIndex | Select-Object -First 1
+if ($null -eq $adapter) { throw 'No connected IPv4 interface for the native firewall regression' }
+$interface = [string]$adapter.InterfaceAlias
+Write-Output "Native firewall fixture: PowerShell=$($PSVersionTable.PSVersion) interface_index=$($adapter.InterfaceIndex) alias=$interface"
 $prefix = 'P2WLAN-ICMP-Test-' + [guid]::NewGuid().ToString('N')
 $names = @("$prefix-legacy", "$prefix-a", "$prefix-b")
 
@@ -22,7 +27,14 @@ function Assert-Address($values, $expected) {
 function Ensure-TestRule($ruleName, $roomCidr) {
     $name = $ruleName
     $cidr = $roomCidr
-    & ([scriptblock]::Create($template))
+    try {
+        & ([scriptblock]::Create($template))
+    } catch {
+        Write-Output "Firewall regression failed: name=$name cidr=$cidr interface=$interface"
+        Get-NetIPInterface -AddressFamily IPv4 | Format-Table InterfaceIndex, InterfaceAlias, ConnectionState
+        Get-NetAdapter -IncludeHidden | Format-Table ifIndex, Name, Status
+        throw
+    }
 }
 
 function Assert-Rule($ruleName, $roomCidr) {
