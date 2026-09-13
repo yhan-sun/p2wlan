@@ -89,7 +89,7 @@ jobs:
       - name: Generate private loopback-only test deployment
         run: |
           set -euo pipefail
-          go run ./server/cmd/p2wlan-config/main.go --mode docker --output deploy/selfhost/config --dev-localhost
+          (cd server && go run ./cmd/p2wlan-config --mode docker --output ../deploy/selfhost/config --dev-localhost)
       - name: Build actual image and start documented Compose topology
         run: |
           set -euo pipefail
