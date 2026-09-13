@@ -16,40 +16,36 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-      - name: Verify and apply exact baseline patch
+      - name: Apply checked follow-up only to the reviewed PR head
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import base64, hashlib, lzma, os, subprocess
           from pathlib import Path
-          base = '009dac2b03a39e0fbf35dba6722380bb059d21ea'
-          data = ''.join(Path(f'.selfhost-workbench/patch.{i}').read_text(encoding='utf-8').strip() for i in range(3))
+          parent = '630ef30ab55944b1a8953fe61bd816ac422cd878'
+          data = Path('.selfhost-workbench/followup.b64').read_text(encoding='utf-8').strip()
           patch = lzma.decompress(base64.b64decode(data, validate=True))
-          assert hashlib.sha256(patch).hexdigest() == '6ab2d40ce7f30e114ba6f1a05f237fdd0e23a4971420cf3e84524fecefdfece5'
-          path = Path(os.environ['RUNNER_TEMP']) / 'selfhost-repair.patch'
+          assert hashlib.sha256(patch).hexdigest() == 'fe9d00d1f5a7a601f1bf3831907039f7345c2c0187aa85b947f4c054086ee11b'
+          path = Path(os.environ['RUNNER_TEMP']) / 'selfhost-followup.patch'
           path.write_bytes(patch)
-          subprocess.run(['git', 'checkout', '--detach', base], check=True)
+          subprocess.run(['git', 'checkout', '--detach', parent], check=True)
           subprocess.run(['git', 'apply', '--check', str(path)], check=True)
           subprocess.run(['git', 'apply', '--index', str(path)], check=True)
-          subprocess.run(['git', 'restore', '--source', base, '--staged', '--worktree', '--', '.github'], check=True)
           paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
-          allowed = ('server/', 'deploy/selfhost/', 'scripts/selfhost/', 'scripts/p2wlan-server', 'docs/self-hosting.md', 'docs/server-deployment.md', 'README.md', 'README.en.md', '.gitignore')
-          assert paths and all(p.startswith(allowed) for p in paths)
-          assert not any('.selfhost-workbench' in p for p in paths)
+          assert paths and all(p.startswith(('server/', 'docs/self-hosting.md')) for p in paths)
           subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
           subprocess.run(['git', 'diff', '--cached', '--stat'], check=True)
           PY
-      - name: Create result branch without changing main or existing branches
+      - name: Fast-forward the unchanged repair branch only
         shell: bash
         run: |
           set -euo pipefail
-          BASE=009dac2b03a39e0fbf35dba6722380bb059d21ea
+          PARENT=630ef30ab55944b1a8953fe61bd816ac422cd878
           RESULT=fix/selfhost-issue78-20260913
-          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$BASE"
-          test -z "$(git ls-remote origin refs/heads/$RESULT)"
+          test "$(git ls-remote origin refs/heads/$RESULT | cut -f1)" = "$PARENT"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat:修复自托管部署配置和服务健康检查'
+          git commit -m 'feat:修复Windows身份冲突和私有文件访问控制'
           git push origin "HEAD:refs/heads/$RESULT"
-          echo "Repair source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Follow-up source commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
