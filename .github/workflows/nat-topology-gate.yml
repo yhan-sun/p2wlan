@@ -6,6 +6,8 @@ on:
     paths:
       - ".github/workflows/path-state-machine-required.yml"
       - ".github/workflows/nat-topology-gate.yml"
+      - ".github/workflows/windows-lifecycle.yml"
+      - ".github/workflows/mobile-lifecycle.yml"
       - "scripts/nat-sim/**"
       - "scripts/diagnostics-auth.sh"
       - "client/nat/**"
