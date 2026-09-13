@@ -48,16 +48,16 @@ impl<'a> PeerUpdateLockTrace<'a> {
         peer_session_generation: Option<u64>,
         signal_context: Option<(&str, Option<u64>, &str)>,
     ) -> Self {
-        let attempt = NEXT_PEER_UPDATE_LOCK_ATTEMPT.fetch_add(
-            1,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let peer_fingerprint =
-            crate::transport::wire_fingerprint(node_id.as_bytes());
+        let attempt =
+            NEXT_PEER_UPDATE_LOCK_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let peer_fingerprint = crate::transport::wire_fingerprint(node_id.as_bytes());
         let (signal_fingerprint, signal_sequence, signal_type) = signal_context
             .map(|(signal_id, sequence, signal_type)| {
                 (
-                    format!("{:016x}", crate::transport::wire_fingerprint(signal_id.as_bytes())),
+                    format!(
+                        "{:016x}",
+                        crate::transport::wire_fingerprint(signal_id.as_bytes())
+                    ),
                     sequence.map_or_else(|| "none".to_string(), |value| value.to_string()),
                     signal_type.to_string(),
                 )
@@ -75,7 +75,12 @@ impl<'a> PeerUpdateLockTrace<'a> {
         }
     }
 
-    fn wait_started(&mut self, resource: PeerUpdateLockResource, queue: &'static str, held: &'static str) {
+    fn wait_started(
+        &mut self,
+        resource: PeerUpdateLockResource,
+        queue: &'static str,
+        held: &'static str,
+    ) {
         let index = resource.index();
         if self.wait_started[index].is_some() || self.observed_contention[index] {
             return;
@@ -120,7 +125,9 @@ impl<'a> PeerUpdateLockTrace<'a> {
             None,
             Some(resource.name()),
             Some(format!(
-                "{} resource={} phase=fair_writer_queue_probe_acquired", self.context, resource.name()
+                "{} resource={} phase=fair_writer_queue_probe_acquired",
+                self.context,
+                resource.name()
             )),
         );
     }
@@ -131,7 +138,9 @@ impl<'a> PeerUpdateLockTrace<'a> {
             None,
             Some(resource.name()),
             Some(format!(
-                "{} resource={} phase=fair_writer_queue_probe_released", self.context, resource.name()
+                "{} resource={} phase=fair_writer_queue_probe_released",
+                self.context,
+                resource.name()
             )),
         );
     }
@@ -148,14 +157,20 @@ impl<'a> PeerUpdateLockTrace<'a> {
                 None,
                 Some(resource.name()),
                 Some(format!(
-                    "{} resource={} phase=released", self.context, resource.name()
+                    "{} resource={} phase=released",
+                    self.context,
+                    resource.name()
                 )),
             );
         }
     }
 
     fn emit_peer_update_phase(&self, event: &'static str, phase: &'static str) {
-        if !self.observed_contention.into_iter().any(|observed| observed) {
+        if !self
+            .observed_contention
+            .into_iter()
+            .any(|observed| observed)
+        {
             return;
         }
         self.manager.emit_timeline(
@@ -334,8 +349,7 @@ type PeerMembershipPublishTestGateSlot =
     std::sync::Mutex<Option<(String, Arc<PeerMembershipPublishTestGate>)>>;
 
 #[cfg(test)]
-fn peer_membership_publish_test_gate_slot(
-) -> &'static PeerMembershipPublishTestGateSlot {
+fn peer_membership_publish_test_gate_slot() -> &'static PeerMembershipPublishTestGateSlot {
     static SLOT: std::sync::OnceLock<PeerMembershipPublishTestGateSlot> =
         std::sync::OnceLock::new();
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
@@ -912,7 +926,7 @@ impl PeerManager {
         // first offer of the replacement incarnation fail with `Busy`.
         // `reset_for_peer_session` retains the remote candidate high-water and
         // replay floor, which must continue fencing delayed old signals.
-        if was_offline && info.online && !public_key_changed {
+        if ((was_offline && info.online) || virtual_ip_changed) && !public_key_changed {
             conn.reset_for_peer_session();
             cancel_heartbeat_after_lock = true;
             clear_hard_hard_after_lock = true;
@@ -1159,7 +1173,8 @@ impl PeerManager {
         // work without mistaking an in-progress PeerJoined for a ready peer.
         // Rotate the process-local generation only at a structural, identity,
         // or online lifecycle boundary; metadata and endpoint churn retain it.
-        let rotate_peer_session = is_new || public_key_changed || old_online != info.online;
+        let rotate_peer_session =
+            is_new || public_key_changed || virtual_ip_changed || old_online != info.online;
         let published_generation = self
             .peer_membership
             .lock()
@@ -1208,7 +1223,8 @@ impl PeerManager {
             self.unquarantine_peer(&info.node_id, reason).await;
         }
         if let Some(reason) = recovery_reopen_reason_after_lock {
-            self.recovery_reopen_on_evidence(&info.node_id, reason).await;
+            self.recovery_reopen_on_evidence(&info.node_id, reason)
+                .await;
         }
         lock_trace.emit_peer_update_phase(
             "peer_update_postcommit_cleanup_completed",
@@ -1233,7 +1249,7 @@ impl PeerManager {
     /// supersedes the old one anyway.  Only a public-key / identity change
     /// resets the fresh space.
     pub async fn remove_peer(&self, node_id: &str) {
-        let (removed_virtual_ip, removed_relay_expectation) = {
+        let removed_relay_expectation = {
             let dplpmtud_runtime = self.dplpmtud_runtime.read().await.clone();
             let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
             // PeerLeft is an authoritative quarantine lifecycle boundary.
@@ -1279,17 +1295,23 @@ impl PeerManager {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
-            let removed_virtual_ip = conns.remove(node_id).map(|conn| conn.virtual_ip);
+            if let Some(removed) = conns.remove(node_id) {
+                let mut ip_map = self.ip_to_node.write().await;
+                if ip_map
+                    .get(&removed.virtual_ip)
+                    .is_some_and(|owner| owner == node_id)
+                {
+                    ip_map.remove(&removed.virtual_ip);
+                    self.ip_to_node_snapshot
+                        .send_replace(Arc::new(ip_map.clone()));
+                }
+            }
             self.committed_business_paths
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id);
             if let Some(runtime) = dplpmtud_runtime {
-                runtime.cancel_peer(
-                    node_id,
-                    "peer_left",
-                    tokio::time::Instant::now(),
-                );
+                runtime.cancel_peer(node_id, "peer_left", tokio::time::Instant::now());
             }
             // PeerLeft is a terminal boundary for the current peer session.
             // Cancel the forced-relay token while the same epoch gate covers
@@ -1301,7 +1323,7 @@ impl PeerManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(node_id)
                 .is_some();
-            (removed_virtual_ip, removed_relay_expectation)
+            removed_relay_expectation
         };
         if removed_relay_expectation {
             self.emit_timeline(
@@ -1310,12 +1332,6 @@ impl PeerManager {
                 Some("peer_removed"),
                 Some(format!("peer={node_id}")),
             );
-        }
-        if let Some(virtual_ip) = removed_virtual_ip {
-            let mut ip_map = self.ip_to_node.write().await;
-            ip_map.remove(&virtual_ip);
-            self.ip_to_node_snapshot
-                .send_replace(Arc::new(ip_map.clone()));
         }
         self.cancel_relay_backoff_heartbeat(node_id);
         self.clear_relay_not_found_grace(node_id).await;
@@ -1337,10 +1353,7 @@ impl PeerManager {
 
     /// Look up the node ID for a virtual IP.
     pub async fn resolve_virtual_ip(&self, virtual_ip: &str) -> Option<String> {
-        self.ip_to_node_snapshot
-            .borrow()
-            .get(virtual_ip)
-            .cloned()
+        self.ip_to_node_snapshot.borrow().get(virtual_ip).cloned()
     }
 
     /// Update a peer's connection state.
@@ -1487,12 +1500,7 @@ impl PeerManager {
         } else {
             PathEvent::DirectRetryScheduled { epoch, attempt }
         };
-        if conn.commit_path_transition(
-            event,
-            |_| {},
-        )
-        .accepted()
-        {
+        if conn.commit_path_transition(event, |_| {}).accepted() {
             HolePunchStartOutcome::Started
         } else {
             HolePunchStartOutcome::Stale

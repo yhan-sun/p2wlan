@@ -19,17 +19,17 @@ void main() {
       peer('connecting'),
       peer('direct', online: false),
     ]);
-    expect(partial.label, '部分连通');
-    expect(partial.reachable, 2);
+    expect(partial.label, '部分链路已建立');
+    expect(partial.established, 2);
     expect(partial.online, 3);
     expect(partial.offline, 1);
-    expect(partial.details, contains('直连 1 / 中继 1 / 未连通 1'));
+    expect(partial.details, contains('直连 1 / 中继 1 / 待建链 1'));
     expect(
       RoomConnectivitySummary.fromPeers([peer('direct'), peer('relay')]).label,
       '直连与中继',
     );
-    expect(RoomConnectivitySummary.fromPeers([peer('direct')]).label, '已直连');
-    expect(RoomConnectivitySummary.fromPeers([peer('relay')]).label, '中继可用');
+    expect(RoomConnectivitySummary.fromPeers([peer('direct')]).label, '直连已建立');
+    expect(RoomConnectivitySummary.fromPeers([peer('relay')]).label, '中继已建立');
   });
   test('online presence does not imply a usable path', () {
     final unverified = PeerSnapshot.fromJson({
@@ -37,7 +37,7 @@ void main() {
       'active_path': 'relay',
       'state': 'connecting',
     });
-    expect(RoomConnectivitySummary.fromPeers([unverified]).reachable, 0);
+    expect(RoomConnectivitySummary.fromPeers([unverified]).established, 0);
     expect(RoomConnectivitySummary.fromPeers([unverified]).label, '建立加密会话');
     expect(
       RoomConnectivitySummary.fromPeers([peer('hole_punching')]).label,

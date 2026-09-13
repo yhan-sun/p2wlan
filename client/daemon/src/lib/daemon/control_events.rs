@@ -234,9 +234,7 @@ impl Daemon {
             "remote_incarnation_handshake_restart_kicked",
             None,
             Some("peer_session_generation_rotated"),
-            Some(format!(
-                "peer={peer_id} incarnation={claimed_incarnation}"
-            )),
+            Some(format!("peer={peer_id} incarnation={claimed_incarnation}")),
         );
     }
 
@@ -448,10 +446,7 @@ impl Daemon {
                 .finish_remote_incarnation_reset(peer_id, claimed_incarnation);
             drop(udp_slot);
             if changed {
-                self.kick_handshake_after_remote_incarnation_rotation(
-                    peer_id,
-                    claimed_incarnation,
-                );
+                self.kick_handshake_after_remote_incarnation_rotation(peer_id, claimed_incarnation);
             }
             return if changed {
                 RemoteIncarnationResetOutcome::Changed
@@ -576,10 +571,7 @@ impl Daemon {
         }
         drop(udp_slot);
         if changed {
-            self.kick_handshake_after_remote_incarnation_rotation(
-                peer_id,
-                claimed_incarnation,
-            );
+            self.kick_handshake_after_remote_incarnation_rotation(peer_id, claimed_incarnation);
             RemoteIncarnationResetOutcome::Changed
         } else {
             RemoteIncarnationResetOutcome::RejectedLifecycle
@@ -838,8 +830,13 @@ impl Daemon {
                 return false;
             }
             let recorded_key = self.peers.peer_identity_recorded_public_key_sync(peer_id);
-            if let (Some(recorded), Some(expected)) = (recorded_key.as_deref(), expected_sender_public_key) {
-                if !expected.trim().is_empty() && !recorded.trim().is_empty() && expected.trim() != recorded.trim() {
+            if let (Some(recorded), Some(expected)) =
+                (recorded_key.as_deref(), expected_sender_public_key)
+            {
+                if !expected.trim().is_empty()
+                    && !recorded.trim().is_empty()
+                    && expected.trim() != recorded.trim()
+                {
                     debug!(
                         "Rejecting peer offer from {peer_id}: sender key {expected} does not match recorded key {recorded}"
                     );
@@ -963,9 +960,7 @@ impl Daemon {
                 return false;
             }
             if self.peers.current_network_generation_sync() != offer.network_generation
-                || self
-                    .peers
-                    .peer_session_generation_sync(&offer.from_node_id)
+                || self.peers.peer_session_generation_sync(&offer.from_node_id)
                     != offer.peer_session_generation
             {
                 if let (Some(started), Some(resource)) = (wait_started, wait_resource) {
@@ -1068,7 +1063,10 @@ impl Daemon {
                     )),
                 );
             }
-            return !matches!(outcome, HolePunchStartOutcome::Stale | HolePunchStartOutcome::PeerMissing);
+            return !matches!(
+                outcome,
+                HolePunchStartOutcome::Stale | HolePunchStartOutcome::PeerMissing
+            );
         }
     }
 
@@ -1976,10 +1974,9 @@ impl Daemon {
                 let terminal = match peer_entry {
                     None => true,
                     Some(peer)
-                        if offer
-                            .sender_public_key
-                            .as_deref()
-                            .is_some_and(|k| !k.trim().is_empty() && k.trim() != peer.public_key.trim()) =>
+                        if offer.sender_public_key.as_deref().is_some_and(|k| {
+                            !k.trim().is_empty() && k.trim() != peer.public_key.trim()
+                        }) =>
                     {
                         true
                     }
@@ -2261,20 +2258,21 @@ impl Daemon {
                     offer.sender_public_key.as_deref(),
                 )
                 .await;
-            let (_fresh_verdict, candidate_apply_result, fresh_punch) =
-                if ingress == OfferIngressVerdict::Apply {
-                    if matches!(
-                        fresh_prediction_from_sources(&offer.candidate_sources),
-                        Ok(None)
-                    ) {
-                        // Ordinary candidate revisions are the common cold-start
-                        // path. Never hold the epoch while queueing a connection
-                        // writer: the bounded candidate owner already retains the
-                        // exact payload and can retry without blocking RelayReady,
-                        // confirmation, status, or the responder receipt.
-                        let mut apply_retry_attempt = 0u8;
-                        let apply_result = loop {
-                            match self
+            let (_fresh_verdict, candidate_apply_result, fresh_punch) = if ingress
+                == OfferIngressVerdict::Apply
+            {
+                if matches!(
+                    fresh_prediction_from_sources(&offer.candidate_sources),
+                    Ok(None)
+                ) {
+                    // Ordinary candidate revisions are the common cold-start
+                    // path. Never hold the epoch while queueing a connection
+                    // writer: the bounded candidate owner already retains the
+                    // exact payload and can retry without blocking RelayReady,
+                    // confirmation, status, or the responder receipt.
+                    let mut apply_retry_attempt = 0u8;
+                    let apply_result = loop {
+                        match self
                                 .peers
                                 .try_add_candidates_with_metadata_for_identity(
                                     &peer_id,
@@ -2334,62 +2332,62 @@ impl Daemon {
                                     }
                                 }
                             }
-                        };
-                        (
-                            FreshSignalVerdict::None,
-                            apply_result,
-                            FreshPunchDecision::None,
-                        )
-                    } else {
-                        let mut fresh_retry_attempt = 0u8;
-                        loop {
-                            let result = self
-                                .fresh_prediction_transaction(
-                                    &peer_id,
-                                    &offer.candidates,
-                                    &offer.candidate_sources,
-                                    offer.candidate_generation,
-                                    offer.candidates_expires_at_ms,
-                                    offer.sender_public_key.as_deref(),
-                                    true,
-                                )
-                                .await;
-                            if result.0 != FreshSignalVerdict::Contended {
-                                break result;
-                            }
-                            if let Some(newest) = self
-                                .pending_handshakes
-                                .lock()
-                                .take_queued_candidate_offer_work(&peer_id, reservation.owner)
-                            {
-                                offer = newest;
-                                continue 'work;
-                            }
-                            fresh_retry_attempt = fresh_retry_attempt.saturating_add(1);
-                            let delay = responder_offer_retry_delay(fresh_retry_attempt);
-                            self.timeline.emit(
-                                "peer_offer_fresh_candidate_retry",
-                                None,
-                                Some("fresh_transaction_contended"),
-                                Some(format!(
-                                    "peer={} owner={} retry_attempt={} delay_ms={}",
-                                    peer_id,
-                                    reservation.owner,
-                                    fresh_retry_attempt,
-                                    delay.as_millis()
-                                )),
-                            );
-                            tokio::select! {
-                                _ = sleep(delay) => {}
-                                changed = reservation.cancellation.changed() => {
-                                    let _ = changed;
-                                    return;
-                                }
+                    };
+                    (
+                        FreshSignalVerdict::None,
+                        apply_result,
+                        FreshPunchDecision::None,
+                    )
+                } else {
+                    let mut fresh_retry_attempt = 0u8;
+                    loop {
+                        let result = self
+                            .fresh_prediction_transaction(
+                                &peer_id,
+                                &offer.candidates,
+                                &offer.candidate_sources,
+                                offer.candidate_generation,
+                                offer.candidates_expires_at_ms,
+                                offer.sender_public_key.as_deref(),
+                                true,
+                            )
+                            .await;
+                        if result.0 != FreshSignalVerdict::Contended {
+                            break result;
+                        }
+                        if let Some(newest) = self
+                            .pending_handshakes
+                            .lock()
+                            .take_queued_candidate_offer_work(&peer_id, reservation.owner)
+                        {
+                            offer = newest;
+                            continue 'work;
+                        }
+                        fresh_retry_attempt = fresh_retry_attempt.saturating_add(1);
+                        let delay = responder_offer_retry_delay(fresh_retry_attempt);
+                        self.timeline.emit(
+                            "peer_offer_fresh_candidate_retry",
+                            None,
+                            Some("fresh_transaction_contended"),
+                            Some(format!(
+                                "peer={} owner={} retry_attempt={} delay_ms={}",
+                                peer_id,
+                                reservation.owner,
+                                fresh_retry_attempt,
+                                delay.as_millis()
+                            )),
+                        );
+                        tokio::select! {
+                            _ = sleep(delay) => {}
+                            changed = reservation.cancellation.changed() => {
+                                let _ = changed;
+                                return;
                             }
                         }
                     }
-                } else {
-                    self.peers
+                }
+            } else {
+                self.peers
                         .record_direct_event(
                             &peer_id,
                             "peer_offer_ingress_suppressed",
@@ -2401,20 +2399,19 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    (
-                        FreshSignalVerdict::None,
-                        CandidateSetApplyResult::IgnoredStale,
-                        FreshPunchDecision::None,
-                    )
-                };
+                (
+                    FreshSignalVerdict::None,
+                    CandidateSetApplyResult::IgnoredStale,
+                    FreshPunchDecision::None,
+                )
+            };
             if !offer.handshake_init.is_empty() {
                 self.peers
                     .recovery_reopen_on_evidence(&peer_id, "authenticated_peer_offer")
                     .await;
             }
             #[cfg(test)]
-            let postprocess_test_gate =
-                self.pause_candidate_postprocess_for_test(&peer_id).await;
+            let postprocess_test_gate = self.pause_candidate_postprocess_for_test(&peer_id).await;
             self.apply_deferred_peer_offer_punch_for_candidate_work(
                 &offer,
                 candidate_apply_result,
@@ -3191,11 +3188,24 @@ impl Daemon {
                         match event {
                     ControlEvent::Registered {
                         node_id,
-                        virtual_ip: _,
-                        cidr: _,
+                        virtual_ip,
+                        cidr,
                         relay_servers,
                         relay_catalog,
                     } => {
+                        if crate::rooms::registration_requires_room_restart(
+                            &self.config,
+                            node_id.as_deref(),
+                            &virtual_ip,
+                            cidr.as_deref(),
+                        ) {
+                            self.control.room_authorization().await.invalidate();
+                            self.timeline.emit("room_assignment_changed", None, Some("room_restart_required"),
+                                Some("Room address or identity changed; reconnect this room to rebuild its TUN and routes".into()));
+                            warn!("Room assignment changed; stopping this room daemon instead of retaining the old TUN address");
+                            self.shutdown_tx.send_replace(true);
+                            break;
+                        }
                         self.health.mark_control_success().await;
                         if !*relay_started {
                             let relay_node_id =
@@ -3474,6 +3484,7 @@ impl Daemon {
                             Some(previous_generation)
                                 if !peer_info.online
                                     || update.public_key_changed
+                                    || update.virtual_ip_changed
                                     || peer_rejoined =>
                             {
                                 self.punch_attempts
@@ -3543,12 +3554,14 @@ impl Daemon {
                             }
                             continue;
                         }
-                        if update.public_key_changed || peer_rejoined {
+                        if update.public_key_changed || peer_rejoined || update.virtual_ip_changed {
                             remove_deferred_initiator_handshake(
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
                             );
-                            let (reason, caller) = if peer_rejoined {
+                            let (reason, caller) = if update.virtual_ip_changed {
+                                ("peer_address_changed", "control_events.peer_updated_address")
+                            } else if peer_rejoined {
                                 ("peer_rejoined", "control_events.peer_updated_rejoined")
                             } else {
                                 (
@@ -3567,7 +3580,9 @@ impl Daemon {
                                     caller,
                                 )
                                 .await;
-                            if peer_rejoined {
+                            if update.virtual_ip_changed {
+                                info!("Peer {} address changed; discarded the old WireGuard session", peer_info.node_id);
+                            } else if peer_rejoined {
                                 info!(
                                     "Peer {} rejoined after going offline; discarded the old WireGuard session and UDP lifecycle",
                                     peer_info.node_id
@@ -3621,7 +3636,7 @@ impl Daemon {
                                 )
                                 .await;
                         }
-                        if was_offline || update.public_key_changed || update.endpoint_changed {
+                        if was_offline || update.public_key_changed || update.virtual_ip_changed || update.endpoint_changed {
                             // A peer that comes back online or whose endpoint changed has lost its copy of
                             // our candidate snapshot. Replay it even when our
                             // local snapshot/hash is unchanged; waiting for the

@@ -23,3 +23,4 @@ include!("tests/part16.rs");
 include!("tests/part17.rs");
 include!("tests/part18.rs");
 include!("tests/part19.rs");
+include!("tests/room_connectivity.rs");

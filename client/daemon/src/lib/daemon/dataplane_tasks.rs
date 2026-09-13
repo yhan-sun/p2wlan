@@ -4,6 +4,21 @@ impl Daemon {
         tun: Option<TunDevice>,
         network_inbound_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
     ) {
+        let local_sources = if self.config.network.network_id.starts_with("room-") {
+            tokio::task::spawn_blocking(|| {
+                p2pnet_nat::gather_local_addresses()
+                    .into_iter()
+                    .filter_map(|ip| match ip {
+                        std::net::IpAddr::V4(ip) => Some(ip),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if let Some(tun) = tun {
             let peers = self.peers.clone();
             let transport = self.transport.clone();
@@ -11,7 +26,8 @@ impl Daemon {
             let mut dataplane = dataplane
                 .with_acl(self.acl.clone(), self.config.node.node_id.clone())
                 .with_overlay_cidr(&self.config.network.cidr)
-                .with_room_authorization(self.control.room_authorization().await);
+                .with_room_authorization(self.control.room_authorization().await)
+                .with_local_source_addresses(local_sources);
 
             let outbound_transport = transport.clone();
             self.task_manager
@@ -61,13 +77,15 @@ impl Daemon {
             let local_vip = self.config.network.virtual_ip.clone();
             let interface_name = self.config.network.interface.clone();
             let mtu = self.config.network.mtu;
-            let (tun, controller) = p2pnet_tun::mock::MockTunDevice::new_pair(&interface_name, mtu, &local_vip);
+            let (tun, controller) =
+                p2pnet_tun::mock::MockTunDevice::new_pair(&interface_name, mtu, &local_vip);
             let (dataplane, outbound_rx, inbound_tx) =
                 DataPlane::new_bidirectional(tun, peers.clone());
             let mut dataplane = dataplane
                 .with_acl(self.acl.clone(), self.config.node.node_id.clone())
                 .with_overlay_cidr(&self.config.network.cidr)
-                .with_room_authorization(self.control.room_authorization().await);
+                .with_room_authorization(self.control.room_authorization().await)
+                .with_local_source_addresses(local_sources);
 
             let outbound_transport = transport.clone();
             self.task_manager
@@ -161,6 +179,5 @@ impl Daemon {
                 )
                 .await;
         }
-
     }
 }

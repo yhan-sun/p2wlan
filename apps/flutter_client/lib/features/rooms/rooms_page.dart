@@ -331,7 +331,7 @@ class _RoomsPageState extends State<RoomsPage> {
     }
 
     if (currentSnapshot.peerSnapshotStale) return '状态待更新';
-    return RoomConnectivitySummary.fromPeers(currentSnapshot.peers).label;
+    return RoomConnectivitySummary.fromSnapshot(currentSnapshot).label;
   }
 
   String _message(Object error) =>
@@ -988,7 +988,7 @@ class _RoomsPageState extends State<RoomsPage> {
                   Text(
                     snapshot.peerSnapshotStale
                         ? '链路信息待更新'
-                        : RoomConnectivitySummary.fromPeers(snapshot.peers)
+                        : RoomConnectivitySummary.fromSnapshot(snapshot)
                               .details,
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
@@ -1027,7 +1027,16 @@ class _RoomsPageState extends State<RoomsPage> {
     }
     final latencies =
         snapshot.peers
-            .where((p) => ips.contains(p.virtualIp))
+            .where(
+              (p) =>
+                  ips.contains(p.virtualIp) &&
+                  (roster?.devices.any(
+                        (device) =>
+                            device['user_id'] == room.ownerId &&
+                            roomPeerForDevice(device, [p]) != null,
+                      ) ??
+                      false),
+            )
             .map((p) => p.latencyMs)
             .whereType<int>()
             .toList()
@@ -1054,19 +1063,9 @@ class _RoomsPageState extends State<RoomsPage> {
     DiagnosticsSnapshot? snapshot,
     List<PeerSnapshot> peers,
   ) {
-    final ip = device['virtual_ip'];
-    if (snapshot != null &&
-        ip is String &&
-        ip.isNotEmpty &&
-        ip == snapshot.virtualIp) {
-      return true;
-    }
-    for (final peer in peers) {
-      if (peer.nodeId == device['node_id'] ||
-          (ip is String && ip.isNotEmpty && peer.virtualIp == ip)) {
-        return peer.online;
-      }
-    }
+    if (roomDeviceIsSnapshotLocal(device, snapshot)) return true;
+    final peer = roomPeerForDevice(device, peers);
+    if (peer != null) return peer.online;
     return device['online'] == true;
   }
 
@@ -1118,7 +1117,7 @@ class _RoomsPageState extends State<RoomsPage> {
     for (final peer in peers) {
       if (!devices.any(
         (d) =>
-            d['node_id'] == peer.nodeId ||
+            roomDeviceNodeId(d) == peer.nodeId ||
             (peer.virtualIp.isNotEmpty && d['virtual_ip'] == peer.virtualIp),
       )) {
         devices.add({
@@ -1131,7 +1130,11 @@ class _RoomsPageState extends State<RoomsPage> {
     }
     if (snapshot != null &&
         snapshot.virtualIp.isNotEmpty &&
-        !devices.any((d) => d['virtual_ip'] == snapshot.virtualIp)) {
+        !devices.any(
+          (d) =>
+              roomDeviceNodeId(d) == snapshot.nodeId ||
+              d['virtual_ip'] == snapshot.virtualIp,
+        )) {
       devices.insert(0, {
         'node_id': snapshot.nodeId,
         'device_name': widget.settingsStore.settings.deviceName,
@@ -1188,7 +1191,6 @@ class _RoomsPageState extends State<RoomsPage> {
           final peers = snapshot != null && !snapshot.peerSnapshotStale
               ? snapshot.peers
               : <PeerSnapshot>[];
-          final ip = device['virtual_ip'] as String? ?? '';
           final candidates =
               _rosters[room.id]?.devices ?? <Map<String, dynamic>>[];
           var current = device;
@@ -1198,17 +1200,8 @@ class _RoomsPageState extends State<RoomsPage> {
               break;
             }
           }
-          PeerSnapshot? peer;
-          for (final candidate in peers) {
-            if (candidate.nodeId == current['node_id'] ||
-                (ip.isNotEmpty &&
-                    candidate.virtualIp == current['virtual_ip'])) {
-              peer = candidate;
-              break;
-            }
-          }
-          final local =
-              snapshot != null && current['virtual_ip'] == snapshot.virtualIp;
+          final peer = roomPeerForDevice(current, peers);
+          final local = roomDeviceIsSnapshotLocal(current, snapshot);
           final available = _sameSession && _rooms.any((r) => r.id == room.id);
           final user = current['user_id'] as String? ?? '';
           return DeviceDetailsDialog(
@@ -1219,7 +1212,7 @@ class _RoomsPageState extends State<RoomsPage> {
             contextHeader: Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                '${room.name} · ${user == room.ownerId ? '房主' : '成员'} · ${_memberLabel(user)}',
+                '${room.name} · ${user == room.ownerId ? '房主' : '成员'} · ${_memberLabel(user)}\n房间数据：${roomDeviceDataLabel(current, snapshot)}\n链路与收包状态不代表系统 ping 一定可达。',
               ),
             ),
             content: !available
@@ -1270,15 +1263,12 @@ class _RoomsPageState extends State<RoomsPage> {
     final ip = device['virtual_ip'] as String? ?? '';
     final local =
         _isLocalDevice(room, device) ||
-        (snapshot != null && ip.isNotEmpty && ip == snapshot.virtualIp);
-    PeerSnapshot? peer;
-    for (final candidate in peers) {
-      if (candidate.nodeId == device['node_id'] ||
-          (ip.isNotEmpty && candidate.virtualIp == ip)) {
-        peer = candidate;
-        break;
-      }
-    }
+        roomDeviceIsSnapshotLocal(device, snapshot);
+    final peer = roomPeerForDevice(device, peers);
+    final mappingMismatch =
+        snapshot != null &&
+        !snapshot.peerSnapshotStale &&
+        roomDeviceMappingMismatch(device, peers);
     final access = _accessFor(room, device);
     final state = access?['state'] as String? ?? 'allowed';
     final online = state == 'allowed' && _deviceOnline(device, snapshot, peers);
@@ -1290,6 +1280,8 @@ class _RoomsPageState extends State<RoomsPage> {
         ? '本机未连接'
         : snapshot.peerSnapshotStale
         ? '状态待更新'
+        : mappingMismatch
+        ? '地址待同步'
         : peer == null
         ? (online ? '等待发现' : '离线')
         : switch (peer.path) {
@@ -1469,6 +1461,7 @@ class _RoomsPageState extends State<RoomsPage> {
                     ),
                   ),
                   _deviceMetric('连接', path),
+                  _deviceMetric('房间数据', roomDeviceDataLabel(device, snapshot)),
                   SizedBox(
                     width: 110,
                     child: Column(
@@ -1564,7 +1557,7 @@ class _RoomsPageState extends State<RoomsPage> {
                   Text('本机 IP：${snapshot.virtualIp}'),
                   if (!snapshot.peerSnapshotStale)
                     Text(
-                      RoomConnectivitySummary.fromPeers(snapshot.peers).details,
+                      RoomConnectivitySummary.fromSnapshot(snapshot).details,
                     ),
                 ],
                 if (connection?.message case final message?) ...[
