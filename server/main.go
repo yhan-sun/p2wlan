@@ -43,13 +43,20 @@ func main() {
 	log.Println("P2PNet Control Server starting...")
 
 	// Configuration
-	port := getEnv("PORT", "8080")
+	bind, err := controlBindAddress()
+	if err != nil {
+		log.Fatalf("Invalid control listener configuration: %v", err)
+	}
 	dbPath := getEnv("DB_PATH", "p2pnet.db")
 	jwtSecret := getEnv("JWT_SECRET", "")
 	if jwtSecret == "" {
 		// In production, JWT_SECRET must be explicitly set.
 		// For testing with smoke scripts, use JWT_SECRET=smoke.
 		log.Fatal("JWT_SECRET environment variable is required. Set JWT_SECRET=smoke for testing.")
+	}
+
+	if _, err := api.NewServerFromEnv(nil, nil, nil); err != nil {
+		log.Fatalf("Invalid control configuration: %v", err)
 	}
 
 	// Initialize database
@@ -70,7 +77,10 @@ func main() {
 	defer hub.Close()
 
 	// Initialize API server
-	apiServer := api.NewServer(authService, hub, db)
+	apiServer, err := api.NewServerFromEnv(authService, hub, db)
+	if err != nil {
+		log.Fatalf("Invalid control configuration: %v", err)
+	}
 
 	// HTTP mux
 	mux := http.NewServeMux()
@@ -100,7 +110,7 @@ func main() {
 	registerDeviceControlRoutes(mux, authService, db, apiServer, hub)
 
 	// HTTP server
-	addr := fmt.Sprintf(":%s", port)
+	addr := bind
 	// Wrap with body size limiter middleware (1MB max)
 	limitedMux := withCORS(limitBodySize(mux))
 

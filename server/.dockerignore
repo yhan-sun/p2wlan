@@ -1,0 +1,17 @@
+dist/
+*.db
+*.db-*
+*.sqlite*
+*.pem
+*.key
+*.p12
+.env
+*.env
+config/
+data/
+log-uploads/
+*.tar.gz
+*.zip
+p2wlan-control
+p2wlan-relay
+p2wlan-config

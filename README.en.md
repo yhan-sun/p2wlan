@@ -240,6 +240,8 @@ P2WLAN uses a self-contained **WireGuard-like Noise** data plane with X25519, Ch
 
 ## Self-hosting
 
+For complete configuration, Windows native operation and Docker Compose, see the [self-hosting guide](docs/self-hosting.md) (Chinese).
+
 The Control Plane and Relay live under [`server/`](server/). Linux CLI / daemon components are part of the Rust workspace. A minimal build from the repository root is:
 
 ```bash

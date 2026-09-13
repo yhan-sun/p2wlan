@@ -240,6 +240,8 @@ P2WLAN 使用自包含的 **WireGuard-like Noise** 数据面，并使用 X25519�
 
 ## 自托管
 
+新机器的完整配置、Windows 原生与 Docker Compose 示例见 [自托管入门](docs/self-hosting.md)。
+
 Control Plane 和 Relay 位于 [`server/`](server/)；Linux CLI / daemon 位于 Rust workspace。最小构建可以从仓库根目录执行：
 
 ```bash

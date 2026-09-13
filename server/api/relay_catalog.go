@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -44,23 +45,14 @@ func (d *RelayDescriptor) Validate() error {
 		return fmt.Errorf("relay descriptor endpoint is required")
 	}
 
-	// Validate endpoint scheme
 	ep := strings.TrimSpace(d.Endpoint)
 	if strings.HasPrefix(ep, "tls://") {
-		hostPort := strings.TrimPrefix(ep, "tls://")
-		if _, _, err := net.SplitHostPort(hostPort); err != nil {
-			return fmt.Errorf("relay descriptor endpoint %q: invalid host:port: %w", ep, err)
-		}
-	} else if strings.HasPrefix(ep, "tcp://") {
-		hostPort := strings.TrimPrefix(ep, "tcp://")
-		if _, _, err := net.SplitHostPort(hostPort); err != nil {
-			return fmt.Errorf("relay descriptor endpoint %q: invalid host:port: %w", ep, err)
-		}
+		ep = strings.TrimPrefix(ep, "tls://")
 	} else {
-		// Legacy: bare host:port is treated as tcp:// for backward compat
-		if _, _, err := net.SplitHostPort(ep); err != nil {
-			return fmt.Errorf("relay descriptor endpoint %q: must use tls://host:port or tcp://host:port", ep)
-		}
+		ep = strings.TrimPrefix(ep, "tcp://")
+	}
+	if err := validateRelayHostPort(ep); err != nil {
+		return fmt.Errorf("relay descriptor endpoint: %w", err)
 	}
 
 	if err := validateUDPObserverEndpoint("udp_observer_endpoint", d.UDPObserverEndpoint); err != nil {
@@ -83,9 +75,10 @@ func validateUDPObserverEndpoint(field string, endpoint string) error {
 	if strings.HasPrefix(observer, "udp://") {
 		observer = strings.TrimPrefix(observer, "udp://")
 	}
-	if _, _, err := net.SplitHostPort(observer); err != nil {
-		return fmt.Errorf("relay descriptor %s %q: invalid host:port: %w", field, endpoint, err)
+	if err := validateRelayHostPort(observer); err != nil {
+		return fmt.Errorf("relay descriptor %s: %w", field, err)
 	}
+
 	return nil
 }
 
@@ -93,6 +86,9 @@ func validateUDPObserverEndpoint(field string, endpoint string) error {
 // endpoints are prefixed with tcp:// for backward compatibility.
 func (d *RelayDescriptor) NormalizeEndpoint() {
 	ep := strings.TrimSpace(d.Endpoint)
+	d.Endpoint = ep
+	d.Region = strings.TrimSpace(d.Region)
+	d.Audience = strings.TrimSpace(d.Audience)
 	if !strings.HasPrefix(ep, "tls://") && !strings.HasPrefix(ep, "tcp://") {
 		d.Endpoint = "tcp://" + ep
 	}
@@ -284,4 +280,19 @@ var urlParse = url.Parse
 
 func init() {
 	_ = urlParse // suppress unused warning
+}
+
+func validateRelayHostPort(endpoint string) error {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil || strings.TrimSpace(host) == "" || strings.ContainsAny(host, " /\\?#@\t\r\n") {
+		return fmt.Errorf("expected a non-empty host and numeric port")
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return fmt.Errorf("advertised address must not be a wildcard")
+	}
+	return nil
 }

@@ -1,0 +1,47 @@
+name: p2wlan-selfhost
+services:
+  control:
+    build:
+      context: ../../server
+    image: p2wlan-selfhost:local
+    user: "${P2WLAN_UID:-10001}:${P2WLAN_GID:-10001}"
+    env_file: ./config/control.env
+    ports:
+      - "127.0.0.1:${CONTROL_PORT:-18080}:${CONTROL_PORT:-18080}"
+    volumes:
+      - ./config/data:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:$$PORT/health" >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+  relay:
+    build:
+      context: ../../server
+    image: p2wlan-selfhost:local
+    entrypoint: [/usr/local/bin/p2wlan-relay]
+    user: "${P2WLAN_UID:-10001}:${P2WLAN_GID:-10001}"
+    env_file: ./config/relay.env
+    ports:
+      - "${RELAY_PUBLISH_HOST:-127.0.0.1}:${RELAY_PORT:-18081}:${RELAY_PORT:-18081}"
+    volumes:
+      - ./config/tls.crt:/etc/p2wlan/tls.crt:ro
+      - ./config/tls.key:/etc/p2wlan/tls.key:ro
+    restart: unless-stopped
+    depends_on:
+      control:
+        condition: service_healthy
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS --connect-timeout 2 --max-time 4 "http://$$RELAY_METRICS_BIND/readyz" >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 6

@@ -1,5 +1,7 @@
 # P2WLAN 服务端部署
 
+第一次自托管、Windows 原生运行或 Docker Compose，请先阅读 [从空目录启动 Control 与 Relay](self-hosting.md)。该指南包含组件关系、TLS/票据/撤权配置、配置生成器和完整验证；本页主要说明已有 Linux 安装的包管理与升级。
+
 服务端分为 control 和 relay 两个进程。control 提供账号、设备注册、持久化信令和 Relay 票据；relay 只转发已认证的密文。客户端不会自动使用任何项目服务器，安装后必须手动填写自己的 control URL。
 
 部署有两条等价路径。服务端 Release 构建成功、GitHub Release 发布成功和实际部署健康检查是三个独立结果；只有最后一项通过，才算服务器部署完成。
@@ -127,7 +129,7 @@ sudo p2wlan-server verify --service all
 sudo p2wlan-server check --service all
 ```
 
-`verify` 只检查当前版本链接和二进制身份；`check` 还要求 systemd 服务处于 active，并检查 control 的 `/health`（relay 若配置 loopback metrics，则检查 `/healthz`）。公网反向代理也应单独验证：
+`verify` 只检查当前版本链接和二进制身份；`check` 还要求 systemd 服务处于 active，并检查 control 的 `/health`（Relay 必须配置 loopback metrics，检查撤权就绪 `/readyz`；`all` 同时检查两个服务）。公网反向代理也应单独验证：
 
 ```bash
 curl -fsS https://control.example.com/health
