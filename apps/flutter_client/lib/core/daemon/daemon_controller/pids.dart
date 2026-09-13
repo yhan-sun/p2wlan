@@ -11,6 +11,22 @@ bool isP2wlanDaemonRuntimeCommandLine(String command) {
   return !RegExp(r'(^|\s)--build-info(?:\s|$)').hasMatch(normalized);
 }
 
+/// The OS-returned launch PID and the authenticated diagnostics PID are the
+/// only Windows identities allowed to use the fast process-name check. Any PID
+/// discovered by scanning the process table must still pass the stricter
+/// command-line instance match below.
+bool trustedWindowsDaemonIdentityMatches({
+  required int pid,
+  required int? launchedProcessId,
+  required int? authenticatedProcessId,
+  required String? processName,
+}) {
+  final trusted = pid == launchedProcessId || pid == authenticatedProcessId;
+  if (!trusted || processName == null) return false;
+  return processName.toLowerCase() ==
+      '${DaemonController.daemonBinaryName}.exe';
+}
+
 extension DaemonControllerPids on DaemonController {
   /// Whether a daemon is already occupying the diagnostics instance this
   /// controller is about to start.
@@ -106,12 +122,18 @@ extension DaemonControllerPids on DaemonController {
   }
 
   Future<bool> _processLooksLikeDaemon(int pid) async {
+    if (Platform.isWindows &&
+        (pid == _authenticatedProcessId || pid == _launchedProcessId)) {
+      return trustedWindowsDaemonIdentityMatches(
+        pid: pid,
+        launchedProcessId: _launchedProcessId,
+        authenticatedProcessId: _authenticatedProcessId,
+        processName: await _windowsProcessName(pid),
+      );
+    }
     final command = await _processCommandLine(pid);
     if (command != null) return _matchesInstance(command);
-    return Platform.isWindows &&
-        (pid == _authenticatedProcessId || pid == _launchedProcessId) &&
-        await _windowsProcessName(pid) ==
-            '${DaemonController.daemonBinaryName}.exe';
+    return false;
   }
 
   Future<bool> _waitForDaemonPidExit(int pid, Duration timeout) async {
@@ -297,16 +319,17 @@ extension DaemonControllerPids on DaemonController {
   Future<String?> _windowsProcessName(int processId) async {
     if (!Platform.isWindows) return null;
     final result = await _runWindowsPowerShell(
-      '\$process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" '
-      '-ErrorAction SilentlyContinue; '
-      'if (\$null -ne \$process) { \$process.Name } '
-      'else { (Get-Process -Id $processId '
-      '-ErrorAction SilentlyContinue).ProcessName + ".exe" }',
+      '\$process = Get-Process -Id $processId -ErrorAction SilentlyContinue; '
+      'if (\$null -ne \$process) { \$process.ProcessName + ".exe" }',
     );
     if (result.exitCode != 0) return null;
     final name = result.stdout.toString().trim();
     return name.isEmpty ? null : name;
   }
+
+  @visibleForTesting
+  Future<String?> windowsProcessNameForTesting(int processId) =>
+      _windowsProcessName(processId);
 
   Future<bool> _terminatePid(int pid, {bool allowElevation = true}) async {
     if (!await _processLooksLikeDaemon(pid)) return false;
@@ -423,6 +446,9 @@ extension DaemonControllerPids on DaemonController {
         ? 'powershell.exe'
         : '$windir\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
     final wrappedScript =
+        '\$utf8 = [System.Text.UTF8Encoding]::new(\$false); '
+        '[Console]::OutputEncoding = \$utf8; '
+        '\$OutputEncoding = \$utf8; '
         '\$ErrorActionPreference = \'Stop\'; '
         'try { & { $script }; '
         '\$exitCode = if (\$null -ne \$LASTEXITCODE) { '
@@ -448,12 +474,9 @@ extension DaemonControllerPids on DaemonController {
       ], mode: ProcessStartMode.normal);
       process = started;
 
-      final stdoutFuture = started.stdout
-          .transform(systemEncoding.decoder)
-          .join();
-      final stderrFuture = started.stderr
-          .transform(systemEncoding.decoder)
-          .join();
+      const decoder = Utf8Decoder(allowMalformed: true);
+      final stdoutFuture = started.stdout.transform(decoder).join();
+      final stderrFuture = started.stderr.transform(decoder).join();
       final exitCodeFuture = started.exitCode;
       final valuesFuture = Future.wait<Object>([
         stdoutFuture,
