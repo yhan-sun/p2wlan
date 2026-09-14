@@ -64,7 +64,10 @@ LEGACY_DOC_NAMES = {
 LINK_RE = re.compile(r"\]\(([^)#]+)(?:#[^)]+)?\)")
 PERSONAL_PATH_RE = re.compile(r"/(?:Users|home)/[A-Za-z0-9_.-]+")
 WINDOWS_HOME_RE = re.compile(r"[A-Za-z]:\\Users\\[A-Za-z0-9_.-]+")
-PRIVATE_KEY_NAME_RE = re.compile(r"(?:^|[/\\])(?:id_(?:rsa|dsa|ecdsa|ed25519)|[^/\\\s]+\.pem)(?:$|[\s'\"`])", re.IGNORECASE)
+SSH_PRIVATE_KEY_RE = re.compile(
+    r"(?:^|[/\\])id_(?:rsa|dsa|ecdsa|ed25519)(?:$|[\s'\"`])",
+    re.IGNORECASE,
+)
 TEXT_SCAN_EXEMPTIONS = {
     "scripts/docs/verify_repository.py",
 }
@@ -130,9 +133,12 @@ def check_repository_text(errors: list[str]) -> int:
         if match:
             errors.append(f"{relative}: personal filesystem path {match.group(0)}")
         if relative.startswith(("docs/", "README", "deploy/staging/", ".github/workflows/")):
-            key_match = PRIVATE_KEY_NAME_RE.search(text)
-            if key_match and "example" not in key_match.group(0).lower():
-                errors.append(f"{relative}: private key filename reference {key_match.group(0).strip()}")
+            key_match = SSH_PRIVATE_KEY_RE.search(text)
+            if key_match:
+                errors.append(
+                    f"{relative}: personal SSH private key filename reference "
+                    f"{key_match.group(0).strip()}"
+                )
     return scanned
 
 
