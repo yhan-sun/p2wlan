@@ -424,7 +424,8 @@ restore_server() {
   rollback_copy=$(mktemp -d "$DATA_DIR/backups/pre-restore-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
   chmod 0700 "$rollback_copy"
   if [ -f "$db_path" ]; then
-    cp -p "$db_path" "$rollback_copy/database.sqlite"
+    "$CURRENT_LINK/p2wlan-db" --source "$db_path" --output "$rollback_copy/database.sqlite" \
+      > "$rollback_copy/database-check.txt"
     printf '%s\n' present > "$rollback_copy/database.state"
   else
     printf '%s\n' absent > "$rollback_copy/database.state"
@@ -494,30 +495,38 @@ restore_server() {
   fi
 
   if [ "$restore_failed" -ne 0 ]; then
-    [ "$control_exists" -eq 0 ] || systemctl stop p2wlan-control.service >/dev/null 2>&1 || true
-    [ "$relay_exists" -eq 0 ] || systemctl stop p2wlan-relay.service >/dev/null 2>&1 || true
+    local rollback_failed=0
+    set +e
+    [ "$control_exists" -eq 0 ] || systemctl stop p2wlan-control.service >/dev/null 2>&1
+    [ "$relay_exists" -eq 0 ] || systemctl stop p2wlan-relay.service >/dev/null 2>&1
     if [ "$(cat "$rollback_copy/database.state")" = present ]; then
-      install -m 0600 "$rollback_copy/database.sqlite" "$db_path"
+      install -m 0600 "$rollback_copy/database.sqlite" "$db_path" || rollback_failed=1
     else
-      rm -f "$db_path"
+      rm -f "$db_path" || rollback_failed=1
     fi
-    rm -f "$db_path-wal" "$db_path-shm"
+    rm -f "$db_path-wal" "$db_path-shm" || rollback_failed=1
     for config_name in control.env relay.env; do
       if [ "$(cat "$rollback_copy/$config_name.state")" = present ]; then
-        install -m 0600 "$rollback_copy/$config_name" "$CONFIG_DIR/$config_name"
+        install -m 0600 "$rollback_copy/$config_name" "$CONFIG_DIR/$config_name" || rollback_failed=1
       else
-        rm -f "$CONFIG_DIR/$config_name"
+        rm -f "$CONFIG_DIR/$config_name" || rollback_failed=1
       fi
     done
-    if id p2wlan >/dev/null 2>&1; then chown -R p2wlan:p2wlan "$CONFIG_DIR" "$DATA_DIR"; fi
-    [ "$control_was_active" -eq 0 ] || systemctl start p2wlan-control.service || true
-    [ "$relay_was_active" -eq 0 ] || systemctl start p2wlan-relay.service || true
+    if id p2wlan >/dev/null 2>&1; then
+      chown -R p2wlan:p2wlan "$CONFIG_DIR" "$DATA_DIR" || rollback_failed=1
+    fi
+    [ "$control_was_active" -eq 0 ] || systemctl start p2wlan-control.service || rollback_failed=1
+    [ "$relay_was_active" -eq 0 ] || systemctl start p2wlan-relay.service || rollback_failed=1
     if [ "$control_was_active" -eq 1 ] && [ "$relay_was_active" -eq 1 ]; then
-      (check_server all) || true
+      (check_server all) || rollback_failed=1
     elif [ "$control_was_active" -eq 1 ]; then
-      (check_server control) || true
+      (check_server control) || rollback_failed=1
     elif [ "$relay_was_active" -eq 1 ]; then
-      (check_server relay) || true
+      (check_server relay) || rollback_failed=1
+    fi
+    set -e
+    if [ "$rollback_failed" -ne 0 ]; then
+      die "restore failed and rollback could not fully restore the original state; recovery copy=$rollback_copy"
     fi
     die "restore failed; original database, configuration and service state were restored from $rollback_copy"
   fi
