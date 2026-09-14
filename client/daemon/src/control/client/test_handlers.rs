@@ -1,4 +1,37 @@
+#[cfg(test)]
+pub(crate) struct CapturedCriticalOffer {
+    pub(crate) to_node_id: String,
+    pub(crate) candidates: Vec<String>,
+    pub(crate) handshake_init: Vec<u8>,
+    pub(crate) session_id: Option<String>,
+}
+
 impl ControlClient {
+    /// Observe the actual bounded critical queue rather than the independent
+    /// candidate-signaling forwarder. Only the test consumer is replaced;
+    /// production offer construction, queue admission and response waiting run.
+    #[cfg(test)]
+    pub(crate) fn capture_critical_offers_for_test(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<CapturedCriticalOffer> {
+        let (critical_tx, mut critical_rx) =
+            mpsc::channel::<CriticalOfferCommand>(CRITICAL_OFFER_QUEUE_CAPACITY);
+        let (capture_tx, capture_rx) = mpsc::unbounded_channel();
+        self.critical_offer_tx = critical_tx;
+        tokio::spawn(async move {
+            while let Some(command) = critical_rx.recv().await {
+                let _ = capture_tx.send(CapturedCriticalOffer {
+                    to_node_id: command.to_node_id,
+                    candidates: command.candidates,
+                    handshake_init: command.handshake_init,
+                    session_id: command.session_id,
+                });
+                let _ = command.response_tx.send(PeerOfferSendOutcome::Sent);
+            }
+        });
+        capture_rx
+    }
+
     /// Process a received control message (internal).
     #[cfg(test)]
     async fn handle_message(&self, msg: ControlMessage) {
