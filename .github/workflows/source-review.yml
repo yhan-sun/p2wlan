@@ -1,0 +1,46 @@
+name: Source review
+on:
+  push:
+    branches: [docs/deployment-and-agent-contracts]
+    paths: [.github/workflows/source-review.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Prepare redacted source snapshot
+        shell: python
+        run: |
+          import json, pathlib, re, subprocess, zipfile
+          inventory = []
+          redacted = []
+          with zipfile.ZipFile('source-review.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+              for entry in subprocess.check_output(['git', 'ls-tree', '-rz', 'HEAD']).split(b'\0'):
+                  if not entry:
+                      continue
+                  metadata, raw_path = entry.split(b'\t', 1)
+                  mode, kind, sha = metadata.decode().split()
+                  path = raw_path.decode()
+                  inventory.append({'path': path, 'mode': mode, 'sha': sha})
+                  data = pathlib.Path(path).read_bytes()
+                  try:
+                      text = data.decode('utf-8')
+                  except UnicodeDecodeError:
+                      continue
+                  if '\0' in text:
+                      continue
+                  clean = text.replace('47.109.40.237', '192.0.2.10').replace('ali.pem', 'p2wlan-deploy')
+                  clean = re.sub(r'/Users/(?:pyu|yuhan)/[^\s`\"\'<>)]*', '/path/to/p2wlan', clean)
+                  if clean != text:
+                      redacted.append(path)
+                  archive.writestr(path, clean)
+              archive.writestr('_source_inventory.json', json.dumps({'files': inventory, 'redacted': redacted}, indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-review
+          path: source-review.zip
+          retention-days: 1
