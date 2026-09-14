@@ -6,14 +6,26 @@ on:
 permissions:
   contents: read
 jobs:
-  source:
+  wrapper:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Export tracked source for isolated verification
-        run: git archive --format=tar.gz HEAD > "$RUNNER_TEMP/source.tar.gz"
+      - name: Generate and verify Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --proto '=https' --tlsv1.2 -fL --retry 3 https://services.gradle.org/distributions/gradle-9.1.0-bin.zip -o gradle.zip
+          echo 'a17ddd85a26b6a7f5ddb71ff8b05fc5104c0202c6e64782429790c933686c806  gradle.zip' | sha256sum -c -
+          unzip -q gradle.zip
+          mkdir wrapper-project
+          cd wrapper-project
+          printf '%s\n' 'rootProject.name = "wrapper-verification"' > settings.gradle
+          ../gradle-9.1.0/bin/gradle --no-daemon wrapper --gradle-version 9.1.0 --distribution-type all --gradle-distribution-sha256-sum b84e04fa845fecba48551f425957641074fcc00a88a84d2aae5808743b35fc85
+          echo '76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3  gradle/wrapper/gradle-wrapper.jar' | sha256sum -c -
+          tar -czf "$RUNNER_TEMP/gradle-wrapper.tar.gz" gradlew gradlew.bat gradle/wrapper
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: maintenance-source-${{ github.sha }}
-          path: ${{ runner.temp }}/source.tar.gz
+          name: verified-gradle-wrapper
+          path: ${{ runner.temp }}/gradle-wrapper.tar.gz
           retention-days: 1
