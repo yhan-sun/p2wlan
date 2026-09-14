@@ -78,8 +78,8 @@ func loadEnv(path string) ([]string, error) {
 	return env, nil
 }
 func text(m map[string]any, key string) string { s, _ := m[key].(string); return s }
-func freePort() (int, error) {
-	l, e := net.Listen("tcp", "127.0.0.1:0")
+func freePort(host string) (int, error) {
+	l, e := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if e != nil {
 		return 0, e
 	}
@@ -155,7 +155,10 @@ func register(c client, account string) (node, credential, sequence string, err 
 	}
 	return
 }
-func run(binDir string) error {
+func run(binDir, relayHost string) error {
+	if relayHost != "localhost" && !net.ParseIP(relayHost).IsLoopback() {
+		return errors.New("--relay-host must be localhost or a loopback IP")
+	}
 	dir, err := os.MkdirTemp("", "p2wlan-selfhost-smoke-")
 	if err != nil {
 		return err
@@ -168,7 +171,11 @@ func run(binDir string) error {
 	binaryPath := func(name string) string { return filepath.Join(binDir, "p2wlan-"+name+suffix) }
 	ports := []int{}
 	for len(ports) < 3 {
-		p, e := freePort()
+		host := "127.0.0.1"
+		if len(ports) == 1 && relayHost != "localhost" {
+			host = relayHost
+		}
+		p, e := freePort(host)
 		if e != nil {
 			return e
 		}
@@ -183,7 +190,7 @@ func run(binDir string) error {
 		}
 	}
 	cfg := filepath.Join(dir, "config")
-	cmd := exec.Command(binaryPath("config"), "--output", cfg, "--dev-localhost", "--relay-endpoint", fmt.Sprintf("tls://localhost:%d", ports[1]), "--control-port", strconv.Itoa(ports[0]), "--metrics-port", strconv.Itoa(ports[2]))
+	cmd := exec.Command(binaryPath("config"), "--output", cfg, "--dev-localhost", "--relay-endpoint", "tls://"+net.JoinHostPort(relayHost, strconv.Itoa(ports[1])), "--control-port", strconv.Itoa(ports[0]), "--metrics-port", strconv.Itoa(ports[2]))
 	if output, e := cmd.CombinedOutput(); e != nil {
 		return fmt.Errorf("configuration bootstrap failed: %s: %w", output, e)
 	}
@@ -251,7 +258,7 @@ func run(binDir string) error {
 			return e
 		}
 		ticket := []byte(text(issued, "ticket"))
-		conn, e := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", fmt.Sprintf("127.0.0.1:%d", ports[1]), &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS13})
+		conn, e := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", net.JoinHostPort(relayHost, strconv.Itoa(ports[1])), &tls.Config{RootCAs: roots, ServerName: relayHost, MinVersion: tls.VersionTLS13})
 		if e != nil {
 			return e
 		}
@@ -308,10 +315,11 @@ func run(binDir string) error {
 }
 func main() {
 	dir := flag.String("bin-dir", "", "Directory containing control, relay and config binaries")
+	relayHost := flag.String("relay-host", "localhost", "Loopback host advertised by and used to dial the generated deployment")
 	flag.Parse()
 	absolute, err := filepath.Abs(*dir)
 	if err == nil && *dir != "" {
-		err = run(absolute)
+		err = run(absolute, *relayHost)
 	} else {
 		err = errors.New("--bin-dir is required")
 	}
