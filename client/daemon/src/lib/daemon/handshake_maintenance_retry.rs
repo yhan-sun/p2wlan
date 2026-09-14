@@ -64,7 +64,10 @@ impl MaintenancePreparationRetries {
         now: Instant,
     ) {
         if !self.entries.contains_key(peer_id) && self.entries.len() >= MAX_MAINTENANCE_RETRIES {
-            debug!(reason_code = "maintenance_retry_capacity", "Maintenance scan remains the retry backstop");
+            debug!(
+                reason_code = "maintenance_retry_capacity",
+                "Maintenance scan remains the retry backstop"
+            );
             return;
         }
         let entry = self.entries.entry(peer_id.to_string()).or_insert(
@@ -93,15 +96,19 @@ impl MaintenancePreparationRetries {
         let reason_changed = entry.reason != reason;
         entry.reason = reason;
         entry.attempt = entry.attempt.saturating_add(1);
-        let remaining = entry.hard_deadline.map(|deadline| deadline.saturating_duration_since(now));
-        let urgent = remaining.is_some_and(|remaining| !remaining.is_zero() && remaining <= Duration::from_secs(5));
+        let remaining = entry.hard_deadline
+            .map(|deadline| deadline.saturating_duration_since(now));
+        let urgent = remaining.is_some_and(|remaining| {
+            !remaining.is_zero() && remaining <= Duration::from_secs(5)
+        });
         let base_ms = if urgent {
             50
         } else {
             50u64 << entry.attempt.saturating_sub(1).min(4)
         };
         let peer_fingerprint = crate::transport::wire_fingerprint(peer_id.as_bytes());
-        let jitter_ms = peer_fingerprint.wrapping_add(u64::from(entry.attempt) * 17) % 51;
+        let jitter_ms = peer_fingerprint
+            .wrapping_add(u64::from(entry.attempt) * 17) % 51;
         let delay = Duration::from_millis(base_ms + jitter_ms);
         entry.not_before = now + delay;
         if entry.attempt.is_power_of_two() || reason_changed {
@@ -155,20 +162,26 @@ fn try_stage_maintenance_probe_binding(
         None => MaintenanceBindingOutcome::Retry("connections_contended"),
         Some(ProbeBindingStage::Busy) => MaintenanceBindingOutcome::Retry("binding_capacity"),
         Some(ProbeBindingStage::PeerMissing) => MaintenanceBindingOutcome::Cancel("peer_missing"),
-        Some(ProbeBindingStage::ReplayableDuplicate) => MaintenanceBindingOutcome::Cancel("binding_duplicate"),
-        Some(ProbeBindingStage::StaleDuplicate) => MaintenanceBindingOutcome::Cancel("binding_stale"),
+        Some(ProbeBindingStage::ReplayableDuplicate) => {
+            MaintenanceBindingOutcome::Cancel("binding_duplicate")
+        }
+        Some(ProbeBindingStage::StaleDuplicate) => {
+            MaintenanceBindingOutcome::Cancel("binding_stale")
+        }
     }
 }
 
-/// The immutable tuple is safe to use while an unrelated live gather holds
-/// the refresh mutex. Empty candidates are valid for relay-only rekeys.
+/// An existing encrypted relay session can rekey without UDP candidates,
+/// even before a UDP snapshot exists. Only lock contention defers this read.
+/// First-session candidate gathering continues to use its readiness fence.
 fn try_cached_maintenance_rekey_candidates(
     snapshot: &RwLock<Option<CandidateSnapshotLease>>,
 ) -> Option<(Vec<String>, HashMap<String, String>)> {
     let snapshot = snapshot.try_read().ok()?;
-    snapshot.as_ref().map(|snapshot| {
-        (snapshot.candidates.clone(), snapshot.candidate_sources.clone())
-    })
+    Some(snapshot.as_ref().map_or_else(
+        || (Vec::new(), HashMap::new()),
+        |snapshot| (snapshot.candidates.clone(), snapshot.candidate_sources.clone()),
+    ))
 }
 
 struct MaintenanceProbeCleanup {
@@ -213,7 +226,10 @@ impl MaintenanceProbeCleanups {
         if self.entries.len() >= MAX_MAINTENANCE_RETRIES {
             // The authoritative binding has its own bounded TTL even when the
             // best-effort eager cleanup ledger is at capacity.
-            debug!(reason_code = "maintenance_cleanup_capacity", "Probe binding cleanup left to its bounded TTL");
+            debug!(
+                reason_code = "maintenance_cleanup_capacity",
+                "Probe binding cleanup left to its bounded TTL"
+            );
             return;
         }
         let now = Instant::now();
@@ -245,7 +261,9 @@ mod maintenance_retry_tests {
     use super::*;
 
     async fn fixture() -> (PeerManager, control::PeerInfo, MaintenanceRetryIdentity) {
-        let manager = PeerManager::new(Config::generate_default("http://127.0.0.1:1", "net1").unwrap());
+        let manager = PeerManager::new(
+            Config::generate_default("http://127.0.0.1:1", "net1").unwrap(),
+        );
         let peer = control::PeerInfo {
             node_id: "maintenance-peer".to_string(),
             device_name: String::new(),
@@ -357,12 +375,36 @@ mod maintenance_retry_tests {
     #[tokio::test]
     async fn maintenance_rekey_reads_snapshot_during_live_refresh_and_accepts_relay_only() {
         let daemon = Daemon::new(Config::generate_default("http://127.0.0.1:1", "net1").unwrap());
+        let (candidates, sources) = try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot)
+            .expect("an existing relay session must rekey without a UDP snapshot");
+        assert!(candidates.is_empty() && sources.is_empty());
         daemon.publish_candidate_snapshot(Vec::new(), HashMap::new(), Vec::new()).await;
         let _refresh = daemon.candidate_refresh_lock.lock().await;
-        let (candidates, sources) = try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot).expect("relay-only rekey must not wait for STUN or the refresh lock");
+        let (candidates, sources) = try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot)
+            .expect("relay-only rekey must not wait for STUN or the refresh lock");
         assert!(candidates.is_empty());
         assert!(sources.is_empty());
         let _writer = daemon.candidate_snapshot.write().await;
         assert!(try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot).is_none());
     }
+
+    #[tokio::test]
+    async fn maintenance_cleanup_capacity_and_ttl_do_not_grow_with_duplicate_work() {
+        let (manager, peer, identity) = fixture().await;
+        let reader = manager.hold_connections_reader_for_test().await;
+        let mut cleanups = MaintenanceProbeCleanups::default();
+        cleanups.discard_or_defer(&manager, &peer.node_id, "token-0", identity.peer_session_generation);
+        let first_expiry = cleanups.entries[&(peer.node_id.clone(), "token-0".to_string())].expires_at;
+        for index in 0..MAX_MAINTENANCE_RETRIES + 10 {
+            cleanups.discard_or_defer(&manager, &peer.node_id, &format!("token-{index}"), identity.peer_session_generation);
+        }
+        assert_eq!(cleanups.entries.len(), MAX_MAINTENANCE_RETRIES);
+        assert_eq!(cleanups.entries[&(peer.node_id.clone(), "token-0".to_string())].expires_at, first_expiry);
+        cleanups.drain(&manager, Instant::now() + MAINTENANCE_CLEANUP_TTL);
+        assert!(cleanups.entries.is_empty());
+        assert!(cleanups.not_before.is_none());
+        drop(reader);
+    }
 }
+
+include!("handshake_maintenance_tests.rs");
