@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   identity-gate:
@@ -31,8 +32,67 @@ jobs:
           --daemon target/release/p2wlan-daemon
           --expected-commit "$GITHUB_SHA"
 
-  flutter-android:
+  quality-gate:
     needs: identity-gate
+    name: Release required checks gate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Require release SHA on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "release SHA is not reachable from origin/main: $GITHUB_SHA" >&2
+            exit 1
+          }
+
+      - name: Require exact-SHA quality workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          runs="$RUNNER_TEMP/release-runs.json"
+          gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$RELEASE_SHA&status=completed&per_page=100" \
+            --slurp > "$runs"
+          required=(
+            "CI"
+            "Flutter Client"
+            "Package Test Builds"
+            "Windows Lifecycle"
+            "Mobile Lifecycle"
+            "Self-hosted Server"
+            "Security Audit"
+            "NAT Topology Gate"
+            "Path State Machine"
+            "Path Observability"
+            "DPLPMTUD Required"
+            "Business MTU Budget Required"
+            "Friend Rooms"
+            "Parallel Rooms"
+            "Room Connectivity"
+            "Rekey Reliability"
+          )
+          for workflow in "${required[@]}"; do
+            if ! jq -e --arg workflow "$workflow" --arg sha "$RELEASE_SHA" '
+              [.[].workflow_runs[]? | select(.name == $workflow and .head_sha == $sha and .conclusion == "success")] | length > 0
+            ' "$runs" >/dev/null; then
+              echo "missing successful required workflow for release SHA: $workflow ($RELEASE_SHA)" >&2
+              exit 1
+            fi
+          done
+
+  flutter-android:
+    needs: quality-gate
     name: Flutter Android arm64 APK
     if: startsWith(github.ref, 'refs/tags/v')
     environment: release-signing
@@ -58,22 +118,22 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - name: Configure Android NDK for Rust bridge
+      - name: Configure Flutter-pinned Android NDK for Rust bridge
         shell: bash
         run: |
           set -euo pipefail
           sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
-          ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+          ndk_version="$(grep -RhoE 'ndkVersion[[:space:]]*=[[:space:]]*"[0-9.]+"' "$FLUTTER_ROOT/packages/flutter_tools/gradle" | head -n 1 | sed -E 's/.*"([0-9.]+)"/\1/')"
+          test -n "$ndk_version" || { echo "unable to resolve Flutter-pinned Android NDK version" >&2; exit 1; }
+          ndk_root="$sdk_root/ndk/$ndk_version"
+          test -d "$ndk_root" || { echo "Flutter-pinned Android NDK is unavailable: $ndk_root" >&2; exit 1; }
           echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+          echo "Using Android NDK $ndk_version"
 
       - name: Flutter pub get
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get re-resolves SDK-pinned transitive dependencies and
-      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
-      # checkout.  Restore before the daemon build so the binary is not
-      # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
         run: bash scripts/release/hermetic_build.sh restore
 
@@ -142,7 +202,7 @@ jobs:
           path: dist-release/p2wlan-android-arm64-release.apk
 
   flutter-ios:
-    needs: identity-gate
+    needs: quality-gate
     name: Flutter iOS arm64 IPA
     runs-on: macos-14
     steps:
@@ -159,10 +219,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get re-resolves SDK-pinned transitive dependencies and
-      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
-      # checkout.  Restore before the daemon build so the binary is not
-      # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
         run: bash scripts/release/hermetic_build.sh restore
 
@@ -191,7 +247,7 @@ jobs:
           path: dist-release/p2wlan-ios-arm64-unsigned.ipa
 
   flutter-macos:
-    needs: identity-gate
+    needs: quality-gate
     name: Flutter macOS ${{ matrix.arch }} DMG
     runs-on: macos-14
     strategy:
@@ -227,10 +283,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get re-resolves SDK-pinned transitive dependencies and
-      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
-      # checkout.  Restore before the daemon build so the binary is not
-      # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
         run: bash scripts/release/hermetic_build.sh restore
 
@@ -249,10 +301,9 @@ jobs:
       - name: Restore SDK-migrated files
         run: bash scripts/release/hermetic_build.sh restore --macos
 
-
       - name: Diagnose checkout dirt
-        run: |
-          git status --porcelain=v1 --untracked-files=all
+        run: git status --porcelain=v1 --untracked-files=all
+
       - name: Create architecture-specific DMG
         run: |
           set -euo pipefail
@@ -294,7 +345,7 @@ jobs:
           path: dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
 
   flutter-linux:
-    needs: identity-gate
+    needs: quality-gate
     name: Flutter Linux ${{ matrix.arch }} Bundle
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -304,9 +355,6 @@ jobs:
           - arch: x64
             runner: ubuntu-22.04
             target_platform: linux-x64
-          # Flutter stable is not currently resolved by subosito/flutter-action
-          # for GitHub-hosted Linux ARM64 runners. Linux ARM64 is still shipped
-          # below as the CLI/daemon package.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -340,10 +388,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get re-resolves SDK-pinned transitive dependencies and
-      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
-      # checkout.  Restore before the daemon build so the binary is not
-      # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
         run: bash scripts/release/hermetic_build.sh restore
 
@@ -357,13 +401,13 @@ jobs:
           --release
           --target-platform ${{ matrix.target_platform }}
           --split-debug-info build/symbols/linux-${{ matrix.arch }}
+
       - name: Restore SDK-migrated files
         run: bash scripts/release/hermetic_build.sh restore
 
-
       - name: Diagnose checkout dirt
-        run: |
-          git status --porcelain=v1 --untracked-files=all
+        run: git status --porcelain=v1 --untracked-files=all
+
       - name: Assemble Linux Flutter artifact
         run: |
           set -euo pipefail
@@ -390,7 +434,7 @@ jobs:
           path: dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
 
   flutter-windows:
-    needs: identity-gate
+    needs: quality-gate
     name: Flutter Windows ${{ matrix.arch }} Installer
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -399,8 +443,6 @@ jobs:
         include:
           - arch: x64
             runner: windows-latest
-          # Flutter stable is not currently resolved by subosito/flutter-action
-          # for GitHub-hosted Windows ARM64 runners.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -422,10 +464,6 @@ jobs:
         working-directory: apps/flutter_client
         run: flutter pub get
 
-      # flutter pub get re-resolves SDK-pinned transitive dependencies and
-      # upgrades analysis_options.yaml under a newer Flutter SDK, dirtying the
-      # checkout.  Restore before the daemon build so the binary is not
-      # stamped dirty; the gated jobs restore again after flutter build.
       - name: Restore SDK-migrated files (pre-build)
         run: bash scripts/release/hermetic_build.sh restore
 
@@ -451,13 +489,13 @@ jobs:
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
+
       - name: Restore SDK-migrated files
         run: bash scripts/release/hermetic_build.sh restore
 
-
       - name: Diagnose checkout dirt
-        run: |
-          git status --porcelain=v1 --untracked-files=all
+        run: git status --porcelain=v1 --untracked-files=all
+
       - name: Build Windows installer
         shell: pwsh
         env:
@@ -543,7 +581,7 @@ jobs:
           path: dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
 
   linux-cli:
-    needs: identity-gate
+    needs: quality-gate
     name: Linux ${{ matrix.arch }} CLI Package
     runs-on: ubuntu-22.04
     strategy:
@@ -584,10 +622,6 @@ jobs:
           mkdir -p "$pkg"
           cp target/${{ matrix.target }}/release/p2wlan "$pkg/"
           cp target/${{ matrix.target }}/release/p2wlan-daemon "$pkg/"
-          # The daemon was renamed p2pnet-daemon -> p2wlan-daemon in v0.1.67.
-          # CLIs released before the rename still look for the legacy name in
-          # the update tarball, so ship both names for the same binary to keep
-          # `p2wlan update` working for those installs.
           cp target/${{ matrix.target }}/release/p2wlan-daemon "$pkg/p2pnet-daemon"
           cp scripts/install-linux-cli.sh "$pkg/install.sh"
           cp LICENSE "$pkg/"
@@ -600,9 +634,8 @@ jobs:
           Contents:
           - p2wlan: user-facing command-line client
           - p2wlan-daemon: background daemon with real Linux TUN support
-          - p2pnet-daemon: legacy name of p2wlan-daemon (same binary; kept for
-            installers and update checks that predate the v0.1.67 rename)
-          - install.sh: system-wide installer; also works as an online GitHub release installer
+          - p2pnet-daemon: legacy name of p2wlan-daemon
+          - install.sh: system-wide installer and fixed-version online installer
           - client.md: Linux CLI, room, diagnostics, and systemd deployment guide
           - systemd/p2wlan-daemon.service: hardened systemd unit template
           - LICENSE
@@ -615,46 +648,9 @@ jobs:
           2. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
           3. sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
 
-          Dry-run or install to a user directory:
-          - sh /tmp/p2wlan-install.sh --version ${{ github.ref_name }} --dry-run
-          - sh /tmp/p2wlan-install.sh --version ${{ github.ref_name }} --install-dir "$HOME/.local/bin"
-
           Verify:
           - p2wlan --version
           - p2wlan help
-
-          Quick start:
-          - p2wlan login -u you@example.com
-          - p2wlan up
-          - p2wlan status
-
-          Common commands:
-          - p2wlan config show
-          - p2wlan config set device-name linux-server
-          - p2wlan config set udp-bind 0.0.0.0:60207
-          - p2wlan config set udp-advertise <public-ip>:60207
-          - p2wlan config set proxy-mode direct|environment
-          - p2wlan config set relay-policy auto|direct|prefer-relay|relay
-          - p2wlan config set prefer-direct on|off
-          - p2wlan config set path-policy auto|score|direct-sticky|relay-only
-          - p2wlan room list
-          - p2wlan room connect <room-code-or-id>
-          - p2wlan route verify / p2wlan route repair
-          - p2wlan support-bundle --upload
-          - p2wlan doctor
-          - p2wlan update
-          - p2wlan logs -f
-          - p2wlan down
-          - p2wlan help
-
-          Notes:
-          - `p2wlan up` requests sudo only when creating TUN and routes.
-          - Login and configuration commands must be run without sudo.
-          - Supplying `-p` is supported for automation, but interactive password input is safer.
-          - Cloud direct UDP needs an open fixed UDP port in the provider security group and OS firewall.
-          - `p2wlan doctor` shows peer UDP candidate previews and warns when peers only advertise private endpoints.
-          - See `docs/guides/client.md` in the source tree for systemd and complete room-management instructions.
-          - For self-hosting, run the Go control and relay services separately.
           EOF
           chmod +x "$pkg/p2wlan" "$pkg/p2wlan-daemon" "$pkg/install.sh"
           tar -C dist-release -czf "dist-release/$name.tar.gz" "$name"
