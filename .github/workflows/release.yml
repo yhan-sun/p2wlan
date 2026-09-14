@@ -132,7 +132,17 @@ jobs:
               sdkmanager_bin="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -perm -u+x 2>/dev/null | head -n 1)"
             fi
             test -n "$sdkmanager_bin" || { echo "sdkmanager is unavailable while installing Flutter-pinned Android NDK $ndk_version" >&2; exit 1; }
-            yes | "$sdkmanager_bin" --sdk_root="$sdk_root" "ndk;$ndk_version"
+            # sdkmanager exits after accepting the license, so `yes` can receive
+            # SIGPIPE even when the installation itself succeeds. Preserve the
+            # sdkmanager status without letting that expected pipe close fail
+            # the release job.
+            set +e
+            set +o pipefail
+            yes 2>/dev/null | "$sdkmanager_bin" --sdk_root="$sdk_root" "ndk;$ndk_version"
+            sdkmanager_status="${PIPESTATUS[1]}"
+            set -o pipefail
+            set -e
+            test "$sdkmanager_status" -eq 0
           fi
           test -d "$ndk_root" || { echo "Flutter-pinned Android NDK is unavailable after installation: $ndk_root" >&2; exit 1; }
           echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
