@@ -129,6 +129,7 @@ impl Daemon {
             let overlay_node_id = self.config.node.node_id.clone();
             let overlay_start_gate_file = self.config.network.overlay_start_gate_file.clone();
             let overlay_any_path = self.config.network.overlay_any_path;
+            let overlay_udp_transport = self.udp_transport.clone();
             let overlay_burst = self.config.network.overlay_burst;
             let overlay_timeline = self.timeline.clone();
             let shutdown_rx = self.shutdown_rx.clone();
@@ -141,6 +142,7 @@ impl Daemon {
                         overlay_node_id,
                         overlay_start_gate_file,
                         overlay_any_path,
+                        overlay_udp_transport,
                         overlay_burst,
                         overlay_timeline,
                         overlay_ingress_rx,
