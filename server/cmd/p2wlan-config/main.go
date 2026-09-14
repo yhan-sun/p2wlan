@@ -14,7 +14,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
 	"math/big"
 	"net"
 	"net/url"
@@ -23,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yhan-sun/p2wlan/server/internal/privatefile"
 )
 
 type options struct {
@@ -68,8 +69,8 @@ func generate(o options) (err error) {
 		return errors.New("ports must be between 1 and 65535")
 	}
 	u, err := url.Parse(o.endpoint)
-	if err != nil || u.Scheme != "tls" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return errors.New("--relay-endpoint must be tls://host:port without credentials, path or query")
+	if err != nil || u.Scheme != "tls" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery || strings.Contains(o.endpoint, "#") {
+		return errors.New("--relay-endpoint must be tls://host:port without credentials, path, query or fragment")
 	}
 	host, port, err := net.SplitHostPort(u.Host)
 	if err != nil || host == "" || strings.ContainsAny(host, " \\?#@\r\n\t") {
@@ -120,6 +121,9 @@ func generate(o options) (err error) {
 	if now := time.Now(); now.Before(leaf.NotBefore) || !now.Before(leaf.NotAfter) {
 		return errors.New("TLS certificate is not currently valid")
 	}
+	if !permitsServerAuthentication(leaf) {
+		return errors.New("TLS certificate extended key usage does not permit server authentication")
+	}
 	if strings.ContainsAny(o.output, "\r\n") {
 		return errors.New("output path must not contain newlines")
 	}
@@ -158,9 +162,12 @@ func generate(o options) (err error) {
 	}
 	runtimeDir, runtimeData := filepath.ToSlash(out), filepath.ToSlash(dataDir)
 	controlHost, feedHost := "127.0.0.1", "127.0.0.1"
-	relayHost := ""
+	relayHost, publishHost := "", "127.0.0.1"
 	if o.dev {
-		relayHost = "127.0.0.1"
+		if ip := net.ParseIP(host); ip != nil {
+			publishHost = ip.String()
+		}
+		relayHost = publishHost
 	}
 	if o.mode == "docker" {
 		runtimeDir = "/etc/p2wlan"
@@ -178,7 +185,7 @@ func generate(o options) (err error) {
 	if gid <= 0 {
 		gid = 10001
 	}
-	compose := fmt.Sprintf("P2WLAN_UID=%d\nP2WLAN_GID=%d\nCONTROL_PORT=%d\nRELAY_PORT=%d\nMETRICS_PORT=%d\nRELAY_PUBLISH_HOST=127.0.0.1\n", uid, gid, o.controlPort, n, o.metricsPort)
+	compose := fmt.Sprintf("P2WLAN_UID=%d\nP2WLAN_GID=%d\nCONTROL_PORT=%d\nRELAY_PORT=%d\nMETRICS_PORT=%d\nRELAY_PUBLISH_HOST=%s\n", uid, gid, o.controlPort, n, o.metricsPort, publishHost)
 	for name, data := range map[string][]byte{"control.env": []byte(control), "relay.env": []byte(relay), "compose.env": []byte(compose), "tls.crt": certPEM, "tls.key": keyPEM} {
 		if err = privatefile.WriteNew(filepath.Join(out, name), data); err != nil {
 			return err
@@ -196,6 +203,18 @@ func generate(o options) (err error) {
 		}
 	}
 	return nil
+}
+
+func permitsServerAuthentication(cert *x509.Certificate) bool {
+	if len(cert.ExtKeyUsage) == 0 && len(cert.UnknownExtKeyUsage) == 0 {
+		return true
+	}
+	for _, usage := range cert.ExtKeyUsage {
+		if usage == x509.ExtKeyUsageServerAuth || usage == x509.ExtKeyUsageAny {
+			return true
+		}
+	}
+	return false
 }
 
 func localCertificate(host string) ([]byte, []byte, error) {
