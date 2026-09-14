@@ -1,0 +1,19 @@
+name: Maintenance source verification
+on:
+  push:
+    branches: [chore/docs-deployment-governance]
+    paths: [.github/workflows/maintenance-checkout.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Export tracked source for isolated verification
+        run: git archive --format=tar.gz HEAD > "$RUNNER_TEMP/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: maintenance-source-${{ github.sha }}
+          path: ${{ runner.temp }}/source.tar.gz
+          retention-days: 1
