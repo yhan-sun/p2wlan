@@ -430,14 +430,18 @@ restore_server() {
   else
     printf '%s\n' absent > "$rollback_copy/database.state"
   fi
-  for config_name in control.env relay.env; do
-    if [ -f "$CONFIG_DIR/$config_name" ]; then
-      cp -p "$CONFIG_DIR/$config_name" "$rollback_copy/$config_name"
-      printf '%s\n' present > "$rollback_copy/$config_name.state"
-    else
-      printf '%s\n' absent > "$rollback_copy/$config_name.state"
-    fi
-  done
+  if [ -f "$CONFIG_DIR/control.env" ]; then
+    cp -p "$CONFIG_DIR/control.env" "$rollback_copy/control.env"
+    printf '%s\n' present > "$rollback_copy/control.env.state"
+  else
+    printf '%s\n' absent > "$rollback_copy/control.env.state"
+  fi
+  if [ -f "$CONFIG_DIR/relay.env" ]; then
+    cp -p "$CONFIG_DIR/relay.env" "$rollback_copy/relay.env"
+    printf '%s\n' present > "$rollback_copy/relay.env.state"
+  else
+    printf '%s\n' absent > "$rollback_copy/relay.env.state"
+  fi
 
   local control_exists=0 relay_exists=0 control_was_active=0 relay_was_active=0
   if systemctl cat p2wlan-control.service >/dev/null 2>&1; then
@@ -505,13 +509,16 @@ restore_server() {
       rm -f "$db_path" || rollback_failed=1
     fi
     rm -f "$db_path-wal" "$db_path-shm" || rollback_failed=1
-    for config_name in control.env relay.env; do
-      if [ "$(cat "$rollback_copy/$config_name.state")" = present ]; then
-        install -m 0600 "$rollback_copy/$config_name" "$CONFIG_DIR/$config_name" || rollback_failed=1
-      else
-        rm -f "$CONFIG_DIR/$config_name" || rollback_failed=1
-      fi
-    done
+    if [ "$(cat "$rollback_copy/control.env.state")" = present ]; then
+      install -m 0600 "$rollback_copy/control.env" "$CONFIG_DIR/control.env" || rollback_failed=1
+    else
+      rm -f "$CONFIG_DIR/control.env" || rollback_failed=1
+    fi
+    if [ "$(cat "$rollback_copy/relay.env.state")" = present ]; then
+      install -m 0600 "$rollback_copy/relay.env" "$CONFIG_DIR/relay.env" || rollback_failed=1
+    else
+      rm -f "$CONFIG_DIR/relay.env" || rollback_failed=1
+    fi
     if id p2wlan >/dev/null 2>&1; then
       chown -R p2wlan:p2wlan "$CONFIG_DIR" "$DATA_DIR" || rollback_failed=1
     fi
