@@ -28,7 +28,10 @@ services:
     user: "${P2WLAN_UID:-10001}:${P2WLAN_GID:-10001}"
     env_file: ./config/relay.env
     ports:
-      - "${RELAY_PUBLISH_HOST:-127.0.0.1}:${RELAY_PORT:-18081}:${RELAY_PORT:-18081}"
+      - target: ${RELAY_PORT:-18081}
+        published: "${RELAY_PORT:-18081}"
+        host_ip: "${RELAY_PUBLISH_HOST:-127.0.0.1}"
+        protocol: tcp
     volumes:
       - ./config/tls.crt:/etc/p2wlan/tls.crt:ro
       - ./config/tls.key:/etc/p2wlan/tls.key:ro
