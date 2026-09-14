@@ -553,9 +553,7 @@ Future<AppSettings> _migrateSettings(AppSettings settings) async {
       controlServer == legacyPlaceholderControlServer;
   final currentDeviceName = settings.deviceName.trim();
   var migrated = settings;
-  if (controlServer == legacyControlServer ||
-      legacyPlaceholderControl ||
-      controlServer == 'http://47.109.40.237:18080') {
+  if (controlServer == legacyControlServer || legacyPlaceholderControl) {
     // Known project defaults are cleared.  A localhost/custom address is
     // explicit user data and must survive migration.
     migrated = migrated.copyWith(controlServer: '');

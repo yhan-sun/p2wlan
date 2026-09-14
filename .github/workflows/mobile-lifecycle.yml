@@ -14,8 +14,7 @@ on:
       - "client/daemon/**"
       - "client/tun/**"
       - "contracts/**"
-      - "docs/mobile-lifecycle-device-matrix.md"
-      - "docs/mobile-lifecycle-identity.md"
+      - "docs/explanation/connection-lifecycle.md"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -31,8 +30,7 @@ on:
       - "client/daemon/**"
       - "client/tun/**"
       - "contracts/**"
-      - "docs/mobile-lifecycle-device-matrix.md"
-      - "docs/mobile-lifecycle-identity.md"
+      - "docs/explanation/connection-lifecycle.md"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:

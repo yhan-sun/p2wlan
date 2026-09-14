@@ -9,7 +9,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/p2wlan-control . \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/p2wlan-relay ./relay \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/p2wlan-config ./cmd/p2wlan-config
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/p2wlan-config ./cmd/p2wlan-config \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/p2wlan-db ./cmd/p2wlan-db
 
 FROM debian:bookworm-slim
 

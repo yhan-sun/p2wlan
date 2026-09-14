@@ -8,6 +8,12 @@ INSTALL_ROOT=${P2WLAN_SERVER_ROOT:-/opt/p2wlan-server}
 CONFIG_DIR=${P2WLAN_SERVER_CONFIG:-/etc/p2wlan}
 DATA_DIR=${P2WLAN_SERVER_DATA:-/var/lib/p2wlan}
 DRY_RUN=0
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+die() {
+  echo "install-server: $*" >&2
+  exit 1
+}
 
 usage() {
   cat <<'EOF'
@@ -52,6 +58,10 @@ trap cleanup EXIT INT TERM
 if [ -z "$ARCHIVE" ]; then
   command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
   [ "$VERSION" != latest ] || { echo "--version is required for a reproducible server install" >&2; exit 2; }
+  case "$VERSION" in
+    server-v[A-Za-z0-9._-]*) ;;
+    *) die "--version must look like server-vX.Y.Z" ;;
+  esac
   tmp_dir=$(mktemp -d /tmp/p2wlan-server-install.XXXXXX)
   ARCHIVE="$tmp_dir/p2wlan-server-linux-$arch.tar.gz"
   curl -fL --retry 3 -o "$ARCHIVE" "https://github.com/$REPO/releases/download/$VERSION/p2wlan-server-linux-$arch.tar.gz"
@@ -72,12 +82,9 @@ fi
 
 install -d -m 0755 "$INSTALL_ROOT/releases" "$CONFIG_DIR" /usr/local/bin
 manager_path=/usr/local/bin/p2wlan-server
-if [ -f "$(dirname "$0")/p2wlan-server" ]; then
-  install -m 0755 "$(dirname "$0")/p2wlan-server" "$manager_path"
-else
-  curl -fL --retry 3 -o "$manager_path" "https://raw.githubusercontent.com/$REPO/main/scripts/p2wlan-server"
-  chmod 0755 "$manager_path"
-fi
+manager_source="$SCRIPT_DIR/p2wlan-server"
+[ -x "$manager_source" ] || die "p2wlan-server is missing beside install-server.sh; use the complete verified release archive"
+install -m 0755 "$manager_source" "$manager_path"
 P2WLAN_SERVER_ROOT="$INSTALL_ROOT" P2WLAN_SERVER_CONFIG="$CONFIG_DIR" P2WLAN_SERVER_DATA="$DATA_DIR" \
   "$manager_path" init --role "$ROLE"
 P2WLAN_SERVER_ROOT="$INSTALL_ROOT" P2WLAN_SERVER_CONFIG="$CONFIG_DIR" P2WLAN_SERVER_DATA="$DATA_DIR" \

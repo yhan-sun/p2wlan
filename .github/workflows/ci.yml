@@ -148,10 +148,16 @@ jobs:
         run: go test ./... -count=1
 
   repository_policy:
-    name: React absence and security scan
+    name: Repository policy and security scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify repository contracts
+        run: |
+          python3 scripts/docs/verify_repository.py
+          bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
+          sh -n scripts/install-linux-cli.sh
+          python3 -m py_compile scripts/docs/verify_repository.py scripts/release/verify_release_set.py
       - name: Verify log format compatibility
         run: |
           python3 scripts/dual-end/test-log-format-compatibility.py

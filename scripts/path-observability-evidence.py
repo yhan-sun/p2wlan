@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "client/daemon/src/peer/path_observability.rs"
-DOC = ROOT / "docs/path-observability.md"
+DOC = ROOT / "docs/reference/path-observability.md"
 WORKFLOW = ROOT / ".github/workflows/path-observability-required.yml"
 FIXTURE = ROOT / "contracts/fixtures/status.json"
 EXPECTED_METRICS = [

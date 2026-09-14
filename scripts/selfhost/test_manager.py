@@ -72,6 +72,14 @@ exit 0
         self.assertIn('http://[::1]:18082/readyz', calls)
         self.assertNotIn('/health', calls)
 
+    def test_backup_restore_and_rollback_contracts_are_explicit(self):
+        manager = (ROOT/'scripts/p2wlan-server').read_text()
+        self.assertIn('p2wlan-db" --source "$db_path" --output', manager)
+        self.assertIn('p2wlan-db" --verify', manager)
+        self.assertIn('systemctl stop p2wlan-control.service || die', manager)
+        self.assertIn('rollback target is incomplete', manager)
+        self.assertNotIn('systemctl stop p2wlan-control.service || true', manager)
+
 
 if __name__ == '__main__':
     unittest.main()

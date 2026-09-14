@@ -109,15 +109,24 @@ P2WLAN 的目标不是替你定义业务，而是提供一张跨地域的虚拟�
 | Android 7.0+ (API 24+) arm64 | `p2wlan-android-arm64-release.apk` | 支持 |
 | iOS 15+ arm64 | `p2wlan-ios-arm64-unsigned.ipa` | 实验性，需签名 |
 
-### 2. 登录
+### 2. 配置 Control
 
 打开客户端并登录；服务器或无桌面环境可使用 CLI：
 
 ```bash
-p2wlan login -u you@example.com
+p2wlan config set control https://control.example.com
 ```
 
-### 3. 启动虚拟网络
+### 3. 注册／登录
+
+打开客户端并登录；服务器或无桌面环境可使用 CLI：
+
+```bash
+p2wlan login -u your-name
+p2wlan account show
+```
+
+### 4. 启动虚拟网络
 
 在客户端启动网络，或在 CLI 中执行：
 
@@ -126,7 +135,7 @@ p2wlan up
 p2wlan status
 ```
 
-### 4. 使用虚拟 IP
+### 5. 使用虚拟 IP
 
 连接建立后，直接像访问普通局域网地址一样使用对端的 P2WLAN 虚拟 IP：
 
@@ -137,7 +146,7 @@ ssh user@10.20.0.5
 
 游戏服务器、NAS、Web 面板或数据库同理：应用只需要连接对端虚拟 IP 和对应业务端口。
 
-### 5. 查看连接路径
+### 6. 查看连接路径
 
 客户端会显示 Peer 当前使用的路径。遇到问题时，可先运行：
 
@@ -149,11 +158,12 @@ p2wlan logs -f
 Linux CLI 也提供安装脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh
+VERSION=vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
 ```
 
-Linux CLI 的房间管理、Direct/Relay 路径策略、路由修复、支持包和 systemd 部署说明见 [`docs/linux-cli.md`](docs/linux-cli.md)。常用命令还包括：
+Linux CLI 的房间管理、Direct/Relay 路径策略、路由修复、支持包和 systemd 部署说明见[客户端指南](docs/guides/client.md)与[CLI 参考](docs/reference/cli.md)。常用命令还包括：
 
 ```bash
 p2wlan room list
@@ -162,15 +172,7 @@ p2wlan route verify
 p2wlan support-bundle --upload
 ```
 
-新安装不会预填或自动连接任何公共控制面或中继服务器。请先配置自己的服务端，再登录：
-
-```bash
-p2wlan config set control https://control.example.com
-p2wlan login -u your-name                 # 支持邮箱或用户名
-p2wlan account show                       # 查看当前账号身份
-```
-
-自托管 control/relay 的安装、校验、systemd 启停和独立升级见 [`docs/server-deployment.md`](docs/server-deployment.md) 与 [`docs/server-upgrade.md`](docs/server-upgrade.md)。服务端使用 `server-vX.Y.Z` 标签，客户端使用 `vX.Y.Z` 标签，两者不会互相覆盖 latest 发布。
+自托管 Control/Relay 的安装、校验、systemd 启停、备份和升级见[自托管指南](docs/guides/self-hosting.md)与[升级与恢复](docs/guides/upgrade-and-recovery.md)。服务端使用 `server-vX.Y.Z` 标签，客户端使用 `vX.Y.Z` 标签。
 
 ```bash
 sudo ./scripts/install-server.sh --version server-vX.Y.Z --role all
@@ -189,9 +191,7 @@ sudo p2wlan-server rollback
   --user <SSH用户> --version server-vX.Y.Z --start
 ```
 
-省略 `--identity` 时 SSH 会在终端提示服务器密码，远端 `sudo` 会提示管理员密码；密码不会出现在命令行。Actions staging 的构建包下载、上传、服务器拉取、校验和健康检查见 [`docs/server-deployment.md`](docs/server-deployment.md)。
-
-Actions staging 上传和 `47.109.40.237` 测试约束见 [`docs/staging-validation.md`](docs/staging-validation.md)。本地 `~/.ssh/ali.pem` 只用于人工初始化或生成 CI 专用密钥，不能放进仓库或 GitHub artifact。
+省略 `--identity` 时 SSH 会在终端提示服务器密码，远端 `sudo` 会提示管理员密码；密码不会出现在命令行。部署入口和 staging 变量由[自托管指南](docs/guides/self-hosting.md)与发布 workflow 共同定义，不把具体主机或私钥写入仓库。
 
 ## 工作方式
 
@@ -240,7 +240,7 @@ P2WLAN 使用自包含的 **WireGuard-like Noise** 数据面，并使用 X25519�
 
 ## 自托管
 
-新机器的完整配置、Windows 原生与 Docker Compose 示例见 [自托管入门](docs/self-hosting.md)。
+新机器的完整配置、Windows 原生与 Docker Compose 示例见[自托管指南](docs/guides/self-hosting.md)。
 
 Control Plane 和 Relay 位于 [`server/`](server/)；Linux CLI / daemon 位于 Rust workspace。最小构建可以从仓库根目录执行：
 
@@ -267,7 +267,7 @@ cargo build --release -p p2wlan-cli -p p2wlan-daemon
 - 不保证任意 NAT 环境都能建立 P2P 直连；Relay 可用性同样依赖 Control Plane 和 Relay 可达。
 - 高敏感生产环境请在部署前自行完成安全评估。
 
-依赖扫描、工作流权限和发布资产校验等安全门禁见 [`docs/security-audit.md`](docs/security-audit.md)。
+凭据边界和安全限制见 [SECURITY.md](SECURITY.md)、[隐私说明](PRIVACY.md) 与[安全模型](docs/explanation/security-model.md)；发布资产对应关系见[发布契约](docs/reference/release-contract.md)。
 
 ## 开发者
 

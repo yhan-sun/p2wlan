@@ -56,7 +56,7 @@ Options:
 
 Examples:
   # SSH key authentication:
-  ./scripts/deploy-server.sh --host 47.109.40.237 --user deploy \
+  ./scripts/deploy-server.sh --host server.example.com --user deploy \
     --identity ~/.ssh/id_ed25519 --version server-v0.1.162 --start
 
   # Password authentication: ssh and sudo will prompt in the terminal.

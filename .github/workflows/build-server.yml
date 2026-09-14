@@ -85,7 +85,8 @@ jobs:
             -ldflags="-s -w -X main.buildVersion=$VERSION -X main.buildCommit=$SOURCE_SHA" \
             -o dist/p2wlan-relay ./relay
           CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -o dist/p2wlan-config ./cmd/p2wlan-config
-          chmod 0755 dist/p2wlan-control dist/p2wlan-relay dist/p2wlan-config
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -trimpath -o dist/p2wlan-db ./cmd/p2wlan-db
+          chmod 0755 dist/p2wlan-control dist/p2wlan-relay dist/p2wlan-config dist/p2wlan-db
           {
             echo "version=$VERSION"
             echo "commit=$SOURCE_SHA"
@@ -96,11 +97,11 @@ jobs:
           } > dist/BUILD-METADATA.txt
           (
             cd dist
-            sha256sum p2wlan-control p2wlan-relay p2wlan-config > SHA256SUMS
+            sha256sum p2wlan-control p2wlan-relay p2wlan-config p2wlan-db > SHA256SUMS
           )
           install -m 0755 ../scripts/p2wlan-server ../scripts/install-server.sh ../scripts/deploy-server.sh dist/
           tar -C dist -czf "p2wlan-server-linux-${{ matrix.arch }}.tar.gz" \
-            p2wlan-control p2wlan-relay p2wlan-config p2wlan-server install-server.sh deploy-server.sh BUILD-METADATA.txt SHA256SUMS
+            p2wlan-control p2wlan-relay p2wlan-config p2wlan-db p2wlan-server install-server.sh deploy-server.sh BUILD-METADATA.txt SHA256SUMS
           sha256sum "p2wlan-server-linux-${{ matrix.arch }}.tar.gz" > \
             "p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256"
 
@@ -147,8 +148,7 @@ jobs:
           test -n "$STAGING_HOST"
           test -n "$STAGING_USER"
           case "$STAGING_HOST" in
-            47.109.40.237) ;;
-            *) echo "staging environment must explicitly target 47.109.40.237" >&2; exit 1 ;;
+            ''|*[!A-Za-z0-9._:-]*) echo "STAGING_HOST contains unsupported characters" >&2; exit 1 ;;
           esac
 
       - name: Install SSH key and fixed host key

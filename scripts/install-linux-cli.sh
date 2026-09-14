@@ -2,7 +2,7 @@
 set -eu
 
 REPO=${P2WLAN_REPO:-yhan-sun/p2wlan}
-VERSION=${P2WLAN_VERSION:-latest}
+VERSION=${P2WLAN_VERSION:-}
 INSTALL_DIR=${P2WLAN_INSTALL_DIR:-/usr/local/bin}
 TMP_ROOT=${TMPDIR:-/tmp}
 DRY_RUN=0
@@ -13,13 +13,13 @@ p2wlan Linux CLI installer
 
 Usage:
   sudo ./install.sh
-  curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-  sudo sh /tmp/p2wlan-install.sh
-  sudo sh /tmp/p2wlan-install.sh --version v0.1.26
-  sh /tmp/p2wlan-install.sh --install-dir "$HOME/.local/bin"
+  VERSION=vX.Y.Z
+  curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+  sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
+  sh /tmp/p2wlan-install.sh --version "$VERSION" --install-dir "$HOME/.local/bin"
 
 Environment:
-  P2WLAN_VERSION      Release tag to install, for example v0.1.26. Default: latest
+  P2WLAN_VERSION      Release tag to install, for example v0.1.26. Required for remote install
   P2WLAN_REPO         GitHub repo to download from. Default: yhan-sun/p2wlan
   P2WLAN_INSTALL_DIR  Install directory. Default: /usr/local/bin
 
@@ -86,8 +86,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -z "$REPO" ] || [ -z "$VERSION" ] || [ -z "$INSTALL_DIR" ]; then
-  echo "P2WLAN_REPO, P2WLAN_VERSION, and P2WLAN_INSTALL_DIR must not be empty." >&2
+if [ -z "$REPO" ] || [ -z "$INSTALL_DIR" ]; then
+  echo "P2WLAN_REPO and P2WLAN_INSTALL_DIR must not be empty." >&2
   exit 1
 fi
 
@@ -150,17 +150,21 @@ if [ -f "$PACKAGE_DIR/p2wlan" ] &&
 fi
 
 if [ "$LOCAL_PACKAGE" -ne 1 ]; then
+  if [ -z "$VERSION" ]; then
+    echo "--version vX.Y.Z is required for a reproducible remote install." >&2
+    exit 1
+  fi
+  case "$VERSION" in
+    v[A-Za-z0-9._-]*) ;;
+    *) echo "--version must look like vX.Y.Z." >&2; exit 1 ;;
+  esac
   need_cmd uname
   need_cmd mktemp
   need_cmd tar
 
   RELEASE_ARCH=$(detect_arch)
   ASSET="p2wlan-linux-${RELEASE_ARCH}-cli.tar.gz"
-  if [ "$VERSION" = "latest" ]; then
-    URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-  else
-    URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
-  fi
+  URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "Would download $URL"

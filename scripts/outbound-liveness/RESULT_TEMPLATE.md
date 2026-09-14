@@ -1,6 +1,6 @@
 # Outbound-UDP liveness — Gate 实测报告（模板）
 
-> 对齐 `scripts/punch-research/TEST_REPORT_P2.md` §9/§10 的 Gate 段落写法。
+> 采用可复核的 Gate 段落写法；证据只保存在发布或事件附件中，不进入产品文档。
 > 用 `scripts/outbound-liveness/live_check.sh` 生成证据后填入本模板。
 > 本次为**诊断/归因**特性验收，非 availability-acceptance；relay 全程保底，
 > 本 Gate 不改变生产依赖。

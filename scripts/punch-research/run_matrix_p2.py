@@ -79,7 +79,7 @@ def observed_filtering_state(filtering):
 
 
 def fp_exempt(mapping, allocation, axis):
-    """注入语义冲突豁免（记录于矩阵注释/TEST_REPORT_P2）：
+    """注入语义冲突豁免（记录于矩阵注释和运行输出）：
     - AD/APD × stable：mapping 要求端口随目标变、stable 要求固定 → 模拟以 client 级稳定
       表达，mapping 可观察为 EI-like（豁免 mapping 轴）；
     - AD/APD × random：random 的新会话随机分配在多 key 采样下与 stable 顺序分配同形，

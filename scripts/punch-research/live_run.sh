@@ -9,7 +9,7 @@
 #   host A:  ./live_run.sh listen  9900 stun.l.google.com:19302 --session-out /tmp/live_a.json
 #   host B:  ./live_run.sh connect A_PUB_IP 9900 stun.l.google.com:19302 --session-out /tmp/live_b.json
 #
-# 默认使用 RECOMMENDED_PARAMS.md 推荐参数（N=8 W=2 M=32 pool=1 budget=2s）。
+# 默认使用经过脚本参数化的诊断配置（N=8 W=2 M=32 pool=1 budget=2s）。
 # 输出：session JSON（--session-out）+ stdout 日志（含 NAT profile / 事件时间线）。
 set -euo pipefail
 

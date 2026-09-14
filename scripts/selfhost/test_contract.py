@@ -16,6 +16,7 @@ class SelfhostContracts(unittest.TestCase):
         self.assertIn('GOTOOLCHAIN=local', docker)
         self.assertNotIn('CGO_ENABLED=1', docker)
         self.assertIn('/out/p2wlan-relay ./relay', docker)
+        self.assertIn('/out/p2wlan-db ./cmd/p2wlan-db', docker)
         self.assertIn('ca-certificates', docker)
         self.assertIn('USER p2wlan', docker)
 

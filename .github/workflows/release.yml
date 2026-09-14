@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   identity-gate:
@@ -34,6 +34,8 @@ jobs:
   flutter-android:
     needs: identity-gate
     name: Flutter Android arm64 APK
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release-signing
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -139,12 +141,6 @@ jobs:
           name: p2wlan-android-arm64-release
           path: dist-release/p2wlan-android-arm64-release.apk
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: dist-release/p2wlan-android-arm64-release.apk
-
   flutter-ios:
     needs: identity-gate
     name: Flutter iOS arm64 IPA
@@ -193,12 +189,6 @@ jobs:
         with:
           name: p2wlan-ios-arm64-unsigned
           path: dist-release/p2wlan-ios-arm64-unsigned.ipa
-
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: dist-release/p2wlan-ios-arm64-unsigned.ipa
 
   flutter-macos:
     needs: identity-gate
@@ -303,12 +293,6 @@ jobs:
           name: p2wlan-macos-${{ matrix.arch }}
           path: dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
-
   flutter-linux:
     needs: identity-gate
     name: Flutter Linux ${{ matrix.arch }} Bundle
@@ -404,12 +388,6 @@ jobs:
         with:
           name: p2wlan-linux-${{ matrix.arch }}
           path: dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
-
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
 
   flutter-windows:
     needs: identity-gate
@@ -564,12 +542,6 @@ jobs:
           name: p2wlan-windows-${{ matrix.arch }}-setup
           path: dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
-
   linux-cli:
     needs: identity-gate
     name: Linux ${{ matrix.arch }} CLI Package
@@ -621,7 +593,7 @@ jobs:
           cp LICENSE "$pkg/"
           mkdir -p "$pkg/systemd"
           cp deploy/systemd/p2wlan-daemon.service "$pkg/systemd/"
-          cp docs/linux-cli.md "$pkg/"
+          cp docs/guides/client.md "$pkg/"
           cat > "$pkg/README-LINUX-CLI.txt" <<'EOF'
           p2wlan Linux CLI
 
@@ -631,24 +603,21 @@ jobs:
           - p2pnet-daemon: legacy name of p2wlan-daemon (same binary; kept for
             installers and update checks that predate the v0.1.67 rename)
           - install.sh: system-wide installer; also works as an online GitHub release installer
-          - linux-cli.md: Linux CLI, room, diagnostics, and systemd deployment guide
+          - client.md: Linux CLI, room, diagnostics, and systemd deployment guide
           - systemd/p2wlan-daemon.service: hardened systemd unit template
           - LICENSE
 
           Install from this tarball:
           1. sudo ./install.sh
 
-          Online install latest:
-          1. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-          2. sudo sh /tmp/p2wlan-install.sh
-
-          Online install a specific tag:
-          1. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-          2. sudo sh /tmp/p2wlan-install.sh --version ${{ github.ref_name }}
+          Online install this fixed tag:
+          1. VERSION=${{ github.ref_name }}
+          2. curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+          3. sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
 
           Dry-run or install to a user directory:
           - sh /tmp/p2wlan-install.sh --version ${{ github.ref_name }} --dry-run
-          - sh /tmp/p2wlan-install.sh --install-dir "$HOME/.local/bin"
+          - sh /tmp/p2wlan-install.sh --version ${{ github.ref_name }} --install-dir "$HOME/.local/bin"
 
           Verify:
           - p2wlan --version
@@ -684,7 +653,7 @@ jobs:
           - Supplying `-p` is supported for automation, but interactive password input is safer.
           - Cloud direct UDP needs an open fixed UDP port in the provider security group and OS firewall.
           - `p2wlan doctor` shows peer UDP candidate previews and warns when peers only advertise private endpoints.
-          - See `docs/linux-cli.md` in the source tree for systemd and complete room-management instructions.
+          - See `docs/guides/client.md` in the source tree for systemd and complete room-management instructions.
           - For self-hosting, run the Go control and relay services separately.
           EOF
           chmod +x "$pkg/p2wlan" "$pkg/p2wlan-daemon" "$pkg/install.sh"
@@ -702,10 +671,72 @@ jobs:
             dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz
             dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.sha256
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+  publish:
+    name: Publish complete client release
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.flutter-android.result == 'success' && needs.flutter-ios.result == 'success' && needs.flutter-macos.result == 'success' && needs.flutter-linux.result == 'success' && needs.flutter-windows.result == 'success' && needs.linux-cli.result == 'success' }}
+    needs:
+      - flutter-android
+      - flutter-ios
+      - flutter-macos
+      - flutter-linux
+      - flutter-windows
+      - linux-cli
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          files: |
-            dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz
-            dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.sha256
+          persist-credentials: false
+
+      - name: Download all candidate artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: p2wlan-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify complete release set and write manifest
+        env:
+          P2WLAN_RELEASE_SHA: ${{ github.sha }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/verify_release_set.py \
+            --directory release-assets \
+            --source-sha "$P2WLAN_RELEASE_SHA" \
+            --tag "$P2WLAN_RELEASE_TAG"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$P2WLAN_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "$P2WLAN_RELEASE_TAG" \
+            --generate-notes
+
+      - name: Upload complete release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$P2WLAN_RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Publish release after asset upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$P2WLAN_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest=true
