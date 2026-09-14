@@ -66,6 +66,7 @@ jobs:
         run: go test ./...
 
       - name: Build and checksum server bundle
+        id: bundle
         working-directory: server
         env:
           GOARCH: ${{ matrix.goarch }}
@@ -73,6 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           SOURCE_SHA=$(git rev-parse HEAD)
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           if [[ "$VERSION" == server-dev-* ]]; then VERSION="server-dev-$SOURCE_SHA"; fi
           rm -rf dist
           mkdir -p dist
@@ -105,7 +107,7 @@ jobs:
       - name: Upload server bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: p2wlan-server-linux-${{ matrix.arch }}-${{ github.sha }}
+          name: p2wlan-server-linux-${{ matrix.arch }}-${{ steps.bundle.outputs.source_sha }}
           path: |
             server/p2wlan-server-linux-${{ matrix.arch }}.tar.gz
             server/p2wlan-server-linux-${{ matrix.arch }}.tar.gz.sha256

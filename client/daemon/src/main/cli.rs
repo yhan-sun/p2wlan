@@ -192,6 +192,15 @@ struct Cli {
     #[arg(long, name = "validate-overlay")]
     validate_overlay: bool,
 
+    /// Hold generated overlay-validation business traffic until this regular
+    /// file exists (independent harnesses only).
+    #[arg(
+        long,
+        name = "overlay-start-gate-file",
+        requires = "validate-overlay"
+    )]
+    overlay_start_gate_file: Option<PathBuf>,
+
     /// With --validate-overlay, target every online peer with a WireGuard
     /// session (independent validation harnesses only).  Off by default: the
     /// overlay loop then only sends over confirmed Direct paths.

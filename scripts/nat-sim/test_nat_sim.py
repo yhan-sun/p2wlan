@@ -11,6 +11,7 @@ import os
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -60,6 +61,13 @@ assert TRANSIENT_SPEC.loader is not None
 TRANSIENT = importlib.util.module_from_spec(TRANSIENT_SPEC)
 TRANSIENT_SPEC.loader.exec_module(TRANSIENT)
 
+DIRECT_ORDER_PATH = Path(__file__).with_name("direct_order.py")
+DIRECT_ORDER_SPEC = importlib.util.spec_from_file_location("p2wlan_direct_order", DIRECT_ORDER_PATH)
+assert DIRECT_ORDER_SPEC is not None
+assert DIRECT_ORDER_SPEC.loader is not None
+DIRECT_ORDER = importlib.util.module_from_spec(DIRECT_ORDER_SPEC)
+DIRECT_ORDER_SPEC.loader.exec_module(DIRECT_ORDER)
+
 
 class CaptureProtocol(asyncio.DatagramProtocol):
     def __init__(self):
@@ -104,6 +112,34 @@ class StunEncodingTests(unittest.TestCase):
         self.assertIsNone(NAT_SIM.parse_binding_request(wrong_cookie))
         wrong_type = struct.pack("!HHI", NAT_SIM.BINDING_RESPONSE, 0, NAT_SIM.MAGIC_COOKIE) + transaction_id
         self.assertIsNone(NAT_SIM.parse_binding_request(wrong_type))
+
+
+class DirectBusinessOrderTests(unittest.TestCase):
+    def test_historical_relay_confirmation_race_fails_closed(self):
+        # From the first PR #83 failure: Direct promoted at 7463ms, first
+        # Direct business ingress at 7986ms, Relay confirmation at 8144ms.
+        checks = DIRECT_ORDER.check_direct_business_order(7463, 8144, 7986)
+        self.assertEqual(checks, (True, True, False))
+        result = subprocess.run(
+            [sys.executable, str(DIRECT_ORDER_PATH), "7463", "8144", "7986"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.stdout.strip(), "1 1 0")
+
+    def test_business_after_direct_and_relay_confirmation_passes(self):
+        # Relay need not precede Direct promotion; both must precede business.
+        self.assertEqual(
+            DIRECT_ORDER.check_direct_business_order(7463, 8144, 9000),
+            (True, True, True),
+        )
+
+    def test_missing_order_timestamp_fails_closed(self):
+        self.assertEqual(
+            DIRECT_ORDER.check_direct_business_order(7463, None, 9000),
+            (False, False, False),
+        )
 
 
 class ObservabilityFailClosedTests(unittest.TestCase):

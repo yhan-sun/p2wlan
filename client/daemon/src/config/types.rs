@@ -230,6 +230,11 @@ pub struct NetworkConfig {
     /// macOS TUN creation is unavailable to the validation harness.
     #[serde(default)]
     pub validate_overlay: bool,
+    /// Optional file gate for an independent overlay-validation harness. When
+    /// set, no generated business payload is sent until this path exists as a
+    /// regular file. This runtime-only control is never persisted.
+    #[serde(skip)]
+    pub overlay_start_gate_file: Option<std::path::PathBuf>,
     /// When `validate_overlay` is enabled, target every online peer with an
     /// established WireGuard session instead of only Direct peers.  The
     /// outbound path selector then rides Relay until Direct is confirmed, so
