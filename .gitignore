@@ -47,22 +47,19 @@ coverage/
 ~$*
 .~lock.*#
 
-# Local-only project notes, research drafts and internal docs (kept on disk, never published)
+# Local-only project notes and research drafts (kept on disk, never published)
 P2PNet-Design.md
 PRODUCT.md
 research/nat-traversal-paper/
-docs/*
-!docs/linux-cli.md
-!docs/room-device-controls.md
-!docs/relay-lifecycle-and-authorization.md
-!docs/self-hosting-and-notifications-plan.md
-!docs/server-deployment.md
-!docs/self-hosting.md
-!docs/server-upgrade.md
-!docs/staging-validation.md
 
-# Staging deployment templates (kept on disk, never published)
-deploy/staging/*.env.example
+# Public docs and redacted deployment templates are tracked. Runtime values
+# and generated evidence remain local.
+docs/generated/
+docs/adr/
+deploy/staging/*.env
+deploy/staging/*.env.local
+deploy/staging/*.secret
+!deploy/staging/*.env.example
 
 # Test scripts that hardcode real infra/device IPs (kept on disk, never published)
 scripts/mac-remote-smoke.sh
@@ -93,6 +90,9 @@ scripts/dual-end/*.sh
 *.tar.xz
 *.sha256
 *.sig
+*.backup
+*.backup.enc
+path-observability-evidence.json
 artifacts/
 /release/
 releases/

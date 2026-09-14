@@ -80,7 +80,12 @@ func TestDatabaseLiteralFilenameIsNotAConnectionQuery(t *testing.T) {
 		var schema, actual string
 		err = db.QueryRow("PRAGMA database_list").Scan(&seq, &schema, &actual)
 		db.Close()
-		if err != nil || filepath.Clean(actual) != filepath.Clean(path) {
+		if err != nil {
+			t.Fatalf("database filename query: %v", err)
+		}
+		resolvedActual, actualErr := filepath.EvalSymlinks(actual)
+		resolvedPath, pathErr := filepath.EvalSymlinks(path)
+		if actualErr != nil || pathErr != nil || filepath.Clean(resolvedActual) != filepath.Clean(resolvedPath) {
 			t.Fatalf("database filename changed: got %q want %q err=%v", actual, path, err)
 		}
 	}

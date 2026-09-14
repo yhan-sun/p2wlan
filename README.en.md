@@ -149,11 +149,12 @@ p2wlan logs -f
 The repository also includes a Linux CLI installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/main/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh
+VERSION=vX.Y.Z
+curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
 ```
 
-See [`docs/linux-cli.md`](docs/linux-cli.md) for room management, Direct/Relay path policies, route repair, support bundles, and systemd deployment. Common commands include:
+See the [client guide](docs/guides/client.md) and [CLI reference](docs/reference/cli.md) for room management, Direct/Relay path policies, route repair, support bundles, and systemd deployment. Common commands include:
 
 ```bash
 p2wlan room list
@@ -162,7 +163,7 @@ p2wlan route verify
 p2wlan support-bundle --upload
 ```
 
-Fresh installs do not contain or contact a project-owned Control Plane or Relay. Configure your own server before signing in:
+Fresh installs do not contain or contact a project-owned Control Plane or Relay. Configure the server supplied by your administrator before signing in:
 
 ```bash
 p2wlan config set control https://control.example.com
@@ -170,7 +171,7 @@ p2wlan login -u your-name                 # email or username
 p2wlan account show                       # show the current account identity
 ```
 
-Self-hosted Control/Relay installation, checksum verification, systemd operation, backups, and independent upgrades are documented in [`docs/server-deployment.md`](docs/server-deployment.md) and [`docs/server-upgrade.md`](docs/server-upgrade.md):
+Self-hosted Control/Relay installation, checksum verification, systemd operation, backups, and independent upgrades are documented in the [self-hosting guide](docs/guides/self-hosting.md) and [upgrade and recovery guide](docs/guides/upgrade-and-recovery.md):
 
 ```bash
 sudo ./scripts/install-server.sh --version server-vX.Y.Z --role all
@@ -189,9 +190,7 @@ After a server release, upload it from your workstation or let an already instal
   --user <ssh-user> --version server-vX.Y.Z --start
 ```
 
-When `--identity` is omitted, OpenSSH prompts for the server password and remote `sudo` prompts for the administrator password; passwords are never command-line arguments. See [`docs/server-deployment.md`](docs/server-deployment.md) for Actions artifact download, upload/fetch modes, checksum verification, health checks, and rollback.
-
-The Actions staging workflow can target `47.109.40.237` only through GitHub Environment variables and secrets. The local `~/.ssh/ali.pem` key must never be committed or uploaded as an artifact; see [`docs/staging-validation.md`](docs/staging-validation.md).
+When `--identity` is omitted, OpenSSH prompts for the server password and remote `sudo` prompts for the administrator password; passwords are never command-line arguments. The deployment entry points and staging variables are defined by the [self-hosting guide](docs/guides/self-hosting.md) and release workflows; concrete hosts and private keys are never stored in the repository.
 
 ## How It Works
 
@@ -240,7 +239,7 @@ P2WLAN uses a self-contained **WireGuard-like Noise** data plane with X25519, Ch
 
 ## Self-hosting
 
-For complete configuration, Windows native operation and Docker Compose, see the [self-hosting guide](docs/self-hosting.md) (Chinese).
+For complete configuration, Windows native operation and Docker Compose, see the [self-hosting guide](docs/guides/self-hosting.md) (Chinese).
 
 The Control Plane and Relay live under [`server/`](server/). Linux CLI / daemon components are part of the Rust workspace. A minimal build from the repository root is:
 
@@ -267,7 +266,7 @@ Production deployment also requires HTTPS/WSS, database, authentication secrets,
 - P2P connectivity is not guaranteed across arbitrary NAT environments; Relay availability also depends on the Control Plane and Relay being reachable.
 - Perform your own security assessment before sensitive production deployment.
 
-Dependency scanning, workflow permissions, and published-asset checks are documented in [`docs/security-audit.md`](docs/security-audit.md).
+Credential boundaries and security limitations are documented in [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md), and the [security model](docs/explanation/security-model.md). Published-asset identity is defined in the [release contract](docs/reference/release-contract.md).
 
 ## Developers
 

@@ -281,16 +281,16 @@ mod tests {
             PathBuf::from("/tmp/config/p2wlan/p2wlan-config.json")
         );
         assert_eq!(
-            macos_log_dir_from_home("/Users/test"),
-            PathBuf::from("/Users/test/Library/Logs/p2wlan")
+            macos_log_dir_from_home("/tmp/p2wlan-test-home"),
+            PathBuf::from("/tmp/p2wlan-test-home/Library/Logs/p2wlan")
         );
         assert_eq!(
-            linux_log_dir_from_home("/home/test"),
-            PathBuf::from("/home/test/.p2wlan/logs")
+            linux_log_dir_from_home("/tmp/p2wlan-test-home"),
+            PathBuf::from("/tmp/p2wlan-test-home/.p2wlan/logs")
         );
         assert_eq!(
-            windows_log_dir_from_local_app_data(r"C:\Users\test\AppData\Local"),
-            PathBuf::from(r"C:\Users\test\AppData\Local/p2wlan/logs")
+            windows_log_dir_from_local_app_data(r"C:\p2wlan-test-home\AppData\Local"),
+            PathBuf::from(r"C:\p2wlan-test-home\AppData\Local/p2wlan/logs")
         );
         assert_eq!(
             pid_path_from_log_dir("/tmp/logs"),

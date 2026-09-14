@@ -1128,9 +1128,32 @@ for round in $(seq 1 "$ROUNDS"); do
       stop_round_processes
       continue
     fi
-    # Both peers now have authoritative encrypted Relay confirmation. Release
-    # the shared gate only after the barrier; the daemon immediately injects
-    # its first validation payload and logs the release event.
+    # Both peers now have authoritative encrypted Relay confirmation. Keep the
+    # shared business gate closed until both local Direct state machines have
+    # also committed Direct. Otherwise the faster endpoint can send a real
+    # Direct business packet into the slower endpoint's pre-promotion window;
+    # production correctly rejects that packet as first-usable evidence, but
+    # the Direct ordering gate must prove that no such race is admitted.
+    direct_promotion_barrier_ok=0
+    while (( SECONDS < DIRECT_DEADLINE )); do
+      if ! kill -0 "$NODE_A_PID" 2>/dev/null || ! kill -0 "$NODE_B_PID" 2>/dev/null; then
+        break
+      fi
+      if grep -q 'event="direct_promoted"' "$ROUND_DIR/node-a.log" 2>/dev/null && \
+         grep -q 'event="direct_promoted"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+        direct_promotion_barrier_ok=1
+        break
+      fi
+      deadline_pause 0.1 "$DIRECT_DEADLINE" || break
+    done
+    if [[ "$direct_promotion_barrier_ok" -ne 1 ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=direct_promotion_barrier_timeout node_a_alive=$(kill -0 "$NODE_A_PID" 2>/dev/null && echo 1 || echo 0) node_b_alive=$(kill -0 "$NODE_B_PID" 2>/dev/null && echo 1 || echo 0)" >&2
+      overall=1
+      stop_round_processes
+      continue
+    fi
+    # The daemon's Direct overlay loop additionally waits for the authoritative
+    # DPLPMTUD business budget before injecting the first payload.
     : >"$BUSINESS_START_GATE_FILE"
     gate_release_ok=0
     while (( SECONDS < DIRECT_DEADLINE )); do

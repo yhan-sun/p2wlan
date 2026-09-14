@@ -303,7 +303,7 @@ void main() {
     expect(
       isP2wlanDaemonRuntimeCommandLine(
         '/Applications/P2WLAN.app/Contents/Resources/p2wlan-daemon '
-        '--config /Users/test/Library/Application Support/p2wlan/p2wlan-config.json '
+        '--config /tmp/p2wlan-test-home/Library/Application Support/p2wlan/p2wlan-config.json '
         '--diagnostics-bind 127.0.0.1:39277 --manual',
       ),
       isTrue,

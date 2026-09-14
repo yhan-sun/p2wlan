@@ -14,9 +14,7 @@ on:
       - "scripts/dplpmtud/**"
       - "scripts/mtu-smoke.sh"
       - "contracts/dplpmtud_acceptance.json"
-      - "docs/dplpmtud-runtime-foundation.md"
-      - "docs/dplpmtud-business-budget.md"
-      - "docs/dplpmtud-live-dataplane-acceptance.md"
+      - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
   pull_request:
@@ -32,9 +30,7 @@ on:
       - "scripts/dplpmtud/**"
       - "scripts/mtu-smoke.sh"
       - "contracts/dplpmtud_acceptance.json"
-      - "docs/dplpmtud-runtime-foundation.md"
-      - "docs/dplpmtud-business-budget.md"
-      - "docs/dplpmtud-live-dataplane-acceptance.md"
+      - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:

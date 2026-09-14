@@ -4,7 +4,7 @@ puncher.py — UU远程打洞算法完整实现（RFC 5780 语义修正版）
 
 依据 libstreamer.dylib (UURemote v4.35.0) 反汇编还原；NAT 行为检测按 RFC 5780 语义重写。
 
-与原版 §7 实现的关键差异（详见 TEST_REPORT.md「与原版语义差异」）：
+实现说明（行为以源码、单元测试和运行时输出为准）：
   1. NAT 检测观测「STUN 服务器回显的 XOR-MAPPED-ADDRESS」变化（服务器视角的映射），
      不再用单个 socket 的本地 getsockname() 端口序列（原实现四元组不变→恒定判 cone，linear/random 分支永远不可达）。
   2. 检测结果从整数枚举(1=cone 2=linear 3=random)扩展为 NatProfile(mapping + allocation + filtering + confidence)。

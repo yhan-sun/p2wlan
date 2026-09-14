@@ -7,7 +7,7 @@ on:
       - 'deploy/selfhost/**'
       - 'scripts/selfhost/**'
       - 'scripts/p2wlan-server'
-      - 'docs/self-hosting.md'
+      - 'docs/guides/self-hosting.md'
       - '.github/workflows/selfhost.yml'
       - '.github/workflows/build-server.yml'
   push:

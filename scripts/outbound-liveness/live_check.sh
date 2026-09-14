@@ -4,7 +4,7 @@
 # Records / verifies the "ScatterExtended 0-ACK → firewall diagnosis" feature on
 # REAL networks.  It does NOT fabricate a firewall; it parses the evidence a
 # running daemon emits (its structured log + /status JSON) and renders a
-# Gate-report table (matching scripts/punch-research/TEST_REPORT_P2.md §9/§10).
+# reproducible Gate-report table for an external evidence bundle.
 #
 # The feature logs these markers (daemon, RUST_LOG=info):
 #   outbound_liveness            verdict=<ok|blocked|unknown> total_elapsed_ms=<N>

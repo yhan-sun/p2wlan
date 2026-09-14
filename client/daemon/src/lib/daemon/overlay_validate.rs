@@ -86,8 +86,9 @@ struct SentOverlayNonce {
 }
 
 /// Strict-Direct requests can arrive just before this endpoint commits its own
-/// Direct state. Preserve the request until that local commit so its echo also
-/// traverses Direct instead of falling back to an otherwise healthy Relay.
+/// Direct state or publishes the DPLPMTUD business budget. Preserve the request
+/// until both production Direct business admission conditions hold so its echo
+/// also traverses Direct instead of falling back to an otherwise healthy Relay.
 struct PendingOverlayEcho {
     peer_id: String,
     virtual_ip: String,
@@ -125,6 +126,8 @@ async fn fire_pending_bursts(
     controller: &MockTunController,
     peers: &Arc<PeerManager>,
     local_vip: &str,
+    overlay_any_path: bool,
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
     burst_size: usize,
     next_nonce: &mut u64,
     next_seq: &mut u32,
@@ -137,7 +140,10 @@ async fn fire_pending_bursts(
         .committed_business_path_snapshots_sync()
         .into_iter()
         .filter(|peer| {
-            peer.is_online_in_generation(generation) && peer.active_path().is_some()
+            peer.is_online_in_generation(generation)
+                && peer.active_path().is_some()
+                && (overlay_any_path
+                    || peer.active_path() == Some(crate::peer::NetworkPath::Direct))
         })
         .map(|peer| (peer.peer_id, peer.virtual_ip))
         .collect();
@@ -152,6 +158,11 @@ async fn fire_pending_bursts(
         })
         .collect();
     for (peer_id, virtual_ip) in targets {
+        if !overlay_any_path
+            && !overlay_direct_business_budget_ready(udp_transport, &peer_id).await
+        {
+            continue;
+        }
         let mut nonces = Vec::with_capacity(burst_size);
         for _ in 0..burst_size {
             *next_nonce = next_nonce.wrapping_add(1);
@@ -289,10 +300,29 @@ fn committed_direct_ready_for_echo(
         })
 }
 
+/// Read the same authoritative Direct business admission bit used by the
+/// production outbound selector. `None` is used only by unit tests that focus
+/// on the committed-path transition; the production validation loop always
+/// supplies the live UDP transport slot.
+async fn overlay_direct_business_budget_ready(
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
+    peer_id: &str,
+) -> bool {
+    let Some(udp_transport) = udp_transport else {
+        return true;
+    };
+    udp_transport
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|udp| udp.direct_business_budget_ready_for_peer(peer_id))
+}
+
 async fn flush_pending_overlay_echoes(
     controller: &MockTunController,
     peers: &PeerManager,
     overlay_any_path: bool,
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
     pending: &mut VecDeque<PendingOverlayEcho>,
 ) {
     if pending.is_empty() {
@@ -323,7 +353,9 @@ async fn flush_pending_overlay_echoes(
         if !snapshot.is_online_in_generation(generation) {
             continue;
         }
-        if overlay_any_path || snapshot.active_path() == Some(crate::peer::NetworkPath::Direct) {
+        let direct_ready = snapshot.active_path() == Some(crate::peer::NetworkPath::Direct)
+            && overlay_direct_business_budget_ready(udp_transport, &echo.peer_id).await;
+        if overlay_any_path || direct_ready {
             ready.push(echo);
         } else {
             waiting.push_back(echo);
@@ -341,6 +373,7 @@ async fn run_overlay_send_cycle(
     peers: &Arc<PeerManager>,
     local_vip: &str,
     overlay_any_path: bool,
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
     overlay_burst: usize,
     next_nonce: &mut u64,
     next_seq: &mut u32,
@@ -356,6 +389,7 @@ async fn run_overlay_send_cycle(
             peers,
             local_vip,
             overlay_any_path,
+            udp_transport,
             next_nonce,
             next_seq,
             stats,
@@ -369,6 +403,8 @@ async fn run_overlay_send_cycle(
             controller,
             peers,
             local_vip,
+            overlay_any_path,
+            udp_transport,
             overlay_burst,
             next_nonce,
             next_seq,
@@ -389,6 +425,7 @@ pub async fn run_overlay_validate_loop(
     local_node_id: String,
     overlay_start_gate_file: Option<PathBuf>,
     overlay_any_path: bool,
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     overlay_burst: usize,
     timeline: Arc<ConnectionTimeline>,
     mut overlay_ingress_rx: mpsc::Receiver<OverlayIngressEvent>,
@@ -424,6 +461,7 @@ pub async fn run_overlay_validate_loop(
     // echoed over the other endpoint's still-active Relay path rather than
     // proving a bidirectional Direct business exchange.
     let mut committed_path_changes = peers.subscribe_committed_business_path_changes();
+    let mut direct_budget_changes = peers.subscribe_direct_business_budget_changes();
     let mut start_gate_released = overlay_start_gate_file.is_none();
     let mut start_gate_poll = tokio::time::interval(Duration::from_millis(20));
     start_gate_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -469,6 +507,7 @@ pub async fn run_overlay_validate_loop(
                     &controller,
                     &peers,
                     overlay_any_path,
+                    Some(&udp_transport),
                     &mut pending_echoes,
                 )
                 .await;
@@ -477,6 +516,7 @@ pub async fn run_overlay_validate_loop(
                     &peers,
                     &local_vip,
                     overlay_any_path,
+                    Some(&udp_transport),
                     overlay_burst,
                     &mut next_nonce,
                     &mut next_seq,
@@ -499,6 +539,7 @@ pub async fn run_overlay_validate_loop(
                     &controller,
                     &peers,
                     overlay_any_path,
+                    Some(&udp_transport),
                     &mut pending_echoes,
                 )
                 .await;
@@ -508,6 +549,7 @@ pub async fn run_overlay_validate_loop(
                         &peers,
                         &local_vip,
                         overlay_any_path,
+                        Some(&udp_transport),
                         overlay_burst,
                         &mut next_nonce,
                         &mut next_seq,
@@ -518,6 +560,38 @@ pub async fn run_overlay_validate_loop(
                         &timeline,
                     ).await;
                 }
+            }
+            changed = direct_budget_changes.changed(), if !overlay_any_path => {
+                if changed.is_err() {
+                    warn!("overlay_validate: direct business budget feed closed; stopping");
+                    break;
+                }
+                if !start_gate_released {
+                    continue;
+                }
+                flush_pending_overlay_echoes(
+                    &controller,
+                    &peers,
+                    overlay_any_path,
+                    Some(&udp_transport),
+                    &mut pending_echoes,
+                )
+                .await;
+                run_overlay_send_cycle(
+                    &controller,
+                    &peers,
+                    &local_vip,
+                    overlay_any_path,
+                    Some(&udp_transport),
+                    overlay_burst,
+                    &mut next_nonce,
+                    &mut next_seq,
+                    &mut stats,
+                    &mut sent_nonces,
+                    &mut nonce_order,
+                    &mut bursts,
+                    &timeline,
+                ).await;
             }
             _ = start_gate_poll.tick(), if !start_gate_released => {
                 let Some(gate_path) = overlay_start_gate_file.as_ref() else {
@@ -573,6 +647,7 @@ pub async fn run_overlay_validate_loop(
                     &sent_nonces,
                     &mut bursts,
                     &mut pending_echoes,
+                    Some(&udp_transport),
                 )
                 .await;
             }
@@ -651,6 +726,7 @@ async fn send_overlay_payloads(
     peers: &Arc<PeerManager>,
     local_vip: &str,
     overlay_any_path: bool,
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
     next_nonce: &mut u64,
     next_seq: &mut u32,
     stats: &mut OverlayStats,
@@ -681,6 +757,12 @@ async fn send_overlay_payloads(
             && !peers
                 .is_relay_peer_confirmed_for_generation(&peer_id, generation)
                 .await
+        {
+            continue;
+        }
+        if !overlay_any_path
+            && peer.active_path() == Some(crate::peer::NetworkPath::Direct)
+            && !overlay_direct_business_budget_ready(udp_transport, &peer_id).await
         {
             continue;
         }
@@ -757,6 +839,7 @@ async fn handle_overlay_ingress(
     sent_nonces: &HashMap<u64, SentOverlayNonce>,
     bursts: &mut HashMap<String, OverlayBurst>,
     pending_echoes: &mut VecDeque<PendingOverlayEcho>,
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
 ) {
     let current_generation = peers.current_network_generation_sync();
     if event.connection_generation != current_generation {
@@ -813,13 +896,15 @@ async fn handle_overlay_ingress(
                     nonce,
                     seq,
                 ) {
+                    let direct_committed = committed_direct_ready_for_echo(
+                        peers,
+                        &peer_id,
+                        event.connection_generation,
+                    );
+                    let direct_business_ready = direct_committed
+                        && overlay_direct_business_budget_ready(udp_transport, &peer_id).await;
                     if start_gate_released
-                        && (overlay_any_path
-                        || committed_direct_ready_for_echo(
-                            peers,
-                            &peer_id,
-                            event.connection_generation,
-                        ))
+                        && (overlay_any_path || direct_business_ready)
                     {
                         inject_pending_overlay_echo(controller, echo).await;
                     } else {
@@ -842,7 +927,7 @@ async fn handle_overlay_ingress(
                                 nonce = nonce,
                                 "deferred overlay echo until the external validation start gate releases"
                             );
-                        } else {
+                        } else if !direct_committed {
                             info!(
                                 event = "overlay_echo_deferred_until_direct_commit",
                                 peer = %peer_id,
@@ -850,6 +935,15 @@ async fn handle_overlay_ingress(
                                 seq = seq,
                                 nonce = nonce,
                                 "deferred strict-Direct overlay echo until the local Direct path commits"
+                            );
+                        } else {
+                            info!(
+                                event = "overlay_echo_deferred_until_direct_business_budget",
+                                peer = %peer_id,
+                                generation = event.connection_generation,
+                                seq = seq,
+                                nonce = nonce,
+                                "deferred strict-Direct overlay echo until the local Direct business budget is ready"
                             );
                         }
                         pending_echoes.push_back(echo);
@@ -1290,7 +1384,7 @@ mod overlay_validate_tests {
             .expect("valid IPv4 addresses must build a pending echo"),
         ]);
 
-        flush_pending_overlay_echoes(&controller, &manager, false, &mut pending).await;
+        flush_pending_overlay_echoes(&controller, &manager, false, None, &mut pending).await;
         assert_eq!(
             pending.len(),
             1,
@@ -1317,7 +1411,7 @@ mod overlay_validate_tests {
             Some(NetworkPath::Direct),
         );
 
-        flush_pending_overlay_echoes(&controller, &manager, false, &mut pending).await;
+        flush_pending_overlay_echoes(&controller, &manager, false, None, &mut pending).await;
         assert!(pending.is_empty(), "the Direct commit must release the echo");
 
         let mut packet = [0u8; 512];

@@ -14,7 +14,7 @@ on:
       - "client/relay/**"
       - "scripts/dplpmtud/**"
       - "contracts/dplpmtud_acceptance.json"
-      - "docs/dplpmtud-live-dataplane-acceptance.md"
+      - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
   pull_request:
@@ -30,7 +30,7 @@ on:
       - "client/relay/**"
       - "scripts/dplpmtud/**"
       - "contracts/dplpmtud_acceptance.json"
-      - "docs/dplpmtud-live-dataplane-acceptance.md"
+      - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:

@@ -376,7 +376,7 @@ if [[ "$PASS_MAX" -eq 0 ]]; then
 fi
 
 if [[ "$FAILURES" -gt 0 ]]; then
-  echo "[mtu-smoke] WARN: largest passing packet size is $PASS_MAX; record this in docs/nat-traversal-matrix.*.md"
+  echo "[mtu-smoke] WARN: largest passing packet size is $PASS_MAX; see docs/reference/networking.md"
   exit 1
 fi
 

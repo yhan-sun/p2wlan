@@ -21,7 +21,8 @@ Usage:
   sudo p2wlan-server check [--service control|relay|all]
   sudo p2wlan-server update --archive FILE [--service control|relay|all]
   sudo p2wlan-server update --version VERSION [--base-url URL]
-  sudo p2wlan-server backup
+  sudo p2wlan-server backup [--include-config --age-recipient RECIPIENT]
+  sudo p2wlan-server restore --backup DIRECTORY [--age-identity FILE]
   sudo p2wlan-server rollback [--version VERSION]
   sudo p2wlan-server logs [--service control|relay]
 
@@ -48,9 +49,6 @@ restart_services() {
   if ! systemd_available; then return 0; fi
   systemctl daemon-reload
   while IFS= read -r unit; do
-    # A control-only or relay-only installation intentionally has only one
-    # unit.  Updating/rolling back with the default all selector must not
-    # fail after restarting the unit that exists.
     if systemctl cat "$unit" >/dev/null 2>&1; then
       systemctl restart "$unit"
     fi
@@ -202,8 +200,6 @@ init_server() {
   local role=${1:-all}
   need_root
   case "$role" in control|relay|all) ;; *) die "role must be control, relay, or all" ;; esac
-  # The systemd units run as the unprivileged p2wlan user.  Keep the
-  # installation root traversable while protecting configuration and data.
   install -d -m 0755 "$ROOT_DIR" "$RELEASE_DIR" "$CONFIG_DIR" "$DATA_DIR"
   if ! id p2wlan >/dev/null 2>&1; then
     useradd --system --home-dir "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin p2wlan
@@ -214,10 +210,8 @@ init_server() {
   fi
   if [ ! -f "$CONFIG_DIR/relay.env" ]; then
     install -m 0600 /dev/null "$CONFIG_DIR/relay.env"
-    printf '%s\n' "# Configure TLS, keyring, audience, region and revocation feed before starting; see docs/self-hosting.md" "RELAY_BIND=:18081" "RELAY_REQUIRE_AUTH=true" "RELAY_METRICS_BIND=127.0.0.1:18082" >> "$CONFIG_DIR/relay.env"
+    printf '%s\n' "# Configure TLS, keyring, audience, region and revocation feed before starting; see docs/guides/self-hosting.md" "RELAY_BIND=:18081" "RELAY_REQUIRE_AUTH=true" "RELAY_METRICS_BIND=127.0.0.1:18082" >> "$CONFIG_DIR/relay.env"
   fi
-  # Files created above inherit root ownership.  Transfer only the runtime
-  # config/data trees to the service account; release binaries stay root-owned.
   chown -R p2wlan:p2wlan "$CONFIG_DIR" "$DATA_DIR"
   case "$role" in
     control) install_unit p2wlan-control.service p2wlan-control "$CONFIG_DIR/control.env" ;;
@@ -254,7 +248,9 @@ archive_install() {
   rm -rf "$stage"
   install -d -m 0755 "$stage"
   tar -xzf "$archive" -C "$stage" --no-same-owner
-  [ -x "$stage/p2wlan-control" ] && [ -x "$stage/p2wlan-relay" ] || die "archive is missing control or relay binary"
+  for required in p2wlan-control p2wlan-relay p2wlan-config p2wlan-db p2wlan-server install-server.sh deploy-server.sh; do
+    [ -x "$stage/$required" ] || die "archive is missing required member: $required"
+  done
   if [ -d "$RELEASE_DIR/$version" ]; then
     if cmp -s "$stage/p2wlan-control" "$RELEASE_DIR/$version/p2wlan-control" &&
       cmp -s "$stage/p2wlan-relay" "$RELEASE_DIR/$version/p2wlan-relay"; then
@@ -288,28 +284,292 @@ status_server() {
   if [ -x "$CURRENT_LINK/p2wlan-relay" ]; then "$CURRENT_LINK/p2wlan-relay" --version || true; fi
 }
 
+resolve_db_path() {
+  local env_file="$CONFIG_DIR/control.env"
+  local raw
+  if [ "$#" -gt 0 ]; then env_file=$1; fi
+  raw=$(env_value "$env_file" DB_PATH)
+  if [ -z "$raw" ]; then raw="$DATA_DIR/p2pnet.db"; fi
+  case "$raw" in
+    file:*|:memory:) die "DB_PATH must be a filesystem path for backup and restore" ;;
+    /*) printf '%s\n' "$raw" ;;
+    *) printf '%s/%s\n' "$DATA_DIR" "$raw" ;;
+  esac
+}
+
 backup_server() {
   need_root
+  local include_config=0
+  local age_recipient=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --include-config) include_config=1; shift ;;
+      --age-recipient)
+        [ "$#" -ge 2 ] || die "--age-recipient requires a value"
+        age_recipient=$2
+        shift 2
+        ;;
+      *) die "unknown backup option: $1" ;;
+    esac
+  done
+  if [ "$include_config" -eq 1 ]; then
+    [ -n "$age_recipient" ] || die "--age-recipient is required with --include-config"
+    command -v age >/dev/null 2>&1 || die "age is required for encrypted configuration backups"
+  fi
+  [ -x "$CURRENT_LINK/p2wlan-db" ] || die "current release has no p2wlan-db snapshot tool; install a complete release bundle"
+  local db_path
+  db_path=$(resolve_db_path)
+  [ -f "$db_path" ] || die "database file not found: $db_path"
   install -d -m 0750 "$DATA_DIR/backups"
-  local target="$DATA_DIR/backups/p2wlan-$(date -u +%Y%m%dT%H%M%SZ)"
-  if systemd_available; then systemctl stop p2wlan-control.service 2>/dev/null || true; fi
-  install -d -m 0700 "$target"
-  [ -f "$DATA_DIR/p2pnet.db" ] && cp -p "$DATA_DIR/p2pnet.db" "$target/"
-  [ -f "$DATA_DIR/p2pnet.db-wal" ] && cp -p "$DATA_DIR/p2pnet.db-wal" "$target/"
-  [ -f "$CONFIG_DIR/control.env" ] && cp -p "$CONFIG_DIR/control.env" "$target/"
-  if systemd_available; then systemctl start p2wlan-control.service 2>/dev/null || true; fi
+  local target
+  target=$(mktemp -d "$DATA_DIR/backups/p2wlan-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+  chmod 0700 "$target"
+  "$CURRENT_LINK/p2wlan-db" --source "$db_path" --output "$target/database.sqlite" \
+    > "$target/database-check.txt"
+  sha256sum "$target/database.sqlite" > "$target/database.sqlite.sha256"
+  {
+    printf '%s\n' "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' "database_path=$db_path"
+    printf '%s\n' "release=$(basename "$(readlink -f "$CURRENT_LINK")")"
+    if [ -f "$CURRENT_LINK/BUILD-METADATA.txt" ]; then
+      awk -F= '/^(version|commit|arch)=/{print}' "$CURRENT_LINK/BUILD-METADATA.txt"
+    fi
+    if [ "$include_config" -eq 1 ]; then
+      printf '%s\n' "config_encrypted=true"
+    else
+      printf '%s\n' "config_encrypted=false"
+    fi
+  } > "$target/metadata.txt"
+  if [ "$include_config" -eq 1 ]; then
+    local -a config_files=()
+    [ -f "$CONFIG_DIR/control.env" ] && config_files+=(control.env)
+    [ -f "$CONFIG_DIR/relay.env" ] && config_files+=(relay.env)
+    [ "${#config_files[@]}" -gt 0 ] || die "no service configuration files found"
+    tar -C "$CONFIG_DIR" -czf - "${config_files[@]}" |
+      age --encrypt --recipient "$age_recipient" --output "$target/config.tar.gz.age"
+    sha256sum "$target/config.tar.gz.age" > "$target/config.tar.gz.age.sha256"
+  fi
+  chmod -R go-rwx "$target"
   echo "$target"
+}
+
+restore_server() {
+  need_root
+  systemd_available || die "restore requires systemd so service state can be preserved"
+  local backup=
+  local age_identity=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --backup)
+        [ "$#" -ge 2 ] || die "--backup requires a directory"
+        backup=$2
+        shift 2
+        ;;
+      --age-identity)
+        [ "$#" -ge 2 ] || die "--age-identity requires a file"
+        age_identity=$2
+        shift 2
+        ;;
+      *) die "unknown restore option: $1" ;;
+    esac
+  done
+  [ -n "$backup" ] || die "restore requires --backup DIRECTORY"
+  [ -d "$backup" ] || die "backup directory not found: $backup"
+  [ -f "$backup/database.sqlite" ] || die "backup database is missing"
+  [ -f "$backup/database.sqlite.sha256" ] || die "backup database checksum is missing"
+  [ -f "$backup/metadata.txt" ] || die "backup metadata is missing"
+  for metadata_key in created_at database_path release config_encrypted; do
+    [ -n "$(env_value "$backup/metadata.txt" "$metadata_key")" ] || die "backup metadata is missing $metadata_key"
+  done
+  case "$(env_value "$backup/metadata.txt" config_encrypted)" in
+    true)
+      [ -f "$backup/config.tar.gz.age" ] || die "backup metadata requires encrypted configuration"
+      [ -f "$backup/config.tar.gz.age.sha256" ] || die "encrypted configuration checksum is missing"
+      (cd "$backup" && sha256sum -c config.tar.gz.age.sha256)
+      ;;
+    false) [ ! -e "$backup/config.tar.gz.age" ] || die "backup contains encrypted configuration but metadata says false" ;;
+    *) die "backup metadata has invalid config_encrypted value" ;;
+  esac
+  (cd "$backup" && sha256sum -c database.sqlite.sha256)
+  [ -x "$CURRENT_LINK/p2wlan-db" ] || die "current release has no p2wlan-db restore verifier"
+
+  local restore_tmp
+  restore_tmp=$(mktemp -d /tmp/p2wlan-restore.XXXXXX)
+  trap 'rm -rf "$restore_tmp"' EXIT
+  "$CURRENT_LINK/p2wlan-db" --verify "$backup/database.sqlite" > "$restore_tmp/restore-check.txt"
+  local restore_config="$CONFIG_DIR/control.env"
+  if [ -f "$backup/config.tar.gz.age" ]; then
+    [ -n "$age_identity" ] || die "backup contains encrypted config; pass --age-identity FILE"
+    [ -f "$age_identity" ] || die "age identity not found: $age_identity"
+    command -v age >/dev/null 2>&1 || die "age is required to decrypt configuration backups"
+    mkdir -p "$restore_tmp/config"
+    age --decrypt --identity "$age_identity" --output "$restore_tmp/config.tar.gz" "$backup/config.tar.gz.age"
+    if ! tar -tzf "$restore_tmp/config.tar.gz" | awk '
+        $0 != "control.env" && $0 != "relay.env" { bad=1 }
+        END { exit bad }
+      ' || ! tar -tvzf "$restore_tmp/config.tar.gz" | awk '
+        $1 !~ /^-/ { bad=1 }
+        END { exit bad }
+      '; then
+      die "encrypted configuration archive must contain only regular control.env or relay.env files"
+    fi
+    tar --no-same-owner --no-same-permissions -xzf "$restore_tmp/config.tar.gz" -C "$restore_tmp/config"
+    [ -f "$restore_tmp/config/control.env" ] && restore_config="$restore_tmp/config/control.env"
+  fi
+
+  local db_path
+  db_path=$(resolve_db_path "$restore_config")
+  install -d -m 0750 "$DATA_DIR/backups"
+  local rollback_copy
+  rollback_copy=$(mktemp -d "$DATA_DIR/backups/pre-restore-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+  chmod 0700 "$rollback_copy"
+  if [ -f "$db_path" ]; then
+    "$CURRENT_LINK/p2wlan-db" --source "$db_path" --output "$rollback_copy/database.sqlite" \
+      > "$rollback_copy/database-check.txt"
+    printf '%s\n' present > "$rollback_copy/database.state"
+  else
+    printf '%s\n' absent > "$rollback_copy/database.state"
+  fi
+  if [ -f "$CONFIG_DIR/control.env" ]; then
+    cp -p "$CONFIG_DIR/control.env" "$rollback_copy/control.env"
+    printf '%s\n' present > "$rollback_copy/control.env.state"
+  else
+    printf '%s\n' absent > "$rollback_copy/control.env.state"
+  fi
+  if [ -f "$CONFIG_DIR/relay.env" ]; then
+    cp -p "$CONFIG_DIR/relay.env" "$rollback_copy/relay.env"
+    printf '%s\n' present > "$rollback_copy/relay.env.state"
+  else
+    printf '%s\n' absent > "$rollback_copy/relay.env.state"
+  fi
+
+  local control_exists=0 relay_exists=0 control_was_active=0 relay_was_active=0
+  if systemctl cat p2wlan-control.service >/dev/null 2>&1; then
+    control_exists=1
+    systemctl is-active --quiet p2wlan-control.service && control_was_active=1
+  fi
+  if systemctl cat p2wlan-relay.service >/dev/null 2>&1; then
+    relay_exists=1
+    systemctl is-active --quiet p2wlan-relay.service && relay_was_active=1
+  fi
+
+  if [ "$control_was_active" -eq 1 ]; then
+    systemctl stop p2wlan-control.service || die "failed to stop control before restore"
+    systemctl is-active --quiet p2wlan-control.service && die "control is still active after stop"
+  fi
+  if [ "$relay_was_active" -eq 1 ]; then
+    systemctl stop p2wlan-relay.service || {
+      [ "$control_was_active" -eq 0 ] || systemctl start p2wlan-control.service || true
+      die "failed to stop relay before restore"
+    }
+    systemctl is-active --quiet p2wlan-relay.service && {
+      [ "$control_was_active" -eq 0 ] || systemctl start p2wlan-control.service || true
+      die "relay is still active after stop"
+    }
+  fi
+
+  local restore_failed=0
+  install -m 0600 "$backup/database.sqlite" "$db_path.tmp.$$" || restore_failed=1
+  if [ "$restore_failed" -eq 0 ]; then mv -f "$db_path.tmp.$$" "$db_path" || restore_failed=1; fi
+  if [ "$restore_failed" -eq 0 ]; then rm -f "$db_path-wal" "$db_path-shm" || restore_failed=1; fi
+  if [ "$restore_failed" -eq 0 ] && [ -d "$restore_tmp/config" ]; then
+    for config_name in control.env relay.env; do
+      if [ -f "$restore_tmp/config/$config_name" ]; then
+        install -m 0600 "$restore_tmp/config/$config_name" "$CONFIG_DIR/$config_name" || restore_failed=1
+      fi
+    done
+  fi
+  if [ "$restore_failed" -eq 0 ] && id p2wlan >/dev/null 2>&1; then
+    chown -R p2wlan:p2wlan "$CONFIG_DIR" "$DATA_DIR" || restore_failed=1
+  fi
+  if [ "$restore_failed" -eq 0 ] && [ "$control_was_active" -eq 1 ]; then
+    systemctl start p2wlan-control.service || restore_failed=1
+  fi
+  if [ "$restore_failed" -eq 0 ] && [ "$relay_was_active" -eq 1 ]; then
+    systemctl start p2wlan-relay.service || restore_failed=1
+  fi
+  if [ "$restore_failed" -eq 0 ]; then
+    if [ "$control_was_active" -eq 1 ] && [ "$relay_was_active" -eq 1 ]; then
+      (check_server all) || restore_failed=1
+    elif [ "$control_was_active" -eq 1 ]; then
+      (check_server control) || restore_failed=1
+    elif [ "$relay_was_active" -eq 1 ]; then
+      (check_server relay) || restore_failed=1
+    fi
+  fi
+
+  if [ "$restore_failed" -ne 0 ]; then
+    local rollback_failed=0
+    set +e
+    [ "$control_exists" -eq 0 ] || systemctl stop p2wlan-control.service >/dev/null 2>&1
+    [ "$relay_exists" -eq 0 ] || systemctl stop p2wlan-relay.service >/dev/null 2>&1
+    if [ "$(cat "$rollback_copy/database.state")" = present ]; then
+      install -m 0600 "$rollback_copy/database.sqlite" "$db_path" || rollback_failed=1
+    else
+      rm -f "$db_path" || rollback_failed=1
+    fi
+    rm -f "$db_path-wal" "$db_path-shm" || rollback_failed=1
+    if [ "$(cat "$rollback_copy/control.env.state")" = present ]; then
+      install -m 0600 "$rollback_copy/control.env" "$CONFIG_DIR/control.env" || rollback_failed=1
+    else
+      rm -f "$CONFIG_DIR/control.env" || rollback_failed=1
+    fi
+    if [ "$(cat "$rollback_copy/relay.env.state")" = present ]; then
+      install -m 0600 "$rollback_copy/relay.env" "$CONFIG_DIR/relay.env" || rollback_failed=1
+    else
+      rm -f "$CONFIG_DIR/relay.env" || rollback_failed=1
+    fi
+    if id p2wlan >/dev/null 2>&1; then
+      chown -R p2wlan:p2wlan "$CONFIG_DIR" "$DATA_DIR" || rollback_failed=1
+    fi
+    [ "$control_was_active" -eq 0 ] || systemctl start p2wlan-control.service || rollback_failed=1
+    [ "$relay_was_active" -eq 0 ] || systemctl start p2wlan-relay.service || rollback_failed=1
+    if [ "$control_was_active" -eq 1 ] && [ "$relay_was_active" -eq 1 ]; then
+      (check_server all) || rollback_failed=1
+    elif [ "$control_was_active" -eq 1 ]; then
+      (check_server control) || rollback_failed=1
+    elif [ "$relay_was_active" -eq 1 ]; then
+      (check_server relay) || rollback_failed=1
+    fi
+    set -e
+    if [ "$rollback_failed" -ne 0 ]; then
+      die "restore failed and rollback could not fully restore the original state; recovery copy=$rollback_copy"
+    fi
+    die "restore failed; original database, configuration and service state were restored from $rollback_copy"
+  fi
+
+  rm -rf "$restore_tmp"
+  trap - EXIT
+  echo "restored database from $backup; pre-restore copy=$rollback_copy"
 }
 
 rollback_server() {
   need_root
-  local version=${1:-}
+  local version=
+  if [ "$#" -gt 0 ]; then version=$1; fi
+  [ -L "$CURRENT_LINK" ] || die "current release link is missing: $CURRENT_LINK"
+  local old_target
+  old_target=$(readlink "$CURRENT_LINK")
+  local current_version
+  current_version=$(basename "$(readlink -f "$CURRENT_LINK")")
   if [ -z "$version" ]; then
-    version=$(find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*.tmp' -printf '%f\n' | sort -V | tail -n 2 | head -n 1)
+    while IFS= read -r candidate; do
+      if [ "$candidate" != "$current_version" ]; then version=$candidate; break; fi
+    done < <(find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*.tmp' -printf '%f\n' | sort -V -r)
   fi
+  [ -n "$version" ] || die "no previous release is installed"
   [ -d "$RELEASE_DIR/$version" ] || die "release not found: $version"
+  for required in p2wlan-control p2wlan-relay p2wlan-config p2wlan-db p2wlan-server install-server.sh deploy-server.sh; do
+    [ -x "$RELEASE_DIR/$version/$required" ] || die "rollback target is incomplete: $version (missing $required)"
+  done
+  "$RELEASE_DIR/$version/p2wlan-control" --version >/dev/null
+  "$RELEASE_DIR/$version/p2wlan-relay" --version >/dev/null
   ln -sfn "$RELEASE_DIR/$version" "$CURRENT_LINK"
-  restart_services all
+  if ! restart_services all || ! check_server all; then
+    ln -sfn "$old_target" "$CURRENT_LINK"
+    restart_services all || true
+    die "rollback target failed health verification; restored current=$current_version"
+  fi
   echo "rolled back to $version"
 }
 
@@ -388,8 +648,26 @@ case "$cmd" in
     fi
     restart_services "${selected:-all}"
     ;;
-  backup) backup_server ;;
-  rollback) rollback_server "${2:-${1:-}}" ;;
+  backup) backup_server "$@" ;;
+  restore) restore_server "$@" ;;
+  rollback)
+    rollback_version=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --version)
+          [ "$#" -ge 2 ] || die "--version requires a release"
+          rollback_version=$2
+          shift 2
+          ;;
+        *) die "unknown rollback option: $1" ;;
+      esac
+    done
+    if [ -n "$rollback_version" ]; then
+      rollback_server "$rollback_version"
+    else
+      rollback_server
+    fi
+    ;;
   logs) need_root; journalctl -u "p2wlan-${1:-control}.service" -f ;;
   *) usage >&2; exit 2 ;;
 esac
