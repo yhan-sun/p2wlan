@@ -77,6 +77,11 @@ exit 0
         self.assertIn('p2wlan-db" --source "$db_path" --output', manager)
         self.assertIn('p2wlan-db" --verify', manager)
         self.assertIn('systemctl stop p2wlan-control.service || die', manager)
+        self.assertIn('relay_was_active', manager)
+        self.assertIn('database.state', manager)
+        self.assertIn('control.env.state', manager)
+        self.assertIn('relay.env.state', manager)
+        self.assertIn('restore failed; original database, configuration and service state were restored', manager)
         self.assertIn('rollback target is incomplete', manager)
         self.assertNotIn('systemctl stop p2wlan-control.service || true', manager)
 
