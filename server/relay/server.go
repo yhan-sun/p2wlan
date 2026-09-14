@@ -11,6 +11,9 @@ import (
 )
 
 func NewRelayServer(config *RelayConfig) (*RelayServer, error) {
+	if (strings.TrimSpace(config.TLSCertChainPath) == "") != (strings.TrimSpace(config.TLSPrivateKeyPath) == "") {
+		return nil, fmt.Errorf("RELAY_TLS_CERT and RELAY_TLS_KEY must be configured together")
+	}
 	// Validate keyring BEFORE opening listener to avoid leaking listener on failure
 	keyring, err := loadTicketKeyring(config)
 	if err != nil {

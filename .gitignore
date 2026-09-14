@@ -57,6 +57,7 @@ docs/*
 !docs/relay-lifecycle-and-authorization.md
 !docs/self-hosting-and-notifications-plan.md
 !docs/server-deployment.md
+!docs/self-hosting.md
 !docs/server-upgrade.md
 !docs/staging-validation.md
 

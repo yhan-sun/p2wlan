@@ -929,15 +929,20 @@ for round in $(seq 1 "$ROUNDS"); do
 
   # In direct mode the validation loop targets confirmed Direct peers only;
   # in relay-only mode it may use Relay so that profile tests availability.
-  OVERLAY_FLAGS="--validate-overlay"
+  OVERLAY_FLAGS=(--validate-overlay)
   if [[ "$MODE" == "relay-only" ]]; then
     # Availability mode: drive the real encrypted overlay loopback through the
     # production dataplane over whatever path is usable (Relay here), and let
     # the outbound selector ride Relay since Direct is blackholed.
-    OVERLAY_FLAGS="$OVERLAY_FLAGS --overlay-any-path"
+    OVERLAY_FLAGS+=(--overlay-any-path)
+  else
+    # The direct-profile generator is armed at startup but cannot inject
+    # business traffic until both daemons have confirmed Relay below.
+    BUSINESS_START_GATE_FILE="$ROUND_DIR/business-validation.start-gate"
+    OVERLAY_FLAGS+=(--overlay-start-gate-file "$BUSINESS_START_GATE_FILE")
   fi
   if [[ "$OVERLAY_BURST" -gt 0 ]]; then
-    OVERLAY_FLAGS="$OVERLAY_FLAGS --overlay-burst $OVERLAY_BURST"
+    OVERLAY_FLAGS+=(--overlay-burst "$OVERLAY_BURST")
   fi
 
   TRAVERSAL_FLAGS=""
@@ -967,7 +972,7 @@ for round in $(seq 1 "$ROUNDS"); do
     --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
     --heartbeat-interval 5 \
     $TRAVERSAL_FLAGS \
-    $OVERLAY_FLAGS \
+    "${OVERLAY_FLAGS[@]}" \
     >"$ROUND_DIR/node-a.log" 2>&1 &
   NODE_A_PID=$!
   PIDS+=($NODE_A_PID)
@@ -990,14 +995,15 @@ for round in $(seq 1 "$ROUNDS"); do
     --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
     --heartbeat-interval 5 \
     $TRAVERSAL_FLAGS \
-    $OVERLAY_FLAGS \
+    "${OVERLAY_FLAGS[@]}" \
     >"$ROUND_DIR/node-b.log" 2>&1 &
   NODE_B_PID=$!
   PIDS+=($NODE_B_PID)
 
-  # Both daemons were launched with --validate-overlay, so business
-  # verification is considered active from this point onward. Any later data
-  # plane failure is a business failure and cannot be auto-retried away.
+  # Both daemons were launched with --validate-overlay, so the business
+  # verification contract is armed from this point onward. In direct mode its
+  # shared file gate still prevents generated payloads until both Relay
+  # confirmations below. Any later data-plane failure cannot be auto-retried.
   : >"$ROUND_DIR/business-validation.started"
 
   for _ in {1..40}; do
@@ -1118,6 +1124,28 @@ for round in $(seq 1 "$ROUNDS"); do
     wait_for_relay_confirmation_barrier "$DIRECT_DEADLINE"
     if [[ "$BARRIER_RESULT" != ready ]]; then
       echo "[nat-sim] ROUND $round: FAIL reason_code=${BARRIER_REASON:-relay_peer_confirmation_timeout} stage=barrier relay_peer_confirmed_a=$BARRIER_A_CONFIRMED relay_peer_confirmed_b=$BARRIER_B_CONFIRMED http_a=$BARRIER_A_HTTP http_b=$BARRIER_B_HTTP" >&2
+      overall=1
+      stop_round_processes
+      continue
+    fi
+    # Both peers now have authoritative encrypted Relay confirmation. Release
+    # the shared gate only after the barrier; the daemon immediately injects
+    # its first validation payload and logs the release event.
+    : >"$BUSINESS_START_GATE_FILE"
+    gate_release_ok=0
+    while (( SECONDS < DIRECT_DEADLINE )); do
+      if ! kill -0 "$NODE_A_PID" 2>/dev/null || ! kill -0 "$NODE_B_PID" 2>/dev/null; then
+        break
+      fi
+      if grep -q 'event="overlay_start_gate_released"' "$ROUND_DIR/node-a.log" 2>/dev/null && \
+         grep -q 'event="overlay_start_gate_released"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+        gate_release_ok=1
+        break
+      fi
+      deadline_pause 0.1 "$DIRECT_DEADLINE" || break
+    done
+    if [[ "$gate_release_ok" -ne 1 ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=overlay_start_gate_release_timeout node_a_alive=$(kill -0 "$NODE_A_PID" 2>/dev/null && echo 1 || echo 0) node_b_alive=$(kill -0 "$NODE_B_PID" 2>/dev/null && echo 1 || echo 0)" >&2
       overall=1
       stop_round_processes
       continue
@@ -1411,13 +1439,24 @@ except Exception:
     B_DIRECT_PROMOTED_TMS=$(node_event_tms "$ROUND_DIR/node-b.log" direct_promoted)
     A_DIRECT_BUSINESS_TMS=$(node_event_tms "$ROUND_DIR/node-a.log" first_real_business_ingress)
     B_DIRECT_BUSINESS_TMS=$(node_event_tms "$ROUND_DIR/node-b.log" first_real_business_ingress)
+    read -r A_ORDER_TIMESTAMPS_OK A_DIRECT_BEFORE_BUSINESS A_RELAY_BEFORE_BUSINESS < <(
+      python3 "$ROOT_DIR/scripts/nat-sim/direct_order.py" \
+        "$A_DIRECT_PROMOTED_TMS" "$A_RELAY_CONFIRMED_TMS" "$A_DIRECT_BUSINESS_TMS"
+    )
+    read -r B_ORDER_TIMESTAMPS_OK B_DIRECT_BEFORE_BUSINESS B_RELAY_BEFORE_BUSINESS < <(
+      python3 "$ROOT_DIR/scripts/nat-sim/direct_order.py" \
+        "$B_DIRECT_PROMOTED_TMS" "$B_RELAY_CONFIRMED_TMS" "$B_DIRECT_BUSINESS_TMS"
+    )
+    direct_order_timestamps_ok=1
+    if [[ "$A_ORDER_TIMESTAMPS_OK" -ne 1 || "$B_ORDER_TIMESTAMPS_OK" -ne 1 ]]; then
+      direct_order_timestamps_ok=0
+    fi
+    direct_before_business_ok=1
+    if [[ "$A_DIRECT_BEFORE_BUSINESS" -ne 1 || "$B_DIRECT_BEFORE_BUSINESS" -ne 1 ]]; then
+      direct_before_business_ok=0
+    fi
     relay_before_direct_business_ok=1
-    if [[ ! "$A_RELAY_CONFIRMED_TMS" =~ ^[0-9]+$ || ! "$B_RELAY_CONFIRMED_TMS" =~ ^[0-9]+$ \
-          || ! "$A_DIRECT_PROMOTED_TMS" =~ ^[0-9]+$ || ! "$B_DIRECT_PROMOTED_TMS" =~ ^[0-9]+$ \
-          || ! "$A_DIRECT_BUSINESS_TMS" =~ ^[0-9]+$ || ! "$B_DIRECT_BUSINESS_TMS" =~ ^[0-9]+$ ]]; then
-      relay_before_direct_business_ok=0
-    elif (( A_RELAY_CONFIRMED_TMS > A_DIRECT_BUSINESS_TMS \
-            || B_RELAY_CONFIRMED_TMS > B_DIRECT_BUSINESS_TMS )); then
+    if [[ "$A_RELAY_BEFORE_BUSINESS" -ne 1 || "$B_RELAY_BEFORE_BUSINESS" -ne 1 ]]; then
       relay_before_direct_business_ok=0
     fi
     a_direct_business=0
@@ -1428,6 +1467,8 @@ except Exception:
           && "$DELTA_OK" -eq 1 && "$A_DELTA" -ge 0 && "$A_DELTA" -le 3000 \
           && "$B_DELTA" -ge 0 && "$B_DELTA" -le 3000 \
           && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \
+          && "$direct_order_timestamps_ok" -eq 1 \
+          && "$direct_before_business_ok" -eq 1 \
           && "$relay_before_direct_business_ok" -eq 1 \
           && "$a_direct_business" -eq 1 && "$b_direct_business" -eq 1 \
           && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \
@@ -1445,6 +1486,10 @@ except Exception:
         DIRECT_REASON="relay_first_slo_exceeded"
       elif [[ "$A_RELAY_CONFIRMED" -lt 1 || "$B_RELAY_CONFIRMED" -lt 1 ]]; then
         DIRECT_REASON="relay_confirmation_missing"
+      elif [[ "$direct_order_timestamps_ok" -ne 1 ]]; then
+        DIRECT_REASON="direct_order_timestamps_missing"
+      elif [[ "$direct_before_business_ok" -ne 1 ]]; then
+        DIRECT_REASON="direct_business_before_direct_promotion"
       elif [[ "$relay_before_direct_business_ok" -ne 1 ]]; then
         DIRECT_REASON="relay_not_confirmed_before_direct_business"
       elif [[ "$a_direct_business" -ne 1 || "$b_direct_business" -ne 1 ]]; then

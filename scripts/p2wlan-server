@@ -127,22 +127,41 @@ check_server() {
     done < <(service_list "$selected")
   fi
 
-  if [ "$selected" = relay ]; then
-    metrics_bind=$(env_value "$CONFIG_DIR/relay.env" RELAY_METRICS_BIND)
-    if [ -n "${metrics_bind:-}" ] && command -v curl >/dev/null 2>&1; then
-      metrics_host=${metrics_bind%:*}
-      metrics_port=${metrics_bind##*:}
-      case "$metrics_host" in
-        127.0.0.1|localhost|::1|'[::1]')
-          curl -fsS "http://$metrics_host:$metrics_port/healthz" >/dev/null || die "relay healthz failed"
-          ;;
-      esac
+  command -v curl >/dev/null 2>&1 || die "curl is required for service health checks"
+  local control_enabled=0 relay_enabled=0
+  case "$selected" in
+    control) control_enabled=1 ;;
+    relay) relay_enabled=1 ;;
+    all) control_enabled=1; relay_enabled=1 ;;
+  esac
+  if systemd_available; then
+    systemctl cat p2wlan-control.service >/dev/null 2>&1 || control_enabled=0
+    systemctl cat p2wlan-relay.service >/dev/null 2>&1 || relay_enabled=0
+  fi
+  if [ "$control_enabled" -eq 1 ]; then
+    local bind host port
+    bind=$(env_value "$CONFIG_DIR/control.env" CONTROL_BIND)
+    port=$(env_value "$CONFIG_DIR/control.env" PORT)
+    host=127.0.0.1
+    port=${port:-18080}
+    if [ -n "$bind" ]; then
+      host=${bind%:*}; port=${bind##*:}
+      case "$host" in ''|0.0.0.0) host=127.0.0.1 ;; '[::]') host='[::1]' ;; esac
     fi
-  else
-    command -v curl >/dev/null 2>&1 || die "curl is required for control health checks"
-    control_port=$(env_value "$CONFIG_DIR/control.env" PORT)
-    control_port=${control_port:-18080}
-    curl -fsS "http://127.0.0.1:$control_port/health" >/dev/null || die "control /health failed on port $control_port"
+    case "$port" in ''|*[!0-9]*) die "invalid control health port" ;; esac
+    curl -fsS --connect-timeout 3 --max-time 10 "http://$host:$port/health" >/dev/null || die "control /health failed"
+  fi
+  if [ "$relay_enabled" -eq 1 ]; then
+    local metrics_bind metrics_host metrics_port
+    metrics_bind=$(env_value "$CONFIG_DIR/relay.env" RELAY_METRICS_BIND)
+    [ -n "$metrics_bind" ] || die "relay readiness cannot be verified: set RELAY_METRICS_BIND=127.0.0.1:18082"
+    metrics_host=${metrics_bind%:*}; metrics_port=${metrics_bind##*:}
+    case "$metrics_port" in ''|*[!0-9]*) die "invalid relay metrics port" ;; esac
+    case "$metrics_host" in
+      127.0.0.1|localhost|'[::1]') ;;
+      *) die "relay check requires a loopback RELAY_METRICS_BIND" ;;
+    esac
+    curl -fsS --connect-timeout 3 --max-time 10 "http://$metrics_host:$metrics_port/readyz" >/dev/null || die "relay /readyz failed: check TLS, revocation feed and credentials"
   fi
   echo "health check passed service=$selected"
 }
@@ -164,6 +183,7 @@ User=p2wlan
 Group=p2wlan
 EnvironmentFile=-${env_file}
 ExecStart=${CURRENT_LINK}/${binary}
+WorkingDirectory=${DATA_DIR}
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=yes
@@ -190,11 +210,11 @@ init_server() {
   fi
   if [ ! -f "$CONFIG_DIR/control.env" ]; then
     install -m 0600 /dev/null "$CONFIG_DIR/control.env"
-    printf '%s\n' "PORT=18080" "DB_PATH=$DATA_DIR/p2pnet.db" "JWT_SECRET=$(openssl rand -hex 32)" >> "$CONFIG_DIR/control.env"
+    printf '%s\n' "PORT=18080" "CONTROL_BIND=127.0.0.1:18080" "DB_PATH=$DATA_DIR/p2pnet.db" "LOG_UPLOAD_DIR=$DATA_DIR/log-uploads" "JWT_SECRET=$(openssl rand -hex 32)" >> "$CONFIG_DIR/control.env"
   fi
   if [ ! -f "$CONFIG_DIR/relay.env" ]; then
     install -m 0600 /dev/null "$CONFIG_DIR/relay.env"
-    printf '%s\n' "RELAY_BIND=:18081" "RELAY_REQUIRE_AUTH=true" >> "$CONFIG_DIR/relay.env"
+    printf '%s\n' "# Configure TLS, keyring, audience, region and revocation feed before starting; see docs/self-hosting.md" "RELAY_BIND=:18081" "RELAY_REQUIRE_AUTH=true" "RELAY_METRICS_BIND=127.0.0.1:18082" >> "$CONFIG_DIR/relay.env"
   fi
   # Files created above inherit root ownership.  Transfer only the runtime
   # config/data trees to the service account; release binaries stay root-owned.

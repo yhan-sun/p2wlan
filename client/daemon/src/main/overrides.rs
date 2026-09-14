@@ -129,6 +129,10 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
     if cli.validate_overlay {
         config.network.validate_overlay = true;
     }
+    if let Some(ref gate_file) = cli.overlay_start_gate_file {
+        config.network.validate_overlay = true;
+        config.network.overlay_start_gate_file = Some(gate_file.clone());
+    }
     if cli.overlay_any_path {
         config.network.overlay_any_path = true;
     }

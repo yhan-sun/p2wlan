@@ -10,17 +10,24 @@ import (
 
 // CreateNetworkMembership adds a user to a network.
 func (db *DB) CreateNetworkMembership(userID, networkID, role string) (*NetworkMembership, error) {
-	id := fmt.Sprintf("mem-%d", time.Now().UnixNano())
+	id, err := roomRandomID("mem-", 16)
+	if err != nil {
+		return nil, fmt.Errorf("generate membership ID: %w", err)
+	}
 	now := time.Now().Unix()
-	_, err := db.Exec(`INSERT OR IGNORE INTO network_memberships (id, user_id, network_id, role, created_at)
-        VALUES (?, ?, ?, ?, ?)`, id, userID, networkID, role, now)
+	_, err = db.Exec(`INSERT INTO network_memberships (id, user_id, network_id, role, created_at)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, network_id) DO NOTHING`, id, userID, networkID, role, now)
 	if err != nil {
 		return nil, err
 	}
-	return &NetworkMembership{
-		ID: id, UserID: userID, NetworkID: networkID,
-		Role: role, CreatedAt: now,
-	}, nil
+	var membership NetworkMembership
+	err = db.QueryRow(`SELECT id, user_id, network_id, role, created_at FROM network_memberships
+		WHERE user_id = ? AND network_id = ?`, userID, networkID).
+		Scan(&membership.ID, &membership.UserID, &membership.NetworkID, &membership.Role, &membership.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &membership, nil
 }
 
 // GetUserNetworks returns all networks the user is a member of.

@@ -38,7 +38,10 @@ var (
 // CreateTunnel inserts a new port mapping.
 func (db *DB) CreateTunnel(deviceID, protocol string, localPort, remotePort int, localAddr string) (*Tunnel, error) {
 	protocol = strings.ToLower(strings.TrimSpace(protocol))
-	id := fmt.Sprintf("tunnel-%d", time.Now().UnixNano())
+	id, err := roomRandomID("tunnel-", 16)
+	if err != nil {
+		return nil, fmt.Errorf("generate tunnel ID: %w", err)
+	}
 	now := time.Now().Unix()
 
 	tx, err := db.Begin()

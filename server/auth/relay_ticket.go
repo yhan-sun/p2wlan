@@ -209,8 +209,8 @@ func keyFingerprint(pub ed25519.PublicKey) string {
 // 1. RELAY_TICKET_SIGNER_JSON (inline hex keys, for testing/dev):
 //
 //	{
-//	  "active": {"kid": "key-1", "private_key": "<hex-encoded 64-byte seed>"},
-//	  "previous": {"kid": "key-0", "private_key": "<hex-encoded 64-byte seed>"}
+//	  "active": {"kid": "key-1", "private_key": "<hex-encoded 32-byte seed>"},
+//	  "previous": {"kid": "key-0", "private_key": "<hex-encoded 32-byte seed>"}
 //	}
 //
 // 2. RELAY_TICKET_SIGNER_KEY_FILE (PKCS#8 PEM file path, for production).

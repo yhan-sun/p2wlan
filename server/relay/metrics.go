@@ -45,6 +45,7 @@ func (s *RelayServer) ServeMetrics() (net.Listener, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/readyz", s.handleReadiness)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
@@ -93,5 +94,29 @@ func (s *RelayServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	snapshot.AuthFailureSources = nil
 	if err := json.NewEncoder(w).Encode(snapshot); err != nil {
 		log.Printf("relay metrics encode failed: %v", err)
+	}
+}
+
+// Readiness uses the same revocation admission predicate as registration.
+func (s *RelayServer) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	s.revocationMu.RLock()
+	usable := s.revocationFeedUsableLocked(time.Now())
+	s.revocationMu.RUnlock()
+	if closing || !usable {
+		http.Error(w, "relay not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write([]byte("ready\n"))
 	}
 }

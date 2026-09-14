@@ -127,6 +127,7 @@ impl Daemon {
             let overlay_peers = self.peers.clone();
             let overlay_local_vip = local_vip.clone();
             let overlay_node_id = self.config.node.node_id.clone();
+            let overlay_start_gate_file = self.config.network.overlay_start_gate_file.clone();
             let overlay_any_path = self.config.network.overlay_any_path;
             let overlay_burst = self.config.network.overlay_burst;
             let overlay_timeline = self.timeline.clone();
@@ -138,6 +139,7 @@ impl Daemon {
                         overlay_peers,
                         overlay_local_vip,
                         overlay_node_id,
+                        overlay_start_gate_file,
                         overlay_any_path,
                         overlay_burst,
                         overlay_timeline,

@@ -116,6 +116,7 @@ impl Config {
                 fresh_mapping_harness_loopback: false,
                 gather_host_candidates: true,
                 validate_overlay: false,
+                overlay_start_gate_file: None,
                 overlay_any_path: false,
                 overlay_burst: 0,
             },

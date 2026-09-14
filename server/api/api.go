@@ -2,6 +2,7 @@
 package api
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -29,29 +30,30 @@ type Server struct {
 	registrationSessionLocks registrationSessionLocker
 }
 
-// NewServer creates a new API server.
-// Catalog and signer configuration errors are fatal in production mode
-// (when RELAY_TICKET_SIGNER_KEY_FILE is set), but warnings in dev mode.
+// NewServer retains the existing constructor for callers without an error return.
 func NewServer(authService *auth.Service, hub *signaling.Hub, db *database.DB) *Server {
-	catalog, catalogErr := LoadRelayCatalog()
-	if catalogErr != nil {
-		log.Printf("WARNING: failed to load relay catalog: %v", catalogErr)
-		catalog = nil
+	server, err := NewServerFromEnv(authService, hub, db)
+	if err != nil {
+		log.Fatalf("Invalid control configuration: %v", err)
 	}
+	return server
+}
 
-	signer, signerErr := auth.LoadSignerFromEnv()
-	if signerErr != nil {
-		// If a signer key file was explicitly configured, errors are fatal
-		if os.Getenv("RELAY_TICKET_SIGNER_KEY_FILE") != "" || os.Getenv("RELAY_TICKET_SIGNER_JSON") != "" {
-			log.Fatalf("FATAL: relay ticket signer configuration error: %v", signerErr)
-		}
-		log.Printf("WARNING: relay ticket signer not configured: %v", signerErr)
-		signer = nil
+// NewServerFromEnv validates explicit configuration before serving any request.
+func NewServerFromEnv(authService *auth.Service, hub *signaling.Hub, db *database.DB) (*Server, error) {
+	catalog, err := LoadRelayCatalog()
+	if err != nil {
+		return nil, fmt.Errorf("relay catalog configuration: %w", err)
 	}
-
-	// Fail fast: signer configured but no catalog
-	if signer != nil && catalog == nil {
-		log.Fatalf("FATAL: relay ticket signer is configured but no relay catalog is available. Set RELAY_CATALOG_JSON or RELAY_SERVERS.")
+	signer, err := auth.LoadSignerFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("relay ticket signer configuration: %w", err)
+	}
+	if signer != nil && (catalog == nil || len(catalog.Entries()) == 0) {
+		return nil, fmt.Errorf("relay ticket signer requires a non-empty RELAY_CATALOG_JSON or RELAY_SERVERS")
+	}
+	if strings.TrimSpace(os.Getenv("RELAY_CATALOG_JSON")) != "" && catalog != nil && len(catalog.Entries()) > 0 && signer == nil {
+		return nil, fmt.Errorf("RELAY_CATALOG_JSON requires RELAY_TICKET_SIGNER_KEY_FILE with RELAY_TICKET_SIGNER_KID, or RELAY_TICKET_SIGNER_JSON")
 	}
 
 	if signer != nil {
@@ -69,7 +71,7 @@ func NewServer(authService *auth.Service, hub *signaling.Hub, db *database.DB) *
 		relayRevocationFeedToken: strings.TrimSpace(os.Getenv("RELAY_REVOCATION_FEED_TOKEN")),
 		signalNotifier:           newSignalNotifier(),
 		registrationSessionLocks: newRegistrationSessionLocks(),
-	}
+	}, nil
 }
 
 func parseRelayServers() []string {

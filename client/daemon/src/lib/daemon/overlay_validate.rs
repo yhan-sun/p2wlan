@@ -37,6 +37,7 @@
 //   across machines.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use p2pnet_tun::mock::MockTunController;
 use crate::transport::{OverlayIngress, OverlayIngressEvent};
@@ -291,6 +292,7 @@ fn committed_direct_ready_for_echo(
 async fn flush_pending_overlay_echoes(
     controller: &MockTunController,
     peers: &PeerManager,
+    overlay_any_path: bool,
     pending: &mut VecDeque<PendingOverlayEcho>,
 ) {
     if pending.is_empty() {
@@ -321,7 +323,7 @@ async fn flush_pending_overlay_echoes(
         if !snapshot.is_online_in_generation(generation) {
             continue;
         }
-        if snapshot.active_path() == Some(crate::peer::NetworkPath::Direct) {
+        if overlay_any_path || snapshot.active_path() == Some(crate::peer::NetworkPath::Direct) {
             ready.push(echo);
         } else {
             waiting.push_back(echo);
@@ -385,6 +387,7 @@ pub async fn run_overlay_validate_loop(
     peers: Arc<PeerManager>,
     local_vip: String,
     local_node_id: String,
+    overlay_start_gate_file: Option<PathBuf>,
     overlay_any_path: bool,
     overlay_burst: usize,
     timeline: Arc<ConnectionTimeline>,
@@ -421,6 +424,11 @@ pub async fn run_overlay_validate_loop(
     // echoed over the other endpoint's still-active Relay path rather than
     // proving a bidirectional Direct business exchange.
     let mut committed_path_changes = peers.subscribe_committed_business_path_changes();
+    let mut start_gate_released = overlay_start_gate_file.is_none();
+    let mut start_gate_poll = tokio::time::interval(Duration::from_millis(20));
+    start_gate_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Avoid an immediate filesystem check; the first poll happens after 20ms.
+    start_gate_poll.tick().await;
     // First-usable strictness: a bidirectional encrypted overlay business
     // loopback is proven by the FIRST verified echo.  An echo is only ever
     // generated when the peer verified a fresh request of ours (our outbound ->
@@ -454,7 +462,16 @@ pub async fn run_overlay_validate_loop(
     loop {
         tokio::select! {
             _ = send_tick.tick() => {
-                flush_pending_overlay_echoes(&controller, &peers, &mut pending_echoes).await;
+                if !start_gate_released {
+                    continue;
+                }
+                flush_pending_overlay_echoes(
+                    &controller,
+                    &peers,
+                    overlay_any_path,
+                    &mut pending_echoes,
+                )
+                .await;
                 run_overlay_send_cycle(
                     &controller,
                     &peers,
@@ -475,7 +492,16 @@ pub async fn run_overlay_validate_loop(
                     warn!("overlay_validate: committed path feed closed; stopping");
                     break;
                 }
-                flush_pending_overlay_echoes(&controller, &peers, &mut pending_echoes).await;
+                if !start_gate_released {
+                    continue;
+                }
+                flush_pending_overlay_echoes(
+                    &controller,
+                    &peers,
+                    overlay_any_path,
+                    &mut pending_echoes,
+                )
+                .await;
                 if overlay_any_path {
                     run_overlay_send_cycle(
                         &controller,
@@ -493,6 +519,41 @@ pub async fn run_overlay_validate_loop(
                     ).await;
                 }
             }
+            _ = start_gate_poll.tick(), if !start_gate_released => {
+                let Some(gate_path) = overlay_start_gate_file.as_ref() else {
+                    start_gate_released = true;
+                    continue;
+                };
+                match std::fs::metadata(gate_path) {
+                    Ok(metadata) if metadata.is_file() => {
+                        start_gate_released = true;
+                        info!(
+                            event = "overlay_start_gate_released",
+                            gate_path = %gate_path.display(),
+                            "overlay_start_gate_released"
+                        );
+                        // Do not make the test wait for the next periodic
+                        // tick after the external barrier has released.
+                        send_tick.reset_immediately();
+                    }
+                    Ok(_) => {
+                        error!(
+                            gate_path = %gate_path.display(),
+                            "overlay validation start gate exists but is not a regular file"
+                        );
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        error!(
+                            gate_path = %gate_path.display(),
+                            %error,
+                            "could not inspect overlay validation start gate"
+                        );
+                        break;
+                    }
+                }
+            }
             event = overlay_ingress_rx.recv() => {
                 let Some(event) = event else {
                     warn!("overlay_validate: overlay ingress feed closed; stopping");
@@ -504,6 +565,7 @@ pub async fn run_overlay_validate_loop(
                     &local_vip,
                     &local_node_id,
                     overlay_any_path,
+                    start_gate_released,
                     &mut seen,
                     &mut stats,
                     &peers,
@@ -687,6 +749,7 @@ async fn handle_overlay_ingress(
     local_vip: &str,
     local_node_id: &str,
     overlay_any_path: bool,
+    start_gate_released: bool,
     seen: &mut VecDeque<(u64, u32)>,
     stats: &mut OverlayStats,
     peers: &Arc<PeerManager>,
@@ -750,12 +813,13 @@ async fn handle_overlay_ingress(
                     nonce,
                     seq,
                 ) {
-                    if overlay_any_path
+                    if start_gate_released
+                        && (overlay_any_path
                         || committed_direct_ready_for_echo(
                             peers,
                             &peer_id,
                             event.connection_generation,
-                        )
+                        ))
                     {
                         inject_pending_overlay_echo(controller, echo).await;
                     } else {
@@ -769,14 +833,25 @@ async fn handle_overlay_ingress(
                                 );
                             }
                         }
-                        info!(
-                            event = "overlay_echo_deferred_until_direct_commit",
-                            peer = %peer_id,
-                            generation = event.connection_generation,
-                            seq = seq,
-                            nonce = nonce,
-                            "deferred strict-Direct overlay echo until the local Direct path commits"
-                        );
+                        if !start_gate_released {
+                            info!(
+                                event = "overlay_echo_deferred_until_start_gate",
+                                peer = %peer_id,
+                                generation = event.connection_generation,
+                                seq = seq,
+                                nonce = nonce,
+                                "deferred overlay echo until the external validation start gate releases"
+                            );
+                        } else {
+                            info!(
+                                event = "overlay_echo_deferred_until_direct_commit",
+                                peer = %peer_id,
+                                generation = event.connection_generation,
+                                seq = seq,
+                                nonce = nonce,
+                                "deferred strict-Direct overlay echo until the local Direct path commits"
+                            );
+                        }
                         pending_echoes.push_back(echo);
                     }
                 }
@@ -1215,7 +1290,7 @@ mod overlay_validate_tests {
             .expect("valid IPv4 addresses must build a pending echo"),
         ]);
 
-        flush_pending_overlay_echoes(&controller, &manager, &mut pending).await;
+        flush_pending_overlay_echoes(&controller, &manager, false, &mut pending).await;
         assert_eq!(
             pending.len(),
             1,
@@ -1242,7 +1317,7 @@ mod overlay_validate_tests {
             Some(NetworkPath::Direct),
         );
 
-        flush_pending_overlay_echoes(&controller, &manager, &mut pending).await;
+        flush_pending_overlay_echoes(&controller, &manager, false, &mut pending).await;
         assert!(pending.is_empty(), "the Direct commit must release the echo");
 
         let mut packet = [0u8; 512];

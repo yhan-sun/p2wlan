@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ import (
 
 func tmpDB(t *testing.T) (*DB, string) {
 	t.Helper()
-	f := "test_stage2_" + fmt.Sprintf("%d", time.Now().UnixNano()) + ".db"
+	f := filepath.Join(t.TempDir(), "stage2.db")
 	db, err := New(f)
 	if err != nil {
 		t.Fatalf("New: %v", err)

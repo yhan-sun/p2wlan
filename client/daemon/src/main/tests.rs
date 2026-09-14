@@ -1,4 +1,5 @@
 use super::*;
+use clap::Parser;
 
     fn test_cli(control: Option<&str>, network: Option<&str>) -> Cli {
         Cli {
@@ -42,6 +43,7 @@ use super::*;
             disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
+            overlay_start_gate_file: None,
 
             overlay_any_path: false,
 
@@ -53,6 +55,43 @@ use super::*;
             windows_service_name: None,
             log_file: None,
         }
+    }
+
+    #[test]
+    fn overlay_start_gate_requires_overlay_validation() {
+        assert!(Cli::try_parse_from([
+            "p2wlan-daemon",
+            "--overlay-start-gate-file",
+            "gate",
+        ])
+        .is_err());
+
+        let cli = Cli::try_parse_from([
+            "p2wlan-daemon",
+            "--validate-overlay",
+            "--overlay-start-gate-file",
+            "gate",
+        ])
+        .unwrap();
+        assert_eq!(cli.overlay_start_gate_file, Some(PathBuf::from("gate")));
+    }
+
+    #[test]
+    fn overlay_start_gate_is_runtime_only() {
+        let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+        let mut cli = test_cli(None, None);
+        cli.validate_overlay = true;
+        cli.overlay_start_gate_file = Some(PathBuf::from("business-validation.start-gate"));
+
+        apply_cli_overrides(&mut config, &cli);
+
+        assert!(config.network.validate_overlay);
+        assert_eq!(
+            config.network.overlay_start_gate_file,
+            Some(PathBuf::from("business-validation.start-gate"))
+        );
+        let persisted = serde_json::to_value(&config.network).unwrap();
+        assert!(persisted.get("overlay_start_gate_file").is_none());
     }
 
     #[test]
@@ -166,6 +205,7 @@ use super::*;
             disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
+            overlay_start_gate_file: None,
 
             overlay_any_path: false,
 
@@ -238,6 +278,7 @@ use super::*;
             disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
+            overlay_start_gate_file: None,
 
             overlay_any_path: false,
 
@@ -377,6 +418,7 @@ use super::*;
             disable_predicted_candidates: false,
             disable_birthday_probing: false,
             validate_overlay: false,
+            overlay_start_gate_file: None,
 
             overlay_any_path: false,
 
