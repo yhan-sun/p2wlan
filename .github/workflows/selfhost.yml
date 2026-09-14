@@ -68,6 +68,10 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/selfhost-bin/p2wlan-relay$suffix" ./relay
           CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/selfhost-bin/p2wlan-config$suffix" ./cmd/p2wlan-config
           go run ../scripts/selfhost/smoke.go --bin-dir "$RUNNER_TEMP/selfhost-bin"
+      - name: Verify advertised IPv6 loopback with real TLS peers and revocation
+        shell: bash
+        working-directory: server
+        run: go run ../scripts/selfhost/smoke.go --bin-dir "$RUNNER_TEMP/selfhost-bin" --relay-host ::1
       - name: Manager and source contracts
         if: runner.os == 'Linux'
         run: |
@@ -90,6 +94,21 @@ jobs:
         run: |
           set -euo pipefail
           (cd server && go run ./cmd/p2wlan-config --mode docker --output ../deploy/selfhost/config --dev-localhost)
+      - name: Verify IPv4 and IPv6 Compose publication without exposing environment values
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          for host in ('127.0.0.1', '127.0.0.2', '::1'):
+              env = dict(os.environ, RELAY_PUBLISH_HOST=host, RELAY_PORT='18081', CONTROL_PORT='18080')
+              result = subprocess.run(['docker', 'compose', '--env-file', 'deploy/selfhost/config/compose.env', '-f', 'deploy/selfhost/compose.yml', 'config', '--format', 'json'], env=env, check=True, capture_output=True, text=True)
+              services = json.loads(result.stdout)['services']
+              ports = services['relay']['ports']
+              assert len(ports) == 1 and ports[0]['host_ip'] == host
+              assert ports[0]['target'] == 18081 and str(ports[0]['published']) == '18081'
+              assert ports[0]['protocol'] == 'tcp'
+              assert services['control']['ports'][0]['host_ip'] == '127.0.0.1'
+              print('PASS: Compose publication host=' + host + '; control remains loopback-only')
+          PY
       - name: Build actual image and start documented Compose topology
         run: |
           set -euo pipefail
