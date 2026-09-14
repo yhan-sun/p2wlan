@@ -65,16 +65,7 @@ mod maintenance_integration_tests {
         daemon.peers.add_peer(&peer).await;
         daemon.control = ControlClient::disabled_for_test();
         daemon.control.set_peer_for_test(peer.clone()).await;
-        let (offer_tx, mut offers) = mpsc::unbounded_channel();
-        daemon.control.set_test_signal_forwarder(
-            daemon.config.node.node_id.clone(),
-            hex::encode(local_public),
-            Arc::new(move |offer| {
-                if !offer.handshake_init.is_empty() {
-                    let _ = offer_tx.send(offer);
-                }
-            }),
-        );
+        let mut offers = daemon.control.capture_critical_offers_for_test();
 
         let mut initial = HandshakeInitiator::new(
             NodeIdentity::from_private_key(local_private),
@@ -148,7 +139,7 @@ mod maintenance_integration_tests {
         drop(reader);
         let offer = timeout(Duration::from_secs(2), offers.recv()).await
             .expect("rekey must send without waiting for the ten-second scan")
-            .expect("signaling forwarder closed");
+            .expect("critical offer observer closed");
         assert_eq!(offer.to_node_id, peer.node_id);
         assert!(offer.candidates.is_empty());
         assert_eq!(daemon.pending_handshakes.lock().attempts.get(&peer.node_id).copied(), Some(1));
@@ -241,7 +232,7 @@ mod maintenance_integration_tests {
     }
 
     #[test]
-    fn maintenance_retry_and_cleanup_ledgers_are_bounded() {
+    fn maintenance_retry_ledger_is_bounded() {
         let now = Instant::now();
         let identity = MaintenanceRetryIdentity {
             network_generation: 1,
