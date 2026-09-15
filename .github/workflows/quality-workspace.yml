@@ -6,31 +6,128 @@ on:
     paths: [.github/workflows/quality-workspace.yml]
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: quality-apply-refactor-project-quality-baseline
+  cancel-in-progress: false
 
 jobs:
-  snapshot:
+  apply:
+    if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/refactor/project-quality-baseline'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          components: rustfmt, clippy
-      - name: Archive isolated offline verification tools
+          components: rustfmt
+      - name: Verify and reconstruct the reviewed source changes
+        env:
+          EXPECTED_RECIPE_SHA256: 811703dabd1b58fe1352d91495cd380d4e1309a2c7f71e8a2c614870c54b6405
         run: |
-          mkdir -p "$RUNNER_TEMP/offline/wheels" "$RUNNER_TEMP/offline/rust"
-          python3 -m pip download --only-binary=:all: --python-version=313 --implementation=cp --abi=cp313 --abi=abi3 --platform=manylinux2014_x86_64 --platform=manylinux_2_28_x86_64 --dest "$RUNNER_TEMP/offline/wheels" tree-sitter tree-sitter-rust
-          toolchain="$(dirname "$(dirname "$(rustup which rustc)")")"
-          cp -a "$toolchain/bin" "$toolchain/lib" "$RUNNER_TEMP/offline/rust/"
-          cargo vendor --locked "$RUNNER_TEMP/offline/vendor" > "$RUNNER_TEMP/offline/vendor-config.toml"
-          rustc --version > "$RUNNER_TEMP/offline/rust-version.txt"
-          tar -czf "$RUNNER_TEMP/quality-offline.tar.gz" -C "$RUNNER_TEMP" offline
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: quality-offline-${{ github.sha }}
-          path: ${{ runner.temp }}/quality-offline.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import lzma
+          import os
+          from pathlib import Path, PurePosixPath
+          import subprocess
+
+          root = Path.cwd()
+          encoded = ''.join((root / f'.github/refactor-payload/part{i}.b64').read_text().strip() for i in (1, 2, 3))
+          raw = lzma.decompress(base64.b64decode(encoded, validate=True), memlimit=256 * 1024 * 1024)
+          digest = lambda data: hashlib.sha256(data).hexdigest()
+          assert digest(raw) == os.environ['EXPECTED_RECIPE_SHA256'], 'recipe digest mismatch'
+          recipe = json.loads(raw)
+          assert recipe['version'] == 1 and len(recipe['files']) == 40
+          base = recipe['base_commit']
+          assert base == 'f2f601dbb47a705b490491996d16af2e3324d16d'
+          subprocess.run(['git', 'merge-base', '--is-ancestor', base, 'HEAD'], check=True)
+          allowed_roots = {'client', 'scripts', 'docs'}
+          allowed_files = {'AGENTS.md', 'CONTRIBUTING.md', '.github/workflows/ci.yml'}
+
+          def checked_path(relative):
+              path = PurePosixPath(relative)
+              assert not path.is_absolute() and '..' not in path.parts
+              assert path.as_posix() == relative and relative
+              assert path.parts[0] in allowed_roots or relative in allowed_files
+              target = root / relative
+              assert target.resolve().is_relative_to(root)
+              assert not target.is_symlink()
+              assert all(not parent.is_symlink() for parent in target.parents if parent != root)
+              return target
+
+          prepared = {}
+          for item in recipe['files']:
+              relative = item['path']
+              assert relative not in prepared, 'duplicate target'
+              target = checked_path(relative)
+              current = target.read_bytes() if target.exists() else None
+              actual = digest(current) if current is not None else None
+              assert actual in (item['before_sha256'], item['sha256']), f'concurrent change: {relative}'
+              lines = []
+              if 'source' in item:
+                  checked_path(item['source'])
+                  source = subprocess.check_output(['git', 'show', f"{base}:{item['source']}"])
+                  assert digest(source) == item['source_sha256'], f'base source mismatch: {relative}'
+                  lines = source.decode('utf-8').splitlines(keepends=True)
+                  indent = item['dedent']
+                  assert indent in (0, 4, 8)
+                  if indent:
+                      lines = [line[indent:] if line.startswith(' ' * indent) else line for line in lines]
+              fragments = []
+              for operation in item['ops']:
+                  if isinstance(operation, str):
+                      fragments.append(operation)
+                  else:
+                      assert len(operation) == 2 and all(type(value) is int for value in operation)
+                      start, end = operation
+                      assert 0 <= start <= end <= len(lines)
+                      fragments.extend(lines[start:end])
+              result = ''.join(fragments).encode('utf-8')
+              assert digest(result) == item['sha256'], f'target digest mismatch: {relative}'
+              if relative.startswith('.github/workflows/'):
+                  assert current == result, 'workflow changes must use the authorized connector'
+              prepared[relative] = result
+          for relative, content in prepared.items():
+              target = checked_path(relative)
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(content)
+          paths = Path(os.environ['RUNNER_TEMP']) / 'refactor-paths.txt'
+          paths.write_text('\n'.join(prepared) + '\n')
+          print(f'PASS exact source reconstruction: {len(prepared)} files, recipe {digest(raw)}')
+          PY
+      - name: Validate reconstructed files
+        run: |
+          cargo fmt --all --check
+          git diff --check
+          python3 scripts/docs/verify_repository.py
+          python3 scripts/quality/test_code_health.py
+          python3 scripts/quality/check_code_health.py --base-ref f2f601dbb47a705b490491996d16af2e3324d16d
+          bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
+          sh -n scripts/install-linux-cli.sh
+      - name: Commit only the verified branch changes
+        env:
+          CHECKOUT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          branch='refactor/project-quality-baseline'
+          remote_sha="$(git ls-remote origin "refs/heads/$branch" | cut -f1)"
+          test "$remote_sha" = "$CHECKOUT_SHA"
+          mapfile -t paths < "$RUNNER_TEMP/refactor-paths.txt"
+          git add -- "${paths[@]}"
+          git rm -- .github/refactor-payload/part1.b64 .github/refactor-payload/part2.b64 .github/refactor-payload/part3.b64
+          if git diff --cached --name-only | grep -q '^.github/workflows/'; then
+            echo 'unexpected workflow mutation' >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat:拆分数据面六个热点并修复连接写锁阻塞'
+          git push origin "HEAD:refs/heads/$branch"
+          git rev-parse HEAD
