@@ -27,6 +27,8 @@ LEGACY_RUST_BYTE_CEILINGS = {
     "client/daemon/src/dplpmtud.rs": 231_770,
     "client/daemon/src/network_outbound.rs": 156_974,
     "client/daemon/src/relay_runtime.rs": 125_879,
+    "client/daemon/src/udp/core.rs": 133_201,
+    "client/daemon/src/udp/dynamic_punch.rs": 207_336,
 }
 
 
