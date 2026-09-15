@@ -13,4 +13,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
-if-addrs = "0.13"
+if-addrs = "0.15"
