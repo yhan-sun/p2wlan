@@ -1,0 +1,42 @@
+name: Daemon quality workbench
+
+on:
+  push:
+    branches: [automation/daemon-quality-workbench]
+    paths:
+      - .github/workflows/daemon-quality-workbench.yml
+      - .github/workbench/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daemon-quality-workbench
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.repository == 'yhan-sun/p2wlan'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: f2f601dbb47a705b490491996d16af2e3324d16d
+          persist-credentials: false
+      - name: Export exact source without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = f2f601dbb47a705b490491996d16af2e3324d16d
+          git status --short --branch
+          mkdir -p "$RUNNER_TEMP/daemon-quality-source"
+          git archive HEAD | gzip -n > "$RUNNER_TEMP/daemon-quality-source/source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/daemon-quality-source/source-commit.txt"
+          sha256sum "$RUNNER_TEMP/daemon-quality-source/source.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: daemon-quality-source
+          path: ${{ runner.temp }}/daemon-quality-source/
+          if-no-files-found: error
+          retention-days: 3
