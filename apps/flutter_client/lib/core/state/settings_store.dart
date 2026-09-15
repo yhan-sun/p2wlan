@@ -68,6 +68,15 @@ class SettingsStore extends ChangeNotifier {
           }
           var restoredSettings = (await _migrateSettings(loadedSettings))
               .copyWith(authToken: effectiveToken);
+          if (restoredSettings.manualMode &&
+              restoredSettings.authToken.trim().isNotEmpty) {
+            // Older settings flows could save a credential while leaving the
+            // offline flag enabled. That combination makes the launcher use
+            // --manual and the legacy config profile forever. Treat the
+            // stored credential as the user's durable intent to use managed
+            // mode and repair the flag during load.
+            restoredSettings = restoredSettings.copyWith(manualMode: false);
+          }
           final encryptedAdminPassword = loadedSettings
               .macosAdminPasswordCiphertext
               .trim();
@@ -172,9 +181,14 @@ class SettingsStore extends ChangeNotifier {
         ? await resolveDefaultDeviceName()
         : deviceName.trim();
     final enteredToken = authToken.trim();
+    // The Account & Connection form is also the recovery path from an old
+    // offline session. Entering a credential is an explicit request to join
+    // the managed network, so do not let a stale manual-mode flag override
+    // that request.
+    final normalizedManualMode = manualMode && enteredToken.isEmpty;
     final resolvedAuthToken = enteredToken.isNotEmpty
         ? enteredToken
-        : (manualMode
+        : (normalizedManualMode
               ? '' // manual/offline mode intentionally has no control token
               : _settings.authToken); // managed: empty means "keep stored"
     final nextSettings = _settings.copyWith(
@@ -187,7 +201,7 @@ class SettingsStore extends ChangeNotifier {
       networkId: normalizedNetworkId,
       virtualIp: virtualIp.trim(),
       deviceName: normalizedDeviceName,
-      manualMode: manualMode,
+      manualMode: normalizedManualMode,
       overlayCidr: overlayCidr.trim().isEmpty
           ? defaultOverlayCidr
           : overlayCidr.trim(),
@@ -258,6 +272,12 @@ class SettingsStore extends ChangeNotifier {
       relayServers: settings.relayServers.trim(),
       closeBehavior: normalizeCloseBehavior(settings.closeBehavior),
     );
+    if (normalizedSettings.manualMode &&
+        normalizedSettings.authToken.trim().isNotEmpty) {
+      // Keep the persisted state self-consistent even for callers that use
+      // updateSettings directly (for example logout/offline migrations).
+      normalizedSettings = normalizedSettings.copyWith(authToken: '');
+    }
     final errors = validateAppSettings(normalizedSettings);
     if (errors.isNotEmpty) {
       throw FormatException(errors.join('\n'));

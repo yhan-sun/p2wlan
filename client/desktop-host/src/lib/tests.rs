@@ -168,6 +168,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_fetch_status_retries_transient_unauthorized_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let (status, reason, body, content_type) = if attempt == 0 {
+                    (401, "Unauthorized", "unauthorized\n", "text/plain")
+                } else {
+                    (
+                        200,
+                        "OK",
+                        r#"{"node_id":"node-1"}"#,
+                        "application/json",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let client = test_client();
+        let status = client
+            .fetch_status(&format!("http://{address}/status"))
+            .await
+            .unwrap();
+
+        assert_eq!(status["node_id"], "node-1");
+    }
+
+    #[tokio::test]
     async fn client_fetch_status_non_2xx_maps_daemon_unavailable() {
         let url = diagnostics_server(200, "ok\n", 503, "busy\n", "text/plain").await;
         let client = test_client();

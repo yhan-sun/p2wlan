@@ -9,7 +9,7 @@ use p2pnet_daemon::config::ControlProxyMode;
 use p2pnet_daemon::{Config, Daemon, DaemonError, PathPolicy};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // The daemon never chooses a control plane.  The user or provisioning tool
 // must provide one explicitly in the config or with --control.

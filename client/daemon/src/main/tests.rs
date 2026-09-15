@@ -583,6 +583,45 @@ use clap::Parser;
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    #[tokio::test]
+    async fn diagnostics_auth_guard_repairs_missing_or_stale_file_while_running() {
+        let directory = tempfile_directory("diagnostics-repair");
+        let config_path = directory.join("p2wlan-config.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+        let lock = DaemonInstanceLock::acquire(&config_path).unwrap();
+
+        let mut config = diagnostics_test_config(&directory);
+        let guard = DiagnosticsAuthGuard::prepare(&mut config, &config_path, None)
+            .unwrap()
+            .expect("diagnostics enabled");
+        let path = guard.path.clone();
+        let token = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        wait_for_auth_file(&path, &token).await;
+
+        std::fs::write(&path, b"stale-token").unwrap();
+        wait_for_auth_file(&path, &token).await;
+
+        drop(guard);
+        assert!(!path.exists(), "shutdown must remove the repaired auth file");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    async fn wait_for_auth_file(path: &std::path::Path, expected: &str) {
+        for _ in 0..30 {
+            if std::fs::read_to_string(path)
+                .map(|value| value == expected)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("diagnostics auth file was not repaired: {}", path.display());
+    }
+
     #[test]
     fn diagnostics_auth_creation_fails_closed_when_runtime_directory_is_invalid() {
         let directory = tempfile_directory("diagnostics-fail-closed");
