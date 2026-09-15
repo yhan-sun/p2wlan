@@ -121,11 +121,15 @@ impl WireGuardTransport {
                 match sessions.get_mut(&peer_id) {
                     None => (false, false),
                     Some(existing) => {
+                        // The key can expire while the outbound ordering lock is held.
+                        // Revalidate its lifetime with the sessions lock reacquired.
+                        let promotion_time = Instant::now();
+                        existing.prune_expired(promotion_time);
                         if existing.pending.get(&token).is_some_and(|pending| {
                             pending.slot.session_instance == session_instance
                         }) {
-                            existing.promote_pending(&token, now);
-                            (true, true)
+                            let promoted = existing.promote_pending(&token, promotion_time);
+                            (promoted, promoted)
                         } else {
                             (false, existing.has_session_instance(session_instance))
                         }
@@ -257,3 +261,7 @@ impl WireGuardTransport {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/decryption.rs"]
+mod tests;
