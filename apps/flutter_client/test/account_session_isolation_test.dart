@@ -193,6 +193,46 @@ void main() {
   });
 
   test(
+    'credential entry after offline mode uses a fresh managed profile',
+    () async {
+      final legacy = File('${dir.path}/p2wlan-config.json');
+      await legacy.writeAsString('offline-private-identity');
+      await settings.updateSettings(
+        settings.settings.copyWith(authToken: '', manualMode: true),
+      );
+      final current = settings.settings;
+
+      await settings.updateConnectionSettings(
+        diagnosticsUrl: current.diagnosticsUrl,
+        controlServer: current.controlServer,
+        authToken: _token('b'),
+        networkId: current.networkId,
+        virtualIp: current.virtualIp,
+        deviceName: current.deviceName,
+        manualMode: true,
+        overlayCidr: current.overlayCidr,
+        tunInterface: current.tunInterface,
+        mtu: current.mtu,
+        udpBind: current.udpBind,
+        udpAdvertise: current.udpAdvertise,
+        socketPool: current.socketPool,
+        relayServers: current.relayServers,
+        closeBehavior: current.closeBehavior,
+      );
+
+      expect(settings.settings.manualMode, isFalse);
+      expect(settings.settings.authToken, _token('b'));
+      final managed = networkConfigFile(legacy, settings.settings);
+      expect(managed.path, isNot(legacy.path));
+      expect(
+        managed.path,
+        contains('${Platform.pathSeparator}accounts${Platform.pathSeparator}'),
+      );
+      expect(await legacy.readAsString(), 'offline-private-identity');
+    },
+  );
+
+  test(
     'personal daemon stops before B is saved and old peers are cleared',
     () async {
       await status.refresh();
