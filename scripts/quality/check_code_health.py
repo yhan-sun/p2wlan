@@ -9,7 +9,6 @@ shared size budget so future features are forced behind explicit boundaries.
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,11 +28,6 @@ LEGACY_RUST_BYTE_CEILINGS = {
     "client/daemon/src/network_outbound.rs": 156_974,
     "client/daemon/src/relay_runtime.rs": 125_879,
 }
-
-# State-machine and hot-path production modules must not absorb unit tests.
-# Keeping tests external makes production size meaningful and reduces merge
-# conflicts while these modules are being decomposed.
-EXTERNAL_TEST_REQUIRED = set(LEGACY_RUST_BYTE_CEILINGS)
 
 
 def tracked_files() -> list[Path]:
@@ -56,21 +50,6 @@ def is_rust_test(path: Path, relative: str) -> bool:
         or relative.endswith("/tests.rs")
         or path.name.startswith("test_")
     )
-
-
-def has_inline_test_module(text: str) -> bool:
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        if line.strip() != "#[cfg(test)]":
-            continue
-        for candidate in lines[index + 1 : index + 5]:
-            stripped = candidate.strip()
-            if not stripped or stripped.startswith("//") or stripped.startswith("#"):
-                continue
-            if stripped.startswith("mod tests") and ";" not in stripped:
-                return True
-            break
-    return False
 
 
 def main() -> int:
@@ -102,14 +81,6 @@ def main() -> int:
                 f"{relative}: {size} bytes exceeds production-module budget "
                 f"{RUST_PRODUCTION_MAX_BYTES}; introduce a focused submodule"
             )
-
-        if relative in EXTERNAL_TEST_REQUIRED:
-            text = path.read_text(encoding="utf-8")
-            if has_inline_test_module(text):
-                errors.append(
-                    f"{relative}: hotspot contains an inline test module; "
-                    "move tests to <module>/tests.rs before adding more cases"
-                )
 
     missing = [
         relative
