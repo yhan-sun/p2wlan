@@ -262,6 +262,94 @@ void main() {
       await store.updateSettings(store.settings.copyWith(authToken: ''));
       expect(await secure.read(), isNull);
     });
+
+    test('saving manual mode clears a previously managed credential', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_manual_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(
+        settingsFile: File('${tmp.path}/settings.json'),
+        tokenRepository: secure,
+      );
+      await store.load();
+      await store.updateSettings(
+        store.settings.copyWith(authToken: 'managed-token'),
+      );
+
+      await store.updateSettings(store.settings.copyWith(manualMode: true));
+
+      expect(store.settings.manualMode, isTrue);
+      expect(store.settings.authToken, isEmpty);
+      expect(await secure.read(), isNull);
+    });
+
+    test(
+      'load repairs an offline flag left beside a secure credential',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_manual_migrate_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final settingsFile = File('${tmp.path}/settings.json');
+        await settingsFile.writeAsString('{"manualMode":true,"authToken":""}');
+        final secure = InMemorySecureTokenRepository();
+        await secure.write('managed-token');
+        final store = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: secure,
+        );
+
+        await store.load();
+
+        expect(store.settings.manualMode, isFalse);
+        expect(store.settings.authToken, 'managed-token');
+        final persisted =
+            jsonDecode(await settingsFile.readAsString())
+                as Map<String, dynamic>;
+        expect(persisted['manualMode'], isFalse);
+        expect(persisted['authToken'], isEmpty);
+      },
+    );
+
+    test(
+      'entering a token after offline mode switches to managed mode',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp(
+          'p2wlan_manual_login_',
+        );
+        addTearDown(() async => tmp.delete(recursive: true));
+        final secure = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: File('${tmp.path}/settings.json'),
+          tokenRepository: secure,
+        );
+        await store.load();
+        await store.updateSettings(store.settings.copyWith(manualMode: true));
+        final current = store.settings;
+
+        await store.updateConnectionSettings(
+          diagnosticsUrl: current.diagnosticsUrl,
+          controlServer: 'https://control.example',
+          authToken: 'managed-token',
+          networkId: current.networkId,
+          virtualIp: current.virtualIp,
+          deviceName: current.deviceName,
+          manualMode: true,
+          overlayCidr: current.overlayCidr,
+          tunInterface: current.tunInterface,
+          mtu: current.mtu,
+          udpBind: current.udpBind,
+          udpAdvertise: current.udpAdvertise,
+          socketPool: current.socketPool,
+          relayServers: current.relayServers,
+          closeBehavior: current.closeBehavior,
+        );
+
+        expect(store.settings.manualMode, isFalse);
+        expect(store.settings.authToken, 'managed-token');
+        expect(await secure.read(), 'managed-token');
+      },
+    );
   });
 
   group('redactSensitive', () {
