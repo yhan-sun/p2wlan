@@ -1,0 +1,165 @@
+name: Outbound queue boundary verification
+
+on:
+  push:
+    branches: [automation/outbound-queue-boundaries]
+    paths:
+      - .github/workflows/outbound-queue-boundaries.yml
+      - .github/workbench/queue-merge.patch.gz.b64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: outbound-queue-boundaries
+  cancel-in-progress: false
+
+env:
+  SOURCE_BASE: 58f73d0dfc0c50e625fe2f3bcf85f72b08c83c4a
+  EXPECTED_COMMIT: 445be031a9af37937897d9da3414aa2af6c78a6a
+  EXPECTED_TREE: 4de435f00480ca2951d866cf6cbcbc11130dfec2
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: never
+
+jobs:
+  validate:
+    if: github.repository == 'yhan-sun/p2wlan'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Preserve source line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.SOURCE_BASE }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: workbench
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Reconstruct exact reviewed patch and commit
+        working-directory: source
+        env:
+          GIT_AUTHOR_DATE: '2026-09-15T11:00:00Z'
+          GIT_COMMITTER_DATE: '2026-09-15T11:00:00Z'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_BASE"
+          python - <<'PY'
+          import base64, gzip, hashlib, os, subprocess
+          from pathlib import Path
+          payload = Path('../workbench/.github/workbench/queue-merge.patch.gz.b64').read_text().strip()
+          patch = gzip.decompress(base64.b64decode(payload, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '4884f70af17c3646e483b28d193bc95c89ddfd0b399fecb7f708dcd1bec41678'
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          files = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(files) == {'client/daemon/src/network_outbound/queue.rs', 'client/daemon/src/network_outbound/tests/queue.rs'}
+          subprocess.run(['git', 'add', '--', *files], check=True)
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -c commit.gpgsign=false commit -m 'feat:修复发送队列合并上限与跨代次丢包'
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/queue-evidence"
+          git bundle create "$RUNNER_TEMP/queue-evidence/candidate.bundle" "$SOURCE_BASE..HEAD"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Repository contracts and policy tests
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python scripts/docs/verify_repository.py
+          python scripts/quality/check_code_health.py --base-ref "$SOURCE_BASE"
+          python -m unittest discover -s scripts/quality/tests -p 'test_*.py'
+          cargo fmt --all --check
+      - name: Clippy
+        working-directory: source
+        run: cargo clippy --locked -p p2wlan-daemon --all-targets --all-features -- -D warnings
+      - name: Execute one freshly built binary with exact counts
+        working-directory: source
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, sys
+          from pathlib import Path
+          root = Path.cwd()
+          sys.path.insert(0, str(root / 'scripts/quality'))
+          from run_rust_tests import build_test_binary, list_tests, select_tests, assert_executed
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'queue-evidence'
+          binary = build_test_binary(root, 'p2wlan-daemon')
+          names = list_tests(binary)
+          ignored = set(list_tests(binary, ignored=True))
+          runnable = set(names) - ignored
+          selected = select_tests(names, 'network_outbound::queue::tests::', False, ignored)
+          assert len(selected) == 15, selected
+          hard = select_tests(names, 'hard_hard_', False, ignored)
+          general = runnable - set(hard)
+          assert len(general) > 1200 and len(hard) == 69
+          def execute(args, expected, filename):
+              result = subprocess.run([str(binary), *args, '--test-threads=1'], capture_output=True, text=True, encoding='utf-8', errors='replace')
+              (evidence / filename).write_text(result.stdout + result.stderr, encoding='utf-8')
+              print(result.stdout, end='')
+              print(result.stderr, end='', file=sys.stderr)
+              if result.returncode:
+                  raise RuntimeError(f'test process failed: {args}: {result.returncode}')
+              assert_executed(result.stdout, expected)
+          execute(['network_outbound::queue::tests::'], 15, 'queue-regressions.log')
+          execute(['--skip', 'hard_hard_'], len(general), 'daemon-general.log')
+          for index, name in enumerate(hard):
+              execute([name, '--exact'], 1, f'hard-hard-{index:03d}.log')
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['EXPECTED_COMMIT']
+          assert not subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip()
+          report = {'commit': os.environ['EXPECTED_COMMIT'], 'tree': os.environ['EXPECTED_TREE'], 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'queue_tests': selected, 'general_passed': len(general), 'hard_hard_passed': len(hard), 'ignored': sorted(ignored), 'platform': sys.platform}
+          (evidence / 'summary.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          PY
+      - name: Upload exact-source evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: outbound-queue-${{ matrix.os }}
+          path: ${{ runner.temp }}/queue-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: refactor/daemon-quality-hardening
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: outbound-queue-ubuntu-24.04
+          path: ${{ runner.temp }}/queue-evidence
+      - name: Fast-forward only the reviewed branch and exact tested commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_BASE"
+          git fetch "$RUNNER_TEMP/queue-evidence/candidate.bundle" HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git rev-parse FETCH_HEAD^)" = "$SOURCE_BASE"
+          test "$(git diff --name-only "$SOURCE_BASE" "$EXPECTED_COMMIT" | wc -l | tr -d ' ')" = 2
+          git push origin "$EXPECTED_COMMIT:refs/heads/refactor/daemon-quality-hardening"
