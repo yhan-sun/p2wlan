@@ -13,6 +13,19 @@
 
 普通部署不需要在服务器上安装 Go 或从源码构建。
 
+## 已验证平台
+
+仓库 CI 对服务端做分层验证：
+
+| 范围 | 当前验证 |
+| --- | --- |
+| 原生服务端构建、Go 测试、Control/Relay 双进程 smoke | Ubuntu 22.04、Windows latest |
+| systemd manager、backup/restore/rollback 契约 | Ubuntu 22.04 |
+| Docker Compose 自托管拓扑 | Ubuntu 22.04 runner 上的 Docker |
+| Linux 服务端静态二进制 loader 兼容 | Ubuntu 20.04 容器 |
+
+这表示 Ubuntu 20.04 会验证发布形态的静态 Control/Relay 二进制可以启动并报告版本，但当前 CI 不声明 Ubuntu 20.04 的完整 systemd 管理、真实网络、TLS、升级恢复和长期运行已经端到端验收。正式部署优先使用已验证的 Ubuntu 22.04 或固定镜像；其他发行版在生产使用前自行执行安装、服务管理、TLS、数据库和业务连通性验证。
+
 ## 安装
 
 下载同一 server-vX.Y.Z 下与主机架构匹配的归档和同名 checksum：

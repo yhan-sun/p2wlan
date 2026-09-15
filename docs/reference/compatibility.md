@@ -12,4 +12,8 @@
 
 客户端和服务端使用独立标签：客户端是 vX.Y.Z，服务端是 server-vX.Y.Z。不同标签不代表协议完全兼容；升级前检查发布契约和服务端说明。
 
+## 服务端验证范围
+
+原生服务端 CI 在 Ubuntu 22.04 和 Windows latest 上运行 Go 测试及 Control/Relay 双进程 smoke；systemd manager 与恢复契约在 Ubuntu 22.04 上执行。Docker 自托管拓扑在 Ubuntu 22.04 runner 上验证。服务端使用 `CGO_ENABLED=0` 的静态 Linux 二进制，并额外在 Ubuntu 20.04 容器中执行 loader/`--version` 兼容检查，但这不等于 Ubuntu 20.04 的完整 systemd、TLS、数据库恢复和真实网络部署已经端到端验证。
+
 兼容性声明只覆盖仓库已执行的构建与测试。真实设备、真实 TUN、不同 NAT、休眠唤醒、网络切换和长期业务流量需要单独验证。
