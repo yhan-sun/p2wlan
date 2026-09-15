@@ -39,6 +39,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Rust Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust API documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked -p p2wlan-daemon --lib --no-deps --all-features
       - name: Rust Tests (general suite)
         run: cargo test --workspace --all-targets -- --test-threads=1 --skip hard_hard_
       - name: Rust Tests (Hard↔Hard isolated suite)

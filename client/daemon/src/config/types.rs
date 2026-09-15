@@ -343,7 +343,7 @@ impl ControlProxyMode {
 /// Control plane server configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ControlConfig {
-    /// Control server URL (e.g. "https://control.p2wlan.io:443").
+    /// Control server URL (e.g. <https://control.example.com:443>).
     pub server_url: String,
     /// User authentication token (JWT) obtained after login/register.
     #[serde(default, deserialize_with = "deserialize_string_or_empty")]

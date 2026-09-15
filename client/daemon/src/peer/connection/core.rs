@@ -201,7 +201,7 @@ pub struct PeerConnection {
     /// to carry this peer's traffic (the shared relay slot published an
     /// endpoint while the peer had an encrypting WireGuard session).  This is
     /// the per-peer `RelayTransportConnected` milestone: it is strictly weaker
-    /// than [`relay_confirmed_generation`] (a TCP/TLS connect or a queued
+    /// than `relay_confirmed_generation` (a TCP/TLS connect or a queued
     /// registration must never count as delivery).
     pub relay_ready_generation: Option<u64>,
     /// Monotonic instant (daemon-local) of the per-peer relay-ready milestone.
@@ -230,7 +230,7 @@ pub struct PeerConnection {
     pub(crate) relay_first: RelayFirstBusinessState,
     /// Monotonic relay-confirm sequence.  Bumped (and mirrored in the peer
     /// manager, notified to outbound waiters) every time the peer's relay
-    /// confirmation changes, mirroring [`direct_commit_seq`].
+    /// confirmation changes, mirroring `direct_commit_seq`.
     pub relay_confirm_seq: u64,
     /// Local network generation of the first confirmed usable path
     /// (`RelayPeerConfirmed` or `DirectConfirmed`), the first-business-packet
