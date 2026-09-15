@@ -56,12 +56,15 @@ jobs:
       - name: Resolve published release and tag identity
         id: identity
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = release ]; then
-            tag='${{ github.event.release.tag_name }}'
+            tag="$RELEASE_TAG"
           else
-            tag='${{ inputs.tag }}'
+            tag="$INPUT_TAG"
           fi
           case "$tag" in
             v*) ;;
