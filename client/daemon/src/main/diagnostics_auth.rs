@@ -1,7 +1,7 @@
 use rand::RngCore;
 use std::fs as auth_fs;
 use std::path::{Path as AuthPath, PathBuf as AuthPathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc as DiagnosticsArc, Mutex};
 use std::time::Duration as AuthRepairDuration;
 use zeroize::Zeroizing;
 
@@ -14,7 +14,7 @@ struct DiagnosticsAuthGuard {
     path: AuthPathBuf,
     _token: Zeroizing<String>,
     repair_abort: Option<tokio::task::AbortHandle>,
-    repair_lock: Arc<Mutex<()>>,
+    repair_lock: DiagnosticsArc<Mutex<()>>,
 }
 
 impl DiagnosticsAuthGuard {
@@ -56,7 +56,7 @@ impl DiagnosticsAuthGuard {
 
         config.diagnostics.auth_token = Some(token.to_string());
         config.diagnostics.auth_token_path = Some(path.clone());
-        let repair_lock = Arc::new(Mutex::new(()));
+        let repair_lock = DiagnosticsArc::new(Mutex::new(()));
         let repair_abort = spawn_auth_file_repair(
             path.clone(),
             token.clone(),
@@ -169,7 +169,7 @@ fn spawn_auth_file_repair(
     path: AuthPathBuf,
     token: Zeroizing<String>,
     diagnostics_client_sid: Option<String>,
-    repair_lock: Arc<Mutex<()>>,
+    repair_lock: DiagnosticsArc<Mutex<()>>,
 ) -> Option<tokio::task::AbortHandle> {
     let runtime = tokio::runtime::Handle::try_current().ok()?;
     let task = runtime.spawn(async move {

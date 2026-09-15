@@ -1,0 +1,133 @@
+name: Release Post-publish Audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/release/verify_published_release.py'
+      - 'scripts/release/test_verify_published_release.py'
+      - '.github/workflows/release-post-publish-audit.yml'
+      - 'docs/reference/release-contract.md'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/release/verify_published_release.py'
+      - 'scripts/release/test_verify_published_release.py'
+      - '.github/workflows/release-post-publish-audit.yml'
+      - 'docs/reference/release-contract.md'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Client release tag to audit, for example v0.1.162
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    name: Published release audit contract tests
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Run published release audit tests
+        run: python3 scripts/release/test_verify_published_release.py
+
+  audit:
+    name: Audit published client release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Resolve published release and tag identity
+        id: identity
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            tag="$RELEASE_TAG"
+          else
+            tag="$INPUT_TAG"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "client release audit requires a vX.Y.Z-style tag: $tag" >&2; exit 1 ;;
+          esac
+          work="$RUNNER_TEMP/p2wlan-release-audit"
+          rm -rf "$work"
+          mkdir -p "$work"
+          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$work/release.json"
+          gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > "$work/tag-ref.json"
+          object_type="$(jq -r '.object.type' "$work/tag-ref.json")"
+          object_sha="$(jq -r '.object.sha' "$work/tag-ref.json")"
+          case "$object_type" in
+            tag)
+              gh api "/repos/$GITHUB_REPOSITORY/git/tags/$object_sha" > "$work/tag-object.json"
+              tag_commit="$(jq -r '.object.sha' "$work/tag-object.json")"
+              test "$(jq -r '.object.type' "$work/tag-object.json")" = commit || {
+                echo "annotated tag does not resolve to a commit" >&2; exit 1;
+              }
+              ;;
+            commit) tag_commit="$object_sha" ;;
+            *) echo "unsupported tag object type: $object_type" >&2; exit 1 ;;
+          esac
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$tag_commit" origin/main || {
+            echo "published tag commit is not reachable from main: $tag_commit" >&2
+            exit 1
+          }
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          printf 'tag_commit=%s\n' "$tag_commit" >> "$GITHUB_OUTPUT"
+          printf 'work=%s\n' "$work" >> "$GITHUB_OUTPUT"
+
+      - name: Download published manifest
+        shell: bash
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+          WORK: ${{ steps.identity.outputs.work }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern RELEASE-MANIFEST.json \
+            --dir "$WORK"
+          test -f "$WORK/RELEASE-MANIFEST.json"
+
+      - name: Verify release assets against manifest and tag
+        shell: bash
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+          TAG_COMMIT: ${{ steps.identity.outputs.tag_commit }}
+          WORK: ${{ steps.identity.outputs.work }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/verify_published_release.py \
+            --release-json "$WORK/release.json" \
+            --manifest "$WORK/RELEASE-MANIFEST.json" \
+            --tag "$TAG" \
+            --tag-commit "$TAG_COMMIT" \
+            --report "$WORK/audit-report.json"
+
+      - name: Upload audit evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-post-publish-audit-${{ steps.identity.outputs.tag }}
+          path: ${{ steps.identity.outputs.work }}/audit-report.json
+          if-no-files-found: error

@@ -205,7 +205,6 @@ void main() {
       await store.updateSettings(
         store.settings.copyWith(authToken: 'managed-token'),
       );
-      // JSON on disk must NOT contain the token.
       final raw = await settingsFile.readAsString();
       expect(
         raw.contains('managed-token'),
@@ -214,9 +213,7 @@ void main() {
       );
       final persisted = (jsonDecode(raw) as Map<String, dynamic>)['authToken'];
       expect(persisted, '', reason: 'token field is blanked in persisted JSON');
-      // Secure store holds the effective value.
       expect(await secure.read(), 'managed-token');
-      // In-memory settings still expose the token for the daemon launch.
       expect(store.settings.authToken, 'managed-token');
     });
 
@@ -235,11 +232,8 @@ void main() {
           tokenRepository: secure,
         );
         await store.load();
-        // Migrated into the local token file...
         expect(await secure.read(), 'legacy-token');
-        // ...and still available in-memory...
         expect(store.settings.authToken, 'legacy-token');
-        // ...and the token is NOT re-persisted to the JSON on subsequent save.
         await store.updateSettings(store.settings.copyWith(networkId: 'net1'));
         final raw = await settingsFile.readAsString();
         expect(raw.contains('legacy-token'), isFalse);
@@ -258,7 +252,6 @@ void main() {
       await store.load();
       await store.updateSettings(store.settings.copyWith(authToken: 'tok'));
       expect(await secure.read(), 'tok');
-      // Simulate logout: clear the token.
       await store.updateSettings(store.settings.copyWith(authToken: ''));
       expect(await secure.read(), isNull);
     });
@@ -303,9 +296,8 @@ void main() {
 
         expect(store.settings.manualMode, isFalse);
         expect(store.settings.authToken, 'managed-token');
-        final persisted =
-            jsonDecode(await settingsFile.readAsString())
-                as Map<String, dynamic>;
+        final raw = await settingsFile.readAsString();
+        final persisted = jsonDecode(raw) as Map<String, dynamic>;
         expect(persisted['manualMode'], isFalse);
         expect(persisted['authToken'], isEmpty);
       },
@@ -396,7 +388,6 @@ void main() {
     });
 
     test('does not redact the word token in prose without an assignment', () {
-      // "token" alone (no : or = value) is not a credential occurrence.
       expect(
         redactSensitive('token rotation scheduled'),
         'token rotation scheduled',
