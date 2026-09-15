@@ -152,13 +152,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
       - name: Verify repository contracts
+        env:
+          CODE_HEALTH_BASE: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
         run: |
           python3 scripts/docs/verify_repository.py
-          python3 scripts/quality/check_code_health.py
+          python3 scripts/quality/test_code_health.py
+          python3 scripts/quality/check_code_health.py --base-ref "$CODE_HEALTH_BASE"
           bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
           sh -n scripts/install-linux-cli.sh
-          python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
+          python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/quality/test_code_health.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
           python3 scripts/release/test_release_set.py
           test -x apps/flutter_client/android/gradlew
           printf '%s  %s\n' 76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3 apps/flutter_client/android/gradle/wrapper/gradle-wrapper.jar | sha256sum -c -
