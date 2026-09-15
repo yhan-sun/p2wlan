@@ -1,0 +1,3217 @@
+// Split out of the former flat include!-ed test file so the module is a
+// real Rust scope. Everything below is unchanged test code.
+use super::*;
+use crate::peer::NetworkPath;
+
+#[tokio::test]
+async fn test_network_outbound_relay_ignores_missing_direct_business_budget_when_udp_unavailable() {
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let peer_session_generation = peers
+        .peer_session_generation_sync("node-b")
+        .expect("the online peer must have a session generation");
+    peers.mark_dplpmtud_capable_sync("node-b", peer_session_generation);
+    assert!(peers.peer_supports_dplpmtud_sync("node-b", peer_session_generation));
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_millis(500)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    // Direct is managed but has no confirmed budget. Relay remains independent:
+    // the worker encrypts and sends because the Relay path is confirmed.
+    let payload = vec![4, 9, 8, 7, 6];
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x1234,
+        1,
+        &payload,
+    );
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet.clone(),
+        })
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let RelayMessage::Data { from_node, data } = received {
+        assert_eq!(from_node, "node-a");
+        assert_eq!(
+            remote_session.decrypt_from_bytes(&data).unwrap(),
+            packet,
+            "the relay must carry the worker's encrypted business packet"
+        );
+    } else {
+        panic!("Expected Data message, got {:?}", received);
+    }
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_uses_relay_until_direct_is_verified() {
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+    let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct_endpoint = direct_sink.local_addr().unwrap();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: direct_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(Some(udp)));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_millis(500)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    let payload = vec![9, 8, 7, 6, 5];
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x1234,
+        1,
+        &payload,
+    );
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet.clone(),
+        })
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let RelayMessage::Data { from_node, data } = received {
+        assert_eq!(from_node, "node-a");
+        assert_eq!(
+            remote_session.decrypt_from_bytes(&data).unwrap(),
+            packet,
+            "the worker must encrypt the business packet before it rides the relay"
+        );
+    } else {
+        panic!("Expected Data message, got {:?}", received);
+    }
+
+    let mut buf = [0u8; 64];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), direct_sink.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
+
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::Relay);
+    assert_eq!(conn.active_path(), Some(peer::NetworkPath::Relay));
+    assert_eq!(conn.relay_server, Some(relay_endpoint));
+    let selection = peers.select_path_for_data("node-b", true, true).await;
+    assert_eq!(selection.path, Some(peer::NetworkPath::Relay));
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_promotes_direct_before_relay_slot_is_published() {
+    let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct_endpoint = direct_sink.local_addr().unwrap();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: direct_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers
+        .record_direct_probe_success_with_latency(
+            "node-b",
+            direct_endpoint,
+            Some(Duration::from_millis(8)),
+        )
+        .await;
+    // This is the startup race from the real Mini/Android run: Direct can
+    // become encrypted-confirmed before the relay supervisor publishes its
+    // live transport slot. The authoritative ACK makes Direct primary; the
+    // relay-first state remains warm standby/fallback state.
+    peers
+        .record_direct_success("node-b", Some(direct_endpoint))
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(Some(udp)));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport.clone(),
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(2)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    let payload = vec![1, 2, 3, 5, 8, 13];
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x1234,
+        1,
+        &payload,
+    );
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet.clone(),
+        })
+        .await
+        .unwrap();
+
+    let mut direct_buf = [0u8; 256];
+    let (received_len, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        direct_sink.recv_from(&mut direct_buf),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        remote_session
+            .decrypt_from_bytes(&direct_buf[..received_len])
+            .unwrap(),
+        packet,
+        "an authoritative Direct ACK must promote the first business packet before relay publish"
+    );
+
+    worker.abort();
+    forwarder.abort();
+}
+
+#[tokio::test]
+async fn test_daemon_acl_check() {
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let daemon = Daemon::new(config);
+
+    // Default ACL allows everything
+    assert!(daemon.check_acl("node1", "node2", "tcp", 80).await);
+}
+
+#[tokio::test]
+async fn test_daemon_dns() {
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.dns.enabled = true;
+    let daemon = Daemon::new(config);
+
+    daemon
+        .dns()
+        .register("test", "10.20.0.5", Some("node1"))
+        .await;
+    let ip = daemon.dns().resolve("test").await;
+    assert_eq!(ip, Some("10.20.0.5".to_string()));
+}
+
+#[tokio::test]
+async fn test_daemon_port_mapping() {
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let daemon = Daemon::new(config);
+
+    let mapping =
+        port_mapping::PortMapping::new(port_mapping::Protocol::Tcp, "127.0.0.1", 8080, 30000);
+    daemon.port_mappings().create(mapping).await.unwrap();
+    let list = daemon.port_mappings().list().await;
+    assert_eq!(list.len(), 1);
+}
+
+/// A responder answer must use the cached candidate snapshot: while the
+/// candidate refresh lock is held (simulating a blocked live STUN refresh),
+/// the answer still reaches the control server with the cached candidates
+/// within a strict short timeout.  STUN/refresh and the endpoint update are
+/// NOT prerequisites of the answer.
+#[tokio::test]
+async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let answer_bodies = StdArc::new(StdMutex::new(Vec::<String>::new()));
+    let registered = StdArc::new(AtomicBool::new(false));
+    let server = {
+        let answer_bodies = answer_bodies.clone();
+        let registered = registered.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let answer_bodies = answer_bodies.clone();
+                let registered = registered.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let is_register = head.starts_with("POST") && head.contains("/api/v1/devices");
+                    let is_poll = head.starts_with("GET") && head.contains("/api/v1/signals");
+                    let is_signal = head.starts_with("POST") && head.contains("/api/v1/signals");
+                    let body = if is_signal {
+                        let content_length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let head_end = buf
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                            .unwrap_or(0)
+                            + 4;
+                        while buf.len() < head_end + content_length {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) => break,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                Err(_) => break,
+                            }
+                        }
+                        String::from_utf8_lossy(&buf[head_end..head_end + content_length])
+                            .into_owned()
+                    } else {
+                        String::new()
+                    };
+                    if is_register {
+                        registered.store(true, AtomicOrdering::SeqCst);
+                        let body = r#"{"success":true,"node_id":"node-a","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if is_poll {
+                        let body = r#"{"signals":[],"server_time_ms":0}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if is_signal {
+                        answer_bodies.lock().unwrap().push(body);
+                        let body = r#"{"success":true,"protocol_version":1}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        })
+    };
+
+    let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-a".to_string();
+    let daemon = Daemon::new(config);
+
+    // The local node is the designated responder for this peer.
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let peer_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "peer-cached-answer";
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: hex::encode(peer_identity.public_key()),
+            endpoint: String::new(),
+            nat_type: "FullCone".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    // The cached candidate snapshot the answer must use.
+    let cached = vec![
+        "203.0.113.120:55001".to_string(),
+        "127.0.0.1:55002".to_string(),
+    ];
+    let cached_sources = HashMap::from([
+        (cached[0].clone(), "stun_observed".to_string()),
+        (cached[1].clone(), "host".to_string()),
+    ]);
+    daemon
+        .publish_candidate_snapshot(cached.clone(), cached_sources, Vec::new())
+        .await;
+
+    // A blocked live refresh: any STUN/candidate refresh would stall here.
+    // The answer must not wait for it.
+    let refresh_guard = daemon.candidate_refresh_lock.clone().lock_owned().await;
+
+    let mut initiator = HandshakeInitiator::new(peer_identity.clone(), local_public, None);
+    let initiation = initiator.create_initiation().unwrap().to_bytes();
+    let control = daemon.control.clone();
+    // Occupy the general slow-work lane first.  The responder answer must
+    // still reach control through its dedicated lane; this reproduces the old
+    // round-8 shape where `Received peer offer` was logged but no answer was
+    // ever produced while another slow worker owned the scheduler slot.
+    control
+        .event_sender()
+        .send(ControlEvent::PeerReflexive {
+            from_node_id: peer_id.to_string(),
+            observed_endpoint: "198.51.100.20:41001".to_string(),
+            punch_at_ms: None,
+        })
+        .unwrap();
+    daemon
+        .control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec!["198.51.100.9:44001".to_string()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::new(),
+            candidate_generation: 1,
+            candidates_expires_at_ms: None,
+            handshake_init: initiation,
+            punch_at_ms: Some(relay_assisted_punch_at_ms()),
+            punch_at_server_ms: None,
+            sender_public_key: Some(hex::encode(peer_identity.public_key())),
+        })
+        .unwrap();
+
+    let shutdown = daemon.shutdown_sender();
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+
+    // Registration must land before the critical lane publishes auth.
+    timeout(Duration::from_secs(5), async {
+        while !registered.load(AtomicOrdering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon must register against the mock control server");
+
+    // The answer must arrive with the CACHED candidates within a strict
+    // short timeout while the refresh lock is still held.
+    let answer_body = timeout(Duration::from_secs(5), async {
+        loop {
+            let bodies = answer_bodies.lock().unwrap().clone();
+            if let Some(body) = bodies
+                .iter()
+                .find(|body| body.contains("\"type\":\"peer_answer\""))
+            {
+                break body.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the responder answer must be sent while the refresh is blocked");
+
+    assert!(
+        answer_body.contains("203.0.113.120:55001"),
+        "the answer must carry the cached candidate, got: {answer_body}"
+    );
+    assert!(
+        answer_body.contains("127.0.0.1:55002"),
+        "the answer must carry the cached host candidate, got: {answer_body}"
+    );
+    assert!(
+        !answer_body.contains("198.51.100.9"),
+        "the answer must not mix the offer's remote candidates into its own set: {answer_body}"
+    );
+
+    // Release the refresh lock so the daemon can wind down.
+    drop(refresh_guard);
+    let _ = shutdown.send(true);
+    let _ = timeout(Duration::from_secs(3), loop_task).await;
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_first_packet_liveness_crosses_responder_status_and_writer_contention() {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn fetch_status(address: SocketAddr) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer relay-liveness-test\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let registered = Arc::new(AtomicBool::new(false));
+    let answer_delivered = Arc::new(AtomicBool::new(false));
+    let answer_payload = Arc::new(std::sync::Mutex::new(None::<String>));
+    let server = {
+        let registered = registered.clone();
+        let answer_delivered = answer_delivered.clone();
+        let answer_payload = answer_payload.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let registered = registered.clone();
+                let answer_delivered = answer_delivered.clone();
+                let answer_payload = answer_payload.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(position) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break position + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                    let content_length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < header_end + content_length {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let body = String::from_utf8_lossy(
+                        &request[header_end..request.len().min(header_end + content_length)],
+                    );
+                    let (status_body, registration) = if head.contains("/api/v1/devices") {
+                        (
+                            r#"{"success":true,"node_id":"node-local","virtual_ip":"10.20.0.1","cidr":"10.20.0.0/16","relay_servers":[]}"#,
+                            true,
+                        )
+                    } else if head.contains("/api/v1/signals") && head.starts_with("POST") {
+                        if body.contains("\"type\":\"peer_answer\"") {
+                            answer_delivered.store(true, AtomicOrdering::SeqCst);
+                            *answer_payload
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(body.into_owned());
+                        }
+                        (r#"{"success":true,"protocol_version":1}"#, false)
+                    } else {
+                        (r#"{"signals":[],"server_time_ms":0}"#, false)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        status_body.len(),
+                        status_body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    if registration {
+                        registered.store(true, AtomicOrdering::SeqCst);
+                    }
+                });
+            }
+        })
+    };
+
+    let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+    config.control.auth_token = "test-token".to_string();
+    config.node.node_id = "node-local".to_string();
+    let daemon = Arc::new(Daemon::new(config));
+    timeout(Duration::from_secs(3), async {
+        while !registered.load(AtomicOrdering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon did not register with mock control");
+
+    let local_public = daemon.local_identity().unwrap().public_key();
+    let remote_identity = loop {
+        let identity = NodeIdentity::generate();
+        if identity.public_key() < local_public {
+            break identity;
+        }
+    };
+    let peer_id = "node-remote";
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: hex::encode(remote_identity.public_key()),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    daemon.relay_available_tx.send_replace(true);
+
+    let relay_server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = relay_server.addr.to_string();
+    let (local_relay, local_relay_rx) =
+        RelayTransport::connect(&relay_endpoint, "node-local", daemon.peers.clone())
+            .await
+            .unwrap();
+    let local_relay_connection_id = local_relay.connection_id();
+    let relay_slot = Arc::new(RwLock::new(Some(local_relay.clone())));
+    let (remote_relay, mut remote_relay_rx) =
+        p2pnet_relay::RelayClient::connect(&relay_endpoint, peer_id)
+            .await
+            .unwrap();
+    let remote_peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    remote_peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-local".to_string(),
+            public_key: hex::encode(local_public),
+            virtual_ip: "10.20.0.1".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+
+    // Serve the real diagnostics endpoint against this daemon state and prime
+    // its validated snapshot before introducing a fair-queue writer.
+    let diag_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let diag_address = diag_probe.local_addr().unwrap();
+    drop(diag_probe);
+    let (diag_shutdown_tx, diag_shutdown_rx) = tokio::sync::watch::channel(false);
+    let diagnostics_context = DiagnosticsContext::new(
+        daemon.config.clone(),
+        daemon.peers.clone(),
+        daemon.udp_transport.clone(),
+        daemon.candidate_snapshot.clone(),
+        daemon.nat_profile.clone(),
+        daemon.gateway_mapping_diagnostics.clone(),
+        relay_slot.clone(),
+        daemon.relay_selection.clone(),
+        daemon.health.clone(),
+        daemon.task_manager.clone(),
+        daemon.route_manager.clone(),
+        diag_shutdown_tx.clone(),
+        daemon.timeline.clone(),
+        daemon.status_events.clone(),
+        None,
+        Some("relay-liveness-test".to_string()),
+        None,
+    );
+    let (diag_ready_tx, diag_ready_rx) = tokio::sync::oneshot::channel();
+    let diagnostics_worker = tokio::spawn(run_diagnostics_server_with_retry_ready(
+        diag_address.to_string(),
+        diagnostics_context,
+        diag_shutdown_rx,
+        Some(diag_ready_tx),
+    ));
+    timeout(Duration::from_secs(1), diag_ready_rx)
+        .await
+        .expect("diagnostics listener did not bind")
+        .expect("diagnostics listener dropped readiness");
+    let initial_status = fetch_status(diag_address).await;
+    assert!(initial_status.starts_with("HTTP/1.1 200 OK"));
+
+    let mut remote_initiator = HandshakeInitiator::new(remote_identity, local_public, None);
+    let initiation = remote_initiator.create_initiation().unwrap().to_bytes();
+    let session_id = "post-answer-contention-owner".to_string();
+    let probe_public = hex::encode(DhKeyPair::generate().public_key());
+    let gate = Arc::new(ResponderPostAnswerTestGate::new());
+    daemon.install_responder_post_answer_gate_for_test(peer_id, gate.clone());
+
+    let offer_worker = tokio::spawn({
+        let daemon = daemon.clone();
+        let peer_id = peer_id.to_string();
+        let session_id = session_id.clone();
+        async move {
+            daemon
+                .handle_peer_offer(
+                    &peer_id,
+                    &[],
+                    &initiation,
+                    None,
+                    None,
+                    Some(session_id),
+                    Some(probe_public),
+                )
+                .await
+        }
+    });
+
+    timeout(Duration::from_secs(3), gate.reached.notified())
+        .await
+        .expect("responder did not reach the post-answer grace boundary");
+    assert!(
+        answer_delivered.load(AtomicOrdering::SeqCst),
+        "the controlled pause must occur only after answer delivery succeeded"
+    );
+    let status = daemon.transport.session_status(peer_id).await;
+    assert!(status.has_pending_responder);
+    assert!(!status.has_active);
+
+    let answer_json = answer_payload
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .expect("mock control did not retain the delivered answer");
+    let answer_json: serde_json::Value = serde_json::from_str(&answer_json).unwrap();
+    let response_wire = hex::decode(
+        answer_json
+            .get("handshake")
+            .and_then(serde_json::Value::as_str)
+            .expect("answer did not contain the WireGuard response"),
+    )
+    .unwrap();
+    let response = MessageResponse::from_bytes(&response_wire).unwrap();
+    let mut remote_session =
+        TransportSession::new(remote_initiator.consume_response(&response).unwrap());
+
+    let (encrypted_tx, encrypted_rx) = mpsc::channel(8);
+    let relay_reader = tokio::spawn(local_relay.clone().run_inbound(
+        local_relay_rx,
+        encrypted_tx,
+        None,
+    ));
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let (_udp_tx, udp_updates) = watch::channel(None);
+    let inbound_worker = tokio::spawn({
+        let transport = daemon.transport.clone();
+        let peers = daemon.peers.clone();
+        let evidence = InboundEvidenceFeed {
+            relay_transport: relay_slot.clone(),
+            timeline: Some(daemon.timeline.clone()),
+            overlay_ingress_tx: None,
+        };
+        async move {
+            transport
+                .run_inbound_with_peers_live_udp_and_relay(
+                    encrypted_rx,
+                    inbound_tx,
+                    Some(peers),
+                    udp_updates,
+                    Some(evidence),
+                )
+                .await
+        }
+    });
+    let build_probe = |kind, generation, request_id, owner_token| {
+        Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 2),
+            Ipv4Addr::new(10, 20, 0, 1),
+            request_id,
+            1,
+            &crate::relay_probe::build_relay_probe_payload(
+                kind,
+                generation,
+                request_id,
+                owner_token,
+            ),
+        )
+    };
+
+    // The Answer has been delivered but its responder owner is paused. Hold a
+    // production connection snapshot and send the first encrypted Probe over
+    // an actual relay client/server/reader chain. The pending receive key must
+    // promote and ACK even though every connection transaction contends.
+    let connection_reader = daemon.peers.connection_map_for_test().read_owned().await;
+    let first_request = build_probe(crate::relay_probe::RelayProbeKind::Request, 0, 1, 0x11);
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&first_request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_ack = timeout(Duration::from_secs(1), remote_relay_rx.recv())
+        .await
+        .expect("first Relay Probe ACK stalled behind the connection reader")
+        .expect("remote relay registration closed");
+    let first_ack_wire = match first_ack {
+        p2pnet_relay::RelayMessage::Data { from_node, data } => {
+            assert_eq!(from_node, "node-local");
+            data
+        }
+        other => panic!("expected encrypted Relay Probe ACK, got {other:?}"),
+    };
+    let first_ack_packet = remote_session
+        .decrypt_from_bytes(&first_ack_wire)
+        .expect("first Relay Probe ACK did not use the promoted responder key");
+    let first_ack_token = crate::relay_probe::parse_relay_probe_token(&first_ack_packet)
+        .expect("first Relay response was not a typed Probe ACK");
+    assert_eq!(
+        first_ack_token.kind,
+        crate::relay_probe::RelayProbeKind::Ack
+    );
+    let status = daemon.transport.session_status(peer_id).await;
+    assert!(
+        status.has_active,
+        "first Probe did not promote pending session"
+    );
+    assert!(!status.has_pending_responder);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let events = daemon.timeline.snapshot().events;
+            if events
+                .iter()
+                .any(|event| event.event == "relay_probe_ack_sent")
+                && events.iter().any(|event| {
+                    event.event == "relay_ready_connections_contended"
+                        && event.reason_code.as_deref() == Some("fair_rwlock_writer_unavailable")
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first Relay Probe did not finish its non-queuing ACK path");
+    assert!(
+        daemon.peers.try_all_connections().is_some(),
+        "first-packet handling queued a connection writer"
+    );
+
+    // Add a real queued writer behind the retained reader. Tokio's fair RwLock
+    // now rejects every new reader; /status must serve its validated cache as
+    // HTTP 200, and the responder must still reach its session commit after
+    // its controlled gate is released.
+    // Poll the retained future into the writer queue before checking status.
+    // A task-start notification does not prove its lock attempt was polled.
+    let queued_writer = tokio::task::unconstrained(daemon.peers.hold_connections_writer_for_test());
+    tokio::pin!(queued_writer);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(queued_writer.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(daemon.peers.try_all_connections().is_none());
+    let contended_status = timeout(Duration::from_secs(1), fetch_status(diag_address))
+        .await
+        .expect("/status waited behind the fairly queued connection writer");
+    assert!(contended_status.starts_with("HTTP/1.1 200 OK"));
+    let contended_status_json: serde_json::Value = serde_json::from_str(
+        contended_status
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("status response had no body"),
+    )
+    .unwrap();
+    assert_eq!(
+        contended_status_json
+            .get("peer_snapshot_stale")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    gate.release.wait().await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let events = daemon.timeline.snapshot().events;
+            let contended = events.iter().any(|event| {
+                event.event == "peer_answer_probe_binding_grace_result"
+                    && event.reason_code.as_deref() == Some("fair_rwlock_writer_unavailable")
+            });
+            let committed = events
+                .iter()
+                .any(|event| event.event == "peer_answer_commit_result");
+            if contended && committed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("responder commit stalled behind connection contention");
+    let status = daemon.transport.session_status(peer_id).await;
+    assert!(status.has_active);
+    assert!(!status.has_pending_responder);
+
+    drop(connection_reader);
+    drop(
+        timeout(Duration::from_secs(1), queued_writer)
+            .await
+            .expect("connection writer remained queued after reader release"),
+    );
+    timeout(Duration::from_secs(1), offer_worker)
+        .await
+        .expect("responder did not finish after controlled reader release")
+        .expect("responder task panicked")
+        .expect("responder failed");
+    let events = daemon.timeline.snapshot().events;
+    assert!(events
+        .iter()
+        .any(|event| event.event == "peer_answer_control_accepted"));
+    assert!(events
+        .iter()
+        .any(|event| event.event == "peer_answer_committed"));
+
+    // A later independently encrypted Probe retries the contended ready and
+    // Probe-binding transactions after the reader exits.
+    let second_request = build_probe(crate::relay_probe::RelayProbeKind::Request, 0, 2, 0x22);
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&second_request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_ack = timeout(Duration::from_secs(1), remote_relay_rx.recv())
+        .await
+        .expect("retry Relay Probe did not receive an ACK")
+        .expect("remote relay registration closed during retry");
+    match second_ack {
+        p2pnet_relay::RelayMessage::Data { data, .. } => {
+            remote_session
+                .decrypt_from_bytes(&data)
+                .expect("retry Relay Probe ACK did not decrypt");
+        }
+        other => panic!("expected retry Relay Probe ACK, got {other:?}"),
+    }
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let connection = daemon.peers.get_connection(peer_id).await.unwrap();
+            if connection.relay_ready_connection_id == Some(local_relay_connection_id)
+                && daemon.peers.probe_key_for_peer(peer_id).await.is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry Probe did not commit ready and Probe binding");
+    let local_connection = daemon.peers.get_connection(peer_id).await.unwrap();
+    assert_eq!(
+        local_connection.relay_ready_connection_id,
+        Some(local_relay_connection_id)
+    );
+    assert!(daemon.peers.probe_key_for_peer(peer_id).await.is_some());
+
+    // The first real ACK confirms the opposite endpoint, and a matching ACK
+    // delivered back through the same local Relay incarnation confirms this
+    // endpoint. Both selectors must remain Relay (never Direct).
+    let remote_connection_id = 0x7001;
+    remote_peers
+        .mark_relay_transport_ready_with_transport(
+            "node-local",
+            &relay_endpoint,
+            0,
+            Some(remote_connection_id),
+        )
+        .await;
+    remote_peers.register_relay_probe_expectation_for_transport(
+        "node-local",
+        0,
+        1,
+        0x11,
+        &relay_endpoint,
+        remote_connection_id,
+    );
+    assert!(
+        remote_peers
+            .consume_relay_probe_ack_with_transport(
+                "node-local",
+                first_ack_token,
+                &relay_endpoint,
+                Some(remote_connection_id),
+            )
+            .await
+    );
+    assert!(daemon.peers.register_relay_probe_expectation_for_transport(
+        peer_id,
+        0,
+        3,
+        0x33,
+        &relay_endpoint,
+        local_relay_connection_id,
+    ));
+    let local_ack = build_probe(crate::relay_probe::RelayProbeKind::Ack, 0, 3, 0x33);
+    let local_confirmation = timeout(Duration::from_secs(1), async {
+        // Contention is retryable, not rejection: production's forced Probe
+        // loop emits independently encrypted ACKs. Exercise that exact rule
+        // without sleeping until one short transaction wins the map.
+        for _ in 0..32 {
+            if daemon.peers.is_relay_peer_confirmed(peer_id).await {
+                return;
+            }
+            remote_relay
+                .send_data(
+                    "node-local",
+                    &remote_session.encrypt_to_bytes(&local_ack).unwrap(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..64 {
+                if daemon.peers.is_relay_peer_confirmed(peer_id).await {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        loop {
+            if daemon.peers.is_relay_peer_confirmed(peer_id).await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        local_confirmation.is_ok(),
+        "matching Relay ACK did not confirm the local endpoint; events={:?} connection={:?} expectation_present={}",
+        daemon
+            .timeline
+            .snapshot()
+            .events
+            .iter()
+            .map(|event| (
+                event.event.as_str(),
+                event.reason_code.as_deref(),
+                event.detail.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        daemon.peers.get_connection(peer_id).await,
+        daemon.peers.relay_probe_expectation_present(peer_id),
+    );
+    assert!(daemon.peers.is_relay_peer_confirmed(peer_id).await);
+    assert!(remote_peers.is_relay_peer_confirmed("node-local").await);
+    assert!(!daemon.peers.is_direct(peer_id).await);
+    assert!(!remote_peers.is_direct("node-local").await);
+    assert_eq!(
+        daemon
+            .peers
+            .get_connection(peer_id)
+            .await
+            .unwrap()
+            .active_path(),
+        Some(NetworkPath::Relay)
+    );
+    assert_eq!(
+        remote_peers
+            .get_connection("node-local")
+            .await
+            .unwrap()
+            .active_path(),
+        Some(NetworkPath::Relay)
+    );
+
+    // A normal business packet follows the same real Relay reader and reaches
+    // the inbound business queue; control Probe frames never leak there.
+    let business_packet = Ipv4Packet::build_icmp_echo_request(
+        Ipv4Addr::new(10, 20, 0, 2),
+        Ipv4Addr::new(10, 20, 0, 1),
+        9,
+        1,
+        b"relay-business-after-confirmation",
+    );
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&business_packet).unwrap(),
+        )
+        .await
+        .unwrap();
+    let business_ingress = timeout(Duration::from_secs(1), inbound_rx.recv())
+        .await
+        .expect("business Relay frame accumulated in the inbound actor")
+        .expect("business inbound queue closed");
+    assert_eq!(business_ingress.peer_id, peer_id);
+    assert_eq!(business_ingress.packet, business_packet);
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "control Probe leaked to TUN"
+    );
+
+    // Generation retirement revokes the current proof. A subsequently
+    // decrypted old-generation request is drained and answered idempotently,
+    // but cannot recreate RelayPeerConfirmed in the new generation.
+    assert_eq!(
+        daemon
+            .peers
+            .advance_network_generation("relay first-packet stale-event fence")
+            .await,
+        1
+    );
+    let stale_request = build_probe(crate::relay_probe::RelayProbeKind::Request, 0, 4, 0x44);
+    remote_relay
+        .send_data(
+            "node-local",
+            &remote_session.encrypt_to_bytes(&stale_request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let stale_response = timeout(Duration::from_secs(1), remote_relay_rx.recv())
+        .await
+        .expect("old-generation request accumulated in the inbound actor")
+        .expect("remote relay registration closed during stale-event fence");
+    let stale_response = match stale_response {
+        p2pnet_relay::RelayMessage::Data { data, .. } => remote_session
+            .decrypt_from_bytes(&data)
+            .expect("old-generation idempotent ACK did not decrypt"),
+        other => panic!("expected old-generation idempotent ACK, got {other:?}"),
+    };
+    let stale_response = crate::relay_probe::parse_relay_probe_token(&stale_response)
+        .expect("old-generation response was not a Probe ACK");
+    assert_eq!(stale_response.kind, crate::relay_probe::RelayProbeKind::Ack);
+    assert_eq!(stale_response.generation, 0);
+    assert!(
+        !daemon.peers.is_relay_peer_confirmed(peer_id).await,
+        "old-generation request recreated RelayPeerConfirmed"
+    );
+
+    let final_status = timeout(Duration::from_millis(250), fetch_status(diag_address))
+        .await
+        .expect("/status did not recover after connection contention");
+    assert!(final_status.starts_with("HTTP/1.1 200 OK"));
+    let session_status = daemon.transport.session_status(peer_id).await;
+    assert!(session_status.has_active);
+    assert!(!session_status.has_pending_responder);
+
+    remote_relay.close().await.unwrap();
+    local_relay.abort_writer();
+    let _ = timeout(Duration::from_secs(1), relay_reader)
+        .await
+        .expect("Relay reader task leaked")
+        .expect("Relay reader task panicked");
+    timeout(Duration::from_secs(1), inbound_worker)
+        .await
+        .expect("WireGuard inbound actor leaked")
+        .expect("WireGuard inbound actor panicked")
+        .expect("WireGuard inbound actor failed");
+    diag_shutdown_tx.send_replace(true);
+    timeout(Duration::from_secs(1), diagnostics_worker)
+        .await
+        .expect("diagnostics task leaked")
+        .expect("diagnostics task panicked")
+        .expect("diagnostics task failed");
+
+    server.abort();
+    let _ = server.await;
+    relay_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_delivers() {
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+
+    let (transport, outbound_rx, _remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers,
+        true,
+        udp_transport,
+        relay_transport.clone(),
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_millis(200)),
+        },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    let payload = vec![1, 2, 3];
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                "10.20.0.1".parse().unwrap(),
+                "10.20.0.2".parse().unwrap(),
+                0x1234,
+                1,
+                &payload,
+            ),
+        })
+        .await
+        .unwrap();
+
+    // The bounded wait is 200ms; the packet must NOT be delivered to relay
+    // (it is dropped after the wait, not spun on forever).
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut saw_data = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), rx_b.recv()).await {
+            Ok(Some(RelayMessage::Data { .. })) => {
+                saw_data = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue, // keep polling until the deadline
+        }
+    }
+    assert!(
+        !saw_data,
+        "packet must not reach relay when relay never becomes available"
+    );
+
+    // The timeline must carry the stable reason event with the peer detail.
+    let snapshot = timeline.snapshot();
+    let event = snapshot
+        .events
+        .iter()
+        .find(|event| event.event == "relay_unavailable_or_first_packet_expired")
+        .expect("relay_unavailable_or_first_packet_expired must be emitted on wait timeout");
+    assert!(
+        event.reason_code.is_some(),
+        "timeout event must carry a stable reason_code"
+    );
+    assert!(event
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .contains("peer=node-b"));
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_direct_only_degrades_immediately_with_stable_reason() {
+    // No relay configured at all (RelayStartupWait.timeout = None): the first
+    // business packet degrades to direct-only immediately with a stable,
+    // searchable reason code instead of waiting for a relay that will never
+    // start.
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (transport, outbound_rx, _remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers,
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait { timeout: None },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                "10.20.0.1".parse().unwrap(),
+                "10.20.0.2".parse().unwrap(),
+                0x1234,
+                1,
+                b"direct-only",
+            ),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let snapshot = timeline.snapshot();
+    let event = snapshot
+        .events
+        .iter()
+        .find(|event| event.event == "relay_unavailable_or_first_packet_expired")
+        .expect("direct-only degradation must emit relay_unavailable_or_first_packet_expired");
+    assert_eq!(
+        event.reason_code.as_deref(),
+        Some(crate::network_outbound::REASON_DIRECT_ONLY_NO_RELAY)
+    );
+
+    worker.abort();
+    forwarder.abort();
+}
+
+#[tokio::test]
+async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
+    // Peer node-b is not yet usable (no relay confirmation, no Direct): its
+    // first packet parks in the peer's bounded wait.  Peer node-c is
+    // relay-confirmed.  The shared outbound worker must NEVER be blocked by
+    // node-b's wait: node-c's first packet is delivered promptly even though
+    // node-b is still waiting.
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    for (peer_id, vip) in [("node-b", "10.20.0.2"), ("node-c", "10.20.0.3")] {
+        peers
+            .add_peer(&control::PeerInfo {
+                node_id: peer_id.to_string(),
+                device_name: String::new(),
+                app_version: String::new(),
+                public_key: "pk".to_string(),
+                endpoint: String::new(),
+                nat_type: "Unknown".to_string(),
+                virtual_ip: vip.to_string(),
+                online: true,
+                last_seen: 0,
+                relay_rtt_ms: None,
+            })
+            .await;
+    }
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_c, mut rx_c) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-c")
+        .await
+        .unwrap();
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-c",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let (transport, outbound_rx, mut node_c_remote_session) =
+        part03_outbound_transport("node-c").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(2)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    // node-b's first packet parks (bounded wait, not a blocking loop).
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                "10.20.0.1".parse().unwrap(),
+                "10.20.0.2".parse().unwrap(),
+                0x1234,
+                1,
+                b"parking",
+            ),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // node-c's first packet must arrive at the relay even though node-b's wait
+    // is still pending on the SAME worker.
+    let payload = vec![9, 8, 7];
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.3".parse().unwrap(),
+        0x1234,
+        1,
+        &payload,
+    );
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-c".to_string(),
+            dst_ip: "10.20.0.3".to_string(),
+            packet: packet.clone(),
+        })
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(2), rx_c.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let RelayMessage::Data { data, .. } = received {
+        assert_eq!(
+            node_c_remote_session.decrypt_from_bytes(&data).unwrap(),
+            packet,
+            "the confirmed peer's packet must be delivered while the other peer waits"
+        );
+    } else {
+        panic!("Expected Data message, got {:?}", received);
+    }
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() {
+    // Three packets to the same unusable peer share ONE startup deadline:
+    // the whole burst is dropped together near the single timeout, never
+    // N * timeout (no per-packet serial wait).
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (transport, outbound_rx, _remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_millis(200)),
+        },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    let started = std::time::Instant::now();
+    for seq in 0..3u8 {
+        dataplane_tx
+            .send(OutboundPacket {
+                room_authorization: None,
+                trace: None,
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: Ipv4Packet::build_icmp_echo_request(
+                    "10.20.0.1".parse().unwrap(),
+                    "10.20.0.2".parse().unwrap(),
+                    0x1234,
+                    seq as u16,
+                    b"burst",
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Wait for the shared-deadline drop event.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = timeline.snapshot();
+        if let Some(event) = snapshot
+            .events
+            .iter()
+            .find(|event| event.event == "relay_unavailable_or_first_packet_expired")
+        {
+            assert_eq!(
+                event.reason_code.as_deref(),
+                Some(crate::network_outbound::REASON_RELAY_STARTUP_WAIT_EXPIRED)
+            );
+            assert!(
+                event
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("dropped=3"),
+                "all 3 queued packets must be dropped together in ONE deadline, got {:?}",
+                event.detail
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drop event never emitted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "3 packets must share ONE startup deadline (elapsed {elapsed:?}), never 3 * 200ms"
+    );
+
+    worker.abort();
+    forwarder.abort();
+}
+
+#[tokio::test]
+async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_never_appears() {
+    // Relay never becomes available, but it is configured and therefore gets
+    // a bounded relay-first window.  Direct is confirmed quickly, so the
+    // waiting packet must eventually ride Direct after that window — never
+    // remain queued indefinitely and never bypass relay at startup.
+    let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let direct_endpoint = direct_sink.local_addr().unwrap();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: direct_endpoint.to_string(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(Some(udp)));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(4)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    let payload = vec![4, 5, 6];
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x1234,
+        1,
+        &payload,
+    );
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet.clone(),
+        })
+        .await
+        .unwrap();
+    // Give the packet a moment to park, then confirm Direct well inside the
+    // bounded relay-first window.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let generation = peers.current_network_generation().await;
+    assert!(
+        peers
+            .record_direct_success_for_generation("node-b", Some(direct_endpoint), generation)
+            .await
+    );
+
+    // The waiting packet must be flushed over DIRECT after the bounded relay
+    // window, not dropped or held forever.  The direct sink receives the
+    // worker's ENCRYPTED wire bytes.
+    let mut buf = [0u8; 256];
+    let (n, _from) = tokio::time::timeout(Duration::from_secs(4), direct_sink.recv_from(&mut buf))
+        .await
+        .expect("the waiting first packet must reach Direct after the bounded relay window")
+        .unwrap();
+    assert_eq!(
+        remote_session.decrypt_from_bytes(&buf[..n]).unwrap(),
+        packet,
+        "the direct-sent bytes must be the worker's encryption of the parked packet"
+    );
+
+    worker.abort();
+    forwarder.abort();
+}
+
+#[tokio::test]
+async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() {
+    // The first business packet parks with a SHORT startup deadline.  The relay
+    // path is confirmed just before that deadline expires: the confirmation
+    // must win — the queued packet is flushed over the relay, never dropped by
+    // a deadline-expiry that raced the confirmation.
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_millis(150)),
+        },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    let payload = vec![7, 8, 9];
+    let packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x1234,
+        1,
+        &payload,
+    );
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: packet.clone(),
+        })
+        .await
+        .unwrap();
+
+    // Let the packet park (its 150ms deadline is still running), then confirm
+    // the relay path just before the deadline.  The confirmation must flush the
+    // waiting packet over the relay instead of the expiry dropping it.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let mut saw_data = false;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), rx_b.recv()).await {
+            Ok(Some(RelayMessage::Data { data, .. })) => {
+                assert_eq!(
+                    remote_session.decrypt_from_bytes(&data).unwrap(),
+                    packet,
+                    "the parked PLAINTEXT packet must be encrypted and flushed after confirmation"
+                );
+                saw_data = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_data,
+        "the waiting first packet must ride the relay after confirmation"
+    );
+
+    // The confirmation must not be defeated by a racing startup-wait expiry.
+    let snapshot = timeline.snapshot();
+    assert!(
+        !snapshot.events.iter().any(|event| event.event
+            == "relay_unavailable_or_first_packet_expired"
+            && event.reason_code.as_deref() == Some("relay_startup_wait_expired")),
+        "a confirmed relay path must never be dropped by relay_startup_wait_expired"
+    );
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
+    // RelayPeerConfirmed must NEVER be set by a local connect / queue accept:
+    // only a MATCHING forced-relay probe ACK (matching request id + generation
+    // + owner, within TTL) may confirm it.  A stale/foreign ACK no-ops, and a
+    // relay 404 / transport invalidation revokes the confirmation so a later
+    // relay must re-probe.
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let generation = peers.current_network_generation().await;
+    let relay_endpoint = "tcp://relay.test:18081".to_string();
+
+    // A foreign/stale ACK (wrong owner) must not confirm.
+    peers.register_relay_probe_expectation("node-b", generation, 7, 0xaaa, &relay_endpoint);
+    let foreign_ack = crate::relay_probe::RelayProbeToken {
+        kind: crate::relay_probe::RelayProbeKind::Ack,
+        generation,
+        request_id: 7,
+        owner_token: 0xbbb, // wrong owner
+    };
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", foreign_ack, &relay_endpoint)
+            .await
+    );
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+
+    // A matching ACK over the SAME relay confirms.
+    let matching_ack = crate::relay_probe::RelayProbeToken {
+        kind: crate::relay_probe::RelayProbeKind::Ack,
+        generation,
+        request_id: 7,
+        owner_token: 0xaaa,
+    };
+    assert!(
+        peers
+            .consume_relay_probe_ack("node-b", matching_ack, &relay_endpoint)
+            .await
+    );
+    assert!(peers.is_relay_peer_confirmed("node-b").await);
+    // Duplicate ACK is a no-op.
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", matching_ack, &relay_endpoint)
+            .await
+    );
+
+    // A matching TOKEN that arrives over a DIFFERENT relay must NOT confirm:
+    // the ACK is bound to the real ingress relay the probe was sent on.
+    peers.revoke_relay_peer_confirmation("node-b").await;
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+    peers.register_relay_probe_expectation("node-b", generation, 9, 0xddd, &relay_endpoint);
+    let other_relay_ack = crate::relay_probe::RelayProbeToken {
+        kind: crate::relay_probe::RelayProbeKind::Ack,
+        generation,
+        request_id: 9,
+        owner_token: 0xddd,
+    };
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", other_relay_ack, "tcp://relay-other.test:18081")
+            .await
+    );
+    assert!(
+        !peers.is_relay_peer_confirmed("node-b").await,
+        "an ACK over a different relay must never confirm the path"
+    );
+
+    // A matching ACK whose probe generation is no longer current must NOT
+    // confirm (the candidate/NAT mapping advanced since the probe was sent).
+    peers.register_relay_probe_expectation("node-b", generation, 10, 0xeee, &relay_endpoint);
+    let old_gen = peers.current_network_generation().await;
+    peers
+        .advance_network_generation("test generation advance")
+        .await;
+    let stale_gen_ack = crate::relay_probe::RelayProbeToken {
+        kind: crate::relay_probe::RelayProbeKind::Ack,
+        generation: old_gen,
+        request_id: 10,
+        owner_token: 0xeee,
+    };
+    assert!(
+        !peers
+            .consume_relay_probe_ack("node-b", stale_gen_ack, &relay_endpoint)
+            .await
+    );
+    assert!(
+        !peers.is_relay_peer_confirmed("node-b").await,
+        "an ACK from an advanced generation must never confirm the current path"
+    );
+
+    // Re-confirm under the current generation.
+    let generation = peers.current_network_generation().await;
+    peers.register_relay_probe_expectation("node-b", generation, 8, 0xccc, &relay_endpoint);
+    assert!(
+        peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 8,
+                    owner_token: 0xccc,
+                },
+                &relay_endpoint,
+            )
+            .await
+    );
+    assert!(peers.is_relay_peer_confirmed("node-b").await);
+
+    // The FIRST peer_not_found revokes the confirmation IMMEDIATELY (the
+    // relay says the peer is not registered, so the confirmed path is invalid
+    // even inside the recovery grace window): outbound must not keep sending
+    // on a path the relay will 404.
+    peers
+        .record_relay_failure(
+            "node-b",
+            "peer_not_found",
+            "peer node-b not registered on relay",
+        )
+        .await;
+    assert!(
+        !peers.is_relay_peer_confirmed("node-b").await,
+        "the first peer_not_found must revoke RelayPeerConfirmed so the data plane stops sending on a 404 path"
+    );
+
+    // The quarantine path also revokes (already unconfirmed here).
+    peers
+        .quarantine_peer("node-b", "sustained relay peer_not_found")
+        .await;
+    let conn = peers.get_connection("node-b").await.unwrap();
+    assert_eq!(conn.state, ConnectionState::FallbackToRelay);
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+
+    // Even a syntactically matching ACK must be rejected while the peer is
+    // quarantined.  This is the late-ACK boundary for the old registration.
+    peers.register_relay_probe_expectation("node-b", generation, 11, 0x111, &relay_endpoint);
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 11,
+                    owner_token: 0x111,
+                },
+                &relay_endpoint,
+            )
+            .await
+    );
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+
+    // A quarantined peer cannot be re-confirmed by an old registration.  The
+    // control plane must authoritatively reopen the peer first; this models a
+    // new registration/incarnation after the stale relay 404.
+    peers
+        .unquarantine_peer("node-b", "authoritative test re-registration")
+        .await;
+
+    // Re-confirm, then invalidate the whole relay transport: confirmation is
+    // revoked again.
+    peers.register_relay_probe_expectation("node-b", generation, 8, 0xccc, &relay_endpoint);
+    assert!(
+        peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 8,
+                    owner_token: 0xccc,
+                },
+                &relay_endpoint,
+            )
+            .await
+    );
+    assert!(peers.is_relay_peer_confirmed("node-b").await);
+    peers
+        .invalidate_relay_transport(&relay_endpoint, "relay_transport_closed", "transport gone")
+        .await;
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+}
+
+#[tokio::test]
+async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
+    // REGRESSION (the relay-first confirmation deadlock): a parked first
+    // business packet must never hold the peer's emit lock, so the forced
+    // relay probe control lane completes promptly WHILE the packet waits.
+    // In the pre-fix design the parked packet kept the emit lock and the
+    // probe (same lock) could not be encrypted — the confirmation never
+    // happened and the first packet was lost for the whole startup window.
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+
+    let (transport, outbound_rx, _remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport.clone(),
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport.clone(),
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(2)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    // The first business packet parks PLAINTEXT (peer not usable yet).
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                "10.20.0.1".parse().unwrap(),
+                "10.20.0.2".parse().unwrap(),
+                0x1234,
+                1,
+                b"first-business",
+            ),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // While the packet waits, the relay probe control lane must complete
+    // promptly (the parked packet holds NO lock).
+    let probe_payload = crate::relay_probe::build_relay_probe_payload(
+        crate::relay_probe::RelayProbeKind::Request,
+        peers.current_network_generation().await,
+        0x77,
+        0xdeadbeef,
+    );
+    let probe_packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x77,
+        1,
+        &probe_payload,
+    );
+    let started = std::time::Instant::now();
+    let probe_sent = transport
+        .encrypt_and_emit_outbound(
+            OutboundPacket {
+                room_authorization: None,
+                trace: None,
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: probe_packet,
+            },
+            |encrypted| async move {
+                relay_transport
+                    .read()
+                    .await
+                    .clone()
+                    .expect("relay transport")
+                    .send_packet(&encrypted)
+                    .await
+            },
+        )
+        .await
+        .expect("probe encrypt must not fail");
+    assert!(
+        probe_sent,
+        "the relay probe must be emitted while the first business packet waits"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the probe control lane must not be blocked by the parked business packet (took {:?})",
+        started.elapsed()
+    );
+    let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .expect("the probe must reach the peer through the relay")
+        .expect("channel open");
+    assert!(
+        matches!(received, RelayMessage::Data { .. }),
+        "the first frame must be the relay probe"
+    );
+
+    // Now confirm the relay path: the parked business packet must flush.
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+    let received = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .expect("the parked first packet must flush after confirmation")
+        .expect("channel open");
+    assert!(
+        matches!(received, RelayMessage::Data { .. }),
+        "the second frame must be the flushed business packet"
+    );
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_65_packet_burst_confirmation_has_zero_replay_loss() {
+    // 65 business packets park PLAINTEXT for a not-yet-usable peer; the relay
+    // probe (control lane) is emitted and sent FIRST.  After confirmation the
+    // burst flushes with strictly increasing counters.  The receiver decrypts
+    // all 65 packets with ZERO replay rejects.
+    // Pre-fix (e075a1e) this scenario allocated the business counters BEFORE
+    // the probe counter, then sent the probe first: the receiver saw the
+    // probe counter as highest and the LOWEST business counter fell out of the
+    // 64-packet replay window (exactly the out-of-window boundary).
+    run_burst_confirmation_replay_test(65).await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_96_packet_burst_confirmation_has_zero_replay_loss() {
+    run_burst_confirmation_replay_test(96).await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_256_packet_burst_confirmation_has_zero_replay_loss() {
+    // The full network outbound pending queue (256 packets): same invariant.
+    run_burst_confirmation_replay_test(256).await;
+}
+
+/// Shared driver for the burst-confirmation replay test: park `count` raw
+/// business packets while the peer is not usable, ride a relay probe on the
+/// control lane first, confirm the relay path, flush, and verify on the
+/// receiver side that EVERY packet decrypts (zero replay/duplicate/loss) in
+/// strict FIFO order with strictly increasing WireGuard counters on the wire.
+async fn run_burst_confirmation_replay_test(count: usize) {
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+
+    let (transport, outbound_rx, mut remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport.clone(),
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport.clone(),
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(5)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    // Park the whole burst PLAINTEXT (peer not usable: no counters allocated,
+    // no emit lock held).
+    for seq in 0..count as u16 {
+        dataplane_tx
+            .send(OutboundPacket {
+                room_authorization: None,
+                trace: None,
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: Ipv4Packet::build_icmp_echo_request(
+                    "10.20.0.1".parse().unwrap(),
+                    "10.20.0.2".parse().unwrap(),
+                    0x4321,
+                    seq,
+                    &[seq as u8; 8],
+                ),
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // The relay probe rides the control lane BEFORE the confirmation: it is
+    // encrypted with the LOWEST counter and sent first (wire order == counter
+    // order), never jumping ahead of allocated-but-unsent business counters.
+    let probe_payload = crate::relay_probe::build_relay_probe_payload(
+        crate::relay_probe::RelayProbeKind::Request,
+        peers.current_network_generation().await,
+        0x88,
+        0xfeedface,
+    );
+    let probe_packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x88,
+        1,
+        &probe_payload,
+    );
+    let probe_sent = transport
+        .encrypt_and_emit_outbound(
+            OutboundPacket {
+                room_authorization: None,
+                trace: None,
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: probe_packet.clone(),
+            },
+            |encrypted| async move {
+                relay_transport
+                    .read()
+                    .await
+                    .clone()
+                    .expect("relay transport")
+                    .send_packet(&encrypted)
+                    .await
+            },
+        )
+        .await
+        .expect("probe encrypt must not fail");
+    assert!(
+        probe_sent,
+        "the relay probe must be emitted while the burst waits"
+    );
+
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    // Collect count + 1 frames (the probe + the burst) in ARRIVAL order.
+    let mut counters = Vec::with_capacity(count + 1);
+    let mut decoded = Vec::with_capacity(count + 1);
+    for _ in 0..=count {
+        let received = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("every frame must arrive within the timeout")
+            .expect("channel open");
+        let RelayMessage::Data { data, .. } = received else {
+            panic!("unexpected relay frame");
+        };
+        let counter = p2pnet_wireguard::MessageTransport::from_bytes(&data)
+            .expect("frame must parse as a WireGuard transport message")
+            .counter;
+        counters.push(counter);
+        let decrypted = remote_session
+            .decrypt_from_bytes(&data)
+            .expect("every frame must decrypt with ZERO replay rejects, zero duplicates");
+        decoded.push(decrypted);
+    }
+
+    // Wire order == counter order: strictly increasing, starting at the
+    // probe's counter.
+    for window in counters.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "wire order must be strictly increasing (counter order), got {counters:?}"
+        );
+    }
+
+    // The probe is the first frame and decrypts to the probe ICMP packet.
+    assert_eq!(decoded[0], probe_packet, "the probe must arrive first");
+
+    // All `count` business packets decrypt in strict FIFO order.
+    let mut seen_sequences = Vec::with_capacity(count);
+    for frame in &decoded[1..] {
+        let ip = Ipv4Packet::new(frame).expect("decrypted frame must be an IP packet");
+        let icmp = ip.payload();
+        let sequence = u16::from_be_bytes([icmp[6], icmp[7]]);
+        seen_sequences.push(sequence);
+    }
+    assert_eq!(
+        seen_sequences,
+        (0..count as u16).collect::<Vec<_>>(),
+        "the whole burst must decrypt in strict FIFO order with zero loss"
+    );
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_counters() {
+    // Direct-validation style control packets interleave with business bursts
+    // on a CONFIRMED peer: each control packet holds the SAME emit lock, so
+    // the wire stream stays strictly monotonic end to end — no control packet
+    // can ever overtake an unsent business counter into the replay window.
+    let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
+    let relay_endpoint = server.addr.to_string();
+
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    assert!(
+        peers
+            .confirm_relay_peer(
+                "node-b",
+                &relay_endpoint,
+                peers.current_network_generation().await
+            )
+            .await
+    );
+
+    let (relay_a, _rx_a) = RelayTransport::connect(&relay_endpoint, "node-a", peers.clone())
+        .await
+        .unwrap();
+    let (_relay_b, mut rx_b) = p2pnet_relay::RelayClient::connect(&relay_endpoint, "node-b")
+        .await
+        .unwrap();
+
+    let (transport, outbound_rx, _remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(Some(relay_a)));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport.clone(),
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport.clone(),
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(2)),
+        },
+        relay_probe_kick_tx,
+        ConnectionTimeline::new("node-a", 0),
+    ));
+
+    let send_control = |payload: Vec<u8>| {
+        let transport = transport.clone();
+        let relay_transport = relay_transport.clone();
+        async move {
+            transport
+                .encrypt_and_emit_outbound(
+                    OutboundPacket {
+                        room_authorization: None,
+                        trace: None,
+                        peer_id: "node-b".to_string(),
+                        dst_ip: "10.20.0.2".to_string(),
+                        packet: Ipv4Packet::build_icmp_echo_request(
+                            "10.20.0.1".parse().unwrap(),
+                            "10.20.0.2".parse().unwrap(),
+                            0x99,
+                            1,
+                            &payload,
+                        ),
+                    },
+                    |encrypted| async move {
+                        relay_transport
+                            .read()
+                            .await
+                            .clone()
+                            .expect("relay transport")
+                            .send_packet(&encrypted)
+                            .await
+                    },
+                )
+                .await
+        }
+    };
+
+    // Burst 1 (20 packets) rides the relay.
+    for seq in 0..20u16 {
+        dataplane_tx
+            .send(OutboundPacket {
+                room_authorization: None,
+                trace: None,
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: Ipv4Packet::build_icmp_echo_request(
+                    "10.20.0.1".parse().unwrap(),
+                    "10.20.0.2".parse().unwrap(),
+                    0x5555,
+                    seq,
+                    b"burst-one",
+                ),
+            })
+            .await
+            .unwrap();
+    }
+    // A direct-validation style control packet interleaves.
+    assert!(send_control(b"p2wlan-direct-validation".to_vec())
+        .await
+        .unwrap());
+    // Burst 2 (20 packets).
+    for seq in 0..20u16 {
+        dataplane_tx
+            .send(OutboundPacket {
+                room_authorization: None,
+                trace: None,
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: Ipv4Packet::build_icmp_echo_request(
+                    "10.20.0.1".parse().unwrap(),
+                    "10.20.0.2".parse().unwrap(),
+                    0x5555,
+                    seq,
+                    b"burst-two",
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut counters = Vec::new();
+    for _ in 0..41 {
+        let received = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("frame must arrive")
+            .expect("channel open");
+        let RelayMessage::Data { data, .. } = received else {
+            panic!("unexpected relay frame");
+        };
+        counters.push(
+            p2pnet_wireguard::MessageTransport::from_bytes(&data)
+                .expect("must parse")
+                .counter,
+        );
+    }
+    for window in counters.windows(2) {
+        assert!(
+            window[1] > window[0],
+            "control packets interleaved with business bursts must keep wire order == counter order, got {counters:?}"
+        );
+    }
+
+    worker.abort();
+    forwarder.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly() {
+    // Feeding more than the per-peer bound while the peer is unusable must
+    // drop the OLDEST packets FIRST and count BOTH the dropped packet count
+    // AND the dropped bytes structurally (outbound_queue_full in
+    // /status.stats.outbound_drops + the timeline event) — the loss is never
+    // silently ignored.
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (transport, outbound_rx, _remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(16);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (_relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(30)),
+        },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    // Keep the overflow count below the independently bounded diagnostic
+    // event ledger. The structural counter remains authoritative; this load
+    // still crosses the exact 512-packet queue cap by 44 entries and lets the
+    // test compare every retained per-drop event byte-for-byte.
+    let total = 556usize;
+    let packet_len = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        0x2468,
+        0,
+        &[0x5a; 40],
+    )
+    .len();
+    for seq in 0..total as u16 {
+        dataplane_tx
+            .send(OutboundPacket {
+                room_authorization: None,
+                trace: None,
+                peer_id: "node-b".to_string(),
+                dst_ip: "10.20.0.2".to_string(),
+                packet: Ipv4Packet::build_icmp_echo_request(
+                    "10.20.0.1".parse().unwrap(),
+                    "10.20.0.2".parse().unwrap(),
+                    0x2468,
+                    seq,
+                    &[0x5a; 40],
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Wait for the worker to drain the input and the overflow counters to
+    // reach their FINAL value (the first overflow drop lands while later
+    // packets are still in flight).
+    let expected_dropped = (total - 512) as u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (dropped, bytes) = loop {
+        let stats = peers.outbound_loss_stats().await;
+        if let Some(entry) = stats
+            .drops
+            .get(crate::network_outbound::REASON_OUTBOUND_QUEUE_FULL)
+        {
+            if entry.packets == expected_dropped {
+                break (entry.packets, entry.bytes);
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "overflow counters never reached {expected_dropped}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(
+        dropped, expected_dropped,
+        "exactly the packets beyond the 512-per-peer bound must be counted"
+    );
+    assert_eq!(
+        bytes,
+        expected_dropped * packet_len as u64,
+        "the dropped bytes must be the sum of the dropped packets' stored lengths"
+    );
+    let loss_events = peers.outbound_loss_stats().await.events;
+    let event_packets: u64 = loss_events
+        .iter()
+        .filter(|event| {
+            event.kind == "drop"
+                && event.reason_code == crate::network_outbound::REASON_OUTBOUND_QUEUE_FULL
+                && event.peer_id == "node-b"
+        })
+        .map(|event| event.packets)
+        .sum();
+    let event_bytes: u64 = loss_events
+        .iter()
+        .filter(|event| {
+            event.kind == "drop"
+                && event.reason_code == crate::network_outbound::REASON_OUTBOUND_QUEUE_FULL
+                && event.peer_id == "node-b"
+        })
+        .map(|event| event.bytes)
+        .sum();
+    assert_eq!(
+        event_packets, dropped,
+        "loss event ledger must retain packet totals"
+    );
+    assert_eq!(
+        event_bytes, bytes,
+        "loss event ledger must retain byte totals"
+    );
+
+    // The timeline carries the same total: one event per overflow occurrence,
+    // each with the exact per-occurrence counts; the SUM must equal the
+    // structural counter.
+    let snapshot = timeline.snapshot();
+    let overflow_events: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter(|event| event.event == "outbound_packet_dropped")
+        .collect();
+    assert!(
+        !overflow_events.is_empty(),
+        "outbound_packet_dropped must be emitted for the overflow"
+    );
+    let mut timeline_total = 0u64;
+    for event in overflow_events {
+        assert_eq!(
+            event.reason_code.as_deref(),
+            Some(crate::network_outbound::REASON_OUTBOUND_QUEUE_FULL)
+        );
+        let detail = event.detail.as_deref().unwrap_or_default();
+        let dropped = detail
+            .split_once("dropped=")
+            .and_then(|(_, rest)| rest.split(' ').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("each overflow event must carry its dropped count");
+        timeline_total = timeline_total.saturating_add(dropped);
+    }
+    assert_eq!(
+        timeline_total, expected_dropped,
+        "the timeline overflow events must sum to the same total as /status.stats.outbound_drops"
+    );
+
+    worker.abort();
+    forwarder.abort();
+}
+
+#[tokio::test]
+async fn test_network_outbound_worker_shutdown_counts_parked_packets() {
+    // Closing the worker's watch/ingress lifecycle while a peer is still
+    // waiting for relay/direct confirmation must terminally account the
+    // plaintext queue.  This protects the shutdown path from becoming a
+    // silent loss that bypasses /status and the timeline.
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (transport, outbound_rx, _remote_session) = part03_outbound_transport("node-b").await;
+    let (dataplane_tx, dataplane_rx) = mpsc::channel(4);
+    let forwarder = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.run_outbound(dataplane_rx).await }
+    });
+    let udp_transport = Arc::new(RwLock::new(None));
+    let relay_transport = Arc::new(RwLock::new(None));
+    let (relay_available_tx, relay_available_rx) = tokio::sync::watch::channel(false);
+    let (relay_probe_kick_tx, _relay_probe_kick_rx) = tokio::sync::watch::channel(0u64);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let worker = tokio::spawn(run_network_outbound(
+        outbound_rx,
+        transport,
+        peers.clone(),
+        true,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        RelayStartupWait {
+            timeout: Some(Duration::from_secs(30)),
+        },
+        relay_probe_kick_tx,
+        timeline.clone(),
+    ));
+
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: Ipv4Packet::build_icmp_echo_request(
+                "10.20.0.1".parse().unwrap(),
+                "10.20.0.2".parse().unwrap(),
+                0x1357,
+                1,
+                b"shutdown-loss",
+            ),
+        })
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !timeline
+        .snapshot()
+        .events
+        .iter()
+        .any(|event| event.event == "outbound_first_packet_wait_started")
+    {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(dataplane_tx);
+    drop(relay_available_tx);
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("outbound worker must stop after its watch closes")
+        .expect("outbound worker task must not panic");
+    forwarder.abort();
+
+    let stats = peers.outbound_loss_stats().await;
+    let dropped = stats
+        .drops
+        .get(crate::network_outbound::REASON_OUTBOUND_WORKER_STOPPED)
+        .expect("worker shutdown must be counted");
+    assert_eq!(dropped.packets, 1);
+    assert!(dropped.bytes > 0);
+    assert!(stats.events.iter().any(|event| {
+        event.peer_id == "node-b"
+            && event.reason_code == crate::network_outbound::REASON_OUTBOUND_WORKER_STOPPED
+            && event.packets == 1
+            && event.bytes == dropped.bytes
+    }));
+    assert!(timeline.snapshot().events.iter().any(|event| {
+        event.event == "outbound_worker_stopped"
+            && event.reason_code.as_deref()
+                == Some(crate::network_outbound::REASON_OUTBOUND_WORKER_STOPPED)
+    }));
+}
+
+#[tokio::test]
+async fn test_relay_probe_old_relay_ack_never_confirms_new_relay_and_duplicate_acks_noop() {
+    // A late ACK from the OLD relay must never confirm the NEW relay, and a
+    // duplicate ACK must no-op after the expectation was consumed.
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let generation = peers.current_network_generation().await;
+
+    // Probe sent over relay A; the expectation binds to relay A.
+    peers.register_relay_probe_expectation("node-b", generation, 3, 0xaaa, "relay-a");
+    // An ACK arriving over relay B (mismatched ingress) must NOT confirm.
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 3,
+                    owner_token: 0xaaa,
+                },
+                "relay-b",
+            )
+            .await
+    );
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+    // The matching ACK over relay A confirms.
+    assert!(
+        peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 3,
+                    owner_token: 0xaaa,
+                },
+                "relay-a",
+            )
+            .await
+    );
+    assert!(peers.is_relay_peer_confirmed("node-b").await);
+    // A duplicate ACK no-ops (the expectation was consumed).
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation,
+                    request_id: 3,
+                    owner_token: 0xaaa,
+                },
+                "relay-a",
+            )
+            .await
+    );
+    assert!(peers.is_relay_peer_confirmed("node-b").await);
+
+    // The confirmation is bound to relay A: an invalidation of relay B must
+    // NOT revoke it, while an invalidation of relay A must.
+    peers
+        .invalidate_relay_transport("relay-b", "relay_transport_closed", "transport gone")
+        .await;
+    assert!(
+        peers.is_relay_peer_confirmed("node-b").await,
+        "a confirmation earned on relay A must survive relay B's failure"
+    );
+    peers
+        .invalidate_relay_transport("relay-a", "relay_transport_closed", "transport gone")
+        .await;
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+}
+
+#[tokio::test]
+async fn test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack() {
+    // A make-before-break renewal may reuse the exact endpoint and network
+    // generation.  The probe token is intentionally also stable across the
+    // resend.  Only the local relay transport incarnation distinguishes the
+    // old reader from the replacement.
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let generation = peers.current_network_generation().await;
+    let endpoint = "tcp://relay.test:18081";
+    let token = crate::relay_probe::RelayProbeToken {
+        kind: crate::relay_probe::RelayProbeKind::Ack,
+        generation,
+        request_id: 17,
+        owner_token: 0xfeed,
+    };
+
+    // The replacement overwrites the old expectation with the same token but
+    // a new local connection incarnation.
+    peers
+        .mark_relay_transport_ready_with_transport("node-b", endpoint, generation, Some(1))
+        .await;
+    peers.register_relay_probe_expectation_for_transport(
+        "node-b",
+        generation,
+        token.request_id,
+        token.owner_token,
+        endpoint,
+        1,
+    );
+    peers
+        .mark_relay_transport_ready_with_transport("node-b", endpoint, generation, Some(2))
+        .await;
+    peers.register_relay_probe_expectation_for_transport(
+        "node-b",
+        generation,
+        token.request_id,
+        token.owner_token,
+        endpoint,
+        2,
+    );
+
+    assert!(
+        !peers
+            .consume_relay_probe_ack_with_transport("node-b", token, endpoint, Some(1))
+            .await,
+        "a same-token ACK from the superseded relay reader must be rejected"
+    );
+    assert!(!peers.is_relay_peer_confirmed("node-b").await);
+
+    // The old ACK is terminally consumed as stale; the replacement must send
+    // a fresh expectation before a current-transport ACK can confirm.
+    peers.register_relay_probe_expectation_for_transport(
+        "node-b",
+        generation,
+        token.request_id,
+        token.owner_token,
+        endpoint,
+        2,
+    );
+    assert!(
+        peers
+            .consume_relay_probe_ack_with_transport("node-b", token, endpoint, Some(2))
+            .await
+    );
+    let connection = peers.get_connection("node-b").await.unwrap();
+    assert_eq!(
+        connection.relay_confirmed_connection_id,
+        Some(2),
+        "confirmation must record the replacement transport incarnation"
+    );
+}
+
+#[tokio::test]
+async fn test_relay_probe_stale_generation_ack_never_confirms() {
+    // An ACK whose probe generation is not the CURRENT local network
+    // generation is not evidence for the current path (Air restart /
+    // generation change): it must be rejected with generation_changed and the
+    // peer must stay unconfirmed.
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: "pk".to_string(),
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    let old_generation = peers.current_network_generation().await;
+    // Advance the local network generation (a restart/churn equivalent).
+    let new_generation = peers.advance_network_generation("test").await;
+    assert_ne!(
+        new_generation, old_generation,
+        "the test needs a real generation advance"
+    );
+
+    peers.register_relay_probe_expectation("node-b", old_generation, 9, 0xbbb, "relay-a");
+    assert!(
+        !peers
+            .consume_relay_probe_ack(
+                "node-b",
+                crate::relay_probe::RelayProbeToken {
+                    kind: crate::relay_probe::RelayProbeKind::Ack,
+                    generation: old_generation,
+                    request_id: 9,
+                    owner_token: 0xbbb,
+                },
+                "relay-a",
+            )
+            .await
+    );
+    assert!(
+        !peers.is_relay_peer_confirmed("node-b").await,
+        "a stale-generation ACK must never confirm the current path"
+    );
+}
