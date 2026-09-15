@@ -1,0 +1,83 @@
+name: Bug report
+description: Report a reproducible P2WLAN defect with build identity and topology context
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请只提交复现问题所需的信息。删除 token、密钥、真实公网地址、用户名和其他敏感信息；不要上传未经脱敏的完整日志。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题
+      description: 实际发生了什么，期望行为是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现步骤
+      description: 从干净启动或明确初始状态开始，给出最短可重复步骤。
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: identity
+    attributes:
+      label: 构建身份
+      description: 提供客户端/daemon/server 的版本、commit 或发布包身份。daemon 可优先提供 --build-info 的脱敏结果。
+      placeholder: "version / git commit / release artifact"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - Windows
+        - Linux
+        - Android
+        - macOS / iOS
+        - Server / Docker
+        - Multiple platforms
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: topology
+    attributes:
+      label: 网络与路径拓扑
+      description: 描述两端平台、是否同 LAN、NAT 类型（若已知）、Direct/Relay 状态、房间数量。不要填写真实公网 IP。
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断证据
+      description: 提供最小必要的 status/reason code/错误片段和时间顺序。请先脱敏。
+      render: text
+
+  - type: textarea
+    id: regression
+    attributes:
+      label: 回归信息
+      description: 如果以前正常，请给出最后正常版本和第一个异常版本；不知道可写 unknown。
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已确认内容不包含 token、私钥、密码或其他凭据
+          required: true
+        - label: 我已提供实际运行版本/commit，而不是仅写“最新版”
+          required: true
