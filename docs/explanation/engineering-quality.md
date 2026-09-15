@@ -65,7 +65,11 @@ Rust crate 用于隔离可复用协议/平台能力，daemon 内部子模块用�
 - `client/daemon/src/transport.rs`：拆出 session registry / responder lifecycle、validation framing、inbound decrypt/evidence、outbound encryption/order gate；
 - `client/daemon/src/dplpmtud.rs`：拆出 wire format、path identity、budget publication、runtime state machine，并把大体量测试迁到独立测试模块；
 - `client/daemon/src/network_outbound.rs`：拆出 per-peer queue actor、Direct sender、Relay sender、fast-path cache 与 accounting；
-- `client/daemon/src/relay_runtime.rs`：拆出 connection lifecycle、peer stream/session、backpressure 与 reconnect policy。
+- `client/daemon/src/relay_runtime.rs`：拆出 connection lifecycle、peer stream/session、backpressure 与 reconnect policy；
+- `client/daemon/src/udp/core.rs`：把 `UdpTransport` 的 publication/socket ownership 与 Direct validation、DPLPMTUD、probe budgeting、NAT maintainer 等能力拆成明确 owned components，避免继续扩大单一状态聚合体；
+- `client/daemon/src/udp/dynamic_punch.rs`：按 provisional socket lifecycle、fresh-mapping measurement、adaptive prediction、Hard↔Hard wave orchestration 和 diagnostics 拆分，保留 network-generation 与 cancellation fencing。
+
+接近预算但尚未越线的状态机模块也应保持只降不升的趋势；例如 `peer/path_state_machine.rs` 不应再承担与路径状态转移无关的新职责。
 
 拆分必须保持原有类型语义和测试，不以“先移动再修”为理由同时改变协议行为。每次拆分后应降低对应 ratchet ceiling，直到该条目可以从 legacy 列表删除。
 
