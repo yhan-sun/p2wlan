@@ -24,3 +24,6 @@ include!("tests/part17.rs");
 include!("tests/part18.rs");
 include!("tests/part19.rs");
 include!("tests/room_connectivity.rs");
+
+#[path = "tests/history_contention.rs"]
+mod history_contention;

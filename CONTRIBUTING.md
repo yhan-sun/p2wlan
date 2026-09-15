@@ -8,12 +8,13 @@
 
 连接、并发和数据面修改必须先确定状态所有者，再修改代码。跨异步边界缓存状态时使用 generation、revision、incarnation、session identity 或 owner token 等 fencing identity，在真正产生副作用前再次验证。新增队列、锁、缓存、重试和后台任务必须有容量、deadline、取消条件和可观测失败原因。
 
-不要为了缩短文件机械抽象。有效拆分应隔离状态所有权、副作用、协议编码或可独立测试的决策逻辑。现有历史热点采用复杂度棘轮，只允许缩小，不允许继续扩大。
+不要为了缩短文件机械抽象。有效拆分应隔离状态所有权、副作用、协议编码或可独立测试的决策逻辑。现有历史热点采用源码体积棘轮，只允许缩小，不允许继续扩大。
 
 ## 本地检查
 
     python3 scripts/docs/verify_repository.py
     python3 scripts/quality/check_code_health.py
+    python3 scripts/quality/test_code_health.py
     bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
     cargo fmt --all --check
     cargo test --workspace --all-targets -- --test-threads=1

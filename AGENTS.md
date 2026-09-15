@@ -28,7 +28,7 @@
 - 生产路径不得用 panic 处理可由网络、用户输入、远端状态、磁盘或正常生命周期竞争触发的失败。
 - 不允许通过字符串日志驱动控制流；预期失败使用类型化错误或稳定 reason code。
 - 不为了“拆文件”制造 facade、循环依赖或共享内部锁。拆分必须隔离状态所有权、副作用、协议编码或可独立测试的决策逻辑。
-- `scripts/quality/check_code_health.py` 是复杂度棘轮。历史热点只能缩小；新增生产模块必须保持在统一预算内。
+- `scripts/quality/check_code_health.py` 是源码体积棘轮。历史热点只能缩小；新增生产模块必须保持在统一预算内。
 
 ## AI 交付要求
 
@@ -36,6 +36,7 @@
 
     python3 scripts/docs/verify_repository.py
     python3 scripts/quality/check_code_health.py
+    python3 scripts/quality/test_code_health.py
     bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
 
 再按改动范围运行 Rust、Go、Flutter 或脚本测试，并在交付时说明未运行的项目。提交信息必须使用 feat:中文 格式，feat: 后不加空格。

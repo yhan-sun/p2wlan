@@ -36,6 +36,12 @@ use crate::transport::{
     EncryptedPeerPacket, ReceivedEncryptedPacket, ResponderSessionConfirmation, WireGuardTransport,
 };
 
+mod mapping_generation;
+mod mtu;
+mod punch_send;
+mod socket_lifecycle;
+mod validation;
+
 mod probe_budget;
 use probe_budget::{
     default_global_outbound_probe_budget, default_global_relay_backoff_heartbeat_budget,
