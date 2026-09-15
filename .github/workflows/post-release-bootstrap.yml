@@ -1,0 +1,166 @@
+name: Post-release hardening bootstrap
+
+on:
+  push:
+    branches: [codex/post-release-hardening-20260915]
+    paths:
+      - '.github/workflows/post-release-bootstrap.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: codex/post-release-hardening-20260915
+          fetch-depth: 0
+
+      - name: Install official Gradle 9.1.0 wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          android=apps/flutter_client/android
+          wrapper="$android/gradle/wrapper"
+          mkdir -p "$wrapper"
+          curl -fsSL https://raw.githubusercontent.com/gradle/gradle/v9.1.0/gradlew -o "$android/gradlew"
+          curl -fsSL https://raw.githubusercontent.com/gradle/gradle/v9.1.0/gradlew.bat -o "$android/gradlew.bat"
+          curl -fsSL https://raw.githubusercontent.com/gradle/gradle/v9.1.0/gradle/wrapper/gradle-wrapper.jar -o "$wrapper/gradle-wrapper.jar"
+          test "$(git hash-object "$android/gradlew")" = 61b77d7f371ff8d139d0a518d103a6492dc59696
+          test "$(git hash-object "$android/gradlew.bat")" = bd8a8c0556a94aa0c97aa4ddd44bd20756205bb1
+          printf '%s  %s\n' 76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3 "$wrapper/gradle-wrapper.jar" | sha256sum -c -
+          chmod +x "$android/gradlew"
+          python3 - <<'PY'
+          from pathlib import Path
+          ignore = Path('apps/flutter_client/android/.gitignore')
+          lines = ignore.read_text(encoding='utf-8').splitlines()
+          forbidden = {'gradle-wrapper.jar', '/gradlew', '/gradlew.bat'}
+          ignore.write_text('\n'.join(line for line in lines if line not in forbidden) + '\n', encoding='utf-8')
+          props = Path('apps/flutter_client/android/gradle/wrapper/gradle-wrapper.properties')
+          text = props.read_text(encoding='utf-8')
+          checksum = 'distributionSha256Sum=b84e04fa845fecba48551f425957641074fcc00a88a84d2aae5808743b35fc85\n'
+          if 'distributionSha256Sum=' in text:
+              import re
+              text = re.sub(r'(?m)^distributionSha256Sum=.*$', checksum.rstrip(), text)
+          else:
+              text += checksum
+          props.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Bind every release producer to final artifact metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/release.yml')
+          text = path.read_text(encoding='utf-8')
+          matrix_arch = '$' + '{{ matrix.arch }}'
+
+          def replace_one(value: str, old: str, new: str, label: str) -> str:
+              count = value.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              return value.replace(old, new, 1)
+
+          def mutate_job(value: str, start: str, end: str, fn):
+              begin = value.index(start)
+              finish = value.index(end, begin)
+              section = fn(value[begin:finish])
+              return value[:begin] + section + value[finish:]
+
+          def metadata_step(label: str, artifact: str, platform: str, arch: str, identity: str) -> str:
+              return f'''      - name: Bind {label} artifact identity\n        shell: bash\n        run: >\n          python3 scripts/release/write_artifact_metadata.py\n          --artifact {artifact}\n          --source-sha "$GITHUB_SHA"\n          --tag "$GITHUB_REF_NAME"\n          --platform {platform}\n          --arch {arch}\n          --identity {identity}\n\n'''
+
+          def android(section: str) -> str:
+              step = metadata_step('Android', 'dist-release/p2wlan-android-arm64-release.apk', 'android', 'arm64', 'client-stamped')
+              section = replace_one(section, '      - name: Upload artifact\n', step + '      - name: Upload artifact\n', 'android metadata step')
+              return replace_one(section, '          path: dist-release/p2wlan-android-arm64-release.apk\n', '          path: |\n            dist-release/p2wlan-android-arm64-release.apk\n            dist-release/p2wlan-android-arm64-release.apk.metadata.json\n', 'android upload')
+
+          def ios(section: str) -> str:
+              section = replace_one(section, '          flutter build ios\n', '          bash ../../scripts/release/build_flutter_client.sh ios\n', 'ios stamped build')
+              step = metadata_step('iOS', 'dist-release/p2wlan-ios-arm64-unsigned.ipa', 'ios', 'arm64', 'client-stamped')
+              section = replace_one(section, '      - name: Upload artifact\n', step + '      - name: Upload artifact\n', 'ios metadata step')
+              return replace_one(section, '          path: dist-release/p2wlan-ios-arm64-unsigned.ipa\n', '          path: |\n            dist-release/p2wlan-ios-arm64-unsigned.ipa\n            dist-release/p2wlan-ios-arm64-unsigned.ipa.metadata.json\n', 'ios upload')
+
+          def macos(section: str) -> str:
+              section = replace_one(section, '          flutter build macos\n', '          bash ../../scripts/release/build_flutter_client.sh macos\n', 'macos stamped build')
+              artifact = f'dist-release/p2wlan-macos-{matrix_arch}.dmg'
+              step = metadata_step('macOS', artifact, 'macos', matrix_arch, 'client-stamped-daemon-verified')
+              section = replace_one(section, '      - name: Upload artifact\n', step + '      - name: Upload artifact\n', 'macos metadata step')
+              old = f'          path: dist-release/p2wlan-macos-{matrix_arch}.dmg\n'
+              new = f'          path: |\n            dist-release/p2wlan-macos-{matrix_arch}.dmg\n            dist-release/p2wlan-macos-{matrix_arch}.dmg.metadata.json\n'
+              return replace_one(section, old, new, 'macos upload')
+
+          def linux(section: str) -> str:
+              section = replace_one(section, '          flutter build linux\n', '          bash ../../scripts/release/build_flutter_client.sh linux\n', 'linux stamped build')
+              artifact = f'dist-release/p2wlan-linux-{matrix_arch}.tar.gz'
+              step = metadata_step('Linux', artifact, 'linux', matrix_arch, 'client-stamped-daemon-verified')
+              section = replace_one(section, '      - name: Upload artifact\n', step + '      - name: Upload artifact\n', 'linux metadata step')
+              old = f'          path: dist-release/p2wlan-linux-{matrix_arch}.tar.gz\n'
+              new = f'          path: |\n            dist-release/p2wlan-linux-{matrix_arch}.tar.gz\n            dist-release/p2wlan-linux-{matrix_arch}.tar.gz.metadata.json\n'
+              return replace_one(section, old, new, 'linux upload')
+
+          def windows(section: str) -> str:
+              artifact = f'dist-release/p2wlan-windows-{matrix_arch}-setup.exe'
+              step = metadata_step('Windows', artifact, 'windows', matrix_arch, 'client-stamped-daemon-verified')
+              section = replace_one(section, '      - name: Upload artifact\n', step + '      - name: Upload artifact\n', 'windows metadata step')
+              old = f'          path: dist-release/p2wlan-windows-{matrix_arch}-setup.exe\n'
+              new = f'          path: |\n            dist-release/p2wlan-windows-{matrix_arch}-setup.exe\n            dist-release/p2wlan-windows-{matrix_arch}-setup.exe.metadata.json\n'
+              return replace_one(section, old, new, 'windows upload')
+
+          def cli(section: str) -> str:
+              artifact = f'dist-release/p2wlan-linux-{matrix_arch}-cli.tar.gz'
+              step = metadata_step('Linux CLI', artifact, 'linux-cli', matrix_arch, 'rust-source-bound')
+              section = replace_one(section, '      - name: Upload artifact\n', step + '      - name: Upload artifact\n', 'cli metadata step')
+              marker = f'            dist-release/p2wlan-linux-{matrix_arch}-cli.tar.gz.sha256\n'
+              return replace_one(section, marker, marker + f'            dist-release/p2wlan-linux-{matrix_arch}-cli.tar.gz.metadata.json\n', 'cli upload')
+
+          text = mutate_job(text, '  flutter-android:\n', '  flutter-ios:\n', android)
+          text = mutate_job(text, '  flutter-ios:\n', '  flutter-macos:\n', ios)
+          text = mutate_job(text, '  flutter-macos:\n', '  flutter-linux:\n', macos)
+          text = mutate_job(text, '  flutter-linux:\n', '  flutter-windows:\n', linux)
+          text = mutate_job(text, '  flutter-windows:\n', '  linux-cli:\n', windows)
+          text = mutate_job(text, '  linux-cli:\n', '  publish:\n', cli)
+
+          wildcard = '          gh release upload "$P2WLAN_RELEASE_TAG" release-assets/* \\\n'
+          explicit = '''          public_assets=(\n            release-assets/p2wlan-android-arm64-release.apk\n            release-assets/p2wlan-ios-arm64-unsigned.ipa\n            release-assets/p2wlan-linux-arm64-cli.tar.gz\n            release-assets/p2wlan-linux-arm64-cli.tar.gz.sha256\n            release-assets/p2wlan-linux-x64-cli.tar.gz\n            release-assets/p2wlan-linux-x64-cli.tar.gz.sha256\n            release-assets/p2wlan-linux-x64.tar.gz\n            release-assets/p2wlan-macos-arm64.dmg\n            release-assets/p2wlan-macos-x64.dmg\n            release-assets/p2wlan-windows-x64-setup.exe\n            release-assets/RELEASE-MANIFEST.json\n          )\n          for asset in "${public_assets[@]}"; do\n            test -f "$asset" || { echo "missing public release asset: $asset" >&2; exit 1; }\n          done\n          gh release upload "$P2WLAN_RELEASE_TAG" "${public_assets[@]}" \\\n'''
+          text = replace_one(text, wildcard, explicit, 'public release assets')
+          path.write_text(text, encoding='utf-8')
+
+          ci = Path('.github/workflows/ci.yml')
+          ci_text = ci.read_text(encoding='utf-8')
+          old = '          python3 -m py_compile scripts/docs/verify_repository.py scripts/release/verify_release_set.py\n'
+          new = '''          python3 -m py_compile scripts/docs/verify_repository.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py\n          python3 scripts/release/test_release_set.py\n          test -x apps/flutter_client/android/gradlew\n          printf '%s  %s\\n' 76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3 apps/flutter_client/android/gradle/wrapper/gradle-wrapper.jar | sha256sum -c -\n          grep -q '^distributionSha256Sum=b84e04fa845fecba48551f425957641074fcc00a88a84d2aae5808743b35fc85$' apps/flutter_client/android/gradle/wrapper/gradle-wrapper.properties\n'''
+          ci_text = replace_one(ci_text, old, new, 'CI release contract checks')
+          ci.write_text(ci_text, encoding='utf-8')
+          PY
+
+      - name: Verify hardened contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/release/test_release_set.py
+          python3 -m py_compile scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
+          python3 scripts/docs/verify_repository.py
+          bash -n apps/flutter_client/android/gradlew
+          git diff --check
+
+      - name: Commit generated hardening changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/workflows/release.yml .github/workflows/ci.yml \
+            apps/flutter_client/android/.gitignore \
+            apps/flutter_client/android/gradlew \
+            apps/flutter_client/android/gradlew.bat \
+            apps/flutter_client/android/gradle/wrapper/gradle-wrapper.jar \
+            apps/flutter_client/android/gradle/wrapper/gradle-wrapper.properties
+          git diff --cached --check
+          git commit -m 'feat:补全发布溯源与Android构建复现'
+          git push origin HEAD:codex/post-release-hardening-20260915
