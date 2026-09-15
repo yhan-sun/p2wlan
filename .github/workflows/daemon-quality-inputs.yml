@@ -1,0 +1,30 @@
+name: Daemon quality input transfer
+
+on:
+  push:
+    branches: [automation/daemon-quality-workbench]
+    paths:
+      - .github/workbench/run.json
+
+permissions:
+  contents: read
+
+jobs:
+  inputs:
+    if: github.repository == 'yhan-sun/p2wlan'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          sparse-checkout: .github/workbench
+          persist-credentials: false
+      - name: Hash replay inputs
+        run: sha256sum .github/workbench/recipe.part*.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: daemon-quality-replay-inputs
+          path: .github/workbench/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
