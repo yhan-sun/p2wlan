@@ -1,0 +1,40 @@
+name: Daemon refactor workbench
+
+on:
+  push:
+    branches: [refactor/daemon-owned-components]
+    paths:
+      - .github/workflows/daemon-refactor-workbench.yml
+      - scripts/quality/refactor_daemon.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daemon-refactor-workbench
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: github.repository == 'yhan-sun/p2wlan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Snapshot tracked source for offline inspection
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --short --branch
+          mkdir -p "$RUNNER_TEMP/daemon-refactor-source"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/daemon-refactor-source/source.tar.gz" HEAD
+          git rev-parse HEAD > "$RUNNER_TEMP/daemon-refactor-source/commit.txt"
+          sha256sum "$RUNNER_TEMP/daemon-refactor-source/source.tar.gz" > "$RUNNER_TEMP/daemon-refactor-source/source.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: daemon-refactor-source-${{ github.sha }}
+          path: ${{ runner.temp }}/daemon-refactor-source/
+          if-no-files-found: error
+          retention-days: 3
