@@ -13,6 +13,19 @@
 
 普通部署不需要在服务器上安装 Go 或从源码构建。
 
+## 支持与验证范围
+
+固定 `server-vX.Y.Z` 归档的公开部署契约是 Linux + systemd。仓库对不同运行形态的自动验证范围如下：
+
+| 运行形态 | 自动验证范围 | 边界 |
+| --- | --- | --- |
+| Linux 原生服务 | Ubuntu 22.04 上执行 Go vet、race/full tests、Control/Relay 双进程认证 smoke、IPv6 TLS/撤权验证和 manager contract | 这是固定服务端归档与 systemd manager 的主要验证路径 |
+| Linux 静态服务端二进制 | Ubuntu 20.04 容器验证 `CGO_ENABLED=0` 产物没有动态 loader，并能执行 `--version` | 只证明基础 loader 兼容，不等于 Ubuntu 20.04 上完整 systemd、网络和业务链路已验收 |
+| Docker Compose | Ubuntu 22.04 runner 构建实际 Debian bookworm 镜像、启动 Control/Relay、检查 readyz，并验证 SQLite 数据卷重启持久性 | 生产部署仍应使用固定镜像摘要并自行完成公网、TLS 和恢复演练 |
+| Windows 服务端代码 | `windows-latest` 执行 Go vet/tests 和真实 Control/Relay 双进程 smoke | 当前固定 `server-vX.Y.Z` 发布归档不是 Windows 安装包，因此 Windows 不属于公开的固定归档部署路径 |
+
+未列入完整验证矩阵的 Linux 发行版不能仅凭“能启动二进制”视为正式兼容。遇到发行版差异时，优先使用固定归档并核对 systemd、文件权限、反向代理、TLS 和内核网络能力。
+
 ## 安装
 
 下载同一 server-vX.Y.Z 下与主机架构匹配的归档和同名 checksum：
