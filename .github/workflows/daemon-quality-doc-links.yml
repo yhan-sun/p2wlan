@@ -70,5 +70,6 @@ jobs:
           test "$(git diff --cached --name-only | wc -l | tr -d ' ')" = 5
           git diff --cached --check
           git commit -m 'feat:修复Rust API文档链接并加入严格文档门禁'
+          echo "DOC_COMMIT=$(git rev-parse HEAD)"
           git push origin "HEAD:refs/heads/$TARGET_BRANCH"
           git show --stat --oneline HEAD
