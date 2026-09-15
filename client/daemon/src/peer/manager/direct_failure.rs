@@ -277,6 +277,7 @@ impl PeerManager {
             }
             probed_sources
         };
+        drop(conns);
         drop(epoch_guard);
         self.record_traversal_failures(probed_sources).await;
         DirectFailureCommitOutcome::Applied
@@ -420,6 +421,7 @@ impl PeerManager {
             probed_sources
         };
 
+        drop(conns);
         drop(epoch_guard);
         self.record_traversal_failures(probed_sources).await;
         true
@@ -516,6 +518,7 @@ impl PeerManager {
             }
             source
         };
+        drop(conns);
         drop(epoch_guard);
         self.record_traversal_failures(vec![source]).await;
         true

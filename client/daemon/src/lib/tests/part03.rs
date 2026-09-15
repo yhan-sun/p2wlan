@@ -6385,22 +6385,16 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
     // now rejects every new reader; /status must serve its validated cache as
     // HTTP 200, and the responder must still reach its session commit after
     // its controlled gate is released.
-    let writer_started = Arc::new(tokio::sync::Notify::new());
-    let queued_writer = tokio::spawn({
-        let peers = daemon.peers.clone();
-        let writer_started = writer_started.clone();
-        async move {
-            writer_started.notify_one();
-            let _writer = peers.hold_connections_writer_for_test().await;
-        }
-    });
-    writer_started.notified().await;
-    for _ in 0..64 {
-        if daemon.peers.try_all_connections().is_none() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    // Poll the retained future into the writer queue before checking status.
+    // A task-start notification does not prove its lock attempt was polled.
+    let queued_writer =
+        tokio::task::unconstrained(daemon.peers.hold_connections_writer_for_test());
+    tokio::pin!(queued_writer);
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(queued_writer.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
     assert!(daemon.peers.try_all_connections().is_none());
     let contended_status = timeout(Duration::from_secs(1), fetch_status(diag_address))
         .await
@@ -6445,10 +6439,11 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
     assert!(!status.has_pending_responder);
 
     drop(connection_reader);
-    timeout(Duration::from_secs(1), queued_writer)
-        .await
-        .expect("connection writer remained queued after reader release")
-        .expect("connection writer task panicked");
+    drop(
+        timeout(Duration::from_secs(1), queued_writer)
+            .await
+            .expect("connection writer remained queued after reader release"),
+    );
     timeout(Duration::from_secs(1), offer_worker)
         .await
         .expect("responder did not finish after controlled reader release")

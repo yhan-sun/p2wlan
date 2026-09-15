@@ -1092,16 +1092,7 @@ pub(crate) enum FreshMappingOutcome {
     Rejected(FreshMappingRejection),
 }
 
-impl std::fmt::Debug for ProvisionalSocketGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The guard contains live channels and a task handle; only its
-        // identity is stable for debugging.
-        f.debug_struct("ProvisionalSocketGuard")
-            .field("socket_index", &self.socket_index)
-            .field("peer_id", &self.peer_id)
-            .finish_non_exhaustive()
-    }
-}
+
 
 /// A successful fresh-mapping generation result.
 #[derive(Debug, Clone)]

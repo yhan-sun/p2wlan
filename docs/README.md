@@ -24,6 +24,7 @@
 ## 长期机制
 
 - [架构](explanation/architecture.md)
+- [工程质量与架构边界](explanation/engineering-quality.md)
 - [安全模型](explanation/security-model.md)
 - [连接生命周期](explanation/connection-lifecycle.md)
 

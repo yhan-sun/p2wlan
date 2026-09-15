@@ -177,10 +177,14 @@ jobs:
       - name: Windows local-feedback and token-race tests
         shell: pwsh
         run: |
-          cargo test -p p2wlan-daemon --lib tests::direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb -- --exact --test-threads=1
-          cargo test -p p2wlan-daemon --lib tests::direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated -- --exact --test-threads=1
-          cargo test -p p2wlan-daemon --lib dplpmtud::tests::business_publication_is_explicit_revisioned_and_registry_independent -- --exact --test-threads=1
-          cargo test -p p2wlan-daemon --lib dplpmtud::tests::old_business_tokens_fail_after_raise_drop_and_path_replacement -- --exact --test-threads=1
+          python scripts/quality/run_rust_tests.py tests::direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/quality/run_rust_tests.py tests::direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/quality/run_rust_tests.py dplpmtud::runtime::tests::business_publication_is_explicit_revisioned_and_registry_independent --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/quality/run_rust_tests.py dplpmtud::runtime::tests::old_business_tokens_fail_after_raise_drop_and_path_replacement --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   existing_required_gates:
     name: Business MTU external required gates
