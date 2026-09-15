@@ -390,7 +390,7 @@ pub(crate) async fn run_network_outbound(
                 match flush_result {
                     Some(Ok((peer_id, queue))) => {
                         flushing_peers.remove(&peer_id);
-                        merge_completed_flush(&mut pending, peer_id, queue);
+                        merge_completed_flush(&mut pending, peer_id, queue, &peers, &timeline).await;
                         start_ready_peer_flushes(
                             &transport,
                             &peers,
@@ -421,7 +421,9 @@ pub(crate) async fn run_network_outbound(
     // hard timeout and no task owns an encrypted retry packet.
     while let Some(result) = flush_tasks.join_next().await {
         match result {
-            Ok((peer_id, queue)) => merge_completed_flush(&mut pending, peer_id, queue),
+            Ok((peer_id, queue)) => {
+                merge_completed_flush(&mut pending, peer_id, queue, &peers, &timeline).await;
+            }
             Err(err) => warn!("outbound per-peer flush task failed during shutdown: {err}"),
         }
     }
@@ -1032,14 +1034,40 @@ pub(super) async fn flush_one_peer(
     (peer_id, queue)
 }
 
-/// Merge a completed peer task ahead of packets that arrived while it was
-/// running. The completed queue is always older, so appending the newer queue
-/// preserves strict per-peer FIFO.
-pub(super) fn merge_completed_flush(
+/// Merge only the current generation through the same admission policy used
+/// by live ingress. Surviving packets stay FIFO; losses retain their reason.
+pub(super) async fn merge_completed_flush(
     pending: &mut HashMap<String, PeerPendingQueue>,
     peer_id: String,
     mut completed: PeerPendingQueue,
+    peers: &PeerManager,
+    timeline: &ConnectionTimeline,
 ) {
+    let generation = peers.current_network_generation_sync();
+    if pending.get(&peer_id).is_some_and(|entry| {
+        entry.wait_generation.is_some() && entry.wait_generation != Some(generation)
+    }) {
+        drop_pending_queue(
+            peers,
+            pending.remove(&peer_id),
+            REASON_OUTBOUND_GENERATION_CHANGED,
+            timeline,
+        )
+        .await;
+    }
+    if completed.wait_generation.is_some()
+        && completed.wait_generation != Some(peers.current_network_generation_sync())
+    {
+        drop_pending_queue(
+            peers,
+            Some(completed),
+            REASON_OUTBOUND_GENERATION_CHANGED,
+            timeline,
+        )
+        .await;
+        return;
+    }
+
     let Some(mut newer) = pending.remove(&peer_id) else {
         if !completed.queue.is_empty() {
             pending.insert(peer_id, completed);
@@ -1052,8 +1080,20 @@ pub(super) fn merge_completed_flush(
         return;
     }
 
-    completed.queue.append(&mut newer.queue);
-    completed.bytes = completed.bytes.saturating_add(newer.bytes);
+    let mut dropped_packets = 0usize;
+    let mut dropped_bytes = 0usize;
+    while let Some(packet) = newer.pop_front() {
+        let (dropped, bytes) = completed.enqueue(packet);
+        dropped_packets = dropped_packets.saturating_add(dropped.len());
+        dropped_bytes = dropped_bytes.saturating_add(bytes);
+        for packet in dropped {
+            let _ = peers.emit_local_mtu_feedback(
+                &peer_id,
+                packet.raw_packet(),
+                crate::business_mtu::LocalMtuFeedbackKind::Unreachable,
+            );
+        }
+    }
     if completed.wait_started.is_none() {
         completed.wait_started = newer.wait_started;
     }
@@ -1068,6 +1108,17 @@ pub(super) fn merge_completed_flush(
     }
     if completed.delivery_deadline.is_none() {
         completed.delivery_deadline = newer.delivery_deadline;
+    }
+    if dropped_packets > 0 {
+        record_overflow_drop(
+            peers,
+            &peer_id,
+            dropped_packets,
+            dropped_bytes,
+            &completed,
+            timeline,
+        )
+        .await;
     }
     pending.insert(peer_id, completed);
 }

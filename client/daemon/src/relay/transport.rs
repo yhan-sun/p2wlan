@@ -404,7 +404,7 @@ impl RelayTransport {
     /// make-before-break renewal already replaced (the hub's newest-wins close
     /// of the old connection).  Only the supervisor can tell that apart, so it
     /// attributes the diagnostics after classifying the end (see
-    /// [`crate::relay_runtime::RelaySupervisor`]).
+    /// `crate::relay_runtime::RelaySupervisor`).
     pub async fn run_inbound(
         self,
         mut relay_rx: mpsc::Receiver<RelayMessage>,
