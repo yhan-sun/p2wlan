@@ -56,8 +56,21 @@ impl DesktopHostClient {
 
     pub async fn fetch_status(&self, diagnostics_url: &str) -> Result<serde_json::Value> {
         let status_url = normalize_diagnostics_url(diagnostics_url)?;
-        for attempt in 0..2 {
-            let token = (self.auth_token_reader)()?;
+        const AUTH_RETRY_ATTEMPTS: usize = 4;
+        const AUTH_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+        for attempt in 0..AUTH_RETRY_ATTEMPTS {
+            let token = match (self.auth_token_reader)() {
+                Ok(token) => token,
+                Err(_error) if attempt + 1 < AUTH_RETRY_ATTEMPTS => {
+                    // The daemon repairs the discovery file asynchronously;
+                    // give that repair a short window before surfacing a
+                    // transient missing-token error to the UI.
+                    tokio::time::sleep(AUTH_RETRY_DELAY).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let response = self
                 .client
                 .get(status_url.clone())
@@ -74,7 +87,10 @@ impl DesktopHostClient {
                 })?;
 
             let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && attempt + 1 < AUTH_RETRY_ATTEMPTS
+            {
+                tokio::time::sleep(AUTH_RETRY_DELAY).await;
                 continue;
             }
             if !status.is_success() {

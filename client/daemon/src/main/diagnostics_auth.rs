@@ -1,6 +1,8 @@
 use rand::RngCore;
 use std::fs as auth_fs;
 use std::path::{Path as AuthPath, PathBuf as AuthPathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration as AuthRepairDuration;
 use zeroize::Zeroizing;
 
 /// Owns the per-process diagnostics session secret and its discovery file.
@@ -11,6 +13,8 @@ use zeroize::Zeroizing;
 struct DiagnosticsAuthGuard {
     path: AuthPathBuf,
     _token: Zeroizing<String>,
+    repair_abort: Option<tokio::task::AbortHandle>,
+    repair_lock: Arc<Mutex<()>>,
 }
 
 impl DiagnosticsAuthGuard {
@@ -41,47 +45,9 @@ impl DiagnosticsAuthGuard {
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = Zeroizing::new(hex::encode(bytes));
         let path = dir.join("p2wlan-daemon.diag-auth");
-        let temp_path = dir.join(format!(
-            ".p2wlan-daemon.diag-auth.{}.tmp",
-            hex::encode(&bytes[..12])
-        ));
-
-        let result = (|| -> std::io::Result<()> {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp_path)?;
-            file.write_all(token.as_bytes())?;
-            file.flush()?;
-            restrict_auth_file(&temp_path, diagnostics_client_sid)?;
-            file.sync_all()?;
-            drop(file);
-
-            // Unix rename is an atomic replacement. Windows' std::fs::rename
-            // cannot replace an existing file, so remove only the fixed stale
-            // path after the new file has been fully written and ACL-checked.
-            #[cfg(windows)]
-            match auth_fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-            auth_fs::rename(&temp_path, &path)?;
-            if let Err(error) = restrict_auth_file(&path, diagnostics_client_sid) {
-                let _ = auth_fs::remove_file(&path);
-                return Err(error);
-            }
-            #[cfg(unix)]
-            std::fs::File::open(&dir)?.sync_all()?;
-            Ok(())
-        })();
+        let result = publish_auth_file(&path, token.as_str(), diagnostics_client_sid);
 
         if let Err(error) = result {
-            let _ = auth_fs::remove_file(&temp_path);
             return Err(DaemonError::Config(format!(
                 "failed to publish diagnostics auth file {}: {error}",
                 path.display()
@@ -90,16 +56,35 @@ impl DiagnosticsAuthGuard {
 
         config.diagnostics.auth_token = Some(token.to_string());
         config.diagnostics.auth_token_path = Some(path.clone());
+        let repair_lock = Arc::new(Mutex::new(()));
+        let repair_abort = spawn_auth_file_repair(
+            path.clone(),
+            token.clone(),
+            diagnostics_client_sid.map(ToOwned::to_owned),
+            repair_lock.clone(),
+        );
         Ok(Some(Self {
             path,
             _token: token,
+            repair_abort,
+            repair_lock,
         }))
     }
-
 }
 
 impl Drop for DiagnosticsAuthGuard {
     fn drop(&mut self) {
+        if let Some(abort) = self.repair_abort.take() {
+            abort.abort();
+        }
+        // The repair loop performs synchronous filesystem operations while it
+        // holds this short-lived lock. Wait for an in-flight repair to finish
+        // before removing the file, otherwise it could recreate the file after
+        // the daemon has already begun shutting down.
+        let _repair_lock = match self.repair_lock.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         match auth_fs::remove_file(&self.path) {
             Ok(()) => info!("Removed diagnostics auth token file {}", self.path.display()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -109,6 +94,118 @@ impl Drop for DiagnosticsAuthGuard {
             ),
         }
     }
+}
+
+/// Publish the current in-memory token atomically and with the same
+/// permissions/ACLs used at daemon startup. This is deliberately a helper so
+/// the startup path and the live repair path cannot drift apart.
+fn publish_auth_file(
+    path: &AuthPath,
+    token: &str,
+    diagnostics_client_sid: Option<&str>,
+) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| AuthPath::new("."));
+    auth_fs::create_dir_all(dir)?;
+
+    let mut temp_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut temp_bytes);
+    let temp_path = dir.join(format!(
+        ".p2wlan-daemon.diag-auth.{}.tmp",
+        hex::encode(temp_bytes)
+    ));
+
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(token.as_bytes())?;
+        file.flush()?;
+        restrict_auth_file(&temp_path, diagnostics_client_sid)?;
+        file.sync_all()?;
+        drop(file);
+
+        // Unix rename is an atomic replacement. Windows' std::fs::rename
+        // cannot replace an existing file, so remove only the fixed stale
+        // path after the new file has been fully written and ACL-checked.
+        #[cfg(windows)]
+        match auth_fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        auth_fs::rename(&temp_path, path)?;
+        if let Err(error) = restrict_auth_file(path, diagnostics_client_sid) {
+            let _ = auth_fs::remove_file(path);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = auth_fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn auth_file_matches(path: &AuthPath, token: &str) -> bool {
+    auth_fs::read_to_string(path)
+        .map(|value| value.trim() == token)
+        .unwrap_or(false)
+}
+
+/// Keep the discovery file present for the lifetime of the daemon. Desktop
+/// updaters, log cleaners, and account-level cleanup tools can remove files in
+/// `~/Library/Logs` while the daemon continues serving diagnostics with the
+/// token held in memory. Without this repair loop the UI sees transient 401s
+/// (or a missing-token error) even though the dataplane is healthy.
+fn spawn_auth_file_repair(
+    path: AuthPathBuf,
+    token: Zeroizing<String>,
+    diagnostics_client_sid: Option<String>,
+    repair_lock: Arc<Mutex<()>>,
+) -> Option<tokio::task::AbortHandle> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let task = runtime.spawn(async move {
+        let mut interval = tokio::time::interval(AuthRepairDuration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if auth_file_matches(&path, token.as_str()) {
+                continue;
+            }
+
+            let _repair_lock = match repair_lock.lock() {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if auth_file_matches(&path, token.as_str()) {
+                continue;
+            }
+            if let Err(error) = publish_auth_file(
+                &path,
+                token.as_str(),
+                diagnostics_client_sid.as_deref(),
+            ) {
+                warn!(
+                    "Failed to repair diagnostics auth token file {}: {error}",
+                    path.display()
+                );
+            } else {
+                debug!(
+                    "Repaired diagnostics auth token file {}",
+                    path.display()
+                );
+            }
+        }
+    });
+    Some(task.abort_handle())
 }
 
 #[cfg(unix)]
