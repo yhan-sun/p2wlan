@@ -58,6 +58,11 @@ Rust crate 用于隔离可复用协议/平台能力，daemon 内部子模块用�
 
 反过来，如果两个模块需要频繁互相读取内部字段、共享锁或循环调用，应重新确定状态所有者，而不是增加更多 facade。
 
+daemon 内存在两类作用域，拆分方式随之不同：
+
+- **真实 `mod` 作用域**（`udp/`、`transport/`、`dplpmtud/`、`network_outbound/`、`relay_runtime/`、`relay/`）使用真正的 Rust 子模块，可以单独编译和测试；
+- **`include!` 作用域**（`lib/daemon/`、`lib/direct_runtime/`、`peer/manager/`）沿用「薄父文件 + 子文件」惯例。这些文件与同作用域的其余文件共享一个 crate-root 或 `peer` 模块作用域，因此拆分不需要放宽任何可见性，代价是它们不能作为独立 `mod` 单独编译或测试。
+
 ## Daemon 模块归属
 
 DPLPMTUD 的尺寸换算、路径身份、wire 编解码和 reducer 分别位于 `dplpmtud/sizes.rs`、`identity.rs`、`wire.rs`、`state_machine.rs`。`runtime.rs` 负责 worker 生命周期和 budget publication，不再维护第二份 reducer 判定。测试按相同边界分组。
