@@ -144,8 +144,8 @@ fn managed_pending_fifo_obeys_packet_and_byte_caps() {
         .all(|window| { window[1] == window[0].wrapping_add(1) }));
 }
 
-#[test]
-fn completed_peer_flush_stays_ahead_of_live_fifo_arrivals() {
+#[tokio::test]
+async fn completed_peer_flush_stays_ahead_of_live_fifo_arrivals() {
     fn packet(sequence: u8) -> OutboundPacket {
         OutboundPacket {
             room_authorization: None,
@@ -166,7 +166,15 @@ fn completed_peer_flush_stays_ahead_of_live_fifo_arrivals() {
     live.enqueue(PendingPacket::plain(packet(3)));
     pending.insert("peer-a".to_string(), live);
 
-    merge_completed_flush(&mut pending, "peer-a".to_string(), completed);
+    let (peers, timeline) = merge_context();
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
 
     let merged = pending.remove("peer-a").expect("merged queue");
     let sequences: Vec<u8> = merged
@@ -221,4 +229,264 @@ fn empty_queue_rejects_a_single_oversized_packet() {
     assert_eq!(dropped.len(), 1);
     assert!(queue.queue.is_empty());
     assert_eq!(queue.bytes, 0);
+}
+
+fn merge_context() -> (PeerManager, Arc<ConnectionTimeline>) {
+    (
+        PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap()),
+        ConnectionTimeline::new("queue-merge", 0),
+    )
+}
+
+fn merge_packet(sequence: u8, bytes: usize) -> PendingPacket {
+    PendingPacket::plain(OutboundPacket {
+        room_authorization: None,
+        peer_id: "peer-a".to_string(),
+        dst_ip: "10.20.0.2".to_string(),
+        packet: vec![sequence; bytes],
+        trace: None,
+    })
+}
+
+fn merge_queue(generation: u64, sequence: u8, bytes: usize) -> PeerPendingQueue {
+    let mut queue = PeerPendingQueue::new();
+    queue.wait_generation = Some(generation);
+    queue.enqueue(merge_packet(sequence, bytes));
+    queue
+}
+
+#[tokio::test]
+async fn completed_flush_merge_obeys_packet_limit() {
+    let (peers, timeline) = merge_context();
+    let mut completed = PeerPendingQueue::new();
+    let mut newer = PeerPendingQueue::new();
+    for _ in 0..MAX_PENDING_PACKETS_PER_PEER {
+        completed.enqueue(merge_packet(1, 1));
+        newer.enqueue(merge_packet(2, 1));
+    }
+    let mut pending = HashMap::from([("peer-a".to_string(), newer)]);
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
+    let merged = &pending["peer-a"];
+    assert_eq!(merged.queue.len(), MAX_PENDING_PACKETS_PER_PEER);
+    assert_eq!(merged.bytes, MAX_PENDING_PACKETS_PER_PEER);
+    assert!(merged.queue.iter().all(|packet| packet.raw_packet() == [2]));
+    let losses = peers.outbound_loss_stats().await;
+    let overflow = &losses.drops[REASON_OUTBOUND_QUEUE_FULL];
+    assert_eq!(overflow.packets, MAX_PENDING_PACKETS_PER_PEER as u64);
+    assert_eq!(overflow.bytes, MAX_PENDING_PACKETS_PER_PEER as u64);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_flush_merge_obeys_byte_limit_without_extending_deadlines() {
+    let (peers, timeline) = merge_context();
+    let len = MAX_PENDING_BYTES_PER_PEER / 2;
+    let mut completed = merge_queue(0, 1, len);
+    completed.enqueue(merge_packet(2, len));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    completed.delivery_deadline = Some(deadline);
+    completed.wait_deadline = Some(deadline);
+    let mut newer = merge_queue(0, 3, len);
+    newer.delivery_deadline = Some(deadline + Duration::from_secs(10));
+    newer.wait_deadline = newer.delivery_deadline;
+    let mut pending = HashMap::from([("peer-a".to_string(), newer)]);
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
+    let merged = &pending["peer-a"];
+    assert_eq!(merged.bytes, MAX_PENDING_BYTES_PER_PEER);
+    assert_eq!(merged.queue.len(), 2);
+    assert_eq!(merged.queue[0].raw_packet()[0], 2);
+    assert_eq!(merged.queue[1].raw_packet()[0], 3);
+    assert_eq!(merged.delivery_deadline, Some(deadline));
+    assert_eq!(merged.wait_deadline, Some(deadline));
+    let losses = peers.outbound_loss_stats().await;
+    let overflow = &losses.drops[REASON_OUTBOUND_QUEUE_FULL];
+    assert_eq!((overflow.packets, overflow.bytes), (1, len as u64));
+}
+
+#[tokio::test]
+async fn stale_completed_flush_cannot_poison_current_generation_queue() {
+    let (peers, timeline) = merge_context();
+    let current = peers.current_network_generation_sync();
+    let completed = merge_queue(current + 1, 1, 7);
+    let newer = merge_queue(current, 2, 11);
+    let mut pending = HashMap::from([("peer-a".to_string(), newer)]);
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
+    let merged = &pending["peer-a"];
+    assert_eq!(merged.wait_generation, Some(current));
+    assert_eq!(merged.queue.len(), 1);
+    assert_eq!(merged.bytes, 11);
+    assert_eq!(merged.queue[0].raw_packet(), [2; 11]);
+    let losses = peers.outbound_loss_stats().await;
+    let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
+    assert_eq!((stale.packets, stale.bytes), (1, 7));
+    assert!(!losses.drops.contains_key(REASON_OUTBOUND_QUEUE_FULL));
+}
+
+#[tokio::test]
+async fn stale_pending_queue_cannot_contaminate_current_completed_flush() {
+    let (peers, timeline) = merge_context();
+    let current = peers.current_network_generation_sync();
+    let completed = merge_queue(current, 1, 7);
+    let newer = merge_queue(current + 1, 2, 11);
+    let mut pending = HashMap::from([("peer-a".to_string(), newer)]);
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
+    let merged = &pending["peer-a"];
+    assert_eq!(merged.wait_generation, Some(current));
+    assert_eq!(merged.bytes, 7);
+    assert_eq!(merged.queue.len(), 1);
+    assert_eq!(merged.queue[0].raw_packet(), [1; 7]);
+    let losses = peers.outbound_loss_stats().await;
+    let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
+    assert_eq!((stale.packets, stale.bytes), (1, 11));
+}
+
+#[tokio::test]
+async fn stale_flush_without_live_arrivals_is_counted_and_not_reparked() {
+    let (peers, timeline) = merge_context();
+    let completed = merge_queue(peers.current_network_generation_sync() + 1, 1, 7);
+    let mut pending = HashMap::new();
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
+    assert!(pending.is_empty());
+    let losses = peers.outbound_loss_stats().await;
+    let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
+    assert_eq!((stale.packets, stale.bytes), (1, 7));
+}
+
+#[tokio::test]
+async fn empty_completed_flush_preserves_current_ingress_metadata() {
+    let (peers, timeline) = merge_context();
+    let mut newer = merge_queue(peers.current_network_generation_sync(), 2, 11);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    newer.delivery_deadline = Some(deadline);
+    let mut pending = HashMap::from([("peer-a".to_string(), newer)]);
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        PeerPendingQueue::new(),
+        &peers,
+        &timeline,
+    )
+    .await;
+    assert_eq!(pending["peer-a"].bytes, 11);
+    assert_eq!(pending["peer-a"].delivery_deadline, Some(deadline));
+    assert!(peers.outbound_loss_stats().await.drops.is_empty());
+}
+
+#[tokio::test]
+async fn repeated_completed_flushes_stay_bounded_and_count_each_eviction_once() {
+    let (peers, timeline) = merge_context();
+    let mut completed = PeerPendingQueue::new();
+    for _ in 0..MAX_PENDING_PACKETS_PER_PEER {
+        completed.enqueue(merge_packet(0, 1));
+    }
+    let mut pending = HashMap::new();
+    for sequence in 1..=8 {
+        let mut newer = PeerPendingQueue::new();
+        for _ in 0..MAX_PENDING_PACKETS_PER_PEER {
+            newer.enqueue(merge_packet(sequence, 1));
+        }
+        pending.insert("peer-a".to_string(), newer);
+        merge_completed_flush(
+            &mut pending,
+            "peer-a".to_string(),
+            completed,
+            &peers,
+            &timeline,
+        )
+        .await;
+        completed = pending.remove("peer-a").unwrap();
+        assert_eq!(completed.queue.len(), MAX_PENDING_PACKETS_PER_PEER);
+        assert_eq!(completed.bytes, MAX_PENDING_PACKETS_PER_PEER);
+        assert!(completed
+            .queue
+            .iter()
+            .all(|packet| packet.raw_packet() == [sequence]));
+    }
+    let losses = peers.outbound_loss_stats().await;
+    let overflow = &losses.drops[REASON_OUTBOUND_QUEUE_FULL];
+    assert_eq!(overflow.packets, 8 * MAX_PENDING_PACKETS_PER_PEER as u64);
+    assert_eq!(overflow.bytes, 8 * MAX_PENDING_PACKETS_PER_PEER as u64);
+}
+
+#[tokio::test]
+async fn generation_advance_during_flush_preserves_new_network_ingress() {
+    let (peers, timeline) = merge_context();
+    let old_generation = peers.current_network_generation_sync();
+    let completed = merge_queue(old_generation, 1, 7);
+    let generation = peers.advance_network_generation("queue-merge-test").await;
+    assert!(generation > old_generation);
+    let newer = merge_queue(generation, 2, 11);
+    let mut pending = HashMap::from([("peer-a".to_string(), newer)]);
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
+    assert_eq!(pending["peer-a"].wait_generation, Some(generation));
+    assert_eq!(pending["peer-a"].bytes, 11);
+    assert_eq!(pending["peer-a"].queue.len(), 1);
+    assert_eq!(pending["peer-a"].queue[0].raw_packet(), [2; 11]);
+    let losses = peers.outbound_loss_stats().await;
+    let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
+    assert_eq!((stale.packets, stale.bytes), (1, 7));
+}
+
+#[tokio::test]
+async fn both_stale_queues_are_discarded_and_counted_once() {
+    let (peers, timeline) = merge_context();
+    let generation = peers.current_network_generation_sync();
+    let completed = merge_queue(generation, 1, 7);
+    let newer = merge_queue(generation, 2, 11);
+    peers.advance_network_generation("queue-merge-test").await;
+    let mut pending = HashMap::from([("peer-a".to_string(), newer)]);
+    merge_completed_flush(
+        &mut pending,
+        "peer-a".to_string(),
+        completed,
+        &peers,
+        &timeline,
+    )
+    .await;
+    assert!(pending.is_empty());
+    let losses = peers.outbound_loss_stats().await;
+    let stale = &losses.drops[REASON_OUTBOUND_GENERATION_CHANGED];
+    assert_eq!((stale.packets, stale.bytes), (2, 18));
+    assert!(!losses.drops.contains_key(REASON_OUTBOUND_QUEUE_FULL));
 }
