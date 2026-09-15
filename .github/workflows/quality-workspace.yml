@@ -1,0 +1,31 @@
+name: Quality workspace
+
+on:
+  push:
+    branches: [refactor/project-quality-baseline]
+    paths: [.github/workflows/quality-workspace.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Archive tracked source for isolated refactoring
+        run: |
+          git status --short --branch
+          git rev-parse HEAD > "$RUNNER_TEMP/source-commit.txt"
+          git archive --format=tar HEAD -o "$RUNNER_TEMP/source.tar"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: quality-source-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/source.tar
+            ${{ runner.temp }}/source-commit.txt
+          if-no-files-found: error
+          retention-days: 1
