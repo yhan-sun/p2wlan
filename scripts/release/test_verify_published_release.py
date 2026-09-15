@@ -23,12 +23,18 @@ class PublishedReleaseAuditTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.tag = "v0.1.999"
         self.commit = "a" * 40
-        self.files = {
-            name: {"bytes": index + 1, "sha256": f"{index + 1:064x}"}
-            for index, name in enumerate(MODULE.EXPECTED_PAYLOADS)
-        }
+        self.files = {}
+        for index, name in enumerate(MODULE.EXPECTED_PAYLOADS):
+            meta = {"bytes": index + 1, "sha256": f"{index + 1:064x}"}
+            if name in MODULE.PRIMARY_ARTIFACTS:
+                meta.update(
+                    platform=MODULE.PRIMARY_ARTIFACTS[name][0],
+                    arch=MODULE.PRIMARY_ARTIFACTS[name][1],
+                    identity="test-identity",
+                )
+            self.files[name] = meta
         self.manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "tag": self.tag,
             "source_sha": self.commit,
             "files": self.files,
@@ -88,6 +94,20 @@ class PublishedReleaseAuditTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(report["asset_count"], 11)
         self.assertEqual(report["source_sha"], self.commit)
+        self.assertEqual(report["manifest_schema_version"], 2)
+
+    def test_manifest_schema_one_is_rejected(self) -> None:
+        self.manifest["schema_version"] = 1
+        self._write_manifest()
+        errors, _, _ = self.verify()
+        self.assertTrue(any("schema_version" in error for error in errors))
+
+    def test_primary_artifact_identity_is_required(self) -> None:
+        self.files["p2wlan-windows-x64-setup.exe"].pop("identity")
+        self._write_manifest()
+        self.release = self._release_fixture()
+        errors, _, _ = self.verify()
+        self.assertTrue(any("artifact identity" in error for error in errors))
 
     def test_source_sha_must_match_tag_commit(self) -> None:
         self.manifest["source_sha"] = "b" * 40

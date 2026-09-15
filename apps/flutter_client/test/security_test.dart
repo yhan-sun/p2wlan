@@ -192,30 +192,38 @@ void main() {
       expect(store.settings.onboardingCompleted, isFalse);
     });
 
-    test('token is never persisted to the settings JSON; local token file holds it', () async {
-      final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
-      addTearDown(() async => tmp.delete(recursive: true));
-      final settingsFile = File('${tmp.path}/settings.json');
-      final secure = InMemorySecureTokenRepository();
-      final store = SettingsStore(
-        settingsFile: settingsFile,
-        tokenRepository: secure,
-      );
-      await store.load();
-      await store.updateSettings(
-        store.settings.copyWith(authToken: 'managed-token'),
-      );
-      final raw = await settingsFile.readAsString();
-      expect(
-        raw.contains('managed-token'),
-        isFalse,
-        reason: 'auth token must not be written to settings JSON',
-      );
-      final persisted = (jsonDecode(raw) as Map<String, dynamic>)['authToken'];
-      expect(persisted, '', reason: 'token field is blanked in persisted JSON');
-      expect(await secure.read(), 'managed-token');
-      expect(store.settings.authToken, 'managed-token');
-    });
+    test(
+      'token is never persisted to the settings JSON; local token file holds it',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('p2wlan_ss_');
+        addTearDown(() async => tmp.delete(recursive: true));
+        final settingsFile = File('${tmp.path}/settings.json');
+        final secure = InMemorySecureTokenRepository();
+        final store = SettingsStore(
+          settingsFile: settingsFile,
+          tokenRepository: secure,
+        );
+        await store.load();
+        await store.updateSettings(
+          store.settings.copyWith(authToken: 'managed-token'),
+        );
+        final raw = await settingsFile.readAsString();
+        expect(
+          raw.contains('managed-token'),
+          isFalse,
+          reason: 'auth token must not be written to settings JSON',
+        );
+        final persisted =
+            (jsonDecode(raw) as Map<String, dynamic>)['authToken'];
+        expect(
+          persisted,
+          '',
+          reason: 'token field is blanked in persisted JSON',
+        );
+        expect(await secure.read(), 'managed-token');
+        expect(store.settings.authToken, 'managed-token');
+      },
+    );
 
     test(
       'legacy in-JSON token migrates to the local token file on load',
@@ -256,28 +264,25 @@ void main() {
       expect(await secure.read(), isNull);
     });
 
-    test(
-      'saving manual mode clears a previously managed credential',
-      () async {
-        final tmp = await Directory.systemTemp.createTemp('p2wlan_manual_');
-        addTearDown(() async => tmp.delete(recursive: true));
-        final secure = InMemorySecureTokenRepository();
-        final store = SettingsStore(
-          settingsFile: File('${tmp.path}/settings.json'),
-          tokenRepository: secure,
-        );
-        await store.load();
-        await store.updateSettings(
-          store.settings.copyWith(authToken: 'managed-token'),
-        );
+    test('saving manual mode clears a previously managed credential', () async {
+      final tmp = await Directory.systemTemp.createTemp('p2wlan_manual_');
+      addTearDown(() async => tmp.delete(recursive: true));
+      final secure = InMemorySecureTokenRepository();
+      final store = SettingsStore(
+        settingsFile: File('${tmp.path}/settings.json'),
+        tokenRepository: secure,
+      );
+      await store.load();
+      await store.updateSettings(
+        store.settings.copyWith(authToken: 'managed-token'),
+      );
 
-        await store.updateSettings(store.settings.copyWith(manualMode: true));
+      await store.updateSettings(store.settings.copyWith(manualMode: true));
 
-        expect(store.settings.manualMode, isTrue);
-        expect(store.settings.authToken, isEmpty);
-        expect(await secure.read(), isNull);
-      },
-    );
+      expect(store.settings.manualMode, isTrue);
+      expect(store.settings.authToken, isEmpty);
+      expect(await secure.read(), isNull);
+    });
 
     test(
       'load repairs an offline flag left beside a secure credential',

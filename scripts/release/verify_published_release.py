@@ -23,8 +23,19 @@ EXPECTED_PAYLOADS = (
     "p2wlan-macos-x64.dmg",
     "p2wlan-windows-x64-setup.exe",
 )
+PRIMARY_ARTIFACTS = {
+    "p2wlan-android-arm64-release.apk": ("android", "arm64"),
+    "p2wlan-ios-arm64-unsigned.ipa": ("ios", "arm64"),
+    "p2wlan-linux-arm64-cli.tar.gz": ("linux-cli", "arm64"),
+    "p2wlan-linux-x64-cli.tar.gz": ("linux-cli", "x64"),
+    "p2wlan-linux-x64.tar.gz": ("linux", "x64"),
+    "p2wlan-macos-arm64.dmg": ("macos", "arm64"),
+    "p2wlan-macos-x64.dmg": ("macos", "x64"),
+    "p2wlan-windows-x64-setup.exe": ("windows", "x64"),
+}
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+TOKEN_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -76,7 +87,7 @@ def verify(
     if not COMMIT_RE.fullmatch(tag_commit):
         errors.append(f"tag commit is not a full lowercase SHA-1: {tag_commit!r}")
 
-    if manifest.get("schema_version") != 1:
+    if manifest.get("schema_version") != 2:
         errors.append(f"unsupported manifest schema_version: {manifest.get('schema_version')!r}")
     if manifest.get("tag") != expected_tag:
         errors.append(f"manifest tag mismatch: {manifest.get('tag')!r} != {expected_tag!r}")
@@ -121,14 +132,31 @@ def verify(
     for name in EXPECTED_PAYLOADS:
         meta = files.get(name)
         asset = assets.get(name)
-        if not isinstance(meta, dict) or asset is None:
+        if not isinstance(meta, dict):
+            errors.append(f"manifest has invalid metadata for {name}")
+            continue
+        if asset is None:
             continue
         expected_size = meta.get("bytes")
         expected_digest = meta.get("sha256")
-        if not isinstance(expected_size, int) or expected_size < 0:
+        if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0:
             errors.append(f"manifest has invalid byte size for {name}")
         if not isinstance(expected_digest, str) or not SHA256_RE.fullmatch(expected_digest):
             errors.append(f"manifest has invalid sha256 for {name}")
+        if name in PRIMARY_ARTIFACTS:
+            expected_platform, expected_arch = PRIMARY_ARTIFACTS[name]
+            if meta.get("platform") != expected_platform:
+                errors.append(
+                    f"manifest platform mismatch for {name}: {meta.get('platform')!r} != {expected_platform!r}"
+                )
+            if meta.get("arch") != expected_arch:
+                errors.append(
+                    f"manifest arch mismatch for {name}: {meta.get('arch')!r} != {expected_arch!r}"
+                )
+            identity = meta.get("identity")
+            if not isinstance(identity, str) or not TOKEN_RE.fullmatch(identity):
+                errors.append(f"manifest has invalid artifact identity for {name}")
+        if not isinstance(expected_digest, str) or not SHA256_RE.fullmatch(expected_digest):
             continue
         if asset.get("state") != "uploaded":
             errors.append(f"release asset is not uploaded: {name}")
@@ -142,13 +170,19 @@ def verify(
             )
 
     manifest_asset = assets.get(MANIFEST_NAME)
-    manifest_digest = sha256(manifest_path)
+    if manifest_path.is_file():
+        manifest_size = manifest_path.stat().st_size
+        manifest_digest = sha256(manifest_path)
+    else:
+        errors.append(f"downloaded manifest does not exist: {manifest_path}")
+        manifest_size = None
+        manifest_digest = None
     if manifest_asset is not None:
         if manifest_asset.get("state") != "uploaded":
             errors.append("release manifest asset is not uploaded")
-        if manifest_asset.get("size") != manifest_path.stat().st_size:
+        if manifest_size is not None and manifest_asset.get("size") != manifest_size:
             errors.append("release manifest asset size does not match downloaded manifest")
-        if manifest_asset.get("digest") != f"sha256:{manifest_digest}":
+        if manifest_digest is not None and manifest_asset.get("digest") != f"sha256:{manifest_digest}":
             errors.append("release manifest asset digest does not match downloaded manifest")
 
     report = {
@@ -158,6 +192,7 @@ def verify(
         "immutable": immutable is True,
         "asset_count": len(actual_assets),
         "payload_count": len(expected_payloads),
+        "manifest_schema_version": manifest.get("schema_version"),
         "manifest_sha256": manifest_digest,
         "warnings": warnings,
     }
