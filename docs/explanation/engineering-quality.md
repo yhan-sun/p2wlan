@@ -58,6 +58,11 @@ Rust crate 用于隔离可复用协议/平台能力，daemon 内部子模块用�
 
 反过来，如果两个模块需要频繁互相读取内部字段、共享锁或循环调用，应重新确定状态所有者，而不是增加更多 facade。
 
+daemon 内存在两类作用域，拆分方式随之不同：
+
+- **真实 `mod` 作用域**（`udp/`、`transport/`、`dplpmtud/`、`network_outbound/`、`relay_runtime/`、`relay/`）使用真正的 Rust 子模块，可以单独编译和测试；
+- **`include!` 作用域**（`lib/daemon/`、`lib/direct_runtime/`、`peer/manager/`）沿用「薄父文件 + 子文件」惯例。这些文件与同作用域的其余文件共享一个 crate-root 或 `peer` 模块作用域，因此拆分不需要放宽任何可见性，代价是它们不能作为独立 `mod` 单独编译或测试。
+
 ## Daemon 模块归属
 
 DPLPMTUD 的尺寸换算、路径身份、wire 编解码和 reducer 分别位于 `dplpmtud/sizes.rs`、`identity.rs`、`wire.rs`、`state_machine.rs`。`runtime.rs` 负责 worker 生命周期和 budget publication，不再维护第二份 reducer 判定。测试按相同边界分组。
@@ -78,7 +83,7 @@ UDP 的 `core.rs` 和 `dynamic_punch.rs` 使用真正的 Rust 子模块，而不
 
     python3 scripts/quality/check_code_health.py --base-ref main
 
-当前例外仅覆盖 `lib/daemon/control_events.rs`、`lib/direct_runtime/hard_hard.rs`、`lib/direct_runtime/hole_punch.rs`、`peer/manager/peers.rs`、`peer/manager/relay.rs` 及 `lib/tests/part03.rs`、`part07.rs`。这些仍是待治理的历史债务。文件回落到统一预算后必须删除例外；缺失文件或过时例外也会让门禁失败。
+当前没有例外：daemon 控制事件、direct_runtime 打洞、peer manager 与两个测试热点都已回落到统一预算。文件回落到统一预算后必须删除例外；缺失文件或过时例外也会让门禁失败。
 
 ## 精确测试选择
 
