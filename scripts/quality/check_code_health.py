@@ -19,7 +19,7 @@ LEGACY_RUST_BYTE_CEILINGS = {
     "client/daemon/src/lib/direct_runtime/hole_punch.rs": 113_960,
     "client/daemon/src/peer/manager/peers.rs": 103_077,
     "client/daemon/src/peer/manager/relay.rs": 149_242,
-    "client/daemon/src/lib/tests/part03.rs": 340_372,
+    "client/daemon/src/lib/tests/part03.rs": 340_275,
     "client/daemon/src/lib/tests/part07.rs": 203_948,
 }
 
