@@ -213,11 +213,24 @@ jobs:
           cp apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
             dist-release/p2wlan-android-arm64-release.apk
 
+      - name: Bind Android artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-android-arm64-release.apk
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform android
+          --arch arm64
+          --identity client-stamped
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2wlan-android-arm64-release
-          path: dist-release/p2wlan-android-arm64-release.apk
+          path: |
+            dist-release/p2wlan-android-arm64-release.apk
+            dist-release/p2wlan-android-arm64-release.apk.metadata.json
 
   flutter-ios:
     needs: quality-gate
@@ -243,7 +256,7 @@ jobs:
       - name: Build unsigned iOS release app
         working-directory: apps/flutter_client
         run: >
-          flutter build ios
+          bash ../../scripts/release/build_flutter_client.sh ios
           --release
           --no-codesign
           --split-debug-info build/symbols/ios-arm64
@@ -258,11 +271,24 @@ jobs:
           ditto "$app" "$payload/Payload/P2WLAN.app"
           (cd "$payload" && zip -qry "$GITHUB_WORKSPACE/dist-release/p2wlan-ios-arm64-unsigned.ipa" Payload)
 
+      - name: Bind iOS artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-ios-arm64-unsigned.ipa
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform ios
+          --arch arm64
+          --identity client-stamped
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2wlan-ios-arm64-unsigned
-          path: dist-release/p2wlan-ios-arm64-unsigned.ipa
+          path: |
+            dist-release/p2wlan-ios-arm64-unsigned.ipa
+            dist-release/p2wlan-ios-arm64-unsigned.ipa.metadata.json
 
   flutter-macos:
     needs: quality-gate
@@ -307,7 +333,7 @@ jobs:
       - name: Build macOS release app
         working-directory: apps/flutter_client
         run: >
-          flutter build macos
+          bash ../../scripts/release/build_flutter_client.sh macos
           --release
           --split-debug-info build/symbols/macos
 
@@ -356,11 +382,24 @@ jobs:
             -format UDZO \
             "dist-release/p2wlan-macos-${{ matrix.arch }}.dmg"
 
+      - name: Bind macOS artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform macos
+          --arch ${{ matrix.arch }}
+          --identity client-stamped-daemon-verified
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2wlan-macos-${{ matrix.arch }}
-          path: dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
+          path: |
+            dist-release/p2wlan-macos-${{ matrix.arch }}.dmg
+            dist-release/p2wlan-macos-${{ matrix.arch }}.dmg.metadata.json
 
   flutter-linux:
     needs: quality-gate
@@ -415,7 +454,7 @@ jobs:
       - name: Build Linux release bundle
         working-directory: apps/flutter_client
         run: >
-          flutter build linux
+          bash ../../scripts/release/build_flutter_client.sh linux
           --release
           --target-platform ${{ matrix.target_platform }}
           --split-debug-info build/symbols/linux-${{ matrix.arch }}
@@ -445,11 +484,24 @@ jobs:
             --expected-commit "$GITHUB_SHA"
           tar -C "$bundle_dir" -czf "dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz" .
 
+      - name: Bind Linux artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform linux
+          --arch ${{ matrix.arch }}
+          --identity client-stamped-daemon-verified
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2wlan-linux-${{ matrix.arch }}
-          path: dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
+          path: |
+            dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz
+            dist-release/p2wlan-linux-${{ matrix.arch }}.tar.gz.metadata.json
 
   flutter-windows:
     needs: quality-gate
@@ -592,11 +644,24 @@ jobs:
           "@ | Set-Content -Path $iss -Encoding UTF8
           & $iscc $iss
 
+      - name: Bind Windows artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform windows
+          --arch ${{ matrix.arch }}
+          --identity client-stamped-daemon-verified
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: p2wlan-windows-${{ matrix.arch }}-setup
-          path: dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
+          path: |
+            dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe
+            dist-release/p2wlan-windows-${{ matrix.arch }}-setup.exe.metadata.json
 
   linux-cli:
     needs: quality-gate
@@ -677,6 +742,17 @@ jobs:
             sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           )
 
+      - name: Bind Linux CLI artifact identity
+        shell: bash
+        run: >
+          python3 scripts/release/write_artifact_metadata.py
+          --artifact dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz
+          --source-sha "$GITHUB_SHA"
+          --tag "$GITHUB_REF_NAME"
+          --platform linux-cli
+          --arch ${{ matrix.arch }}
+          --identity rust-source-bound
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -684,6 +760,7 @@ jobs:
           path: |
             dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz
             dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.sha256
+            dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.metadata.json
 
   publish:
     name: Publish complete client release
@@ -740,7 +817,23 @@ jobs:
           P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release upload "$P2WLAN_RELEASE_TAG" release-assets/* \
+          public_assets=(
+            release-assets/p2wlan-android-arm64-release.apk
+            release-assets/p2wlan-ios-arm64-unsigned.ipa
+            release-assets/p2wlan-linux-arm64-cli.tar.gz
+            release-assets/p2wlan-linux-arm64-cli.tar.gz.sha256
+            release-assets/p2wlan-linux-x64-cli.tar.gz
+            release-assets/p2wlan-linux-x64-cli.tar.gz.sha256
+            release-assets/p2wlan-linux-x64.tar.gz
+            release-assets/p2wlan-macos-arm64.dmg
+            release-assets/p2wlan-macos-x64.dmg
+            release-assets/p2wlan-windows-x64-setup.exe
+            release-assets/RELEASE-MANIFEST.json
+          )
+          for asset in "${public_assets[@]}"; do
+            test -f "$asset" || { echo "missing public release asset: $asset" >&2; exit 1; }
+          done
+          gh release upload "$P2WLAN_RELEASE_TAG" "${public_assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
