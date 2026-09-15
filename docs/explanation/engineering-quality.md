@@ -78,7 +78,7 @@ UDP 的 `core.rs` 和 `dynamic_punch.rs` 使用真正的 Rust 子模块，而不
 
     python3 scripts/quality/check_code_health.py --base-ref main
 
-当前例外仅覆盖 `lib/daemon/control_events.rs`、`lib/direct_runtime/hard_hard.rs`、`lib/direct_runtime/hole_punch.rs`、`peer/manager/peers.rs`、`peer/manager/relay.rs` 及 `lib/tests/part03.rs`、`part07.rs`。这些仍是待治理的历史债务。文件回落到统一预算后必须删除例外；缺失文件或过时例外也会让门禁失败。
+当前没有例外：daemon 控制事件、direct_runtime 打洞、peer manager 与两个测试热点都已回落到统一预算。文件回落到统一预算后必须删除例外；缺失文件或过时例外也会让门禁失败。
 
 ## 精确测试选择
 

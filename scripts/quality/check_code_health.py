@@ -13,15 +13,10 @@ from typing import Mapping
 ROOT = Path(__file__).resolve().parents[2]
 RUST_PRODUCTION_MAX_BYTES = 96 * 1024
 RUST_TEST_MAX_BYTES = 192 * 1024
-LEGACY_RUST_BYTE_CEILINGS = {
-    "client/daemon/src/lib/daemon/control_events.rs": 216_949,
-    "client/daemon/src/lib/direct_runtime/hard_hard.rs": 229_837,
-    "client/daemon/src/lib/direct_runtime/hole_punch.rs": 113_960,
-    "client/daemon/src/peer/manager/peers.rs": 103_077,
-    "client/daemon/src/peer/manager/relay.rs": 149_242,
-    "client/daemon/src/lib/tests/part03.rs": 340_275,
-    "client/daemon/src/lib/tests/part07.rs": 203_948,
-}
+# No file is currently above the shared budgets. The mechanism is kept:
+# a file that needs a temporary ceiling is listed here, and the entry must
+# be deleted as soon as the file falls back to the shared budget.
+LEGACY_RUST_BYTE_CEILINGS: dict[str, int] = {}
 
 
 def source_size(data: bytes) -> int:
@@ -53,6 +48,8 @@ def base_sizes(root: Path, ref: str) -> dict[str, int]:
         ["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
         cwd=root, check=True, capture_output=True, text=True,
     ).stdout.strip()
+    if not LEGACY_RUST_BYTE_CEILINGS:
+        return {}
     result = subprocess.run(
         ["git", "ls-tree", "-r", "-l", "-z", commit, "--", *LEGACY_RUST_BYTE_CEILINGS],
         cwd=root, check=True, capture_output=True,
