@@ -1,111 +1,122 @@
 #!/usr/bin/env python3
-"""Enforce P2WLAN code-health ratchets without pretending legacy debt is gone.
-
-The policy is intentionally monotonic: known oversized production modules may
-shrink, but they may not grow. New production modules must stay below the
-shared size budget so future features are forced behind explicit boundaries.
-"""
+"""Check source-size budgets; this is not a proof of runtime correctness."""
 
 from __future__ import annotations
 
+import argparse
+import os
 import subprocess
+import sys
 from pathlib import Path
+from typing import Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
-
-# Production Rust files larger than this must either be split or appear in the
-# legacy ratchet below. Tests are governed separately because large scenario
-# suites are less dangerous than large state-owning production modules.
 RUST_PRODUCTION_MAX_BYTES = 96 * 1024
 RUST_TEST_MAX_BYTES = 192 * 1024
-
-# These are debt ceilings, not targets. Lowering a ceiling after a split is
-# encouraged; raising one is a policy regression and should require a visible
-# review of this file.
 LEGACY_RUST_BYTE_CEILINGS = {
-    "client/daemon/src/transport.rs": 278_683,
-    "client/daemon/src/dplpmtud.rs": 231_770,
-    "client/daemon/src/network_outbound.rs": 156_974,
-    "client/daemon/src/relay_runtime.rs": 125_879,
-    "client/daemon/src/udp/core.rs": 133_201,
-    "client/daemon/src/udp/dynamic_punch.rs": 207_336,
+    "client/daemon/src/lib/daemon/control_events.rs": 216_949,
+    "client/daemon/src/lib/direct_runtime/hard_hard.rs": 229_837,
+    "client/daemon/src/lib/direct_runtime/hole_punch.rs": 113_960,
+    "client/daemon/src/peer/manager/peers.rs": 103_077,
+    "client/daemon/src/peer/manager/relay.rs": 149_242,
+    "client/daemon/src/lib/tests/part03.rs": 340_372,
+    "client/daemon/src/lib/tests/part07.rs": 203_948,
 }
 
 
-def tracked_files() -> list[Path]:
+def source_size(data: bytes) -> int:
+    return len(data.replace(b"\r\n", b"\n"))
+
+
+def is_rust_test(relative: str) -> bool:
+    path = Path(relative)
+    return "tests" in path.parts or path.name == "tests.rs" or path.name.startswith("test_")
+
+
+def tracked_sizes(root: Path) -> dict[str, int]:
     result = subprocess.run(
-        ["git", "ls-files", "-z"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
+        ["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True
     )
-    return [
-        ROOT / raw.decode("utf-8")
-        for raw in result.stdout.split(b"\0")
-        if raw
-    ]
-
-
-def is_rust_test(path: Path, relative: str) -> bool:
-    return (
-        "/tests/" in f"/{relative}/"
-        or relative.endswith("/tests.rs")
-        or path.name.startswith("test_")
-    )
-
-
-def main() -> int:
-    errors: list[str] = []
-    rust_files = 0
-
-    for path in tracked_files():
-        if not path.is_file() or path.suffix != ".rs":
+    sizes = {}
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
             continue
-        rust_files += 1
-        relative = path.relative_to(ROOT).as_posix()
-        size = path.stat().st_size
+        relative = os.fsdecode(raw)
+        path = root / relative
+        if path.suffix == ".rs" and path.is_file():
+            sizes[relative] = source_size(path.read_bytes())
+    return sizes
 
-        if relative in LEGACY_RUST_BYTE_CEILINGS:
-            ceiling = LEGACY_RUST_BYTE_CEILINGS[relative]
-            if size > ceiling:
-                errors.append(
-                    f"{relative}: {size} bytes exceeds legacy ratchet {ceiling}; "
-                    "split responsibilities instead of raising the ceiling"
-                )
-        elif is_rust_test(path, relative):
-            if size > RUST_TEST_MAX_BYTES:
-                errors.append(
-                    f"{relative}: {size} bytes exceeds test-file budget "
-                    f"{RUST_TEST_MAX_BYTES}; split scenarios by behavior"
-                )
-        elif size > RUST_PRODUCTION_MAX_BYTES:
-            errors.append(
-                f"{relative}: {size} bytes exceeds production-module budget "
-                f"{RUST_PRODUCTION_MAX_BYTES}; introduce a focused submodule"
-            )
 
-    missing = [
-        relative
-        for relative in LEGACY_RUST_BYTE_CEILINGS
-        if not (ROOT / relative).is_file()
-    ]
-    if missing:
-        errors.extend(
-            f"legacy ratchet references missing file {relative}; remove the obsolete ceiling"
-            for relative in missing
-        )
+def base_sizes(root: Path, ref: str) -> dict[str, int]:
+    commit = subprocess.run(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    result = subprocess.run(
+        ["git", "ls-tree", "-r", "-l", "-z", commit, "--", *LEGACY_RUST_BYTE_CEILINGS],
+        cwd=root, check=True, capture_output=True,
+    )
+    sizes = {}
+    for record in result.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, relative = record.split(b"\t", 1)
+        _, kind, blob, _ = metadata.split()
+        if kind == b"blob":
+            content = subprocess.run(
+                ["git", "cat-file", "blob", blob.decode("ascii")],
+                cwd=root, check=True, capture_output=True,
+            ).stdout
+            sizes[os.fsdecode(relative)] = source_size(content)
+    return sizes
 
+
+def validate_sizes(
+    sizes: Mapping[str, int],
+    legacy: Mapping[str, int],
+    baseline: Mapping[str, int] | None = None,
+) -> list[str]:
+    errors = []
+    for relative, size in sorted(sizes.items()):
+        budget = RUST_TEST_MAX_BYTES if is_rust_test(relative) else RUST_PRODUCTION_MAX_BYTES
+        ceiling = legacy.get(relative, budget)
+        if relative in legacy:
+            if size <= budget:
+                errors.append(f"{relative}: remove the obsolete legacy exception (now within {budget} bytes)")
+            if baseline is not None:
+                if relative not in baseline:
+                    errors.append(f"{relative}: a new legacy exception has no file in the base revision")
+                else:
+                    ceiling = min(ceiling, baseline[relative])
+        if size > ceiling:
+            errors.append(f"{relative}: {size} bytes exceeds {ceiling}; split responsibilities instead of raising the budget")
+    for relative in sorted(legacy.keys() - sizes.keys()):
+        errors.append(f"{relative}: legacy file is missing; remove the obsolete exception")
+    return errors
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-ref", default=os.environ.get("P2WLAN_QUALITY_BASE") or None)
+    args = parser.parse_args(argv)
+    ref = args.base_ref
+    if ref == "0" * 40:
+        ref = None
+    try:
+        sizes = tracked_sizes(ROOT)
+        baseline = base_sizes(ROOT, ref) if ref else None
+        errors = validate_sizes(sizes, LEGACY_RUST_BYTE_CEILINGS, baseline)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"FAIL code health policy: cannot inspect the repository: {error}", file=sys.stderr)
+        return 1
     if errors:
         print("FAIL code health policy")
         for error in errors:
             print(f"- {error}")
         return 1
-
-    print(
-        "PASS code health policy "
-        f"({rust_files} Rust files; production max {RUST_PRODUCTION_MAX_BYTES} bytes; "
-        f"{len(LEGACY_RUST_BYTE_CEILINGS)} legacy ratchets)"
-    )
+    comparison = "base-relative ratchet" if baseline is not None else "static ceilings"
+    print(f"PASS code health policy ({len(sizes)} Rust files; {len(LEGACY_RUST_BYTE_CEILINGS)} legacy exceptions; {comparison})")
     return 0
 
 

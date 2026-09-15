@@ -17,7 +17,7 @@
 <!-- 列出实际运行的命令和结果，不要把未运行的检查写成通过。 -->
 
 - [ ] `python3 scripts/docs/verify_repository.py`
-- [ ] `python3 scripts/quality/check_code_health.py`
+- [ ] `python3 scripts/quality/check_code_health.py --base-ref main`
 - [ ] `cargo fmt --all --check`
 - [ ] 受影响 Rust 测试 / clippy
 - [ ] 受影响 Go 测试 / vet

@@ -448,7 +448,7 @@ async fn committed_dynamic_socket_for_send_test(
         handoff
             .commit_and_pin(transport, peer_id, socket_index, 0, 1)
             .await
-            .committed
+            .committed()
     );
     assert!(handoff.finalize().await);
     assert!(
@@ -1058,7 +1058,7 @@ async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends()
         handoff
             .commit_and_pin(&transport, "peer-b", socket_index, 0, 1)
             .await
-            .committed
+            .committed()
     );
     assert!(handoff.finalize().await);
     transport
@@ -1290,7 +1290,7 @@ async fn provisional_socket_guard_detaches_only_when_abandoned() {
     let outcome = guard
         .commit_and_pin(&transport, "peer-b", committed_index, 0, 2)
         .await;
-    assert!(outcome.committed, "provisional socket must commit");
+    assert!(outcome.committed(), "provisional socket must commit");
     cancellation.cancel();
     drop(guard);
     timeout(Duration::from_secs(2), async {
@@ -1328,7 +1328,7 @@ async fn provisional_socket_guard_detaches_only_when_abandoned() {
     let outcome = guard
         .commit_and_pin(&transport, "peer-b", final_index, 0, 3)
         .await;
-    assert!(outcome.committed, "the final generation must commit");
+    assert!(outcome.committed(), "the final generation must commit");
     guard.finalize().await;
     cancellation.cancel();
     drop(guard);
@@ -1953,7 +1953,7 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
             guard
                 .commit_and_pin(&transport, peer_id, index, 0, 1)
                 .await
-                .committed,
+                .committed(),
             "committed socket must pin the peer"
         );
         transport
@@ -1974,7 +1974,7 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
         guard9
             .commit_and_pin(&transport, "peer-9", index9, 0, 1)
             .await
-            .committed
+            .committed()
     );
     transport
         .remember_peer_socket("peer-9", index9, SocketEvidence::Stamped(0))
@@ -2053,7 +2053,7 @@ async fn network_generation_change_detaches_dynamic_socket_on_next_use() {
         guard
             .commit_and_pin(&transport, "peer-b", index, 0, 1)
             .await
-            .committed
+            .committed()
     );
     transport
         .remember_peer_socket("peer-b", index, SocketEvidence::Stamped(0))
@@ -2272,7 +2272,7 @@ async fn cancelled_provisional_commit_never_succeeds_and_cleans_up() {
             !guard
                 .commit_and_pin(&transport, "peer-b", index, 0, 1)
                 .await
-                .committed,
+                .committed(),
             "a cancelled session must never commit its provisional socket"
         );
     })
@@ -2326,7 +2326,7 @@ async fn concurrent_watcher_and_commit_agree_on_ownership() {
                 guard
                     .commit_and_pin(&transport, "peer-b", index, 0, 10 + round as u64)
                     .await
-                    .committed
+                    .committed()
             })
             .await
             .expect("commit_and_pin must not deadlock against the watcher");
@@ -2370,7 +2370,7 @@ async fn concurrent_watcher_and_commit_agree_on_ownership() {
                 guard
                     .commit_and_pin(&transport, "peer-b", index, 0, 10 + round as u64)
                     .await
-                    .committed
+                    .committed()
             })
             .await
             .expect("commit_and_pin must not deadlock against the watcher");
@@ -2739,7 +2739,7 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
         predecessor_guard
             .commit_and_pin(&transport, "peer-0", predecessor_index, 0, 1)
             .await
-            .committed
+            .committed()
     );
     transport
         .remember_peer_socket("peer-0", predecessor_index, SocketEvidence::Stamped(0))
@@ -3091,7 +3091,7 @@ async fn stale_watcher_never_detaches_new_incarnation_socket() {
         new_guard
             .commit_and_pin(&transport, "peer-b", new_index, 0, 2)
             .await
-            .committed,
+            .committed(),
         "the new incarnation socket must commit"
     );
     new_guard.finalize().await;
@@ -3188,7 +3188,7 @@ async fn cancelled_after_commit_restores_predecessor_pin() {
     let outcome_a = guard_a
         .commit_and_pin(&transport, "peer-b", index_a, 0, 1)
         .await;
-    assert!(outcome_a.committed);
+    assert!(outcome_a.committed());
     guard_a.finalize().await;
     assert_eq!(
         transport.dynamic_socket_index_for_peer("peer-b").await,
@@ -3206,12 +3206,12 @@ async fn cancelled_after_commit_restores_predecessor_pin() {
     let outcome_b = guard_b
         .commit_and_pin(&transport, "peer-b", index_b, 0, 2)
         .await;
-    assert!(outcome_b.committed);
+    assert!(outcome_b.committed());
     let predecessor = outcome_b
-        .predecessor
+        .predecessor()
         .expect("pin A must be the predecessor");
     assert_eq!(predecessor.socket_index, index_a);
-    let installed_b = outcome_b.installed.expect("commit must install a pin");
+    let installed_b = outcome_b.installed().expect("commit must install a pin");
 
     // The session is cancelled after the commit: the watcher rolls back —
     // restores the predecessor pin, then detaches the cancelled generation's
@@ -3276,7 +3276,7 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
         guard_1
             .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
             .await
-            .committed
+            .committed()
     );
     guard_1.finalize().await;
 
@@ -3290,7 +3290,7 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
     let outcome_2 = guard_2
         .commit_and_pin(&transport, "peer-b", index_2, 0, 2)
         .await;
-    assert!(outcome_2.committed);
+    assert!(outcome_2.committed());
 
     // G3 commits on top of G2 (predecessor = G2's pin).
     let (index_3, socket_3) = transport.bind_fresh_punch_socket().await.unwrap();
@@ -3301,13 +3301,13 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
     let outcome_3 = guard_3
         .commit_and_pin(&transport, "peer-b", index_3, 0, 3)
         .await;
-    assert!(outcome_3.committed, "G3 must commit");
+    assert!(outcome_3.committed(), "G3 must commit");
     assert_eq!(
-        outcome_3.predecessor.map(|pin| pin.socket_index),
+        outcome_3.predecessor().map(|pin| pin.socket_index),
         Some(index_2),
         "G3's predecessor is G2's pin"
     );
-    let installed_3 = outcome_3.installed.expect("G3 installed a pin");
+    let installed_3 = outcome_3.installed().expect("G3 installed a pin");
 
     // G2's session is cancelled after G3 committed: G2's rollback must be
     // skipped (the affinity no longer equals G2's installed pin) and G3's pin
@@ -3400,7 +3400,7 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         guard
             .commit_and_pin(&transport, "peer-b", index, 0, 1)
             .await
-            .committed
+            .committed()
     );
     transport
         .remember_peer_socket("peer-b", index, SocketEvidence::Fresh)
@@ -3431,7 +3431,7 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         guard_c
             .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
             .await
-            .committed
+            .committed()
     );
     transport
         .remember_peer_socket("peer-b", index_c, SocketEvidence::Fresh)
@@ -3459,7 +3459,7 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         guard_old
             .commit_and_pin(&transport, "peer-b", index_old, 0, 2)
             .await
-            .committed
+            .committed()
     );
     let committed_epoch = {
         let state = transport.socket_state.lock().await;
@@ -3523,7 +3523,7 @@ async fn detached_dynamic_socket_fallback_ack_still_matches_on_actual_socket() {
         guard
             .commit_and_pin(&transport, "peer-b", index, 0, 1)
             .await
-            .committed
+            .committed()
     );
 
     let endpoint: SocketAddr = "127.0.0.1:59999".parse().unwrap();
@@ -3933,7 +3933,7 @@ async fn network_generation_change_between_punch_and_commit_refuses_commit() {
         .commit_and_pin(&transport, "peer-b", index, 0, 1)
         .await;
     assert!(
-        !outcome.committed,
+        !outcome.committed(),
         "a generation whose network changed before the commit must be refused"
     );
     assert_eq!(
@@ -3977,7 +3977,7 @@ async fn resolve_then_detach_ack_still_matches() {
         guard
             .commit_and_pin(&transport, "peer-b", index, 0, 1)
             .await
-            .committed
+            .committed()
     );
     guard.finalize().await;
 
@@ -4110,7 +4110,7 @@ async fn cross_peer_dynamic_socket_index_refused() {
         guard_c
             .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
             .await
-            .committed
+            .committed()
     );
 
     // peer-b asks to send through peer-c's dynamic index: the resolver must
@@ -4658,7 +4658,7 @@ async fn finalized_socket_survives_immediate_guard_drop() {
         guard
             .commit_and_pin(&transport, "peer-b", index, 0, 1)
             .await
-            .committed
+            .committed()
     );
 
     // The durable handoff completes BEFORE the cancellation is even fired:
@@ -4713,7 +4713,7 @@ async fn rollback_keeps_repinned_socket_as_durable() {
     let outcome = guard
         .commit_and_pin(&transport, "peer-b", index, 0, 1)
         .await;
-    assert!(outcome.committed);
+    assert!(outcome.committed());
 
     // Fresh inbound evidence re-pins the SAME socket (a new epoch, so the
     // full-pin comparison the old code used would have failed to recognize
@@ -4722,7 +4722,7 @@ async fn rollback_keeps_repinned_socket_as_durable() {
         .remember_peer_socket(
             "peer-b",
             index,
-            SocketEvidence::Stamped(outcome.installed.expect("installed pin").epoch),
+            SocketEvidence::Stamped(outcome.installed().expect("installed pin").epoch),
         )
         .await;
     let repinned_epoch = {
@@ -4730,7 +4730,7 @@ async fn rollback_keeps_repinned_socket_as_durable() {
         state.affinity.get("peer-b").map(|pin| pin.epoch).unwrap()
     };
     assert!(
-        repinned_epoch > outcome.installed.expect("installed pin").epoch,
+        repinned_epoch > outcome.installed().expect("installed pin").epoch,
         "the fresh re-pin must carry a newer epoch"
     );
 
@@ -4779,7 +4779,7 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
         guard_1
             .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
             .await
-            .committed
+            .committed()
     );
     guard_1.finalize().await;
 
@@ -4794,7 +4794,7 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
         guard_2
             .commit_and_pin(&transport, "peer-b", index_2, 0, 2)
             .await
-            .committed
+            .committed()
     );
     let (index_3, socket_3) = transport.bind_fresh_punch_socket().await.unwrap();
     let guard_3 = transport
@@ -4804,7 +4804,7 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
     let outcome_3 = guard_3
         .commit_and_pin(&transport, "peer-b", index_3, 0, 3)
         .await;
-    assert!(outcome_3.committed);
+    assert!(outcome_3.committed());
 
     // G2 is cancelled: its rollback must detach G2's OWN socket (the affinity
     // belongs to G3) and must NOT touch G3's pin.
@@ -4866,7 +4866,7 @@ async fn detach_keeps_reader_alive_until_pending_probe_ack() {
         guard
             .commit_and_pin(&transport, "peer-b", index, 0, 1)
             .await
-            .committed
+            .committed()
     );
     guard.finalize().await;
 

@@ -58,20 +58,37 @@ Rust crate 用于隔离可复用协议/平台能力，daemon 内部子模块用�
 
 反过来，如果两个模块需要频繁互相读取内部字段、共享锁或循环调用，应重新确定状态所有者，而不是增加更多 facade。
 
-## 当前复杂度棘轮
+## Daemon 模块归属
 
-`scripts/quality/check_code_health.py` 是可执行复杂度策略。普通 Rust 生产模块不得超过共享预算；当前已经超出预算的历史热点采用“只降不升”的字节上限。它们不是允许永久保留的大文件，而是待拆分债务：
+DPLPMTUD 的尺寸换算、路径身份、wire 编解码和 reducer 分别位于 `dplpmtud/sizes.rs`、`identity.rs`、`wire.rs`、`state_machine.rs`。`runtime.rs` 负责 worker 生命周期和 budget publication，不再维护第二份 reducer 判定。测试按相同边界分组。
 
-- `client/daemon/src/transport.rs`：拆出 session registry / responder lifecycle、validation framing、inbound decrypt/evidence、outbound encryption/order gate；
-- `client/daemon/src/dplpmtud.rs`：拆出 wire format、path identity、budget publication、runtime state machine，并把大体量测试迁到独立测试模块；
-- `client/daemon/src/network_outbound.rs`：拆出 per-peer queue actor、Direct sender、Relay sender、fast-path cache 与 accounting；
-- `client/daemon/src/relay_runtime.rs`：拆出 connection lifecycle、peer stream/session、backpressure 与 reconnect policy；
-- `client/daemon/src/udp/core.rs`：把 `UdpTransport` 的 publication/socket ownership 与 Direct validation、DPLPMTUD、probe budgeting、NAT maintainer 等能力拆成明确 owned components，避免继续扩大单一状态聚合体；
-- `client/daemon/src/udp/dynamic_punch.rs`：按 provisional socket lifecycle、fresh-mapping measurement、adaptive prediction、Hard↔Hard wave orchestration 和 diagnostics 拆分，保留 network-generation 与 cancellation fencing。
+`transport/sessions.rs` 拥有 active、previous 与 pending 会话。加密和解密是这个模块的子模块，共享同一份会话状态；外部接收循环不能直接修改会话字段。接收索引不是唯一身份，同一个 peer 的多个 pending key 匹配索引时，必须逐个验证认证结果，并仅提升通过认证且通过 fencing 的精确 token/session instance。重放错误按 `WireGuardError` 变体分类，不能匹配错误文本。
 
-接近预算但尚未越线的状态机模块也应保持只降不升的趋势；例如 `peer/path_state_machine.rs` 不应再承担与路径状态转移无关的新职责。
+`network_outbound/queue.rs` 拥有 pending FIFO 和 per-peer 调度，`fast_path.rs` 拥有快路径缓存，`send.rs` 负责加密与 handoff，Direct 和 Relay 发送分开。超过单队列总字节上限的单包直接丢弃，不能先驱逐有效队列再接纳超限包。
 
-拆分必须保持原有类型语义和测试，不以“先移动再修”为理由同时改变协议行为。每次拆分后应降低对应 ratchet ceiling，直到该条目可以从 legacy 列表删除。
+`relay_runtime/connection.rs` 保持连接及 renewal 生命周期的单一所有者；`supervisor.rs` 决定重连，`write_boundary.rs` 封装写入许可，validation 与 probe 调度使用独立模块。
+
+UDP 的 `core.rs` 和 `dynamic_punch.rs` 使用真正的 Rust 子模块，而不是文本 include。`UdpTransport` 仍是进程内共享的权威状态，不能为拆分另建平行状态副本。socket registry、business MTU、peer cleanup、Direct validation、diagnostics、learning cache、provisional socket lifecycle、birthday wave 和 punch sender 按职责分组；可变 cache/guard 内部字段留在所属模块。模块划分不代表所有函数复杂度或真实设备风险已消除。
+
+## 源码体积与增长门禁
+
+`scripts/quality/check_code_health.py` 检查 Rust 源码体积：普通生产文件上限为 96 KiB，独立测试文件为 192 KiB，按 LF 规范化字节计算。体积是审查提示，不是圈复杂度、耦合度或正确性的证明；不得靠删注释、压行或移动同一状态的访问点来满足门禁。
+
+历史超限文件在脚本中有明确上限。CI 通过 `P2WLAN_QUALITY_BASE` 指定 PR 基线或 push 前提交，取静态上限与基线文件大小的较小值，因此已缩小的文件不能在后续 PR 中重新增长。离线运行未指定 `--base-ref` 时只检查静态上限；本地完整比较使用：
+
+    python3 scripts/quality/check_code_health.py --base-ref main
+
+当前例外仅覆盖 `lib/daemon/control_events.rs`、`lib/direct_runtime/hard_hard.rs`、`lib/direct_runtime/hole_punch.rs`、`peer/manager/peers.rs`、`peer/manager/relay.rs` 及 `lib/tests/part03.rs`、`part07.rs`。这些仍是待治理的历史债务。文件回落到统一预算后必须删除例外；缺失文件或过时例外也会让门禁失败。
+
+## 精确测试选择
+
+选定 Rust 场景由 `scripts/quality/run_rust_tests.py` 执行。它从 Cargo 本次构建输出获取测试程序，而不是按文件修改时间猜测二进制；在运行前枚举测试，拒绝零匹配和仅匹配 ignored 的选择，并核对实际执行数量。Hard↔Hard 场景使用 `--each` 保持进程隔离。
+
+    python3 scripts/quality/run_rust_tests.py dplpmtud
+    python3 scripts/quality/run_rust_tests.py hard_hard_ --each
+    python3 scripts/quality/run_rust_tests.py transport::tests::pending_receiver_index_collision_tries_every_matching_key --exact
+
+测试模块改名必须同时更新 workflow、验收脚本和 evidence contract 的完整 test ID。失效过滤器不能视作通过，不得删除真实断言或降低测试数量来让流水线变绿。
 
 ## 变更审查
 

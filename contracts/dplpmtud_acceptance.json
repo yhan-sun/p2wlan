@@ -63,7 +63,7 @@
     {
       "scenario_id": "DP-06",
       "category": "silent_blackhole",
-      "test_id": "dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak",
+      "test_id": "dplpmtud::runtime::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak",
       "log_file": "dp-06-blackhole.log",
       "marker_required": false,
       "expected_decision": "verified",
@@ -99,7 +99,7 @@
     {
       "scenario_id": "DP-08",
       "category": "downward_recovery",
-      "test_id": "dplpmtud::tests::runtime_downward_recovery_withholds_budget_until_fresh_base_ack",
+      "test_id": "dplpmtud::runtime::tests::runtime_downward_recovery_withholds_budget_until_fresh_base_ack",
       "log_file": "dp-08-downward.log",
       "marker_required": false,
       "expected_decision": "verified",
@@ -115,7 +115,7 @@
     {
       "scenario_id": "DP-09",
       "category": "cancellation_relay_invalidation",
-      "test_id": "dplpmtud::tests::cancel_close_generation_and_relay_budget_invalidation_acceptance",
+      "test_id": "dplpmtud::runtime::tests::cancel_close_generation_and_relay_budget_invalidation_acceptance",
       "log_file": "dp-09-cancellation.log",
       "marker_required": false,
       "expected_decision": "verified",
@@ -132,7 +132,7 @@
     {
       "scenario_id": "DP-10",
       "category": "revision_aba_stale_duplicate",
-      "test_id": "dplpmtud::tests::budget_revision_is_monotonic_and_closes_identity_aba",
+      "test_id": "dplpmtud::runtime::tests::budget_revision_is_monotonic_and_closes_identity_aba",
       "log_file": "dp-10-revision.log",
       "marker_required": false,
       "expected_decision": "verified",

@@ -1385,16 +1385,7 @@ mod tests {
                 .await,
             ResponderSessionCommit::PendingConfirmation
         );
-        {
-            let mut sessions = transport.sessions.lock().await;
-            sessions
-                .get_mut("peer-a")
-                .unwrap()
-                .pending
-                .get_mut("expired-token")
-                .unwrap()
-                .expires_at = Instant::now();
-        }
+        transport.expire_pending_responder_for_test("peer-a", "expired-token").await;
 
         assert_eq!(
             transport
@@ -1501,16 +1492,7 @@ mod tests {
                 .await,
             ResponderSessionCommit::PendingConfirmation
         );
-        {
-            let mut sessions = transport.sessions.lock().await;
-            sessions
-                .get_mut("peer-a")
-                .unwrap()
-                .pending
-                .get_mut("expired-before-initiator")
-                .unwrap()
-                .expires_at = Instant::now();
-        }
+        transport.expire_pending_responder_for_test("peer-a", "expired-before-initiator").await;
         assert!(
             !transport
                 .session_status("peer-a")
@@ -1562,16 +1544,7 @@ mod tests {
                 ResponderSessionConfirmation::Promoted
             );
         }
-        {
-            let mut sessions = transport.sessions.lock().await;
-            sessions
-                .get_mut("peer-a")
-                .unwrap()
-                .previous
-                .as_mut()
-                .unwrap()
-                .expires_at = Instant::now();
-        }
+        transport.expire_previous_session_for_test("peer-a").await;
 
         assert_eq!(
             transport
@@ -4669,5 +4642,49 @@ mod tests {
             .expect("a fresh packet must still decrypt after hedge duplicates")
             .expect("fresh packet decrypts");
         assert_eq!(next.peer_id, "peer-b");
+    }
+
+    #[test]
+    fn replay_classification_uses_the_error_variant_not_its_message() {
+        assert!(is_replay_decrypt_error(&WireGuardError::ReplayDetected(7)));
+        assert!(!is_replay_decrypt_error(&WireGuardError::InvalidPacket(
+            "replay detected".to_string(),
+        )));
+        assert!(!InboundDecryptError::Parse(WireGuardError::ReplayDetected(7)).is_replay());
+    }
+
+    #[tokio::test]
+    async fn pending_receiver_index_collision_tries_every_matching_key() {
+        let (transport, _outbound_rx) = WireGuardTransport::new();
+        let mut senders = HashMap::new();
+        for number in 1u8..=3 {
+            let token = format!("collision-{number}");
+            let local = TransportSession::new(p2pnet_wireguard::TransportKeyPair {
+                send_key: [number; 32],
+                recv_key: [number + 10; 32],
+                our_index: 77,
+                peer_index: 88,
+            });
+            let remote = TransportSession::new(p2pnet_wireguard::TransportKeyPair {
+                send_key: [number + 10; 32],
+                recv_key: [number; 32],
+                our_index: 88,
+                peer_index: 77,
+            });
+            assert!(matches!(
+                transport.stage_responder_session("peer", token.clone(), local).await,
+                ResponderSessionStage::Staged { .. },
+            ));
+            senders.insert(token, remote);
+        }
+        let token = transport.last_pending_responder_token_for_test("peer").await;
+        let plaintext = b"authenticated-last-colliding-key";
+        let encrypted = senders.get_mut(&token).unwrap().encrypt(plaintext).unwrap().to_bytes();
+        let inbound = transport.decrypt_inbound(&encrypted).await.unwrap().unwrap();
+        assert_eq!(inbound.peer_id, "peer");
+        assert_eq!(inbound.packet, plaintext);
+        assert!(!inbound.from_previous_session);
+        assert_eq!(transport.active_responder_token_for_test("peer").await.as_deref(), Some(token.as_str()));
+        assert_eq!(transport.session_status("peer").await.pending_responder_count, 0);
     }
 }

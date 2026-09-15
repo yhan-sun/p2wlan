@@ -42,27 +42,9 @@ jobs:
       - name: Rust Tests (general suite)
         run: cargo test --workspace --all-targets -- --test-threads=1 --skip hard_hard_
       - name: Rust Tests (Hard↔Hard isolated suite)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test -p p2wlan-daemon --lib --no-run
-          hard_hard_binary="$(find target/debug/deps -maxdepth 1 -type f -name 'p2pnet_daemon-*' -perm -111 -print0 | xargs -0 ls -t | head -n 1)"
-          if [ -z "$hard_hard_binary" ]; then
-            echo "Hard↔Hard test binary was not built" >&2
-            exit 1
-          fi
-          hard_hard_tests="$("$hard_hard_binary" hard_hard_ --list | sed -n 's/: test$//p')"
-          test_count="$(printf '%s\n' "$hard_hard_tests" | sed '/^$/d' | wc -l | tr -d ' ')"
-          if [ "$test_count" -eq 0 ]; then
-            echo "No Hard↔Hard tests discovered" >&2
-            exit 1
-          fi
-          while IFS= read -r test_name; do
-            [ -n "$test_name" ] || continue
-            "$hard_hard_binary" "$test_name" --exact --test-threads=1
-          done <<< "$hard_hard_tests"
+        run: python3 scripts/quality/run_rust_tests.py hard_hard_ --each
       - name: Linux route gate tests
-        run: "cargo test -p p2wlan-daemon --lib route::tests::"
+        run: "python3 scripts/quality/run_rust_tests.py route::tests::"
       - name: Rust Linux Target Cross-Compile Check
         run: |
           rustup target add x86_64-unknown-linux-gnu
@@ -108,28 +90,7 @@ jobs:
       - name: Rust Tests (Windows, general suite)
         run: cargo test --workspace -- --test-threads=1 --skip hard_hard_
       - name: Rust Tests (Windows, Hard↔Hard isolated suite)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          cargo test -p p2wlan-daemon --lib --no-run
-          $hardHardBinary = Get-ChildItem -Path 'target/debug/deps' -Filter 'p2pnet_daemon-*.exe' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if ($null -eq $hardHardBinary) {
-            throw 'Hard↔Hard test binary was not built'
-          }
-          $hardHardTests = @(& $hardHardBinary.FullName hard_hard_ --list |
-            Where-Object { $_ -match ': test$' } |
-            ForEach-Object { $_ -replace ': test$', '' })
-          if ($hardHardTests.Count -eq 0) {
-            throw 'No Hard↔Hard tests discovered'
-          }
-          foreach ($testName in $hardHardTests) {
-            & $hardHardBinary.FullName $testName --exact --test-threads=1
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
-          }
+        run: python scripts/quality/run_rust_tests.py hard_hard_ --each
 
   go:
     name: Go Check
@@ -152,13 +113,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Test quality gates
+        run: python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
       - name: Verify repository contracts
+        env:
+          P2WLAN_QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           python3 scripts/docs/verify_repository.py
           python3 scripts/quality/check_code_health.py
           bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
           sh -n scripts/install-linux-cli.sh
-          python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
+          python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/quality/run_rust_tests.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
           python3 scripts/release/test_release_set.py
           test -x apps/flutter_client/android/gradlew
           printf '%s  %s\n' 76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3 apps/flutter_client/android/gradle/wrapper/gradle-wrapper.jar | sha256sum -c -

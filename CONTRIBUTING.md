@@ -13,7 +13,8 @@
 ## 本地检查
 
     python3 scripts/docs/verify_repository.py
-    python3 scripts/quality/check_code_health.py
+    python3 scripts/quality/check_code_health.py --base-ref main
+    python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
     bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
     cargo fmt --all --check
     cargo test --workspace --all-targets -- --test-threads=1

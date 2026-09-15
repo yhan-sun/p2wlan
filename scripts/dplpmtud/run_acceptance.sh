@@ -29,8 +29,7 @@ run_exact() {
     cd "$ROOT_DIR"
     # Keep libtest's canonical `test <id> ... ok` status line intact while
     # still retaining successful test stdout for the machine-evidence parser.
-    cargo test -p p2wlan-daemon --lib "$test_id" -- \
-      --exact --show-output --test-threads=1
+    python3 scripts/quality/run_rust_tests.py "$test_id" --exact --show-output
   ) 2>&1 | tee "$OUT_DIR/logs/$log_file"
 }
 
@@ -45,15 +44,15 @@ run_exact dp-04-path-switch.log \
 run_exact dp-05-counters.log \
   tests::dplpmtud_final_typed_counters_use_bounded_labels
 run_exact dp-06-blackhole.log \
-  dplpmtud::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak
+  dplpmtud::runtime::tests::encrypted_udp_blackhole_converges_without_path_failure_or_worker_leak
 run_exact dp-07-business-e2e.log \
   tests::direct_business_budget_production_path_e2e
 run_exact dp-08-downward.log \
-  dplpmtud::tests::runtime_downward_recovery_withholds_budget_until_fresh_base_ack
+  dplpmtud::runtime::tests::runtime_downward_recovery_withholds_budget_until_fresh_base_ack
 run_exact dp-09-cancellation.log \
-  dplpmtud::tests::cancel_close_generation_and_relay_budget_invalidation_acceptance
+  dplpmtud::runtime::tests::cancel_close_generation_and_relay_budget_invalidation_acceptance
 run_exact dp-10-revision.log \
-  dplpmtud::tests::budget_revision_is_monotonic_and_closes_identity_aba
+  dplpmtud::runtime::tests::budget_revision_is_monotonic_and_closes_identity_aba
 
 python3 "$ROOT_DIR/scripts/dplpmtud/collect_evidence.py" \
   --contract "$ROOT_DIR/contracts/dplpmtud_acceptance.json" \
