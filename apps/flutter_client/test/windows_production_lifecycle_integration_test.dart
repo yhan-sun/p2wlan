@@ -108,6 +108,7 @@ Future<Map<String, dynamic>> _runUiStopCycle(
   var authTokenRemoved = false;
   var daemonProcessesClean = false;
   var detail = '';
+  List<_ProcessIdentity>? observedChildProcesses;
 
   try {
     await settingsStore.load();
@@ -157,6 +158,7 @@ Future<Map<String, dynamic>> _runUiStopCycle(
     startSucceeded = true;
     await statusStore.refresh(silent: true);
     expect(statusStore.daemonReachable, isTrue);
+    observedChildProcesses = await _observeDescendantProcesses(process.pid);
 
     final tray = DesktopTrayController(
       settingsStore: settingsStore,
@@ -172,7 +174,9 @@ Future<Map<String, dynamic>> _runUiStopCycle(
 
     exitCode = await process.exitCode.timeout(const Duration(seconds: 20));
     processExited = true;
-    survivingChildPids = await _survivingDescendants(process.pid);
+    survivingChildPids = await _survivingObservedDescendants(
+      observedChildProcesses,
+    );
     childrenGone = survivingChildPids.isEmpty;
     daemonProcessesClean = await _daemonProcessesClean();
     portReleased = await _loopbackPortReleased(port);
@@ -198,7 +202,9 @@ Future<Map<String, dynamic>> _runUiStopCycle(
           processExited = true;
         } catch (_) {}
       }
-      survivingChildPids = await _survivingDescendants(currentProcess.pid);
+      survivingChildPids = await _survivingObservedDescendants(
+        observedChildProcesses,
+      );
       childrenGone = survivingChildPids.isEmpty;
     }
     daemonProcessesClean = await _daemonProcessesClean();
@@ -291,49 +297,123 @@ Future<bool> _loopbackPortReleased(int port) async {
   }
 }
 
-/// Descendants of [rootPid] that are still alive after the bounded wait.
-///
-/// The embedded probe already serialises the surviving process ids; returning
-/// them (instead of only a boolean) is what makes a `children_gone` failure
-/// diagnosable after the fact.
-Future<List<int>> _survivingDescendants(int rootPid) async {
+class _ProcessIdentity {
+  const _ProcessIdentity({required this.pid, required this.creationTicks});
+
+  final int pid;
+  final int creationTicks;
+}
+
+/// Snapshot descendants while the daemon is alive, filtering out processes
+/// whose creation predates this daemon. Windows retains parent PID values after
+/// a process exits, so scanning only after exit can mistake an unrelated
+/// process (or a recycled PID) for a daemon child.
+Future<List<_ProcessIdentity>?> _observeDescendantProcesses(int rootPid) async {
   final script =
       r'''
-$deadline = [DateTime]::UtcNow.AddSeconds(5)
-do {
-  $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
-  $frontier = [System.Collections.Generic.Queue[int]]::new()
-  $frontier.Enqueue(__ROOT_PID__)
-  $descendants = [System.Collections.Generic.HashSet[int]]::new()
-  while ($frontier.Count -gt 0) {
-    $parent = $frontier.Dequeue()
-    foreach ($process in $all | Where-Object { [int]$_.ParentProcessId -eq $parent }) {
-      $child = [int]$process.ProcessId
-      if ($descendants.Add($child)) { $frontier.Enqueue($child) }
+$all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+$root = @($all | Where-Object { [int]$_.ProcessId -eq __ROOT_PID__ }) | Select-Object -First 1
+if (-not $root -or -not $root.CreationDate) { exit 2 }
+$rootCreation = $root.CreationDate.ToUniversalTime().AddSeconds(-2)
+$frontier = [System.Collections.Generic.Queue[int]]::new()
+$frontier.Enqueue(__ROOT_PID__)
+$seen = [System.Collections.Generic.HashSet[int]]::new()
+$records = [System.Collections.Generic.List[object]]::new()
+while ($frontier.Count -gt 0) {
+  $parent = $frontier.Dequeue()
+  foreach ($process in @($all | Where-Object { [int]$_.ParentProcessId -eq $parent })) {
+    if (-not $process.CreationDate) { continue }
+    $creation = $process.CreationDate.ToUniversalTime()
+    if ($creation -lt $rootCreation) { continue }
+    $child = [int]$process.ProcessId
+    if ($seen.Add($child)) {
+      $records.Add([ordered]@{
+          pid = $child
+          creation_ticks = [int64]$creation.Ticks
+        })
+      $frontier.Enqueue($child)
     }
   }
-  if ($descendants.Count -eq 0) { exit 0 }
-  Start-Sleep -Milliseconds 100
-} while ([DateTime]::UtcNow -lt $deadline)
-$descendants | ConvertTo-Json -Compress
-exit 1
+}
+if ($records.Count -eq 0) { Write-Output '[]'; exit 0 }
+$records | ConvertTo-Json -Compress
+exit 0
 '''
           .replaceFirst('__ROOT_PID__', '$rootPid');
   final result = await _runPowerShell(script);
-  if (result.exitCode == 0) {
-    return const <int>[];
-  }
   final text = '${result.stdout}'.trim();
-  if (text.isEmpty) {
-    // The probe failed without reporting survivors; record the failure without
-    // inventing an identity for it.
-    return const <int>[-1];
-  }
+  if (result.exitCode != 0 || text.isEmpty) return null;
   try {
     final decoded = jsonDecode(text);
-    if (decoded is int) {
-      return <int>[decoded];
+    final values = decoded is List ? decoded : <Object?>[decoded];
+    final identities = <_ProcessIdentity>[];
+    for (final value in values) {
+      if (value is! Map) return null;
+      final pid = value['pid'];
+      final creationTicks = value['creation_ticks'];
+      if (pid is! int || creationTicks is! int || pid <= 0) return null;
+      identities.add(_ProcessIdentity(pid: pid, creationTicks: creationTicks));
     }
+    return identities;
+  } on FormatException {
+    return null;
+  }
+}
+
+/// Wait for the identities observed while the daemon was alive to disappear.
+///
+/// Matching the creation time as well as the PID prevents a recycled PID from
+/// being reported as a surviving child. A failed probe returns a sentinel so
+/// the evidence remains fail-closed instead of silently passing.
+Future<List<int>> _survivingObservedDescendants(
+  List<_ProcessIdentity>? observed,
+) async {
+  if (observed == null) return const <int>[-1];
+  if (observed.isEmpty) return const <int>[];
+  final encoded = base64Encode(
+    utf8.encode(
+      jsonEncode(
+        observed
+            .map(
+              (process) => {
+                'pid': process.pid,
+                'creation_ticks': process.creationTicks,
+              },
+            )
+            .toList(growable: false),
+      ),
+    ),
+  );
+  final script =
+      r'''
+$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__OBSERVED__'))
+$observed = @(ConvertFrom-Json $json)
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+do {
+  $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+  $alive = @(
+    foreach ($item in $observed) {
+      $candidate = @($all | Where-Object { [int]$_.ProcessId -eq [int]$item.pid }) | Select-Object -First 1
+      if ($candidate -and $candidate.CreationDate) {
+        $ticks = [int64]$candidate.CreationDate.ToUniversalTime().Ticks
+        if ($ticks -eq [int64]$item.creation_ticks) { [int]$item.pid }
+      }
+    }
+  )
+  if ($alive.Count -eq 0) { Write-Output '[]'; exit 0 }
+  Start-Sleep -Milliseconds 100
+} while ([DateTime]::UtcNow -lt $deadline)
+$alive | ConvertTo-Json -Compress
+exit 1
+'''
+          .replaceFirst('__OBSERVED__', encoded);
+  final result = await _runPowerShell(script);
+  if (result.exitCode == 0) return const <int>[];
+  final text = '${result.stdout}'.trim();
+  if (text.isEmpty) return const <int>[-1];
+  try {
+    final decoded = jsonDecode(text);
+    if (decoded is int) return <int>[decoded];
     if (decoded is List) {
       return decoded.whereType<int>().toList(growable: false);
     }
