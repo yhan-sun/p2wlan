@@ -22,9 +22,9 @@ void main() {
     );
 
     expect(await registration.isEnabled(), isTrue);
-    expect(calls, [
-      ('reg.exe', ['query', registryKey, '/v', 'P2WLAN']),
-    ]);
+    expect(calls, hasLength(1));
+    expect(calls.single.$1, 'reg.exe');
+    expect(calls.single.$2, ['query', registryKey, '/v', 'P2WLAN']);
   });
 
   test('rejects stale Windows startup registration', () async {
@@ -52,21 +52,18 @@ void main() {
 
     await registration.setEnabled(true);
 
-    expect(calls, [
-      (
-        'reg.exe',
-        [
-          'add',
-          registryKey,
-          '/v',
-          'P2WLAN',
-          '/t',
-          'REG_SZ',
-          '/d',
-          expectedCommand,
-          '/f',
-        ],
-      ),
+    expect(calls, hasLength(1));
+    expect(calls.single.$1, 'reg.exe');
+    expect(calls.single.$2, [
+      'add',
+      registryKey,
+      '/v',
+      'P2WLAN',
+      '/t',
+      'REG_SZ',
+      '/d',
+      expectedCommand,
+      '/f',
     ]);
   });
 
@@ -82,8 +79,14 @@ void main() {
 
     await registration.setEnabled(false);
 
-    expect(calls, [
-      ('reg.exe', ['delete', registryKey, '/v', 'P2WLAN', '/f']),
+    expect(calls, hasLength(1));
+    expect(calls.single.$1, 'reg.exe');
+    expect(calls.single.$2, [
+      'delete',
+      registryKey,
+      '/v',
+      'P2WLAN',
+      '/f',
     ]);
   });
 
