@@ -81,13 +81,7 @@ void main() {
 
     expect(calls, hasLength(1));
     expect(calls.single.$1, 'reg.exe');
-    expect(calls.single.$2, [
-      'delete',
-      registryKey,
-      '/v',
-      'P2WLAN',
-      '/f',
-    ]);
+    expect(calls.single.$2, ['delete', registryKey, '/v', 'P2WLAN', '/f']);
   });
 
   test('rejects unsafe paths and failed registry writes', () async {
