@@ -215,7 +215,7 @@ jobs:
         run: bash scripts/dplpmtud/run_acceptance.sh "$RUNNER_TEMP/p2wlan-dplpmtud-live"
       - name: Upload live component evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: dplpmtud-live-component-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/p2wlan-dplpmtud-live/**
@@ -362,7 +362,7 @@ jobs:
             --output "$RUNNER_TEMP/dplpmtud-aggregate.json"
       - name: Upload DPLPMTUD aggregate
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: dplpmtud-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dplpmtud-aggregate.json

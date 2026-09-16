@@ -132,7 +132,7 @@ jobs:
             > dist-test/p2wlan-macos-arm64-test.dmg.sha256
 
       - name: Upload macOS test package
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-macos-arm64-test
           path: dist-test/
@@ -222,7 +222,7 @@ jobs:
             > ../../dist-test/p2wlan-android-arm64-ci-test.apk.sha256
 
       - name: Upload Android test package
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-android-arm64-test
           path: dist-test/

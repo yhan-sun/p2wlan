@@ -225,7 +225,7 @@ jobs:
           --identity client-stamped
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-android-arm64-release
           path: |
@@ -283,7 +283,7 @@ jobs:
           --identity client-stamped
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-ios-arm64-unsigned
           path: |
@@ -394,7 +394,7 @@ jobs:
           --identity client-stamped-daemon-verified
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-macos-${{ matrix.arch }}
           path: |
@@ -496,7 +496,7 @@ jobs:
           --identity client-stamped-daemon-verified
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-linux-${{ matrix.arch }}
           path: |
@@ -656,7 +656,7 @@ jobs:
           --identity client-stamped-daemon-verified
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-windows-${{ matrix.arch }}-setup
           path: |
@@ -754,7 +754,7 @@ jobs:
           --identity rust-source-bound
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-linux-${{ matrix.arch }}-cli
           path: |

@@ -57,7 +57,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh unit
       - name: Upload unit evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: nat-topology-unit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/p2wlan-nat-topology-*.log
@@ -91,7 +91,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh direct
       - name: Upload Direct evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: nat-topology-direct-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -139,7 +139,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh relay
       - name: Upload Relay evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: nat-topology-relay-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}-of-5
           path: |
@@ -170,7 +170,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh fail-closed
       - name: Upload failure-injection evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: nat-topology-fail-closed-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -249,7 +249,7 @@ jobs:
 
       - name: Upload actual-execution NAT aggregate
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: nat-topology-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nat-topology-aggregate.json

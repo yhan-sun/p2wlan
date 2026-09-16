@@ -184,7 +184,7 @@ jobs:
           echo "android_apk_sha256=$(sha256sum "$apk" | awk '{print $1}')"
 
       - name: Upload APK
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-android-arm64-ci-test-apk
           path: apps/flutter_client/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
@@ -239,7 +239,7 @@ jobs:
         run: tar -C build/linux/x64/release/bundle -czf build/p2wlan-linux-x64-release.tar.gz .
 
       - name: Upload Linux bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-linux-x64-release
           path: apps/flutter_client/build/p2wlan-linux-x64-release.tar.gz
@@ -293,7 +293,7 @@ jobs:
           done
 
       - name: Upload macOS apps
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-macos-release
           path: apps/flutter_client/build/p2wlan-macos-*-release.app.zip
@@ -375,7 +375,7 @@ jobs:
         run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath build/p2wlan-windows-x64-release.zip -Force
 
       - name: Upload Windows bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: p2wlan-windows-x64-release
           path: apps/flutter_client/build/p2wlan-windows-x64-release.zip
