@@ -272,6 +272,24 @@ class ResponseTests(unittest.TestCase):
         self.assertIn("page=1", runs_pages[0])
         self.assertIn("page=2", runs_pages[1])
 
+    def test_in_flight_runs_are_re_read_but_finished_runs_are_cached(self):
+        jobs = [{"name": "CI Required", "status": "completed", "conclusion": "success"}]
+
+        def route(url):
+            if self.JOBS_URL in url:
+                return 200, self._jobs_page(jobs)
+            return 200, self._runs_page([self._run_entry(7)])
+
+        client, patcher, requested = self._client(route)
+        with patcher:
+            client.jobs(7, final=False)
+            client.jobs(7, final=False)
+            client.jobs(7, final=True)
+            client.jobs(7, final=True)
+        job_urls = [url for url in requested if self.JOBS_URL in url]
+        # An in-flight run is re-read every poll; a completed one is cached.
+        self.assertEqual(len(job_urls), 3, job_urls)
+
     def test_jobs_are_fetched_once_per_run(self):
         jobs = [{"name": "CI Required", "status": "completed", "conclusion": "success"}]
 
@@ -292,7 +310,7 @@ class ResponseTests(unittest.TestCase):
             lambda url: (200, self._jobs_page([{"status": "completed", "conclusion": "success"}]))
         )
         with patcher, self.assertRaises(gates.GateRequestError):
-            client.jobs(7)
+            client.jobs(7, final=True)
 
 
 class CliTests(unittest.TestCase):

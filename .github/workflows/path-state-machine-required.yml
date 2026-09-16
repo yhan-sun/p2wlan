@@ -114,9 +114,12 @@ jobs:
       - name: Require same-SHA NAT, Windows, and Mobile gates
         env:
           GH_TOKEN: ${{ github.token }}
+          # Untrusted event data must reach the shell through a validated env
+          # value, never by direct interpolation.
+          P2WLAN_GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           python3 scripts/quality/check_required_gates.py \
-            --sha "${{ github.event.pull_request.head.sha }}" \
+            --sha "$P2WLAN_GATE_HEAD_SHA" \
             --require "NAT Topology Required" \
             --require "Windows Lifecycle Required" \
             --require "Mobile Lifecycle Required" \

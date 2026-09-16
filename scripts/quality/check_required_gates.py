@@ -268,18 +268,23 @@ class GitHubClient:
             if page > MAX_PAGES:
                 raise GateRequestError(f"GET {path} did not finish paginating within {MAX_PAGES} pages")
 
-    def jobs(self, run_id: int) -> tuple[JobResult, ...]:
-        if run_id not in self._job_cache:
-            raw = self._paginate(f"/repos/{self.repo}/actions/runs/{run_id}/jobs", "jobs", {})
-            parsed = []
-            for job in raw:
-                name = job.get("name")
-                status = job.get("status")
-                if not isinstance(name, str) or not isinstance(status, str):
-                    raise GateRequestError(f"run {run_id} returned a job without name/status")
-                parsed.append(JobResult(name=name, status=status, conclusion=job.get("conclusion")))
+    def jobs(self, run_id: int, *, final: bool) -> tuple[JobResult, ...]:
+        # A job list is only stable once the run is completed: caching the jobs
+        # of an in-flight run freezes the "job not published yet" state and
+        # later reports a finished run as missing that gate.
+        if final and run_id in self._job_cache:
+            return self._job_cache[run_id]
+        raw = self._paginate(f"/repos/{self.repo}/actions/runs/{run_id}/jobs", "jobs", {})
+        parsed: list[JobResult] = []
+        for job in raw:
+            name = job.get("name")
+            status = job.get("status")
+            if not isinstance(name, str) or not isinstance(status, str):
+                raise GateRequestError(f"run {run_id} returned a job without name/status")
+            parsed.append(JobResult(name=name, status=status, conclusion=job.get("conclusion")))
+        if final:
             self._job_cache[run_id] = tuple(parsed)
-        return self._job_cache[run_id]
+        return tuple(parsed)
 
     def runs_for(self, head_sha: str) -> list[WorkflowRun]:
         raw = self._paginate(
@@ -311,7 +316,7 @@ class GitHubClient:
                     conclusion=run.get("conclusion"),
                     run_attempt=int(run.get("run_attempt") or 1),
                     created_at=created_at,
-                    jobs=self.jobs(run_id),
+                    jobs=self.jobs(run_id, final=status == "completed"),
                 )
             )
         return runs
