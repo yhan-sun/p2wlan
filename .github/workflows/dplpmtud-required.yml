@@ -44,7 +44,6 @@ permissions:
   contents: read
   checks: read
   actions: read
-  actions: read
 
 concurrency:
   # A commit validation (push / pull_request) and a periodic health check
