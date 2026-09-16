@@ -18,10 +18,16 @@ on:
 permissions:
   contents: read
   checks: read
+  actions: read
 
 concurrency:
-  group: path-state-machine-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A commit validation (push / pull_request) and a periodic health check
+  # (schedule / workflow_dispatch) are different obligations for the same
+  # ref. Sharing one concurrency group let a scheduled run cancel an
+  # in-flight commit validation, so each event class gets its own group and
+  # only a pull request cancels its own superseded predecessors.
+  group: path-state-machine-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust_required:
@@ -102,71 +108,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
-      - name: Require same-SHA NAT, Windows, and Mobile gates
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          script: |
-            const requiredNames = [
-              'NAT Topology Required',
-              'Windows Lifecycle Required',
-              'Mobile Lifecycle Required',
-            ];
-            // On pull_request, context.sha is the synthetic merge ref. The
-            // independent required workflows publish their checks on the PR's
-            // exact head commit, which is the generation this aggregate must
-            // prove. Non-PR/manual runs retain the ordinary context SHA.
-            const targetSha = context.payload.pull_request?.head?.sha || context.sha;
-            const deadline = Date.now() + 50 * 60 * 1000;
-            let lastSummary = '';
-
-            while (Date.now() < deadline) {
-              const response = await github.rest.checks.listForRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: targetSha,
-                per_page: 100,
-                filter: 'latest',
-              });
-              const latestByName = new Map();
-              for (const run of response.data.check_runs) {
-                if (!requiredNames.includes(run.name)) continue;
-                const prior = latestByName.get(run.name);
-                if (!prior || new Date(run.started_at || 0) > new Date(prior.started_at || 0)) {
-                  latestByName.set(run.name, run);
-                }
-              }
-
-              const summary = requiredNames.map((name) => {
-                const run = latestByName.get(name);
-                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}` : 'missing'}`;
-              }).join(', ');
-              if (summary !== lastSummary) {
-                core.info(`same-SHA gate status: ${summary}`);
-                lastSummary = summary;
-              }
-
-              const failed = requiredNames.filter((name) => {
-                const run = latestByName.get(name);
-                return run && run.status === 'completed' && run.conclusion !== 'success';
-              });
-              if (failed.length > 0) {
-                core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
-                return;
-              }
-              const complete = requiredNames.every((name) => {
-                const run = latestByName.get(name);
-                return run && run.status === 'completed' && run.conclusion === 'success';
-              });
-              if (complete) {
-                core.info(`All existing required gates passed for ${targetSha}.`);
-                return;
-              }
-
-              await new Promise((resolve) => setTimeout(resolve, 15000));
-            }
-
-            core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
-
+          persist-credentials: false
+      - name: Require same-SHA NAT, Windows, and Mobile gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Untrusted event data must reach the shell through a validated env
+          # value, never by direct interpolation.
+          P2WLAN_GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/quality/check_required_gates.py \
+            --sha "$P2WLAN_GATE_HEAD_SHA" \
+            --require "NAT Topology Required" \
+            --require "Windows Lifecycle Required" \
+            --require "Mobile Lifecycle Required" \
+            --timeout-seconds 3000
   required:
     name: Path State Machine Required
     if: always()

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -132,9 +133,20 @@ def collect(
     log_root: Path,
     source_head_sha: str,
     workflow_sha: str,
+    run_id: int | None,
+    run_attempt: int | None,
 ) -> dict[str, Any]:
     _validate_sha(source_head_sha, "source_head_sha")
     _validate_sha(workflow_sha, "workflow_sha")
+    # A local run publishes no run identity. Such evidence is still a valid
+    # local report, but the selector can never match it to a CI attempt, so it
+    # can never be consumed as a reuse of another attempt.
+    if (run_id is None) != (run_attempt is None):
+        raise ValueError("run_identity_incomplete")
+    if run_id is not None and run_id <= 0:
+        raise ValueError("run_id_invalid")
+    if run_attempt is not None and run_attempt <= 0:
+        raise ValueError("run_attempt_invalid")
     if contract.get("schema_version") != 1:
         raise ValueError("contract_schema_unknown")
     if contract.get("repository") != "yhan-sun/p2wlan":
@@ -257,6 +269,10 @@ def collect(
         "component": contract["component"],
         "source_head_sha": source_head_sha,
         "workflow_sha": workflow_sha,
+        # The run identity is part of the digest so a later attempt can tell
+        # which attempt actually produced a reused component artifact.
+        "run_id": run_id,
+        "run_attempt": run_attempt,
         "contract_sha256": _canonical_sha256(contract),
         "result": "pass",
         "scenario_count": len(records),
@@ -272,6 +288,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--log-root", required=True)
     parser.add_argument("--source-head-sha", required=True)
     parser.add_argument("--workflow-sha", required=True)
+    parser.add_argument("--run-id", type=int, default=os.environ.get("GITHUB_RUN_ID") or None)
+    parser.add_argument(
+        "--run-attempt", type=int, default=os.environ.get("GITHUB_RUN_ATTEMPT") or None
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)
 
@@ -284,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.log_root),
         args.source_head_sha,
         args.workflow_sha,
+        args.run_id,
+        args.run_attempt,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

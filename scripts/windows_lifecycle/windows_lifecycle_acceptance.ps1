@@ -185,6 +185,42 @@ function Test-LoopbackPortReleased {
     }
 }
 
+function Wait-LoopbackPortReleased {
+    # Binding the port is the observable condition. A single sample right after
+    # the process exits races the OS releasing the listener, so poll it under a
+    # bounded deadline instead of asserting on one reading.
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [int]$TimeoutSeconds = 10
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (Test-LoopbackPortReleased -Port $Port) { return $true }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $false
+}
+
+function Wait-PathRemoved {
+    # The daemon unlinks its diagnostics auth file as part of shutdown; the
+    # observable condition is the absence of that path.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$TimeoutSeconds = 10
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $false
+}
+
+function Get-SurvivingProcessIds {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][int[]]$ProcessIds)
+    @($ProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+}
+
 function Wait-DaemonReady {
     param(
         [Parameter(Mandatory = $true)][string]$BaseUrl,
@@ -457,12 +493,17 @@ public static class P2WlanCtrlCInjector {
     if (-not $injector.Start()) { throw 'failed to start Ctrl+C injector' }
     $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 5
     if (-not $result.exited) {
+        # The injector attaches to the daemon console, so it also receives the
+        # CTRL_C_EVENT it broadcast. Its own lifetime is a helper concern and
+        # not the assertion -- the daemon's graceful exit is. Reap it under a
+        # bounded budget, record the outcome, and let the daemon decide.
         try { Stop-Process -Id $injector.Id -Force -ErrorAction SilentlyContinue } catch {}
-        throw 'Ctrl+C injector did not exit within the bounded budget'
+        $result = Wait-ProcessExited -Process $injector -TimeoutSeconds 10
+        if (-not $result.exited) {
+            throw 'Ctrl+C injector could not be reaped after the broadcast'
+        }
     }
-    # The injector is attached to the daemon console and may itself receive
-    # the broadcast CTRL_C_EVENT. Its exit code is therefore not meaningful;
-    # the daemon's graceful exit is the authoritative assertion.
+    [pscustomobject]@{ injector_exited = $true }
 }
 
 function Invoke-ProductionCycle {
@@ -494,6 +535,9 @@ function Invoke-ProductionCycle {
     $wintunObserved = $false
     $daemonProcessesClean = $false
     $childPids = @()
+    $observedChildPids = @()
+    $survivingChildPids = @()
+    $ctrlCResult = $null
     $detail = ''
 
     try {
@@ -534,7 +578,7 @@ function Invoke-ProductionCycle {
         switch ($Entrypoint) {
             'diagnostics' { Stop-DiagnosticsDaemon -BaseUrl $baseUrl -Token $token }
             'cli' { Stop-CliDaemon -ConfigPath $configPath -StateDirectory $cycleRoot }
-            'ctrl_c' { Send-ConsoleCtrlC -ProcessId $process.Id }
+            'ctrl_c' { $ctrlCResult = Send-ConsoleCtrlC -ProcessId $process.Id }
         }
         $stopRequested = $true
         $result = Wait-ProcessExited -Process $process -TimeoutSeconds 20
@@ -551,14 +595,15 @@ function Invoke-ProductionCycle {
         $observedChildPids = @($childPids) + @($childrenAfterExit)
         $observedChildPids = @($observedChildPids | Sort-Object -Unique)
         $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds $observedChildPids
-        $portReleased = Test-LoopbackPortReleased -Port $port
-        $authRemoved = -not (Test-Path -LiteralPath $authPath)
+        $survivingChildPids = if ($childrenGone) { @() } else { @(Get-SurvivingProcessIds -ProcessIds $observedChildPids) }
+        $portReleased = Wait-LoopbackPortReleased -Port $port
+        $authRemoved = Wait-PathRemoved -Path $authPath
         $afterWintun = Get-WintunSnapshot
         $wintunStale = if ($RealWintun) { -not (Wait-TargetWintunReleased) } else { Test-TargetWintunPresent -Snapshot $afterWintun }
         $daemonProcessesClean = @(
             Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
         ).Count -eq 0
-        if (-not $childrenGone) { throw "child process remained after daemon exit" }
+        if (-not $childrenGone) { throw "child process remained after daemon exit (pids=$($survivingChildPids -join ','))" }
         if (-not $portReleased) { throw "diagnostics port $port was not released" }
         if (-not $authRemoved) { throw "diagnostics auth file remained" }
         if (-not $daemonProcessesClean) { throw "a new p2wlan-daemon process remained after daemon exit" }
@@ -578,11 +623,12 @@ function Invoke-ProductionCycle {
             $processExited = $result.exited
             $exitCode = $result.exit_code
         }
-        $portReleased = Test-LoopbackPortReleased -Port $port
-        $authRemoved = -not (Test-Path -LiteralPath $authPath)
+        $portReleased = Wait-LoopbackPortReleased -Port $port
+        $authRemoved = Wait-PathRemoved -Path $authPath
         $afterWintun = Get-WintunSnapshot
         $wintunStale = if ($RealWintun) { -not (Wait-TargetWintunReleased) } else { Test-TargetWintunPresent -Snapshot $afterWintun }
         $childrenGone = Wait-ObservedChildProcessesGone -ProcessIds @($childPids)
+        $survivingChildPids = if ($childrenGone) { @() } else { @(Get-SurvivingProcessIds -ProcessIds $observedChildPids) }
         $daemonProcessesClean = @(
             Get-ProcessIdList | Where-Object { $beforePids -notcontains $_ }
         ).Count -eq 0
@@ -598,6 +644,10 @@ function Invoke-ProductionCycle {
         process_exited = $processExited
         process_exit_code = $exitCode
         children_gone = $childrenGone
+        # Identity of whatever outlived the daemon, so the next occurrence is
+        # diagnosable instead of only reporting that something remained.
+        surviving_child_pids = @($survivingChildPids)
+        ctrl_c_injector_exited = if ($ctrlCResult) { $ctrlCResult.injector_exited } else { $null }
         diagnostics_port_released = $portReleased
         auth_token_removed = $authRemoved
         wintun_stale = $wintunStale

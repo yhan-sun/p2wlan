@@ -43,10 +43,16 @@ on:
 permissions:
   contents: read
   checks: read
+  actions: read
 
 concurrency:
-  group: dplpmtud-${{ github.event.pull_request.number || inputs.validation_sha || github.ref }}
-  cancel-in-progress: true
+  # A commit validation (push / pull_request) and a periodic health check
+  # (schedule / workflow_dispatch) are different obligations for the same
+  # ref. Sharing one concurrency group let a scheduled run cancel an
+  # in-flight commit validation, so each event class gets its own group and
+  # only a pull request cancels its own superseded predecessors.
+  group: dplpmtud-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.validation_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -246,78 +252,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     steps:
-      - name: Require same-SHA business, path, topology, lifecycle, package, security and observability gates
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          script: |
-            const requiredNames = [
-              'Business MTU Budget Required',
-              'Path State Machine Required',
-              'NAT Topology Required',
-              'Windows Lifecycle Required',
-              'Mobile Lifecycle Required',
-              'Path Observability Required',
-              'Security Audit Required',
-              'CI Required',
-              'Analyze and Test',
-              'Android arm64 CI test APK',
-              'iOS Compile',
-              'Linux x64 Release Bundle',
-              'macOS Release Apps',
-              'Windows x64 Release Bundle',
-              'macOS arm64 test DMG',
-              'Android arm64 test APK',
-            ];
-            const targetSha = context.payload.pull_request?.head?.sha || context.sha;
-            const deadline = Date.now() + 65 * 60 * 1000;
-            let lastSummary = '';
-
-            while (Date.now() < deadline) {
-              const response = await github.rest.checks.listForRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: targetSha,
-                per_page: 100,
-                filter: 'latest',
-              });
-              const latestByName = new Map();
-              for (const run of response.data.check_runs) {
-                if (!requiredNames.includes(run.name)) continue;
-                const prior = latestByName.get(run.name);
-                if (!prior || new Date(run.started_at || 0) > new Date(prior.started_at || 0)) {
-                  latestByName.set(run.name, run);
-                }
-              }
-
-              const summary = requiredNames.map((name) => {
-                const run = latestByName.get(name);
-                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}` : 'missing'}`;
-              }).join(', ');
-              if (summary !== lastSummary) {
-                core.info(`same-SHA gate status: ${summary}`);
-                lastSummary = summary;
-              }
-
-              const failed = requiredNames.filter((name) => {
-                const run = latestByName.get(name);
-                return run && run.status === 'completed' && run.conclusion !== 'success';
-              });
-              if (failed.length > 0) {
-                core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
-                return;
-              }
-              const complete = requiredNames.every((name) => {
-                const run = latestByName.get(name);
-                return run && run.status === 'completed' && run.conclusion === 'success';
-              });
-              if (complete) {
-                core.info(`All required live dataplane and repository gates passed for ${targetSha}.`);
-                return;
-              }
-              await new Promise((resolve) => setTimeout(resolve, 15000));
-            }
-            core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
-
+          persist-credentials: false
+      - name: Require same-SHA business, path, topology, lifecycle, package, security and observability gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Untrusted event data must reach the shell through a validated env
+          # value, never by direct interpolation.
+          P2WLAN_GATE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/quality/check_required_gates.py \
+            --sha "$P2WLAN_GATE_HEAD_SHA" \
+            --require "Business MTU Budget Required" \
+            --require "Path State Machine Required" \
+            --require "NAT Topology Required" \
+            --require "Windows Lifecycle Required" \
+            --require "Mobile Lifecycle Required" \
+            --require "Path Observability Required" \
+            --require "Security Audit Required" \
+            --require "CI Required" \
+            --require "Analyze and Test" \
+            --require "Android arm64 CI test APK" \
+            --require "iOS Compile" \
+            --require "Linux x64 Release Bundle" \
+            --require "macOS Release Apps" \
+            --require "Windows x64 Release Bundle" \
+            --require "macOS arm64 test DMG" \
+            --require "Android arm64 test APK" \
+            --timeout-seconds 3900
   evidence_aggregate:
     name: DPLPMTUD evidence aggregate
     if: always()
@@ -343,14 +306,36 @@ jobs:
             echo "source_head_sha=$actual"
             echo "workflow_sha=$workflow_sha"
           } >> "$GITHUB_OUTPUT"
-      - name: Download live component evidence
+      - name: Download every live component attempt of this run
         id: download
         if: always()
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: dplpmtud-live-component-${{ github.run_id }}-${{ github.run_attempt }}
+          # A partial re-run uploads nothing new: the component artifact stays
+          # under the attempt that produced it. Fetch every attempt of this run
+          # and let the selector decide which one may be consumed.
+          pattern: dplpmtud-live-component-${{ github.run_id }}-*
           path: ${{ runner.temp }}/dplpmtud-component
           merge-multiple: false
+      - name: Select the component evidence this aggregate may consume
+        id: select
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPONENT_RESULT: ${{ needs.live_evidence.result }}
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          WORKFLOW_SHA: ${{ steps.identity.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/dplpmtud/select_component_artifact.py \
+            --artifacts-root "$RUNNER_TEMP/dplpmtud-component" \
+            --contract contracts/dplpmtud_acceptance.json \
+            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --current-attempt "$GITHUB_RUN_ATTEMPT" \
+            --component-result "$COMPONENT_RESULT" \
+            --output "$GITHUB_OUTPUT"
       - name: Aggregate fail-closed evidence
         id: aggregate
         if: always()
@@ -362,16 +347,18 @@ jobs:
           WORKFLOW_SHA: ${{ steps.identity.outputs.workflow_sha }}
         run: |
           set -euo pipefail
-          component="$(find "$RUNNER_TEMP/dplpmtud-component" -name dplpmtud-live-component.json -type f -print -quit)"
-          test -n "$component"
           python3 scripts/dplpmtud/aggregate_evidence.py \
             --contract contracts/dplpmtud_acceptance.json \
-            --component "$component" \
+            --component "${{ steps.select.outputs.component }}" \
             --source-head-sha "$SOURCE_HEAD_SHA" \
             --workflow-sha "$WORKFLOW_SHA" \
             --event-name "$EVENT_NAME" \
             --component-result "$COMPONENT_RESULT" \
             --external-gates-result "$EXTERNAL_RESULT" \
+            --component-run-id "${{ steps.select.outputs.component_run_id }}" \
+            --component-run-attempt "${{ steps.select.outputs.component_run_attempt }}" \
+            --component-reused "${{ steps.select.outputs.component_reused }}" \
+            --current-attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/dplpmtud-aggregate.json"
       - name: Upload DPLPMTUD aggregate
         if: always()
@@ -387,12 +374,14 @@ jobs:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           LIVE_RESULT: ${{ needs.live_evidence.result }}
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          SELECT_OUTCOME: ${{ steps.select.outcome }}
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         run: |
           set -euo pipefail
           test "$CONTRACT_RESULT" = "success"
           test "$LIVE_RESULT" = "success"
           test "$DOWNLOAD_OUTCOME" = "success"
+          test "$SELECT_OUTCOME" = "success"
           test "$AGGREGATE_OUTCOME" = "success"
 
   required:

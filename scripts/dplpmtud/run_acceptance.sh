@@ -59,6 +59,8 @@ python3 "$ROOT_DIR/scripts/dplpmtud/collect_evidence.py" \
   --log-root "$OUT_DIR/logs" \
   --source-head-sha "$SOURCE_HEAD_SHA" \
   --workflow-sha "$WORKFLOW_SHA" \
+  ${GITHUB_RUN_ID:+--run-id "$GITHUB_RUN_ID"} \
+  ${GITHUB_RUN_ATTEMPT:+--run-attempt "$GITHUB_RUN_ATTEMPT"} \
   --output "$OUT_DIR/dplpmtud-live-component.json"
 
 python3 - "$OUT_DIR/dplpmtud-live-component.json" <<'PY'

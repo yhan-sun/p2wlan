@@ -229,7 +229,13 @@ def _validate_cycles(document: dict[str, Any]) -> tuple[list[dict[str, Any]], li
         if value.get("process_exit_code") not in (None, 0):
             errors.append(f"{path}: daemon exit code was {value['process_exit_code']}")
         if not value["children_gone"]:
-            errors.append(f"{path}: child process cleanup failed")
+            # Name whatever outlived the daemon; "something remained" alone is
+            # not diagnosable after the fact.
+            survivors = value.get("surviving_child_pids")
+            suffix = ""
+            if isinstance(survivors, list) and survivors:
+                suffix = " pids=" + ",".join(str(pid) for pid in survivors)
+            errors.append(f"{path}: child process cleanup failed{suffix}")
         if not value["diagnostics_port_released"]:
             errors.append(f"{path}: diagnostics port was not released")
         if not value["auth_token_removed"]:

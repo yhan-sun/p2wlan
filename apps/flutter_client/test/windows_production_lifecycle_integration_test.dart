@@ -103,6 +103,7 @@ Future<Map<String, dynamic>> _runUiStopCycle(
   var processExited = false;
   int? exitCode;
   var childrenGone = false;
+  var survivingChildPids = <int>[];
   var portReleased = false;
   var authTokenRemoved = false;
   var daemonProcessesClean = false;
@@ -171,7 +172,8 @@ Future<Map<String, dynamic>> _runUiStopCycle(
 
     exitCode = await process.exitCode.timeout(const Duration(seconds: 20));
     processExited = true;
-    childrenGone = await _descendantsGone(process.pid);
+    survivingChildPids = await _survivingDescendants(process.pid);
+    childrenGone = survivingChildPids.isEmpty;
     daemonProcessesClean = await _daemonProcessesClean();
     portReleased = await _loopbackPortReleased(port);
     authTokenRemoved = !await authPath.exists();
@@ -196,7 +198,8 @@ Future<Map<String, dynamic>> _runUiStopCycle(
           processExited = true;
         } catch (_) {}
       }
-      childrenGone = await _descendantsGone(currentProcess.pid);
+      survivingChildPids = await _survivingDescendants(currentProcess.pid);
+      childrenGone = survivingChildPids.isEmpty;
     }
     daemonProcessesClean = await _daemonProcessesClean();
     portReleased = await _loopbackPortReleased(port);
@@ -222,6 +225,7 @@ Future<Map<String, dynamic>> _runUiStopCycle(
     'process_exited': processExited,
     'process_exit_code': exitCode,
     'children_gone': childrenGone,
+    'surviving_child_pids': survivingChildPids,
     'diagnostics_port_released': portReleased,
     'auth_token_removed': authTokenRemoved,
     'wintun_stale': false,
@@ -287,7 +291,12 @@ Future<bool> _loopbackPortReleased(int port) async {
   }
 }
 
-Future<bool> _descendantsGone(int rootPid) async {
+/// Descendants of [rootPid] that are still alive after the bounded wait.
+///
+/// The embedded probe already serialises the surviving process ids; returning
+/// them (instead of only a boolean) is what makes a `children_gone` failure
+/// diagnosable after the fact.
+Future<List<int>> _survivingDescendants(int rootPid) async {
   final script =
       r'''
 $deadline = [DateTime]::UtcNow.AddSeconds(5)
@@ -311,7 +320,27 @@ exit 1
 '''
           .replaceFirst('__ROOT_PID__', '$rootPid');
   final result = await _runPowerShell(script);
-  return result.exitCode == 0;
+  if (result.exitCode == 0) {
+    return const <int>[];
+  }
+  final text = '${result.stdout}'.trim();
+  if (text.isEmpty) {
+    // The probe failed without reporting survivors; record the failure without
+    // inventing an identity for it.
+    return const <int>[-1];
+  }
+  try {
+    final decoded = jsonDecode(text);
+    if (decoded is int) {
+      return <int>[decoded];
+    }
+    if (decoded is List) {
+      return decoded.whereType<int>().toList(growable: false);
+    }
+  } on FormatException {
+    // fall through
+  }
+  return const <int>[-1];
 }
 
 Future<bool> _daemonProcessesClean() async {
