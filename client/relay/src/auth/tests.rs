@@ -317,6 +317,145 @@ use super::*;
     }
 
     #[test]
+    fn test_ticket_verify_rejects_signature_from_another_key() {
+        // Correct kid and header, but signed by a key the relay does not trust.
+        let (kid, _priv_hex, pub_hex) = generate_test_key("key-1");
+        let (_other_kid, other_priv_hex, _other_pub) = generate_test_key("key-2");
+
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), pub_hex);
+        let verifier =
+            TicketVerifier::new(keys, DEFAULT_CLOCK_SKEW, "relay-sg-1".into(), "sg".into())
+                .unwrap();
+
+        let claims = make_test_claims("relay-sg-1", "sg");
+        let ticket = sign_test_ticket(&claims, &kid, &other_priv_hex);
+
+        let err = verifier.verify(&ticket).unwrap_err();
+        assert!(
+            matches!(err, RelayError::AuthError(RelayErrorCode::INVALID_TICKET, _)),
+            "expected INVALID_TICKET, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_ticket_verify_rejects_tampered_payload() {
+        let (kid, priv_hex, pub_hex) = generate_test_key("key-1");
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), pub_hex);
+        let verifier =
+            TicketVerifier::new(keys, DEFAULT_CLOCK_SKEW, "relay-sg-1".into(), "sg".into())
+                .unwrap();
+
+        let claims = make_test_claims("relay-sg-1", "sg");
+        let ticket = sign_test_ticket(&claims, &kid, &priv_hex);
+        // Flip a byte inside the signature segment.
+        let mut parts: Vec<&str> = ticket.split('.').collect();
+        let signature = parts[2];
+        let mut bytes = signature.as_bytes().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+        parts[2] = std::str::from_utf8(&bytes).unwrap();
+        let tampered = parts.join(".");
+
+        assert!(verifier.verify(&tampered).is_err());
+    }
+
+    #[test]
+    fn test_ticket_verify_rejects_unknown_issuer() {
+        let (kid, priv_hex, pub_hex) = generate_test_key("key-1");
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), pub_hex);
+        let verifier =
+            TicketVerifier::new(keys, DEFAULT_CLOCK_SKEW, "relay-sg-1".into(), "sg".into())
+                .unwrap();
+
+        let mut claims = make_test_claims("relay-sg-1", "sg");
+        claims.iss = "https://evil.example.com".into();
+        let ticket = sign_test_ticket(&claims, &kid, &priv_hex);
+
+        assert!(verifier.verify(&ticket).is_err());
+    }
+
+    #[test]
+    fn test_ticket_verify_rejects_not_yet_valid_beyond_skew() {
+        let (kid, priv_hex, pub_hex) = generate_test_key("key-1");
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), pub_hex);
+        let verifier =
+            TicketVerifier::new(keys, DEFAULT_CLOCK_SKEW, "relay-sg-1".into(), "sg".into())
+                .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut claims = make_test_claims("relay-sg-1", "sg");
+        claims.nbf = Some(now + DEFAULT_CLOCK_SKEW.as_secs() as i64 + 3600);
+        let ticket = sign_test_ticket(&claims, &kid, &priv_hex);
+
+        let err = verifier.verify(&ticket).unwrap_err();
+        assert!(
+            matches!(err, RelayError::AuthError(RelayErrorCode::TICKET_NOT_YET_VALID, _)),
+            "expected TICKET_NOT_YET_VALID, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_ticket_verify_accepts_nbf_just_inside_skew() {
+        let (kid, priv_hex, pub_hex) = generate_test_key("key-1");
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), pub_hex);
+        let verifier =
+            TicketVerifier::new(keys, DEFAULT_CLOCK_SKEW, "relay-sg-1".into(), "sg".into())
+                .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut claims = make_test_claims("relay-sg-1", "sg");
+        claims.nbf = Some(now + DEFAULT_CLOCK_SKEW.as_secs() as i64 - 1);
+        let ticket = sign_test_ticket(&claims, &kid, &priv_hex);
+
+        assert!(verifier.verify(&ticket).is_ok());
+    }
+
+    #[test]
+    fn test_ticket_verify_rejects_non_numeric_time_claims() {
+        // `exp`/`nbf` must be numbers. A string must be a clean rejection, not
+        // a panic inside the decoder.
+        let (kid, priv_hex, pub_hex) = generate_test_key("key-1");
+        let mut keys = HashMap::new();
+        keys.insert(kid.clone(), pub_hex);
+        let verifier =
+            TicketVerifier::new(keys, DEFAULT_CLOCK_SKEW, "relay-sg-1".into(), "sg".into())
+                .unwrap();
+
+        for (field, value) in [("exp", "1234567890"), ("nbf", "1234567890")] {
+            let mut claims = serde_json::to_value(make_test_claims("relay-sg-1", "sg")).unwrap();
+            claims[field] = serde_json::Value::String(value.into());
+
+            use ed25519_dalek::pkcs8::EncodePrivateKey;
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(
+                &hex::decode(&priv_hex).unwrap().try_into().unwrap(),
+            );
+            let der = signing_key.to_pkcs8_der().unwrap();
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(kid.clone());
+            header.typ = Some(JWT_TYP.to_string());
+            let encoding_key = EncodingKey::from_ed_der(der.as_bytes());
+            let ticket = jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap();
+
+            let err = verifier.verify(&ticket).unwrap_err();
+            assert!(
+                matches!(err, RelayError::AuthError(RelayErrorCode::INVALID_TICKET, _)),
+                "{field} as a string must be rejected as INVALID_TICKET, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_key_rotation_current_and_previous() {
         let (kid_curr, priv_curr, pub_curr) = generate_test_key("key-2");
         let (kid_prev, priv_prev, pub_prev) = generate_test_key("key-1");
