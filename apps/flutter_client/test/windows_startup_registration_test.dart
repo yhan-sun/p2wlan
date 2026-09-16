@@ -8,8 +8,7 @@ void main() {
   const executable = r'C:\Program Files\P2WLAN\p2wlan.exe';
   const expectedCommand =
       r'"C:\Program Files\P2WLAN\p2wlan.exe" --p2wlan-login-startup';
-  const staleCommand =
-      r'"C:\Old\p2wlan.exe" --p2wlan-login-startup';
+  const staleCommand = r'"C:\Old\p2wlan.exe" --p2wlan-login-startup';
 
   test('reports only the current executable registration as enabled', () async {
     final calls = <(String, List<String>)>[];
@@ -39,8 +38,12 @@ void main() {
       final registration = WindowsStartupRegistration(
         executablePath: executable,
         isSupportedOverride: true,
-        processRunner: (_, _) async =>
-            ProcessResult(0, 0, 'P2WLAN REG_SZ $staleCommand', ''),
+        processRunner: (_, _) async => ProcessResult(
+          0,
+          0,
+          'P2WLAN REG_SZ $staleCommand',
+          '',
+        ),
       );
 
       expect(await registration.isEnabled(), isFalse);

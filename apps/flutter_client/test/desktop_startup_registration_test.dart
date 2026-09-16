@@ -97,9 +97,7 @@ void main() {
     );
 
     await registration.setEnabled(true);
-    final fallback = File(
-      '${tempHome.path}/.config/autostart/p2wlan.desktop',
-    );
+    final fallback = File('${tempHome.path}/.config/autostart/p2wlan.desktop');
     expect(await fallback.exists(), isTrue);
   });
 
@@ -115,9 +113,6 @@ void main() {
     expect(desktopEntryQuoteArgument(r'/tmp/a$b'), r'"/tmp/a\$b"');
     expect(xmlEscape('A&B<"'), 'A&amp;B&lt;&quot;');
     final malformedPath = '/tmp/a\\nmalformed'.replaceAll(r'\n', '\n');
-    expect(
-      () => desktopEntryQuoteArgument(malformedPath),
-      throwsArgumentError,
-    );
+    expect(() => desktopEntryQuoteArgument(malformedPath), throwsArgumentError);
   });
 }

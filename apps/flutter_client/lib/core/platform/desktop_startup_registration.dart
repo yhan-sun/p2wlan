@@ -28,10 +28,11 @@ class DesktopStartupRegistration implements StartupRegistration {
     this._homeDirectoryPath,
     Map<String, String>? environment,
     DesktopStartupPlatform? platformOverride,
-  }) : _processRunner = processRunner ?? _runProcess,
-       _executablePath = executablePath ?? Platform.resolvedExecutable,
-       _environment = environment ?? Platform.environment,
-       _platform = platformOverride ?? _currentPlatform();
+  })
+    : _processRunner = processRunner ?? _runProcess,
+      _executablePath = executablePath ?? Platform.resolvedExecutable,
+      _environment = environment ?? Platform.environment,
+      _platform = platformOverride ?? _currentPlatform();
 
   static const _registryKey =
       r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run';
