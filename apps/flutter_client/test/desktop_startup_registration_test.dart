@@ -81,7 +81,9 @@ void main() {
     expect(contents, contains('[Desktop Entry]'));
     expect(
       contents,
-      contains('Exec="${tempHome.path}/P2WLAN Client/p2wlan" $loginStartupArgument'),
+      contains(
+        'Exec="${tempHome.path}/P2WLAN Client/p2wlan" $loginStartupArgument',
+      ),
     );
     expect(contents, contains('X-GNOME-Autostart-enabled=true'));
 
@@ -116,7 +118,7 @@ void main() {
     expect(desktopEntryQuoteArgument(r'/tmp/a$b'), r'"/tmp/a\$b"');
     expect(xmlEscape('A&B<"'), 'A&amp;B&lt;&quot;');
     expect(
-      () => desktopEntryQuoteArgument('/tmp/a\nmalformed'),
+      () => desktopEntryQuoteArgument('/tmp/a\nmalformed'.replaceAll(r'\n', '\n')),
       throwsArgumentError,
     );
   });
