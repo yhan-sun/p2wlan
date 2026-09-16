@@ -1,0 +1,32 @@
+name: Format Debug
+
+on:
+  push:
+    branches: [feat/desktop-login-startup]
+    paths: [.github/workflows/format-debug.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version-file: .fvmrc
+          cache: true
+      - name: Format exact source
+        working-directory: apps/flutter_client
+        run: dart format lib/core/platform/desktop_startup_registration.dart
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-startup-formatted
+          path: apps/flutter_client/lib/core/platform/desktop_startup_registration.dart
+          if-no-files-found: error
+          retention-days: 1
