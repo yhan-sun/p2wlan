@@ -28,6 +28,8 @@ AGGREGATE_SPEC.loader.exec_module(AGGREGATE)
 
 
 class DplpmtudEvidenceTests(unittest.TestCase):
+    RUN_ID = 424242
+    RUN_ATTEMPT = 2
     SOURCE = "a" * 40
     WORKFLOW = "b" * 40
 
@@ -107,12 +109,14 @@ class DplpmtudEvidenceTests(unittest.TestCase):
                 "\n".join(lines) + "\n", encoding="utf-8"
             )
 
-    def _collect(self, contract=None):
+    def _collect(self, contract=None, *, run_id=RUN_ID, run_attempt=RUN_ATTEMPT):
         return COLLECT.collect(
             contract or self.contract,
             self.root,
             self.SOURCE,
             self.WORKFLOW,
+            run_id,
+            run_attempt,
         )
 
     def _aggregate(
@@ -122,6 +126,10 @@ class DplpmtudEvidenceTests(unittest.TestCase):
         event_name="pull_request",
         component_result="success",
         external_result="success",
+        component_run_id=RUN_ID,
+        component_run_attempt=RUN_ATTEMPT,
+        component_reused=False,
+        current_attempt=RUN_ATTEMPT,
     ):
         return AGGREGATE.aggregate(
             self.contract,
@@ -131,6 +139,10 @@ class DplpmtudEvidenceTests(unittest.TestCase):
             event_name,
             component_result,
             external_result,
+            component_run_id,
+            component_run_attempt,
+            component_reused,
+            current_attempt,
         )
 
     def test_valid_actual_execution_report_and_aggregate_pass(self):
@@ -250,6 +262,40 @@ class DplpmtudEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(aggregate["result"], "pass")
         self.assertFalse(aggregate["business_mtu_gate_required"])
+
+
+    def test_run_identity_is_covered_by_the_report_digest(self):
+        first = self._collect(run_attempt=2)
+        second = self._collect(run_attempt=3)
+        self.assertEqual(first["run_id"], self.RUN_ID)
+        self.assertNotEqual(first["report_digest"], second["report_digest"])
+
+    def test_component_run_id_mismatch_fails_aggregate(self):
+        with self.assertRaisesRegex(ValueError, "component_run_id_mismatch"):
+            self._aggregate(component_run_id=self.RUN_ID + 1)
+
+    def test_component_run_attempt_mismatch_fails_aggregate(self):
+        with self.assertRaisesRegex(ValueError, "component_run_attempt_mismatch"):
+            self._aggregate(component_run_attempt=self.RUN_ATTEMPT + 1)
+
+    def test_reused_component_must_come_from_an_earlier_attempt(self):
+        with self.assertRaisesRegex(ValueError, "component_reuse_flag_inconsistent"):
+            self._aggregate(component_reused=True, current_attempt=self.RUN_ATTEMPT)
+
+    def test_reused_component_from_an_earlier_attempt_is_recorded(self):
+        component = self._collect(run_attempt=1)
+        aggregate = self._aggregate(
+            component,
+            component_run_attempt=1,
+            component_reused=True,
+            current_attempt=self.RUN_ATTEMPT,
+        )
+        self.assertTrue(aggregate["component_reused_from_earlier_attempt"])
+        self.assertEqual(aggregate["component_run_attempt"], 1)
+
+    def test_invalid_run_identity_is_rejected_by_the_collector(self):
+        with self.assertRaisesRegex(ValueError, "run_attempt_invalid"):
+            self._collect(run_attempt=0)
 
 
 if __name__ == "__main__":

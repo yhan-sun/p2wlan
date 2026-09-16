@@ -43,6 +43,10 @@ def aggregate(
     event_name: str,
     component_result: str,
     external_gates_result: str,
+    component_run_id: int,
+    component_run_attempt: int,
+    component_reused: bool,
+    current_attempt: int,
 ) -> dict[str, Any]:
     _validate_sha(source_head_sha, "source_head_sha")
     _validate_sha(workflow_sha, "workflow_sha")
@@ -71,6 +75,18 @@ def aggregate(
         raise ValueError("component_workflow_sha_mismatch")
     if component.get("result") != "pass":
         raise ValueError("component_result_not_pass")
+    # A component artifact may be reused from an earlier attempt of the same
+    # run, but only the attempt it was actually produced by may be advertised.
+    if component.get("run_id") != component_run_id:
+        raise ValueError(
+            f"component_run_id_mismatch:{component.get('run_id')}:{component_run_id}"
+        )
+    if component.get("run_attempt") != component_run_attempt:
+        raise ValueError(
+            f"component_run_attempt_mismatch:{component.get('run_attempt')}:{component_run_attempt}"
+        )
+    if component_reused and component_run_attempt >= current_attempt:
+        raise ValueError("component_reuse_flag_inconsistent")
     expected_contract_digest = _canonical_sha256(contract)
     if component.get("contract_sha256") != expected_contract_digest:
         raise ValueError("component_contract_digest_mismatch")
@@ -161,6 +177,9 @@ def aggregate(
         "scenarios": sorted(compact_records, key=lambda item: item["scenario_id"]),
         "contract_sha256": expected_contract_digest,
         "component_report_digest": claimed_report_digest,
+        "component_run_id": component_run_id,
+        "component_run_attempt": component_run_attempt,
+        "component_reused_from_earlier_attempt": component_reused,
     }
     aggregate_value["aggregate_digest"] = _canonical_sha256(aggregate_value)
     return aggregate_value
@@ -175,6 +194,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--event-name", required=True)
     parser.add_argument("--component-result", required=True)
     parser.add_argument("--external-gates-result", required=True)
+    parser.add_argument("--component-run-id", required=True, type=int)
+    parser.add_argument("--component-run-attempt", required=True, type=int)
+    parser.add_argument("--current-attempt", required=True, type=int)
+    parser.add_argument("--component-reused", required=True, choices=["true", "false"])
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)
 
@@ -189,6 +212,10 @@ def main(argv: list[str] | None = None) -> int:
         args.event_name,
         args.component_result,
         args.external_gates_result,
+        args.component_run_id,
+        args.component_run_attempt,
+        args.component_reused == "true",
+        args.current_attempt,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
