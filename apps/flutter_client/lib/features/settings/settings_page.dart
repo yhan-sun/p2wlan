@@ -16,6 +16,7 @@ import '../../core/build_info.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/diagnostics/session_log_bundle.dart';
 import '../../core/models/diagnostics_models.dart';
+import '../../core/platform/windows_startup_registration.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
 import '../../shared/widgets/app_back_button.dart';
@@ -67,6 +68,7 @@ class SettingsPage extends StatefulWidget {
     this.onLogout,
     this.onDirtyChanged,
     this.controller,
+    this.startupRegistration,
     this.showHeader = true,
   });
 
@@ -90,6 +92,10 @@ class SettingsPage extends StatefulWidget {
 
   final SettingsPageController? controller;
 
+  /// Optional Windows login-startup implementation. Tests inject this to
+  /// exercise the setting without touching the host registry.
+  final StartupRegistration? startupRegistration;
+
   final bool showHeader;
 
   @override
@@ -100,6 +106,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late final PlatformCapabilities _capabilities;
   late final ControlApi _controlApi;
   late final bool _ownsControlApi;
+  late final StartupRegistration _startupRegistration;
   late final TextEditingController _diagnosticsUrlController;
   late final TextEditingController _controlServerController;
   late final TextEditingController _authTokenController;
@@ -172,6 +179,8 @@ class _SettingsPageState extends State<SettingsPage> {
   void initState() {
     super.initState();
     _capabilities = widget.capabilities ?? PlatformCapabilities.current();
+    _startupRegistration =
+        widget.startupRegistration ?? WindowsStartupRegistration();
     _ownsControlApi = widget.controlApi == null;
     _controlApi = widget.controlApi ?? ControlApi();
     _statusViewNotifier = ValueNotifier(_statusProjection(widget.statusStore));
