@@ -266,7 +266,8 @@ class WindowsStartupRegistration extends DesktopStartupRegistration {
     super.processRunner,
     super.executablePath,
     bool? isSupportedOverride,
-  }) : super(platformOverride: _windowsPlatformOverride(isSupportedOverride));
+  })
+    : super(platformOverride: _windowsPlatformOverride(isSupportedOverride));
 
   static const loginStartupArgument = '--p2wlan-login-startup';
 }

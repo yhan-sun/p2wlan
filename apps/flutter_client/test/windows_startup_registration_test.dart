@@ -10,19 +10,14 @@ void main() {
       r'"C:\Program Files\P2WLAN\p2wlan.exe" --p2wlan-login-startup';
   const staleCommand = r'"C:\Old\p2wlan.exe" --p2wlan-login-startup';
 
-  test('reports only the current executable registration as enabled', () async {
+  test('reports current Windows startup registration', () async {
     final calls = <(String, List<String>)>[];
     final registration = WindowsStartupRegistration(
       executablePath: executable,
       isSupportedOverride: true,
       processRunner: (command, arguments) async {
         calls.add((command, arguments));
-        return ProcessResult(
-          0,
-          0,
-          'P2WLAN    REG_SZ    $expectedCommand',
-          '',
-        );
+        return ProcessResult(0, 0, 'P2WLAN REG_SZ $expectedCommand', '');
       },
     );
 
@@ -32,59 +27,50 @@ void main() {
     ]);
   });
 
-  test(
-    'stale Windows executable registration is not reported enabled',
-    () async {
-      final registration = WindowsStartupRegistration(
-        executablePath: executable,
-        isSupportedOverride: true,
-        processRunner: (_, _) async => ProcessResult(
-          0,
-          0,
-          'P2WLAN REG_SZ $staleCommand',
-          '',
-        ),
-      );
+  test('rejects stale Windows startup registration', () async {
+    final registration = WindowsStartupRegistration(
+      executablePath: executable,
+      isSupportedOverride: true,
+      processRunner: (_, _) async {
+        return ProcessResult(0, 0, 'P2WLAN REG_SZ $staleCommand', '');
+      },
+    );
 
-      expect(await registration.isEnabled(), isFalse);
-    },
-  );
+    expect(await registration.isEnabled(), isFalse);
+  });
 
-  test(
-    'writes a quoted application command when enabling login startup',
-    () async {
-      final calls = <(String, List<String>)>[];
-      final registration = WindowsStartupRegistration(
-        executablePath: executable,
-        isSupportedOverride: true,
-        processRunner: (command, arguments) async {
-          calls.add((command, arguments));
-          return ProcessResult(0, 0, '', '');
-        },
-      );
+  test('writes quoted Windows startup command', () async {
+    final calls = <(String, List<String>)>[];
+    final registration = WindowsStartupRegistration(
+      executablePath: executable,
+      isSupportedOverride: true,
+      processRunner: (command, arguments) async {
+        calls.add((command, arguments));
+        return ProcessResult(0, 0, '', '');
+      },
+    );
 
-      await registration.setEnabled(true);
+    await registration.setEnabled(true);
 
-      expect(calls, [
-        (
-          'reg.exe',
-          [
-            'add',
-            registryKey,
-            '/v',
-            'P2WLAN',
-            '/t',
-            'REG_SZ',
-            '/d',
-            expectedCommand,
-            '/f',
-          ],
-        ),
-      ]);
-    },
-  );
+    expect(calls, [
+      (
+        'reg.exe',
+        [
+          'add',
+          registryKey,
+          '/v',
+          'P2WLAN',
+          '/t',
+          'REG_SZ',
+          '/d',
+          expectedCommand,
+          '/f',
+        ],
+      ),
+    ]);
+  });
 
-  test('removes the P2WLAN login-startup value when disabling', () async {
+  test('removes Windows startup registration', () async {
     final calls = <(String, List<String>)>[];
     final registration = WindowsStartupRegistration(
       isSupportedOverride: true,
@@ -101,29 +87,29 @@ void main() {
     ]);
   });
 
-  test(
-    'rejects ambiguous executable paths and failed registry writes',
-    () async {
-      expect(
-        () => startupCommandForExecutable(
-          r'C:\bad"path\p2wlan.exe',
-          loginStartupArgument: loginStartupArgument,
-        ),
-        throwsArgumentError,
-      );
-      final registration = WindowsStartupRegistration(
-        isSupportedOverride: true,
-        processRunner: (_, _) async => ProcessResult(0, 1, '', 'denied'),
-      );
+  test('rejects unsafe paths and failed registry writes', () async {
+    expect(
+      () => startupCommandForExecutable(
+        r'C:\bad"path\p2wlan.exe',
+        loginStartupArgument: loginStartupArgument,
+      ),
+      throwsArgumentError,
+    );
 
-      await expectLater(
-        registration.setEnabled(true),
-        throwsA(isA<StartupRegistrationException>()),
-      );
-    },
-  );
+    final registration = WindowsStartupRegistration(
+      isSupportedOverride: true,
+      processRunner: (_, _) async {
+        return ProcessResult(0, 1, '', 'denied');
+      },
+    );
 
-  test('login startup connects only after safe desktop bootstrap', () {
+    await expectLater(
+      registration.setEnabled(true),
+      throwsA(isA<StartupRegistrationException>()),
+    );
+  });
+
+  test('login startup requires safe desktop bootstrap', () {
     expect(isLoginStartupInvocation([loginStartupArgument]), isTrue);
     expect(isLoginStartupInvocation(const []), isFalse);
     expect(
