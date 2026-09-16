@@ -12,9 +12,9 @@ void main() {
 
   test('reports current Windows startup registration', () async {
     final calls = <(String, List<String>)>[];
-    final registration = WindowsStartupRegistration(
+    final registration = DesktopStartupRegistration(
       executablePath: executable,
-      isSupportedOverride: true,
+      platformOverride: DesktopStartupPlatform.windows,
       processRunner: (command, arguments) async {
         calls.add((command, arguments));
         return ProcessResult(0, 0, 'P2WLAN REG_SZ $expectedCommand', '');
@@ -28,9 +28,9 @@ void main() {
   });
 
   test('rejects stale Windows startup registration', () async {
-    final registration = WindowsStartupRegistration(
+    final registration = DesktopStartupRegistration(
       executablePath: executable,
-      isSupportedOverride: true,
+      platformOverride: DesktopStartupPlatform.windows,
       processRunner: (_, _) async {
         return ProcessResult(0, 0, 'P2WLAN REG_SZ $staleCommand', '');
       },
@@ -41,9 +41,9 @@ void main() {
 
   test('writes quoted Windows startup command', () async {
     final calls = <(String, List<String>)>[];
-    final registration = WindowsStartupRegistration(
+    final registration = DesktopStartupRegistration(
       executablePath: executable,
-      isSupportedOverride: true,
+      platformOverride: DesktopStartupPlatform.windows,
       processRunner: (command, arguments) async {
         calls.add((command, arguments));
         return ProcessResult(0, 0, '', '');
@@ -72,8 +72,8 @@ void main() {
 
   test('removes Windows startup registration', () async {
     final calls = <(String, List<String>)>[];
-    final registration = WindowsStartupRegistration(
-      isSupportedOverride: true,
+    final registration = DesktopStartupRegistration(
+      platformOverride: DesktopStartupPlatform.windows,
       processRunner: (command, arguments) async {
         calls.add((command, arguments));
         return ProcessResult(0, 0, '', '');
@@ -96,8 +96,8 @@ void main() {
       throwsArgumentError,
     );
 
-    final registration = WindowsStartupRegistration(
-      isSupportedOverride: true,
+    final registration = DesktopStartupRegistration(
+      platformOverride: DesktopStartupPlatform.windows,
       processRunner: (_, _) async {
         return ProcessResult(0, 1, '', 'denied');
       },

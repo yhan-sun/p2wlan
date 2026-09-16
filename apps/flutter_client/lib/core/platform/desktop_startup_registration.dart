@@ -143,9 +143,11 @@ class DesktopStartupRegistration implements StartupRegistration {
     }
   }
 
-  File get _macosLaunchAgentFile => File(
-    '${_homeDirectory.path}/Library/LaunchAgents/$_launchAgentLabel.plist',
-  );
+  File get _macosLaunchAgentFile {
+    final path =
+        '${_homeDirectory.path}/Library/LaunchAgents/$_launchAgentLabel.plist';
+    return File(path);
+  }
 
   String get _macosLaunchAgentContents {
     final executable = xmlEscape(_validatedExecutablePath);
@@ -172,9 +174,11 @@ class DesktopStartupRegistration implements StartupRegistration {
   File get _linuxAutostartFile {
     final configured = _environment['XDG_CONFIG_HOME']?.trim();
     String configRoot;
-    if (configured != null &&
+    final configuredIsAbsolute =
+        configured != null &&
         configured.isNotEmpty &&
-        configured.startsWith('/')) {
+        configured.startsWith('/');
+    if (configuredIsAbsolute) {
       configRoot = _requireSafePath(configured, 'XDG_CONFIG_HOME');
     } else {
       configRoot = '${_homeDirectory.path}/.config';
@@ -237,8 +241,9 @@ X-GNOME-Autostart-enabled=true
     return Directory(_requireSafePath(home, 'HOME'));
   }
 
-  String get _validatedExecutablePath =>
-      _requireSafePath(_executablePath, 'executablePath');
+  String get _validatedExecutablePath {
+    return _requireSafePath(_executablePath, 'executablePath');
+  }
 
   void _ensureSupported() {
     if (!isSupported) {
@@ -256,26 +261,9 @@ X-GNOME-Autostart-enabled=true
   static Future<ProcessResult> _runProcess(
     String executable,
     List<String> arguments,
-  ) => Process.run(executable, arguments);
-}
-
-/// Compatibility entry point kept for existing Windows callers and tests.
-/// Without an override it delegates to the current desktop platform.
-class WindowsStartupRegistration extends DesktopStartupRegistration {
-  WindowsStartupRegistration({
-    super.processRunner,
-    super.executablePath,
-    bool? isSupportedOverride,
-  })
-    : super(platformOverride: _windowsPlatformOverride(isSupportedOverride));
-
-  static const loginStartupArgument = '--p2wlan-login-startup';
-}
-
-DesktopStartupPlatform? _windowsPlatformOverride(bool? isSupported) {
-  if (isSupported == null) return null;
-  if (isSupported) return DesktopStartupPlatform.windows;
-  return DesktopStartupPlatform.unsupported;
+  ) {
+    return Process.run(executable, arguments);
+  }
 }
 
 String startupCommandForExecutable(
@@ -293,21 +281,22 @@ String startupCommandForExecutable(
 }
 
 String desktopEntryQuoteArgument(String value) {
-  final argument = _requireSafePath(value, 'argument');
-  final escaped = argument
-      .replaceAll('\\', r'\\')
-      .replaceAll('"', r'\"')
-      .replaceAll(r'$', r'\$')
-      .replaceAll('`', r'\`');
+  var escaped = _requireSafePath(value, 'argument');
+  escaped = escaped.replaceAll('\\', r'\\');
+  escaped = escaped.replaceAll('"', r'\"');
+  escaped = escaped.replaceAll(r'$', r'\$');
+  escaped = escaped.replaceAll('`', r'\`');
   return '"$escaped"';
 }
 
-String xmlEscape(String value) => value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
+String xmlEscape(String value) {
+  var escaped = value.replaceAll('&', '&amp;');
+  escaped = escaped.replaceAll('<', '&lt;');
+  escaped = escaped.replaceAll('>', '&gt;');
+  escaped = escaped.replaceAll('"', '&quot;');
+  escaped = escaped.replaceAll("'", '&apos;');
+  return escaped;
+}
 
 String _requireSafePath(String value, String argumentName) {
   final path = value.trim();
@@ -320,34 +309,22 @@ String _requireSafePath(String value, String argumentName) {
   return path;
 }
 
-bool isLoginStartupInvocation(Iterable<String> executableArguments) =>
-    executableArguments.contains(loginStartupArgument);
+bool isLoginStartupInvocation(Iterable<String> executableArguments) {
+  return executableArguments.contains(loginStartupArgument);
+}
 
 bool shouldConnectAfterLoginStartup({
   required bool wasLaunchedAtLogin,
   required bool hasValidSession,
   required bool onboardingComplete,
   required bool canActAsLocalVpnNode,
-}) =>
-    wasLaunchedAtLogin &&
-    hasValidSession &&
-    onboardingComplete &&
-    canActAsLocalVpnNode;
-
-bool isWindowsLoginStartupInvocation(Iterable<String> executableArguments) =>
-    isLoginStartupInvocation(executableArguments);
-
-bool shouldConnectAfterWindowsLoginStartup({
-  required bool wasLaunchedAtLogin,
-  required bool hasValidSession,
-  required bool onboardingComplete,
-  required bool canActAsLocalVpnNode,
-}) => shouldConnectAfterLoginStartup(
-  wasLaunchedAtLogin: wasLaunchedAtLogin,
-  hasValidSession: hasValidSession,
-  onboardingComplete: onboardingComplete,
-  canActAsLocalVpnNode: canActAsLocalVpnNode,
-);
+}) {
+  if (!wasLaunchedAtLogin) return false;
+  if (!hasValidSession) return false;
+  if (!onboardingComplete) return false;
+  if (!canActAsLocalVpnNode) return false;
+  return true;
+}
 
 class StartupRegistrationException implements Exception {
   const StartupRegistrationException();
