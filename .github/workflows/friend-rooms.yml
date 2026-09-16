@@ -25,7 +25,7 @@ jobs:
     if: github.ref == 'refs/heads/feat/friend-rooms-20260907'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Archive exact tracked source
         run: git archive --format=tar.gz HEAD -o "${RUNNER_TEMP}/p2wlan-room-source.tar.gz"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -37,7 +37,7 @@ jobs:
     name: Room server race and vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: server/go.mod

@@ -44,7 +44,7 @@ jobs:
             goarch: arm64
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
@@ -121,7 +121,7 @@ jobs:
     steps:
       - name: Resolve exact source SHA
         id: source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 1
