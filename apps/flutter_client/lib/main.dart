@@ -8,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 import 'app/desktop_tray_controller.dart';
 import 'app/desktop_window_operations.dart';
 import 'app/p2wlan_app.dart';
+import 'core/platform/windows_startup_registration.dart';
 
 Future<void> main() async {
   writeDesktopTrayLifecycleTrace('main.ensureInitialized.begin');
@@ -29,6 +30,8 @@ Future<void> main() async {
       roomLinks: appLinks.uriLinkStream,
       enableDesktopTray: enableFlutterTray,
       enableDesktopTaskbarStatus: _supportsDesktopHost && !enableFlutterTray,
+      connectAfterLoginStartup: Platform.isWindows &&
+          isWindowsLoginStartupInvocation(Platform.executableArguments),
     ),
   );
   writeDesktopTrayLifecycleTrace('runApp.end');

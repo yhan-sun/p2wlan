@@ -611,6 +611,16 @@ class AppStrings {
   String get closeBehaviorKeepRunning =>
       isZh ? '继续在后台运行' : 'Keep running in background';
   String get closeBehaviorStopAndQuit => isZh ? '停止 P2WLAN' : 'Stop P2WLAN';
+  String get startAtLogin => isZh ? '登录时启动 P2WLAN' : 'Launch P2WLAN at login';
+  String get startAtLoginHelper => isZh
+      ? '登录 Windows 后启动应用并自动连接已配置的 P2WLAN 网络。'
+      : 'Launches the app and connects the configured P2WLAN network when you sign in to Windows.';
+  String get startAtLoginUnavailable => isZh
+      ? '无法读取 Windows 自动启动与连接设置。请检查当前用户权限后重试。'
+      : 'Unable to read the Windows login-startup setting. Check the current user permissions and try again.';
+  String get startAtLoginUpdateFailed => isZh
+      ? '无法更新 Windows 自动启动与连接设置。请检查当前用户权限后重试。'
+      : 'Unable to update the Windows login-startup setting. Check the current user permissions and try again.';
 
   // Credential / account
   String get credentialSectionTitle => isZh ? '认证凭据' : 'Authentication';
