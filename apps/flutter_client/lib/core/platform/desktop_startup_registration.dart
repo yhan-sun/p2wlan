@@ -267,6 +267,12 @@ X-GNOME-Autostart-enabled=true
   }
 }
 
+/// Source-compatible constructor retained for the existing settings page.
+/// Platform selection still happens inside [DesktopStartupRegistration].
+class WindowsStartupRegistration extends DesktopStartupRegistration {
+  WindowsStartupRegistration() : super();
+}
+
 String startupCommandForExecutable(
   String executablePath, {
   required String loginStartupArgument,
