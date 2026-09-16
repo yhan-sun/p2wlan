@@ -339,7 +339,7 @@ if ($records.Count -eq 0) { Write-Output '[]'; exit 0 }
 $records | ConvertTo-Json -Compress
 exit 0
 '''
-          .replaceFirst('__ROOT_PID__', '$rootPid');
+          .replaceAll('__ROOT_PID__', '$rootPid');
   final result = await _runPowerShell(script);
   final text = '${result.stdout}'.trim();
   if (result.exitCode != 0 || text.isEmpty) return null;
