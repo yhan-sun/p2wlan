@@ -1,16 +1,7 @@
 version: 2
-# Dependency PRs are a standing background load, not a work queue: weekly
-# checks with five open PRs per ecosystem produced overlapping PRs that each
-# consumed the full required-check set. The policy below is deliberately
-# conservative about *what* is grouped, not just how often it runs.
-#
-# Two things this file cannot express, and therefore does not claim:
-#   * a 0.x package's "minor" bump is a breaking change. Packages whose current
-#     line is 0.x are excluded from grouping by name;
-#   * whether a security advisory produces a PR is decided by the Dependabot
-#     alerts / security updates settings on the repository, not by this file.
-#     This file cannot read or assert those settings, and it adds no ignore, so
-#     nothing is exempted from them.
+# Dependency PRs are a standing background load, not a work queue. The policy
+# keeps normal update noise bounded; security updates are controlled by the
+# repository's Dependabot security settings, not by this file.
 updates:
   - package-ecosystem: cargo
     directory: "/"
@@ -20,14 +11,12 @@ updates:
     labels:
       - dependencies
     groups:
-      # Compatible ordinary updates only. Anything below is reviewed on its own.
       cargo-compatible:
         applies-to: version-updates
         update-types:
           - minor
           - patch
         exclude-patterns:
-          # cryptographic primitives, key material and RNG
           - "x25519-dalek"
           - "curve25519-dalek"
           - "ed25519-dalek"
@@ -42,7 +31,6 @@ updates:
           - "rustls*"
           - "ring"
           - "webpki*"
-          # 0.x lines: a "minor" bump here is a compatibility break
           - "tracing"
           - "tracing-subscriber"
           - "tracing-core"
@@ -67,8 +55,6 @@ updates:
           - minor
           - patch
         exclude-patterns:
-          # golang.org/x/* are 0.x by policy and carry their own compatibility
-          # rules; x/crypto is security-relevant on top of that.
           - "golang.org/x/crypto"
           - "golang.org/x/sys"
           - "golang.org/x/net"
@@ -83,8 +69,6 @@ updates:
     labels:
       - dependencies
     groups:
-      # Actions are pinned by full commit SHA; only the pin is moved, and a
-      # major bump is a breaking change that is reviewed on its own.
       actions-minor-patch:
         applies-to: version-updates
         update-types:
