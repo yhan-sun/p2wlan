@@ -7,9 +7,10 @@ version: 2
 # Two things this file cannot express, and therefore does not claim:
 #   * a 0.x package's "minor" bump is a breaking change. Packages whose current
 #     line is 0.x are excluded from grouping by name;
-#   * security advisories are handled by Dependabot alerts / security updates
-#     in repository settings, which stay enabled. Nothing here is ignored
-#     permanently.
+#   * whether a security advisory produces a PR is decided by the Dependabot
+#     alerts / security updates settings on the repository, not by this file.
+#     This file cannot read or assert those settings, and it adds no ignore, so
+#     nothing is exempted from them.
 updates:
   - package-ecosystem: cargo
     directory: "/"
