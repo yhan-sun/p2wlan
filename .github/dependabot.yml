@@ -1,25 +1,91 @@
 version: 2
+# Dependency PRs are a standing background load, not a work queue: weekly
+# checks with five open PRs per ecosystem produced overlapping PRs that each
+# consumed the full required-check set. The policy below is deliberately
+# conservative about *what* is grouped, not just how often it runs.
+#
+# Two things this file cannot express, and therefore does not claim:
+#   * a 0.x package's "minor" bump is a breaking change. Packages whose current
+#     line is 0.x are excluded from grouping by name;
+#   * security advisories are handled by Dependabot alerts / security updates
+#     in repository settings, which stay enabled. Nothing here is ignored
+#     permanently.
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 1
     labels:
       - dependencies
+    groups:
+      # Compatible ordinary updates only. Anything below is reviewed on its own.
+      cargo-compatible:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+        exclude-patterns:
+          # cryptographic primitives, key material and RNG
+          - "x25519-dalek"
+          - "curve25519-dalek"
+          - "ed25519-dalek"
+          - "chacha20poly1305"
+          - "blake2"
+          - "sha2"
+          - "zeroize"
+          - "subtle"
+          - "rand"
+          - "rand_core"
+          - "rcgen"
+          - "rustls*"
+          - "ring"
+          - "webpki*"
+          # 0.x lines: a "minor" bump here is a compatibility break
+          - "tracing"
+          - "tracing-subscriber"
+          - "tracing-core"
+          - "socket2"
+          - "hex"
+          - "libc"
+          - "if-addrs"
+          - "nix"
+          - "mio"
 
   - package-ecosystem: gomod
     directory: "/server"
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 1
     labels:
       - dependencies
+    groups:
+      gomod-compatible:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+        exclude-patterns:
+          # golang.org/x/* are 0.x by policy and carry their own compatibility
+          # rules; x/crypto is security-relevant on top of that.
+          - "golang.org/x/crypto"
+          - "golang.org/x/sys"
+          - "golang.org/x/net"
+          - "golang.org/x/text"
+          - "github.com/golang-jwt/jwt/*"
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
+      interval: monthly
+    open-pull-requests-limit: 1
     labels:
       - dependencies
+    groups:
+      # Actions are pinned by full commit SHA; only the pin is moved, and a
+      # major bump is a breaking change that is reviewed on its own.
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
