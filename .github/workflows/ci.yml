@@ -134,7 +134,7 @@ jobs:
           python3 scripts/quality/check_code_health.py
           bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
           sh -n scripts/install-linux-cli.sh
-          python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/quality/run_rust_tests.py scripts/quality/check_required_gates.py scripts/dplpmtud/select_component_artifact.py scripts/dplpmtud/aggregate_evidence.py scripts/dplpmtud/collect_evidence.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
+          python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/quality/run_rust_tests.py scripts/quality/check_required_gates.py scripts/dplpmtud/select_component_artifact.py scripts/dplpmtud/aggregate_evidence.py scripts/dplpmtud/collect_evidence.py scripts/nat-sim/select_attempt_evidence.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
           python3 scripts/release/test_release_set.py
           test -x apps/flutter_client/android/gradlew
           printf '%s  %s\n' 76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3 apps/flutter_client/android/gradle/wrapper/gradle-wrapper.jar | sha256sum -c -
