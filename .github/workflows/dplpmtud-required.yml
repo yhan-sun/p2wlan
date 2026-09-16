@@ -43,10 +43,16 @@ on:
 permissions:
   contents: read
   checks: read
+  actions: read
 
 concurrency:
-  group: dplpmtud-${{ github.event.pull_request.number || inputs.validation_sha || github.ref }}
-  cancel-in-progress: true
+  # A commit validation (push / pull_request) and a periodic health check
+  # (schedule / workflow_dispatch) are different obligations for the same
+  # ref. Sharing one concurrency group let a scheduled run cancel an
+  # in-flight commit validation, so each event class gets its own group and
+  # only a pull request cancels its own superseded predecessors.
+  group: dplpmtud-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.validation_sha || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -246,78 +252,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     steps:
-      - name: Require same-SHA business, path, topology, lifecycle, package, security and observability gates
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          script: |
-            const requiredNames = [
-              'Business MTU Budget Required',
-              'Path State Machine Required',
-              'NAT Topology Required',
-              'Windows Lifecycle Required',
-              'Mobile Lifecycle Required',
-              'Path Observability Required',
-              'Security Audit Required',
-              'CI Required',
-              'Analyze and Test',
-              'Android arm64 CI test APK',
-              'iOS Compile',
-              'Linux x64 Release Bundle',
-              'macOS Release Apps',
-              'Windows x64 Release Bundle',
-              'macOS arm64 test DMG',
-              'Android arm64 test APK',
-            ];
-            const targetSha = context.payload.pull_request?.head?.sha || context.sha;
-            const deadline = Date.now() + 65 * 60 * 1000;
-            let lastSummary = '';
-
-            while (Date.now() < deadline) {
-              const response = await github.rest.checks.listForRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: targetSha,
-                per_page: 100,
-                filter: 'latest',
-              });
-              const latestByName = new Map();
-              for (const run of response.data.check_runs) {
-                if (!requiredNames.includes(run.name)) continue;
-                const prior = latestByName.get(run.name);
-                if (!prior || new Date(run.started_at || 0) > new Date(prior.started_at || 0)) {
-                  latestByName.set(run.name, run);
-                }
-              }
-
-              const summary = requiredNames.map((name) => {
-                const run = latestByName.get(name);
-                return `${name}=${run ? `${run.status}/${run.conclusion || 'pending'}` : 'missing'}`;
-              }).join(', ');
-              if (summary !== lastSummary) {
-                core.info(`same-SHA gate status: ${summary}`);
-                lastSummary = summary;
-              }
-
-              const failed = requiredNames.filter((name) => {
-                const run = latestByName.get(name);
-                return run && run.status === 'completed' && run.conclusion !== 'success';
-              });
-              if (failed.length > 0) {
-                core.setFailed(`Required gate failed for ${targetSha}: ${failed.join(', ')}`);
-                return;
-              }
-              const complete = requiredNames.every((name) => {
-                const run = latestByName.get(name);
-                return run && run.status === 'completed' && run.conclusion === 'success';
-              });
-              if (complete) {
-                core.info(`All required live dataplane and repository gates passed for ${targetSha}.`);
-                return;
-              }
-              await new Promise((resolve) => setTimeout(resolve, 15000));
-            }
-            core.setFailed(`Timed out waiting for required gates on ${targetSha}: ${lastSummary}`);
-
+          persist-credentials: false
+      - name: Require same-SHA business, path, topology, lifecycle, package, security and observability gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/quality/check_required_gates.py \
+            --sha "${{ github.event.pull_request.head.sha }}" \
+            --require "Business MTU Budget Required" \
+            --require "Path State Machine Required" \
+            --require "NAT Topology Required" \
+            --require "Windows Lifecycle Required" \
+            --require "Mobile Lifecycle Required" \
+            --require "Path Observability Required" \
+            --require "Security Audit Required" \
+            --require "CI Required" \
+            --require "Analyze and Test" \
+            --require "Android arm64 CI test APK" \
+            --require "iOS Compile" \
+            --require "Linux x64 Release Bundle" \
+            --require "macOS Release Apps" \
+            --require "Windows x64 Release Bundle" \
+            --require "macOS arm64 test DMG" \
+            --require "Android arm64 test APK" \
+            --timeout-seconds 3900
   evidence_aggregate:
     name: DPLPMTUD evidence aggregate
     if: always()
