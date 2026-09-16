@@ -25,12 +25,11 @@ class DesktopStartupRegistration implements StartupRegistration {
   DesktopStartupRegistration({
     StartupProcessRunner? processRunner,
     String? executablePath,
-    String? homeDirectoryPath,
+    this._homeDirectoryPath,
     Map<String, String>? environment,
     DesktopStartupPlatform? platformOverride,
   }) : _processRunner = processRunner ?? _runProcess,
        _executablePath = executablePath ?? Platform.resolvedExecutable,
-       _homeDirectoryPath = homeDirectoryPath,
        _environment = environment ?? Platform.environment,
        _platform = platformOverride ?? _currentPlatform();
 
@@ -134,7 +133,8 @@ class DesktopStartupRegistration implements StartupRegistration {
 
   Future<ProcessResult> _runWindows(List<String> arguments) async {
     try {
-      return await _processRunner('reg.exe', arguments).timeout(_commandTimeout);
+      final process = _processRunner('reg.exe', arguments);
+      return await process.timeout(_commandTimeout);
     } on TimeoutException {
       throw const StartupRegistrationException();
     } on ProcessException {
@@ -170,10 +170,14 @@ class DesktopStartupRegistration implements StartupRegistration {
 
   File get _linuxAutostartFile {
     final configured = _environment['XDG_CONFIG_HOME']?.trim();
-    final configRoot = configured != null && configured.isNotEmpty &&
-            configured.startsWith('/')
-        ? _requireSafePath(configured, 'XDG_CONFIG_HOME')
-        : '${_homeDirectory.path}/.config';
+    String configRoot;
+    if (configured != null &&
+        configured.isNotEmpty &&
+        configured.startsWith('/')) {
+      configRoot = _requireSafePath(configured, 'XDG_CONFIG_HOME');
+    } else {
+      configRoot = '${_homeDirectory.path}/.config';
+    }
     return File('$configRoot/autostart/$_linuxDesktopFileName');
   }
 
@@ -254,24 +258,22 @@ X-GNOME-Autostart-enabled=true
   ) => Process.run(executable, arguments);
 }
 
-/// Compatibility entry point kept for the original Windows-only PR and tests.
-/// Without an override it now delegates to the current desktop platform.
+/// Compatibility entry point kept for existing Windows callers and tests.
+/// Without an override it delegates to the current desktop platform.
 class WindowsStartupRegistration extends DesktopStartupRegistration {
   WindowsStartupRegistration({
-    StartupProcessRunner? processRunner,
-    String? executablePath,
+    super.processRunner,
+    super.executablePath,
     bool? isSupportedOverride,
-  }) : super(
-         processRunner: processRunner,
-         executablePath: executablePath,
-         platformOverride: isSupportedOverride == null
-             ? null
-             : isSupportedOverride
-             ? DesktopStartupPlatform.windows
-             : DesktopStartupPlatform.unsupported,
-       );
+  }) : super(platformOverride: _windowsPlatformOverride(isSupportedOverride));
 
   static const loginStartupArgument = '--p2wlan-login-startup';
+}
+
+DesktopStartupPlatform? _windowsPlatformOverride(bool? isSupported) {
+  if (isSupported == null) return null;
+  if (isSupported) return DesktopStartupPlatform.windows;
+  return DesktopStartupPlatform.unsupported;
 }
 
 String startupCommandForExecutable(

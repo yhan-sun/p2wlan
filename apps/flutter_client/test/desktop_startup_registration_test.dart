@@ -79,12 +79,9 @@ void main() {
     final file = File('${xdg.path}/autostart/p2wlan.desktop');
     final contents = await file.readAsString();
     expect(contents, contains('[Desktop Entry]'));
-    expect(
-      contents,
-      contains(
-        'Exec="${tempHome.path}/P2WLAN Client/p2wlan" $loginStartupArgument',
-      ),
-    );
+    final expectedExec =
+        'Exec="${tempHome.path}/P2WLAN Client/p2wlan" $loginStartupArgument';
+    expect(contents, contains(expectedExec));
     expect(contents, contains('X-GNOME-Autostart-enabled=true'));
 
     await registration.setEnabled(false);
@@ -100,10 +97,10 @@ void main() {
     );
 
     await registration.setEnabled(true);
-    expect(
-      await File('${tempHome.path}/.config/autostart/p2wlan.desktop').exists(),
-      isTrue,
+    final fallback = File(
+      '${tempHome.path}/.config/autostart/p2wlan.desktop',
     );
+    expect(await fallback.exists(), isTrue);
   });
 
   test('unsupported platforms hide the login-startup preference', () {
@@ -117,8 +114,9 @@ void main() {
     expect(desktopEntryQuoteArgument('/tmp/a b'), '"/tmp/a b"');
     expect(desktopEntryQuoteArgument(r'/tmp/a$b'), r'"/tmp/a\$b"');
     expect(xmlEscape('A&B<"'), 'A&amp;B&lt;&quot;');
+    final malformedPath = '/tmp/a\\nmalformed'.replaceAll(r'\n', '\n');
     expect(
-      () => desktopEntryQuoteArgument('/tmp/a\nmalformed'.replaceAll(r'\n', '\n')),
+      () => desktopEntryQuoteArgument(malformedPath),
       throwsArgumentError,
     );
   });
