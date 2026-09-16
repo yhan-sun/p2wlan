@@ -206,6 +206,19 @@ def evaluate(
     return [classify_gate(name, runs, head_sha=head_sha) for name in gates]
 
 
+def blocking_findings(findings: Sequence[GateFinding]) -> list[GateFinding]:
+    """Gates that already failed; a pass and a pending gate are not blockers.
+
+    Only a terminal non-pass state stops the wait. Treating a pass as a blocker
+    would abort on the first gate that finishes instead of waiting for the rest.
+    """
+    return [
+        finding
+        for finding in findings
+        if finding.state not in (GateState.PENDING, GateState.PASS)
+    ]
+
+
 def authorized(findings: Sequence[GateFinding]) -> bool:
     """Only a fully terminal, fully passing set of gates authorizes a merge."""
     return bool(findings) and all(finding.state is GateState.PASS for finding in findings)
@@ -380,7 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"PASS required gates for {args.sha}: {len(findings)} gates")
             return 0
 
-        blocking = [f for f in findings if f.state is not GateState.PENDING]
+        blocking = blocking_findings(findings)
         if blocking:
             print(f"FAIL required gates for {args.sha}", file=sys.stderr)
             for finding in blocking:

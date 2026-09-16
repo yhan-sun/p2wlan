@@ -141,6 +141,35 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(gates.authorized([pending]))
 
 
+    def test_a_pass_does_not_block_waiting_for_the_rest(self):
+        findings = [
+            gates.classify_gate(
+                "CI Required",
+                [run("CI", "push", [job("CI Required")])],
+                head_sha=SHA,
+            ),
+            gates.classify_gate(
+                "NAT Topology Required",
+                [run("NAT Topology Gate", "push", [job("NAT Topology Required", status="in_progress", conclusion=None)], status="in_progress")],
+                head_sha=SHA,
+            ),
+        ]
+        self.assertIs(findings[0].state, gates.GateState.PASS)
+        self.assertIs(findings[1].state, gates.GateState.PENDING)
+        self.assertEqual(gates.blocking_findings(findings), [])
+        self.assertFalse(gates.authorized(findings))
+
+    def test_terminal_failures_and_missing_do_block(self):
+        findings = [
+            gates.classify_gate("CI Required", [run("CI", "push", [job("CI Required", conclusion="failure")])], head_sha=SHA),
+            gates.classify_gate("NAT Topology Required", [], head_sha=SHA),
+        ]
+        self.assertEqual(
+            [f.job_name for f in gates.blocking_findings(findings)],
+            ["CI Required", "NAT Topology Required"],
+        )
+
+
 class ResponseTests(unittest.TestCase):
     """The HTTP layer must never turn a broken response into success."""
 
