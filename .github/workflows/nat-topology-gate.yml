@@ -208,7 +208,7 @@ jobs:
       - name: Download every Direct attempt of this run
         id: download_direct
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           # Every attempt is fetched so a partial re-run can still be
           # aggregated and so a failing attempt stays available afterwards.
@@ -219,7 +219,7 @@ jobs:
       - name: Download every Relay attempt of this run
         id: download_relay
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: nat-topology-relay-${{ github.run_id }}-*-of-5
           path: ${{ runner.temp }}/nat-topology-artifacts
