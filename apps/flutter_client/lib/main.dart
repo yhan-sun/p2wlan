@@ -8,6 +8,7 @@ import 'package:window_manager/window_manager.dart';
 import 'app/desktop_tray_controller.dart';
 import 'app/desktop_window_operations.dart';
 import 'app/p2wlan_app.dart';
+import 'core/platform/desktop_startup_registration.dart';
 
 Future<void> main() async {
   writeDesktopTrayLifecycleTrace('main.ensureInitialized.begin');
@@ -15,6 +16,9 @@ Future<void> main() async {
   final appLinks = AppLinks();
   writeDesktopTrayLifecycleTrace('main.ensureInitialized.end');
   final enableFlutterTray = _enableFlutterTray;
+  final launchedAtLogin = isLoginStartupInvocation(
+    Platform.executableArguments,
+  );
   if (_supportsDesktopHost) {
     writeDesktopTrayLifecycleTrace('window.ensureInitialized.begin');
     await windowManager.ensureInitialized();
@@ -29,6 +33,7 @@ Future<void> main() async {
       roomLinks: appLinks.uriLinkStream,
       enableDesktopTray: enableFlutterTray,
       enableDesktopTaskbarStatus: _supportsDesktopHost && !enableFlutterTray,
+      connectAfterLoginStartup: _supportsDesktopHost && launchedAtLogin,
     ),
   );
   writeDesktopTrayLifecycleTrace('runApp.end');

@@ -16,6 +16,7 @@ import '../core/api/diagnostics_api.dart';
 import '../core/capabilities/platform_capabilities.dart';
 import '../core/daemon/daemon_controller.dart';
 import '../core/models/diagnostics_models.dart';
+import '../core/platform/windows_startup_registration.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
 import '../features/auth/login_page.dart';
@@ -36,6 +37,7 @@ class P2WlanApp extends StatefulWidget {
     this.daemonController,
     this.enableDesktopTray = false,
     this.enableDesktopTaskbarStatus = false,
+    this.connectAfterLoginStartup = false,
   });
 
   final bool initialRefresh;
@@ -46,6 +48,10 @@ class P2WlanApp extends StatefulWidget {
   final DaemonController? daemonController;
   final bool enableDesktopTray;
   final bool enableDesktopTaskbarStatus;
+
+  /// True only for a command line created by a P2WLAN desktop login-startup
+  /// registration. Manual launches never turn on a network implicitly.
+  final bool connectAfterLoginStartup;
 
   @override
   State<P2WlanApp> createState() => _P2WlanAppState();
@@ -106,9 +112,11 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     await _settingsStore.load();
     writeDesktopTrayLifecycleTrace('bootstrap.settings-loaded');
     final authToken = _settingsStore.settings.authToken.trim();
-    _authenticated =
-        _settingsStore.settings.manualMode ||
-        (authToken.isNotEmpty && !isAuthTokenExpired(authToken));
+    final hasValidSession =
+        !_settingsStore.settings.manualMode &&
+        authToken.isNotEmpty &&
+        !isAuthTokenExpired(authToken);
+    _authenticated = _settingsStore.settings.manualMode || hasValidSession;
     if (mounted) {
       setState(() => _ready = true);
     }
@@ -161,6 +169,14 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       _statusStore.startPolling();
     } else if (widget.initialRefresh && canPollLocalDaemon) {
       unawaited(_statusStore.refreshUntilPeerCatalogSettled(silent: true));
+    }
+    if (shouldConnectAfterLoginStartup(
+      wasLaunchedAtLogin: widget.connectAfterLoginStartup,
+      hasValidSession: hasValidSession,
+      onboardingComplete: !_needsOnboarding,
+      canActAsLocalVpnNode: canPollLocalDaemon,
+    )) {
+      unawaited(_statusStore.startDaemon());
     }
   }
 

@@ -15,6 +15,12 @@
 
 登录和配置不要使用 sudo；创建 TUN、路由或系统服务时，CLI 会在需要的位置请求权限。
 
+Windows、macOS 和 Linux 桌面客户端可在“设置 → 通用 → 登录时启动 P2WLAN”中选择是否在当前用户进入桌面会话后自动启动应用，并在登录状态、首次配置和本机 VPN 能力均有效时连接已配置的 P2WLAN 网络。手动启动应用不会隐式连接网络。
+
+登录自启只写入当前用户范围：Windows 使用 `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`，macOS 使用 `~/Library/LaunchAgents/io.p2wlan.desktop.login-startup.plist`，Linux 使用 XDG Autostart（`$XDG_CONFIG_HOME/autostart/p2wlan.desktop`，未设置绝对的 `XDG_CONFIG_HOME` 时回退到 `~/.config/autostart/p2wlan.desktop`）。关闭开关会移除对应当前用户条目，不创建系统级服务。
+
+如果应用安装位置变化，设置页会把旧条目视为未启用；重新打开开关会使用当前应用路径重建条目。没有有效登录状态、首次配置未完成或当前平台不能作为本机 VPN 节点时，即使应用由登录自启启动，也不会自动启动网络。
+
 ## 路径和路由
 
     p2wlan doctor
