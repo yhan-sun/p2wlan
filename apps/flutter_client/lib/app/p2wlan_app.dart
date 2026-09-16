@@ -49,8 +49,8 @@ class P2WlanApp extends StatefulWidget {
   final bool enableDesktopTray;
   final bool enableDesktopTaskbarStatus;
 
-  /// True only for the command line created by the Windows login-startup
-  /// preference. Manual launches never turn on a network implicitly.
+  /// True only for a command line created by a P2WLAN desktop login-startup
+  /// registration. Manual launches never turn on a network implicitly.
   final bool connectAfterLoginStartup;
 
   @override
@@ -116,9 +116,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
         !_settingsStore.settings.manualMode &&
         authToken.isNotEmpty &&
         !isAuthTokenExpired(authToken);
-    _authenticated =
-        _settingsStore.settings.manualMode ||
-        hasValidSession;
+    _authenticated = _settingsStore.settings.manualMode || hasValidSession;
     if (mounted) {
       setState(() => _ready = true);
     }
@@ -172,7 +170,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     } else if (widget.initialRefresh && canPollLocalDaemon) {
       unawaited(_statusStore.refreshUntilPeerCatalogSettled(silent: true));
     }
-    if (shouldConnectAfterWindowsLoginStartup(
+    if (shouldConnectAfterLoginStartup(
       wasLaunchedAtLogin: widget.connectAfterLoginStartup,
       hasValidSession: hasValidSession,
       onboardingComplete: !_needsOnboarding,
