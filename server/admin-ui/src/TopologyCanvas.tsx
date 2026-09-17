@@ -14,6 +14,8 @@ import {
   Box,
   CircleAlert,
   Expand,
+  Eye,
+  EyeOff,
   Laptop,
   Network,
   RadioTower,
@@ -35,23 +37,23 @@ interface TopologyCanvasProps {
 }
 
 const dimensions: Record<AdminTopologyNode['kind'], { width: number; height: number }> = {
-  account: { width: 220, height: 84 },
-  network: { width: 210, height: 82 },
-  room: { width: 210, height: 82 },
-  device: { width: 232, height: 88 },
+  account: { width: 228, height: 88 },
+  network: { width: 218, height: 86 },
+  room: { width: 218, height: 86 },
+  device: { width: 238, height: 92 },
 }
 
 function DeviceIcon({ platform }: { platform?: string }) {
   const normalized = platform?.toLowerCase() ?? ''
-  if (normalized.includes('android') || normalized.includes('ios')) return <Smartphone size={17} />
-  if (normalized.includes('server') || normalized.includes('linux')) return <Server size={17} />
-  return <Laptop size={17} />
+  if (normalized.includes('android') || normalized.includes('ios')) return <Smartphone size={18} />
+  if (normalized.includes('server') || normalized.includes('linux')) return <Server size={18} />
+  return <Laptop size={18} />
 }
 
 function nodeIcon(node: AdminTopologyNode) {
-  if (node.kind === 'account') return <Users size={17} />
-  if (node.kind === 'room') return <RadioTower size={17} />
-  if (node.kind === 'network') return <Network size={17} />
+  if (node.kind === 'account') return <Users size={18} />
+  if (node.kind === 'room') return <RadioTower size={18} />
+  if (node.kind === 'network') return <Network size={18} />
   return <DeviceIcon platform={node.platform} />
 }
 
@@ -62,17 +64,21 @@ function nodeMeta(node: AdminTopologyNode): string {
   return [node.virtual_ip, node.platform].filter(Boolean).join(' · ')
 }
 
+function ownerColor(node: AdminTopologyNode): string {
+  return accountColor(node.account_id || (node.kind === 'account' ? node.account_id : node.owner_id))
+}
+
 function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
-  const color = accountColor(node.account_id || (node.kind === 'account' ? node.account_id : node.owner_id))
+  const color = ownerColor(node)
   return (
     <div className="topology-node-content">
-      <div className="topology-node-icon" style={{ color, background: colorWithAlpha(color, 0.11) }}>
+      <div className="topology-node-icon" style={{ color, background: colorWithAlpha(color, 0.1) }}>
         {nodeIcon(node)}
       </div>
       <div className="topology-node-copy">
         <div className="topology-node-title-row">
           <strong>{node.label}</strong>
-          {node.kind === 'device' && <span className={`presence-dot ${node.online ? 'online' : ''}`} />}
+          {node.kind === 'device' && <span className={`presence-dot ${node.online ? 'online' : ''}`} title={node.online ? '在线' : '离线'} />}
         </div>
         <span>{nodeMeta(node)}</span>
       </div>
@@ -80,13 +86,23 @@ function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
   )
 }
 
-function buildGraph(data: AdminTopology, search: string): { nodes: Node[]; edges: Edge[] } {
-  const graph = new dagre.graphlib.Graph()
-  graph.setDefaultEdgeLabel(() => ({}))
-  graph.setGraph({ rankdir: 'LR', ranksep: 100, nodesep: 34, edgesep: 20, marginx: 40, marginy: 40 })
+interface GraphOptions {
+  search: string
+  showOffline: boolean
+  showSignals: boolean
+}
 
+function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]; edges: Edge[] } {
+  const { search, showOffline, showSignals } = options
   const normalizedSearch = search.trim().toLowerCase()
   const sourceNodes = new Map(data.nodes.map((node) => [node.id, node]))
+  const visibleSourceNodes = data.nodes.filter((node) => showOffline || node.kind !== 'device' || node.online)
+  const visibleIds = new Set(visibleSourceNodes.map((node) => node.id))
+  const visibleEdges = data.edges.filter((edge) => {
+    if (!visibleIds.has(edge.source) || !visibleIds.has(edge.target)) return false
+    return showSignals || edge.kind !== 'pending_signal'
+  })
+
   const matches = (node: AdminTopologyNode) => {
     if (!normalizedSearch) return true
     return [node.label, node.username, node.virtual_ip, node.cidr, node.room_code, node.platform]
@@ -94,19 +110,19 @@ function buildGraph(data: AdminTopology, search: string): { nodes: Node[]; edges
       .some((value) => String(value).toLowerCase().includes(normalizedSearch))
   }
 
-  for (const node of data.nodes) {
-    const size = dimensions[node.kind]
-    graph.setNode(node.id, size)
-  }
-  for (const edge of data.edges) {
+  const graph = new dagre.graphlib.Graph()
+  graph.setDefaultEdgeLabel(() => ({}))
+  graph.setGraph({ rankdir: 'LR', ranksep: 112, nodesep: 38, edgesep: 24, marginx: 56, marginy: 56 })
+  for (const node of visibleSourceNodes) graph.setNode(node.id, dimensions[node.kind])
+  for (const edge of visibleEdges) {
     if (edge.kind !== 'pending_signal') graph.setEdge(edge.source, edge.target)
   }
   dagre.layout(graph)
 
-  const nodes: Node[] = data.nodes.map((node) => {
+  const nodes: Node[] = visibleSourceNodes.map((node) => {
     const size = dimensions[node.kind]
     const point = graph.node(node.id) as { x: number; y: number } | undefined
-    const ownerColor = accountColor(node.account_id || (node.kind === 'account' ? node.account_id : node.owner_id))
+    const color = ownerColor(node)
     const isMatch = matches(node)
     const neutral = node.kind === 'network' || node.kind === 'room'
     return {
@@ -120,12 +136,14 @@ function buildGraph(data: AdminTopology, search: string): { nodes: Node[]; edges
         width: size.width,
         height: size.height,
         padding: 0,
-        borderRadius: 13,
-        border: node.focus ? `2px solid ${ownerColor}` : neutral ? '1px solid #cbd5e1' : `1px solid ${colorWithAlpha(ownerColor, 0.42)}`,
-        background: neutral ? '#ffffff' : colorWithAlpha(ownerColor, node.focus ? 0.09 : 0.045),
-        boxShadow: node.focus ? `0 0 0 4px ${colorWithAlpha(ownerColor, 0.10)}, 0 8px 24px rgba(15, 23, 42, .08)` : '0 4px 16px rgba(15, 23, 42, .055)',
+        borderRadius: 12,
+        border: node.focus ? `2px solid ${color}` : neutral ? '1px solid #cfd6df' : `1px solid ${colorWithAlpha(color, 0.38)}`,
+        background: neutral ? '#ffffff' : colorWithAlpha(color, node.focus ? 0.09 : 0.045),
+        boxShadow: node.focus
+          ? `0 0 0 4px ${colorWithAlpha(color, 0.1)}, 0 10px 28px rgba(15, 23, 42, .09)`
+          : '0 5px 18px rgba(15, 23, 42, .055)',
         color: '#0f172a',
-        opacity: isMatch ? 1 : 0.18,
+        opacity: isMatch ? 1 : 0.16,
         transition: 'opacity 150ms ease, box-shadow 150ms ease',
       },
       draggable: false,
@@ -133,12 +151,12 @@ function buildGraph(data: AdminTopology, search: string): { nodes: Node[]; edges
     }
   })
 
-  const edges: Edge[] = data.edges.map((edge) => {
+  const edges: Edge[] = visibleEdges.map((edge) => {
     const source = sourceNodes.get(edge.source)
     const target = sourceNodes.get(edge.target)
     const colorSource = edge.kind === 'attachment' ? target : source
-    const color = accountColor(colorSource?.account_id || (colorSource?.kind === 'account' ? colorSource.account_id : colorSource?.owner_id))
-    const endpointsMatch = (!normalizedSearch || (source && matches(source)) || (target && matches(target)))
+    const color = colorSource ? ownerColor(colorSource) : '#94a3b8'
+    const endpointsMatch = !normalizedSearch || Boolean((source && matches(source)) || (target && matches(target)))
     const isSignal = edge.kind === 'pending_signal'
     return {
       id: edge.id,
@@ -148,14 +166,14 @@ function buildGraph(data: AdminTopology, search: string): { nodes: Node[]; edges
       animated: false,
       style: {
         stroke: isSignal ? '#d97706' : color,
-        strokeWidth: isSignal ? 1.6 : edge.kind === 'membership' ? 1.8 : 1.4,
-        strokeDasharray: isSignal ? '6 5' : undefined,
-        opacity: endpointsMatch ? (isSignal ? 0.78 : 0.48) : 0.08,
+        strokeWidth: isSignal ? 1.7 : edge.kind === 'membership' ? 2 : 1.5,
+        strokeDasharray: isSignal ? '7 6' : undefined,
+        opacity: endpointsMatch ? (isSignal ? 0.78 : 0.46) : 0.07,
       },
       markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: '#d97706', width: 14, height: 14 } : undefined,
-      label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type} ×${edge.count}` : undefined,
-      labelStyle: { fontSize: 10, fill: '#92400e' },
-      labelBgStyle: { fill: '#fffbeb', fillOpacity: 0.95 },
+      label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type || 'signal'} ×${edge.count}` : undefined,
+      labelStyle: { fontSize: 11, fill: '#92400e', fontWeight: 600 },
+      labelBgStyle: { fill: '#fffbeb', fillOpacity: 0.96 },
     }
   })
 
@@ -163,9 +181,9 @@ function buildGraph(data: AdminTopology, search: string): { nodes: Node[]; edges
 }
 
 function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () => void }) {
-  const color = accountColor(node.account_id || (node.kind === 'account' ? node.account_id : node.owner_id))
+  const color = ownerColor(node)
   return (
-    <div className="topology-detail">
+    <aside className="topology-detail" aria-label="拓扑节点详情">
       <button className="icon-button topology-detail-close" onClick={onClose} aria-label="关闭详情"><X size={16} /></button>
       <div className="topology-detail-type" style={{ color }}>{node.kind.toUpperCase()}</div>
       <h3>{node.label}</h3>
@@ -180,14 +198,33 @@ function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () =
         {node.relay_rtt_ms !== undefined && <div><dt>Relay RTT</dt><dd>{node.relay_rtt_ms} ms</dd></div>}
         {node.online !== undefined && <div><dt>状态</dt><dd><span className={`status-label ${node.online ? 'online' : ''}`}><span />{node.online ? '在线' : '离线'}</span></dd></div>}
       </dl>
-    </div>
+    </aside>
   )
+}
+
+function TopologySummary({ data }: { data: AdminTopology }) {
+  const counts = useMemo(() => ({
+    accounts: data.nodes.filter((node) => node.kind === 'account').length,
+    networks: data.nodes.filter((node) => node.kind === 'network' || node.kind === 'room').length,
+    devices: data.nodes.filter((node) => node.kind === 'device').length,
+    online: data.nodes.filter((node) => node.kind === 'device' && node.online).length,
+  }), [data])
+  return <div className="topology-summary" aria-label="拓扑摘要">
+    <span><strong>{counts.accounts}</strong>账号</span>
+    <span><strong>{counts.networks}</strong>网络</span>
+    <span><strong>{counts.online}/{counts.devices}</strong>设备在线</span>
+  </div>
 }
 
 export function TopologyCanvas({ data, loading, error, search = '', compact = false }: TopologyCanvasProps) {
   const [fullscreen, setFullscreen] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const graph = useMemo(() => data ? buildGraph(data, search) : { nodes: [], edges: [] }, [data, search])
+  const [showOffline, setShowOffline] = useState(true)
+  const [showSignals, setShowSignals] = useState(true)
+  const graph = useMemo(
+    () => data ? buildGraph(data, { search, showOffline, showSignals }) : { nodes: [], edges: [] },
+    [data, search, showOffline, showSignals],
+  )
   const selected = data?.nodes.find((node) => node.id === selectedId)
   const accounts = useMemo(() => data?.nodes.filter((node) => node.kind === 'account') ?? [], [data])
 
@@ -201,15 +238,16 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         nodes={graph.nodes}
         edges={graph.edges}
         fitView
-        fitViewOptions={{ padding: 0.18, maxZoom: 1.05 }}
-        minZoom={0.2}
-        maxZoom={1.6}
+        fitViewOptions={{ padding: compact ? 0.12 : 0.18, maxZoom: 1.05 }}
+        minZoom={0.18}
+        maxZoom={1.7}
         nodesConnectable={false}
         nodesDraggable={false}
+        onPaneClick={() => setSelectedId(null)}
         onNodeClick={(_, node) => setSelectedId(node.id)}
         proOptions={{ hideAttribution: true }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#d7dee9" />
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#d8dee8" />
         <Controls showInteractive={false} position="bottom-left" />
         {!compact && <MiniMap
           pannable
@@ -218,30 +256,41 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           nodeColor={(node) => {
             const source = data.nodes.find((item) => item.id === node.id)
             if (!source) return '#94a3b8'
-            return source.kind === 'network' || source.kind === 'room'
-              ? '#cbd5e1'
-              : accountColor(source.account_id || source.owner_id)
+            return source.kind === 'network' || source.kind === 'room' ? '#cbd5e1' : ownerColor(source)
           }}
         />}
       </ReactFlow>
 
-      <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
-        {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
-      </button>
+      <div className="topology-canvas-actions">
+        {!compact && <>
+          <button className={`topology-filter-button ${showOffline ? 'active' : ''}`} onClick={() => setShowOffline((value) => !value)} title="显示或隐藏离线设备">
+            {showOffline ? <Eye size={15} /> : <EyeOff size={15} />}离线设备
+          </button>
+          <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title="显示或隐藏待处理信令">
+            <RadioTower size={15} />待处理信令
+          </button>
+        </>}
+        <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
+          {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
+        </button>
+      </div>
 
-      {!compact && <div className="topology-legend">
-        <div className="topology-legend-heading">账号</div>
-        {accounts.slice(0, 8).map((account) => (
-          <div className="legend-row" key={account.id}>
-            <span className="legend-color" style={{ background: accountColor(account.account_id) }} />
-            <span>{account.label}</span>
-          </div>
-        ))}
-        {accounts.length > 8 && <div className="legend-more">+{accounts.length - 8} 个账号</div>}
+      <TopologySummary data={data} />
+
+      {!compact && <aside className="topology-legend">
+        <div className="topology-legend-heading">账号颜色</div>
+        <div className="topology-account-legend-list">
+          {accounts.map((account) => (
+            <div className="legend-row" key={account.id}>
+              <span className="legend-color" style={{ background: accountColor(account.account_id) }} />
+              <span title={account.label}>{account.label}</span>
+            </div>
+          ))}
+        </div>
         <div className="topology-legend-heading edge-heading">关系</div>
-        <div className="legend-row"><span className="legend-line solid" />成员 / 设备</div>
+        <div className="legend-row"><span className="legend-line solid" />成员 / 设备挂载</div>
         <div className="legend-row"><span className="legend-line dashed" />待处理信令</div>
-      </div>}
+      </aside>}
 
       {selected && <DetailPanel node={selected} onClose={() => setSelectedId(null)} />}
     </div>
