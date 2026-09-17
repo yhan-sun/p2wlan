@@ -110,16 +110,25 @@ func (s *Server) serveConsole(w http.ResponseWriter, r *http.Request) {
 	}
 	setBrowserSecurityHeaders(w)
 	w.Header().Set("Cache-Control", "no-store")
+
 	asset := strings.TrimPrefix(r.URL.Path, "/admin/")
-	if asset == "" {
+	switch asset {
+	case "", "index.html":
+		asset = "index.html"
+	case "app.css", "app.js":
+		// Static build artifacts are served as-is.
+	default:
+		// BrowserRouter uses clean paths such as /admin/accounts/:id. Any path
+		// without a file extension is an SPA route and must receive index.html so
+		// refresh/deep-link navigation works. Unknown asset-looking paths remain
+		// 404 instead of accidentally serving HTML as JavaScript or CSS.
+		if strings.Contains(asset, ".") {
+			http.NotFound(w, r)
+			return
+		}
 		asset = "index.html"
 	}
-	switch asset {
-	case "index.html", "app.css", "app.js":
-	default:
-		http.NotFound(w, r)
-		return
-	}
+
 	clone := r.Clone(r.Context())
 	if asset == "index.html" {
 		clone.URL.Path = "/"
