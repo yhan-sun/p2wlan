@@ -49,6 +49,25 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22.16.0"
+          cache: npm
+          cache-dependency-path: server/admin-ui/package-lock.json
+
+      - name: Build embedded admin UI
+        working-directory: server/admin-ui
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm run build
+          test -s ../admin/web/index.html
+          test -s ../admin/web/app.js
+          test -s ../admin/web/app.css
+          grep -q '/admin/app.js' ../admin/web/index.html
+
       - name: Set up Go
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
         with:

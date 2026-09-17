@@ -11,7 +11,7 @@
 - p2wlan-server、install-server.sh、deploy-server.sh
 - BUILD-METADATA.txt 和 SHA256SUMS
 
-普通部署不需要在服务器上安装 Go 或从源码构建。
+普通部署不需要在服务器上安装 Go、Node.js 或从源码构建。管理台使用 React/TypeScript/Vite 开发，但 Vite 只在开发和 CI 构建阶段运行；生成的静态产物由 `go:embed` 编译进 `p2wlan-control`，发布后仍然是单一 Control 进程。
 
 ## 支持与验证范围
 
@@ -20,6 +20,7 @@
 | 运行形态 | 自动验证范围 | 边界 |
 | --- | --- | --- |
 | Linux 原生服务 | Ubuntu 22.04 上执行 Go vet、race/full tests、Control/Relay 双进程认证 smoke、IPv6 TLS/撤权验证和 manager contract | 这是固定服务端归档与 systemd manager 的主要验证路径 |
+| 管理台前端 | 固定 Node 版本安装依赖，执行 TypeScript typecheck、Vite production build，并校验构建后的静态产物；服务端发布任务会在 Go 编译前再次构建管理台 | Node 只属于构建链，不进入生产服务器运行时 |
 | Linux 静态服务端二进制 | Ubuntu 20.04 容器验证 `CGO_ENABLED=0` 产物没有动态 loader，并能执行 `--version` | 只证明基础 loader 兼容，不等于 Ubuntu 20.04 上完整 systemd、网络和业务链路已验收 |
 | Docker Compose | Ubuntu 22.04 runner 构建实际 Debian bookworm 镜像、启动 Control/Relay、检查 readyz，并验证 SQLite 数据卷重启持久性 | 生产部署仍应使用固定镜像摘要并自行完成公网、TLS 和恢复演练 |
 | Windows 服务端代码 | `windows-latest` 执行 Go vet/tests 和真实 Control/Relay 双进程 smoke | 当前固定 `server-vX.Y.Z` 发布归档不是 Windows 安装包，因此 Windows 不属于公开的固定归档部署路径 |
@@ -48,7 +49,7 @@ Control 的 HTTP 监听默认只在 loopback，公网通过可信 HTTPS 反向�
 
 | 入口 | 用途 | 公开 |
 | --- | --- | --- |
-| HTTPS 443 | Control API、WebSocket | 是 |
+| HTTPS 443 | Control API、WebSocket、可选 `/admin/` | 是 |
 | TLS 18081 | Relay 数据连接 | 是 |
 | HTTP 18080 | Control 内部监听 | 否 |
 | HTTP 18082 | Relay metrics、readyz | 否 |
@@ -58,6 +59,16 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 ## 配置
 
 先用 p2wlan-config 在新目录生成匹配的 Control/Relay 配置，再按[配置参考](../reference/configuration.md)填入域名、证书和密钥。配置文件和数据库应由专用 p2wlan 用户拥有，权限分别限制为服务需要的最小范围。
+
+`p2wlan-config` 会和 JWT、Relay 凭据一起生成独立的 256-bit `CONTROL_ADMIN_TOKEN` 并写入受保护的 `control.env`，因此使用 `p2wlan-config` 的部署不需要手工制造管理台凭据。生成器不会把这些秘密打印到 stdout，也不会覆盖已有部署。
+
+使用发布归档的 `install-server.sh` 安装时，`p2wlan-server init` 生成的是最小 `control.env`（只有监听、数据库、日志目录和 `JWT_SECRET`），其中不含 `CONTROL_ADMIN_TOKEN`，因此这类部署默认没有管理台。要启用管理台，请在 `control.env` 中追加 `CONTROL_ADMIN_TOKEN=$(openssl rand -hex 32)` 后重启 Control。
+
+管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
+
+管理台源码位于 `server/admin-ui/`；CI 按锁文件执行 `npm ci` 并重新构建，再与仓库中已提交的 `server/admin/web/` 逐字节比对，因此源码改动后忘记重新构建会被 CI 拦下。服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证发布归档和本地 `go build` 都不会携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
+
+管理员令牌不能与 `JWT_SECRET`、设备凭据、Relay ticket 或撤权 feed token 复用，也不要放入 URL、公开日志或反向代理访问日志字段。页面中的账号、membership、设备挂载、在线状态、Relay RTT、隧道和 signaling 来自 Control 已提交状态；当前页面不会把这些字段推断成真实 Direct/Relay 路径，也不等于 TUN 或业务应用已经端到端可达。
 
 Docker Compose 适合隔离验证或已建立镜像发布流程的部署。默认 Control 只发布到 loopback；容器以非 root、只读根文件系统和无额外 capability 运行。生产镜像必须来自固定发布摘要，不能在业务服务器上临时 build 未验证源码。
 

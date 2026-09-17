@@ -117,6 +117,49 @@ jobs:
         working-directory: server
         run: go test ./... -count=1
 
+  admin_ui:
+    name: Admin UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22.16.0"
+          cache: npm
+          cache-dependency-path: server/admin-ui/package-lock.json
+      - name: Install admin UI dependencies
+        working-directory: server/admin-ui
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck admin UI
+        working-directory: server/admin-ui
+        run: npm run typecheck
+      - name: Build admin UI
+        working-directory: server/admin-ui
+        run: npm run build
+      - name: Verify embedded artifacts match the committed build
+        run: |
+          test -s server/admin/web/index.html
+          test -s server/admin/web/app.js
+          test -s server/admin/web/app.css
+          grep -q '/admin/app.js' server/admin/web/index.html
+          # The embedded assets are committed so that a plain `go build` works,
+          # which means a source change without a rebuild would ship an outdated
+          # console. The Vite output is deterministic for a locked dependency
+          # tree, so comparing against the committed files is a reliable gate.
+          git diff --exit-code -- server/admin/web
+      - name: Upload reproducible admin UI build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: admin-ui-build-${{ github.sha }}
+          path: |
+            server/admin-ui/package-lock.json
+            server/admin/web/index.html
+            server/admin/web/app.js
+            server/admin/web/app.css
+          if-no-files-found: error
+          retention-days: 7
+
   repository_policy:
     name: Repository policy and security scan
     runs-on: ubuntu-latest
@@ -146,19 +189,46 @@ jobs:
           python3 scripts/dual-end/test-production-availability-parser.py
           bash -n scripts/dual-end/mini-air-smoke.sh
           bash -n scripts/nat-sim/nat-sim-smoke.sh
-      - name: Assert web GUI dependencies are absent
+      - name: Assert admin UI dependency boundary
         run: |
           test ! -e package.json
           test ! -e pnpm-lock.yaml
           test ! -e pnpm-workspace.yaml
           test ! -e vite.config.ts
-      - name: Scan for deleted React/Vite origins
+          test -f server/admin-ui/package.json
+          test -f server/admin-ui/vite.config.ts
+          test -f server/admin-ui/src/main.tsx
+          test -f server/admin/web/index.html
+      - name: Scan admin UI production origins
         run: |
-          legacy_port=327
-          if git grep -nE "react-dom|from [\"']react[\"']|@vitejs|vite/client|pnpm run|localhost:14${legacy_port}" -- . ':!docs/**' ':!*.md' ':!.github/workflows/**'; then
-            echo "deleted React/Vite/legacy-origin reference found" >&2
-            exit 1
-          fi
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          patterns = (
+              re.compile(r"localhost:14327"),
+              re.compile(r"127\.0\.0\.1:14327"),
+              re.compile(r"https?://[^\"'\s]+/admin/api"),
+          )
+          roots = (pathlib.Path("server/admin-ui"), pathlib.Path("server/admin"))
+          bad = []
+          for root in roots:
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  try:
+                      text = path.read_text(encoding="utf-8")
+                  except UnicodeDecodeError:
+                      continue
+                  for pattern in patterns:
+                      if pattern.search(text):
+                          bad.append(str(path))
+                          break
+          if bad:
+              print("hard-coded admin UI development/external API origin found:", file=sys.stderr)
+              for path in bad:
+                  print(f"  {path}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
       - name: Scan production credential transport
         run: |
           if git grep -nE 'localStorage|sessionStorage|--token([ =]|$)|p2wlan-daemon\.token' -- \
@@ -173,7 +243,7 @@ jobs:
   required:
     name: CI Required
     if: always()
-    needs: [rust, rust_windows, go, repository_policy]
+    needs: [rust, rust_windows, go, admin_ui, repository_policy]
     runs-on: ubuntu-latest
     steps:
       - name: Enforce required job results
@@ -183,5 +253,6 @@ jobs:
           test "${{ needs.rust.result }}" = "success"
           test "${{ needs.rust_windows.result }}" = "success"
           test "${{ needs.go.result }}" = "success"
+          test "${{ needs.admin_ui.result }}" = "success"
           test "${{ needs.repository_policy.result }}" = "success"
           echo "all required CI jobs succeeded"
