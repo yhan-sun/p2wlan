@@ -53,6 +53,7 @@ import type {
   AdminDevice,
   AdminNetwork,
   AdminRoom,
+  AdminTopology,
 } from './types'
 
 const PAGE_SIZE = 25
@@ -118,6 +119,25 @@ function LoadingBlock({ label = '加载中…' }: { label?: string }) {
 function ErrorBlock({ error }: { error: unknown }) {
   const message = error instanceof Error ? error.message : '加载失败'
   return <div className="error-block"><CircleAlert size={18} /><div><strong>无法加载数据</strong><span>{message}</span></div></div>
+}
+
+// A paused query (the browser is offline) is neither loading nor failed:
+// react-query keeps isPending true while isFetching is false, so gating a page
+// on isLoading would render nothing at all, with no message and no retry hint.
+function PendingBlock({ queries, label = '加载中…' }: { queries: { fetchStatus: string }[]; label?: string }) {
+  if (queries.some((query) => query.fetchStatus === 'paused')) {
+    return <ErrorBlock error={new Error('浏览器当前离线，无法访问 Control。恢复网络后会自动重新请求。')} />
+  }
+  return <LoadingBlock label={label} />
+}
+
+// Control owns whether a live Direct/Relay path is observable at all. Render the
+// control plane's own statement, and only fall back to the localized
+// explanation while the control plane confirms the path is not observable —
+// otherwise the console would keep asserting something it no longer knows.
+function PathNotice({ data, fallback }: { data?: AdminTopology; fallback: string }) {
+  const note = data?.path_observation_available ? data.path_observation_note : ''
+  return <div className="truth-notice"><CircleAlert size={15} /><span>{note || fallback}</span></div>
 }
 
 function MetricCard({ icon, label, value, meta }: { icon: ReactNode; label: string; value: ReactNode; meta: ReactNode }) {
@@ -252,8 +272,8 @@ function Shell({ onLogout }: { onLogout: () => void }) {
       <Link to="/" className="brand-lockup"><div className="brand-symbol"><Waypoints size={20} /></div><div><strong>P2WLAN</strong><span>Control</span></div></Link>
       <nav className="sidebar-nav">{navGroups.map((group) => <div className="nav-group" key={group.label}><span className="nav-group-label">{group.label}</span>{group.items.map((item) => <NavLink key={item.to} to={item.to} end={item.end} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>{item.icon}<span>{item.label}</span></NavLink>)}</div>)}</nav>
       <div className="sidebar-runtime">
-        <div className="runtime-line"><span className="health-dot" /><strong>Control healthy</strong></div>
-        <span>{runtime.data?.build_version ?? 'loading…'}</span>
+        <div className="runtime-line"><span className={`health-dot${runtime.isError ? ' down' : runtime.isPending ? ' unknown' : ''}`} /><strong>{runtime.isError ? 'Control 不可达' : runtime.isPending ? '正在检查 Control' : 'Control healthy'}</strong></div>
+        <span>{runtime.data?.build_version ?? (runtime.isError ? '—' : 'loading…')}</span>
         <small>只读管理模式</small>
       </div>
     </aside>
@@ -276,10 +296,10 @@ function Dashboard() {
   const accounts = useQuery({ queryKey: ['accounts', 'recent'], queryFn: () => adminApi.accounts('', 6, 0), refetchInterval: 30_000 })
   const topology = useQuery({ queryKey: ['topology', 'global'], queryFn: () => adminApi.topology(), refetchInterval: 30_000 })
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: adminApi.runtime, refetchInterval: 30_000 })
-  if (overview.isLoading || accounts.isLoading || topology.isLoading || runtime.isLoading) return <LoadingBlock label="正在读取 Control 状态…" />
+  if (overview.isPending || accounts.isPending || topology.isPending || runtime.isPending) return <PendingBlock queries={[overview, accounts, topology, runtime]} label="正在读取 Control 状态…" />
   const error = overview.error || accounts.error || topology.error || runtime.error
   if (error) return <ErrorBlock error={error} />
-  if (!overview.data || !accounts.data || !topology.data || !runtime.data) return null
+  if (!overview.data || !accounts.data || !topology.data || !runtime.data) return <ErrorBlock error={new Error('Control 未返回完整快照，请刷新重试。')} />
 
   return <div className="page-stack">
     <section className="metrics-grid-v2">
@@ -398,9 +418,9 @@ function AccountDetailPage() {
   const [tab, setTab] = useState<'topology' | 'devices' | 'networks' | 'rooms'>('topology')
   const detail = useQuery({ queryKey: ['account', id], queryFn: () => adminApi.account(id), enabled: Boolean(id) })
   const topology = useQuery({ queryKey: ['topology', 'account', id], queryFn: () => adminApi.topology(id), enabled: Boolean(id) })
-  if (detail.isLoading) return <LoadingBlock label="正在加载账号…" />
+  if (detail.isPending) return <PendingBlock queries={[detail]} label="正在加载账号…" />
   if (detail.error) return <ErrorBlock error={detail.error} />
-  if (!detail.data) return null
+  if (!detail.data) return <ErrorBlock error={new Error('Control 未返回该账号详情，请返回账号列表重试。')} />
   const account = detail.data.account
   const color = accountColor(account.id)
 
@@ -416,8 +436,8 @@ function AccountDetailPage() {
     </div>
 
     {tab === 'topology' && <Panel title={`${account.username} 的拓扑`} subtitle="包含该账号以及共享网络 / 房间中的对端账号和设备">
-      <div className="truth-notice"><CircleAlert size={15} /><span>Control 当前没有持久化 daemon 的实时 Direct / Relay 业务路径，因此这里只展示成员关系、设备挂载关系和待处理信令，不伪造连接路径。</span></div>
-      <TopologyCanvas data={topology.data} loading={topology.isLoading} error={topology.error instanceof Error ? topology.error.message : undefined} />
+      <PathNotice data={topology.data} fallback="Control 当前没有持久化 daemon 的实时 Direct / Relay 业务路径，因此这里只展示成员关系、设备挂载关系和待处理信令，不伪造连接路径。" />
+      <TopologyCanvas data={topology.data} loading={topology.isPending} error={topology.error instanceof Error ? topology.error.message : undefined} />
     </Panel>}
     {tab === 'devices' && <Panel><DeviceTable devices={detail.data.devices} /></Panel>}
     {tab === 'networks' && <Panel><NetworkTable networks={detail.data.networks} /></Panel>}
@@ -438,7 +458,7 @@ function TopologyPage() {
     </div></div>
     <Panel className="topology-main-panel">
       <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>颜色用于区分账号；绿色 / 灰色状态点表示设备在线状态。虚线只表示待处理 signaling，不代表 Relay 数据路径。</span></div>
-      <TopologyCanvas data={topology.data} loading={topology.isLoading} error={topology.error instanceof Error ? topology.error.message : undefined} search={search} />
+      <TopologyCanvas data={topology.data} loading={topology.isPending} error={topology.error instanceof Error ? topology.error.message : undefined} search={search} />
     </Panel>
   </div>
 }
@@ -463,7 +483,7 @@ function DevicesPage() {
 
   return <div className="page-stack">
     <div className="page-intro"><div><h2>设备</h2><p>全部账号下已注册的 P2WLAN 设备。</p></div><div className="toolbar-controls"><div className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索设备、账号、IP 或网络" /></div><select className="select-field" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option><option value="online">在线</option><option value="offline">离线</option></select></div></div>
-    <Panel>{result.isLoading ? <LoadingBlock /> : result.error ? <ErrorBlock error={result.error} /> : result.data && <><DataTable<AdminDevice> columns={columns} data={result.data.items} /><Pagination total={result.data.total} offset={offset} limit={PAGE_SIZE} onChange={setOffset} /></>}</Panel>
+    <Panel>{result.isPending ? <PendingBlock queries={[result]} /> : result.error ? <ErrorBlock error={result.error} /> : result.data ? <><DataTable<AdminDevice> columns={columns} data={result.data.items} /><Pagination total={result.data.total} offset={offset} limit={PAGE_SIZE} onChange={setOffset} /></> : <ErrorBlock error={new Error('Control 未返回设备列表。')} />}</Panel>
   </div>
 }
 
@@ -472,9 +492,9 @@ function NetworksPage() {
   const networks = useQuery({ queryKey: ['networks'], queryFn: () => adminApi.networks() })
   const rooms = useQuery({ queryKey: ['rooms'], queryFn: () => adminApi.rooms() })
   const error = networks.error || rooms.error
-  if (networks.isLoading || rooms.isLoading) return <LoadingBlock />
+  if (networks.isPending || rooms.isPending) return <PendingBlock queries={[networks, rooms]} />
   if (error) return <ErrorBlock error={error} />
-  if (!networks.data || !rooms.data) return null
+  if (!networks.data || !rooms.data) return <ErrorBlock error={new Error('Control 未返回完整的网络与房间列表。')} />
   return <div className="page-stack">
     <div className="page-intro"><div><h2>网络与房间</h2><p>统一查看普通网络与房间网络的成员和设备规模。</p></div></div>
     <div className="tabs-v2"><button className={tab === 'networks' ? 'active' : ''} onClick={() => setTab('networks')}>网络 {networks.data.total}</button><button className={tab === 'rooms' ? 'active' : ''} onClick={() => setTab('rooms')}>房间 {rooms.data.total}</button></div>
@@ -485,10 +505,10 @@ function NetworksPage() {
 function SystemPage() {
   const runtime = useQuery({ queryKey: ['runtime-system'], queryFn: adminApi.runtime, refetchInterval: 15_000 })
   const overview = useQuery({ queryKey: ['overview-system'], queryFn: adminApi.overview, refetchInterval: 15_000 })
-  if (runtime.isLoading || overview.isLoading) return <LoadingBlock />
+  if (runtime.isPending || overview.isPending) return <PendingBlock queries={[runtime, overview]} />
   const error = runtime.error || overview.error
   if (error) return <ErrorBlock error={error} />
-  if (!runtime.data || !overview.data) return null
+  if (!runtime.data || !overview.data) return <ErrorBlock error={new Error('Control 未返回完整的运行状态快照。')} />
   return <div className="page-stack">
     <div className="page-intro"><div><h2>Control 运行状态</h2><p>只展示当前 Control 进程与数据库能直接确认的事实。</p></div><span className="badge success large"><span />运行中</span></div>
     <section className="system-grid">
@@ -526,10 +546,16 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState(Boolean(getAdminToken()))
+  const queryClient = useQueryClient()
   useEffect(() => {
-    const unauthorized = () => setAuthenticated(false)
+    const unauthorized = () => {
+      // A rejected token must not leave the previous session's pages in the
+      // cache, or the next login would briefly render the old session's data.
+      queryClient.clear()
+      setAuthenticated(false)
+    }
     window.addEventListener('p2wlan:unauthorized', unauthorized)
     return () => window.removeEventListener('p2wlan:unauthorized', unauthorized)
-  }, [])
+  }, [queryClient])
   return authenticated ? <AuthenticatedApp onLogout={() => setAuthenticated(false)} /> : <Login onSuccess={() => setAuthenticated(true)} />
 }

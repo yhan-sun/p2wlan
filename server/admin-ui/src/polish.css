@@ -316,3 +316,15 @@
     overflow-y: auto;
   }
 }
+
+/* The sidebar indicator reports the runtime query state; a permanently green
+   dot would claim the control plane is healthy even when it is unreachable. */
+.health-dot.down {
+  background: #d92d20;
+  box-shadow: 0 0 0 3px rgba(217, 45, 32, .14);
+}
+
+.health-dot.unknown {
+  background: #98a2b3;
+  box-shadow: 0 0 0 3px rgba(152, 162, 179, .16);
+}
