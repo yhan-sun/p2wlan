@@ -144,6 +144,10 @@ func generate(o options) (err error) {
 	if err != nil {
 		return err
 	}
+	adminSecret, err := secret()
+	if err != nil {
+		return err
+	}
 	feedSecret, err := secret()
 	if err != nil {
 		return err
@@ -176,7 +180,7 @@ func generate(o options) (err error) {
 		feedHost = "control"
 		relayHost = ""
 	}
-	control := fmt.Sprintf("CONTROL_BIND=%s\nPORT=%d\nDB_PATH=%s/p2pnet.db\nLOG_UPLOAD_DIR=%s/log-uploads\nJWT_SECRET=%s\nRELAY_CATALOG_JSON=%s\nRELAY_TICKET_SIGNER_JSON=%s\nRELAY_TICKET_TTL=5m\nRELAY_REVOCATION_FEED_TOKEN=%s\n", net.JoinHostPort(controlHost, strconv.Itoa(o.controlPort)), o.controlPort, runtimeData, runtimeData, jwtSecret, catalog, signer, feedSecret)
+	control := fmt.Sprintf("CONTROL_BIND=%s\nPORT=%d\nDB_PATH=%s/p2pnet.db\nLOG_UPLOAD_DIR=%s/log-uploads\nJWT_SECRET=%s\nCONTROL_ADMIN_TOKEN=%s\nRELAY_CATALOG_JSON=%s\nRELAY_TICKET_SIGNER_JSON=%s\nRELAY_TICKET_TTL=5m\nRELAY_REVOCATION_FEED_TOKEN=%s\n", net.JoinHostPort(controlHost, strconv.Itoa(o.controlPort)), o.controlPort, runtimeData, runtimeData, jwtSecret, adminSecret, catalog, signer, feedSecret)
 	relay := fmt.Sprintf("RELAY_BIND=%s\nRELAY_REQUIRE_AUTH=true\nRELAY_ALLOW_LEGACY_UNAUTH=false\nRELAY_ALLOW_INSECURE_PLAINTEXT=false\nRELAY_TLS_CERT=%s/tls.crt\nRELAY_TLS_KEY=%s/tls.key\nRELAY_TICKET_KEYRING_JSON=%s\nRELAY_AUDIENCE=selfhost-relay-1\nRELAY_REGION=selfhost\nRELAY_REVOCATION_FEED_URL=http://%s/api/v1/relay/revocations\nRELAY_REVOCATION_FEED_TOKEN=%s\nRELAY_REVOCATION_POLL_INTERVAL=5s\nRELAY_METRICS_BIND=127.0.0.1:%d\n", net.JoinHostPort(relayHost, port), runtimeDir, runtimeDir, keyring, net.JoinHostPort(feedHost, strconv.Itoa(o.controlPort)), feedSecret, o.metricsPort)
 	uid, gid := os.Getuid(), os.Getgid()
 	if uid <= 0 {
