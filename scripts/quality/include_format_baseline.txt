@@ -5,5 +5,4 @@
 #                      rustfmt can only parse it in that context
 # Neither list is an exemption: both may only shrink. Format a drift entry
 # and drop it; if a fragment becomes a standalone file, move it to drift.
-# 0 drift, 1 fragment.
-fragment client/daemon/src/control/runtime/commands.rs
+# 0 drift, 0 fragment.

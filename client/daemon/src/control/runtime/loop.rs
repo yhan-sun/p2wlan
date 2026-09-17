@@ -661,8 +661,29 @@ async fn run_control_loop(
                     }
                 }
                 Some(cmd) = cmd_rx.recv() => {
-                    include!("commands.rs");
-
+                    match handle_control_command(
+                        cmd,
+                        &http,
+                        &base_url,
+                        &token,
+                        &config,
+                        &self_node_id,
+                        registration_seq,
+                        &state,
+                        event_tx,
+                        health.as_ref(),
+                        relay_selection.as_ref(),
+                        &advertised_snapshot,
+                        &mut peer_roster_tick,
+                        signal_ws_task.as_ref(),
+                        &mut poll_failures,
+                    )
+                    .await
+                    {
+                        ControlCommandDisposition::Continue => {}
+                        ControlCommandDisposition::Reregister => break,
+                        ControlCommandDisposition::Exit => return,
+                    }
                 }
                 else => {
                     // Command channel closed — exit.
