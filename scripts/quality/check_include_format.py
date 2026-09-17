@@ -158,7 +158,7 @@ def compare(
 ) -> list[str]:
     errors: list[str] = []
     for kind, paths in (("drift", dirty), ("fragment", fragments)):
-        relative = {str(path.relative_to(ROOT)) for path in paths}
+        relative = {path.relative_to(ROOT).as_posix() for path in paths}
         known = baseline[kind]
         if kind == "drift":
             errors += [
@@ -184,8 +184,8 @@ def compare(
 def write_baseline(
     dirty: Iterable[Path], fragments: Iterable[Path], path: Path = BASELINE, root: Path = ROOT
 ) -> None:
-    drift = sorted(str(target.relative_to(root)) for target in dirty)
-    frags = sorted(str(target.relative_to(root)) for target in fragments)
+    drift = sorted(target.relative_to(root).as_posix() for target in dirty)
+    frags = sorted(target.relative_to(root).as_posix() for target in fragments)
     header = (
         "# Rust sources reached through include! that `cargo fmt --all --check` cannot see.\n"
         "# cargo fmt follows `mod`, not `include!`, so rustfmt never inspected these.\n"
