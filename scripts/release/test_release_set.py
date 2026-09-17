@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -114,6 +115,47 @@ class ReleaseSetTests(unittest.TestCase):
         result = self.verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing artifact metadata", result.stdout)
+
+
+class PlatformApplicationIdentityTests(unittest.TestCase):
+    def test_android_distribution_identity_is_canonical(self) -> None:
+        gradle = (ROOT / "apps/flutter_client/android/app/build.gradle.kts").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('namespace = "com.p2wlan.client"', gradle)
+        self.assertIn('applicationId = "com.p2wlan.client"', gradle)
+        self.assertNotIn("TODO: Specify your own unique Application ID", gradle)
+
+        manifest = (ROOT / "apps/flutter_client/android/app/src/main/AndroidManifest.xml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'android:name="com.example.p2wlan_flutter_client.MainActivity"', manifest
+        )
+        self.assertIn(
+            'android:name="com.example.p2wlan_flutter_client.P2wlanVpnService"', manifest
+        )
+
+    def test_apple_distribution_identity_is_canonical(self) -> None:
+        with (ROOT / "apps/flutter_client/ios/Runner/Info.plist").open("rb") as handle:
+            ios_info = plistlib.load(handle)
+        self.assertEqual(ios_info["CFBundleIdentifier"], "com.p2wlan.client")
+        self.assertEqual(ios_info["CFBundleDisplayName"], "P2WLAN")
+
+        macos_config = (
+            ROOT / "apps/flutter_client/macos/Runner/Configs/AppInfo.xcconfig"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PRODUCT_BUNDLE_IDENTIFIER = com.p2wlan.client", macos_config)
+
+    def test_linux_desktop_identity_matches_gtk_application_id(self) -> None:
+        cmake = (ROOT / "apps/flutter_client/linux/CMakeLists.txt").read_text(encoding="utf-8")
+        installer = (ROOT / "apps/flutter_client/scripts/install_room_links.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('set(APPLICATION_ID "com.p2wlan.diagnostics")', cmake)
+        self.assertIn("com.p2wlan.diagnostics.desktop", installer)
+        self.assertIn("StartupWMClass=com.p2wlan.diagnostics", installer)
+        self.assertNotIn("com.example.p2wlan_flutter_client.desktop", installer)
 
 
 if __name__ == "__main__":
