@@ -117,6 +117,67 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(fmt.FormatCheckError):
             fmt.read_baseline(baseline)
 
+    def test_item_file_spliced_by_include_is_not_a_fragment(self):
+        """The shape a stand-alone include! item file has.
+
+        `runtime/commands.rs` used to be a bare `match` statement and could only
+        be parsed inside its including function. It is now an `enum` plus an
+        `async fn`, which rustfmt must check as an ordinary file rather than
+        file away as an unparseable fragment.
+        """
+        item = self.write(
+            "src/commands.rs",
+            "enum Disposition {\n    Continue,\n}\n\nasync fn handle() -> Disposition {\n    Disposition::Continue\n}\n",
+        )
+        subprocess.run(
+            ["rustfmt", "--edition", "2021", str(item)], check=True, capture_output=True
+        )
+        dirty, fragments = fmt.classify([item], "2021")
+        self.assertEqual(fragments, [], "an item file must not be recorded as a fragment")
+        self.assertEqual(dirty, [])
+
+    def test_a_new_unformatted_include_target_is_reported_from_disk(self):
+        self.write("Cargo.toml", '[workspace.package]\nedition = "2021"\n')
+        self.write("src/entry.rs", 'include!("ugly.rs");\n')
+        ugly = self.write("src/ugly.rs", UNFORMATTED)
+        dirty, fragments = fmt.classify(
+            fmt.include_targets(self.root), fmt.workspace_edition(self.root)
+        )
+        self.assertEqual(fragments, [])
+        self.assertEqual(dirty, [ugly.resolve()])
+
+    def test_a_new_malformed_include_target_fails_closed_from_disk(self):
+        self.write("Cargo.toml", '[workspace.package]\nedition = "2021"\n')
+        self.write("src/entry.rs", 'include!("broken.rs");\n')
+        self.write("src/broken.rs", MALFORMED)
+        with self.assertRaises(fmt.FormatCheckError):
+            fmt.classify(
+                fmt.include_targets(self.root), fmt.workspace_edition(self.root)
+            )
+
+
+class RepositoryBaselineTests(unittest.TestCase):
+    def test_no_include_debt_is_recorded_in_the_repository(self):
+        """The ratchet that makes the baseline non-escapable.
+
+        `compare` already fails on an unformatted file that is not recorded, so
+        an empty checked-in baseline means every include! source the repository
+        reaches is formatted today. Recording a new exemption therefore means
+        editing this test, which is visible in review; a cleared historical
+        fragment cannot quietly come back.
+        """
+        recorded = fmt.read_baseline(fmt.BASELINE)
+        self.assertEqual(
+            recorded["drift"],
+            set(),
+            "format the file with rustfmt instead of re-recording it",
+        )
+        self.assertEqual(
+            recorded["fragment"],
+            set(),
+            "an include! fragment must stay converted into a stand-alone item file",
+        )
+
 
 class EditionTests(unittest.TestCase):
     def test_workspace_edition_is_read(self):
