@@ -5,6 +5,16 @@ const ACCOUNT_COLORS = [
   '#4338ca', '#115e59', '#7e22ce', '#9a3412', '#075985', '#9f1239',
 ]
 
+function accountHash(id?: string): number {
+  if (!id) return 0
+  let hash = 2166136261
+  for (let i = 0; i < id.length; i += 1) {
+    hash ^= id.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return hash >>> 0
+}
+
 /**
  * Returns a stable, high-contrast account color. The palette is intentionally
  * bounded instead of generating arbitrary RGB values so labels remain legible
@@ -12,12 +22,17 @@ const ACCOUNT_COLORS = [
  */
 export function accountColor(id?: string): string {
   if (!id) return '#64748b'
-  let hash = 2166136261
-  for (let i = 0; i < id.length; i += 1) {
-    hash ^= id.charCodeAt(i)
-    hash = Math.imul(hash, 16777619)
-  }
-  return ACCOUNT_COLORS[(hash >>> 0) % ACCOUNT_COLORS.length]
+  return ACCOUNT_COLORS[accountHash(id) % ACCOUNT_COLORS.length]
+}
+
+/**
+ * Color is only the first identity channel: a finite accessible palette must
+ * eventually repeat. This six-character code is a second stable visual key so
+ * hundreds of accounts remain distinguishable even when two share a hue.
+ */
+export function accountIdentityCode(id?: string): string {
+  if (!id) return '------'
+  return accountHash(id).toString(36).toUpperCase().padStart(6, '0').slice(-6)
 }
 
 export function colorWithAlpha(hex: string, alpha: number): string {

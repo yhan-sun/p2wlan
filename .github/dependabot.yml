@@ -75,6 +75,23 @@ updates:
           - "golang.org/x/text"
           - "github.com/golang-jwt/jwt/*"
 
+  - package-ecosystem: npm
+    directory: "/server/admin-ui"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels:
+      - dependencies
+    groups:
+      # Keep routine compatible UI updates together. Major releases remain
+      # separate reviews, while repository security settings continue to own
+      # advisory-triggered updates independently of this grouping policy.
+      admin-ui-compatible:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

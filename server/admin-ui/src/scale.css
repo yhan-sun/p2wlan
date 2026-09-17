@@ -1,0 +1,94 @@
+/* Scale-oriented UI layer: cursor state, progressive topology snapshots and
+ * secondary account identity. It intentionally does not change the base visual
+ * language introduced by the admin console. */
+
+.topology-streaming {
+  position: absolute;
+  z-index: 10;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid rgba(208, 213, 221, .9);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .94);
+  color: #667085;
+  box-shadow: 0 5px 15px rgba(15, 23, 42, .06);
+  backdrop-filter: blur(8px);
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.topology-streaming .spinner {
+  width: 13px;
+  height: 13px;
+}
+
+.legend-account-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend-account-code {
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  border: 1px solid #eaecf0;
+  border-radius: 4px;
+  background: #f9fafb;
+  color: #667085;
+  font-size: 8px;
+}
+
+.topology-scope-controls {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.account-option-search {
+  width: 190px;
+}
+
+.topology-view-select {
+  min-width: 104px;
+}
+
+.pagination-v2 > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+@media (max-width: 1100px) {
+  .topology-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .topology-scope-controls {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 650px) {
+  .topology-streaming {
+    top: 50px;
+    max-width: calc(100% - 20px);
+    white-space: nowrap;
+  }
+
+  .account-option-search {
+    width: 100%;
+  }
+
+  .legend-account-code {
+    display: none;
+  }
+}
