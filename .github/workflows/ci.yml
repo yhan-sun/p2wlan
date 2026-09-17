@@ -197,10 +197,34 @@ jobs:
           test -f server/admin/web/index.html
       - name: Scan admin UI production origins
         run: |
-          if git grep -nE 'localhost:14327|127\.0\.0\.1:14327|https?://[^"'"' ]+/admin/api' -- server/admin-ui server/admin; then
-            echo "hard-coded admin UI development/external API origin found" >&2
-            exit 1
-          fi
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          patterns = (
+              re.compile(r"localhost:14327"),
+              re.compile(r"127\.0\.0\.1:14327"),
+              re.compile(r"https?://[^\"'\s]+/admin/api"),
+          )
+          roots = (pathlib.Path("server/admin-ui"), pathlib.Path("server/admin"))
+          bad = []
+          for root in roots:
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  try:
+                      text = path.read_text(encoding="utf-8")
+                  except UnicodeDecodeError:
+                      continue
+                  for pattern in patterns:
+                      if pattern.search(text):
+                          bad.append(str(path))
+                          break
+          if bad:
+              print("hard-coded admin UI development/external API origin found:", file=sys.stderr)
+              for path in bad:
+                  print(f"  {path}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
       - name: Scan production credential transport
         run: |
           if git grep -nE 'localStorage|sessionStorage|--token([ =]|$)|p2wlan-daemon\.token' -- \
