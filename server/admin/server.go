@@ -23,6 +23,9 @@ var embeddedWeb embed.FS
 
 type Store interface {
 	AdminOverviewSnapshot() (*database.AdminOverview, error)
+	AdminAccounts(query string, limit, offset int) (*database.AdminAccountPage, error)
+	AdminAccount(accountID string) (*database.AdminAccountDetail, error)
+	AdminTopology(accountID string) (*database.AdminTopology, error)
 	AdminDevices(query, status string, limit, offset int) (*database.AdminDevicePage, error)
 	AdminNetworks(limit, offset int) (*database.AdminNetworkPage, error)
 	AdminRooms(limit, offset int) (*database.AdminRoomPage, error)
@@ -79,6 +82,10 @@ func (s *Server) Enabled() bool {
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin", s.redirectConsole)
 	mux.HandleFunc("GET /admin/api/v1/overview", s.requireAdmin(s.overview))
+	mux.HandleFunc("GET /admin/api/v1/accounts", s.requireAdmin(s.accounts))
+	mux.HandleFunc("GET /admin/api/v1/accounts/{id}/topology", s.requireAdmin(s.accountTopology))
+	mux.HandleFunc("GET /admin/api/v1/accounts/{id}", s.requireAdmin(s.account))
+	mux.HandleFunc("GET /admin/api/v1/topology", s.requireAdmin(s.topology))
 	mux.HandleFunc("GET /admin/api/v1/devices", s.requireAdmin(s.devices))
 	mux.HandleFunc("GET /admin/api/v1/networks", s.requireAdmin(s.networks))
 	mux.HandleFunc("GET /admin/api/v1/rooms", s.requireAdmin(s.rooms))
@@ -115,8 +122,6 @@ func (s *Server) serveConsole(w http.ResponseWriter, r *http.Request) {
 	}
 	clone := r.Clone(r.Context())
 	if asset == "index.html" {
-		// FileServer redirects an explicit /index.html to ./; serving the embedded
-		// root here avoids turning /admin/ into a redirect loop.
 		clone.URL.Path = "/"
 	} else {
 		clone.URL.Path = "/" + asset
@@ -157,6 +162,54 @@ func (s *Server) overview(w http.ResponseWriter, _ *http.Request) {
 	value, err := s.store.AdminOverviewSnapshot()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load admin overview"})
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
+	limit, offset, ok := parsePage(w, r)
+	if !ok {
+		return
+	}
+	value, err := s.store.AdminAccounts(r.URL.Query().Get("q"), limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load accounts"})
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) account(w http.ResponseWriter, r *http.Request) {
+	value, err := s.store.AdminAccount(r.PathValue("id"))
+	if errors.Is(err, database.ErrAdminAccountNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load account"})
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) topology(w http.ResponseWriter, _ *http.Request) {
+	value, err := s.store.AdminTopology("")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load topology"})
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) accountTopology(w http.ResponseWriter, r *http.Request) {
+	value, err := s.store.AdminTopology(r.PathValue("id"))
+	if errors.Is(err, database.ErrAdminAccountNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load account topology"})
 		return
 	}
 	writeJSON(w, http.StatusOK, value)
