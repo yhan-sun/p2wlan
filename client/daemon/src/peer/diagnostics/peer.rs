@@ -181,8 +181,7 @@ impl PeerDiagnostics {
             conn.current_direct_pair_for_diagnostics(local_generation, current_selection);
         let confirmed_direct_snapshot = conn.state == ConnectionState::Direct
             && snapshot_direct_pair.is_some_and(|pair| {
-                pair.state == CandidatePairState::Selected
-                    && !conn.is_overlay_candidate_pair(pair)
+                pair.state == CandidatePairState::Selected && !conn.is_overlay_candidate_pair(pair)
             });
         let on_link_direct_snapshot = confirmed_direct_snapshot
             && snapshot_direct_pair
@@ -204,8 +203,8 @@ impl PeerDiagnostics {
         // the warm standby.
         let relay_first_pending = !on_link_direct_snapshot
             && conn.relay_first_confirmation_pending(local_generation, relay_available);
-        let relay_first_business_pending =
-            !on_link_direct_snapshot && conn.relay_first_business_pending(local_generation, relay_available);
+        let relay_first_business_pending = !on_link_direct_snapshot
+            && conn.relay_first_business_pending(local_generation, relay_available);
         let confirmed_direct_active = confirmed_direct_snapshot;
         let mut active_path = match current_selection {
             Some(selection) => match selection.path {
@@ -215,21 +214,20 @@ impl PeerDiagnostics {
                         && selection
                             .direct_endpoint
                             .is_some_and(|endpoint| !conn.is_overlay_direct_endpoint(endpoint)) =>
-                    Some(NetworkPath::Direct),
+                {
+                    Some(NetworkPath::Direct)
+                }
                 Some(NetworkPath::Direct)
-                    if relay_peer_confirmed && !selection.direct_confirmed => {
+                    if relay_peer_confirmed && !selection.direct_confirmed =>
+                {
                     Some(NetworkPath::Relay)
                 }
-                Some(NetworkPath::Relay) if relay_peer_confirmed => {
-                    Some(NetworkPath::Relay)
-                }
+                Some(NetworkPath::Relay) if relay_peer_confirmed => Some(NetworkPath::Relay),
                 _ => None,
             },
             None => match conn.active_path() {
                 Some(NetworkPath::Relay) if relay_peer_confirmed => Some(NetworkPath::Relay),
-                Some(NetworkPath::Direct) if confirmed_direct_active => {
-                    Some(NetworkPath::Direct)
-                }
+                Some(NetworkPath::Direct) if confirmed_direct_active => Some(NetworkPath::Direct),
                 _ => None,
             },
         };
@@ -239,8 +237,9 @@ impl PeerDiagnostics {
         // Relay. This preserves make-before-break while still allowing a
         // real Direct ACK to correct an older `Relay` selector decision.
         let selector_is_confirmed_relay = !on_link_direct_snapshot
-            && current_selection
-            .is_some_and(|selection| selection.path == Some(NetworkPath::Relay) && relay_peer_confirmed);
+            && current_selection.is_some_and(|selection| {
+                selection.path == Some(NetworkPath::Relay) && relay_peer_confirmed
+            });
         if confirmed_direct_active && !selector_is_confirmed_relay {
             active_path = Some(NetworkPath::Direct);
         }
@@ -265,9 +264,9 @@ impl PeerDiagnostics {
         let consent_endpoint = conn.selected_direct_endpoint_for_consent(local_generation);
         let direct_selection_confirmed = confirmed_direct_active
             || (active_path == Some(NetworkPath::Direct)
-            && current_selection
-                .map(|selection| selection.direct_confirmed)
-                .unwrap_or(conn.state == ConnectionState::Direct));
+                && current_selection
+                    .map(|selection| selection.direct_confirmed)
+                    .unwrap_or(conn.state == ConnectionState::Direct));
         let direct_confirmed = direct_selection_confirmed
             && current_pair.is_some_and(|pair| pair.state == CandidatePairState::Selected);
         let direct_type = classify_candidate_pair_path_with_on_link_host(
@@ -278,8 +277,8 @@ impl PeerDiagnostics {
         );
         let selected_pair = selected_pair.map(|pair| {
             let is_current = Some(pair.remote_endpoint) == current_pair_endpoint;
-            let pair_direct_confirmed =
-                direct_selection_confirmed && (is_current || pair.state == CandidatePairState::Selected);
+            let pair_direct_confirmed = direct_selection_confirmed
+                && (is_current || pair.state == CandidatePairState::Selected);
             let pair_active_path = if pair_direct_confirmed {
                 Some(NetworkPath::Direct)
             } else {
@@ -354,9 +353,10 @@ impl PeerDiagnostics {
             .as_ref()
             .unwrap_or(&default_remote_capabilities);
         let remote_nat_profile_fresh = conn.remote_nat_profile_is_fresh();
-        let remote_profile_mapping_known = conn.remote_nat_profile.as_ref().is_some_and(|profile| {
-            profile.capabilities.mapping_behavior != MappingBehavior::Unknown
-        });
+        let remote_profile_mapping_known =
+            conn.remote_nat_profile.as_ref().is_some_and(|profile| {
+                profile.capabilities.mapping_behavior != MappingBehavior::Unknown
+            });
         let remote_candidate_endpoints = conn
             .candidates
             .iter()
@@ -365,10 +365,11 @@ impl PeerDiagnostics {
         let on_link_lan = remote_candidate_endpoints
             .iter()
             .any(|endpoint| conn.is_on_link_host_candidate(*endpoint));
-        let global_ipv6_direct_available = local_endpoint.is_some_and(|endpoint| endpoint.is_ipv6())
-            && remote_candidate_endpoints.iter().any(|endpoint| {
-                endpoint.is_ipv6() && is_public_probe_endpoint(*endpoint)
-            });
+        let global_ipv6_direct_available = local_endpoint
+            .is_some_and(|endpoint| endpoint.is_ipv6())
+            && remote_candidate_endpoints
+                .iter()
+                .any(|endpoint| endpoint.is_ipv6() && is_public_probe_endpoint(*endpoint));
         let peer_reflexive_evidence = conn.candidate_pairs.iter().any(|pair| {
             matches!(pair.source, CandidatePairSource::PeerReflexive)
                 && matches!(
@@ -487,7 +488,8 @@ impl PeerDiagnostics {
             relay_ready_connection_id: conn.relay_ready_connection_id,
             relay_first_gate_generation: conn.relay_first.gate_generation,
             relay_first_gate_age_ms: conn
-                .relay_first.gate_started_at
+                .relay_first
+                .gate_started_at
                 .map(|started_at| duration_millis(started_at.elapsed())),
             relay_first_confirmation_pending: relay_first_pending,
             relay_first_business_pending,

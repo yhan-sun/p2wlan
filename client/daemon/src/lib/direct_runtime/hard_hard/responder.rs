@@ -146,7 +146,8 @@ pub(crate) async fn spawn_hard_hard_responder(
             &coordination.token,
             Some(&cancellation),
         )
-        .await else {
+        .await
+        else {
             peers
                 .record_direct_event(
                     &peer_id,
@@ -231,11 +232,8 @@ pub(crate) async fn spawn_hard_hard_responder(
                 ),
             )
             .await;
-        let response_coordination = coordination.as_response(
-            current_plan,
-            local_confidence,
-            local_model,
-        );
+        let response_coordination =
+            coordination.as_response(current_plan, local_confidence, local_model);
         let prediction_window = hard_hard_prediction_targets(
             &candidates,
             hard_hard_measurement_target_limit(&measurement),
@@ -264,8 +262,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             generated_candidate_count: candidate_contract.generated_candidate_count,
             signaled_candidate_count: candidate_contract.signaled_candidate_count,
             birthday,
-            requested_socket_count:
-                hard_hard_measurement_requested_socket_count(&measurement),
+            requested_socket_count: hard_hard_measurement_requested_socket_count(&measurement),
             requested_socket_indices,
             prediction_window,
             remote_prediction: remote_prediction.clone(),
@@ -417,8 +414,8 @@ pub(crate) async fn spawn_hard_hard_responder(
             )
             .await;
         let fresh_socket = primary_socket;
-        let birthday_socket_indices = birthday
-            .then(|| hard_hard_measurement_socket_indices(&measurement));
+        let birthday_socket_indices =
+            birthday.then(|| hard_hard_measurement_socket_indices(&measurement));
         let cleanup_udp = udp.clone();
         let swept = hard_hard_wait_and_sweep(
             udp,
@@ -447,12 +444,9 @@ pub(crate) async fn spawn_hard_hard_responder(
             .hard_hard_fresh_socket_for_token(&peer_id, &coordination.token)
             .await
             .unwrap_or_else(|| fresh_socket.clone());
-        let direct_on_fresh_socket = hard_hard_exact_direct_confirmation_is_current(
-            &cleanup_udp,
-            &peers,
-            &confirmed_socket,
-        )
-        .await;
+        let direct_on_fresh_socket =
+            hard_hard_exact_direct_confirmation_is_current(&cleanup_udp, &peers, &confirmed_socket)
+                .await;
         if swept {
             if !direct_on_fresh_socket && peers.is_direct(&peer_id).await {
                 peers
@@ -477,14 +471,13 @@ pub(crate) async fn spawn_hard_hard_responder(
                     .await;
             }
         } else {
-            let authenticated_winner =
-                hard_hard_authenticated_winner_for_cleanup(
-                    &cleanup_udp,
-                    &peers,
-                    &peer_id,
-                    &coordination.token,
-                )
-                .await;
+            let authenticated_winner = hard_hard_authenticated_winner_for_cleanup(
+                &cleanup_udp,
+                &peers,
+                &peer_id,
+                &coordination.token,
+            )
+            .await;
             let retained_socket = if authenticated_winner.is_some() {
                 authenticated_winner
             } else if hard_hard_authenticated_socket_for_cleanup(

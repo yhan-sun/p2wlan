@@ -119,8 +119,7 @@ pub(super) async fn fetch_relay_ticket_http(
     region: &str,
 ) -> Result<FetchRelayTicketResponse> {
     let resp = with_registration_sequence(
-        http
-            .post(format!("{base_url}/api/v1/relay/tickets"))
+        http.post(format!("{base_url}/api/v1/relay/tickets"))
             .timeout(CONTROL_REQUEST_TIMEOUT)
             .bearer_auth(token)
             .json(&serde_json::json!({
@@ -129,9 +128,9 @@ pub(super) async fn fetch_relay_ticket_http(
             })),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("relay ticket request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("relay ticket request failed: {e}")))?;
 
     if !resp.status().is_success() {
         let status = resp.status();

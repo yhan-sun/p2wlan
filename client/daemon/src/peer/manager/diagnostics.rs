@@ -126,11 +126,11 @@ impl PeerManager {
                     && conn.state != ConnectionState::Closed
                     && !grace_peers.contains(&conn.node_id)
                     && (conn.state != ConnectionState::Direct
-                    || conn
-                        .direct_health
-                        .rtt_ewma_ms
-                        .or(conn.direct_health.latency_ms)
-                        .is_some_and(|rtt| rtt >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS))
+                        || conn
+                            .direct_health
+                            .rtt_ewma_ms
+                            .or(conn.direct_health.latency_ms)
+                            .is_some_and(|rtt| rtt >= SLOW_DIRECT_RELAY_VALIDATION_RTT_MS))
             })
             .filter(|conn| !conn.relay_health.is_confirmed_recent(max_success_age))
             .map(|conn| (conn.node_id.clone(), conn.virtual_ip.clone()))
@@ -153,15 +153,11 @@ impl PeerManager {
         // value already used by the dataplane-safe diagnostics path below.
         let generation = self.current_network_generation_sync();
         let profile_generation = self.current_local_profile_generation_sync();
-        let local_nat_capabilities = self
-            .local_nat_profile
-            .try_read()
-            .ok()
-            .and_then(|profile| {
-                profile.as_ref().map(|profile| {
-                    NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
-                })
-            });
+        let local_nat_capabilities = self.local_nat_profile.try_read().ok().and_then(|profile| {
+            profile.as_ref().map(|profile| {
+                NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
+            })
+        });
         let relay_available = self.relay_first_required();
         let traversal_history = self
             .traversal_history
@@ -231,15 +227,11 @@ impl PeerManager {
         // /status or /peers wait until the diagnostics timeout.
         let generation = self.current_network_generation_sync();
         let profile_generation = self.current_local_profile_generation_sync();
-        let local_nat_capabilities = self
-            .local_nat_profile
-            .try_read()
-            .ok()
-            .and_then(|profile| {
-                profile.as_ref().map(|profile| {
-                    NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
-                })
-            });
+        let local_nat_capabilities = self.local_nat_profile.try_read().ok().and_then(|profile| {
+            profile.as_ref().map(|profile| {
+                NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
+            })
+        });
         let traversal_history = self
             .traversal_history
             .try_read()
@@ -260,15 +252,9 @@ impl PeerManager {
             Ok(connections) => connections
                 .values()
                 .map(|conn| {
-                    let policy = self
-                        .config
-                        .relay
-                        .effective_path_policy(prefer_direct);
-                    let current_selection = conn.select_path_for_data_with_policy(
-                        generation,
-                        policy,
-                        relay_available,
-                    );
+                    let policy = self.config.relay.effective_path_policy(prefer_direct);
+                    let current_selection =
+                        conn.select_path_for_data_with_policy(generation, policy, relay_available);
                     let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
                         conn,
                         Some(&current_selection),
@@ -330,26 +316,16 @@ impl PeerManager {
             .and_then(|runtime| runtime.snapshots().remove(node_id));
         let generation = self.current_network_generation_sync();
         let profile_generation = self.current_local_profile_generation_sync();
-        let local_nat_capabilities = self
-            .local_nat_profile
-            .try_read()
-            .ok()
-            .and_then(|profile| {
-                profile.as_ref().map(|profile| {
-                    NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
-                })
-            });
+        let local_nat_capabilities = self.local_nat_profile.try_read().ok().and_then(|profile| {
+            profile.as_ref().map(|profile| {
+                NatCapabilities::from_profile(profile).with_profile_generation(profile_generation)
+            })
+        });
         let conns = self.connections.try_read().ok()?;
         let conn = conns.get(node_id)?;
-        let policy = self
-            .config
-            .relay
-            .effective_path_policy(prefer_direct);
-        let current_selection = conn.select_path_for_data_with_policy(
-            generation,
-            policy,
-            relay_available,
-        );
+        let policy = self.config.relay.effective_path_policy(prefer_direct);
+        let current_selection =
+            conn.select_path_for_data_with_policy(generation, policy, relay_available);
         let mut diagnostics = PeerDiagnostics::from_connection_with_path_selection(
             conn,
             Some(&current_selection),
@@ -395,8 +371,12 @@ impl PeerManager {
                 RecoveryEpochDiagnostics {
                     epoch: state.epoch,
                     stage: state.stage.label().to_string(),
-                    stage_age_ms: duration_millis(now.saturating_duration_since(state.stage_started_at)),
-                    epoch_age_ms: duration_millis(now.saturating_duration_since(state.epoch_started_at)),
+                    stage_age_ms: duration_millis(
+                        now.saturating_duration_since(state.stage_started_at),
+                    ),
+                    epoch_age_ms: duration_millis(
+                        now.saturating_duration_since(state.epoch_started_at),
+                    ),
                     probe_credit_remaining: state.epoch_probe_credit_remaining,
                     fresh_generation_quota_remaining: state.epoch_fresh_generation_quota_remaining,
                     hard_hard_generation_quota_remaining: state
@@ -452,12 +432,7 @@ mod diagnostics_tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(100),
-            manager.diagnostics_with_path_selection(
-                true,
-                false,
-                DIRECT_RETRY_BASE_INTERVAL,
-                None,
-            ),
+            manager.diagnostics_with_path_selection(true, false, DIRECT_RETRY_BASE_INTERVAL, None),
         )
         .await;
 

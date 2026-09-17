@@ -64,9 +64,7 @@ fn redacted_presence(value: &str) -> &'static str {
 /// Older desktop and Android config writers used JSON `null` for credentials
 /// that had not been issued yet. Keep loading those files safe and
 /// backwards-compatible while continuing to serialize canonical strings.
-fn deserialize_string_or_empty<'de, D>(
-    deserializer: D,
-) -> std::result::Result<String, D::Error>
+fn deserialize_string_or_empty<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -280,7 +278,7 @@ fn default_stun_timeout_ms() -> u64 {
 }
 fn default_udp_liveness_targets() -> Vec<String> {
     vec![
-        "223.5.5.5:53".into(),      // AliDNS (CN)
+        "223.5.5.5:53".into(),       // AliDNS (CN)
         "119.29.29.29:53".into(),    // China Unicom (CN)
         "114.114.114.114:53".into(), // 114DNS (CN)
         "8.8.8.8:53".into(),         // Google (overseas / fallback)

@@ -774,8 +774,8 @@ async fn authenticated_pending_probe_promotes_matching_wireguard_and_probe_trans
     );
     let encrypted = wireguard
         .encrypt_outbound(crate::dataplane::OutboundPacket {
-                room_authorization: None,
-                trace: None,
+            room_authorization: None,
+            trace: None,
             peer_id: "peer-b".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: packet.clone(),

@@ -153,11 +153,18 @@ fn apply_cli_overrides(config: &mut Config, cli: &Cli) {
 fn validate_room_profile_overrides(config: &Config, cli: &Cli) -> Result<(), DaemonError> {
     let next_network = cli.network.as_deref().unwrap_or(&config.network.network_id);
     let room = config.network.network_id.starts_with("room-") || next_network.starts_with("room-");
-    if room && (next_network != config.network.network_id || cli.control.as_deref().is_some_and(|server| server.trim_end_matches('/') != config.control.server_url.trim_end_matches('/'))) {
+    if room
+        && (next_network != config.network.network_id
+            || cli.control.as_deref().is_some_and(|server| {
+                server.trim_end_matches('/') != config.control.server_url.trim_end_matches('/')
+            }))
+    {
         return Err(DaemonError::Config("Room identities cannot be moved between networks or control servers; use a separate --config profile".into()));
     }
     if room && (cli.manual || cli.address.is_some()) {
-        return Err(DaemonError::Config("Room addresses must be assigned by the control server".into()));
+        return Err(DaemonError::Config(
+            "Room addresses must be assigned by the control server".into(),
+        ));
     }
     Ok(())
 }

@@ -3,8 +3,7 @@
 // ============================================================
 
 use crate::udp::probe_budget::{
-    RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW,
-    RELAY_BACKOFF_HEARTBEAT_PER_REMOTE_IP_PER_WINDOW,
+    RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW, RELAY_BACKOFF_HEARTBEAT_PER_REMOTE_IP_PER_WINDOW,
 };
 
 #[tokio::test]
@@ -84,19 +83,17 @@ async fn nat_maintainer_dedicated_budget_is_bounded_and_recovers() {
     assert!(saturated);
 
     assert!(
-        !transport
-            .admit_nat_maintainer_probe("peer-b", 0)
-            .await,
+        !transport.admit_nat_maintainer_probe("peer-b", 0).await,
         "a saturated dedicated budget must reject the maintainer probe"
     );
     assert!(
-        transport
-            .admit_nat_maintainer_probe("peer-b", 1)
-            .await,
+        transport.admit_nat_maintainer_probe("peer-b", 1).await,
         "a different socket has its own independent budget"
     );
     assert!(
-        transport.admit_outbound_connectivity_probe("peer-b", receiver_addr, 0).await
+        transport
+            .admit_outbound_connectivity_probe("peer-b", receiver_addr, 0)
+            .await
             == OutboundProbeAdmission::Accepted,
         "the dedicated maintainer budget must never affect ordinary probes"
     );
@@ -224,7 +221,9 @@ async fn cancelled_heartbeat_is_replaced_only_after_old_worker_quit() {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
     let peers = peer_manager();
-    peers.add_peer(&peer("peer-b", "10.20.0.9", Some(receiver_addr))).await;
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.9", Some(receiver_addr)))
+        .await;
     peers
         .add_candidates_with_sources(
             "peer-b",
@@ -266,9 +265,15 @@ async fn cancelled_heartbeat_is_replaced_only_after_old_worker_quit() {
             .relay_backoff_heartbeats
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert!(registry.active.is_empty(), "no worker may be send-capable while the old owner is quitting");
         assert!(
-            registry.quitting.get("peer-b").is_some_and(|lease| lease.owner_token == first_owner),
+            registry.active.is_empty(),
+            "no worker may be send-capable while the old owner is quitting"
+        );
+        assert!(
+            registry
+                .quitting
+                .get("peer-b")
+                .is_some_and(|lease| lease.owner_token == first_owner),
             "the cancelled owner must stay registered as quitting"
         );
         assert!(
@@ -286,7 +291,10 @@ async fn cancelled_heartbeat_is_replaced_only_after_old_worker_quit() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(lease) = registry.active.get("peer-b") {
-            assert_ne!(lease.owner_token, first_owner, "the replacement must be a new owner");
+            assert_ne!(
+                lease.owner_token, first_owner,
+                "the replacement must be a new owner"
+            );
             assert!(
                 registry.quitting.is_empty() && registry.pending_restarts.is_empty(),
                 "no quitting worker or pending restart may remain after the handshake"
@@ -299,9 +307,16 @@ async fn cancelled_heartbeat_is_replaced_only_after_old_worker_quit() {
             .relay_backoff_heartbeats
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(registry.active.len(), 1, "exactly one send-capable owner may exist");
+        assert_eq!(
+            registry.active.len(),
+            1,
+            "exactly one send-capable owner may exist"
+        );
         assert!(
-            registry.active.get("peer-b").is_some_and(|lease| lease.owner_token == replacement_owner),
+            registry
+                .active
+                .get("peer-b")
+                .is_some_and(|lease| lease.owner_token == replacement_owner),
             "the sole owner must be the replacement"
         );
     }
@@ -313,7 +328,9 @@ async fn heartbeat_lifecycle_cancellation_handles_direct_removal_and_relay_loss(
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
     let peers = peer_manager();
-    peers.add_peer(&peer("peer-b", "10.20.0.9", Some(receiver_addr))).await;
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.9", Some(receiver_addr)))
+        .await;
     peers
         .add_candidates_with_sources(
             "peer-b",
@@ -368,7 +385,10 @@ async fn heartbeat_lifecycle_cancellation_handles_direct_removal_and_relay_loss(
         }
         sleep(Duration::from_millis(20)).await;
     }
-    assert!(started, "a heartbeat worker must take over after the peer re-enters Relay");
+    assert!(
+        started,
+        "a heartbeat worker must take over after the peer re-enters Relay"
+    );
     peers.remove_peer("peer-b").await;
     assert!(transport
         .relay_backoff_heartbeats
@@ -377,7 +397,9 @@ async fn heartbeat_lifecycle_cancellation_handles_direct_removal_and_relay_loss(
         .active
         .is_empty());
 
-    peers.add_peer(&peer("peer-b", "10.20.0.9", Some(receiver_addr))).await;
+    peers
+        .add_peer(&peer("peer-b", "10.20.0.9", Some(receiver_addr)))
+        .await;
     peers
         .add_candidates_with_sources(
             "peer-b",
@@ -406,7 +428,10 @@ async fn heartbeat_lifecycle_cancellation_handles_direct_removal_and_relay_loss(
         }
         sleep(Duration::from_millis(20)).await;
     }
-    assert!(restarted, "a heartbeat worker must take over after the peer is re-added");
+    assert!(
+        restarted,
+        "a heartbeat worker must take over after the peer is re-added"
+    );
     peers
         .invalidate_relay_transport("relay-a.test:28081", "transport_closed", "test loss")
         .await;
@@ -466,7 +491,11 @@ async fn relay_backoff_heartbeat_global_budget_counts_actual_packets_across_peer
     let receiver = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let receiver_port = receiver.local_addr().unwrap().port();
     let endpoints = (1..=4)
-        .map(|host_octet| format!("127.0.0.{host_octet}:{receiver_port}").parse().unwrap())
+        .map(|host_octet| {
+            format!("127.0.0.{host_octet}:{receiver_port}")
+                .parse()
+                .unwrap()
+        })
         .collect::<Vec<SocketAddr>>();
     let peers = peer_manager();
     for index in 0..20 {
@@ -517,9 +546,7 @@ async fn relay_backoff_heartbeat_global_budget_counts_actual_packets_across_peer
     // even though the datagrams are already queued by the kernel.  Keep the
     // quiet-period assertion bounded, but leave enough room for one scheduler
     // turn so this test measures packet coverage rather than test-runner load.
-    while let Ok(Ok(_)) =
-        timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await
-    {
+    while let Ok(Ok(_)) = timeout(Duration::from_millis(200), receiver.recv_from(&mut buf)).await {
         received_total += 1;
     }
     let diagnostics_sent = transport
@@ -529,7 +556,10 @@ async fn relay_backoff_heartbeat_global_budget_counts_actual_packets_across_peer
         .map(|member| member.probes_sent)
         .sum::<u64>();
     assert_eq!(diagnostics_sent, reported_packets as u64);
-    assert!(received_total > 0, "at least one heartbeat packet must reach the local receiver");
+    assert!(
+        received_total > 0,
+        "at least one heartbeat packet must reach the local receiver"
+    );
     assert!(
         diagnostics_sent as usize <= RELAY_BACKOFF_HEARTBEAT_GLOBAL_PER_WINDOW,
         "actual successful UDP sends must obey the process cap: {diagnostics_sent}"
@@ -569,7 +599,10 @@ fn relay_backoff_heartbeat_cursor_rotates_predicted_endpoints_and_sockets() {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        choices.iter().map(|choice| choice.endpoint).collect::<Vec<_>>(),
+        choices
+            .iter()
+            .map(|choice| choice.endpoint)
+            .collect::<Vec<_>>(),
         predicted[..8].to_vec(),
         "the predicted cursor must progress beyond the fixed head of a 96-port window"
     );
@@ -730,7 +763,8 @@ async fn relay_backoff_heartbeat_target_set_prioritizes_authenticated_peer_refle
 }
 
 #[tokio::test]
-async fn relay_backoff_heartbeat_hard_nat_slice_serves_all_eleven_peers_without_socket_cartesian_burst() {
+async fn relay_backoff_heartbeat_hard_nat_slice_serves_all_eleven_peers_without_socket_cartesian_burst(
+) {
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let receiver_addr = receiver.local_addr().unwrap();
     let mut candidates = vec![receiver_addr];
@@ -748,7 +782,11 @@ async fn relay_backoff_heartbeat_hard_nat_slice_serves_all_eleven_peers_without_
     let peers = peer_manager();
     for index in 0..11 {
         let node_id = format!("hard-nat-{index}");
-        let mut info = peer(&node_id, &format!("10.20.2.{}", index + 1), Some(receiver_addr));
+        let mut info = peer(
+            &node_id,
+            &format!("10.20.2.{}", index + 1),
+            Some(receiver_addr),
+        );
         info.app_version = "0.1.25".to_string();
         peers.add_peer(&info).await;
     }

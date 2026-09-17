@@ -9,15 +9,15 @@ fn windows_elevated_token() -> std::io::Result<bool> {
     use std::mem::size_of;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
     use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token: HANDLE = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(std::io::Error::from_raw_os_error(unsafe {
-            GetLastError()
-        } as i32));
+        return Err(std::io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ));
     }
 
     let result = (|| {
@@ -33,9 +33,9 @@ fn windows_elevated_token() -> std::io::Result<bool> {
             )
         } == 0
         {
-            return Err(std::io::Error::from_raw_os_error(unsafe {
-                GetLastError()
-            } as i32));
+            return Err(std::io::Error::from_raw_os_error(
+                unsafe { GetLastError() } as i32
+            ));
         }
         Ok(elevation.TokenIsElevated != 0)
     })();

@@ -402,7 +402,8 @@ impl PeerManager {
             return None;
         }
         let mut set = self.direct_probe_target_set_for(node_id).await?;
-        set.candidates.truncate(RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES as usize);
+        set.candidates
+            .truncate(RECOVERY_STAGE_RELAY_BACKOFF_MAX_PROBES as usize);
         // A network generation transition invalidates every candidate pair
         // and its cursor.  Return no mixed-generation snapshot; the next beat
         // rebuilds against the authoritative generation.
@@ -594,13 +595,10 @@ impl PeerManager {
                     }
                 }
                 if !conn.has_direct_retry_opportunity(local_nat_profile.as_ref()) {
-                    let needs_record = conn
-                        .direct_events
-                        .last()
-                        .is_none_or(|event| {
-                            event.network_generation != generation
-                                || event.stage != "retry_skipped_no_viable_nat_window"
-                        });
+                    let needs_record = conn.direct_events.last().is_none_or(|event| {
+                        event.network_generation != generation
+                            || event.stage != "retry_skipped_no_viable_nat_window"
+                    });
                     let endpoint = conn.endpoint;
                     drop(conns);
                     if needs_record {
@@ -718,7 +716,7 @@ impl PeerManager {
                 stable_remote_scatter: remote_scatter_pool
                     && birthday_plan
                         .as_ref()
-                    .is_some_and(|plan| plan.stable_side_unique_scatter),
+                        .is_some_and(|plan| plan.stable_side_unique_scatter),
                 remote_scatter_pool,
                 candidates: endpoints,
                 preferred_fast_candidates,
@@ -861,19 +859,20 @@ impl PeerManager {
             "first_direct_probe_sent",
             Some("direct"),
             None,
-            Some(format!("peer={node_id} endpoint={endpoint} generation={generation}")),
+            Some(format!(
+                "peer={node_id} endpoint={endpoint} generation={generation}"
+            )),
         );
         if first_probe {
             // Route inspection is intentionally first-probe-only: it is
             // valuable for diagnosing Windows multi-NIC selection, but doing
             // an interface enumeration for every punch would turn a
             // diagnostic into a source of probe latency.
-            let route = tokio::task::spawn_blocking(move || {
-                p2pnet_netbind::resolve_route(endpoint.ip())
-            })
-            .await
-            .ok()
-            .flatten();
+            let route =
+                tokio::task::spawn_blocking(move || p2pnet_netbind::resolve_route(endpoint.ip()))
+                    .await
+                    .ok()
+                    .flatten();
             let source = self
                 .connections
                 .read()
@@ -962,13 +961,12 @@ fn recovery_target_cap(
     // spent as a 64-port window (field evidence v0.1.116, R4/R7/R8: the
     // stable side covered only 64 unique CGNAT ports per session; at ~0.1%
     // per-port hit odds that is why 3/10 rounds stayed on relay).
-    let max_candidates = if remote_port_dependent
-        && effective_stage >= RecoveryStage::ScatterExtended
-    {
-        max_probes as usize
-    } else {
-        (max_probes / socket_count.max(1) as u32).max(1) as usize
-    };
+    let max_candidates =
+        if remote_port_dependent && effective_stage >= RecoveryStage::ScatterExtended {
+            max_probes as usize
+        } else {
+            (max_probes / socket_count.max(1) as u32).max(1) as usize
+        };
     Some(max_candidates)
 }
 
@@ -1017,8 +1015,7 @@ fn cap_targets_by_recovery_stage(
             .iter()
             .copied()
             .filter(|endpoint| {
-                conn.candidate_source_for_endpoint(*endpoint)
-                    != CandidatePairSource::Birthday
+                conn.candidate_source_for_endpoint(*endpoint) != CandidatePairSource::Birthday
             })
             .collect::<Vec<_>>();
         if !trusted.is_empty() {
@@ -1052,13 +1049,12 @@ fn cap_targets_by_recovery_stage(
     // the fan-out division is skipped there.  Field evidence v0.1.116:
     // applying the division capped the stable side at 64 unique CGNAT ports
     // while the session budget allowed 192.
-    let max_candidates = if remote_port_dependent
-        && effective_stage >= RecoveryStage::ScatterExtended
-    {
-        max_probes as usize
-    } else {
-        (max_probes / socket_count.max(1) as u32).max(1) as usize
-    };
+    let max_candidates =
+        if remote_port_dependent && effective_stage >= RecoveryStage::ScatterExtended {
+            max_probes as usize
+        } else {
+            (max_probes / socket_count.max(1) as u32).max(1) as usize
+        };
     if endpoints.len() > max_candidates {
         endpoints.truncate(max_candidates);
     }

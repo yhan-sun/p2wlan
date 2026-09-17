@@ -22,14 +22,18 @@ async fn read_diagnostics_head(
                 return Err((431, "request headers too large\n"));
             }
             let capacity = remaining.min(chunk.len());
-            let n = stream.read(&mut chunk[..capacity]).await
+            let n = stream
+                .read(&mut chunk[..capacity])
+                .await
                 .map_err(|_| (400, "request read failed\n"))?;
             if n == 0 {
                 return Err((400, "incomplete request headers\n"));
             }
             bytes.extend_from_slice(&chunk[..n]);
         }
-    }).await.map_err(|_| (408, "request headers timed out\n"))?
+    })
+    .await
+    .map_err(|_| (408, "request headers timed out\n"))?
 }
 
 fn validate_diagnostics_head(head: &str) -> std::result::Result<(), DiagnosticsHeadError> {
@@ -55,9 +59,12 @@ fn validate_diagnostics_head(head: &str) -> std::result::Result<(), DiagnosticsH
         }
         let (name, value) = line.split_once(':').ok_or(invalid)?;
         if name.is_empty()
-            || !name.bytes().all(|byte| byte.is_ascii_alphanumeric()
-                || b"!#$%&'*+-.^_`|~".contains(&byte))
-            || value.bytes().any(|byte| byte.is_ascii_control() && byte != b'\t')
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
         {
             return Err(invalid);
         }
@@ -100,7 +107,9 @@ mod http_request_reliability_tests {
 
     async fn pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (server, _) = listener.accept().await.unwrap();
         (client, server)
     }
@@ -109,9 +118,15 @@ mod http_request_reliability_tests {
     async fn fragmented_authorization_is_read_completely() {
         let (mut client, mut server) = pair().await;
         let read = tokio::spawn(async move { read_diagnostics_head(&mut server).await });
-        client.write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nAuthoriz").await.unwrap();
+        client
+            .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nAuthoriz")
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
-        client.write_all(b"ation: Bearer correct-secret\r\n\r\n").await.unwrap();
+        client
+            .write_all(b"ation: Bearer correct-secret\r\n\r\n")
+            .await
+            .unwrap();
         let head = read.await.unwrap().unwrap();
         assert_eq!(bearer_token(&head), Some("correct-secret"));
     }
@@ -119,7 +134,10 @@ mod http_request_reliability_tests {
     #[tokio::test]
     async fn headers_larger_than_one_tcp_read_are_accepted() {
         let (mut client, mut server) = pair().await;
-        let head = format!("GET /health HTTP/1.1\r\nX-Padding: {}\r\n\r\n", "a".repeat(4096));
+        let head = format!(
+            "GET /health HTTP/1.1\r\nX-Padding: {}\r\n\r\n",
+            "a".repeat(4096)
+        );
         client.write_all(head.as_bytes()).await.unwrap();
         assert_eq!(read_diagnostics_head(&mut server).await.unwrap(), head);
     }
@@ -132,7 +150,10 @@ mod http_request_reliability_tests {
         assert_eq!(read_diagnostics_head(&mut server).await.unwrap_err().0, 400);
         let (mut client, mut server) = pair().await;
         let read = tokio::spawn(async move { read_diagnostics_head(&mut server).await });
-        client.write_all(&vec![b'a'; DIAGNOSTICS_MAX_HEADER_BYTES]).await.unwrap();
+        client
+            .write_all(&vec![b'a'; DIAGNOSTICS_MAX_HEADER_BYTES])
+            .await
+            .unwrap();
         assert_eq!(read.await.unwrap().unwrap_err().0, 431);
     }
 
@@ -161,8 +182,12 @@ mod http_request_reliability_tests {
             std::future::pending::<()>().await;
         };
         drop(client);
-        let result = timeout(Duration::from_secs(1),
-            until_diagnostics_client_disconnect(&mut server, shutdown_rx, operation)).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            until_diagnostics_client_disconnect(&mut server, shutdown_rx, operation),
+        )
+        .await
+        .unwrap();
         assert!(result.is_none());
         assert_eq!(semaphore.available_permits(), 1);
     }
@@ -172,8 +197,16 @@ mod http_request_reliability_tests {
         let (_client, mut server) = pair().await;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         shutdown_tx.send(true).unwrap();
-        let result = timeout(Duration::from_secs(1),
-            until_diagnostics_client_disconnect(&mut server, shutdown_rx, std::future::pending::<()>())).await.unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            until_diagnostics_client_disconnect(
+                &mut server,
+                shutdown_rx,
+                std::future::pending::<()>(),
+            ),
+        )
+        .await
+        .unwrap();
         assert!(result.is_none());
     }
 }

@@ -128,8 +128,7 @@ pub(crate) async fn select_relay_with_cooldowns(
             let started = Instant::now();
             let result = timeout(selection_timeout, async {
                 let ticket: Option<(String, i64)> =
-                    relay_ticket_for_candidate(&candidate, ticket_cache, static_ticket)
-                        .await?;
+                    relay_ticket_for_candidate(&candidate, ticket_cache, static_ticket).await?;
                 let (transport, relay_rx) = RelayTransport::connect_in_region(
                     &candidate.endpoint,
                     &candidate.region,
@@ -146,7 +145,11 @@ pub(crate) async fn select_relay_with_cooldowns(
                 // audience is the ticket's audience.
                 let transport = match (ticket, candidate.audience.clone()) {
                     (Some((_, expires_at_unix)), Some(audience)) if expires_at_unix > 0 => {
-                        transport.with_ticket_metadata(&audience, &candidate.region, expires_at_unix)
+                        transport.with_ticket_metadata(
+                            &audience,
+                            &candidate.region,
+                            expires_at_unix,
+                        )
                     }
                     _ => transport,
                 };
@@ -193,9 +196,7 @@ pub(crate) async fn select_relay_with_cooldowns(
             }) {
                 break;
             }
-            if preference_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
+            if preference_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 break;
             }
         }
@@ -336,7 +337,10 @@ async fn relay_ticket_for_candidate(
         (ticket_cache, relay_ticket_lookup_key(candidate))
     {
         let expiry = cache.ticket_expiry_for(audience, region).await;
-        let ticket = cache.ticket_for(audience, region).await.map_err(RelayAttemptError::Daemon)?;
+        let ticket = cache
+            .ticket_for(audience, region)
+            .await
+            .map_err(RelayAttemptError::Daemon)?;
         // ticket_for may have refreshed the cache: read the authoritative
         // expiry after the fetch.
         let expiry = cache

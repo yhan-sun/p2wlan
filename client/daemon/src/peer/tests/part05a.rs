@@ -58,34 +58,38 @@ async fn authoritative_direct_confirmation_bypasses_ready_relay_business_gate() 
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(8)))
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
 
     let selected = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
     assert!(selected.direct_confirmed);
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    assert!(
+        manager
+            .is_data_path_admitted_for_generation("peer1", generation, true)
+            .await
+    );
     let diagnostics = manager
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
         .await;
     assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
 
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
     let still_direct = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(still_direct.path, Some(NetworkPath::Direct));
-    assert!(manager
-        .mark_relay_first_business_received_for_generation(
-            "peer1",
-            relay_endpoint,
-            generation,
-        )
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation,)
+            .await
+    );
     let after_business = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(after_business.path, Some(NetworkPath::Direct));
     let connection = manager.get_connection("peer1").await.unwrap();
@@ -123,9 +127,11 @@ async fn on_link_direct_bypasses_relay_first_gate() {
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
     assert!(selected.direct_confirmed);
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    assert!(
+        manager
+            .is_data_path_admitted_for_generation("peer1", generation, true)
+            .await
+    );
 
     let diagnostics = manager
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
@@ -151,20 +157,26 @@ async fn on_link_direct_business_can_be_first_usable_without_relay_business() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
     manager
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(4)))
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
 
-    assert!(manager
-        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
-        .await);
-    assert!(!manager
-        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
-        .await);
+    assert!(
+        manager
+            .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+            .await
+    );
+    assert!(
+        !manager
+            .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+            .await
+    );
 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.first_usable_generation, Some(generation));
@@ -180,49 +192,40 @@ async fn relay_ticket_renewal_does_not_rearm_completed_relay_first_gate() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(101),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(101))
         .await;
     manager
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(101),
-        )
-        .await);
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_received_for_generation_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(101),
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(101),)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation_with_transport(
+                "peer1",
+                relay_endpoint,
+                generation,
+                Some(101),
+            )
+            .await
+    );
 
     let completed = manager.get_connection("peer1").await.unwrap();
     assert_eq!(
-        completed
-            .relay_first
-            .business_gate_completed_generation,
+        completed.relay_first.business_gate_completed_generation,
         Some(generation)
     );
     assert_eq!(
-        manager
-            .select_path_for_data("peer1", true, true)
-            .await
-            .path,
+        manager.select_path_for_data("peer1", true, true).await.path,
         Some(NetworkPath::Direct)
     );
 
@@ -230,37 +233,24 @@ async fn relay_ticket_renewal_does_not_rearm_completed_relay_first_gate() {
     // revokes only the old relay confirmation. It must not make an already
     // established Direct path wait for the first-business exchange again.
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(202),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(202))
         .await;
     let replacement = manager.get_connection("peer1").await.unwrap();
     assert_eq!(replacement.relay_confirmed_generation, None);
     assert_eq!(
-        replacement
-            .relay_first
-            .business_gate_completed_generation,
+        replacement.relay_first.business_gate_completed_generation,
         Some(generation)
     );
     assert_eq!(
-        manager
-            .select_path_for_data("peer1", true, true)
-            .await
-            .path,
+        manager.select_path_for_data("peer1", true, true).await.path,
         Some(NetworkPath::Direct)
     );
 
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(202),
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(202),)
+            .await
+    );
     let after_confirmation = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(after_confirmation.path, Some(NetworkPath::Direct));
     assert!(manager.path_commit_targets().await.is_empty());
@@ -290,28 +280,40 @@ async fn authoritative_direct_does_not_wait_for_one_way_relay_business() {
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
 
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
 
     // Outbound business has crossed the relay (local send direction)...
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
     // ...but the peer sends nothing back. Direct is already authoritative.
     let selected = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selected.path, Some(NetworkPath::Direct));
 
     // A later path-commit remains accepted as relay standby evidence and is
     // idempotent with respect to the already-selected Direct path.
-    assert!(manager
-        .mark_relay_first_business_pathcommit_for_generation("peer1", generation, relay_endpoint)
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_pathcommit_for_generation(
+                "peer1",
+                generation,
+                relay_endpoint
+            )
+            .await
+    );
     let promoted = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(promoted.path, Some(NetworkPath::Direct));
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    assert!(
+        manager
+            .is_data_path_admitted_for_generation("peer1", generation, true)
+            .await
+    );
 }
 
 #[tokio::test]
@@ -331,15 +333,23 @@ async fn stale_pathcommit_does_not_override_authoritative_direct() {
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
 
     // A path-commit marked for a generation that is NOT the current one is
     // refused (stale) and does not release the gate.
-    assert!(!manager
-        .mark_relay_first_business_pathcommit_for_generation("peer1", generation + 1, relay_endpoint)
-        .await);
+    assert!(
+        !manager
+            .mark_relay_first_business_pathcommit_for_generation(
+                "peer1",
+                generation + 1,
+                relay_endpoint
+            )
+            .await
+    );
     let still = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(still.path, Some(NetworkPath::Direct));
 }
@@ -353,65 +363,52 @@ async fn relay_transport_replacement_revokes_old_confirmation_and_rejects_old_ac
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(101),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(101))
         .await;
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(101),
-        )
-        .await);
-    assert!(manager
-        .is_relay_peer_confirmed_for_generation("peer1", generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(101),)
+            .await
+    );
+    assert!(
+        manager
+            .is_relay_peer_confirmed_for_generation("peer1", generation)
+            .await
+    );
 
     // Same endpoint and generation, but a new TCP/TLS connection: the old
     // encrypted ACK is no longer evidence for the replacement transport.
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(202),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(202))
         .await;
     let replaced = manager.get_connection("peer1").await.unwrap();
     assert_eq!(replaced.relay_ready_connection_id, Some(202));
     assert_eq!(replaced.relay_confirmed_generation, None);
     assert_eq!(replaced.relay_confirmed_connection_id, None);
-    assert!(!manager
-        .is_relay_peer_confirmed_for_generation("peer1", generation)
-        .await);
+    assert!(
+        !manager
+            .is_relay_peer_confirmed_for_generation("peer1", generation)
+            .await
+    );
 
     // A delayed ACK from the retired connection cannot re-admit the peer.
-    assert!(!manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(101),
-        )
-        .await);
-    assert!(!manager
-        .is_relay_peer_confirmed_for_generation("peer1", generation)
-        .await);
+    assert!(
+        !manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(101),)
+            .await
+    );
+    assert!(
+        !manager
+            .is_relay_peer_confirmed_for_generation("peer1", generation)
+            .await
+    );
 
     // The replacement must earn its own encrypted ACK.
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(202),
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(202),)
+            .await
+    );
     let confirmed = manager.get_connection("peer1").await.unwrap();
     assert_eq!(confirmed.relay_confirmed_connection_id, Some(202));
 }
@@ -425,40 +422,24 @@ async fn retiring_old_relay_transport_does_not_clear_replacement_confirmation() 
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(301),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(301))
         .await;
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(301),
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(301),)
+            .await
+    );
 
     // Make-before-break publishes and confirms the replacement before the
     // retired reader's cleanup callback runs.
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(302),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(302))
         .await;
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(302),
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(302),)
+            .await
+    );
 
     manager
         .invalidate_relay_transport_for_connection(
@@ -472,9 +453,11 @@ async fn retiring_old_relay_transport_does_not_clear_replacement_confirmation() 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.relay_ready_connection_id, Some(302));
     assert_eq!(connection.relay_confirmed_connection_id, Some(302));
-    assert!(manager
-        .is_relay_peer_confirmed_for_generation("peer1", generation)
-        .await);
+    assert!(
+        manager
+            .is_relay_peer_confirmed_for_generation("peer1", generation)
+            .await
+    );
 }
 
 #[tokio::test]
@@ -488,35 +471,34 @@ async fn direct_business_cannot_be_first_usable_before_relay_receive() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
 
-    assert!(!manager
-        .record_verified_first_usable(
-            "peer1",
-            generation,
-            NetworkPath::Direct,
-            "direct",
-        )
-        .await);
-    assert!(manager
-        .mark_relay_first_business_received_for_generation(
-            "peer1",
-            relay_endpoint,
-            generation,
-        )
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct",)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation,)
+            .await
+    );
     // Relay business received + first-usable are one atomic connection
     // transaction now; the compatibility call is therefore idempotent.
-    assert!(!manager
-        .record_verified_first_usable(
-            "peer1",
-            generation,
-            NetworkPath::Relay,
-            "relay:tcp://relay.test:18081",
-        )
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable(
+                "peer1",
+                generation,
+                NetworkPath::Relay,
+                "relay:tcp://relay.test:18081",
+            )
+            .await
+    );
 }
 
 #[test]
@@ -536,10 +518,8 @@ fn relay_business_pending_ledger_is_newest_wins_ttl_and_capacity_bounded() {
     let expired_at = base
         .checked_sub(PENDING_RELAY_BUSINESS_EVIDENCE_TTL + Duration::from_millis(1))
         .expect("test instant is representable");
-    assert!(!manager.retain_pending_relay_business_evidence(evidence(
-        "expired".to_string(),
-        expired_at,
-    )));
+    assert!(!manager
+        .retain_pending_relay_business_evidence(evidence("expired".to_string(), expired_at,)));
     assert_eq!(manager.pending_relay_business_evidence_len(), 0);
 
     for index in 0..=MAX_PENDING_RELAY_BUSINESS_EVIDENCE {
@@ -556,12 +536,9 @@ fn relay_business_pending_ledger_is_newest_wins_ttl_and_capacity_bounded() {
     let newest_peer = format!("peer-{MAX_PENDING_RELAY_BUSINESS_EVIDENCE}");
     assert!(manager.pending_relay_business_evidence_present(&newest_peer));
 
-    let current_received_at = base
-        + Duration::from_nanos(MAX_PENDING_RELAY_BUSINESS_EVIDENCE as u64);
-    assert!(!manager.retain_pending_relay_business_evidence(evidence(
-        newest_peer.clone(),
-        base,
-    )));
+    let current_received_at =
+        base + Duration::from_nanos(MAX_PENDING_RELAY_BUSINESS_EVIDENCE as u64);
+    assert!(!manager.retain_pending_relay_business_evidence(evidence(newest_peer.clone(), base,)));
     let retained = manager
         .pending_relay_business_evidence_for_lifecycle(
             &newest_peer,
@@ -587,27 +564,31 @@ async fn relay_receive_before_local_send_completes_after_local_send() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_received_for_generation(
-            "peer1",
-            relay_endpoint,
-            generation,
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation,)
+            .await
+    );
 
     // The inbound relay packet arrived before this daemon had sent its own
     // first relay business packet. Its receive marker and Relay first-usable
     // evidence commit atomically, while Direct remains gated until this daemon
     // also sends one.
-    assert!(!manager
-        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
-        .await);
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
     manager
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
         .await;
@@ -616,9 +597,11 @@ async fn relay_receive_before_local_send_completes_after_local_send() {
     // two-direction gate without requiring an unrelated later TUN packet.
     let selection = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert!(!manager
-        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+            .await
+    );
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
 }
@@ -634,9 +617,11 @@ async fn authoritative_direct_business_can_be_first_usable_before_relay_receive(
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
     manager
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(7)))
         .await;
@@ -653,9 +638,11 @@ async fn authoritative_direct_business_can_be_first_usable_before_relay_receive(
     let selection = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
     assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert!(manager
-        .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
-        .await);
+    assert!(
+        manager
+            .record_verified_first_usable("peer1", generation, NetworkPath::Direct, "direct")
+            .await
+    );
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.first_usable_path, Some(NetworkPath::Direct));
 }
@@ -671,29 +658,30 @@ async fn relay_first_receive_before_ack_is_promoted_on_confirmation() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(!manager
-        .mark_relay_first_business_received_for_generation(
-            "peer1",
-            relay_endpoint,
-            generation,
-        )
-        .await);
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        !manager
+            .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation,)
+            .await
+    );
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
     // Confirmation consumes the bounded pre-confirmation evidence.  The
     // packet cannot be replayed through WireGuard a second time just to make
     // this marker, so the later call is intentionally idempotent.
-    assert!(!manager
-        .mark_relay_first_business_received_for_generation(
-            "peer1",
-            relay_endpoint,
-            generation,
-        )
-        .await);
+    assert!(
+        !manager
+            .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation,)
+            .await
+    );
 
     let connection = manager.get_connection("peer1").await.unwrap();
-    assert_eq!(connection.relay_first.business_received_generation, Some(generation));
+    assert_eq!(
+        connection.relay_first.business_received_generation,
+        Some(generation)
+    );
     assert_eq!(connection.first_usable_generation, Some(generation));
     assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
 }
@@ -707,12 +695,7 @@ async fn encrypted_business_ingress_can_confirm_relay_before_probe_ack() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(17),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(17))
         .await;
 
     // This models the real ordering seen in dual-end logs: the peer's
@@ -727,29 +710,36 @@ async fn encrypted_business_ingress_can_confirm_relay_before_probe_ack() {
             Some(17),
         )
         .await);
-    assert!(manager
-        .mark_relay_first_business_received_for_generation_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(17),
-        )
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation_with_transport(
+                "peer1",
+                relay_endpoint,
+                generation,
+                Some(17),
+            )
+            .await
+    );
     // The typed Relay business transaction records first-usable atomically
     // with the receive marker.
-    assert!(!manager
-        .record_verified_first_usable(
-            "peer1",
-            generation,
-            NetworkPath::Relay,
-            "relay:tcp://relay.test:18081",
-        )
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable(
+                "peer1",
+                generation,
+                NetworkPath::Relay,
+                "relay:tcp://relay.test:18081",
+            )
+            .await
+    );
 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.relay_confirmed_generation, Some(generation));
     assert_eq!(connection.relay_confirmed_connection_id, Some(17));
-    assert_eq!(connection.relay_first.business_received_generation, Some(generation));
+    assert_eq!(
+        connection.relay_first.business_received_generation,
+        Some(generation)
+    );
     assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
 }
 
@@ -762,44 +752,40 @@ async fn preconfirmation_business_from_replaced_relay_transport_is_rejected() {
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
-        .mark_relay_transport_ready_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(12),
-        )
+        .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(12))
         .await;
 
     // The business packet belonged to the old connection incarnation.  A
     // same-endpoint replacement must not inherit that evidence.
-    assert!(!manager
-        .mark_relay_first_business_received_for_generation_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(11),
-        )
-        .await);
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(12),
-        )
-        .await);
+    assert!(
+        !manager
+            .mark_relay_first_business_received_for_generation_with_transport(
+                "peer1",
+                relay_endpoint,
+                generation,
+                Some(11),
+            )
+            .await
+    );
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport("peer1", relay_endpoint, generation, Some(12),)
+            .await
+    );
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.relay_first.business_received_generation, None);
     assert_eq!(connection.first_usable_generation, None);
 
-    assert!(manager
-        .mark_relay_first_business_received_for_generation_with_transport(
-            "peer1",
-            relay_endpoint,
-            generation,
-            Some(12),
-        )
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation_with_transport(
+                "peer1",
+                relay_endpoint,
+                generation,
+                Some(12),
+            )
+            .await
+    );
 }
 
 #[tokio::test]
@@ -814,14 +800,16 @@ async fn unconfirmed_relay_ingress_cannot_be_first_usable() {
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
 
-    assert!(!manager
-        .record_verified_first_usable(
-            "peer1",
-            generation,
-            NetworkPath::Relay,
-            "relay:tcp://relay.test:18081",
-        )
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable(
+                "peer1",
+                generation,
+                NetworkPath::Relay,
+                "relay:tcp://relay.test:18081",
+            )
+            .await
+    );
     assert_eq!(
         manager
             .get_connection("peer1")
@@ -853,18 +841,20 @@ async fn direct_confirmation_is_bounded_fallback_when_relay_probe_does_not_ack()
             .get_mut("peer1")
             .expect("peer exists")
             .relay_ready_at = Some(
-                Instant::now()
-                    .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
-                    .expect("test instant is representable"),
-            );
+            Instant::now()
+                .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
+                .expect("test instant is representable"),
+        );
     }
 
     let selection = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selection.path, Some(NetworkPath::Direct));
     assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    assert!(
+        manager
+            .is_data_path_admitted_for_generation("peer1", generation, true)
+            .await
+    );
 }
 
 #[tokio::test]
@@ -882,9 +872,11 @@ async fn authoritative_direct_ack_wins_before_per_peer_relay_ready_is_published(
     // A shared relay transport exists, but this peer has not published its
     // relay-ready milestone yet. The encrypted Direct ACK is stronger than
     // the startup gate and may consume a counter immediately.
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    assert!(
+        manager
+            .is_data_path_admitted_for_generation("peer1", generation, true)
+            .await
+    );
     let selected = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
@@ -896,15 +888,18 @@ async fn authoritative_direct_ack_wins_before_per_peer_relay_ready_is_published(
         connections
             .get_mut("peer1")
             .expect("peer exists")
-            .relay_first.gate_started_at = Some(
-                Instant::now()
-                    .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
-                    .expect("test instant is representable"),
-            );
+            .relay_first
+            .gate_started_at = Some(
+            Instant::now()
+                .checked_sub(RELAY_FIRST_CONFIRMATION_GRACE + Duration::from_millis(1))
+                .expect("test instant is representable"),
+        );
     }
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    assert!(
+        manager
+            .is_data_path_admitted_for_generation("peer1", generation, true)
+            .await
+    );
     let after_expiry = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(after_expiry.path, Some(NetworkPath::Direct));
 }
@@ -927,9 +922,11 @@ async fn relay_catalog_gate_does_not_override_authoritative_direct_ack() {
     let selected = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert_eq!(selected.reason_code, REASON_PATH_DIRECT_CONFIRMED);
-    assert!(manager
-        .is_data_path_admitted_for_generation("peer1", generation, true)
-        .await);
+    assert!(
+        manager
+            .is_data_path_admitted_for_generation("peer1", generation, true)
+            .await
+    );
 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.state, ConnectionState::Direct);
@@ -962,16 +959,18 @@ async fn encrypted_validation_rtt_replaces_delayed_candidate_probe_rtt() {
     let generation = manager.current_network_generation().await;
     let epoch_gate = manager.network_epoch_gate();
     let epoch_guard = epoch_gate.lock().await;
-    assert!(manager
-        .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
-            &epoch_guard,
-            "peer1",
-            Some(endpoint),
-            generation,
-            None,
-            Some(Duration::from_millis(8)),
-        )
-        .await);
+    assert!(
+        manager
+            .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch(
+                &epoch_guard,
+                "peer1",
+                Some(endpoint),
+                generation,
+                None,
+                Some(Duration::from_millis(8)),
+            )
+            .await
+    );
     drop(epoch_guard);
 
     let connection = manager.get_connection("peer1").await.unwrap();
@@ -1001,11 +1000,7 @@ async fn alternate_endpoint_probe_rtt_does_not_replace_active_direct_health() {
         .add_candidates("peer1", &[selected.to_string(), alternate.to_string()])
         .await;
     manager
-        .record_direct_probe_success_with_latency(
-            "peer1",
-            selected,
-            Some(Duration::from_millis(8)),
-        )
+        .record_direct_probe_success_with_latency("peer1", selected, Some(Duration::from_millis(8)))
         .await;
     manager.record_direct_success("peer1", Some(selected)).await;
 
@@ -1029,7 +1024,10 @@ async fn alternate_endpoint_probe_rtt_does_not_replace_active_direct_health() {
         .iter()
         .find(|pair| pair.remote_endpoint == alternate)
         .expect("alternate ACK must remain useful candidate evidence");
-    assert_eq!(alternate_pair.rtt_ewma_ms.or(alternate_pair.rtt_ms), Some(408));
+    assert_eq!(
+        alternate_pair.rtt_ewma_ms.or(alternate_pair.rtt_ms),
+        Some(408)
+    );
 }
 
 #[tokio::test]
@@ -1051,15 +1049,21 @@ async fn slow_encrypted_direct_validation_confirms_and_promotes_direct() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation)
+            .await
+    );
     manager
         .record_direct_probe_success_with_latency(
             "peer1",
@@ -1115,10 +1119,7 @@ async fn slow_encrypted_direct_validation_confirms_and_promotes_direct() {
         .await;
     let selection = manager.select_path_for_data("peer1", true, true).await;
     assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert_eq!(
-        selection.reason_code,
-        REASON_PATH_DIRECT_CONFIRMED
-    );
+    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
     assert!(selection.direct_confirmed);
 }
 
@@ -1141,12 +1142,16 @@ async fn slow_direct_probe_does_not_start_validation_over_confirmed_relay() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
 
     let validation_trigger = manager
         .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
@@ -1167,7 +1172,10 @@ async fn slow_direct_probe_does_not_start_validation_over_confirmed_relay() {
         .find(|pair| pair.remote_endpoint == endpoint && pair.local_generation == generation)
         .unwrap();
     assert_eq!(pair.state, CandidatePairState::Degraded);
-    assert_eq!(pair.last_error_code.as_deref(), Some(REASON_DIRECT_SLOW_RELAY_RETAINED));
+    assert_eq!(
+        pair.last_error_code.as_deref(),
+        Some(REASON_DIRECT_SLOW_RELAY_RETAINED)
+    );
     assert_eq!(pair.slow_validation_count, 1);
     assert!(connection
         .direct_events
@@ -1182,9 +1190,7 @@ async fn slow_probe_evidence_does_not_replace_active_endpoint() {
     let slow_endpoint: SocketAddr = "198.51.100.65:51865".parse().unwrap();
     let relay_endpoint = "tcp://relay.test:18081";
 
-    manager
-        .add_peer(&test_peer("peer1", active_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", active_endpoint)).await;
     let generation = manager.current_network_generation().await;
     manager
         .record_relay_success_with_latency(
@@ -1197,22 +1203,28 @@ async fn slow_probe_evidence_does_not_replace_active_endpoint() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
 
-    assert!(!manager
-        .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
-            "peer1",
-            slow_endpoint,
-            Some(Duration::from_millis(505)),
-            generation,
-            None,
-        )
-        .await);
+    assert!(
+        !manager
+            .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
+                "peer1",
+                slow_endpoint,
+                Some(Duration::from_millis(505)),
+                generation,
+                None,
+            )
+            .await
+    );
 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.state, ConnectionState::Relay);
@@ -1242,15 +1254,21 @@ async fn slow_confirmed_direct_is_not_active_over_confirmed_relay() {
     manager
         .mark_relay_transport_ready("peer1", relay_endpoint, generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", relay_endpoint, generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation("peer1", generation)
-        .await);
-    assert!(manager
-        .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", relay_endpoint, generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation("peer1", generation)
+            .await
+    );
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation("peer1", relay_endpoint, generation)
+            .await
+    );
     manager
         .record_direct_probe_success_with_latency(
             "peer1",
@@ -1492,7 +1510,10 @@ async fn candidate_refresh_generation_keeps_confirmed_relay_admission() {
         "candidate refresh must not revoke an already encrypted-confirmed relay ingress"
     );
     let conn = manager.get_connection("peer1").await.unwrap();
-    assert_eq!(conn.relay_confirmed_endpoint.as_deref(), Some("relay.test:443"));
+    assert_eq!(
+        conn.relay_confirmed_endpoint.as_deref(),
+        Some("relay.test:443")
+    );
 }
 
 #[tokio::test]
@@ -1542,7 +1563,11 @@ async fn candidate_refresh_retains_confirmed_peer_reflexive_direct() {
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
     manager
-        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(42)))
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(42)),
+        )
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
 
@@ -1569,9 +1594,7 @@ async fn confirmed_public_peer_reflexive_direct_survives_peer_updated() {
     let public: SocketAddr = "8.8.4.4:51843".parse().unwrap();
     let private: SocketAddr = "192.168.0.159:51843".parse().unwrap();
     manager.add_peer(&test_peer("peer1", public)).await;
-    manager
-        .learn_authenticated_endpoint("peer1", public)
-        .await;
+    manager.learn_authenticated_endpoint("peer1", public).await;
     manager
         .record_direct_probe_success_with_latency("peer1", public, Some(Duration::from_millis(9)))
         .await;
@@ -1606,9 +1629,11 @@ async fn stale_hole_punch_transition_cannot_overwrite_direct() {
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
 
-    assert!(!manager
-        .begin_hole_punch_if_current("peer1", stale_generation, stale_commit_seq)
-        .await);
+    assert!(
+        !manager
+            .begin_hole_punch_if_current("peer1", stale_generation, stale_commit_seq)
+            .await
+    );
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(conn.state, ConnectionState::Direct);
     assert_eq!(conn.active_path(), Some(NetworkPath::Direct));
@@ -1622,9 +1647,7 @@ async fn diagnostics_current_pair_prefers_confirmed_public_pair() {
     let public: SocketAddr = "8.8.8.8:51845".parse().unwrap();
     let private: SocketAddr = "192.168.0.159:51845".parse().unwrap();
     manager.add_peer(&test_peer("peer1", public)).await;
-    manager
-        .learn_authenticated_endpoint("peer1", public)
-        .await;
+    manager.learn_authenticated_endpoint("peer1", public).await;
     manager.record_direct_success("peer1", Some(public)).await;
     manager.learn_authenticated_endpoint("peer1", private).await;
 
@@ -1679,14 +1702,10 @@ async fn diagnostics_does_not_keep_reporting_public_pair_after_host_pair_wins() 
         connection.state = ConnectionState::Direct;
         connection.endpoint = Some(host);
 
-        let mut public_pair = CandidatePair::new_with_source(
-            public,
-            0,
-            CandidatePairSource::StunObserved,
-        );
+        let mut public_pair =
+            CandidatePair::new_with_source(public, 0, CandidatePairSource::StunObserved);
         public_pair.record_success(Some(Duration::from_millis(100)), true, None);
-        let mut host_pair =
-            CandidatePair::new_with_source(host, 0, CandidatePairSource::Host);
+        let mut host_pair = CandidatePair::new_with_source(host, 0, CandidatePairSource::Host);
         host_pair.record_success(Some(Duration::from_millis(2)), true, None);
         connection.candidate_pairs = vec![public_pair, host_pair];
     }
@@ -1713,8 +1732,10 @@ async fn diagnostics_direct_state_overrides_stale_relay_selection() {
     manager.record_direct_success("peer1", Some(public)).await;
     {
         let mut conns = manager.connections.write().await;
-        conns.get_mut("peer1").unwrap().last_path_selection =
-            Some(PathSelection::relay("stale", "stale relay selector snapshot"));
+        conns.get_mut("peer1").unwrap().last_path_selection = Some(PathSelection::relay(
+            "stale",
+            "stale relay selector snapshot",
+        ));
     }
 
     let peer = manager
@@ -1724,10 +1745,22 @@ async fn diagnostics_direct_state_overrides_stale_relay_selection() {
         .unwrap();
     assert_eq!(peer.state, ConnectionState::Direct);
     assert_eq!(peer.active_path, Some(NetworkPath::Direct));
-    assert!(matches!(peer.direct_type, DirectPathType::PublicUdp | DirectPathType::PeerReflexive));
-    assert_eq!(peer.selected_pair.as_ref().unwrap().remote_endpoint, public.to_string());
-    assert_eq!(peer.current_direct_pair.as_ref().unwrap().remote_endpoint, public.to_string());
-    assert_eq!(peer.last_path_selection.as_ref().unwrap().path, Some(NetworkPath::Direct));
+    assert!(matches!(
+        peer.direct_type,
+        DirectPathType::PublicUdp | DirectPathType::PeerReflexive
+    ));
+    assert_eq!(
+        peer.selected_pair.as_ref().unwrap().remote_endpoint,
+        public.to_string()
+    );
+    assert_eq!(
+        peer.current_direct_pair.as_ref().unwrap().remote_endpoint,
+        public.to_string()
+    );
+    assert_eq!(
+        peer.last_path_selection.as_ref().unwrap().path,
+        Some(NetworkPath::Direct)
+    );
 }
 
 #[tokio::test]
@@ -1737,7 +1770,9 @@ async fn direct_promotion_updates_selection_atomically() {
     manager.add_peer(&test_peer("peer1", public)).await;
     manager.record_direct_success("peer1", Some(public)).await;
     let conn = manager.get_connection("peer1").await.unwrap();
-    let selection = conn.last_path_selection.expect("promotion selector snapshot");
+    let selection = conn
+        .last_path_selection
+        .expect("promotion selector snapshot");
     assert_eq!(conn.state, ConnectionState::Direct);
     assert!(conn.candidate_pairs.iter().any(|pair| {
         pair.local_generation == conn.direct_generation
@@ -1828,11 +1863,13 @@ async fn degraded_direct_is_retained_until_relay_peer_path_is_confirmed() {
         .diagnostics_with_path_selection(true, true, Duration::from_secs(5), None)
         .await;
     assert_eq!(diagnostics[0].active_path, Some(NetworkPath::Direct));
-    assert!(!diagnostics[0]
-        .current_path_selection
-        .as_ref()
-        .unwrap()
-        .relay_hedged);
+    assert!(
+        !diagnostics[0]
+            .current_path_selection
+            .as_ref()
+            .unwrap()
+            .relay_hedged
+    );
 }
 
 #[tokio::test]
@@ -1850,9 +1887,11 @@ async fn in_flight_hole_punch_completion_after_direct_promotion_is_refused() {
     manager
         .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(4)))
         .await;
-    assert!(manager
-        .begin_hole_punch_if_current("peer1", task_generation, task_commit_seq)
-        .await);
+    assert!(
+        manager
+            .begin_hole_punch_if_current("peer1", task_generation, task_commit_seq)
+            .await
+    );
     let started = manager.get_connection("peer1").await.unwrap();
     assert_eq!(started.state, ConnectionState::HolePunching);
 
@@ -1864,9 +1903,11 @@ async fn in_flight_hole_punch_completion_after_direct_promotion_is_refused() {
     assert!(!manager.recovery_epoch_active("peer1").await);
     drop(promoted);
 
-    assert!(!manager
-        .begin_hole_punch_if_current("peer1", task_generation, task_commit_seq)
-        .await);
+    assert!(
+        !manager
+            .begin_hole_punch_if_current("peer1", task_generation, task_commit_seq)
+            .await
+    );
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(conn.state, ConnectionState::Direct);
     assert_eq!(conn.active_path(), Some(NetworkPath::Direct));
@@ -1890,7 +1931,10 @@ async fn relay_connection_metadata_survives_direct_promotion_for_recovery() {
         .await;
     let relay = manager.get_connection("peer1").await.unwrap();
     assert_eq!(relay.state, ConnectionState::Relay);
-    assert_eq!(relay.relay_server.as_deref(), Some("tcp://relay.test:18081"));
+    assert_eq!(
+        relay.relay_server.as_deref(),
+        Some("tcp://relay.test:18081")
+    );
 
     manager.record_direct_success("peer1", Some(endpoint)).await;
     let promoted = manager.get_connection("peer1").await.unwrap();
@@ -2027,9 +2071,7 @@ async fn relay_probe_rtt_starts_at_writer_boundary_not_local_enqueue_time() {
         .mark_relay_transport_ready_with_transport("peer1", relay_endpoint, generation, Some(81))
         .await;
 
-    let queued_at = Instant::now()
-        .checked_sub(Duration::from_secs(5))
-        .unwrap();
+    let queued_at = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
     let write_boundary = Instant::now();
     assert!(manager.register_relay_probe_expectation_at_write_boundary(
         "peer1",
@@ -2064,7 +2106,10 @@ async fn relay_probe_rtt_starts_at_writer_boundary_not_local_enqueue_time() {
         .relay_health
         .latency_ms
         .unwrap();
-    assert!(latency_ms >= 8, "writer-boundary RTT should include the ACK wait");
+    assert!(
+        latency_ms >= 8,
+        "writer-boundary RTT should include the ACK wait"
+    );
     assert!(
         latency_ms < 500,
         "the five-second local queue wait must not enter relay RTT"
@@ -2099,24 +2144,21 @@ async fn periodic_relay_sample_cannot_overwrite_forced_confirmation_expectation(
         Instant::now(),
     ));
     let permit = manager
-        .relay_validation_write_permit_for_transport(
-            "peer1",
-            generation,
-            relay_endpoint,
-            82,
-        )
+        .relay_validation_write_permit_for_transport("peer1", generation, relay_endpoint, 82)
         .await
         .unwrap();
-    assert!(!manager.register_relay_validation_expectation_at_write_boundary(
-        "peer1",
-        generation,
-        13,
-        0xbbb,
-        relay_endpoint,
-        82,
-        permit,
-        Instant::now(),
-    ));
+    assert!(
+        !manager.register_relay_validation_expectation_at_write_boundary(
+            "peer1",
+            generation,
+            13,
+            0xbbb,
+            relay_endpoint,
+            82,
+            permit,
+            Instant::now(),
+        )
+    );
     let installed = manager.relay_probe_expectations.lock().unwrap();
     let installed = installed.get("peer1").unwrap();
     assert_eq!(installed.request_id, 12);

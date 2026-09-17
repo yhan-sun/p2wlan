@@ -32,18 +32,14 @@ fn query_daemon_state() -> DaemonState {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("—")
         .to_string();
-    let online = status
-        .as_ref()
-        .and_then(verified_online_connection_count);
+    let online = status.as_ref().and_then(verified_online_connection_count);
     let peer_count = status
         .as_ref()
         .and_then(|value| value.get("stats"))
         .and_then(|stats| stats.get("total_peers"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let latency_ms = status
-        .as_ref()
-        .and_then(average_verified_latency_ms);
+    let latency_ms = status.as_ref().and_then(average_verified_latency_ms);
     let total_bytes = status.as_ref().and_then(total_bytes_from_status);
     let devices = status.as_ref().map(tray_device_menu).unwrap_or_default();
     DaemonState {
@@ -141,9 +137,8 @@ fn fetch_status_with_auth(
     status_url: &str,
 ) -> Result<serde_json::Value, String> {
     for attempt in 0..2 {
-        let token = read_diagnostics_auth_token().ok_or_else(|| {
-            "诊断会话 Token 文件不存在，请重新启动 p2wlan-daemon。".to_string()
-        })?;
+        let token = read_diagnostics_auth_token()
+            .ok_or_else(|| "诊断会话 Token 文件不存在，请重新启动 p2wlan-daemon。".to_string())?;
         let response = client
             .get(status_url)
             .bearer_auth(token)
@@ -156,7 +151,10 @@ fn fetch_status_with_auth(
             return Err("诊断会话已变化，请重新启动 p2wlan-daemon。".to_string());
         }
         if !response.status().is_success() {
-            return Err(format!("p2wlan-daemon 状态请求返回 HTTP {}。", response.status()));
+            return Err(format!(
+                "p2wlan-daemon 状态请求返回 HTTP {}。",
+                response.status()
+            ));
         }
         return response
             .json::<serde_json::Value>()
@@ -279,10 +277,7 @@ fn build_tray_menu(state: &DaemonState) -> MenuBuilder<UserEvent> {
         .item("打开 P2WLAN", UserEvent::OpenClient)
         .item("启动 Daemon", UserEvent::StartDaemon)
         .item("停止 Daemon", UserEvent::StopDaemon)
-        .submenu(
-            &format!("设备（{}）", state.devices.total),
-            device_menu,
-        )
+        .submenu(&format!("设备（{}）", state.devices.total), device_menu)
         .separator()
         .item("打开日志", UserEvent::OpenLogs)
         .separator()

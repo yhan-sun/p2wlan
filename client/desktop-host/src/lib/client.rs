@@ -87,9 +87,7 @@ impl DesktopHostClient {
                 })?;
 
             let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                && attempt + 1 < AUTH_RETRY_ATTEMPTS
-            {
+            if status == reqwest::StatusCode::UNAUTHORIZED && attempt + 1 < AUTH_RETRY_ATTEMPTS {
                 tokio::time::sleep(AUTH_RETRY_DELAY).await;
                 continue;
             }

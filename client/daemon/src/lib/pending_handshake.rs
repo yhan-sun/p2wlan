@@ -1272,8 +1272,7 @@ impl PendingHandshakeState {
             return CandidateOfferWorkAdmission::Capacity;
         }
 
-        self.next_candidate_offer_worker_id =
-            self.next_candidate_offer_worker_id.saturating_add(1);
+        self.next_candidate_offer_worker_id = self.next_candidate_offer_worker_id.saturating_add(1);
         let owner = self.next_candidate_offer_worker_id;
         let peer_id = offer.from_node_id.clone();
         let active_sender_public_key = offer.sender_public_key.clone();

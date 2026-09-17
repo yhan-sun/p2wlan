@@ -1,4 +1,3 @@
-
 fn flood_peer(node_id: &str, virtual_ip: &str, endpoint: SocketAddr) -> PeerInfo {
     PeerInfo {
         node_id: node_id.to_string(),
@@ -28,10 +27,18 @@ async fn direct_events_for(manager: &PeerManager, node_id: &str) -> usize {
 async fn unrelated_failed_peer_cannot_flood_or_disturb_healthy_direct_peer() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer("peer-direct", "10.20.0.2", "1.2.3.4:5000".parse().unwrap()))
+        .add_peer(&flood_peer(
+            "peer-direct",
+            "10.20.0.2",
+            "1.2.3.4:5000".parse().unwrap(),
+        ))
         .await;
     manager
-        .add_peer(&flood_peer("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager
         .update_state("peer-direct", ConnectionState::Direct)
@@ -60,7 +67,10 @@ async fn unrelated_failed_peer_cannot_flood_or_disturb_healthy_direct_peer() {
     }
 
     // The healthy Direct peer is untouched by the failing peer's churn:
-    assert!(manager.is_direct("peer-direct").await, "Direct state survives");
+    assert!(
+        manager.is_direct("peer-direct").await,
+        "Direct state survives"
+    );
     assert_eq!(
         manager.current_network_generation().await,
         generation,
@@ -72,7 +82,9 @@ async fn unrelated_failed_peer_cannot_flood_or_disturb_healthy_direct_peer() {
         "a failing peer's churn must not add a single traversal event to the healthy Direct peer"
     );
     // The Direct peer is never re-scanned because an unrelated peer fails:
-    let targets = manager.direct_probe_targets_due(Duration::from_secs(1)).await;
+    let targets = manager
+        .direct_probe_targets_due(Duration::from_secs(1))
+        .await;
     assert!(
         targets.iter().all(|target| target.peer_id == "peer-fail"),
         "only the failing peer may have retry targets, got {:?}",
@@ -106,7 +118,9 @@ async fn unrelated_failed_peer_cannot_flood_or_disturb_healthy_direct_peer() {
     // (not due right after the failures), and the newly arrived candidate did
     // NOT reset that backoff.
     assert!(
-        !manager.direct_retry_due("peer-fail", Duration::from_secs(2)).await,
+        !manager
+            .direct_retry_due("peer-fail", Duration::from_secs(2))
+            .await,
         "a failing peer must back off after consecutive failures even when new candidates arrive"
     );
 }
@@ -115,12 +129,18 @@ async fn unrelated_failed_peer_cannot_flood_or_disturb_healthy_direct_peer() {
 async fn non_direct_peer_has_bounded_recovery() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer("peer-recover", "10.20.0.4", "9.9.9.9:7000".parse().unwrap()))
+        .add_peer(&flood_peer(
+            "peer-recover",
+            "10.20.0.4",
+            "9.9.9.9:7000".parse().unwrap(),
+        ))
         .await;
     let generation = manager.current_network_generation().await;
 
     // The non-Direct peer still gets retry targets while its backoff allows.
-    let targets = manager.direct_probe_targets_due(Duration::from_millis(100)).await;
+    let targets = manager
+        .direct_probe_targets_due(Duration::from_millis(100))
+        .await;
     assert_eq!(targets.len(), 1, "the non-Direct peer must still recover");
     assert_eq!(targets[0].peer_id, "peer-recover");
 
@@ -136,7 +156,9 @@ async fn non_direct_peer_has_bounded_recovery() {
             .await;
     }
     assert!(
-        !manager.direct_retry_due("peer-recover", Duration::from_secs(1)).await,
+        !manager
+            .direct_retry_due("peer-recover", Duration::from_secs(1))
+            .await,
         "repeated failures must extend the retry backoff"
     );
     // Recovery is not suppressed forever: the backoff is bounded (max
@@ -163,7 +185,11 @@ fn direct_retry_backoff_grows_exponentially_and_is_bounded() {
     let base = Duration::from_secs(1);
     assert_eq!(health.retry_after(base), base);
     health.record_failure("probe_failed", "no ACK");
-    assert_eq!(health.retry_after(base), base, "first failure keeps the base");
+    assert_eq!(
+        health.retry_after(base),
+        base,
+        "first failure keeps the base"
+    );
     health.record_failure("probe_failed", "no ACK");
     assert_eq!(health.retry_after(base), Duration::from_secs(2));
     health.record_failure("probe_failed", "no ACK");

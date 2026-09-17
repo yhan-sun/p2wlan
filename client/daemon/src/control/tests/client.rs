@@ -17,7 +17,13 @@ fn test_no_proxy_client() -> reqwest::Client {
 #[test]
 fn test_control_client_creation() {
     let config = test_config();
-    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
     // Client created successfully, no events yet
     drop(client);
 }
@@ -27,7 +33,13 @@ fn test_control_client_creation_disabled() {
     let mut config = test_config();
     config.control.auth_token = "test-token".to_string();
     // When disabled, no background control loop is spawned
-    let (client, _rx) = ControlClient::new(&config, false, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, _rx) = ControlClient::new(
+        &config,
+        false,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
     drop(client);
 }
 
@@ -50,7 +62,13 @@ async fn test_control_client_disabled_emits_no_events() {
     config.control.auth_token = "test-token".to_string();
     config.control.server_url = "http://127.0.0.1:1".to_string(); // unreachable
 
-    let (client, mut rx) = ControlClient::new(&config, false, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, mut rx) = ControlClient::new(
+        &config,
+        false,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
 
     // Give any accidental background task a moment to fire events.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -64,7 +82,13 @@ async fn test_control_client_disabled_emits_no_events() {
 #[tokio::test]
 async fn test_control_client_handle_registered() {
     let config = test_config();
-    let (client, mut rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, mut rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
 
     client
         .handle_message(ControlMessage::Registered {
@@ -95,7 +119,13 @@ async fn test_control_client_handle_registered() {
 #[tokio::test]
 async fn test_control_client_handle_peer_join_leave() {
     let config = test_config();
-    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
 
     client
         .handle_message(ControlMessage::PeerJoin {
@@ -167,10 +197,8 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
                     }
                 }
                 let head = String::from_utf8_lossy(&buf);
-                let is_signal_post =
-                    head.starts_with("POST") && head.contains("/api/v1/signals");
-                let is_device_post =
-                    head.starts_with("POST") && head.contains("/api/v1/devices");
+                let is_signal_post = head.starts_with("POST") && head.contains("/api/v1/signals");
+                let is_device_post = head.starts_with("POST") && head.contains("/api/v1/devices");
                 if is_signal_post {
                     posts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -193,7 +221,13 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
     config.control.server_url = format!("http://{address}");
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, mut rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, mut rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
 
     timeout(Duration::from_secs(5), async {
         loop {
@@ -223,10 +257,7 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
         )
         .await;
     assert!(
-        matches!(
-            result,
-            Err(crate::control::PeerOfferSendFailure::Cancelled)
-        ),
+        matches!(result, Err(crate::control::PeerOfferSendFailure::Cancelled)),
         "a revoked fresh offer must be reported as Cancelled, got {result:?}"
     );
     // Give the worker time to process the queue: it must never post.  The
@@ -278,8 +309,8 @@ async fn queued_fresh_offer_is_skipped_when_ownership_revoked() {
 /// signals must still reach the event loop and the poll must return Ok.
 #[tokio::test]
 async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
-    use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -344,9 +375,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
         None,
         &event_tx,
         0,
-        &Arc::new(tokio::sync::Mutex::new(
-            SignalDeliveryTracker::default(),
-        )),
+        &Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default())),
     )
     .await;
     assert!(
@@ -407,10 +436,12 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
                     }
                 }
                 let request = String::from_utf8_lossy(&buf);
-                if !request.lines().any(|line| {
-                    line.eq_ignore_ascii_case("x-p2wlan-registration-seq: 41")
-                }) {
-                    missing_registration_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("x-p2wlan-registration-seq: 41"))
+                {
+                    missing_registration_sequence
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 if request.starts_with("POST") {
                     // The ACK request: count it and reply success.
@@ -454,9 +485,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
     };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let dedup = Arc::new(tokio::sync::Mutex::new(
-        SignalDeliveryTracker::default(),
-    ));
+    let dedup = Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
 
     // First poll: the signal is decoded and dispatched, but remains durable
     // until the daemon state machine completes the receipt.
@@ -473,9 +502,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
     .await;
     assert!(result.is_ok(), "first poll must succeed: {result:?}");
     let receipt = match timeout(Duration::from_secs(5), event_rx.recv()).await {
-        Ok(Some(ControlEvent::DeliveredSignal {
-            event, receipt, ..
-        })) => match *event {
+        Ok(Some(ControlEvent::DeliveredSignal { event, receipt, .. })) => match *event {
             ControlEvent::PeerOffer { from_node_id, .. } => {
                 assert_eq!(from_node_id, "peer-b");
                 receipt
@@ -504,7 +531,10 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &dedup,
     )
     .await;
-    assert!(result.is_ok(), "in-flight redelivery poll must succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "in-flight redelivery poll must succeed: {result:?}"
+    );
     tokio::task::yield_now().await;
     assert!(
         event_rx.try_recv().is_err(),
@@ -627,10 +657,9 @@ async fn read_http_request(stream: &mut TcpStream) -> Option<HttpRequest> {
                         }
                     }
                     let line = head.lines().next().unwrap_or_default().to_string();
-                    let body = String::from_utf8_lossy(
-                        &buf[body_start..body_start + content_length],
-                    )
-                    .into_owned();
+                    let body =
+                        String::from_utf8_lossy(&buf[body_start..body_start + content_length])
+                            .into_owned();
                     return Some(HttpRequest { line, body });
                 }
             }
@@ -640,7 +669,11 @@ async fn read_http_request(stream: &mut TcpStream) -> Option<HttpRequest> {
 }
 
 async fn mock_respond(mut stream: TcpStream, status: u16, body: &str) {
-    let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+    let reason = if status == 200 {
+        "OK"
+    } else {
+        "Internal Server Error"
+    };
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
@@ -652,9 +685,7 @@ async fn mock_respond(mut stream: TcpStream, status: u16, body: &str) {
 impl MockControlServer {
     /// Serve registration, empty signal polls, and `POST /api/v1/signals` /
     /// `PATCH .../endpoint` whose fate is decided per request by `decide`.
-    async fn spawn(
-        decide: impl Fn(&str, &str) -> MockAction + Send + Sync + 'static,
-    ) -> Self {
+    async fn spawn(decide: impl Fn(&str, &str) -> MockAction + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let registered = Arc::new(AtomicBool::new(false));
@@ -712,12 +743,8 @@ impl MockControlServer {
                                 .await;
                             }
                             "poll" => {
-                                mock_respond(
-                                    stream,
-                                    200,
-                                    r#"{"signals":[],"server_time_ms":0}"#,
-                                )
-                                .await;
+                                mock_respond(stream, 200, r#"{"signals":[],"server_time_ms":0}"#)
+                                    .await;
                             }
                             "signal" | "endpoint" => match decide(kind, &request.body) {
                                 MockAction::Ok => {
@@ -802,7 +829,13 @@ async fn critical_answer_bypasses_stalled_ordinary_candidate_post() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
     server.wait_registered().await;
 
     let stalled = tokio::spawn({
@@ -823,11 +856,14 @@ async fn critical_answer_bypasses_stalled_ordinary_candidate_post() {
     // Give the ordinary lane time to enter the blocked POST.
     sleep(Duration::from_millis(150)).await;
 
-    timeout(Duration::from_secs(2), client.send_peer_answer(
-        "peer-d",
-        &["203.0.113.61:50001".to_string()],
-        b"wg-answer-bytes",
-    ))
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_answer(
+            "peer-d",
+            &["203.0.113.61:50001".to_string()],
+            b"wg-answer-bytes",
+        ),
+    )
     .await
     .expect("the critical answer must not wait behind the stalled ordinary POST")
     .expect("the critical answer must be delivered");
@@ -850,9 +886,9 @@ async fn critical_answer_bypasses_stalled_ordinary_candidate_post() {
     .expect("the candidate worker must reach the stalled request independently");
     let posts = server.signal_posts.lock().unwrap().clone();
     assert!(
-        posts.iter().any(|body| {
-            body.contains("\"type\":\"peer_answer\"") && body.contains("peer-d")
-        }),
+        posts
+            .iter()
+            .any(|body| { body.contains("\"type\":\"peer_answer\"") && body.contains("peer-d") }),
         "the answer must reach the server: {posts:?}"
     );
     assert!(
@@ -1259,7 +1295,13 @@ async fn critical_answer_not_blocked_by_slow_critical_offers() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
     server.wait_registered().await;
 
     let mut offers = Vec::new();
@@ -1282,11 +1324,14 @@ async fn critical_answer_not_blocked_by_slow_critical_offers() {
     // Let the offers occupy the offer lane (in flight + queued).
     sleep(Duration::from_millis(250)).await;
 
-    timeout(Duration::from_secs(2), client.send_peer_answer(
-        "peer-answer-1",
-        &["203.0.113.71:52001".to_string()],
-        b"wg-answer-bytes",
-    ))
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_answer(
+            "peer-answer-1",
+            &["203.0.113.71:52001".to_string()],
+            b"wg-answer-bytes",
+        ),
+    )
     .await
     .expect("a later answer must never wait behind slow critical offers")
     .expect("the answer must be delivered");
@@ -1326,19 +1371,28 @@ async fn critical_answer_retries_exact_payload_then_succeeds() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
     server.wait_registered().await;
 
-    timeout(Duration::from_secs(3), client.send_peer_answer_with_sources_schedule_and_session(
-        "peer-e",
-        &["203.0.113.80:53000".to_string()],
-        &HashMap::from([("203.0.113.80:53000".to_string(), "host".to_string())]),
-        b"wg-answer-retry",
-        None,
-        None,
-        Some("session-retry-1".to_string()),
-        None,
-    ))
+    timeout(
+        Duration::from_secs(3),
+        client.send_peer_answer_with_sources_schedule_and_session(
+            "peer-e",
+            &["203.0.113.80:53000".to_string()],
+            &HashMap::from([("203.0.113.80:53000".to_string(), "host".to_string())]),
+            b"wg-answer-retry",
+            None,
+            None,
+            Some("session-retry-1".to_string()),
+            None,
+        ),
+    )
     .await
     .expect("the transient failure must be retried within the lane deadline")
     .expect("the retry must succeed");
@@ -1372,10 +1426,7 @@ async fn critical_answer_retries_exact_payload_then_succeeds() {
 #[tokio::test]
 async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
     let server = MockControlServer::spawn(|kind, body| {
-        if kind == "signal"
-            && body.contains("\"type\":\"peer_answer\"")
-            && body.contains("60001")
-        {
+        if kind == "signal" && body.contains("\"type\":\"peer_answer\"") && body.contains("60001") {
             MockAction::Stall
         } else {
             MockAction::Ok
@@ -1386,7 +1437,13 @@ async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
     config.control.server_url = format!("http://{}", server.address);
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-a".to_string();
-    let (client, _rx) = ControlClient::new(&config, true, None, None, ConnectionTimeline::new("test-node", 0));
+    let (client, _rx) = ControlClient::new(
+        &config,
+        true,
+        None,
+        None,
+        ConnectionTimeline::new("test-node", 0),
+    );
     server.wait_registered().await;
 
     // Owner A's answer is in flight against a stalled server connection.
@@ -1438,11 +1495,14 @@ async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
     );
 
     // A new owner for the same peer is served normally.
-    timeout(Duration::from_secs(2), client.send_peer_answer(
-        "peer-x",
-        &["203.0.113.90:60002".to_string()],
-        b"new-owner-answer",
-    ))
+    timeout(
+        Duration::from_secs(2),
+        client.send_peer_answer(
+            "peer-x",
+            &["203.0.113.90:60002".to_string()],
+            b"new-owner-answer",
+        ),
+    )
     .await
     .expect("the new owner's answer must be delivered")
     .expect("the new owner's answer must succeed");
@@ -1510,17 +1570,19 @@ async fn critical_endpoint_publish_bypasses_stalled_ordinary_lane() {
     });
     sleep(Duration::from_millis(150)).await;
 
-    timeout(Duration::from_secs(2), client.update_endpoint_for_handshake(
-        "203.0.113.99:54000",
-        "FullCone",
-    ))
+    timeout(
+        Duration::from_secs(2),
+        client.update_endpoint_for_handshake("203.0.113.99:54000", "FullCone"),
+    )
     .await
     .expect("the handshake endpoint publish must not wait behind the ordinary lane")
     .expect("the handshake endpoint publish must succeed");
 
     let endpoints = server.endpoint_posts.lock().unwrap().clone();
     assert!(
-        endpoints.iter().any(|body| body.contains("203.0.113.99:54000")),
+        endpoints
+            .iter()
+            .any(|body| body.contains("203.0.113.99:54000")),
         "the endpoint publish must reach the server: {endpoints:?}"
     );
     let health_snapshot = health.snapshot(&[]).await;
@@ -1556,7 +1618,11 @@ async fn graceful_shutdown_releases_device_presence_after_registration() {
         .expect("shutdown command must be accepted");
 
     let releases = server.presence_releases.lock().unwrap().clone();
-    assert_eq!(releases.len(), 1, "shutdown must release presence exactly once");
+    assert_eq!(
+        releases.len(),
+        1,
+        "shutdown must release presence exactly once"
+    );
     assert!(releases[0].contains("/api/v1/devices/node-a/offline"));
 
     drop(client);
@@ -1608,8 +1674,13 @@ async fn failed_critical_endpoint_publish_invalidates_only_device_lease() {
 
 #[tokio::test]
 async fn explicit_room_device_access_preserves_denials_and_legacy_compatibility() {
-    for (status, code) in [(200, ""), (404, ""), (403, "room_device_pending"),
-        (403, "room_device_blocked"), (403, "room_device_paused")] {
+    for (status, code) in [
+        (200, ""),
+        (404, ""),
+        (403, "room_device_pending"),
+        (403, "room_device_blocked"),
+        (403, "room_device_paused"),
+    ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = test_config();
         config.control.server_url = format!("http://{}", listener.local_addr().unwrap());
@@ -1618,15 +1689,32 @@ async fn explicit_room_device_access_preserves_denials_and_legacy_compatibility(
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let request = read_http_request(&mut stream).await.unwrap();
-            assert!(request.line.starts_with("POST /api/v1/rooms/room-device-policy/device-access "));
+            assert!(request
+                .line
+                .starts_with("POST /api/v1/rooms/room-device-policy/device-access "));
             let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
             assert_eq!(body["resume"], true);
-            mock_respond(stream, status, &serde_json::json!({"error_code":code}).to_string()).await;
+            mock_respond(
+                stream,
+                status,
+                &serde_json::json!({"error_code":code}).to_string(),
+            )
+            .await;
         });
-        let result = timeout(Duration::from_secs(3), ControlClient::request_room_device_access(
-            &test_no_proxy_client(), &config)).await.unwrap();
-        if code.is_empty() { assert!(result.is_ok()); }
-        else { assert!(result.unwrap_err().to_string().contains(code)); }
-        timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
+        let result = timeout(
+            Duration::from_secs(3),
+            ControlClient::request_room_device_access(&test_no_proxy_client(), &config),
+        )
+        .await
+        .unwrap();
+        if code.is_empty() {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.unwrap_err().to_string().contains(code));
+        }
+        timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

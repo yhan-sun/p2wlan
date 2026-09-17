@@ -51,10 +51,8 @@ pub(crate) fn prepare_signal_payload(
     probe_ephemeral_public_key: Option<&str>,
     signing_identity: Option<&SignalSigningIdentity>,
 ) -> Result<serde_json::Value> {
-    let (candidates, candidate_sources, _) = crate::candidate_refresh::normalize_signal_candidates(
-        candidates,
-        candidate_sources,
-    );
+    let (candidates, candidate_sources, _) =
+        crate::candidate_refresh::normalize_signal_candidates(candidates, candidate_sources);
     // `candidate_generation` is the signal/candidate freshness revision, not
     // a declaration that this process rebound its UDP transport. A fresh
     // offer/answer (including a routine WireGuard rekey) deliberately gets a
@@ -115,9 +113,9 @@ pub(super) async fn send_prepared_signal(
             .json(payload),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("send signal request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("send signal request failed: {e}")))?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -159,7 +157,11 @@ pub(super) async fn send_prepared_signal(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("<missing>");
         let received_to = receipt.to_node_id.as_deref().unwrap_or("<missing>");
-        if receipt.to_node_id.as_deref().is_some_and(|to| to != expected_to) {
+        if receipt
+            .to_node_id
+            .as_deref()
+            .is_some_and(|to| to != expected_to)
+        {
             return Err(DaemonError::ControlPlane(format!(
                 "control signal receipt target mismatch: expected {expected_to}, got {received_to}"
             )));
@@ -202,9 +204,9 @@ pub(super) async fn poll_signals(
         .bearer_auth(token),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("list signals request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("list signals request failed: {e}")))?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -435,11 +437,7 @@ pub(super) async fn poll_signals(
         if let (Some(signal_id), Some(ack)) = (signal_id, delivery_ack) {
             debug!(
                 "Control signal delivery staged id={} from={} to={} type={} signal_seq={:?}",
-                signal_id,
-                from_node_id,
-                self_node_id,
-                signal_type,
-                signal_seq,
+                signal_id, from_node_id, self_node_id, signal_type, signal_seq,
             );
             leased_deliveries
                 .entry(sender_key)
@@ -500,7 +498,12 @@ pub(super) struct SignalDeliveryTracker {
 }
 
 impl SignalDeliveryTracker {
-    fn already_applied(&self, signal_id: &str, from_node_id: &str, signal_seq: Option<u64>) -> bool {
+    fn already_applied(
+        &self,
+        signal_id: &str,
+        from_node_id: &str,
+        signal_seq: Option<u64>,
+    ) -> bool {
         self.applied_ids.iter().any(|seen| seen == signal_id)
             || signal_seq.is_some_and(|seq| {
                 self.applied_seq_by_sender
@@ -544,8 +547,7 @@ impl SignalDeliveryTracker {
             from_node_id.to_string(),
         );
         let waiter = receipt.waiter();
-        self.in_flight
-            .insert(signal_id.to_string(), waiter.clone());
+        self.in_flight.insert(signal_id.to_string(), waiter.clone());
         TrackedSignalApplication::Start { receipt, waiter }
     }
 
@@ -588,13 +590,7 @@ impl SignalDeliveryTracker {
             // keep this waiter so a lease redelivery joins that exact work.
             return false;
         };
-        self.finish_application(
-            signal_id,
-            from_node_id,
-            signal_seq,
-            Some(waiter),
-            outcome,
-        );
+        self.finish_application(signal_id, from_node_id, signal_seq, Some(waiter), outcome);
         true
     }
 }
@@ -688,15 +684,12 @@ mod signal_application_timeout_tests {
     #[tokio::test(start_paused = true)]
     async fn redelivery_after_wait_timeout_joins_original_application_without_resubmitting() {
         let mut tracker = SignalDeliveryTracker::default();
-        let (receipt, waiter) = match tracker.begin_application(
-            "signal-restart-11",
-            "peer-b",
-            Some(11),
-            "peer_answer",
-        ) {
-            TrackedSignalApplication::Start { receipt, waiter } => (receipt, waiter),
-            other => panic!("first delivery must create the one application owner: {other:?}"),
-        };
+        let (receipt, waiter) =
+            match tracker.begin_application("signal-restart-11", "peer-b", Some(11), "peer_answer")
+            {
+                TrackedSignalApplication::Start { receipt, waiter } => (receipt, waiter),
+                other => panic!("first delivery must create the one application owner: {other:?}"),
+            };
 
         let waiting = tokio::spawn(wait_for_signal_application_with_timeout(
             waiter.clone(),
@@ -721,20 +714,19 @@ mod signal_application_timeout_tests {
             "timing out the waiter must not retire an event that is still owned by the daemon"
         );
 
-        let joined = match tracker.begin_application(
-            "signal-restart-11",
-            "peer-b",
-            Some(11),
-            "peer_answer",
-        ) {
-            TrackedSignalApplication::Join(joined) => joined,
-            TrackedSignalApplication::Start { .. } => {
-                panic!("redelivery must join the pending application instead of submitting twice")
-            }
-            TrackedSignalApplication::AlreadyApplied => {
-                panic!("a pending application cannot be treated as already applied")
-            }
-        };
+        let joined =
+            match tracker.begin_application("signal-restart-11", "peer-b", Some(11), "peer_answer")
+            {
+                TrackedSignalApplication::Join(joined) => joined,
+                TrackedSignalApplication::Start { .. } => {
+                    panic!(
+                        "redelivery must join the pending application instead of submitting twice"
+                    )
+                }
+                TrackedSignalApplication::AlreadyApplied => {
+                    panic!("a pending application cannot be treated as already applied")
+                }
+            };
         assert!(waiter.same_delivery(&joined));
 
         let joined_wait = tokio::spawn(wait_for_signal_application_with_timeout(
@@ -759,12 +751,7 @@ mod signal_application_timeout_tests {
             joined_outcome,
         ));
         assert!(matches!(
-            tracker.begin_application(
-                "signal-restart-11",
-                "peer-b",
-                Some(11),
-                "peer_answer",
-            ),
+            tracker.begin_application("signal-restart-11", "peer-b", Some(11), "peer_answer",),
             TrackedSignalApplication::AlreadyApplied
         ));
     }
@@ -865,7 +852,10 @@ fn spawn_signal_application_lane(
                             receipt.record_phase("queued", "daemon_event_channel");
                             info!(
                                 "Control signal phase=queued id={} from={} type={} seq={:?}",
-                                log_signal_id, log_from_node_id, log_signal_type, delivery.signal_seq
+                                log_signal_id,
+                                log_from_node_id,
+                                log_signal_type,
+                                delivery.signal_seq
                             );
                             let wait_result = wait_for_signal_application(
                                 waiter,
@@ -906,8 +896,8 @@ fn spawn_signal_application_lane(
                     log_signal_id, log_from_node_id, delivery.signal_seq
                 );
             } else if let Some(waiter) = application_waiter.as_ref() {
-                let wait_result = application_wait_result
-                    .unwrap_or(SignalApplicationWait::Completed(outcome));
+                let wait_result =
+                    application_wait_result.unwrap_or(SignalApplicationWait::Completed(outcome));
                 delivery_tracker.lock().await.finish_application_wait(
                     delivery.signal_id.clone(),
                     &delivery.from_node_id,
@@ -988,15 +978,17 @@ async fn ack_signals(
     acks: &[SignalAckRequest],
 ) -> Result<()> {
     let res = with_registration_sequence(
-        http.post(format!("{base_url}/api/v1/signals/ack?node_id={self_node_id}"))
-            .timeout(SIGNAL_SEND_TIMEOUT)
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "signals": acks })),
+        http.post(format!(
+            "{base_url}/api/v1/signals/ack?node_id={self_node_id}"
+        ))
+        .timeout(SIGNAL_SEND_TIMEOUT)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "signals": acks })),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("signal ack request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("signal ack request failed: {e}")))?;
     if !res.status().is_success() {
         let status = res.status();
         let (detail, error_code, current_seq) = control_error_detail(res).await;
@@ -1064,8 +1056,10 @@ pub(super) const CANDIDATE_GENERATION_INCARNATION_FLAG: u64 = 0x4000_0000_0000_0
 pub(super) const CANDIDATE_GENERATION_INCARNATION_BITS: u64 = 41;
 /// Counter field width in bits: 2^21 generations per boot before the limit is
 /// reached and further generations are refused.
-pub(super) const CANDIDATE_GENERATION_COUNTER_BITS: u64 = 63 - 1 - CANDIDATE_GENERATION_INCARNATION_BITS;
-pub(super) const CANDIDATE_GENERATION_COUNTER_MASK: u64 = (1u64 << CANDIDATE_GENERATION_COUNTER_BITS) - 1;
+pub(super) const CANDIDATE_GENERATION_COUNTER_BITS: u64 =
+    63 - 1 - CANDIDATE_GENERATION_INCARNATION_BITS;
+pub(super) const CANDIDATE_GENERATION_COUNTER_MASK: u64 =
+    (1u64 << CANDIDATE_GENERATION_COUNTER_BITS) - 1;
 
 /// Return the daemon-incarnation component of an encoded candidate
 /// generation. Legacy generations have no restart identity and must not be
@@ -1074,8 +1068,8 @@ pub(crate) fn candidate_generation_incarnation(generation: u64) -> Option<u64> {
     if generation & CANDIDATE_GENERATION_INCARNATION_FLAG == 0 {
         return None;
     }
-    let incarnation =
-        (generation & (CANDIDATE_GENERATION_INCARNATION_FLAG - 1)) >> CANDIDATE_GENERATION_COUNTER_BITS;
+    let incarnation = (generation & (CANDIDATE_GENERATION_INCARNATION_FLAG - 1))
+        >> CANDIDATE_GENERATION_COUNTER_BITS;
     (incarnation != 0).then_some(incarnation)
 }
 
@@ -1192,7 +1186,9 @@ pub(super) fn next_candidate_generation_for_incarnation(
     // The per-boot counter starts at 1 and strictly increments: it never
     // borrows the wall clock's low bits, so the boot time can never decide
     // how much capacity this boot has left.
-    let counter = previous_counter.saturating_add(1).min(CANDIDATE_GENERATION_COUNTER_MASK);
+    let counter = previous_counter
+        .saturating_add(1)
+        .min(CANDIDATE_GENERATION_COUNTER_MASK);
     Ok(CANDIDATE_GENERATION_INCARNATION_FLAG
         | (incarnation << CANDIDATE_GENERATION_COUNTER_BITS)
         | counter)

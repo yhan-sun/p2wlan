@@ -507,7 +507,10 @@ impl PeerManager {
             .remote_fresh_generations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if high_water.get(peer_id).is_some_and(|current| id <= *current) {
+        if high_water
+            .get(peer_id)
+            .is_some_and(|current| id <= *current)
+        {
             return false;
         }
         high_water.insert(peer_id.to_string(), id);

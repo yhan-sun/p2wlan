@@ -16,17 +16,17 @@ use std::sync::{Arc, OnceLock};
 use windows_sys::Win32::Foundation::{GetLastError, BOOL};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Console::{
-    AttachConsole, SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT,
+    AttachConsole, SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
     CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Services::{
-    RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_SESSIONCHANGE,
-    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
-    SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN,
-    SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
-    SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
+    RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
+    SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_SHUTDOWN,
+    SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PRESHUTDOWN,
+    SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED,
+    SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 
 #[cfg(target_os = "windows")]
@@ -71,13 +71,8 @@ impl WindowsLifecycleSignal {
 
     fn trigger(&self, reason: u32) -> bool {
         self.reason
-            .compare_exchange(
-            LIFECYCLE_NONE,
-            reason,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok()
+            .compare_exchange(LIFECYCLE_NONE, reason, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     fn reason(&self) -> u32 {
@@ -93,7 +88,8 @@ static CONSOLE_SIGNAL: OnceLock<Arc<WindowsLifecycleSignal>> = OnceLock::new();
 /// have no console at startup; registering the handler is still valid and the
 /// callback becomes active if the process attaches to one later.
 #[cfg(target_os = "windows")]
-pub(crate) fn install_windows_console_handler() -> p2pnet_daemon::Result<Arc<WindowsLifecycleSignal>> {
+pub(crate) fn install_windows_console_handler() -> p2pnet_daemon::Result<Arc<WindowsLifecycleSignal>>
+{
     let signal = CONSOLE_SIGNAL
         .get_or_init(|| Arc::new(WindowsLifecycleSignal::new()))
         .clone();
@@ -176,9 +172,8 @@ fn windows_service_name_from_args() -> String {
 #[cfg(target_os = "windows")]
 pub(crate) fn run_windows_service() -> p2pnet_daemon::Result<()> {
     let name = windows_service_name_from_args();
-    let wide_name = SERVICE_NAME.get_or_init(|| {
-        name.encode_utf16().chain(std::iter::once(0)).collect()
-    });
+    let wide_name =
+        SERVICE_NAME.get_or_init(|| name.encode_utf16().chain(std::iter::once(0)).collect());
     let entry = SERVICE_TABLE_ENTRYW {
         lpServiceName: wide_name.as_ptr() as *mut u16,
         lpServiceProc: Some(windows_service_main),
@@ -426,7 +421,9 @@ pub(crate) fn emit_windows_lifecycle_handler_probe() -> p2pnet_daemon::Result<()
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     serde_json::to_writer(&mut output, &payload).map_err(|error| {
-        DaemonError::Config(format!("failed to serialize Windows handler probe: {error}"))
+        DaemonError::Config(format!(
+            "failed to serialize Windows handler probe: {error}"
+        ))
     })?;
     std::io::Write::write_all(&mut output, b"\n").map_err(|error| {
         DaemonError::Config(format!("failed to write Windows handler probe: {error}"))

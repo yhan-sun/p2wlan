@@ -23,8 +23,7 @@ fn fingerprint_profile(
     likely_symmetric: Option<bool>,
     confidence: u8,
 ) -> NatProfile {
-    let observations = if mapping == MappingBehavior::AddressOrPortDependent
-        && prediction_candidate
+    let observations = if mapping == MappingBehavior::AddressOrPortDependent && prediction_candidate
     {
         vec![
             StunObservation {
@@ -229,7 +228,11 @@ fn test_parse_roundtrip_recovers_mapping_allocation_filtering_hairpin() {
                     assert_eq!(hint.mapping, mapping, "m mismatch: {label}");
                     assert_eq!(hint.filtering, filtering, "f mismatch: {label}");
                     assert_eq!(hint.hairpin, hairpin, "h mismatch: {label}");
-                    assert_eq!(hint.allocation, expected_allocation(&profile), "a mismatch: {label}");
+                    assert_eq!(
+                        hint.allocation,
+                        expected_allocation(&profile),
+                        "a mismatch: {label}"
+                    );
                     assert_eq!(hint.confidence, Some(55), "c mismatch: {label}");
                     assert_eq!(hint.port_delta, profile.port_delta, "d mismatch: {label}");
                 }
@@ -323,10 +326,19 @@ fn test_parse_old_p2_label_yields_unknown_f_h() {
 /// the legacy classifier on the raw string (never panics, never changes).
 #[test]
 fn test_parse_bare_and_corrupted_not_parsed() {
-    for bad in ["", "symmetric", "address_or_port_dependent", "Confluence", "p2v2:garbage", "p2:!!!"]
-    {
+    for bad in [
+        "",
+        "symmetric",
+        "address_or_port_dependent",
+        "Confluence",
+        "p2v2:garbage",
+        "p2:!!!",
+    ] {
         let hint = parse_nat_hint(bad);
-        assert!(!hint.parsed, "must not parse a bare/corrupted input: {bad:?}");
+        assert!(
+            !hint.parsed,
+            "must not parse a bare/corrupted input: {bad:?}"
+        );
         assert_eq!(hint.filtering, FilteringBehavior::Unknown);
         assert_eq!(hint.hairpin, HairpinBehavior::Unknown);
         assert_eq!(hint.mapping, MappingBehavior::Unknown);
@@ -342,13 +354,13 @@ fn test_parse_bare_and_corrupted_not_parsed() {
 fn test_parse_corrupted_token_value_not_parsed() {
     for bad in [
         "p2v2:m=address_or_port_dependentX;a=linear;d=32;c=90;f=unknown;h=unknown", // truncated m
-        "p2v2:m=bogus_token;a=stable;d=0;c=70;f=unknown;h=unknown",             // unknown m value
-        "p2v2:m=open;a=sometimes;d=0;c=70;f=unknown;h=unknown",                 // unknown a value
-        "p2v2:m=open;a=stable;d=0;c=999;f=unknown;h=unknown",                   // c out of u8 range
-        "p2v2:m=open;a=stable;d=-5;c=70;f=unknown;h=unknown",                   // negative d
-        "p2v2:m=open;a=stable;d=0;c=70;f=weird;h=unknown",                      // unknown f value
-        "p2v2:m=open;a=stable;d=0;c=70;f=unknown;h=maybe",                      // unknown h value
-        "p2v2:m=open;a=stable;d=0;c=70;z=9;f=unknown;h=unknown",                // unrecognized key
+        "p2v2:m=bogus_token;a=stable;d=0;c=70;f=unknown;h=unknown", // unknown m value
+        "p2v2:m=open;a=sometimes;d=0;c=70;f=unknown;h=unknown",     // unknown a value
+        "p2v2:m=open;a=stable;d=0;c=999;f=unknown;h=unknown",       // c out of u8 range
+        "p2v2:m=open;a=stable;d=-5;c=70;f=unknown;h=unknown",       // negative d
+        "p2v2:m=open;a=stable;d=0;c=70;f=weird;h=unknown",          // unknown f value
+        "p2v2:m=open;a=stable;d=0;c=70;f=unknown;h=maybe",          // unknown h value
+        "p2v2:m=open;a=stable;d=0;c=70;z=9;f=unknown;h=unknown",    // unrecognized key
     ] {
         let hint = parse_nat_hint(bad);
         assert!(!hint.parsed, "corrupted token must not parse: {bad:?}");

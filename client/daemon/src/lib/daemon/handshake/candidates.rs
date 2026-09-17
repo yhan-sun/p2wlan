@@ -526,9 +526,7 @@ impl Daemon {
         let observed_generation = self.peers.current_network_generation_sync();
         let observed_commit_seq = self.peers.direct_commit_seq_sync(node_id);
 
-        if !non_queuing_peer_commit
-            && self.peers.should_defer_relay_assisted_punch(node_id).await
-        {
+        if !non_queuing_peer_commit && self.peers.should_defer_relay_assisted_punch(node_id).await {
             debug!(
                 "Skipping relay-assisted punch for {node_id}: healthy confirmed Direct path is active"
             );

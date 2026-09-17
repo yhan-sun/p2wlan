@@ -7,10 +7,7 @@ async fn relay_first_packet_transactions_survive_128_controlled_interleavings() 
     let manager = PeerManager::new(test_config());
     let peer_id = "peer-relay-first-packet-model";
     manager
-        .add_peer(&test_peer(
-            peer_id,
-            "220.165.178.32:9090".parse().unwrap(),
-        ))
+        .add_peer(&test_peer(peer_id, "220.165.178.32:9090".parse().unwrap()))
         .await;
     let generation = manager.current_network_generation_sync();
     let endpoint = "relay.test:443";

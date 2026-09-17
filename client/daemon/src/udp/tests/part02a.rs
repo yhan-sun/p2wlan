@@ -18,9 +18,11 @@ async fn connectivity_scan_probe_is_not_retransmitted() {
     let packet = decode_punch_packet(&buf[..n]).unwrap();
     assert_eq!(packet.kind, PunchPacketKind::Punch);
     assert_eq!(packet.nonce, nonce);
-    assert!(timeout(Duration::from_millis(180), receiver.recv_from(&mut buf))
-        .await
-        .is_err());
+    assert!(
+        timeout(Duration::from_millis(180), receiver.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -202,9 +204,11 @@ async fn modern_authenticated_peer_does_not_receive_legacy_probe_copy() {
         .unwrap()
         .unwrap();
     assert!(peek_authenticated_punch_identity(&buf[..n]).is_some());
-    assert!(timeout(Duration::from_millis(180), receiver.recv_from(&mut buf))
-        .await
-        .is_err());
+    assert!(
+        timeout(Duration::from_millis(180), receiver.recv_from(&mut buf))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

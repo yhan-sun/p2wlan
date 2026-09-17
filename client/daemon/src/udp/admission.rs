@@ -1,6 +1,4 @@
-use probe_budget::{
-    RelayBackoffHeartbeatReservation, RelayBackoffHeartbeatReservationRejection,
-};
+use probe_budget::{RelayBackoffHeartbeatReservation, RelayBackoffHeartbeatReservationRejection};
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -18,7 +16,10 @@ pub(crate) struct ProbeSendFailureGuard {
 #[cfg(test)]
 impl Drop for ProbeSendFailureGuard {
     fn drop(&mut self) {
-        *self.hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.enabled.store(false, Ordering::Release);
     }
 }
@@ -185,11 +186,7 @@ impl UdpTransport {
         // refilled by per-second windows or new candidate offers, so a failing
         // peer's whole recovery episode stays bounded regardless of how many
         // punch sessions or fresh-mapping generations start.
-        if !self
-            .peers
-            .try_consume_recovery_probe_credit(peer_id)
-            .await
-        {
+        if !self.peers.try_consume_recovery_probe_credit(peer_id).await {
             return OutboundProbeAdmission::EpochCreditExhausted;
         }
 
@@ -282,7 +279,11 @@ impl UdpTransport {
             .is_ok()
     }
 
-    async fn notify_peer_reflexive_observation(&self, peer_id: &str, observed_endpoint: SocketAddr) {
+    async fn notify_peer_reflexive_observation(
+        &self,
+        peer_id: &str,
+        observed_endpoint: SocketAddr,
+    ) {
         // A converged Direct peer needs no outbound peer-reflexive signal: the
         // relayed HTTP signal and the fast punch would only re-create
         // speculative traversal work on a path that is already confirmed.
@@ -332,9 +333,7 @@ impl UdpTransport {
             .entry(peer_id.to_string())
             .or_insert_with(|| TriggeredCheckRecord {
                 latest_endpoint: observed_endpoint,
-                last_sent_at: now
-                    .checked_sub(TRIGGERED_CHECK_COOLDOWN)
-                    .unwrap_or(now),
+                last_sent_at: now.checked_sub(TRIGGERED_CHECK_COOLDOWN).unwrap_or(now),
                 in_flight: false,
             });
         record.latest_endpoint = observed_endpoint;
@@ -378,12 +377,7 @@ impl UdpTransport {
         }
         let admitted_endpoint = {
             let mut checks = self.triggered_checks.lock().await;
-            Self::admit_triggered_check(
-                &mut checks,
-                peer_id,
-                observed_endpoint,
-                Instant::now(),
-            )
+            Self::admit_triggered_check(&mut checks, peer_id, observed_endpoint, Instant::now())
         };
         let Some(admitted_endpoint) = admitted_endpoint else {
             return;
@@ -569,9 +563,9 @@ impl UdpTransport {
         }
         // The dynamic socket is gone (or belongs to someone else): fall back
         // to the peer's resolved pool socket.
-        self.socket_for_peer(Some(peer_id)).await.map(|(index, socket)| {
-            (index, socket, DynamicSocketSendLease::noop(index))
-        })
+        self.socket_for_peer(Some(peer_id))
+            .await
+            .map(|(index, socket)| (index, socket, DynamicSocketSendLease::noop(index)))
     }
 
     /// Resolve exactly `socket_index` for a peer-directed send.
@@ -794,37 +788,33 @@ impl UdpTransport {
             accepts_legacy_ack,
             compat_legacy_probe,
             probe_session_id,
-        ) =
-            if let Some((bytes, nonce, probe_session_id)) = authenticated_probe {
-                // Compatibility bridge for pre-v2 peers. v0.1.24 and older only
-                // understand PNCH v1 and otherwise forward PNCH v2 into the
-                // WireGuard parser, producing "invalid message type: 80".
-                // Send a legacy probe with the same nonce so either ACK form clears
-                // the same pending probe without weakening the v2 path between
-                // upgraded peers.
-                (
-                    bytes,
-                    nonce,
-                    true,
-                    requires_legacy_probe,
-                    requires_legacy_probe
-                        .then(|| build_punch_packet_with_nonce(nonce).to_vec()),
-                    probe_session_id,
-                )
-            } else {
-                let bytes = build_punch_packet();
-                let nonce = decode_punch_packet(&bytes)
-                    .map(|packet| packet.nonce)
-                    .ok_or_else(|| {
-                        ProbeSendFailure::new(
-                            ProbeSendFailureKind::ProbeEncodingFailed,
-                            DaemonError::Network(
-                                "failed to create UDP probe".to_string(),
-                            ),
-                        )
-                    })?;
-                (bytes.to_vec(), nonce, false, true, None, None)
-            };
+        ) = if let Some((bytes, nonce, probe_session_id)) = authenticated_probe {
+            // Compatibility bridge for pre-v2 peers. v0.1.24 and older only
+            // understand PNCH v1 and otherwise forward PNCH v2 into the
+            // WireGuard parser, producing "invalid message type: 80".
+            // Send a legacy probe with the same nonce so either ACK form clears
+            // the same pending probe without weakening the v2 path between
+            // upgraded peers.
+            (
+                bytes,
+                nonce,
+                true,
+                requires_legacy_probe,
+                requires_legacy_probe.then(|| build_punch_packet_with_nonce(nonce).to_vec()),
+                probe_session_id,
+            )
+        } else {
+            let bytes = build_punch_packet();
+            let nonce = decode_punch_packet(&bytes)
+                .map(|packet| packet.nonce)
+                .ok_or_else(|| {
+                    ProbeSendFailure::new(
+                        ProbeSendFailureKind::ProbeEncodingFailed,
+                        DaemonError::Network("failed to create UDP probe".to_string()),
+                    )
+                })?;
+            (bytes.to_vec(), nonce, false, true, None, None)
+        };
 
         // Re-verify the snapshot and register the pending probe as one
         // transaction under the socket-state lock and the pending lock (in
@@ -880,7 +870,9 @@ impl UdpTransport {
                 );
                 return Err(ProbeSendFailure::new(
                     ProbeSendFailureKind::PeerSessionChanged,
-                    DaemonError::Network("probe invalidated: peer cleanup raced the send".to_string()),
+                    DaemonError::Network(
+                        "probe invalidated: peer cleanup raced the send".to_string(),
+                    ),
                 ));
             }
             if require_exact_dynamic_owner && socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
@@ -996,9 +988,9 @@ impl UdpTransport {
                 wait_for_probe_post_send_gate_for_test().await;
                 self.pending_probes.lock().await.remove(&nonce);
                 self.clear_hard_hard_pending_probe_token(nonce).await;
-                return Err(ProbeSendFailure::with_physical_send_error(DaemonError::Network(
-                    format!("UDP probe send to {peer_addr} failed: {error}"),
-                )));
+                return Err(ProbeSendFailure::with_physical_send_error(
+                    DaemonError::Network(format!("UDP probe send to {peer_addr} failed: {error}")),
+                ));
             }
         };
         // The send completed: release the in-flight send lease.  The pending
@@ -1120,8 +1112,7 @@ impl UdpTransport {
             return false;
         };
         hook.physical_send_attempt = hook.physical_send_attempt.saturating_add(1);
-        hook.fail_on_attempts
-            .contains(&hook.physical_send_attempt)
+        hook.fail_on_attempts.contains(&hook.physical_send_attempt)
     }
 
     /// Send an authenticated ICE-style nominated connectivity check for a direct trial.

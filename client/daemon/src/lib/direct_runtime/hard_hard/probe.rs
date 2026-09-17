@@ -36,9 +36,9 @@ struct HardHardMeasurementPayload {
 fn hard_hard_measurement_target_limit(measurement: &HardHardLocalMeasurement) -> usize {
     match measurement {
         HardHardLocalMeasurement::Predictable { .. } => HARD_HARD_MAX_PREDICTION_TARGETS,
-        HardHardLocalMeasurement::Birthday(result) => result
-            .level
-            .min(HARD_HARD_MAX_BIRTHDAY_TARGETS),
+        HardHardLocalMeasurement::Birthday(result) => {
+            result.level.min(HARD_HARD_MAX_BIRTHDAY_TARGETS)
+        }
     }
 }
 
@@ -64,9 +64,7 @@ fn hard_hard_measurement_socket_indices(measurement: &HardHardLocalMeasurement) 
     }
 }
 
-fn hard_hard_measurement_requested_socket_count(
-    measurement: &HardHardLocalMeasurement,
-) -> usize {
+fn hard_hard_measurement_requested_socket_count(measurement: &HardHardLocalMeasurement) -> usize {
     match measurement {
         HardHardLocalMeasurement::Predictable { .. } => 1,
         HardHardLocalMeasurement::Birthday(result) => result.requested_socket_count,
@@ -290,19 +288,22 @@ fn hard_hard_measurement_primary_socket(
         HardHardLocalMeasurement::Predictable { result, .. } => {
             Some(hard_hard_socket_identity(peer_id, token, result, plan))
         }
-        HardHardLocalMeasurement::Birthday(result) => result.sockets.first().map(|socket| {
-            crate::peer::HardHardFreshSocketIdentity {
-                peer_id: peer_id.to_string(),
-                session_token: token.to_string(),
-                network_generation: plan.local_network_generation,
-                remote_candidate_epoch: plan.remote_candidate_epoch,
-                local_profile_generation: plan.local_profile_generation,
-                remote_profile_generation: plan.remote_profile_generation,
-                punch_generation: socket.punch_generation,
-                socket_index: socket.socket_index,
-                socket_local_endpoint: socket.socket_local_endpoint,
-            }
-        }),
+        HardHardLocalMeasurement::Birthday(result) => {
+            result
+                .sockets
+                .first()
+                .map(|socket| crate::peer::HardHardFreshSocketIdentity {
+                    peer_id: peer_id.to_string(),
+                    session_token: token.to_string(),
+                    network_generation: plan.local_network_generation,
+                    remote_candidate_epoch: plan.remote_candidate_epoch,
+                    local_profile_generation: plan.local_profile_generation,
+                    remote_profile_generation: plan.remote_profile_generation,
+                    punch_generation: socket.punch_generation,
+                    socket_index: socket.socket_index,
+                    socket_local_endpoint: socket.socket_local_endpoint,
+                })
+        }
     }
 }
 
@@ -327,9 +328,9 @@ async fn hard_hard_wait_and_sweep(
     origin: &'static str,
 ) -> bool {
     let socket_index = fresh_socket.socket_index;
-    let birthday_waves_planned = birthday_socket_indices.as_ref().map_or(1, |indices| {
-        hard_hard_birthday_wave_count(indices.len())
-    });
+    let birthday_waves_planned = birthday_socket_indices
+        .as_ref()
+        .map_or(1, |indices| hard_hard_birthday_wave_count(indices.len()));
     let birthday_progress = birthday_socket_indices.as_ref().map(|_| {
         Arc::new(tokio::sync::Mutex::new(BirthdaySweepProgress {
             birthday: BirthdaySweepReport {
@@ -396,35 +397,38 @@ async fn hard_hard_wait_and_sweep(
         .await;
     let mut report = None;
     let birthday_progress_for_work = birthday_progress.clone();
-    let outcome = run_owned_punch_session_with_deadline(&session, HARD_HARD_SWEEP_DEADLINE, async {
-        report = Some(if let Some(socket_indices) = birthday_socket_indices.clone() {
-            udp.punch_hard_hard_birthday_candidates_with_metadata(
-                &peer_id,
-                socket_indices,
-                targets.clone(),
-                requested_level,
-                generated_candidate_count,
-                signaled_candidate_count,
-                peer_session_generation,
-                profile_generations,
-                &session_token,
-                birthday_progress_for_work,
-            )
-            .await
-        } else {
-            udp.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
-                &peer_id,
-                socket_index,
-                targets.clone(),
-                HARD_HARD_SWEEP_INTERVAL,
-                HARD_HARD_SWEEP_ATTEMPTS,
-                Some(profile_generations),
-                Some(&session_token),
-            )
-            .await
-        });
-    })
-    .await;
+    let outcome =
+        run_owned_punch_session_with_deadline(&session, HARD_HARD_SWEEP_DEADLINE, async {
+            report = Some(
+                if let Some(socket_indices) = birthday_socket_indices.clone() {
+                    udp.punch_hard_hard_birthday_candidates_with_metadata(
+                        &peer_id,
+                        socket_indices,
+                        targets.clone(),
+                        requested_level,
+                        generated_candidate_count,
+                        signaled_candidate_count,
+                        peer_session_generation,
+                        profile_generations,
+                        &session_token,
+                        birthday_progress_for_work,
+                    )
+                    .await
+                } else {
+                    udp.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
+                        &peer_id,
+                        socket_index,
+                        targets.clone(),
+                        HARD_HARD_SWEEP_INTERVAL,
+                        HARD_HARD_SWEEP_ATTEMPTS,
+                        Some(profile_generations),
+                        Some(&session_token),
+                    )
+                    .await
+                },
+            );
+        })
+        .await;
     let probe_rx_after = udp
         .probe_rx_snapshot_for_peer_session(
             &peer_id,
@@ -439,14 +443,15 @@ async fn hard_hard_wait_and_sweep(
                 .failure_kind
                 .map(BirthdaySweepFailureKind::stop_reason)
                 .or_else(|| {
-                    report.birthday.as_ref().and_then(|birthday| match birthday
-                        .stop_reason
-                        .as_deref()
-                    {
-                        Some(reason) if BirthdaySweepFailureKind::from_stop_reason(reason).is_some() => {
+                    report.birthday.as_ref().and_then(|birthday| {
+                        match birthday.stop_reason.as_deref() {
                             Some(reason)
+                                if BirthdaySweepFailureKind::from_stop_reason(reason).is_some() =>
+                            {
+                                Some(reason)
+                            }
+                            _ => None,
                         }
-                        _ => None,
                     })
                 });
             let worker_failed = worker_failure_reason.is_some();
@@ -638,8 +643,12 @@ async fn hard_hard_wait_and_sweep(
                         Some(report.packets_sent),
                         format!(
                             "origin={origin} stage=sweep reason={} stop_reason={} budget_used={}",
-                            session_stop_reason.as_deref().unwrap_or("no_authenticated_direct_confirmation"),
-                            session_stop_reason.as_deref().unwrap_or("no_authenticated_direct_confirmation"),
+                            session_stop_reason
+                                .as_deref()
+                                .unwrap_or("no_authenticated_direct_confirmation"),
+                            session_stop_reason
+                                .as_deref()
+                                .unwrap_or("no_authenticated_direct_confirmation"),
                             report.packets_sent,
                         ),
                     )
@@ -683,19 +692,19 @@ async fn hard_hard_wait_and_sweep(
                         ),
                     )
                     .await;
-                peers
-                    .record_direct_event(
-                        &peer_id,
-                        "hard_hard_failed",
-                        targets.first().copied(),
-                        Some(targets.len()),
-                        None,
-                        format!(
-                            "origin={origin} exact-socket sweep error stop_reason={}",
-                            stop_reason.as_str(),
-                        ),
-                    )
-                    .await;
+            peers
+                .record_direct_event(
+                    &peer_id,
+                    "hard_hard_failed",
+                    targets.first().copied(),
+                    Some(targets.len()),
+                    None,
+                    format!(
+                        "origin={origin} exact-socket sweep error stop_reason={}",
+                        stop_reason.as_str(),
+                    ),
+                )
+                .await;
             false
         }
         (PunchSessionOutcome::DeadlineExceeded, _) => {
@@ -738,7 +747,7 @@ async fn hard_hard_wait_and_sweep(
                         ),
                     )
                     .await;
-                peers
+            peers
                     .record_direct_event(
                         &peer_id,
                         "hard_hard_failed",

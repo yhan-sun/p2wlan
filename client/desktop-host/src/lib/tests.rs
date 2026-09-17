@@ -181,12 +181,7 @@ mod tests {
                 let (status, reason, body, content_type) = if attempt == 0 {
                     (401, "Unauthorized", "unauthorized\n", "text/plain")
                 } else {
-                    (
-                        200,
-                        "OK",
-                        r#"{"node_id":"node-1"}"#,
-                        "application/json",
-                    )
+                    (200, "OK", r#"{"node_id":"node-1"}"#, "application/json")
                 };
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

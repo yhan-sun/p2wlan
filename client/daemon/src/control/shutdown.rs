@@ -253,14 +253,32 @@ mod shutdown_reliability_tests {
         config.node.ed25519_private_key.clear();
         config.node.ed25519_public_key.clear();
         let (client, _events) = ControlClient::new(
-            &config, true, None, None, ConnectionTimeline::new("test-node", 0),
+            &config,
+            true,
+            None,
+            None,
+            ConnectionTimeline::new("test-node", 0),
         );
-        timeout(Duration::from_secs(2), accepted_rx).await.unwrap().unwrap();
-        client.shutdown_lifecycle.as_ref().unwrap().requested.send_replace(true);
+        timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .shutdown_lifecycle
+            .as_ref()
+            .unwrap()
+            .requested
+            .send_replace(true);
         tokio::task::yield_now().await;
         response_tx.send(()).unwrap();
-        timeout(Duration::from_secs(2), client.shutdown()).await.unwrap().unwrap();
-        timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -16,7 +16,9 @@ impl Daemon {
                 )
             })?;
             let tun = TunDevice::from_raw_fd_with_mode(fd, &config, self.android_tun_mode)
-                .map_err(|e| DaemonError::Network(format!("failed to attach Android VPN TUN: {e}")))?;
+                .map_err(|e| {
+                    DaemonError::Network(format!("failed to attach Android VPN TUN: {e}"))
+                })?;
             info!(
                 "Android VPN TUN {} is attached at logical address {} MTU {} mode={:?}",
                 tun.name(),
@@ -42,5 +44,4 @@ impl Daemon {
             Ok(Some(tun))
         }
     }
-
 }

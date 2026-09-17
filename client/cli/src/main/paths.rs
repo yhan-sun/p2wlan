@@ -40,7 +40,9 @@ fn state_dir_for_config(config_path: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     config_path.to_string_lossy().hash(&mut hasher);
-    state_dir().join("instances").join(format!("{:016x}", hasher.finish()))
+    state_dir()
+        .join("instances")
+        .join(format!("{:016x}", hasher.finish()))
 }
 
 fn user_home() -> PathBuf {

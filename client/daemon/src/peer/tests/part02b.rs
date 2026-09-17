@@ -283,9 +283,11 @@ async fn confirmed_public_direct_allows_on_link_peer_reflexive_upgrade() {
         .record_direct_success("peer1", Some(public_endpoint))
         .await;
 
-    assert!(manager
-        .learn_authenticated_endpoint("peer1", lan_endpoint)
-        .await);
+    assert!(
+        manager
+            .learn_authenticated_endpoint("peer1", lan_endpoint)
+            .await
+    );
     let learned = manager.get_connection("peer1").await.unwrap();
     assert_eq!(
         learned.candidate_sources.get(&lan_endpoint.to_string()),
@@ -341,7 +343,10 @@ async fn confirmed_public_direct_allows_on_link_peer_reflexive_upgrade() {
         .find(|peer| peer.node_id == "peer1")
         .expect("peer diagnostics should be present");
     assert_eq!(peer.direct_type, DirectPathType::Lan);
-    assert_eq!(peer.selected_pair.as_ref().unwrap().remote_endpoint, lan_endpoint.to_string());
+    assert_eq!(
+        peer.selected_pair.as_ref().unwrap().remote_endpoint,
+        lan_endpoint.to_string()
+    );
 }
 
 #[tokio::test]

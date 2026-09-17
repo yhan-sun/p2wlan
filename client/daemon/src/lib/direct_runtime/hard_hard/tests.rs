@@ -76,7 +76,10 @@ mod hard_hard_tests {
                 peers.recovery_stage_for(&peer_id).await,
                 RecoveryStage::ScatterExtended
             );
-            assert_eq!(hard_hard_birthday_level(&peers, &peer_id).await, expected_level);
+            assert_eq!(
+                hard_hard_birthday_level(&peers, &peer_id).await,
+                expected_level
+            );
         }
     }
 
@@ -123,7 +126,9 @@ mod hard_hard_tests {
             created_at: Instant::now(),
             cancellation: Arc::new(crate::PunchSessionCancellation::default()),
         };
-        assert!(hard_hard_initiator_response_record_matches(&expected, &expected));
+        assert!(hard_hard_initiator_response_record_matches(
+            &expected, &expected
+        ));
 
         let mut capped_level = expected.clone();
         capped_level.requested_birthday_level = capped_level.signaled_candidate_count;
@@ -204,9 +209,7 @@ mod hard_hard_tests {
                 let current = progress.lock().await;
                 current.live.clone()
             };
-            let mut progress = live
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut progress = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             progress.counters.targets_assigned = 4;
             progress.counters.targets_examined = 3;
             progress.counters.targets_attempted = 1;
@@ -216,7 +219,9 @@ mod hard_hard_tests {
             progress.counters.logical_probes_sent = 1;
             progress.counters.physical_datagrams_sent = 2;
             progress.counters.physical_send_errors = 1;
-            progress.sent_target_endpoints.insert(endpoint_for_test(41000));
+            progress
+                .sent_target_endpoints
+                .insert(endpoint_for_test(41000));
             progress.per_socket_sent.insert(4_096, 2);
             progress.first_send_at_ms = Some(100);
             progress.last_send_at_ms = Some(110);
@@ -300,11 +305,7 @@ mod hard_hard_tests {
             let identity = identity.clone();
             async move {
                 hard_hard_wait_for_exact_direct_confirmation(
-                    &udp,
-                    &peers,
-                    &session,
-                    &identity,
-                    None,
+                    &udp, &peers, &session, &identity, None,
                 )
                 .await
             }
@@ -330,7 +331,8 @@ mod hard_hard_tests {
                 .await
         );
         assert!(wait.await.unwrap());
-        udp.detach_all_dynamic_punch_sockets("test_confirmation_grace").await;
+        udp.detach_all_dynamic_punch_sockets("test_confirmation_grace")
+            .await;
     }
 
     #[tokio::test]
@@ -385,7 +387,8 @@ mod hard_hard_tests {
             .into_iter()
             .flat_map(|peer| peer.direct_events)
             .any(|event| event.stage == "hard_hard_failed"));
-        udp.detach_all_dynamic_punch_sockets("test_confirmation_writer").await;
+        udp.detach_all_dynamic_punch_sockets("test_confirmation_writer")
+            .await;
     }
 
     #[tokio::test]
@@ -417,7 +420,8 @@ mod hard_hard_tests {
         drop(connection_writer);
         assert_eq!(snapshot.authenticated_probe_acks_observed, 3);
         assert_eq!(snapshot.probe_acks_received, 2);
-        udp.detach_all_dynamic_punch_sockets("test_probe_session_lock").await;
+        udp.detach_all_dynamic_punch_sockets("test_probe_session_lock")
+            .await;
     }
 
     fn birthday_runtime_nat_profile() -> p2pnet_nat::NatProfile {
@@ -455,7 +459,9 @@ mod hard_hard_tests {
             .await
             .expect("exact fixture must install a session ledger record");
 
-        peers.update_nat_profile(birthday_runtime_nat_profile()).await;
+        peers
+            .update_nat_profile(birthday_runtime_nat_profile())
+            .await;
         let local_profile_generation = peers.current_local_profile_generation_sync();
         let session_token = "birthday-runtime-token".to_string();
         identity.session_token = session_token.clone();
@@ -496,9 +502,10 @@ mod hard_hard_tests {
             exact_birthday_runtime_fixture().await;
         udp.clear_authenticated_evidence_for_test(identity.socket_index)
             .await;
-        assert!(!udp
-            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
-            .await);
+        assert!(
+            !udp.hard_hard_socket_identity_has_authenticated_evidence(&identity)
+                .await
+        );
 
         let sweeping = peers
             .hard_hard_begin_sweep(
@@ -541,9 +548,10 @@ mod hard_hard_tests {
             }
             tokio::task::yield_now().await;
         }
-        assert!(udp
-            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
-            .await);
+        assert!(
+            udp.hard_hard_socket_identity_has_authenticated_evidence(&identity)
+                .await
+        );
         assert_eq!(
             peers
                 .hard_hard_winner_for_token(&identity.peer_id, &identity.session_token)
@@ -555,12 +563,10 @@ mod hard_hard_tests {
             "durable diagnostics must still be waiting on the held connection writer"
         );
         drop(connections_writer);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), promotion)
-                .await
-                .expect("promotion must finish after diagnostics are released")
-                .expect("promotion task must not panic")
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), promotion)
+            .await
+            .expect("promotion must finish after diagnostics are released")
+            .expect("promotion task must not panic"));
         assert_eq!(
             hard_hard_authenticated_winner_for_cleanup(
                 &udp,
@@ -573,13 +579,15 @@ mod hard_hard_tests {
             "cleanup retention requires the same transaction's authenticated socket evidence"
         );
 
-        assert!(peers
-            .hard_hard_retire_session(
-                &identity.peer_id,
-                &sweeping.session_id,
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_retire_session(
+                    &identity.peer_id,
+                    &sweeping.session_id,
+                    &identity.session_token,
+                )
+                .await
+        );
         udp.detach_hard_hard_sockets_for_token(
             &identity.peer_id,
             &identity.session_token,
@@ -593,13 +601,15 @@ mod hard_hard_tests {
             None,
         )
         .await;
-        assert!(peers
-            .hard_hard_complete_session_cleanup(
-                &identity.peer_id,
-                &sweeping.session_id,
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_complete_session_cleanup(
+                    &identity.peer_id,
+                    &sweeping.session_id,
+                    &identity.session_token,
+                )
+                .await
+        );
         assert_eq!(udp.dynamic_socket_count().await, 0);
     }
 
@@ -649,13 +659,15 @@ mod hard_hard_tests {
         assert!(!current.cancellation.is_cancelled());
         assert_eq!(udp.dynamic_socket_count().await, 1);
 
-        assert!(peers
-            .hard_hard_retire_session(
-                &identity.peer_id,
-                &original.session_id,
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_retire_session(
+                    &identity.peer_id,
+                    &original.session_id,
+                    &identity.session_token,
+                )
+                .await
+        );
         udp.detach_hard_hard_sockets_for_token(
             &identity.peer_id,
             &identity.session_token,
@@ -669,13 +681,15 @@ mod hard_hard_tests {
             None,
         )
         .await;
-        assert!(peers
-            .hard_hard_complete_session_cleanup(
-                &identity.peer_id,
-                &original.session_id,
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_complete_session_cleanup(
+                    &identity.peer_id,
+                    &original.session_id,
+                    &identity.session_token,
+                )
+                .await
+        );
         assert_eq!(udp.dynamic_socket_count().await, 0);
     }
 
@@ -739,9 +753,10 @@ mod hard_hard_tests {
             None,
             "pre-commit cancellation must not strand a manager-only winner"
         );
-        assert!(!udp
-            .hard_hard_socket_identity_has_authenticated_evidence(&identity)
-            .await);
+        assert!(
+            !udp.hard_hard_socket_identity_has_authenticated_evidence(&identity)
+                .await
+        );
         assert_eq!(
             hard_hard_authenticated_winner_for_cleanup(
                 &udp,
@@ -754,13 +769,15 @@ mod hard_hard_tests {
             "an unauthenticated pre-commit socket must never be preserved"
         );
 
-        assert!(peers
-            .hard_hard_retire_session(
-                &identity.peer_id,
-                &sweeping.session_id,
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_retire_session(
+                    &identity.peer_id,
+                    &sweeping.session_id,
+                    &identity.session_token,
+                )
+                .await
+        );
         udp.detach_hard_hard_sockets_for_token(
             &identity.peer_id,
             &identity.session_token,
@@ -774,13 +791,15 @@ mod hard_hard_tests {
             None,
         )
         .await;
-        assert!(peers
-            .hard_hard_complete_session_cleanup(
-                &identity.peer_id,
-                &sweeping.session_id,
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_complete_session_cleanup(
+                    &identity.peer_id,
+                    &sweeping.session_id,
+                    &identity.session_token,
+                )
+                .await
+        );
         assert_eq!(udp.dynamic_socket_count().await, 0);
     }
 
@@ -799,9 +818,7 @@ mod hard_hard_tests {
     ) -> PunchSendReport {
         let localhost = "127.0.0.1".parse().unwrap();
         let candidates = (0..count)
-            .map(|offset| {
-                SocketAddr::new(localhost, 41_000 + u16::try_from(offset).unwrap())
-            })
+            .map(|offset| SocketAddr::new(localhost, 41_000 + u16::try_from(offset).unwrap()))
             .collect::<Vec<_>>();
         let task = tokio::spawn({
             let udp = udp.clone();
@@ -857,9 +874,7 @@ mod hard_hard_tests {
         panic!("Hard↔Hard cleanup watcher did not claim its exact owner");
     }
 
-    async fn wait_for_hard_hard_cleanup_gate(
-        gate: &Arc<crate::peer::HardHardCleanupGate>,
-    ) {
+    async fn wait_for_hard_hard_cleanup_gate(gate: &Arc<crate::peer::HardHardCleanupGate>) {
         let reached = gate.wait_for_reached();
         tokio::pin!(reached);
         let watchdog = async {
@@ -927,16 +942,19 @@ mod hard_hard_tests {
             &descriptor.session_token,
         );
         if cancel_before_watcher {
-            assert!(!peers
-                .hard_hard_cleanup_owner_claimed_for_test(
-                    &descriptor.peer_id,
-                    &descriptor.session_id,
-                    &descriptor.session_token,
-                )
-                .await);
+            assert!(
+                !peers
+                    .hard_hard_cleanup_owner_claimed_for_test(
+                        &descriptor.peer_id,
+                        &descriptor.session_id,
+                        &descriptor.session_token,
+                    )
+                    .await
+            );
             descriptor.cancellation.cancel_for_hard_hard_cleanup();
         }
-        let completion = spawn_hard_hard_session_cleanup(udp.clone(), peers.clone(), descriptor.clone());
+        let completion =
+            spawn_hard_hard_session_cleanup(udp.clone(), peers.clone(), descriptor.clone());
         if !cancel_before_watcher {
             wait_for_hard_hard_cleanup_owner(&peers, &descriptor).await;
             assert_eq!(
@@ -981,23 +999,23 @@ mod hard_hard_tests {
 
         gate.release();
         wait_for_hard_hard_cleanup_completion(&completion).await;
+        assert!(peers
+            .hard_hard_session_snapshot_for_cleanup(
+                &descriptor.peer_id,
+                &descriptor.session_id,
+                &descriptor.session_token,
+            )
+            .await
+            .is_none());
         assert!(
-            peers
-                .hard_hard_session_snapshot_for_cleanup(
+            !peers
+                .hard_hard_cleanup_owner_claimed_for_test(
                     &descriptor.peer_id,
                     &descriptor.session_id,
                     &descriptor.session_token,
                 )
                 .await
-                .is_none()
         );
-        assert!(!peers
-            .hard_hard_cleanup_owner_claimed_for_test(
-                &descriptor.peer_id,
-                &descriptor.session_id,
-                &descriptor.session_token,
-            )
-            .await);
         assert_eq!(udp.dynamic_socket_count().await, 0);
         assert_eq!(
             udp.hard_hard_pending_probe_count_for_token_for_test(
@@ -1070,35 +1088,43 @@ mod hard_hard_tests {
         assert_eq!(expired_snapshot.state, HardHardSessionState::AwaitingPeer);
         assert!(!cancellation.is_cancelled());
 
-        assert!(peers
-            .hard_hard_retire_session(
-                &identity.peer_id,
-                "proof-session",
-                &identity.session_token,
-            )
-            .await);
-        assert!(peers
-            .hard_hard_retire_session(
-                &identity.peer_id,
-                "proof-session",
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_retire_session(
+                    &identity.peer_id,
+                    "proof-session",
+                    &identity.session_token,
+                )
+                .await
+        );
+        assert!(
+            peers
+                .hard_hard_retire_session(
+                    &identity.peer_id,
+                    "proof-session",
+                    &identity.session_token,
+                )
+                .await
+        );
         assert!(!peers.hard_hard_session_is_active(&identity.peer_id).await);
-        assert!(peers
-            .hard_hard_complete_session_cleanup(
-                &identity.peer_id,
-                "proof-session",
-                &identity.session_token,
-            )
-            .await);
-        assert!(!peers
-            .hard_hard_complete_session_cleanup(
-                &identity.peer_id,
-                "proof-session",
-                &identity.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_complete_session_cleanup(
+                    &identity.peer_id,
+                    "proof-session",
+                    &identity.session_token,
+                )
+                .await
+        );
+        assert!(
+            !peers
+                .hard_hard_complete_session_cleanup(
+                    &identity.peer_id,
+                    "proof-session",
+                    &identity.session_token,
+                )
+                .await
+        );
         assert!(peers
             .hard_hard_session_snapshot_for_cleanup(
                 &identity.peer_id,
@@ -1142,13 +1168,14 @@ mod hard_hard_tests {
                 .state,
             HardHardSessionState::Retiring
         );
-        assert!(udp
-            .tag_hard_hard_socket(
+        assert!(
+            udp.tag_hard_hard_socket(
                 &replacement.peer_id,
                 replacement.fresh_socket.socket_index,
                 &replacement.session_token,
             )
-            .await);
+            .await
+        );
 
         let _ = peers
             .hard_hard_retire_session(&old.peer_id, &old.session_id, &old.session_token)
@@ -1160,22 +1187,29 @@ mod hard_hard_tests {
             "test_old_token_cleanup",
         )
         .await;
-        udp.detach_hard_hard_socket_if_identity(
-            &old.fresh_socket,
-            "test_old_identity_cleanup",
-        )
-        .await;
+        udp.detach_hard_hard_socket_if_identity(&old.fresh_socket, "test_old_identity_cleanup")
+            .await;
         udp.clear_hard_hard_pending_probes_for_token(&old.peer_id, &old.session_token, None)
             .await;
-        assert!(peers
-            .hard_hard_complete_session_cleanup(&old.peer_id, &old.session_id, &old.session_token)
-            .await);
+        assert!(
+            peers
+                .hard_hard_complete_session_cleanup(
+                    &old.peer_id,
+                    &old.session_id,
+                    &old.session_token
+                )
+                .await
+        );
         assert_eq!(udp.dynamic_socket_count().await, 1);
         assert!(peers
             .hard_hard_session_by_token(&replacement.peer_id, &replacement.session_token)
             .await
             .is_some());
-        assert!(peers.hard_hard_session_is_active(&replacement.peer_id).await);
+        assert!(
+            peers
+                .hard_hard_session_is_active(&replacement.peer_id)
+                .await
+        );
         assert_eq!(
             udp.hard_hard_socket_indices_for_token(
                 &replacement.peer_id,
@@ -1185,13 +1219,15 @@ mod hard_hard_tests {
             vec![replacement.fresh_socket.socket_index]
         );
 
-        assert!(peers
-            .hard_hard_retire_session(
-                &replacement.peer_id,
-                &replacement.session_id,
-                &replacement.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_retire_session(
+                    &replacement.peer_id,
+                    &replacement.session_id,
+                    &replacement.session_token,
+                )
+                .await
+        );
         udp.detach_hard_hard_sockets_for_token(
             &replacement.peer_id,
             &replacement.session_token,
@@ -1205,13 +1241,15 @@ mod hard_hard_tests {
             None,
         )
         .await;
-        assert!(peers
-            .hard_hard_complete_session_cleanup(
-                &replacement.peer_id,
-                &replacement.session_id,
-                &replacement.session_token,
-            )
-            .await);
+        assert!(
+            peers
+                .hard_hard_complete_session_cleanup(
+                    &replacement.peer_id,
+                    &replacement.session_id,
+                    &replacement.session_token,
+                )
+                .await
+        );
         assert_eq!(udp.dynamic_socket_count().await, 0);
     }
 
@@ -1237,13 +1275,16 @@ mod hard_hard_tests {
             .attach_dynamic_punch_socket(&identity.peer_id, socket_index, socket, 0, 2, None)
             .await
             .unwrap();
-        assert!(handoff
-            .commit_and_pin_for_test(&udp, &identity.peer_id, socket_index, 0, 2)
-            .await);
+        assert!(
+            handoff
+                .commit_and_pin_for_test(&udp, &identity.peer_id, socket_index, 0, 2)
+                .await
+        );
         assert!(handoff.finalize().await);
-        assert!(udp
-            .tag_hard_hard_socket(&identity.peer_id, socket_index, "replacement-token")
-            .await);
+        assert!(
+            udp.tag_hard_hard_socket(&identity.peer_id, socket_index, "replacement-token")
+                .await
+        );
         let mut mismatched_identity = identity.clone();
         mismatched_identity.socket_index = socket_index;
         mismatched_identity.punch_generation = 2;
@@ -1283,14 +1324,16 @@ mod hard_hard_tests {
         let _clock = HardHardTestClockReset;
         let (peers, udp, identity, remote, _peer_session_generation) =
             exact_birthday_runtime_fixture().await;
-        assert!(peers
-            .record_direct_success_for_generation_with_local_endpoint(
-                &identity.peer_id,
-                Some(remote),
-                identity.network_generation,
-                Some(identity.socket_local_endpoint),
-            )
-            .await);
+        assert!(
+            peers
+                .record_direct_success_for_generation_with_local_endpoint(
+                    &identity.peer_id,
+                    Some(remote),
+                    identity.network_generation,
+                    Some(identity.socket_local_endpoint),
+                )
+                .await
+        );
         assert!(
             hard_hard_exact_direct_socket_is_current_for_cleanup(&udp, &peers, &identity).await
         );
@@ -1309,7 +1352,8 @@ mod hard_hard_tests {
             &descriptor.session_id,
             &descriptor.session_token,
         );
-        let completion = spawn_hard_hard_session_cleanup(udp.clone(), peers.clone(), descriptor.clone());
+        let completion =
+            spawn_hard_hard_session_cleanup(udp.clone(), peers.clone(), descriptor.clone());
         wait_for_hard_hard_cleanup_gate(&gate).await;
         assert_eq!(
             udp.hard_hard_socket_indices_for_token(&identity.peer_id, &identity.session_token)
@@ -1332,9 +1376,7 @@ mod hard_hard_tests {
         assert_eq!(udp.dynamic_socket_count().await, 0);
     }
 
-    async fn wait_for_birthday_worker_gate(
-        gate: &Arc<crate::udp::BirthdayWorkerCompletionGate>,
-    ) {
+    async fn wait_for_birthday_worker_gate(gate: &Arc<crate::udp::BirthdayWorkerCompletionGate>) {
         let reached = gate.reached.notified();
         let mut watchdog = tokio::spawn(async {
             for _ in 0..64 {
@@ -1350,9 +1392,7 @@ mod hard_hard_tests {
         }
     }
 
-    async fn wait_for_birthday_post_send_gate(
-        gate: &Arc<crate::udp::ProbePostSendGate>,
-    ) {
+    async fn wait_for_birthday_post_send_gate(gate: &Arc<crate::udp::ProbePostSendGate>) {
         // Register the waiter before starting the production task: the hook
         // uses notify_waiters, so an already-reached gate must not be lost.
         let reached = gate.reached.notified();
@@ -1392,7 +1432,9 @@ mod hard_hard_tests {
             );
         }
         assert!(
-            summary.detail.contains(&format!("stop_reason={stop_reason}")),
+            summary
+                .detail
+                .contains(&format!("stop_reason={stop_reason}")),
             "terminal summary has an unexpected stop reason: {}",
             summary.detail
         );
@@ -1420,7 +1462,10 @@ mod hard_hard_tests {
             assert!(count("physical_datagrams_sent=") >= 1);
             assert!(count("logical_probes_sent=") >= 1);
             assert!(count("unique_target_endpoints=") >= 1);
-            assert!(summary.detail.contains("per_socket_sent=") && !summary.detail.contains("per_socket_sent= "));
+            assert!(
+                summary.detail.contains("per_socket_sent=")
+                    && !summary.detail.contains("per_socket_sent= ")
+            );
             assert!(summary.detail.contains("first_send_at_ms=Some("));
             assert!(summary.detail.contains("last_send_at_ms=Some("));
         }
@@ -1537,9 +1582,7 @@ mod hard_hard_tests {
 
         let events = peers.diagnostics().await[0].direct_events.clone();
         assert_live_birthday_terminal_summary(&events, "session_cancelled");
-        assert!(events
-            .iter()
-            .any(|event| event.stage == "hard_hard_failed"));
+        assert!(events.iter().any(|event| event.stage == "hard_hard_failed"));
         gate.release.notify_waiters();
         udp.detach_all_dynamic_punch_sockets("test_cancel_live_progress")
             .await;
@@ -1593,7 +1636,8 @@ mod hard_hard_tests {
         let events = peers.diagnostics().await[0].direct_events.clone();
         assert_post_send_race_summary(&events, "deadline", false);
         gate.release.notify_waiters();
-        udp.detach_all_dynamic_punch_sockets("test_post_send_deadline").await;
+        udp.detach_all_dynamic_punch_sockets("test_post_send_deadline")
+            .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1748,10 +1792,7 @@ mod hard_hard_tests {
         );
         assert!(
             peers
-                .set_probe_session_id(
-                    "peer-exact-proof",
-                    Some("probe-session-exact".to_string()),
-                )
+                .set_probe_session_id("peer-exact-proof", Some("probe-session-exact".to_string()),)
                 .await
         );
 

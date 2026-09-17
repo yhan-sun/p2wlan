@@ -164,7 +164,8 @@ async fn live_filtering_probe_classifies_changed_port_response() {
                 }),
             Some((true, true))
         );
-        let mut response = StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
+        let mut response =
+            StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
         response.add_attribute(StunAttribute::XorMappedAddress(
             "203.0.113.7:45678".parse().unwrap(),
         ));
@@ -713,7 +714,8 @@ async fn direct_peer_authenticated_punch_produces_no_scan_no_observation_no_vali
     let mut saw_probe_punch = false;
     let deadline = Instant::now() + Duration::from_millis(300);
     while Instant::now() < deadline {
-        if let Ok(Ok((n, _))) = timeout(Duration::from_millis(60), sender.recv_from(&mut buf)).await {
+        if let Ok(Ok((n, _))) = timeout(Duration::from_millis(60), sender.recv_from(&mut buf)).await
+        {
             if let Some(identity) = peek_authenticated_punch_identity(&buf[..n]) {
                 if identity.kind == PunchPacketKind::Punch {
                     saw_probe_punch = true;
@@ -804,13 +806,8 @@ async fn direct_peer_matched_ack_creates_no_validation_expectation_or_probe() {
     while let Ok(Ok(_)) = timeout(Duration::from_millis(150), sender.recv_from(&mut buf)).await {}
 
     let generation = peers.current_network_generation().await;
-    let ack = p2pnet_nat::build_authenticated_punch_ack(
-        nonce,
-        "peer-a",
-        "peer-b",
-        generation,
-        &key,
-    );
+    let ack =
+        p2pnet_nat::build_authenticated_punch_ack(nonce, "peer-a", "peer-b", generation, &key);
     sender.send_to(&ack, local_addr).await.unwrap();
 
     let mut buf = [0u8; 512];

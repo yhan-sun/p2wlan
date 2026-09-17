@@ -816,9 +816,7 @@ async fn remote_incarnation_try_claim_is_non_queuing_and_fences_retired_work() {
             first,
             Some(&peer.public_key),
         ),
-        RemoteCandidateIncarnationTryClaim::Committed(
-            RemoteCandidateIncarnationClaim::NoReset,
-        )
+        RemoteCandidateIncarnationTryClaim::Committed(RemoteCandidateIncarnationClaim::NoReset,)
     );
     assert_eq!(
         manager
@@ -841,9 +839,7 @@ async fn remote_incarnation_try_claim_is_non_queuing_and_fences_retired_work() {
             same_incarnation,
             Some(&peer.public_key),
         ),
-        RemoteCandidateIncarnationTryClaim::Committed(
-            RemoteCandidateIncarnationClaim::NoReset,
-        ),
+        RemoteCandidateIncarnationTryClaim::Committed(RemoteCandidateIncarnationClaim::NoReset,),
         "the synchronous incarnation ledger must bypass a contended connection map",
     );
     assert!(
@@ -883,12 +879,10 @@ async fn remote_incarnation_try_claim_is_non_queuing_and_fences_retired_work() {
             newer_incarnation,
             Some(&peer.public_key),
         ),
-        RemoteCandidateIncarnationTryClaim::Committed(
-            RemoteCandidateIncarnationClaim::Reset {
-                old_incarnation: 4_000,
-                new_incarnation: 4_001,
-            },
-        )
+        RemoteCandidateIncarnationTryClaim::Committed(RemoteCandidateIncarnationClaim::Reset {
+            old_incarnation: 4_000,
+            new_incarnation: 4_001,
+        },)
     ));
 }
 

@@ -518,12 +518,11 @@ impl PeerManager {
                         let mut exchange_confirmed = false;
                         let mut first_usable_recorded = false;
                         if pending_is_current {
-                            pending_committed = conn.relay_first.business_received_generation
-                                != Some(generation);
+                            pending_committed =
+                                conn.relay_first.business_received_generation != Some(generation);
                             conn.relay_first.business_received_generation = Some(generation);
                             if conn.relay_first.business_sent_generation == Some(generation)
-                                && conn.relay_first.business_exchange_generation
-                                    != Some(generation)
+                                && conn.relay_first.business_exchange_generation != Some(generation)
                             {
                                 conn.relay_first.business_exchange_generation = Some(generation);
                                 conn.relay_first.business_gate_completed_generation =
@@ -743,39 +742,46 @@ impl PeerManager {
         {
             return false;
         }
-        let (recorded, rejected_reason, fallback_reason) =
-            if conn.is_on_link_direct_for_generation(generation) {
-                (conn.record_first_usable(NetworkPath::Direct, generation), None, None)
-            } else if !conn.has_current_authoritative_direct(generation)
-                && conn.relay_confirmed_generation == Some(generation)
-                && conn.relay_confirmed_endpoint.is_some()
-                && conn.relay_first.business_gate_completed_generation != Some(generation)
-                && conn.relay_first.business_exchange_generation != Some(generation)
-            {
-                (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
-            } else if !conn.has_current_authoritative_direct(generation)
-                && (conn.relay_ready_generation == Some(generation)
-                    || conn.relay_first.gate_generation == Some(generation))
-                && conn.relay_confirmed_generation != Some(generation)
-            {
-                let gate_expired = conn
-                    .relay_ready_at
-                    .or(conn.relay_first.gate_started_at)
-                    .is_some_and(|started_at| {
-                        started_at.elapsed() >= RELAY_FIRST_CONFIRMATION_GRACE
-                    });
-                if gate_expired {
-                    (
-                        conn.record_first_usable(NetworkPath::Direct, generation),
-                        None,
-                        Some(REASON_FIRST_DIRECT_AFTER_RELAY_BUSINESS_DEADLINE),
-                    )
-                } else {
-                    (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
-                }
+        let (recorded, rejected_reason, fallback_reason) = if conn
+            .is_on_link_direct_for_generation(generation)
+        {
+            (
+                conn.record_first_usable(NetworkPath::Direct, generation),
+                None,
+                None,
+            )
+        } else if !conn.has_current_authoritative_direct(generation)
+            && conn.relay_confirmed_generation == Some(generation)
+            && conn.relay_confirmed_endpoint.is_some()
+            && conn.relay_first.business_gate_completed_generation != Some(generation)
+            && conn.relay_first.business_exchange_generation != Some(generation)
+        {
+            (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
+        } else if !conn.has_current_authoritative_direct(generation)
+            && (conn.relay_ready_generation == Some(generation)
+                || conn.relay_first.gate_generation == Some(generation))
+            && conn.relay_confirmed_generation != Some(generation)
+        {
+            let gate_expired = conn
+                .relay_ready_at
+                .or(conn.relay_first.gate_started_at)
+                .is_some_and(|started_at| started_at.elapsed() >= RELAY_FIRST_CONFIRMATION_GRACE);
+            if gate_expired {
+                (
+                    conn.record_first_usable(NetworkPath::Direct, generation),
+                    None,
+                    Some(REASON_FIRST_DIRECT_AFTER_RELAY_BUSINESS_DEADLINE),
+                )
             } else {
-                (conn.record_first_usable(NetworkPath::Direct, generation), None, None)
-            };
+                (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
+            }
+        } else {
+            (
+                conn.record_first_usable(NetworkPath::Direct, generation),
+                None,
+                None,
+            )
+        };
         drop(conns);
         if let Some(reason_code) = rejected_reason {
             self.emit_timeline(
@@ -839,82 +845,82 @@ impl PeerManager {
             return false;
         }
         let (recorded, rejected_reason, fallback_reason) = match conns.get_mut(node_id) {
-                None => (false, Some("peer_missing"), None),
-                Some(conn) => {
-                    // A WireGuard packet can race with the control-plane
-                    // offline or peer-session teardown event. Once the manager
-                    // has marked the peer offline/closed, that packet belongs
-                    // to the retired session, even if it still decrypts under
-                    // a short rekey overlap. Do not let it create first-usable
-                    // evidence for the new session.
-                    if !conn.online || conn.state == ConnectionState::Closed {
-                        (false, Some("peer_offline_or_closed"), None)
-                    } else if path == NetworkPath::Relay
-                        && !(conn.relay_confirmed_generation == Some(generation)
-                            && ingress_label
-                                .strip_prefix("relay:")
-                                .is_some_and(|relay_endpoint| {
-                                    conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
-                                }))
-                    {
-                        // A relay socket may decrypt an unsolicited frame
-                        // before the forced relay probe has been ACKed.  That
-                        // is diagnostic ingress, not a usable relay path.
-                        // Keep it out of first_usable so TCP connect, writer
-                        // completion, or an unconfirmed peer cannot satisfy
-                        // the relay-first contract.
-                        (false, Some(REASON_FIRST_RELAY_BEFORE_CONFIRMATION), None)
-                    } else if conn.is_on_link_direct_for_generation(generation) {
-                        // A validated Host candidate inside one of our local
-                        // interface prefixes is already a physical LAN proof.
-                        // It must not wait for the off-link relay-first
-                        // business exchange, which exists to protect public
-                        // UDP hole punching from winning before relay delivery
-                        // has been proven.
-                        (conn.record_first_usable(path, generation), None, None)
-                    } else if path == NetworkPath::Direct
-                        && !conn.has_current_authoritative_direct(generation)
-                        && (conn.relay_confirmed_generation == Some(generation)
-                            && conn.relay_confirmed_endpoint.is_some())
-                        && conn.relay_first.business_gate_completed_generation != Some(generation)
-                        && conn.relay_first.business_exchange_generation != Some(generation)
-                    {
-                        // Before an authoritative Direct commit, a confirmed
-                        // relay remains the business safety path until both
-                        // same-generation relay business directions have been
-                        // observed.  The authoritative Direct case is handled
-                        // above by the current Selected-pair check.
-                        (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
-                    } else if path == NetworkPath::Direct
-                        && !conn.has_current_authoritative_direct(generation)
-                        && (conn.relay_ready_generation == Some(generation)
-                            || conn.relay_first.gate_generation == Some(generation))
-                        && conn.relay_confirmed_generation != Some(generation)
-                    {
-                        // If relay peer confirmation itself is still pending,
-                        // keep the bounded startup fallback for an uncommitted
-                        // Direct trial.  A separately encrypted-confirmed
-                        // Direct path has already been admitted above.
-                        let gate_expired = conn
-                            .relay_ready_at
-                            .or(conn.relay_first.gate_started_at)
-                            .is_some_and(|started_at| {
-                                started_at.elapsed() >= RELAY_FIRST_CONFIRMATION_GRACE
-                            });
-                        if gate_expired {
-                            (
-                                conn.record_first_usable(path, generation),
-                                None,
-                                Some(REASON_FIRST_DIRECT_AFTER_RELAY_BUSINESS_DEADLINE),
-                            )
-                        } else {
-                            (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
-                        }
+            None => (false, Some("peer_missing"), None),
+            Some(conn) => {
+                // A WireGuard packet can race with the control-plane
+                // offline or peer-session teardown event. Once the manager
+                // has marked the peer offline/closed, that packet belongs
+                // to the retired session, even if it still decrypts under
+                // a short rekey overlap. Do not let it create first-usable
+                // evidence for the new session.
+                if !conn.online || conn.state == ConnectionState::Closed {
+                    (false, Some("peer_offline_or_closed"), None)
+                } else if path == NetworkPath::Relay
+                    && !(conn.relay_confirmed_generation == Some(generation)
+                        && ingress_label
+                            .strip_prefix("relay:")
+                            .is_some_and(|relay_endpoint| {
+                                conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
+                            }))
+                {
+                    // A relay socket may decrypt an unsolicited frame
+                    // before the forced relay probe has been ACKed.  That
+                    // is diagnostic ingress, not a usable relay path.
+                    // Keep it out of first_usable so TCP connect, writer
+                    // completion, or an unconfirmed peer cannot satisfy
+                    // the relay-first contract.
+                    (false, Some(REASON_FIRST_RELAY_BEFORE_CONFIRMATION), None)
+                } else if conn.is_on_link_direct_for_generation(generation) {
+                    // A validated Host candidate inside one of our local
+                    // interface prefixes is already a physical LAN proof.
+                    // It must not wait for the off-link relay-first
+                    // business exchange, which exists to protect public
+                    // UDP hole punching from winning before relay delivery
+                    // has been proven.
+                    (conn.record_first_usable(path, generation), None, None)
+                } else if path == NetworkPath::Direct
+                    && !conn.has_current_authoritative_direct(generation)
+                    && (conn.relay_confirmed_generation == Some(generation)
+                        && conn.relay_confirmed_endpoint.is_some())
+                    && conn.relay_first.business_gate_completed_generation != Some(generation)
+                    && conn.relay_first.business_exchange_generation != Some(generation)
+                {
+                    // Before an authoritative Direct commit, a confirmed
+                    // relay remains the business safety path until both
+                    // same-generation relay business directions have been
+                    // observed.  The authoritative Direct case is handled
+                    // above by the current Selected-pair check.
+                    (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
+                } else if path == NetworkPath::Direct
+                    && !conn.has_current_authoritative_direct(generation)
+                    && (conn.relay_ready_generation == Some(generation)
+                        || conn.relay_first.gate_generation == Some(generation))
+                    && conn.relay_confirmed_generation != Some(generation)
+                {
+                    // If relay peer confirmation itself is still pending,
+                    // keep the bounded startup fallback for an uncommitted
+                    // Direct trial.  A separately encrypted-confirmed
+                    // Direct path has already been admitted above.
+                    let gate_expired = conn
+                        .relay_ready_at
+                        .or(conn.relay_first.gate_started_at)
+                        .is_some_and(|started_at| {
+                            started_at.elapsed() >= RELAY_FIRST_CONFIRMATION_GRACE
+                        });
+                    if gate_expired {
+                        (
+                            conn.record_first_usable(path, generation),
+                            None,
+                            Some(REASON_FIRST_DIRECT_AFTER_RELAY_BUSINESS_DEADLINE),
+                        )
                     } else {
-                        (conn.record_first_usable(path, generation), None, None)
+                        (false, Some(REASON_FIRST_DIRECT_BEFORE_RELAY_BUSINESS), None)
                     }
+                } else {
+                    (conn.record_first_usable(path, generation), None, None)
                 }
-            };
+            }
+        };
         if let Some(reason_code) = rejected_reason {
             self.emit_timeline(
                 "first_usable_rejected",

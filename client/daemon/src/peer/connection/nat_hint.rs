@@ -53,8 +53,7 @@ pub fn scatter_decision(nat_type: &str) -> bool {
                 | p2pnet_nat::NatAllocation::Random
                 | p2pnet_nat::NatAllocation::Blocked
         );
-    base
-        || hint.filtering == p2pnet_nat::FilteringBehavior::AddressOrPortDependent
+    base || hint.filtering == p2pnet_nat::FilteringBehavior::AddressOrPortDependent
 }
 
 #[cfg(test)]
@@ -121,9 +120,7 @@ mod nat_hint_tests {
         for (mtok, mb) in mappings {
             for atok in allocations {
                 for (ftok, fb) in filterings {
-                    let label = format!(
-                        "p2v2:m={mtok};a={atok};d=?;c=0;f={ftok};h=unknown"
-                    );
+                    let label = format!("p2v2:m={mtok};a={atok};d=?;c=0;f={ftok};h=unknown");
                     assert_eq!(
                         scatter_decision(&label),
                         legacy_nat_classifier(&label),
@@ -141,7 +138,8 @@ mod nat_hint_tests {
     /// (in the f field).  So `f == apd` is provably a no-op in R1.
     #[test]
     fn f_apd_stable_is_a_legacy_restatement() {
-        let label = "p2v2:m=endpoint_independent;a=stable;d=0;c=70;f=address_or_port_dependent;h=unknown";
+        let label =
+            "p2v2:m=endpoint_independent;a=stable;d=0;c=70;f=address_or_port_dependent;h=unknown";
         assert!(
             legacy_nat_classifier(label),
             "legacy's wide contains already scatters this label, so f==apd is provably a no-op in R1"
@@ -181,7 +179,12 @@ mod nat_hint_tests {
     /// raw string — never panic, never change behavior.
     #[test]
     fn corrupted_inputs_fall_back_to_legacy() {
-        for label in ["p2v2:garbage", "p2:!!!", "totally not a label a=random", "   "] {
+        for label in [
+            "p2v2:garbage",
+            "p2:!!!",
+            "totally not a label a=random",
+            "   ",
+        ] {
             assert_eq!(
                 scatter_decision(label),
                 legacy_nat_classifier(label),

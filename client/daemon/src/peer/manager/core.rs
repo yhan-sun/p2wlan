@@ -28,8 +28,7 @@ impl PeerManager {
         traversal_history: TraversalHistory,
     ) -> Self {
         let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
-        let (dplpmtud_capability_tx, _) =
-            tokio::sync::watch::channel(Arc::new(HashMap::new()));
+        let (dplpmtud_capability_tx, _) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
         let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
         let (ip_to_node_snapshot, _) =
             tokio::sync::watch::channel(Arc::new(HashMap::<String, String>::new()));
@@ -150,9 +149,7 @@ impl PeerManager {
             .is_some_and(|generation| *generation == peer_session_generation)
     }
 
-    pub(crate) fn direct_business_budget_change_sender(
-        &self,
-    ) -> tokio::sync::watch::Sender<u64> {
+    pub(crate) fn direct_business_budget_change_sender(&self) -> tokio::sync::watch::Sender<u64> {
         self.direct_business_budget_change_tx.clone()
     }
 
@@ -163,14 +160,13 @@ impl PeerManager {
     }
 
     pub(crate) fn notify_direct_business_budget_changed(&self) {
-        self.direct_business_budget_change_tx.send_modify(|revision| {
-            *revision = revision.wrapping_add(1);
-        });
+        self.direct_business_budget_change_tx
+            .send_modify(|revision| {
+                *revision = revision.wrapping_add(1);
+            });
     }
 
-    pub(crate) fn subscribe_local_mtu_feedback(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
+    pub(crate) fn subscribe_local_mtu_feedback(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
         self.local_mtu_feedback_tx.subscribe()
     }
 
@@ -194,15 +190,13 @@ impl PeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .admit(peer_id, tokio::time::Instant::now());
         if !admitted {
-            return LocalMtuFeedbackOutcome::Suppressed(
-                LocalMtuFeedbackSuppression::RateLimited,
-            );
+            return LocalMtuFeedbackOutcome::Suppressed(LocalMtuFeedbackSuppression::RateLimited);
         }
         match self.local_mtu_feedback_tx.send(packet) {
             Ok(_) => LocalMtuFeedbackOutcome::Published,
-            Err(_) => LocalMtuFeedbackOutcome::Suppressed(
-                LocalMtuFeedbackSuppression::NoTunConsumer,
-            ),
+            Err(_) => {
+                LocalMtuFeedbackOutcome::Suppressed(LocalMtuFeedbackSuppression::NoTunConsumer)
+            }
         }
     }
 
@@ -767,10 +761,7 @@ impl PeerManager {
         let _epoch_guard = epoch_gate.lock().await;
         let previous = self.dplpmtud_runtime.write().await.replace(runtime);
         if let Some(previous) = previous {
-            previous.close(
-                "udp_transport_replaced",
-                tokio::time::Instant::now(),
-            );
+            previous.close("udp_transport_replaced", tokio::time::Instant::now());
         }
     }
 
@@ -781,11 +772,7 @@ impl PeerManager {
     }
 
     /// Cancel the current exact-path worker at a peer lifecycle boundary.
-    pub(crate) async fn cancel_active_dplpmtud_for_peer(
-        &self,
-        peer_id: &str,
-        reason: &str,
-    ) {
+    pub(crate) async fn cancel_active_dplpmtud_for_peer(&self, peer_id: &str, reason: &str) {
         let epoch_gate = self.network_epoch_gate();
         let _epoch_guard = epoch_gate.lock().await;
         if let Some(runtime) = self.dplpmtud_runtime.read().await.clone() {
@@ -810,11 +797,8 @@ impl PeerManager {
         let Some(committed) = committed else {
             return false;
         };
-        if !identity.matches_committed_path(
-            committed.lifecycle,
-            committed.epoch,
-            &committed.active,
-        ) {
+        if !identity.matches_committed_path(committed.lifecycle, committed.epoch, &committed.active)
+        {
             return false;
         }
         self.direct_commit_pair_mirror
@@ -871,10 +855,7 @@ impl PeerManager {
             .active_generation(node_id)
     }
 
-    fn peer_session_generation_any_sync(
-        &self,
-        node_id: &str,
-    ) -> Option<PeerSessionGeneration> {
+    fn peer_session_generation_any_sync(&self, node_id: &str) -> Option<PeerSessionGeneration> {
         self.peer_membership
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1238,12 +1219,11 @@ impl PeerManager {
             else {
                 continue;
             };
-            let retained_confirmed_direct =
-                conn.mark_candidate_refresh_generation_changed(
-                    generation,
-                    peer_session_generation,
-                    reason.clone(),
-                );
+            let retained_confirmed_direct = conn.mark_candidate_refresh_generation_changed(
+                generation,
+                peer_session_generation,
+                reason.clone(),
+            );
             if retained_confirmed_direct {
                 retained_confirmed_direct_count += 1;
                 continue;

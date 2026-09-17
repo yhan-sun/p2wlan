@@ -45,9 +45,7 @@ async fn enqueue_peer_reflexive_signal_observation(
     let now = Instant::now();
     let mut slots_guard = slots.lock().await;
     slots_guard.retain(|_, slot| {
-        slot.active
-            || slot.latest.is_some()
-            || slot.next_signal_at.is_some_and(|next| next > now)
+        slot.active || slot.latest.is_some() || slot.next_signal_at.is_some_and(|next| next > now)
     });
 
     if let Some(slot) = slots_guard.get_mut(&peer_id) {
@@ -278,7 +276,8 @@ async fn run_peer_reflexive_signal_worker(
     punch_deduplicator: PunchAttemptDeduplicator,
 ) {
     loop {
-        let Some((mut observation, delay)) = take_peer_reflexive_observation(&slots, &peer_id).await
+        let Some((mut observation, delay)) =
+            take_peer_reflexive_observation(&slots, &peer_id).await
         else {
             return;
         };
@@ -320,11 +319,8 @@ async fn run_peer_reflexive_signal_worker(
         let endpoint = observation.observed_endpoint.to_string();
         let punch_at_ms = relay_assisted_punch_at_ms();
         let fast_punch = run_peer_reflexive_fast_punch(&udp, &peers, &observation);
-        let peer_reflexive_signal = control.send_peer_reflexive(
-            &observation.peer_id,
-            &endpoint,
-            Some(punch_at_ms),
-        );
+        let peer_reflexive_signal =
+            control.send_peer_reflexive(&observation.peer_id, &endpoint, Some(punch_at_ms));
         let (_, result) = tokio::join!(fast_punch, peer_reflexive_signal);
 
         let now = Instant::now();

@@ -169,9 +169,10 @@ impl PeerManager {
         let Some(conn) = connections.get_mut(node_id) else {
             return CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::PeerMissing);
         };
-        if sender_public_key.map(str::trim).is_some_and(|public_key| {
-            public_key.is_empty() || conn.public_key.trim() != public_key
-        }) {
+        if sender_public_key
+            .map(str::trim)
+            .is_some_and(|public_key| public_key.is_empty() || conn.public_key.trim() != public_key)
+        {
             conn.record_direct_event(
                 generation,
                 "candidates_stale_identity",
@@ -308,8 +309,7 @@ impl PeerManager {
         // this guard also rejects a synthetic invariant violation.
         let retained_direct_endpoint = remote_candidate_set_changed
             .then(|| {
-                (conn.state == ConnectionState::Direct
-                    && conn.direct_generation == generation)
+                (conn.state == ConnectionState::Direct && conn.direct_generation == generation)
                     .then(|| conn.selected_direct_endpoint_for_consent(generation))
                     .flatten()
             })
@@ -457,7 +457,10 @@ impl PeerManager {
                 candidate_sources,
                 candidates_expires_at_ms,
             );
-            debug_assert!(committed, "fresh candidate commit lost its serialized identity");
+            debug_assert!(
+                committed,
+                "fresh candidate commit lost its serialized identity"
+            );
             if !committed {
                 return CandidateSetTryApplyOutcome::Completed(
                     CandidateSetApplyResult::IgnoredStale,
@@ -497,5 +500,4 @@ impl PeerManager {
         }
         CandidateSetTryApplyOutcome::Completed(CandidateSetApplyResult::Applied)
     }
-
 }

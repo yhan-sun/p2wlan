@@ -55,18 +55,11 @@ fn dplpmtud_final_confirm_base(
     now: tokio::time::Instant,
 ) -> crate::dplpmtud::DplpmtudProbePlan {
     let plan = runtime
-        .schedule_probe(
-            &identity.peer_id,
-            identity,
-            lease.worker_owner_token,
-            now,
-        )
+        .schedule_probe(&identity.peer_id, identity, lease.worker_owner_token, now)
         .expect("BASE probe must be scheduled");
     assert_eq!(
         plan.probe_identity.candidate_udp_datagram_size,
-        crate::dplpmtud::UdpDatagramSize(
-            crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
-        )
+        crate::dplpmtud::UdpDatagramSize(crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,)
     );
     assert!(runtime.begin_probe_send(&plan, now));
     runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
@@ -123,19 +116,15 @@ fn dplpmtud_final_boundary_matrix_ipv4_ipv6() {
         }
     }
     assert_eq!(
-        crate::dplpmtud::UdpDatagramSize(
-            crate::dplpmtud::DPLPMTUD_IPV4_UDP_DATAGRAM_CEILING
-        )
-        .outer_ip_packet_size(crate::dplpmtud::OuterIpFamily::Ipv4)
-        .0,
+        crate::dplpmtud::UdpDatagramSize(crate::dplpmtud::DPLPMTUD_IPV4_UDP_DATAGRAM_CEILING)
+            .outer_ip_packet_size(crate::dplpmtud::OuterIpFamily::Ipv4)
+            .0,
         1500
     );
     assert_eq!(
-        crate::dplpmtud::UdpDatagramSize(
-            crate::dplpmtud::DPLPMTUD_IPV6_UDP_DATAGRAM_CEILING
-        )
-        .outer_ip_packet_size(crate::dplpmtud::OuterIpFamily::Ipv6)
-        .0,
+        crate::dplpmtud::UdpDatagramSize(crate::dplpmtud::DPLPMTUD_IPV6_UDP_DATAGRAM_CEILING)
+            .outer_ip_packet_size(crate::dplpmtud::OuterIpFamily::Ipv6)
+            .0,
         1500
     );
     dplpmtud_final_emit(serde_json::json!({
@@ -191,11 +180,7 @@ fn dplpmtud_final_epoch_and_socket_identity_isolation() {
         crate::dplpmtud::OuterIpFamily::Ipv4,
     );
     let new_lease = runtime
-        .install_path(
-            new_identity.clone(),
-            true,
-            now + Duration::from_millis(3),
-        )
+        .install_path(new_identity.clone(), true, now + Duration::from_millis(3))
         .worker
         .expect("replacement exact Direct path must own a worker");
     assert!(
@@ -212,10 +197,7 @@ fn dplpmtud_final_epoch_and_socket_identity_isolation() {
         dplpmtud_final_ack_ingress(&old_identity),
         now + Duration::from_millis(4),
     );
-    assert_eq!(
-        stale,
-        crate::dplpmtud::DplpmtudTransitionDecision::Stale
-    );
+    assert_eq!(stale, crate::dplpmtud::DplpmtudTransitionDecision::Stale);
     let replacement_before_base = runtime
         .snapshot_for_peer(&new_identity.peer_id)
         .expect("replacement snapshot");
@@ -239,9 +221,7 @@ fn dplpmtud_final_epoch_and_socket_identity_isolation() {
         .expect("replacement path must confirm its own BASE");
     assert_eq!(
         new_budget.udp_datagram_size,
-        crate::dplpmtud::UdpDatagramSize(
-            crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
-        )
+        crate::dplpmtud::UdpDatagramSize(crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,)
     );
     assert!(new_budget.budget_revision > old_budget.budget_revision);
     assert!(runtime.confirmed_budget_for_path(&old_identity).is_none());
@@ -316,15 +296,8 @@ fn dplpmtud_final_loss_reorder_duplicate_are_fenced() {
             now + Duration::from_millis(4),
         )
         .expect("upward search attempt");
-    assert!(runtime.begin_probe_send(
-        &first_attempt,
-        now + Duration::from_millis(4)
-    ));
-    runtime.finish_probe_send(
-        &first_attempt,
-        Ok(()),
-        now + Duration::from_millis(5),
-    );
+    assert!(runtime.begin_probe_send(&first_attempt, now + Duration::from_millis(4)));
+    runtime.finish_probe_send(&first_attempt, Ok(()), now + Duration::from_millis(5));
     assert_eq!(
         runtime.timeout_probe(&first_attempt, first_attempt.deadline),
         crate::dplpmtud::DplpmtudTransitionDecision::Applied
@@ -345,10 +318,7 @@ fn dplpmtud_final_loss_reorder_duplicate_are_fenced() {
             first_attempt.deadline + Duration::from_millis(1),
         )
         .expect("bounded retry must schedule");
-    assert!(runtime.begin_probe_send(
-        &retry,
-        first_attempt.deadline + Duration::from_millis(1)
-    ));
+    assert!(runtime.begin_probe_send(&retry, first_attempt.deadline + Duration::from_millis(1)));
     runtime.finish_probe_send(
         &retry,
         Ok(()),
@@ -361,10 +331,7 @@ fn dplpmtud_final_loss_reorder_duplicate_are_fenced() {
         dplpmtud_final_ack_ingress(&identity),
         first_attempt.deadline + Duration::from_millis(3),
     );
-    assert_eq!(
-        late_old,
-        crate::dplpmtud::DplpmtudTransitionDecision::Stale
-    );
+    assert_eq!(late_old, crate::dplpmtud::DplpmtudTransitionDecision::Stale);
     assert_eq!(
         runtime.try_accept_ack(
             &identity.peer_id,
@@ -464,11 +431,7 @@ fn dplpmtud_final_direct_relay_switch_and_recovery() {
         crate::dplpmtud::OuterIpFamily::Ipv4,
     );
     let lease_b = runtime
-        .install_path(
-            direct_b.clone(),
-            true,
-            now + Duration::from_millis(4),
-        )
+        .install_path(direct_b.clone(), true, now + Duration::from_millis(4))
         .worker
         .expect("new Direct path after Relay");
     assert!(
@@ -486,9 +449,7 @@ fn dplpmtud_final_direct_relay_switch_and_recovery() {
             .confirmed_budget_for_path(&direct_b)
             .expect("fresh Direct must recover only after BASE ACK")
             .udp_datagram_size,
-        crate::dplpmtud::UdpDatagramSize(
-            crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
-        )
+        crate::dplpmtud::UdpDatagramSize(crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,)
     );
     assert!(runtime.confirmed_budget_for_path(&direct_a).is_none());
     runtime.cancel_peer(

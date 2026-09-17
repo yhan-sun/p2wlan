@@ -408,11 +408,7 @@ impl CandidatePair {
             .map(|last_success| last_success.elapsed())
     }
 
-    pub(super) fn slow_validation_is_recent_at(
-        &self,
-        now: Instant,
-        cooldown: Duration,
-    ) -> bool {
+    pub(super) fn slow_validation_is_recent_at(&self, now: Instant, cooldown: Duration) -> bool {
         let Some(slow_validation_at) = self.last_slow_validation_at else {
             return false;
         };

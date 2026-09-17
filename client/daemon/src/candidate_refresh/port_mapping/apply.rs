@@ -8,9 +8,12 @@ pub(super) async fn maybe_add_port_mapping_udp_candidate(
     diagnostics: Arc<RwLock<GatewayMappingDiagnostics>>,
 ) {
     let gateway = default_ipv4_gateway().await;
-    let Some(local_addr) =
-        port_mapping_local_addr(udp_local_addr, existing_candidates, existing_candidate_sources, gateway)
-    else {
+    let Some(local_addr) = port_mapping_local_addr(
+        udp_local_addr,
+        existing_candidates,
+        existing_candidate_sources,
+        gateway,
+    ) else {
         let mut diagnostics = diagnostics.write().await;
         diagnostics.local_endpoint = None;
         diagnostics.upnp.status = "unavailable".to_string();

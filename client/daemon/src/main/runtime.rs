@@ -107,8 +107,8 @@ async fn run_daemon_inner(
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _logging_guard = if let Some(ref log_file) = cli.log_file {
-        let (writer, guard) =
-            p2pnet_daemon::diagnostics::logging::bounded_file_writer(log_file).map_err(|error| {
+        let (writer, guard) = p2pnet_daemon::diagnostics::logging::bounded_file_writer(log_file)
+            .map_err(|error| {
                 DaemonError::Config(format!(
                     "failed to initialize bounded private log {}: {error}",
                     log_file.display()

@@ -21,7 +21,11 @@ fn flood_peer_112(node_id: &str, virtual_ip: &str, endpoint: SocketAddr) -> Peer
 async fn failed_peer_has_one_active_recovery_epoch_despite_rapid_offers() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
 
     // Rapid triggers (offers / retries / peer-reflexive observations) all
@@ -49,19 +53,28 @@ async fn failed_peer_has_one_active_recovery_epoch_despite_rapid_offers() {
     assert_eq!(report.3, RECOVERY_EPOCH_HTTP_PUBLISHES);
 
     // A generation advance rotates the epoch (new plan per generation).
-    manager.advance_candidate_refresh_generation("test generation advance").await;
+    manager
+        .advance_candidate_refresh_generation("test generation advance")
+        .await;
     let admission = manager.recovery_epoch_admit("peer-fail").await;
     let RecoveryAdmission::Accepted { epoch: e2 } = admission else {
         panic!("admission after generation advance must succeed");
     };
-    assert!(e2 > e1, "a generation advance must start a new recovery epoch");
+    assert!(
+        e2 > e1,
+        "a generation advance must start a new recovery epoch"
+    );
 }
 
 #[tokio::test]
 async fn failed_scatter_requires_feedback_before_expansion() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager.recovery_epoch_admit("peer-fail").await;
 
@@ -109,7 +122,11 @@ async fn failed_scatter_requires_feedback_before_expansion() {
 async fn recovery_epoch_probe_credit_cannot_be_bypassed_by_new_candidates() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager.recovery_epoch_admit("peer-fail").await;
 
@@ -124,22 +141,26 @@ async fn recovery_epoch_probe_credit_cannot_be_bypassed_by_new_candidates() {
         }
     }
     assert_eq!(accepted, RECOVERY_EPOCH_PROBE_CREDIT);
-    assert_eq!(exhausted, 64, "probes beyond the epoch credit must be rejected");
+    assert_eq!(
+        exhausted, 64,
+        "probes beyond the epoch credit must be rejected"
+    );
 
     // New candidates (offers / fresh predictions) cannot refill the credit:
     // the epoch stays exhausted regardless of how many triggers arrive.
     for _ in 0..8 {
         manager.recovery_epoch_admit("peer-fail").await;
-        manager.stash_recovery_target(PendingRecoveryTarget {
-            peer_id: "peer-fail".to_string(),
-            candidates: vec!["5.6.7.8:6001".parse().unwrap()],
-            preferred_fast_candidates: Vec::new(),
-            frozen_targets: None,
-            fresh_prediction: None,
-            punch_at_ms: None,
-            seen_at: Instant::now(),
-        })
-        .await;
+        manager
+            .stash_recovery_target(PendingRecoveryTarget {
+                peer_id: "peer-fail".to_string(),
+                candidates: vec!["5.6.7.8:6001".parse().unwrap()],
+                preferred_fast_candidates: Vec::new(),
+                frozen_targets: None,
+                fresh_prediction: None,
+                punch_at_ms: None,
+                seen_at: Instant::now(),
+            })
+            .await;
         assert!(
             !manager.try_consume_recovery_probe_credit("peer-fail").await,
             "new candidates must never bypass the recovery-epoch probe credit"
@@ -162,7 +183,11 @@ async fn recovery_epoch_probe_credit_cannot_be_bypassed_by_new_candidates() {
 async fn direct_commit_seq_prevents_post_promotion_udp_sends() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager.recovery_epoch_admit("peer-fail").await;
     assert_eq!(
@@ -197,7 +222,10 @@ async fn direct_commit_seq_prevents_post_promotion_udp_sends() {
     let seq2 = manager
         .direct_commit_seq_sync("peer-fail")
         .expect("a direct-endpoint change must bump the sequence");
-    assert!(seq2 > seq, "every direct confirmation change must bump the sequence");
+    assert!(
+        seq2 > seq,
+        "every direct confirmation change must bump the sequence"
+    );
 
     // The bounded feedback wait returns immediately when a commit is already
     // newer than the snapshot.
@@ -211,7 +239,11 @@ async fn direct_commit_seq_prevents_post_promotion_udp_sends() {
 async fn offer_storm_cannot_reset_backoff_or_spawn_fresh_sockets() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager.recovery_epoch_admit("peer-fail").await;
 
@@ -247,16 +279,17 @@ async fn offer_storm_cannot_reset_backoff_or_spawn_fresh_sockets() {
             matches!(admission, RecoveryAdmission::Accepted { .. }),
             "the storm's triggers must stay admitted"
         );
-        manager.stash_recovery_target(PendingRecoveryTarget {
-            peer_id: "peer-fail".to_string(),
-            candidates: vec!["5.6.7.8:7001".parse().unwrap()],
-            preferred_fast_candidates: Vec::new(),
-            frozen_targets: None,
-            fresh_prediction: None,
-            punch_at_ms: None,
-            seen_at: Instant::now(),
-        })
-        .await;
+        manager
+            .stash_recovery_target(PendingRecoveryTarget {
+                peer_id: "peer-fail".to_string(),
+                candidates: vec!["5.6.7.8:7001".parse().unwrap()],
+                preferred_fast_candidates: Vec::new(),
+                frozen_targets: None,
+                fresh_prediction: None,
+                punch_at_ms: None,
+                seen_at: Instant::now(),
+            })
+            .await;
     }
     let retry_after_after_offers = manager
         .diagnostics_with_path_selection(true, true, DIRECT_RETRY_BASE_INTERVAL, None)
@@ -286,25 +319,30 @@ async fn offer_storm_cannot_reset_backoff_or_spawn_fresh_sockets() {
 async fn old_generation_validation_ack_cannot_promote_or_adopt_affinity() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer", "10.20.0.2", "1.2.3.4:5000".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer",
+            "10.20.0.2",
+            "1.2.3.4:5000".parse().unwrap(),
+        ))
         .await;
     let endpoint: SocketAddr = "1.2.3.4:5000".parse().unwrap();
 
     // An ACK from an OLD generation must be ignored: it can neither promote
     // Direct nor adopt socket affinity.
     let old_generation = manager.current_network_generation().await;
-    manager.advance_candidate_refresh_generation("test generation advance").await;
+    manager
+        .advance_candidate_refresh_generation("test generation advance")
+        .await;
     let new_generation = manager.current_network_generation().await;
     assert!(new_generation > old_generation);
 
     let promoted = manager
-        .record_direct_success_for_generation(
-            "peer",
-            Some(endpoint),
-            old_generation,
-        )
+        .record_direct_success_for_generation("peer", Some(endpoint), old_generation)
         .await;
-    assert!(!promoted, "an old-generation validation ACK must not promote");
+    assert!(
+        !promoted,
+        "an old-generation validation ACK must not promote"
+    );
     assert!(!manager.is_direct("peer").await);
     assert_eq!(
         manager.direct_commit_seq_sync("peer"),
@@ -328,7 +366,11 @@ async fn old_generation_validation_ack_cannot_promote_or_adopt_affinity() {
 async fn unmatched_authenticated_acks_do_not_weaken_validation_or_expand_unboundedly() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager.recovery_epoch_admit("peer-fail").await;
 

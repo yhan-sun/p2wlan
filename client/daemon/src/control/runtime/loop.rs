@@ -49,7 +49,14 @@ async fn run_control_loop(
                 }
                 .await;
                 match registration {
-                    Ok((node_id, virtual_ip, cidr, server_relay_servers, relay_catalog, registration_seq)) => {
+                    Ok((
+                        node_id,
+                        virtual_ip,
+                        cidr,
+                        server_relay_servers,
+                        relay_catalog,
+                        registration_seq,
+                    )) => {
                         let registration_seq_changed =
                             config.control.registration_seq != registration_seq;
                         config.control.registration_seq = registration_seq;
@@ -202,7 +209,8 @@ async fn run_control_loop(
                             if let Some(health) = health.as_ref() {
                                 health.set_reauth_required(true);
                             }
-                            let _ = event_tx.send(ControlEvent::ReauthRequired { message: err_str });
+                            let _ =
+                                event_tx.send(ControlEvent::ReauthRequired { message: err_str });
                             let _ = event_tx.send(ControlEvent::Disconnected);
                             return;
                         }

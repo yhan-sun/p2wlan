@@ -11,8 +11,7 @@ pub(super) async fn poll_peers(
 ) -> Result<()> {
     let request_started = std::time::Instant::now();
     let res = with_registration_sequence(
-        http
-        .get(format!(
+        http.get(format!(
             "{base_url}/api/v1/nodes?network_id={}",
             config.network.network_id
         ))
@@ -20,9 +19,9 @@ pub(super) async fn poll_peers(
         .bearer_auth(token),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("list nodes request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("list nodes request failed: {e}")))?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -45,16 +44,26 @@ pub(super) async fn poll_peers(
 
     let room_authorization = state.read().await.room_authorization.clone();
     if room_authorization.enabled() {
-        let local = body.nodes.iter().find(|node| node.id == self_node_id && node.public_key == config.node.public_key);
-        let valid = local.is_some_and(|local| room_authorization.replace(
-            &local.virtual_ip,
-            body.nodes.iter().filter(|node| node.id != self_node_id).map(|node| (node.id.clone(), node.virtual_ip.clone())),
-            request_started,
-            body.authorization_lease_seconds,
-        ));
+        let local = body
+            .nodes
+            .iter()
+            .find(|node| node.id == self_node_id && node.public_key == config.node.public_key);
+        let valid = local.is_some_and(|local| {
+            room_authorization.replace(
+                &local.virtual_ip,
+                body.nodes
+                    .iter()
+                    .filter(|node| node.id != self_node_id)
+                    .map(|node| (node.id.clone(), node.virtual_ip.clone())),
+                request_started,
+                body.authorization_lease_seconds,
+            )
+        });
         if !valid {
             room_authorization.invalidate();
-            return Err(DaemonError::ControlPlane("room authorization roster is missing, invalid or expired".into()));
+            return Err(DaemonError::ControlPlane(
+                "room authorization roster is missing, invalid or expired".into(),
+            ));
         }
     }
 
@@ -172,22 +181,21 @@ pub(super) async fn create_tunnel(
     remote_port: u16,
 ) -> Result<(String, String)> {
     let res = with_registration_sequence(
-        http
-        .post(format!("{base_url}/api/v1/tunnels"))
-        .timeout(CONTROL_REQUEST_TIMEOUT)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "device_id": device_id,
-            "protocol": protocol,
-            "local_port": local_port,
-            "remote_port": remote_port,
-            "local_address": "127.0.0.1",
-        })),
+        http.post(format!("{base_url}/api/v1/tunnels"))
+            .timeout(CONTROL_REQUEST_TIMEOUT)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "device_id": device_id,
+                "protocol": protocol,
+                "local_port": local_port,
+                "remote_port": remote_port,
+                "local_address": "127.0.0.1",
+            })),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("create tunnel request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("create tunnel request failed: {e}")))?;
 
     if !res.status().is_success() {
         let status = res.status();

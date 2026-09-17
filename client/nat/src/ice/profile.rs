@@ -79,11 +79,11 @@ fn build_nat_profile(local_addr: SocketAddr, observations: Vec<StunObservation>)
     let prediction_candidate = linear_successor_predictions.is_some()
         || (mapped.len() >= 2
             && is_prediction_candidate(
-        false,
-        public_ip_stable,
-        public_port_stable,
-        mapping_behavior,
-        port_delta,
+                false,
+                public_ip_stable,
+                public_port_stable,
+                mapping_behavior,
+                port_delta,
             ));
     let predicted_endpoints = predicted_reflexive_endpoints_for_mappings(
         &mapped,

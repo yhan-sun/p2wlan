@@ -21,10 +21,17 @@ async fn authenticate(path: &Path, args: AuthArgs, register: bool) -> Result<(),
     };
     let server = args
         .server
-        .or_else(|| existing.as_ref().map(|config| config.control.server_url.clone()))
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|config| config.control.server_url.clone())
+        })
         .unwrap_or_default();
     if server.trim().is_empty() {
-        return Err("尚未配置控制服务器，请先使用 `p2wlan config set control https://你的服务器`".to_string());
+        return Err(
+            "尚未配置控制服务器，请先使用 `p2wlan config set control https://你的服务器`"
+                .to_string(),
+        );
     }
     let server = normalize_control_server(&server)?;
 
@@ -174,8 +181,8 @@ async fn account_command(path: &Path, command: AccountCommand) -> Result<(), Str
         .text()
         .await
         .map_err(|error| format!("读取账号响应失败：{error}"))?;
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|error| format!("账号服务返回了无效响应：{error}"))?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|error| format!("账号服务返回了无效响应：{error}"))?;
     if !status.is_success() {
         return Err(format!("账号请求失败（HTTP {status}）"));
     }
@@ -198,8 +205,20 @@ async fn account_command(path: &Path, command: AccountCommand) -> Result<(), Str
             let user = &public["user"];
             println!("账号服务器：{}", public["server"].as_str().unwrap_or(""));
             println!("用户 ID：{}", user["id"].as_str().unwrap_or("(unknown)"));
-            println!("用户名：{}", user["username"].as_str().filter(|v| !v.is_empty()).unwrap_or("(未设置)"));
-            println!("邮箱：{}", user["email"].as_str().filter(|v| !v.is_empty()).unwrap_or("(未返回)"));
+            println!(
+                "用户名：{}",
+                user["username"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("(未设置)")
+            );
+            println!(
+                "邮箱：{}",
+                user["email"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("(未返回)")
+            );
         }
     }
     Ok(())
@@ -245,8 +264,8 @@ fn save_cli_session_token(config_path: &Path, server: &str, token: &str) -> Resu
         server: server.to_string(),
         token: token.to_string(),
     };
-    let encoded = serde_json::to_vec(&record)
-        .map_err(|error| format!("无法编码 CLI 会话文件：{error}"))?;
+    let encoded =
+        serde_json::to_vec(&record).map_err(|error| format!("无法编码 CLI 会话文件：{error}"))?;
     file.write_all(&encoded)
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())

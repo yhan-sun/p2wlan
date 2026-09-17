@@ -63,7 +63,10 @@ mod tests {
             decoded.network.udp_liveness_timeout_ms,
             config.network.udp_liveness_timeout_ms
         );
-        assert_eq!(decoded.network.udp_liveness_ttl_ms, config.network.udp_liveness_ttl_ms);
+        assert_eq!(
+            decoded.network.udp_liveness_ttl_ms,
+            config.network.udp_liveness_ttl_ms
+        );
         assert_eq!(
             decoded.network.udp_liveness_retries,
             config.network.udp_liveness_retries

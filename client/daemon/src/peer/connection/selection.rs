@@ -36,7 +36,10 @@ impl PeerConnection {
                     now,
                     self.is_on_link_host_candidate(b.remote_endpoint),
                 ))
-                .then_with(|| candidate_pair_last_success_sort_key(a).cmp(&candidate_pair_last_success_sort_key(b)))
+                .then_with(|| {
+                    candidate_pair_last_success_sort_key(a)
+                        .cmp(&candidate_pair_last_success_sort_key(b))
+                })
                 .then_with(|| {
                     candidate_pair_source_rank(a.source).cmp(&candidate_pair_source_rank(b.source))
                 })
@@ -66,11 +69,10 @@ impl PeerConnection {
         self.best_candidate_pair_for_send(local_generation)
             .map(|pair| pair.remote_endpoint)
             .or_else(|| {
-                self.endpoint
-                    .filter(|endpoint| {
-                        !self.is_overlay_direct_endpoint(*endpoint)
-                            && self.is_current_remote_endpoint(*endpoint)
-                    })
+                self.endpoint.filter(|endpoint| {
+                    !self.is_overlay_direct_endpoint(*endpoint)
+                        && self.is_current_remote_endpoint(*endpoint)
+                })
             })
     }
 
@@ -141,9 +143,7 @@ impl PeerConnection {
             .or(self.endpoint);
 
         selected_endpoint != Some(endpoint)
-            && selected_endpoint.is_none_or(|selected| {
-                !self.is_on_link_host_candidate(selected)
-            })
+            && selected_endpoint.is_none_or(|selected| !self.is_on_link_host_candidate(selected))
     }
 
     fn selected_candidate_pair_for_diagnostics(
@@ -346,11 +346,7 @@ impl PeerConnection {
                 .unwrap_or(true)
     }
 
-    fn relay_first_business_pending(
-        &self,
-        local_generation: u64,
-        relay_available: bool,
-    ) -> bool {
+    fn relay_first_business_pending(&self, local_generation: u64, relay_available: bool) -> bool {
         if !relay_available
             || self.relay_ready_generation != Some(local_generation)
             || !self.relay_peer_confirmed_for_generation(local_generation)
@@ -524,8 +520,14 @@ impl PeerConnection {
                         },
                         format!(
                             "{} direct score {} is below quality floor {} and relay score {}",
-                            if score_policy { "score policy:" } else { "confirmed" },
-                            direct_score.score, DIRECT_CONFIRMED_MIN_SCORE, relay_score.score
+                            if score_policy {
+                                "score policy:"
+                            } else {
+                                "confirmed"
+                            },
+                            direct_score.score,
+                            DIRECT_CONFIRMED_MIN_SCORE,
+                            relay_score.score
                         ),
                     )
                     .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
@@ -560,8 +562,13 @@ impl PeerConnection {
                         },
                         format!(
                             "{} direct score {} is below relay score {} after hysteresis",
-                            if score_policy { "score policy:" } else { "confirmed" },
-                            direct_score.score, relay_score.score
+                            if score_policy {
+                                "score policy:"
+                            } else {
+                                "confirmed"
+                            },
+                            direct_score.score,
+                            relay_score.score
                         ),
                     )
                     .with_scores(Some(direct_score.clone()), Some(relay_score.clone()));
@@ -578,7 +585,10 @@ impl PeerConnection {
                     .as_ref()
                     .map(|score| {
                         if policy == crate::config::PathPolicy::Score {
-                            format!("score policy selected encrypted Direct; score={}", score.score)
+                            format!(
+                                "score policy selected encrypted Direct; score={}",
+                                score.score
+                            )
                         } else {
                             format!("direct UDP pair is confirmed; score={}", score.score)
                         }

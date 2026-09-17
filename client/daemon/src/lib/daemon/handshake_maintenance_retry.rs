@@ -48,10 +48,8 @@ impl MaintenancePreparationRetries {
         let generation = peers.current_network_generation_sync();
         self.entries.retain(|peer_id, retry| {
             retry.identity.network_generation == generation
-                && peers.peer_session_is_current_sync(
-                    peer_id,
-                    retry.identity.peer_session_generation,
-                )
+                && peers
+                    .peer_session_is_current_sync(peer_id, retry.identity.peer_session_generation)
         });
     }
 
@@ -70,15 +68,16 @@ impl MaintenancePreparationRetries {
             );
             return;
         }
-        let entry = self.entries.entry(peer_id.to_string()).or_insert(
-            MaintenancePreparationRetry {
-                identity,
-                not_before: now,
-                hard_deadline,
-                attempt: 0,
-                reason,
-            },
-        );
+        let entry =
+            self.entries
+                .entry(peer_id.to_string())
+                .or_insert(MaintenancePreparationRetry {
+                    identity,
+                    not_before: now,
+                    hard_deadline,
+                    attempt: 0,
+                    reason,
+                });
         if entry.identity != identity {
             *entry = MaintenancePreparationRetry {
                 identity,
@@ -96,19 +95,18 @@ impl MaintenancePreparationRetries {
         let reason_changed = entry.reason != reason;
         entry.reason = reason;
         entry.attempt = entry.attempt.saturating_add(1);
-        let remaining = entry.hard_deadline
+        let remaining = entry
+            .hard_deadline
             .map(|deadline| deadline.saturating_duration_since(now));
-        let urgent = remaining.is_some_and(|remaining| {
-            !remaining.is_zero() && remaining <= Duration::from_secs(5)
-        });
+        let urgent = remaining
+            .is_some_and(|remaining| !remaining.is_zero() && remaining <= Duration::from_secs(5));
         let base_ms = if urgent {
             50
         } else {
             50u64 << entry.attempt.saturating_sub(1).min(4)
         };
         let peer_fingerprint = crate::transport::wire_fingerprint(peer_id.as_bytes());
-        let jitter_ms = peer_fingerprint
-            .wrapping_add(u64::from(entry.attempt) * 17) % 51;
+        let jitter_ms = peer_fingerprint.wrapping_add(u64::from(entry.attempt) * 17) % 51;
         let delay = Duration::from_millis(base_ms + jitter_ms);
         entry.not_before = now + delay;
         if entry.attempt.is_power_of_two() || reason_changed {
@@ -180,7 +178,12 @@ fn try_cached_maintenance_rekey_candidates(
     let snapshot = snapshot.try_read().ok()?;
     Some(snapshot.as_ref().map_or_else(
         || (Vec::new(), HashMap::new()),
-        |snapshot| (snapshot.candidates.clone(), snapshot.candidate_sources.clone()),
+        |snapshot| {
+            (
+                snapshot.candidates.clone(),
+                snapshot.candidate_sources.clone(),
+            )
+        },
     ))
 }
 
@@ -209,7 +212,9 @@ fn try_cleanup_maintenance_probe_binding(
         return true;
     }
     // Both removed and already promoted are terminal. Never remove an active key.
-    peers.try_discard_pending_probe_session_binding(peer_id, token).is_some()
+    peers
+        .try_discard_pending_probe_session_binding(peer_id, token)
+        .is_some()
 }
 
 impl MaintenanceProbeCleanups {
@@ -233,12 +238,12 @@ impl MaintenanceProbeCleanups {
             return;
         }
         let now = Instant::now();
-        self.entries.entry((peer_id.to_string(), token.to_string())).or_insert(
-            MaintenanceProbeCleanup {
+        self.entries
+            .entry((peer_id.to_string(), token.to_string()))
+            .or_insert(MaintenanceProbeCleanup {
                 peer_session_generation,
                 expires_at: now + MAINTENANCE_CLEANUP_TTL,
-            },
-        );
+            });
         self.not_before = Some(self.not_before.map_or(now, |deadline| deadline.min(now)));
     }
 
@@ -261,9 +266,8 @@ mod maintenance_retry_tests {
     use super::*;
 
     async fn fixture() -> (PeerManager, control::PeerInfo, MaintenanceRetryIdentity) {
-        let manager = PeerManager::new(
-            Config::generate_default("http://127.0.0.1:1", "net1").unwrap(),
-        );
+        let manager =
+            PeerManager::new(Config::generate_default("http://127.0.0.1:1", "net1").unwrap());
         let peer = control::PeerInfo {
             node_id: "maintenance-peer".to_string(),
             device_name: String::new(),
@@ -290,7 +294,13 @@ mod maintenance_retry_tests {
         let (_, peer, identity) = fixture().await;
         let now = Instant::now();
         let mut retries = MaintenancePreparationRetries::default();
-        retries.schedule(&peer.node_id, identity, Some(now + Duration::from_secs(40)), "connections_contended", now);
+        retries.schedule(
+            &peer.node_id,
+            identity,
+            Some(now + Duration::from_secs(40)),
+            "connections_contended",
+            now,
+        );
         let due = retries.next_deadline().unwrap();
         assert!(due > now);
         assert!(due <= now + Duration::from_millis(100));
@@ -308,16 +318,34 @@ mod maintenance_retry_tests {
         let mut retries = MaintenancePreparationRetries::default();
         for attempt in 0..20 {
             let now = start + Duration::from_secs(attempt);
-            retries.schedule(&peer.node_id, identity, Some(now + Duration::from_secs(30)), "connections_contended", now);
+            retries.schedule(
+                &peer.node_id,
+                identity,
+                Some(now + Duration::from_secs(30)),
+                "connections_contended",
+                now,
+            );
             assert_eq!(retries.entries[&peer.node_id].hard_deadline, Some(deadline));
             let delay = retries.next_deadline().unwrap() - now;
             assert!(delay >= Duration::from_millis(50));
             assert!(delay <= Duration::from_millis(850));
         }
         let urgent = deadline - Duration::from_secs(4);
-        retries.schedule(&peer.node_id, identity, Some(deadline), "connections_contended", urgent);
+        retries.schedule(
+            &peer.node_id,
+            identity,
+            Some(deadline),
+            "connections_contended",
+            urgent,
+        );
         assert!(retries.next_deadline().unwrap() - urgent <= Duration::from_millis(100));
-        retries.schedule(&peer.node_id, identity, Some(deadline), "connections_contended", deadline);
+        retries.schedule(
+            &peer.node_id,
+            identity,
+            Some(deadline),
+            "connections_contended",
+            deadline,
+        );
         assert!(retries.next_deadline().unwrap() > deadline);
     }
 
@@ -326,11 +354,26 @@ mod maintenance_retry_tests {
         let (manager, peer, identity) = fixture().await;
         let now = Instant::now();
         let mut retries = MaintenancePreparationRetries::default();
-        retries.schedule(&peer.node_id, identity, Some(now), "connections_contended", now);
-        let replacement = MaintenanceRetryIdentity { active_session_instance: Some(2), ..identity };
+        retries.schedule(
+            &peer.node_id,
+            identity,
+            Some(now),
+            "connections_contended",
+            now,
+        );
+        let replacement = MaintenanceRetryIdentity {
+            active_session_instance: Some(2),
+            ..identity
+        };
         assert!(retries.ready(&peer.node_id, replacement, now));
         assert!(retries.next_deadline().is_none());
-        retries.schedule(&peer.node_id, identity, Some(now), "connections_contended", now);
+        retries.schedule(
+            &peer.node_id,
+            identity,
+            Some(now),
+            "connections_contended",
+            now,
+        );
         manager.remove_peer(&peer.node_id).await;
         manager.add_peer(&peer).await;
         retries.retain_current(&manager);
@@ -340,21 +383,69 @@ mod maintenance_retry_tests {
     #[tokio::test]
     async fn maintenance_cleanup_never_queues_a_writer_and_preserves_promoted_binding() {
         let (manager, peer, identity) = fixture().await;
-        assert_eq!(manager.stage_probe_session_binding(&peer.node_id, "pending".to_string(), Some("pending".to_string()), None, false).await, ProbeBindingStage::Staged);
+        assert_eq!(
+            manager
+                .stage_probe_session_binding(
+                    &peer.node_id,
+                    "pending".to_string(),
+                    Some("pending".to_string()),
+                    None,
+                    false
+                )
+                .await,
+            ProbeBindingStage::Staged
+        );
         let reader = manager.hold_connections_reader_for_test().await;
         let mut cleanups = MaintenanceProbeCleanups::default();
-        cleanups.discard_or_defer(&manager, &peer.node_id, "pending", identity.peer_session_generation);
+        cleanups.discard_or_defer(
+            &manager,
+            &peer.node_id,
+            "pending",
+            identity.peer_session_generation,
+        );
         assert_eq!(cleanups.entries.len(), 1);
-        let second_reader = tokio::time::timeout(Duration::from_millis(100), manager.hold_connections_reader_for_test()).await.expect("cleanup must not enqueue a writer ahead of another reader");
+        let second_reader = tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.hold_connections_reader_for_test(),
+        )
+        .await
+        .expect("cleanup must not enqueue a writer ahead of another reader");
         drop(second_reader);
         drop(reader);
         cleanups.drain(&manager, Instant::now());
         assert!(cleanups.entries.is_empty());
-        assert_eq!(manager.stage_probe_session_binding(&peer.node_id, "pending".to_string(), Some("pending".to_string()), None, false).await, ProbeBindingStage::Staged);
-        assert!(manager.install_probe_session_binding(&peer.node_id, "pending".to_string(), Some("pending".to_string()), None).await);
-        cleanups.discard_or_defer(&manager, &peer.node_id, "pending", identity.peer_session_generation);
+        assert_eq!(
+            manager
+                .stage_probe_session_binding(
+                    &peer.node_id,
+                    "pending".to_string(),
+                    Some("pending".to_string()),
+                    None,
+                    false
+                )
+                .await,
+            ProbeBindingStage::Staged
+        );
+        assert!(
+            manager
+                .install_probe_session_binding(
+                    &peer.node_id,
+                    "pending".to_string(),
+                    Some("pending".to_string()),
+                    None
+                )
+                .await
+        );
+        cleanups.discard_or_defer(
+            &manager,
+            &peer.node_id,
+            "pending",
+            identity.peer_session_generation,
+        );
         assert!(cleanups.entries.is_empty());
-        assert!(!manager.try_discard_pending_probe_session_binding(&peer.node_id, "pending").unwrap());
+        assert!(!manager
+            .try_discard_pending_probe_session_binding(&peer.node_id, "pending")
+            .unwrap());
     }
 
     #[tokio::test]
@@ -362,26 +453,57 @@ mod maintenance_retry_tests {
         let (manager, peer, identity) = fixture().await;
         let reader = manager.hold_connections_reader_for_test().await;
         let mut cleanups = MaintenanceProbeCleanups::default();
-        cleanups.discard_or_defer(&manager, &peer.node_id, "same-token", identity.peer_session_generation);
+        cleanups.discard_or_defer(
+            &manager,
+            &peer.node_id,
+            "same-token",
+            identity.peer_session_generation,
+        );
         drop(reader);
         manager.remove_peer(&peer.node_id).await;
         manager.add_peer(&peer).await;
-        assert_eq!(manager.stage_probe_session_binding(&peer.node_id, "same-token".to_string(), Some("same-token".to_string()), None, false).await, ProbeBindingStage::Staged);
+        assert_eq!(
+            manager
+                .stage_probe_session_binding(
+                    &peer.node_id,
+                    "same-token".to_string(),
+                    Some("same-token".to_string()),
+                    None,
+                    false
+                )
+                .await,
+            ProbeBindingStage::Staged
+        );
         cleanups.drain(&manager, Instant::now());
         assert!(cleanups.entries.is_empty());
-        assert_eq!(manager.stage_probe_session_binding(&peer.node_id, "same-token".to_string(), Some("same-token".to_string()), None, false).await, ProbeBindingStage::ReplayableDuplicate);
+        assert_eq!(
+            manager
+                .stage_probe_session_binding(
+                    &peer.node_id,
+                    "same-token".to_string(),
+                    Some("same-token".to_string()),
+                    None,
+                    false
+                )
+                .await,
+            ProbeBindingStage::ReplayableDuplicate
+        );
     }
 
     #[tokio::test]
     async fn maintenance_rekey_reads_snapshot_during_live_refresh_and_accepts_relay_only() {
         let daemon = Daemon::new(Config::generate_default("http://127.0.0.1:1", "net1").unwrap());
-        let (candidates, sources) = try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot)
-            .expect("an existing relay session must rekey without a UDP snapshot");
+        let (candidates, sources) =
+            try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot)
+                .expect("an existing relay session must rekey without a UDP snapshot");
         assert!(candidates.is_empty() && sources.is_empty());
-        daemon.publish_candidate_snapshot(Vec::new(), HashMap::new(), Vec::new()).await;
+        daemon
+            .publish_candidate_snapshot(Vec::new(), HashMap::new(), Vec::new())
+            .await;
         let _refresh = daemon.candidate_refresh_lock.lock().await;
-        let (candidates, sources) = try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot)
-            .expect("relay-only rekey must not wait for STUN or the refresh lock");
+        let (candidates, sources) =
+            try_cached_maintenance_rekey_candidates(&daemon.candidate_snapshot)
+                .expect("relay-only rekey must not wait for STUN or the refresh lock");
         assert!(candidates.is_empty());
         assert!(sources.is_empty());
         let _writer = daemon.candidate_snapshot.write().await;
@@ -393,13 +515,27 @@ mod maintenance_retry_tests {
         let (manager, peer, identity) = fixture().await;
         let reader = manager.hold_connections_reader_for_test().await;
         let mut cleanups = MaintenanceProbeCleanups::default();
-        cleanups.discard_or_defer(&manager, &peer.node_id, "token-0", identity.peer_session_generation);
-        let first_expiry = cleanups.entries[&(peer.node_id.clone(), "token-0".to_string())].expires_at;
+        cleanups.discard_or_defer(
+            &manager,
+            &peer.node_id,
+            "token-0",
+            identity.peer_session_generation,
+        );
+        let first_expiry =
+            cleanups.entries[&(peer.node_id.clone(), "token-0".to_string())].expires_at;
         for index in 0..MAX_MAINTENANCE_RETRIES + 10 {
-            cleanups.discard_or_defer(&manager, &peer.node_id, &format!("token-{index}"), identity.peer_session_generation);
+            cleanups.discard_or_defer(
+                &manager,
+                &peer.node_id,
+                &format!("token-{index}"),
+                identity.peer_session_generation,
+            );
         }
         assert_eq!(cleanups.entries.len(), MAX_MAINTENANCE_RETRIES);
-        assert_eq!(cleanups.entries[&(peer.node_id.clone(), "token-0".to_string())].expires_at, first_expiry);
+        assert_eq!(
+            cleanups.entries[&(peer.node_id.clone(), "token-0".to_string())].expires_at,
+            first_expiry
+        );
         cleanups.drain(&manager, Instant::now() + MAINTENANCE_CLEANUP_TTL);
         assert!(cleanups.entries.is_empty());
         assert!(cleanups.not_before.is_none());

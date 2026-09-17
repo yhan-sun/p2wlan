@@ -33,10 +33,7 @@ struct SupportLogTail {
     truncated: bool,
 }
 
-async fn support_bundle(
-    config_path: &Path,
-    args: SupportBundleArgs,
-) -> Result<(), String> {
+async fn support_bundle(config_path: &Path, args: SupportBundleArgs) -> Result<(), String> {
     let mut config = load_config(config_path)?;
     if args.upload {
         hydrate_cli_session_token(config_path, &mut config)?;
@@ -57,11 +54,10 @@ async fn support_bundle(
     });
     let main_state = state_dir();
     let mut instances = Vec::with_capacity(1 + MAX_SUPPORT_ROOM_INSTANCES);
-    let main_status = fetch_status_at(&status_url(&config), &main_state).await.ok();
-    let main_log = read_support_log(
-        &main_state.join("p2wlan-daemon.log"),
-        args.max_log_bytes,
-    );
+    let main_status = fetch_status_at(&status_url(&config), &main_state)
+        .await
+        .ok();
+    let main_log = read_support_log(&main_state.join("p2wlan-daemon.log"), args.max_log_bytes);
     let main_summary = support_status_summary(&config, main_status.as_ref());
     let daemon_version = main_status
         .as_ref()
@@ -112,10 +108,8 @@ async fn support_bundle(
             let room_status = fetch_status_at(&status_url(&room_config), &room_state)
                 .await
                 .ok();
-            let room_log = read_support_log(
-                &room_state.join("p2wlan-daemon.log"),
-                args.max_log_bytes,
-            );
+            let room_log =
+                read_support_log(&room_state.join("p2wlan-daemon.log"), args.max_log_bytes);
             instances.push(serde_json::json!({
                 "instance_type": "room",
                 "network_id": room_config.network.network_id,
@@ -332,7 +326,10 @@ fn gzip_bytes(content: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn write_binary_file(path: &Path, content: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)
             .map_err(|error| format!("无法创建支持包目录 {}：{error}", parent.display()))?;
     }

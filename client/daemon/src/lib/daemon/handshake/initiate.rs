@@ -1,4 +1,3 @@
-
 enum EventInitiatorReservationOutcome {
     Reserved(HandshakeStartReservation),
     Busy,

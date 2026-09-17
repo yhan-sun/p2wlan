@@ -33,9 +33,10 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
         "the Initial recovery stage must not build a birthday plan"
     );
     assert!(
-        initial_targets[0].candidates.iter().all(|target| {
-            *target == stable_endpoint || *target == second_observed
-        }),
+        initial_targets[0]
+            .candidates
+            .iter()
+            .all(|target| { *target == stable_endpoint || *target == second_observed }),
         "the Initial recovery stage only probes trusted endpoints"
     );
 
@@ -76,13 +77,11 @@ async fn stable_public_candidate_precedes_birthday_budget_in_due_targets() {
             .saturating_sub([stable_endpoint, second_observed].len())
             .min(BIRTHDAY_PLAN_SLICE.saturating_sub([stable_endpoint, second_observed].len())),
     );
-    let expected_birthday_count = birthday_probe_endpoints_for_bases(
-        &[stable_endpoint, second_observed],
-        sliced_budget,
-    )
-    .into_iter()
-    .filter(|target| *target != stable_endpoint && *target != second_observed)
-    .count();
+    let expected_birthday_count =
+        birthday_probe_endpoints_for_bases(&[stable_endpoint, second_observed], sliced_budget)
+            .into_iter()
+            .filter(|target| *target != stable_endpoint && *target != second_observed)
+            .count();
 
     assert_eq!(targets.first().copied(), Some(stable_endpoint));
     assert!(targets.contains(&stable_endpoint));
@@ -160,7 +159,9 @@ async fn healthy_selected_peer_reflexive_direct_suppresses_background_full_scatt
         })
         .collect::<HashMap<_, _>>();
 
-    manager.add_peer(&test_peer("peer1", selected_endpoint)).await;
+    manager
+        .add_peer(&test_peer("peer1", selected_endpoint))
+        .await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &candidate_sources)
         .await;
@@ -188,7 +189,9 @@ async fn relay_assisted_punch_deferred_until_direct_stops_being_healthy() {
     let manager = PeerManager::new(test_config());
     let selected_endpoint: SocketAddr = "8.8.8.8:41000".parse().unwrap();
     let local: SocketAddr = "192.168.1.10:51820".parse().unwrap();
-    manager.add_peer(&test_peer("peer1", selected_endpoint)).await;
+    manager
+        .add_peer(&test_peer("peer1", selected_endpoint))
+        .await;
     manager
         .add_candidates_with_sources(
             "peer1",
@@ -231,7 +234,9 @@ async fn direct_confirmed_retires_speculative_probing_pairs_from_stats() {
             (candidate.clone(), source.to_string())
         })
         .collect::<HashMap<_, _>>();
-    manager.add_peer(&test_peer("peer1", selected_endpoint)).await;
+    manager
+        .add_peer(&test_peer("peer1", selected_endpoint))
+        .await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &candidate_sources)
         .await;

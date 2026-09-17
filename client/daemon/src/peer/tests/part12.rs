@@ -37,9 +37,7 @@ async fn hard_nat_side_probes_every_stable_public_mapping_in_initial_burst() {
     // Air-like: hard NAT, and the connection endpoint happens to be the
     // STALE :9092 mapping (learned first / long ago).
     manager.update_nat_profile(birthday_nat_profile()).await;
-    manager
-        .add_peer(&test_peer("peer1", stale_endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", stale_endpoint)).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
@@ -104,18 +102,13 @@ async fn easy_nat_activates_socket_pool_for_multi_socket_hard_peer() {
         "8.8.8.8:10002".parse::<SocketAddr>().unwrap(),
         "8.8.8.8:10003".parse::<SocketAddr>().unwrap(),
     ];
-    let candidates = air_pool
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    let candidates = air_pool.iter().map(ToString::to_string).collect::<Vec<_>>();
     let sources = candidates
         .iter()
         .cloned()
         .map(|candidate| (candidate, "stun_observed".to_string()))
         .collect::<HashMap<_, _>>();
-    manager
-        .add_peer(&test_peer("peer1", air_pool[0]))
-        .await;
+    manager.add_peer(&test_peer("peer1", air_pool[0])).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
@@ -127,7 +120,9 @@ async fn easy_nat_activates_socket_pool_for_multi_socket_hard_peer() {
 
     // A single-mapping peer does not need the pool.
     let single_manager = PeerManager::new(test_config());
-    single_manager.update_nat_profile(stable_profile.clone()).await;
+    single_manager
+        .update_nat_profile(stable_profile.clone())
+        .await;
     let single: SocketAddr = "8.8.8.8:5000".parse().unwrap();
     single_manager
         .add_peer(&test_peer("peer-single", single))
@@ -140,13 +135,17 @@ async fn easy_nat_activates_socket_pool_for_multi_socket_hard_peer() {
         )
         .await;
     assert!(
-        !single_manager.peer_needs_local_socket_pool("peer-single").await,
+        !single_manager
+            .peer_needs_local_socket_pool("peer-single")
+            .await,
         "a single-mapping peer never needs the local socket pool"
     );
 
     // A hard local NAT already runs the pool; the easy-side trigger is moot.
     let hard_manager = PeerManager::new(test_config());
-    hard_manager.update_nat_profile(birthday_nat_profile()).await;
+    hard_manager
+        .update_nat_profile(birthday_nat_profile())
+        .await;
     hard_manager
         .add_peer(&test_peer("peer-hard", air_pool[0]))
         .await;
@@ -175,9 +174,7 @@ async fn maintainer_targets_cover_the_whole_advertised_pool_on_the_hard_side() {
         .collect::<HashMap<_, _>>();
 
     manager.update_nat_profile(birthday_nat_profile()).await;
-    manager
-        .add_peer(&test_peer("peer1", pool[0]))
-        .await;
+    manager.add_peer(&test_peer("peer1", pool[0])).await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &sources)
         .await;
@@ -194,7 +191,11 @@ async fn maintainer_targets_cover_the_whole_advertised_pool_on_the_hard_side() {
 async fn authenticated_evidence_reopens_frozen_epoch_with_bounded_retry_credit() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager.recovery_epoch_admit("peer-fail").await;
 
@@ -224,8 +225,7 @@ async fn authenticated_evidence_reopens_frozen_epoch_with_bounded_retry_credit()
         .await
         .expect("epoch must exist");
     assert_eq!(
-        report.probe_credit_remaining,
-        RECOVERY_EVIDENCE_RETRY_CREDIT,
+        report.probe_credit_remaining, RECOVERY_EVIDENCE_RETRY_CREDIT,
         "the re-open grants exactly the small retry credit, never a full refill"
     );
     assert_eq!(
@@ -266,7 +266,11 @@ async fn authenticated_evidence_reopens_frozen_epoch_with_bounded_retry_credit()
     // A healthy epoch is untouched by the re-open.
     let healthy_manager = PeerManager::new(test_config());
     healthy_manager
-        .add_peer(&flood_peer_112("peer-ok", "10.20.0.4", "5.6.7.8:5002".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-ok",
+            "10.20.0.4",
+            "5.6.7.8:5002".parse().unwrap(),
+        ))
         .await;
     healthy_manager.recovery_epoch_admit("peer-ok").await;
     let before = healthy_manager
@@ -281,8 +285,7 @@ async fn authenticated_evidence_reopens_frozen_epoch_with_bounded_retry_credit()
         .await
         .unwrap();
     assert_eq!(
-        before.probe_credit_remaining,
-        after.probe_credit_remaining,
+        before.probe_credit_remaining, after.probe_credit_remaining,
         "a healthy epoch must not be refilled by evidence"
     );
 }
@@ -313,7 +316,11 @@ async fn remote_candidate_handover_reopens_frozen_recovery_epoch() {
         .await
     {}
     for _ in 0..RECOVERY_EPOCH_PLAN_BUILDS {
-        assert!(manager.try_consume_recovery_plan_build("peer-handover").await);
+        assert!(
+            manager
+                .try_consume_recovery_plan_build("peer-handover")
+                .await
+        );
     }
     for _ in 0..RECOVERY_EPOCH_SESSIONS {
         assert!(manager.try_consume_recovery_session("peer-handover").await);
@@ -340,15 +347,25 @@ async fn remote_candidate_handover_reopens_frozen_recovery_epoch() {
         .recovery_epoch_work_budget_report("peer-handover")
         .await
         .expect("the existing recovery epoch must be retained");
-    assert_eq!(report.probe_credit_remaining, RECOVERY_EVIDENCE_RETRY_CREDIT);
-    assert_eq!(report.sessions_remaining, RECOVERY_EVIDENCE_REGRANT_SESSIONS);
+    assert_eq!(
+        report.probe_credit_remaining,
+        RECOVERY_EVIDENCE_RETRY_CREDIT
+    );
+    assert_eq!(
+        report.sessions_remaining,
+        RECOVERY_EVIDENCE_REGRANT_SESSIONS
+    );
 }
 
 #[tokio::test]
 async fn quota_exhaustion_events_are_reported_once_per_epoch() {
     let manager = PeerManager::new(test_config());
     manager
-        .add_peer(&flood_peer_112("peer-fail", "10.20.0.3", "5.6.7.8:5001".parse().unwrap()))
+        .add_peer(&flood_peer_112(
+            "peer-fail",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
         .await;
     manager.recovery_epoch_admit("peer-fail").await;
     for _ in 0..RECOVERY_EPOCH_PLAN_BUILDS {
@@ -583,11 +600,8 @@ fn candidate_pair_cap_keeps_current_probed_and_recent_pairs() {
         current_generation,
         CandidatePairSource::Birthday,
     ));
-    let mut old_observation = CandidatePair::new_with_source(
-        weak_old,
-        current_generation,
-        CandidatePairSource::Birthday,
-    );
+    let mut old_observation =
+        CandidatePair::new_with_source(weak_old, current_generation, CandidatePairSource::Birthday);
     old_observation.source_observed_at = Some(Instant::now() - Duration::from_secs(60));
     conn.candidate_pairs.push(old_observation);
     let mut recent_observation = CandidatePair::new_with_source(
@@ -616,8 +630,14 @@ fn candidate_pair_cap_keeps_current_probed_and_recent_pairs() {
     assert_eq!(retired, 6);
     assert_eq!(conn.candidate_pairs.len(), MAX_CANDIDATE_PAIRS_PER_PEER);
 
-    for endpoint in [old_recent_high, old_recent_high_2, weak_none, weak_old, weak_recent, weak_low_probe]
-    {
+    for endpoint in [
+        old_recent_high,
+        old_recent_high_2,
+        weak_none,
+        weak_old,
+        weak_recent,
+        weak_low_probe,
+    ] {
         assert!(
             !conn
                 .candidate_pairs
@@ -641,9 +661,7 @@ fn candidate_pair_cap_keeps_current_probed_and_recent_pairs() {
 async fn matched_ack_alone_never_promotes_direct_without_encrypted_confirmation() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "8.8.8.8:45000".parse().unwrap();
-    manager
-        .add_peer(&test_peer("peer1", endpoint))
-        .await;
+    manager.add_peer(&test_peer("peer1", endpoint)).await;
     manager
         .add_candidates_with_sources(
             "peer1",
@@ -656,7 +674,11 @@ async fn matched_ack_alone_never_promotes_direct_without_encrypted_confirmation(
     // A matched authenticated ACK proves bidirectional UDP reachability but
     // must NEVER promote Direct: the encrypted data path is unconfirmed.
     manager
-        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(12)))
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(12)),
+        )
         .await;
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_ne!(
@@ -681,9 +703,7 @@ async fn matched_ack_alone_never_promotes_direct_without_encrypted_confirmation(
     );
 
     // Only the encrypted-data-path confirmation promotes Direct.
-    manager
-        .record_direct_success("peer1", Some(endpoint))
-        .await;
+    manager.record_direct_success("peer1", Some(endpoint)).await;
     let conn = manager.get_connection("peer1").await.unwrap();
     assert_eq!(
         conn.state,

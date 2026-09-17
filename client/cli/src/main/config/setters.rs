@@ -2,7 +2,8 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
     match key {
         "control" => {
             let server = normalize_control_server(value)?;
-            if server != config.control.server_url && config.network.network_id.starts_with("room-") {
+            if server != config.control.server_url && config.network.network_id.starts_with("room-")
+            {
                 return Err("房间身份不能切换服务器，请使用独立配置文件".into());
             }
             if server != config.control.server_url {
@@ -16,7 +17,9 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 return Err("network 不能为空".to_string());
             }
             let network = value.trim();
-            if network != config.network.network_id && (network.starts_with("room-") || config.network.network_id.starts_with("room-")) {
+            if network != config.network.network_id
+                && (network.starts_with("room-") || config.network.network_id.starts_with("room-"))
+            {
                 return Err("房间身份不能迁移网络，请使用独立配置文件".into());
             }
             if network != config.network.network_id {
@@ -150,11 +153,7 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 config.relay.prefer_direct = false;
                 config.relay.path_policy = PathPolicy::RelayOnly;
             }
-            _ => {
-                return Err(
-                    "relay-policy 只支持 auto、direct、prefer-relay 或 relay".to_string(),
-                )
-            }
+            _ => return Err("relay-policy 只支持 auto、direct、prefer-relay 或 relay".to_string()),
         },
         "prefer-direct" => {
             let prefer_direct = parse_bool_config(value, "prefer-direct")?;
@@ -186,8 +185,7 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 config.control.proxy_mode = p2pnet_daemon::config::ControlProxyMode::Direct;
             }
             "environment" | "env" => {
-                config.control.proxy_mode =
-                    p2pnet_daemon::config::ControlProxyMode::Environment;
+                config.control.proxy_mode = p2pnet_daemon::config::ControlProxyMode::Environment;
             }
             _ => return Err("proxy-mode 只支持 direct 或 environment".to_string()),
         },

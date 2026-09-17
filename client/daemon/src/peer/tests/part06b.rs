@@ -46,7 +46,11 @@ async fn confirmed_direct_ignores_background_probe_batch_timeout() {
 
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     manager
-        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(42)))
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(42)),
+        )
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
     let generation = manager.current_network_generation().await;
@@ -246,7 +250,11 @@ async fn completed_birthday_epochs_can_increase_peer_retry_backoff() {
     }
 
     for epoch in 0..2 {
-        assert!(manager.record_direct_probe_sent("peer1", epoch_endpoint).await);
+        assert!(
+            manager
+                .record_direct_probe_sent("peer1", epoch_endpoint)
+                .await
+        );
         assert!(
             manager
                 .record_expected_birthday_window_miss_for_generation(
@@ -385,9 +393,11 @@ async fn test_peer_manager_path_health_drives_data_path() {
     assert_eq!(trial.reason_code, REASON_PATH_DIRECT_NOT_CONFIRMED);
     assert!(!trial.relay_hedged);
     assert!(!trial.direct_confirmed);
-    assert!(!manager
-        .should_use_direct_for_data("peer1", true, true)
-        .await);
+    assert!(
+        !manager
+            .should_use_direct_for_data("peer1", true, true)
+            .await
+    );
 
     manager.record_direct_success("peer1", Some(endpoint)).await;
     let conn = manager.get_connection("peer1").await.unwrap();
@@ -568,7 +578,9 @@ async fn synchronized_probe_targets_are_empty_for_direct_peer_even_with_public_c
             (candidate.clone(), source.to_string())
         })
         .collect::<HashMap<_, _>>();
-    manager.add_peer(&test_peer("peer1", selected_endpoint)).await;
+    manager
+        .add_peer(&test_peer("peer1", selected_endpoint))
+        .await;
     manager
         .add_candidates_with_sources("peer1", &candidates, &candidate_sources)
         .await;

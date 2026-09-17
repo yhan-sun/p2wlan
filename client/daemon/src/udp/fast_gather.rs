@@ -94,11 +94,8 @@ impl UdpTransport {
                     }))
                     .await;
                     let local_addr = socket.local_addr().ok()?;
-                    let pool_report = candidate_report_from_observations(
-                        local_addr,
-                        false,
-                        observations,
-                    );
+                    let pool_report =
+                        candidate_report_from_observations(local_addr, false, observations);
                     Some((socket_index, pool_report))
                 }
             }))
@@ -115,12 +112,8 @@ impl UdpTransport {
                 // usable, so startup Direct and recovery use the same
                 // evidence that candidate signaling uses.
                 merge_pool_nat_profile(&mut report, &pool_report);
-                self.append_pool_candidates(
-                    &mut report,
-                    pool_report.candidates,
-                    socket_index,
-                )
-                .await;
+                self.append_pool_candidates(&mut report, pool_report.candidates, socket_index)
+                    .await;
             }
         }
 
@@ -181,20 +174,24 @@ impl UdpTransport {
         stun_timeout: Duration,
     ) {
         if report.nat_profile.udp_blocked
-            || report.nat_profile.mapping_behavior
-                != MappingBehavior::EndpointIndependent
+            || report.nat_profile.mapping_behavior != MappingBehavior::EndpointIndependent
             || report.nat_profile.filtering_behavior != FilteringBehavior::Unknown
         {
             return;
         }
 
-        let Some(server) = report.nat_profile.observations.iter().find_map(|observation| {
-            let server = observation.server.parse::<SocketAddr>().ok()?;
-            (observation.error.is_none()
-                && observation.mapped_address.is_some()
-                && stun_servers.contains(&server))
-            .then_some(server)
-        }) else {
+        let Some(server) = report
+            .nat_profile
+            .observations
+            .iter()
+            .find_map(|observation| {
+                let server = observation.server.parse::<SocketAddr>().ok()?;
+                (observation.error.is_none()
+                    && observation.mapped_address.is_some()
+                    && stun_servers.contains(&server))
+                .then_some(server)
+            })
+        else {
             return;
         };
         let timeout = stun_timeout_for_live_filtering_probe(stun_timeout);
@@ -221,7 +218,9 @@ impl UdpTransport {
 }
 
 fn stun_timeout_for_live_filtering_probe(timeout: Duration) -> Duration {
-    timeout.min(LIVE_FILTERING_PROBE_TIMEOUT).max(Duration::from_millis(50))
+    timeout
+        .min(LIVE_FILTERING_PROBE_TIMEOUT)
+        .max(Duration::from_millis(50))
 }
 
 fn classify_live_filtering_response(
@@ -285,8 +284,7 @@ fn merge_pool_nat_profile(
     report.nat_profile.public_ip_stable = Some(distinct_ips.len() == 1);
     report.nat_profile.public_port_stable = Some(distinct_ports.len() == 1);
     report.nat_profile.mapping_behavior = p2pnet_nat::MappingBehavior::AddressOrPortDependent;
-    report.nat_profile.filtering_behavior =
-        p2pnet_nat::FilteringBehavior::Unknown;
+    report.nat_profile.filtering_behavior = p2pnet_nat::FilteringBehavior::Unknown;
     report.nat_profile.likely_symmetric = Some(true);
     report.nat_profile.prediction_candidate = false;
     report.nat_profile.predicted_endpoints.clear();

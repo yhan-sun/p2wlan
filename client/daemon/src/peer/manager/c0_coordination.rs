@@ -147,19 +147,13 @@ impl PeerManager {
             MAX_C0_PAIRS_PER_GENERATION,
             outcome_label(outcome),
         );
-        self.record_direct_event(
-            peer_id,
-            "c0_attempt",
-            None,
-            None,
-            None,
-            detail.clone(),
-        )
-        .await;
+        self.record_direct_event(peer_id, "c0_attempt", None, None, None, detail.clone())
+            .await;
         // Exhaustion attribution is only for the bounded-cap case (misses);
         // a hit stops attempts via the ledger but is success, not depletion.
         if exhausted_now && !hit {
-            self.record_c0_exhaustion(peer_id, generation, epoch, &key).await;
+            self.record_c0_exhaustion(peer_id, generation, epoch, &key)
+                .await;
         }
         exhausted_now
     }
@@ -174,24 +168,28 @@ impl PeerManager {
         let requested = {
             let ledgers = self.c0_pair_ledgers.read().await;
             let ledger = ledgers.get(key);
-            ledger.map(|l| l.attempted_pairs.clone()).unwrap_or_default()
+            ledger
+                .map(|l| l.attempted_pairs.clone())
+                .unwrap_or_default()
         };
         let pairs = requested
             .iter()
-            .map(|p| {
-                format!(
-                    "({}, {})",
-                    p.local_fresh_endpoint, p.remote_fresh_endpoint
-                )
-            })
+            .map(|p| format!("({}, {})", p.local_fresh_endpoint, p.remote_fresh_endpoint))
             .collect::<Vec<_>>()
             .join(", ");
         let detail = format!(
             "no mutually-admitted (local_fresh, remote_fresh) pair found across C={} epochs -> relay fallback is correct (C=0); attempted_pairs=[{pairs}]",
             MAX_C0_PAIRS_PER_GENERATION,
         );
-        self.record_direct_event(peer_id, "c0_pairs_exhausted", None, None, None, detail.clone())
-            .await;
+        self.record_direct_event(
+            peer_id,
+            "c0_pairs_exhausted",
+            None,
+            None,
+            None,
+            detail.clone(),
+        )
+        .await;
         info!(
             event = "c0_pairs_exhausted",
             peer_id = %peer_id,
@@ -225,12 +223,7 @@ impl PeerManager {
         let conns = self.connections.read().await;
         conns
             .get(peer_id)
-            .map(|c| {
-                c.direct_events
-                    .iter()
-                    .filter(|e| e.stage == stage)
-                    .count()
-            })
+            .map(|c| c.direct_events.iter().filter(|e| e.stage == stage).count())
             .unwrap_or(0)
     }
 

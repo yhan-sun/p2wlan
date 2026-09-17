@@ -8,8 +8,7 @@ impl PeerManager {
         *self
             .relay_probe_snapshot_test_gate
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((node_id.to_string(), gate));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((node_id.to_string(), gate));
     }
 
     #[cfg(test)]
@@ -142,16 +141,14 @@ impl PeerManager {
             return None;
         }
         let peer_session_generation = self.peer_session_generation_sync(node_id)?;
-        let confirmed_on_transport = conns
-            .get(node_id)
-            .is_some_and(|conn| {
-                conn.online
-                    && conn.state != ConnectionState::Closed
-                    && conn.relay_confirmed_at.is_some()
-                    && conn.relay_confirmed_generation == Some(generation)
-                    && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
-                    && conn.relay_confirmed_connection_id == Some(relay_connection_id)
-            });
+        let confirmed_on_transport = conns.get(node_id).is_some_and(|conn| {
+            conn.online
+                && conn.state != ConnectionState::Closed
+                && conn.relay_confirmed_at.is_some()
+                && conn.relay_confirmed_generation == Some(generation)
+                && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
+                && conn.relay_confirmed_connection_id == Some(relay_connection_id)
+        });
         if !confirmed_on_transport {
             return None;
         }

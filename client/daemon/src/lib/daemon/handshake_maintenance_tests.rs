@@ -31,7 +31,10 @@ mod maintenance_integration_tests {
             .await
             .unwrap()
             .expect("a usable session must remain installed throughout local rekey retries");
-        assert_eq!(receiver.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(), expected);
+        assert_eq!(
+            receiver.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+            expected
+        );
     }
 
     #[tokio::test]
@@ -73,19 +76,23 @@ mod maintenance_integration_tests {
             None,
         );
         let init = initial.create_initiation().unwrap();
-        let mut responder = HandshakeResponder::new(NodeIdentity::from_private_key(remote_private), None);
+        let mut responder =
+            HandshakeResponder::new(NodeIdentity::from_private_key(remote_private), None);
         let (response, remote_keys) = responder.consume_initiation_and_respond(&init).unwrap();
         let local_keys = initial.consume_response(&response).unwrap();
         let mut old_remote_session = TransportSession::new(remote_keys);
-        daemon.transport.add_session(
-            peer.node_id.clone(),
-            TransportSession::new(local_keys).with_thresholds(
-                u64::MAX,
-                Duration::ZERO,
-                u64::MAX,
-                Duration::from_secs(8),
-            ),
-        ).await;
+        daemon
+            .transport
+            .add_session(
+                peer.node_id.clone(),
+                TransportSession::new(local_keys).with_thresholds(
+                    u64::MAX,
+                    Duration::ZERO,
+                    u64::MAX,
+                    Duration::from_secs(8),
+                ),
+            )
+            .await;
         let old_status = daemon.transport.session_status(&peer.node_id).await;
         assert!(old_status.has_active && old_status.needs_rekey && !old_status.expired);
         assert!(daemon.candidate_snapshot.read().await.is_none());
@@ -122,48 +129,100 @@ mod maintenance_integration_tests {
                 }
                 sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("local binding contention must have its own progress timer");
+        })
+        .await
+        .expect("local binding contention must have its own progress timer");
         assert!(offers.try_recv().is_err());
-        assert_eq!(daemon.pending_handshakes.lock().attempts.get(&peer.node_id).copied().unwrap_or(0), 0);
+        assert_eq!(
+            daemon
+                .pending_handshakes
+                .lock()
+                .attempts
+                .get(&peer.node_id)
+                .copied()
+                .unwrap_or(0),
+            0
+        );
         let another_reader = timeout(
             Duration::from_millis(200),
             daemon.peers.hold_connections_reader_for_test(),
-        ).await.expect("failed binding preparation must not queue a cleanup writer");
+        )
+        .await
+        .expect("failed binding preparation must not queue a cleanup writer");
         drop(another_reader);
         for sequence in 0..16 {
-            assert_business_decrypts(&daemon.transport, &peer.node_id, &mut old_remote_session, sequence).await;
+            assert_business_decrypts(
+                &daemon.transport,
+                &peer.node_id,
+                &mut old_remote_session,
+                sequence,
+            )
+            .await;
         }
 
         // No kick and no additional traffic is sent after releasing the lock.
         // Only the maintenance-owned retry timer can progress before the scan.
         drop(reader);
-        let offer = timeout(Duration::from_secs(2), offers.recv()).await
+        let offer = timeout(Duration::from_secs(2), offers.recv())
+            .await
             .expect("rekey must send without waiting for the ten-second scan")
             .expect("critical offer observer closed");
         assert_eq!(offer.to_node_id, peer.node_id);
         assert!(offer.candidates.is_empty());
-        assert_eq!(daemon.pending_handshakes.lock().attempts.get(&peer.node_id).copied(), Some(1));
-        assert_business_decrypts(&daemon.transport, &peer.node_id, &mut old_remote_session, 16).await;
+        assert_eq!(
+            daemon
+                .pending_handshakes
+                .lock()
+                .attempts
+                .get(&peer.node_id)
+                .copied(),
+            Some(1)
+        );
+        assert_business_decrypts(
+            &daemon.transport,
+            &peer.node_id,
+            &mut old_remote_session,
+            16,
+        )
+        .await;
 
         // Complete the real Noise response through the daemon answer handler,
         // then authenticate business ciphertext under the newly derived key.
         let initiation = MessageInitiation::from_bytes(&offer.handshake_init).unwrap();
-        let mut responder = HandshakeResponder::new(NodeIdentity::from_private_key(remote_private), None);
-        let (answer, remote_keys) = responder.consume_initiation_and_respond(&initiation).unwrap();
+        let mut responder =
+            HandshakeResponder::new(NodeIdentity::from_private_key(remote_private), None);
+        let (answer, remote_keys) = responder
+            .consume_initiation_and_respond(&initiation)
+            .unwrap();
         let mut new_remote_session = TransportSession::new(remote_keys);
         let (_, response_probe_public) = new_probe_ephemeral_keypair();
-        assert!(daemon.handle_peer_answer(
-            &peer.node_id,
-            &answer.to_bytes(),
-            offer.session_id,
-            Some(response_probe_public),
-        ).await.unwrap());
+        assert!(daemon
+            .handle_peer_answer(
+                &peer.node_id,
+                &answer.to_bytes(),
+                offer.session_id,
+                Some(response_probe_public),
+            )
+            .await
+            .unwrap());
         let new_status = daemon.transport.session_status(&peer.node_id).await;
         assert!(new_status.has_active && !new_status.expired && !new_status.needs_rekey);
-        assert_ne!(new_status.active_session_instance, old_status.active_session_instance);
-        assert_eq!(new_status.previous_session_instance, old_status.active_session_instance);
+        assert_ne!(
+            new_status.active_session_instance,
+            old_status.active_session_instance
+        );
+        assert_eq!(
+            new_status.previous_session_instance,
+            old_status.active_session_instance
+        );
         for sequence in 17..33 {
-            assert_business_decrypts(&daemon.transport, &peer.node_id, &mut new_remote_session, sequence).await;
+            assert_business_decrypts(
+                &daemon.transport,
+                &peer.node_id,
+                &mut new_remote_session,
+                sequence,
+            )
+            .await;
         }
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
@@ -187,32 +246,57 @@ mod maintenance_integration_tests {
         };
         daemon.peers.add_peer(&peer).await;
         let generation = daemon.peers.current_network_generation_sync();
-        let peer_generation = daemon.peers.peer_session_generation_sync(&peer.node_id).unwrap();
-        let MaintenanceInitiatorReservationOutcome::Reserved { reservation, .. } = try_reserve_maintenance_initiator(
-            &daemon.pending_handshakes,
-            &daemon.handshake_arbiter,
-            &peer.node_id,
-            generation,
-            peer_generation,
-        ) else {
+        let peer_generation = daemon
+            .peers
+            .peer_session_generation_sync(&peer.node_id)
+            .unwrap();
+        let MaintenanceInitiatorReservationOutcome::Reserved { reservation, .. } =
+            try_reserve_maintenance_initiator(
+                &daemon.pending_handshakes,
+                &daemon.handshake_arbiter,
+                &peer.node_id,
+                generation,
+                peer_generation,
+            )
+        else {
             panic!("maintenance reservation must be available");
         };
         let epoch = daemon.peers.network_epoch_gate();
         let guard = epoch.lock().await;
-        assert_eq!(try_stage_maintenance_probe_binding(&daemon.peers, &peer.node_id, &reservation, "attempt"), MaintenanceBindingOutcome::Retry("network_epoch_contended"));
+        assert_eq!(
+            try_stage_maintenance_probe_binding(
+                &daemon.peers,
+                &peer.node_id,
+                &reservation,
+                "attempt"
+            ),
+            MaintenanceBindingOutcome::Retry("network_epoch_contended")
+        );
         drop(guard);
         let reader = daemon.peers.hold_connections_reader_for_test().await;
-        assert_eq!(try_stage_maintenance_probe_binding(&daemon.peers, &peer.node_id, &reservation, "attempt"), MaintenanceBindingOutcome::Retry("connections_contended"));
+        assert_eq!(
+            try_stage_maintenance_probe_binding(
+                &daemon.peers,
+                &peer.node_id,
+                &reservation,
+                "attempt"
+            ),
+            MaintenanceBindingOutcome::Retry("connections_contended")
+        );
         drop(reader);
         let mut capacity_reached = false;
         for index in 0..64 {
-            match daemon.peers.stage_probe_session_binding(
-                &peer.node_id,
-                format!("occupant-{index}"),
-                Some(format!("occupant-{index}")),
-                None,
-                false,
-            ).await {
+            match daemon
+                .peers
+                .stage_probe_session_binding(
+                    &peer.node_id,
+                    format!("occupant-{index}"),
+                    Some(format!("occupant-{index}")),
+                    None,
+                    false,
+                )
+                .await
+            {
                 ProbeBindingStage::Staged => {}
                 ProbeBindingStage::Busy => {
                     capacity_reached = true;
@@ -222,13 +306,48 @@ mod maintenance_integration_tests {
             }
         }
         assert!(capacity_reached);
-        assert_eq!(try_stage_maintenance_probe_binding(&daemon.peers, &peer.node_id, &reservation, "attempt"), MaintenanceBindingOutcome::Retry("binding_capacity"));
-        assert!(daemon.peers.try_discard_pending_probe_session_binding(&peer.node_id, "occupant-0").unwrap());
-        assert_eq!(try_stage_maintenance_probe_binding(&daemon.peers, &peer.node_id, &reservation, "attempt"), MaintenanceBindingOutcome::Staged);
-        assert_eq!(try_stage_maintenance_probe_binding(&daemon.peers, &peer.node_id, &reservation, "attempt"), MaintenanceBindingOutcome::Cancel("binding_duplicate"));
+        assert_eq!(
+            try_stage_maintenance_probe_binding(
+                &daemon.peers,
+                &peer.node_id,
+                &reservation,
+                "attempt"
+            ),
+            MaintenanceBindingOutcome::Retry("binding_capacity")
+        );
+        assert!(daemon
+            .peers
+            .try_discard_pending_probe_session_binding(&peer.node_id, "occupant-0")
+            .unwrap());
+        assert_eq!(
+            try_stage_maintenance_probe_binding(
+                &daemon.peers,
+                &peer.node_id,
+                &reservation,
+                "attempt"
+            ),
+            MaintenanceBindingOutcome::Staged
+        );
+        assert_eq!(
+            try_stage_maintenance_probe_binding(
+                &daemon.peers,
+                &peer.node_id,
+                &reservation,
+                "attempt"
+            ),
+            MaintenanceBindingOutcome::Cancel("binding_duplicate")
+        );
         daemon.peers.remove_peer(&peer.node_id).await;
         daemon.peers.add_peer(&peer).await;
-        assert_eq!(try_stage_maintenance_probe_binding(&daemon.peers, &peer.node_id, &reservation, "attempt"), MaintenanceBindingOutcome::Cancel("stale_lifecycle"));
+        assert_eq!(
+            try_stage_maintenance_probe_binding(
+                &daemon.peers,
+                &peer.node_id,
+                &reservation,
+                "attempt"
+            ),
+            MaintenanceBindingOutcome::Cancel("stale_lifecycle")
+        );
     }
 
     #[test]
@@ -241,7 +360,13 @@ mod maintenance_integration_tests {
         };
         let mut retries = MaintenancePreparationRetries::default();
         for index in 0..MAX_MAINTENANCE_RETRIES + 10 {
-            retries.schedule(&format!("peer-{index}"), identity, None, "connections_contended", now);
+            retries.schedule(
+                &format!("peer-{index}"),
+                identity,
+                None,
+                "connections_contended",
+                now,
+            );
         }
         assert_eq!(retries.entries.len(), MAX_MAINTENANCE_RETRIES);
         for _ in 0..100 {

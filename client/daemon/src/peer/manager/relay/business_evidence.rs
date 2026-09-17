@@ -36,8 +36,7 @@ impl PeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
         Self::prune_pending_relay_business_evidence_locked(&mut pending, now);
-        if now.saturating_duration_since(evidence.received_at)
-            > PENDING_RELAY_BUSINESS_EVIDENCE_TTL
+        if now.saturating_duration_since(evidence.received_at) > PENDING_RELAY_BUSINESS_EVIDENCE_TTL
         {
             return false;
         }
@@ -79,13 +78,16 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::prune_pending_relay_business_evidence_locked(&mut pending, now);
-        pending.get(node_id).filter(|evidence| {
-            evidence.network_generation == generation
-                && evidence.peer_session_generation == peer_session_generation
-                && evidence.wireguard_session_instance == wireguard_session_instance
-                && evidence.relay_endpoint == relay_endpoint
-                && evidence.relay_connection_id == relay_connection_id
-        }).cloned()
+        pending
+            .get(node_id)
+            .filter(|evidence| {
+                evidence.network_generation == generation
+                    && evidence.peer_session_generation == peer_session_generation
+                    && evidence.wireguard_session_instance == wireguard_session_instance
+                    && evidence.relay_endpoint == relay_endpoint
+                    && evidence.relay_connection_id == relay_connection_id
+            })
+            .cloned()
     }
 
     fn remove_pending_relay_business_evidence_if_exact(
@@ -114,9 +116,9 @@ impl PeerManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::prune_pending_relay_business_evidence_locked(&mut pending, now);
-        pending.get(&evidence.peer_id).is_some_and(|current| {
-            Self::pending_relay_business_evidence_matches(current, evidence)
-        })
+        pending
+            .get(&evidence.peer_id)
+            .is_some_and(|current| Self::pending_relay_business_evidence_matches(current, evidence))
     }
 
     #[cfg(test)]
@@ -506,14 +508,14 @@ impl PeerManager {
             && conn.relay_confirmed_endpoint.as_deref() == Some(relay_endpoint)
             && conn.relay_confirmed_connection_id == relay_connection_id;
         if !confirmed {
-            let current_relay_incarnation_mismatch =
-                (conn.relay_ready_generation == Some(generation)
-                    && (conn.relay_ready_endpoint.as_deref() != Some(relay_endpoint)
-                        || conn.relay_ready_connection_id != relay_connection_id))
-                    || (conn.relay_confirmed_at.is_some()
-                        && conn.relay_confirmed_generation == Some(generation)
-                        && (conn.relay_confirmed_endpoint.as_deref() != Some(relay_endpoint)
-                            || conn.relay_confirmed_connection_id != relay_connection_id));
+            let current_relay_incarnation_mismatch = (conn.relay_ready_generation
+                == Some(generation)
+                && (conn.relay_ready_endpoint.as_deref() != Some(relay_endpoint)
+                    || conn.relay_ready_connection_id != relay_connection_id))
+                || (conn.relay_confirmed_at.is_some()
+                    && conn.relay_confirmed_generation == Some(generation)
+                    && (conn.relay_confirmed_endpoint.as_deref() != Some(relay_endpoint)
+                        || conn.relay_confirmed_connection_id != relay_connection_id));
             if current_relay_incarnation_mismatch {
                 drop(conns);
                 self.remove_pending_relay_business_evidence_if_exact(&evidence);
@@ -548,8 +550,7 @@ impl PeerManager {
                 observation: RelayBusinessObservation::Received,
             },
             |conn| {
-                first_receive =
-                    conn.relay_first.business_received_generation != Some(generation);
+                first_receive = conn.relay_first.business_received_generation != Some(generation);
                 if first_receive {
                     conn.relay_first.business_received_generation = Some(generation);
                 }
@@ -612,11 +613,13 @@ impl PeerManager {
                 relay_connection_id,
             );
         }
-        finish(if first_receive || exchange_confirmed || first_usable_recorded {
-            RelayBusinessEvidenceCommitOutcome::Committed
-        } else {
-            RelayBusinessEvidenceCommitOutcome::AlreadyCurrent
-        })
+        finish(
+            if first_receive || exchange_confirmed || first_usable_recorded {
+                RelayBusinessEvidenceCommitOutcome::Committed
+            } else {
+                RelayBusinessEvidenceCommitOutcome::AlreadyCurrent
+            },
+        )
     }
 
     /// The per-peer first-usable instant, if any (daemon-local monotonic).

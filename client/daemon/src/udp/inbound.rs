@@ -547,8 +547,7 @@ impl UdpTransport {
                                         .saturating_add(1)
                                 })
                                 .await;
-                                if let Some(token) =
-                                    self.hard_hard_socket_token(socket_index).await
+                                if let Some(token) = self.hard_hard_socket_token(socket_index).await
                                 {
                                     hard_hard_winner_promoted = self
                                         .promote_hard_hard_winner_in_epoch(
@@ -718,11 +717,8 @@ impl UdpTransport {
                                 // validation ingress on the already-finalized
                                 // socket before the short rendezvous cleanup
                                 // can race that worker.
-                                self.trigger_encrypted_validation(
-                                    &identity.source_node_id,
-                                    source,
-                                )
-                                .await;
+                                self.trigger_encrypted_validation(&identity.source_node_id, source)
+                                    .await;
                             }
                         } else {
                             debug!(
@@ -952,8 +948,7 @@ impl UdpTransport {
                             let socket_epoch = pending.socket_epoch;
                             let hard_hard_winner_promoted =
                                 if let Some(token) = hard_hard_token.as_deref() {
-                                    self
-                                    .promote_hard_hard_winner_in_epoch(
+                                    self.promote_hard_hard_winner_in_epoch(
                                         &epoch_guard,
                                         &identity.source_node_id,
                                         token,
@@ -1500,7 +1495,8 @@ impl UdpTransport {
             let transport_queue_send_started = Instant::now();
             let queue_depth_before_send = inbound_tx
                 .max_capacity()
-                .saturating_sub(inbound_tx.capacity()) as u64;
+                .saturating_sub(inbound_tx.capacity())
+                as u64;
             inbound_tx
                 .send(ReceivedEncryptedPacket {
                     source: Some(source),
@@ -1543,7 +1539,8 @@ impl UdpTransport {
             );
             self.update_socket_diagnostics_try(socket_index, |metrics| {
                 metrics.datagrams_received = metrics.datagrams_received.saturating_add(1);
-                metrics.encrypted_packets_received = metrics.encrypted_packets_received.saturating_add(1);
+                metrics.encrypted_packets_received =
+                    metrics.encrypted_packets_received.saturating_add(1);
             });
 
             debug!("Received {n} encrypted UDP bytes from {source}");

@@ -149,19 +149,13 @@ impl HardHardCleanupGate {
 
     pub(crate) async fn wait_for_reached(&self) {
         loop {
-            if self
-                .reached_flag
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.reached_flag.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
             let notified = self.reached.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self
-                .reached_flag
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.reached_flag.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
             notified.await;
@@ -438,8 +432,7 @@ pub struct PeerManager {
     #[cfg(test)]
     relay_probe_snapshot_test_gate: RelayProbeSnapshotTestGateSlot,
     #[cfg(test)]
-    hard_hard_cleanup_gate:
-        Arc<std::sync::Mutex<Option<HardHardCleanupGateRegistration>>>,
+    hard_hard_cleanup_gate: Arc<std::sync::Mutex<Option<HardHardCleanupGateRegistration>>>,
     #[cfg(test)]
     peer_add_wait_started_test_tx:
         Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
@@ -456,16 +449,14 @@ pub struct PeerManager {
     /// No-await projection of the typed state machine's committed business
     /// path. Unlike `diagnostics_cache`, this is updated at the sole path commit
     /// point and therefore never reports stale readiness under writer pressure.
-    committed_business_paths:
-        Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
+    committed_business_paths: Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
     /// Latest-value notification for committed path/lifecycle/epoch changes.
     committed_business_path_change_tx: tokio::sync::watch::Sender<u64>,
     /// Session-bound DPLPMTUD capability mirror.  The immutable map survives
     /// a UDP transport replacement, so a modern peer cannot temporarily fall
     /// back to legacy business sending while the replacement exact path is
     /// still re-confirming BASE.
-    dplpmtud_capability_tx:
-        tokio::sync::watch::Sender<Arc<HashMap<String, PeerSessionGeneration>>>,
+    dplpmtud_capability_tx: tokio::sync::watch::Sender<Arc<HashMap<String, PeerSessionGeneration>>>,
     /// Latest-value wakeup for Direct business-budget publication changes.
     /// The actual budget remains owned by the concrete UDP transport; this
     /// sequence is only an event-driven queue wakeup.
@@ -652,8 +643,7 @@ pub struct PeerManager {
     /// Lock-free exact pair selected by the latest Direct commit.  Hard↔Hard
     /// confirmation reads this beside `direct_commit_seq_mirror` so a
     /// contended connection writer cannot delay the grace timer.
-    direct_commit_pair_mirror:
-        Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
+    direct_commit_pair_mirror: Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
     /// Lock-free per-peer relay-confirm sequence mirror.  Bumped (and notified)
     /// whenever a peer's forced-relay encrypted probe/ACK confirms the relay
     /// path, so the outbound actor can flush a waiting first packet the moment

@@ -13,7 +13,9 @@ fn authoritative_rtt_replaces_probe_once_then_keeps_ewma_history() {
     // it must not reset the EWMA to the newest raw value.
     health.record_success_with_authoritative_latency(Duration::from_millis(40));
     assert_eq!(health.latency_ms, Some(40));
-    assert!(health.rtt_ewma_ms.is_some_and(|ewma| (20..40).contains(&ewma)));
+    assert!(health
+        .rtt_ewma_ms
+        .is_some_and(|ewma| (20..40).contains(&ewma)));
 }
 
 #[test]
@@ -147,41 +149,49 @@ async fn first_usable_rejects_stale_generation_and_retired_peer_packets() {
     manager
         .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", "relay.test:443", old_generation)
-        .await);
-    assert!(manager
-        .record_verified_first_usable(
-            "peer1",
-            old_generation,
-            NetworkPath::Relay,
-            "relay:relay.test:443",
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+            .await
+    );
+    assert!(
+        manager
+            .record_verified_first_usable(
+                "peer1",
+                old_generation,
+                NetworkPath::Relay,
+                "relay:relay.test:443",
+            )
+            .await
+    );
 
     let new_generation = manager.advance_network_generation("air_restart").await;
     assert!(new_generation > old_generation);
-    assert!(!manager
-        .record_verified_first_usable(
-            "peer1",
-            old_generation,
-            NetworkPath::Relay,
-            "relay:relay.test:443",
-        )
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable(
+                "peer1",
+                old_generation,
+                NetworkPath::Relay,
+                "relay:relay.test:443",
+            )
+            .await
+    );
 
     {
         let mut connections = manager.connections.write().await;
         connections.get_mut("peer1").unwrap().online = false;
     }
-    assert!(!manager
-        .record_verified_first_usable(
-            "peer1",
-            new_generation,
-            NetworkPath::Relay,
-            "relay:relay.test:443",
-        )
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable(
+                "peer1",
+                new_generation,
+                NetworkPath::Relay,
+                "relay:relay.test:443",
+            )
+            .await
+    );
 
     {
         let mut connections = manager.connections.write().await;
@@ -189,14 +199,16 @@ async fn first_usable_rejects_stale_generation_and_retired_peer_packets() {
         connection.online = true;
         connection.transition(ConnectionState::Closed);
     }
-    assert!(!manager
-        .record_verified_first_usable(
-            "peer1",
-            new_generation,
-            NetworkPath::Relay,
-            "relay:relay.test:443",
-        )
-        .await);
+    assert!(
+        !manager
+            .record_verified_first_usable(
+                "peer1",
+                new_generation,
+                NetworkPath::Relay,
+                "relay:relay.test:443",
+            )
+            .await
+    );
 }
 
 #[tokio::test]
@@ -209,9 +221,11 @@ async fn first_usable_commit_is_serialized_with_generation_advance() {
     manager
         .mark_relay_transport_ready("peer1", "relay.test:443", generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", "relay.test:443", generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", generation)
+            .await
+    );
 
     // Hold the same gate as Air/network restart. A stale evidence writer may
     // not pass its generation check and mutate the connection until the
@@ -236,7 +250,9 @@ async fn first_usable_commit_is_serialized_with_generation_advance() {
     drop(epoch_guard);
     assert!(record_task.await.unwrap());
 
-    let next_generation = manager.advance_network_generation("serialized_restart").await;
+    let next_generation = manager
+        .advance_network_generation("serialized_restart")
+        .await;
     assert!(next_generation > generation);
     assert_eq!(
         manager
@@ -259,11 +275,15 @@ async fn relay_confirmation_and_business_markers_reject_retired_generation() {
     manager
         .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
         .await;
-    assert!(manager
-        .confirm_relay_peer("peer1", "relay.test:443", old_generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+            .await
+    );
 
-    let new_generation = manager.advance_network_generation("retire_relay_state").await;
+    let new_generation = manager
+        .advance_network_generation("retire_relay_state")
+        .await;
     assert!(new_generation > old_generation);
 
     // Every relay state writer must fail closed after the generation advance;
@@ -272,19 +292,25 @@ async fn relay_confirmation_and_business_markers_reject_retired_generation() {
     manager
         .mark_relay_transport_ready("peer1", "relay.test:443", old_generation)
         .await;
-    assert!(!manager
-        .confirm_relay_peer("peer1", "relay.test:443", old_generation)
-        .await);
-    assert!(!manager
-        .mark_relay_first_business_sent_for_generation("peer1", old_generation)
-        .await);
-    assert!(!manager
-        .mark_relay_first_business_received_for_generation(
-            "peer1",
-            "relay.test:443",
-            old_generation,
-        )
-        .await);
+    assert!(
+        !manager
+            .confirm_relay_peer("peer1", "relay.test:443", old_generation)
+            .await
+    );
+    assert!(
+        !manager
+            .mark_relay_first_business_sent_for_generation("peer1", old_generation)
+            .await
+    );
+    assert!(
+        !manager
+            .mark_relay_first_business_received_for_generation(
+                "peer1",
+                "relay.test:443",
+                old_generation,
+            )
+            .await
+    );
 
     let connection = manager.get_connection("peer1").await.unwrap();
     assert_eq!(connection.relay_ready_generation, None);
@@ -313,7 +339,11 @@ async fn generation_advance_wins_over_nonqueued_relay_confirmation() {
     let epoch_guard = epoch_gate.lock().await;
     let advance_task = tokio::spawn({
         let manager = manager.clone();
-        async move { manager.advance_network_generation("queued_before_old_ack").await }
+        async move {
+            manager
+                .advance_network_generation("queued_before_old_ack")
+                .await
+        }
     });
     tokio::task::yield_now().await;
     assert!(!advance_task.is_finished());
@@ -468,7 +498,9 @@ async fn relay_validation_targets_include_slow_direct_but_skip_fast_direct() {
 
     manager.add_peer(&test_peer("fast", fast_endpoint)).await;
     manager.add_peer(&test_peer("slow", slow_endpoint)).await;
-    manager.add_peer(&test_peer("offline", "127.0.0.1:51847".parse().unwrap())).await;
+    manager
+        .add_peer(&test_peer("offline", "127.0.0.1:51847".parse().unwrap()))
+        .await;
     {
         let mut conns = manager.connections.write().await;
         let fast = conns.get_mut("fast").unwrap();

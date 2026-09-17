@@ -176,14 +176,17 @@ fn canonical_network_identity_ignores_capped_prediction_window_churn() {
     fn prepared_identity(first_port: u16) -> Vec<String> {
         let host = "192.168.0.239:56255".to_string();
         let mut candidates = vec![host.clone()];
-        candidates.extend(
-            (first_port..first_port + 120).map(|port| format!("93.184.216.34:{port}")),
-        );
+        candidates
+            .extend((first_port..first_port + 120).map(|port| format!("93.184.216.34:{port}")));
         let mut sources = candidates
             .iter()
             .cloned()
             .map(|endpoint| {
-                let source = if endpoint == host { "host" } else { "predicted" };
+                let source = if endpoint == host {
+                    "host"
+                } else {
+                    "predicted"
+                };
                 (endpoint, source.to_string())
             })
             .collect::<HashMap<_, _>>();
@@ -210,8 +213,9 @@ fn identity_only_candidate_refresh_still_requires_commit() {
 
 #[test]
 fn signal_candidate_cap_balances_disjoint_prediction_windows() {
-    let mut candidates =
-        (40_000..40_007).map(|port| format!("203.0.113.10:{port}")).collect::<Vec<_>>();
+    let mut candidates = (40_000..40_007)
+        .map(|port| format!("203.0.113.10:{port}"))
+        .collect::<Vec<_>>();
     candidates.extend((41_000..41_080).map(|port| format!("203.0.113.10:{port}")));
     candidates.extend((42_000..42_080).map(|port| format!("203.0.113.10:{port}")));
     let mut sources = candidates
@@ -220,10 +224,7 @@ fn signal_candidate_cap_balances_disjoint_prediction_windows() {
         .map(|endpoint| (endpoint, "predicted".to_string()))
         .collect::<HashMap<_, _>>();
     for port in 40_000..40_007 {
-        sources.insert(
-            format!("203.0.113.10:{port}"),
-            "stun_observed".to_string(),
-        );
+        sources.insert(format!("203.0.113.10:{port}"), "stun_observed".to_string());
     }
 
     compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
@@ -239,7 +240,10 @@ fn signal_candidate_cap_balances_disjoint_prediction_windows() {
         .count();
     assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES);
     assert!(first_window >= 40, "first window retained {first_window}");
-    assert!(second_window >= 40, "second window retained {second_window}");
+    assert!(
+        second_window >= 40,
+        "second window retained {second_window}"
+    );
     assert!(candidates.contains(&"203.0.113.10:42001".to_string()));
 }
 
@@ -403,8 +407,14 @@ fn candidate_refresh_generation_ignores_external_overlay_and_public_port_churn()
         "220.163.6.190:6984".to_string(),
     ];
     let previous_sources = HashMap::from([
-        ("tailscale.example.com:60155".to_string(), "host".to_string()),
-        ("tailscale.example.com:58770".to_string(), "host".to_string()),
+        (
+            "tailscale.example.com:60155".to_string(),
+            "host".to_string(),
+        ),
+        (
+            "tailscale.example.com:58770".to_string(),
+            "host".to_string(),
+        ),
         (
             "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
             "host".to_string(),
@@ -428,8 +438,14 @@ fn candidate_refresh_generation_ignores_external_overlay_and_public_port_churn()
         "220.163.6.190:6995".to_string(),
     ];
     let next_sources = HashMap::from([
-        ("tailscale.example.com:59581".to_string(), "host".to_string()),
-        ("tailscale.example.com:60155".to_string(), "host".to_string()),
+        (
+            "tailscale.example.com:59581".to_string(),
+            "host".to_string(),
+        ),
+        (
+            "tailscale.example.com:60155".to_string(),
+            "host".to_string(),
+        ),
         (
             "[fd7a:115c:a1e0::b936:4102]:60155".to_string(),
             "host".to_string(),
@@ -666,13 +682,7 @@ fn fresh_window_survives_full_candidate_set_with_order_and_budget() {
     // Scenario from the field: 96 ordinary candidates are already gathered
     // when a fresh-mapping prediction window must be signaled.
     let mut candidates = (1..=MAX_SIGNAL_CANDIDATES)
-        .map(|index| {
-            format!(
-                "198.51.100.{}:{}",
-                index % 32 + 1,
-                40000 + index
-            )
-        })
+        .map(|index| format!("198.51.100.{}:{}", index % 32 + 1, 40000 + index))
         .collect::<Vec<_>>();
     let mut sources = candidates
         .iter()
@@ -731,8 +741,7 @@ fn fresh_window_survives_full_candidate_set_with_order_and_budget() {
     );
     // Fresh candidates lead the list so the receiver probes top-1 first.
     assert_eq!(
-        candidates[0],
-        "203.0.113.10:45393",
+        candidates[0], "203.0.113.10:45393",
         "fresh top-1 must stay first"
     );
     // Every surviving fresh endpoint carries the fresh label.
@@ -775,9 +784,18 @@ fn malformed_and_zero_generation_labels_do_not_claim_fresh_budget() {
     // Malformed labels and generation zero are NOT fresh: they degrade to
     // ordinary predicted candidates and must not reserve the fresh budget.
     for (endpoint, label) in [
-        ("203.0.113.10:46001", format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}garbage")),
-        ("203.0.113.10:46002", format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}{boot}:0")),
-        ("203.0.113.10:46003", format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}39")),
+        (
+            "203.0.113.10:46001",
+            format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}garbage"),
+        ),
+        (
+            "203.0.113.10:46002",
+            format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}{boot}:0"),
+        ),
+        (
+            "203.0.113.10:46003",
+            format!("{FRESH_PREDICTION_SOURCE_LABEL_PREFIX}39"),
+        ),
         ("203.0.113.10:46004", "predicted".to_string()),
     ] {
         candidates.push(endpoint.to_string());
@@ -872,8 +890,7 @@ fn fresh_window_mixes_with_lan_hosts_and_multiple_public_ips() {
         .collect::<Vec<_>>();
     assert_eq!(
         window_ports,
-        (45393u16..45393u16 + (MAX_SIGNAL_FRESH_WINDOW_CANDIDATES - 3) as u16)
-            .collect::<Vec<_>>()
+        (45393u16..45393u16 + (MAX_SIGNAL_FRESH_WINDOW_CANDIDATES - 3) as u16).collect::<Vec<_>>()
     );
     // Ordinary predicted may or may not survive the STUN-filled budget; if it
     // does it stays an ordinary predicted candidate.

@@ -43,7 +43,12 @@ async fn c0_budget_bounded_and_exhausts_after_cap_misses() {
             )
             .await;
         // The final attempt (index == cap-1) exhausts the budget.
-        assert_eq!(exhausted, i == MAX_C0_PAIRS_PER_GENERATION - 1, "attempt {}", i + 1);
+        assert_eq!(
+            exhausted,
+            i == MAX_C0_PAIRS_PER_GENERATION - 1,
+            "attempt {}",
+            i + 1
+        );
     }
 
     // Budget exhausted: no further admission.
@@ -53,7 +58,10 @@ async fn c0_budget_bounded_and_exhausts_after_cap_misses() {
         MAX_C0_PAIRS_PER_GENERATION
     );
 
-    let ledger = manager.c0_ledger_snapshot("peer-c0", gen).await.expect("ledger present");
+    let ledger = manager
+        .c0_ledger_snapshot("peer-c0", gen)
+        .await
+        .expect("ledger present");
     assert_eq!(
         ledger.attempted_count(),
         MAX_C0_PAIRS_PER_GENERATION,
@@ -63,7 +71,9 @@ async fn c0_budget_bounded_and_exhausts_after_cap_misses() {
     assert!(ledger.is_exhausted(), "ledger must be marked exhausted");
 
     assert_eq!(
-        manager.c0_event_count("peer-c0", "c0_pairs_exhausted").await,
+        manager
+            .c0_event_count("peer-c0", "c0_pairs_exhausted")
+            .await,
         1,
         "c0_pairs_exhausted attributed exactly once"
     );
@@ -96,7 +106,10 @@ async fn c0_hit_stops_further_attempts_immediately() {
         !manager.c0_pair_admission("peer-hit", gen).await,
         "a hit must stop all further C=0 attempts for the generation"
     );
-    let ledger = manager.c0_ledger_snapshot("peer-hit", gen).await.expect("ledger present");
+    let ledger = manager
+        .c0_ledger_snapshot("peer-hit", gen)
+        .await
+        .expect("ledger present");
     assert_eq!(ledger.attempted_count(), 1, "only the hit pair recorded");
     assert!(ledger.is_exhausted(), "hit ledger is finished");
     assert_eq!(manager.c0_event_count("peer-hit", "c0_attempt").await, 1);
@@ -133,11 +146,17 @@ async fn c0_generation_change_resets_ledger() {
         "generation change must reset the C=0 budget"
     );
     assert!(
-        manager.c0_ledger_snapshot("peer-gen", next_gen).await.is_none(),
+        manager
+            .c0_ledger_snapshot("peer-gen", next_gen)
+            .await
+            .is_none(),
         "no ledger yet for the new generation"
     );
     // The exhausted old-generation ledger is untouched.
-    let old = manager.c0_ledger_snapshot("peer-gen", gen).await.expect("old ledger present");
+    let old = manager
+        .c0_ledger_snapshot("peer-gen", gen)
+        .await
+        .expect("old ledger present");
     assert!(old.is_exhausted(), "old generation ledger stays exhausted");
 }
 
@@ -175,7 +194,10 @@ async fn c0_attempt_distinguishes_distinct_pair_by_epoch_and_endpoints() {
         )
         .await;
 
-    let ledger = manager.c0_ledger_snapshot("peer-pairs", gen).await.expect("ledger present");
+    let ledger = manager
+        .c0_ledger_snapshot("peer-pairs", gen)
+        .await
+        .expect("ledger present");
     assert_eq!(ledger.attempted_count(), 2);
     assert_eq!(
         ledger.attempted_pairs[0].pair_index, 0,
@@ -240,7 +262,10 @@ async fn c0_retry_after_hit_is_rejected_without_double_record() {
         )
         .await;
     assert!(exhausted, "post-hit retry reports exhaust/stop");
-    let ledger = manager.c0_ledger_snapshot("peer-retry", gen).await.expect("ledger present");
+    let ledger = manager
+        .c0_ledger_snapshot("peer-retry", gen)
+        .await
+        .expect("ledger present");
     assert_eq!(ledger.attempted_count(), 2, "no third pair recorded");
     assert_eq!(manager.c0_event_count("peer-retry", "c0_attempt").await, 2);
 }

@@ -88,27 +88,19 @@ fn parse_lifecycle_probe_args(
             }
             TRAY_COUNT_FLAG => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    lifecycle_probe_error(
-                        "--test-tray-event-count requires a value",
-                    )
+                    lifecycle_probe_error("--test-tray-event-count requires a value")
                 })?;
                 count = value.parse::<usize>().map_err(|_| {
-                    lifecycle_probe_error(
-                        "--test-tray-event-count must be an integer",
-                    )
+                    lifecycle_probe_error("--test-tray-event-count must be an integer")
                 })?;
                 index += 2;
             }
             TRAY_DELAY_FLAG => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    lifecycle_probe_error(
-                        "--test-tray-event-delay-ms requires a value",
-                    )
+                    lifecycle_probe_error("--test-tray-event-delay-ms requires a value")
                 })?;
                 delay_ms = value.parse::<u64>().map_err(|_| {
-                    lifecycle_probe_error(
-                        "--test-tray-event-delay-ms must be an integer",
-                    )
+                    lifecycle_probe_error("--test-tray-event-delay-ms must be an integer")
                 })?;
                 index += 2;
             }
@@ -126,9 +118,7 @@ fn parse_lifecycle_probe_args(
         ));
     }
     let event = event.ok_or_else(|| {
-        lifecycle_probe_error(
-            "--test-tray-event-source requires --test-tray-event",
-        )
+        lifecycle_probe_error("--test-tray-event-source requires --test-tray-event")
     })?;
     if !(1..=1024).contains(&count) {
         return Err(lifecycle_probe_error(
@@ -182,16 +172,13 @@ fn emit_binary_lifecycle_probe() -> p2pnet_daemon::Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     serde_json::to_writer(&mut output, &payload).map_err(|error| {
-        lifecycle_probe_error(format!(
-            "failed to serialize binary response: {error}",
-        ))
+        lifecycle_probe_error(format!("failed to serialize binary response: {error}",))
     })?;
     std::io::Write::write_all(&mut output, b"\n").map_err(|error| {
         lifecycle_probe_error(format!("failed to write binary response: {error}"))
     })?;
-    std::io::Write::flush(&mut output).map_err(|error| {
-        lifecycle_probe_error(format!("failed to flush binary response: {error}"))
-    })
+    std::io::Write::flush(&mut output)
+        .map_err(|error| lifecycle_probe_error(format!("failed to flush binary response: {error}")))
 }
 
 fn emit_tray_lifecycle_probe(
@@ -204,15 +191,11 @@ fn emit_tray_lifecycle_probe(
     })?;
     let base_sequence = base_event
         .as_object()
-        .ok_or_else(|| {
-            lifecycle_probe_error("--test-tray-event must be a JSON object")
-        })?
+        .ok_or_else(|| lifecycle_probe_error("--test-tray-event must be a JSON object"))?
         .get("sequence")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| {
-            lifecycle_probe_error(
-                "--test-tray-event.sequence must be an unsigned integer",
-            )
+            lifecycle_probe_error("--test-tray-event.sequence must be an unsigned integer")
         })?;
 
     let stdout = io::stdout();
@@ -270,12 +253,9 @@ mod lifecycle_probe_tests {
                 .expect("binary probe must parse"),
             Some(LifecycleProbeCommand::Binary)
         );
-        let error = parse_lifecycle_probe_args(&owned(&[
-            BINARY_PROBE_FLAG,
-            "--config",
-            "daemon.json",
-        ]))
-        .expect_err("binary probe must reject mixed daemon arguments");
+        let error =
+            parse_lifecycle_probe_args(&owned(&[BINARY_PROBE_FLAG, "--config", "daemon.json"]))
+                .expect_err("binary probe must reject mixed daemon arguments");
         assert!(error.to_string().contains("must be the only argument"));
     }
 
@@ -283,12 +263,8 @@ mod lifecycle_probe_tests {
     fn tray_probe_defaults_are_bounded_and_preserve_raw_event() {
         let event = r#"{"event_type":"status","sequence":77}"#;
         assert_eq!(
-            parse_lifecycle_probe_args(&owned(&[
-                TRAY_SOURCE_FLAG,
-                TRAY_EVENT_FLAG,
-                event,
-            ]))
-            .expect("tray probe must parse"),
+            parse_lifecycle_probe_args(&owned(&[TRAY_SOURCE_FLAG, TRAY_EVENT_FLAG, event,]))
+                .expect("tray probe must parse"),
             Some(LifecycleProbeCommand::Tray {
                 event: event.to_string(),
                 count: 1,

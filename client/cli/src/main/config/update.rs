@@ -66,7 +66,10 @@ async fn download_to_file(url: &str, path: &Path) -> Result<(), String> {
     if !status.is_success() {
         return Err(format!("下载更新包返回 HTTP {status}"));
     }
-    if response.content_length().is_some_and(|size| size > 100 * 1024 * 1024) {
+    if response
+        .content_length()
+        .is_some_and(|size| size > 100 * 1024 * 1024)
+    {
         return Err("更新包超过 100 MiB，已拒绝下载".to_string());
     }
     let bytes = response
@@ -129,7 +132,9 @@ fn verify_archive_checksum(archive: &Path, checksum_file: &Path) -> Result<(), S
     let bytes = fs::read(archive).map_err(|error| format!("无法读取更新包：{error}"))?;
     let actual = format!("{:x}", Sha256::digest(bytes));
     if actual != expected {
-        return Err(format!("更新包 SHA-256 不匹配：期望 {expected}，实际 {actual}"));
+        return Err(format!(
+            "更新包 SHA-256 不匹配：期望 {expected}，实际 {actual}"
+        ));
     }
     Ok(())
 }
@@ -149,10 +154,7 @@ fn install_release_binaries(package_dir: &Path, install_dir: &Path) -> Result<()
             install_dir.display()
         );
     }
-    let install_args = vec![
-        OsString::from("-d"),
-        install_dir.as_os_str().to_os_string(),
-    ];
+    let install_args = vec![OsString::from("-d"), install_dir.as_os_str().to_os_string()];
     run_install_command(install_args)?;
     run_install_command(vec![
         OsString::from("-m"),

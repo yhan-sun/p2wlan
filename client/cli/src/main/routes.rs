@@ -86,7 +86,10 @@ fn print_route_report(value: &Value, repair: bool) {
         let cidr = value.get("cidr").and_then(Value::as_str).unwrap_or("?");
         let before = value.get("before").and_then(Value::as_str).unwrap_or("?");
         let after = value.get("after").and_then(Value::as_str).unwrap_or("?");
-        let changed = value.get("changed").and_then(Value::as_bool).unwrap_or(false);
+        let changed = value
+            .get("changed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let reason = value.get("reason").and_then(Value::as_str).unwrap_or("?");
         println!(
             "路由修复：{cidr} {before} -> {after}（{}，原因：{reason}）",
@@ -95,7 +98,10 @@ fn print_route_report(value: &Value, repair: bool) {
         return;
     }
 
-    let healthy = value.get("healthy").and_then(Value::as_bool).unwrap_or(false);
+    let healthy = value
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let interface = value
         .get("interface")
         .and_then(Value::as_str)

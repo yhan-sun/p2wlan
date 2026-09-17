@@ -86,15 +86,9 @@ impl PeerManager {
                     return selection;
                 }
                 conn.expire_stale_trial_nominations(generation, local_endpoint);
-                let policy = self
-                    .config
-                    .relay
-                    .effective_path_policy(prefer_direct);
-                let mut selection = conn.select_path_for_data_with_policy(
-                    generation,
-                    policy,
-                    relay_available,
-                );
+                let policy = self.config.relay.effective_path_policy(prefer_direct);
+                let mut selection =
+                    conn.select_path_for_data_with_policy(generation, policy, relay_available);
                 if selection.path == Some(NetworkPath::Relay) {
                     selection.relay_server = conn.relay_server.clone();
                 }
@@ -389,10 +383,7 @@ impl PeerManager {
     /// next for Internet hole punching, and an RFC1918/ULA endpoint that is
     /// not on one of our local prefixes is weakest.  Address class alone must
     /// never make an off-link private endpoint outrank a usable public one.
-    fn direct_validation_target_priority(
-        connection: &PeerConnection,
-        endpoint: SocketAddr,
-    ) -> u8 {
+    fn direct_validation_target_priority(connection: &PeerConnection, endpoint: SocketAddr) -> u8 {
         if connection.is_on_link_host_candidate(endpoint) {
             2
         } else if crate::peer::is_public_probe_endpoint(endpoint) {
@@ -455,7 +446,9 @@ impl PeerManager {
     ) -> Option<u8> {
         let connections = self.connections.try_read().ok()?;
         let connection = connections.get(node_id)?;
-        Some(Self::direct_validation_target_priority(connection, endpoint))
+        Some(Self::direct_validation_target_priority(
+            connection, endpoint,
+        ))
     }
 
     /// Lock-free/try-lock counterpart used by the synchronous UDP ingress
@@ -498,10 +491,7 @@ impl PeerManager {
     }
 
     /// The currently selected direct endpoint for consent keepalive, if any.
-    pub async fn selected_direct_endpoint_for_consent(
-        &self,
-        node_id: &str,
-    ) -> Option<SocketAddr> {
+    pub async fn selected_direct_endpoint_for_consent(&self, node_id: &str) -> Option<SocketAddr> {
         let generation = self.current_network_generation().await;
         self.connections
             .read()
@@ -574,22 +564,20 @@ impl PeerManager {
     /// inbound path to prove that datagrams from a known peer public IP
     /// reached this daemon at all, independently of Probe v1/v2 decoding.
     pub async fn has_known_public_candidate_ip(&self, ip: IpAddr) -> bool {
-        self.connections
-            .read()
-            .await
-            .values()
-            .any(|conn| {
-                conn.endpoint.is_some_and(|endpoint| endpoint.ip() == ip)
-                    || conn.signaled_endpoint.is_some_and(|endpoint| endpoint.ip() == ip)
-                    || conn
-                        .candidates
-                        .iter()
-                        .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
-                        .any(|endpoint| endpoint.ip() == ip)
-                    || conn
-                        .candidate_pairs
-                        .iter()
-                        .any(|pair| pair.remote_endpoint.ip() == ip)
-            })
+        self.connections.read().await.values().any(|conn| {
+            conn.endpoint.is_some_and(|endpoint| endpoint.ip() == ip)
+                || conn
+                    .signaled_endpoint
+                    .is_some_and(|endpoint| endpoint.ip() == ip)
+                || conn
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
+                    .any(|endpoint| endpoint.ip() == ip)
+                || conn
+                    .candidate_pairs
+                    .iter()
+                    .any(|pair| pair.remote_endpoint.ip() == ip)
+        })
     }
 }

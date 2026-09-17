@@ -1,4 +1,8 @@
-fn business_budget_peer(node_id: &str, virtual_ip: &str, endpoint: SocketAddr) -> control::PeerInfo {
+fn business_budget_peer(
+    node_id: &str,
+    virtual_ip: &str,
+    endpoint: SocketAddr,
+) -> control::PeerInfo {
     control::PeerInfo {
         node_id: node_id.to_string(),
         device_name: String::new(),
@@ -29,11 +33,7 @@ async fn business_budget_commit_direct(
         .current_remote_candidate_epoch(peer_id)
         .await
         .expect("business E2E peer must own a candidate epoch");
-    let epoch = peer::PathEpoch::new(
-        generation,
-        peer_session_generation,
-        remote_candidate_epoch,
-    );
+    let epoch = peer::PathEpoch::new(generation, peer_session_generation, remote_candidate_epoch);
     assert!(
         peers
             .mark_direct_validation_started(
@@ -90,18 +90,11 @@ fn business_budget_confirm_base(
     now: tokio::time::Instant,
 ) {
     let plan = runtime
-        .schedule_probe(
-            &identity.peer_id,
-            identity,
-            lease.worker_owner_token,
-            now,
-        )
+        .schedule_probe(&identity.peer_id, identity, lease.worker_owner_token, now)
         .expect("BASE recovery must schedule a probe");
     assert_eq!(
         plan.probe_identity.candidate_udp_datagram_size,
-        crate::dplpmtud::UdpDatagramSize(
-            crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,
-        )
+        crate::dplpmtud::UdpDatagramSize(crate::dplpmtud::DPLPMTUD_BASE_UDP_DATAGRAM_SIZE,)
     );
     assert!(runtime.begin_probe_send(&plan, now));
     runtime.finish_probe_send(&plan, Ok(()), now + Duration::from_millis(1));
@@ -128,12 +121,7 @@ fn business_budget_ack_next_probe(
     now: tokio::time::Instant,
 ) {
     let plan = runtime
-        .schedule_probe(
-            &identity.peer_id,
-            identity,
-            lease.worker_owner_token,
-            now,
-        )
+        .schedule_probe(&identity.peer_id, identity, lease.worker_owner_token, now)
         .expect("upward search must schedule a probe");
     assert!(
         plan.probe_identity.candidate_udp_datagram_size.0
@@ -195,14 +183,8 @@ fn business_budget_icmp_sequence(packet: &[u8]) -> u16 {
 fn assert_business_budget_feedback(packet: &[u8], expected_mtu: u16) {
     let ip = Ipv4Packet::new(packet).expect("local feedback must be valid IPv4");
     assert!(ip.verify_checksum());
-    assert_eq!(
-        ip.src_addr(),
-        "10.20.0.2".parse::<Ipv4Addr>().unwrap()
-    );
-    assert_eq!(
-        ip.dst_addr(),
-        "10.20.0.1".parse::<Ipv4Addr>().unwrap()
-    );
+    assert_eq!(ip.src_addr(), "10.20.0.2".parse::<Ipv4Addr>().unwrap());
+    assert_eq!(ip.dst_addr(), "10.20.0.1".parse::<Ipv4Addr>().unwrap());
     let icmp = ip.payload();
     assert_eq!(&icmp[..2], &[3, 4]);
     assert_eq!(u16::from_be_bytes([icmp[6], icmp[7]]), expected_mtu);
@@ -397,25 +379,24 @@ async fn direct_business_budget_production_path_e2e() {
     let router = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let router_endpoint = router.local_addr().unwrap();
     peers_a
-        .add_peer(&business_budget_peer("peer-b", "10.20.0.2", router_endpoint))
+        .add_peer(&business_budget_peer(
+            "peer-b",
+            "10.20.0.2",
+            router_endpoint,
+        ))
         .await;
     peers_b
-        .add_peer(&business_budget_peer("peer-a", "10.20.0.1", router_endpoint))
+        .add_peer(&business_budget_peer(
+            "peer-a",
+            "10.20.0.1",
+            router_endpoint,
+        ))
         .await;
 
     udp_a.set_inbound_publication_owner(UDP_OWNER);
-    let identity = business_budget_commit_direct(
-        &peers_a,
-        &udp_a,
-        "peer-b",
-        router_endpoint,
-        71,
-        73,
-    )
-    .await;
-    let peer_session_generation = peers_a
-        .peer_session_generation_sync("peer-b")
-        .unwrap();
+    let identity =
+        business_budget_commit_direct(&peers_a, &udp_a, "peer-b", router_endpoint, 71, 73).await;
+    let peer_session_generation = peers_a.peer_session_generation_sync("peer-b").unwrap();
     assert!(udp_a.mark_peer_dplpmtud_supported("peer-b", peer_session_generation));
     let runtime = udp_a.dplpmtud_runtime();
     let lease = runtime
@@ -429,11 +410,8 @@ async fn direct_business_budget_production_path_e2e() {
     wireguard_a.add_session("peer-b", session_a).await;
     wireguard_b.add_session("peer-a", session_b).await;
 
-    let (tun_a, ctrl_a) = p2pnet_tun::MockTunDevice::new_pair(
-        "business-budget-a",
-        1500,
-        "10.20.0.1",
-    );
+    let (tun_a, ctrl_a) =
+        p2pnet_tun::MockTunDevice::new_pair("business-budget-a", 1500, "10.20.0.1");
     let (mut dataplane_a, dataplane_a_rx, _dataplane_a_inbound) =
         DataPlane::new_bidirectional(tun_a, peers_a.clone());
     let dataplane_a_task = tokio::spawn(async move { dataplane_a.run().await });
@@ -442,11 +420,8 @@ async fn direct_business_budget_production_path_e2e() {
         async move { wireguard.run_outbound(dataplane_a_rx).await }
     });
 
-    let (tun_b, ctrl_b) = p2pnet_tun::MockTunDevice::new_pair(
-        "business-budget-b",
-        1500,
-        "10.20.0.2",
-    );
+    let (tun_b, ctrl_b) =
+        p2pnet_tun::MockTunDevice::new_pair("business-budget-b", 1500, "10.20.0.2");
     let (mut dataplane_b, _dataplane_b_rx, dataplane_b_inbound) =
         DataPlane::new_bidirectional(tun_b, peers_b.clone());
     let dataplane_b_task = tokio::spawn(async move { dataplane_b.run().await });
@@ -504,10 +479,7 @@ async fn direct_business_budget_production_path_e2e() {
 
     let committed = peers_a.get_connection("peer-b").await.unwrap();
     assert_eq!(committed.active_path(), Some(peer::NetworkPath::Direct));
-    assert!(peers_a.peer_supports_dplpmtud_sync(
-        "peer-b",
-        peer_session_generation,
-    ));
+    assert!(peers_a.peer_supports_dplpmtud_sync("peer-b", peer_session_generation,));
     assert!(udp_a.peer_requires_direct_business_budget("peer-b"));
     assert!(!udp_a.direct_business_budget_ready_for_peer("peer-b"));
     assert!(
@@ -556,12 +528,7 @@ async fn direct_business_budget_production_path_e2e() {
     )
     .await;
     assert_eq!(wire_count.load(std::sync::atomic::Ordering::Acquire), 0);
-    business_budget_confirm_base(
-        &runtime,
-        &identity,
-        &lease,
-        tokio::time::Instant::now(),
-    );
+    business_budget_confirm_base(&runtime, &identity, &lease, tokio::time::Instant::now());
     let first = timeout(Duration::from_secs(2), ctrl_b.recv_written())
         .await
         .unwrap()
@@ -619,12 +586,7 @@ async fn direct_business_budget_production_path_e2e() {
 
     // Raise once, then revoke the exact revision while the packet is parked
     // after real encryption. The old high-budget token must send nothing.
-    business_budget_ack_next_probe(
-        &runtime,
-        &identity,
-        &lease,
-        tokio::time::Instant::now(),
-    );
+    business_budget_ack_next_probe(&runtime, &identity, &lease, tokio::time::Instant::now());
     let raised_token = business_budget_token(&runtime, "peer-b", UDP_OWNER);
     assert!(raised_token.max_overlay_payload_size.0 > 1168);
     let high_packet_len = raised_token.max_overlay_payload_size.0 as usize;
@@ -638,10 +600,7 @@ async fn direct_business_budget_production_path_e2e() {
     timeout(Duration::from_secs(2), race_gate.reached.wait())
         .await
         .expect("business packet must reach the post-encryption barrier");
-    assert!(runtime.invalidate_direct_business_budget(
-        &raised_token,
-        tokio::time::Instant::now(),
-    ));
+    assert!(runtime.invalidate_direct_business_budget(&raised_token, tokio::time::Instant::now(),));
     let revoked = runtime.direct_business_budget_entry("peer-b").unwrap();
     assert!(revoked.update.budget.is_none());
     assert!(revoked.update.budget_revision > raised_token.budget_revision);
@@ -657,27 +616,25 @@ async fn direct_business_budget_production_path_e2e() {
         "revoked post-encryption token was not rejected",
     )
     .await;
-    assert_eq!(wire_count.load(std::sync::atomic::Ordering::Acquire), before_revoke);
-    assert!(!runtime.invalidate_direct_business_budget(
-        &raised_token,
-        tokio::time::Instant::now(),
-    ));
+    assert_eq!(
+        wire_count.load(std::sync::atomic::Ordering::Acquire),
+        before_revoke
+    );
+    assert!(!runtime.invalidate_direct_business_budget(&raised_token, tokio::time::Instant::now(),));
 
     // BASE re-confirmation publishes 1200/1168. The queued old large packet
     // is re-routed exactly once, then rejected under the lower budget; a new
     // small packet resumes over the still-active Direct path.
-    business_budget_confirm_base(
-        &runtime,
-        &identity,
-        &lease,
-        tokio::time::Instant::now(),
-    );
+    business_budget_confirm_base(&runtime, &identity, &lease, tokio::time::Instant::now());
     let lowered_feedback = timeout(Duration::from_secs(2), ctrl_a.recv_written())
         .await
         .unwrap()
         .unwrap();
     assert_business_budget_feedback(&lowered_feedback, 1168);
-    assert_eq!(wire_count.load(std::sync::atomic::Ordering::Acquire), before_revoke);
+    assert_eq!(
+        wire_count.load(std::sync::atomic::Ordering::Acquire),
+        before_revoke
+    );
     let recovered_packet = business_budget_ipv4_packet(256, 6);
     ctrl_a.inject(recovered_packet.clone()).await.unwrap();
     assert_eq!(
@@ -692,10 +649,8 @@ async fn direct_business_budget_production_path_e2e() {
     // the plaintext estimate. The production post-encryption check observes
     // the real 1200-byte ciphertext, blocks it, and invalidates the revision.
     let before_ciphertext = wire_count.load(std::sync::atomic::Ordering::Acquire);
-    assert!(runtime.force_business_udp_budget_for_test(
-        "peer-b",
-        crate::dplpmtud::UdpDatagramSize(1199),
-    ));
+    assert!(runtime
+        .force_business_udp_budget_for_test("peer-b", crate::dplpmtud::UdpDatagramSize(1199),));
     ctrl_a
         .inject(business_budget_ipv4_packet(1168, 7))
         .await
@@ -704,20 +659,21 @@ async fn direct_business_budget_production_path_e2e() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&Ipv4Packet::new(&ciphertext_feedback).unwrap().payload()[..2], &[3, 4]);
-    assert_eq!(wire_count.load(std::sync::atomic::Ordering::Acquire), before_ciphertext);
+    assert_eq!(
+        &Ipv4Packet::new(&ciphertext_feedback).unwrap().payload()[..2],
+        &[3, 4]
+    );
+    assert_eq!(
+        wire_count.load(std::sync::atomic::Ordering::Acquire),
+        before_ciphertext
+    );
     assert!(runtime
         .direct_business_budget_entry("peer-b")
         .unwrap()
         .update
         .budget
         .is_none());
-    business_budget_confirm_base(
-        &runtime,
-        &identity,
-        &lease,
-        tokio::time::Instant::now(),
-    );
+    business_budget_confirm_base(&runtime, &identity, &lease, tokio::time::Instant::now());
 
     // Typed EMSGSIZE is injected at the exact syscall seam. It is a definite
     // no-send, revokes only this identity+revision, restarts BASE, and leaves
@@ -733,27 +689,30 @@ async fn direct_business_budget_production_path_e2e() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&Ipv4Packet::new(&emsgsize_feedback).unwrap().payload()[..2], &[3, 4]);
-    assert_eq!(wire_count.load(std::sync::atomic::Ordering::Acquire), before_emsgsize);
+    assert_eq!(
+        &Ipv4Packet::new(&emsgsize_feedback).unwrap().payload()[..2],
+        &[3, 4]
+    );
+    assert_eq!(
+        wire_count.load(std::sync::atomic::Ordering::Acquire),
+        before_emsgsize
+    );
     let emsgsize_snapshot = runtime.snapshot_for_peer("peer-b").unwrap();
-    assert_eq!(emsgsize_snapshot.state, crate::dplpmtud::DplpmtudState::Base);
+    assert_eq!(
+        emsgsize_snapshot.state,
+        crate::dplpmtud::DplpmtudState::Base
+    );
     assert!(!emsgsize_snapshot.base_confirmed);
     assert!(emsgsize_snapshot.business_packet_too_large_count >= 3);
-    assert!(!runtime.invalidate_direct_business_budget(
-        &emsgsize_token,
-        tokio::time::Instant::now(),
-    ));
+    assert!(
+        !runtime.invalidate_direct_business_budget(&emsgsize_token, tokio::time::Instant::now(),)
+    );
     let connection = peers_a.get_connection("peer-b").await.unwrap();
     assert_eq!(connection.active_path(), Some(peer::NetworkPath::Direct));
     assert_eq!(connection.direct_health.failure_count, 0);
     assert_eq!(connection.relay_health.failure_count, 0);
 
-    business_budget_confirm_base(
-        &runtime,
-        &identity,
-        &lease,
-        tokio::time::Instant::now(),
-    );
+    business_budget_confirm_base(&runtime, &identity, &lease, tokio::time::Instant::now());
     let after_emsgsize_packet = business_budget_ipv4_packet(256, 9);
     ctrl_a.inject(after_emsgsize_packet.clone()).await.unwrap();
     assert_eq!(
@@ -785,10 +744,9 @@ async fn direct_business_budget_production_path_e2e() {
     timeout(Duration::from_secs(2), path_gate.reached.wait())
         .await
         .expect("path race packet must reach the post-encryption barrier");
-    let udp_replacement =
-        UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_a.clone())
-            .await
-            .unwrap();
+    let udp_replacement = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_a.clone())
+        .await
+        .unwrap();
     assert_ne!(
         udp_replacement.transport_instance_id(),
         identity.socket.transport_instance_id,
@@ -826,7 +784,10 @@ async fn direct_business_budget_production_path_e2e() {
         before_path_replace
     );
     let final_connection = peers_a.get_connection("peer-b").await.unwrap();
-    assert_eq!(final_connection.active_path(), Some(peer::NetworkPath::Direct));
+    assert_eq!(
+        final_connection.active_path(),
+        Some(peer::NetworkPath::Direct)
+    );
     assert_eq!(final_connection.direct_health.failure_count, 0);
     assert_eq!(final_connection.relay_health.failure_count, 0);
     assert_eq!(runtime.active_worker_count(), 0);
@@ -871,14 +832,12 @@ async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated
         .await
         .unwrap();
     udp.set_inbound_publication_owner(UDP_OWNER);
-    let (_identity_a, _lease_a) = business_budget_install_confirmed_direct(
-        &peers, &udp, "peer-a", endpoint_a, 101, 103,
-    )
-    .await;
-    let (_identity_b, _lease_b) = business_budget_install_confirmed_direct(
-        &peers, &udp, "peer-b", endpoint_b, 105, 107,
-    )
-    .await;
+    let (_identity_a, _lease_a) =
+        business_budget_install_confirmed_direct(&peers, &udp, "peer-a", endpoint_a, 101, 103)
+            .await;
+    let (_identity_b, _lease_b) =
+        business_budget_install_confirmed_direct(&peers, &udp, "peer-b", endpoint_b, 105, 107)
+            .await;
     let runtime = udp.dplpmtud_runtime();
     let budget_a_before = runtime
         .direct_business_budget_entry("peer-a")
@@ -940,9 +899,7 @@ async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated
             timeline.snapshot().events.iter().any(|event| {
                 event.event == "direct_business_local_backpressure"
                     && event.reason_code.as_deref()
-                        == Some(
-                            crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE,
-                        )
+                        == Some(crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE)
                     && event
                         .detail
                         .as_deref()
@@ -958,8 +915,7 @@ async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated
         "WouldBlock must not revoke or revise the confirmed budget"
     );
     assert!(!timeline.snapshot().events.iter().any(|event| {
-        event.reason_code.as_deref()
-            == Some(crate::network_outbound::REASON_DIRECT_BUDGET_STALE)
+        event.reason_code.as_deref() == Some(crate::network_outbound::REASON_DIRECT_BUDGET_STALE)
     }));
 
     // Keep Peer A under deterministic backpressure. Peer B must still reach
@@ -974,8 +930,7 @@ async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated
                     == Some(crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE)
         })
         .count();
-    let mut until_deadline =
-        udp.inject_direct_business_would_block_for_test("peer-a", 1024);
+    let mut until_deadline = udp.inject_direct_business_would_block_for_test("peer-a", 1024);
     dataplane_tx
         .send(OutboundPacket {
             room_authorization: None,
@@ -995,9 +950,7 @@ async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated
                 .iter()
                 .filter(|event| {
                     event.reason_code.as_deref()
-                        == Some(
-                            crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE,
-                        )
+                        == Some(crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE)
                 })
                 .count()
                 > local_backpressure_events_before
@@ -1037,9 +990,7 @@ async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated
             loop {
                 if timeline.snapshot().events.iter().any(|event| {
                     event.reason_code.as_deref()
-                        == Some(
-                            crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE,
-                        )
+                        == Some(crate::network_outbound::REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE)
                 }) {
                     break;
                 }
@@ -1127,10 +1078,8 @@ async fn direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb() 
         .await
         .unwrap();
     udp.set_inbound_publication_owner(UDP_OWNER);
-    let (_identity, _lease) = business_budget_install_confirmed_direct(
-        &peers, &udp, "peer-v6", endpoint, 111, 113,
-    )
-    .await;
+    let (_identity, _lease) =
+        business_budget_install_confirmed_direct(&peers, &udp, "peer-v6", endpoint, 111, 113).await;
     let runtime = udp.dplpmtud_runtime();
     assert_eq!(
         runtime
@@ -1306,7 +1255,11 @@ async fn direct_business_commit_keeps_confirmed_relay_carrier_until_budget_confi
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = receiver.local_addr().unwrap();
     peers
-        .add_peer(&business_budget_peer("node-b", "10.20.0.2", direct_endpoint))
+        .add_peer(&business_budget_peer(
+            "node-b",
+            "10.20.0.2",
+            direct_endpoint,
+        ))
         .await;
     let peer_session_generation = peers
         .peer_session_generation_sync("node-b")
@@ -1406,9 +1359,11 @@ async fn direct_business_commit_keeps_confirmed_relay_carrier_until_budget_confi
         "no Direct business datagram may be emitted while the budget is pending"
     );
     assert!(
-        !timeline.snapshot().events.iter().any(|event| {
-            event.event == "direct_business_budget_pending"
-        }),
+        !timeline
+            .snapshot()
+            .events
+            .iter()
+            .any(|event| { event.event == "direct_business_budget_pending" }),
         "make-before-break must keep the queue flushable instead of parking it behind the budget"
     );
     business_budget_assert_no_deadline_expiry(&timeline).await;
@@ -1479,7 +1434,11 @@ async fn relay_carries_business_when_direct_validation_completes_after_ingress()
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = receiver.local_addr().unwrap();
     peers
-        .add_peer(&business_budget_peer("node-b", "10.20.0.2", direct_endpoint))
+        .add_peer(&business_budget_peer(
+            "node-b",
+            "10.20.0.2",
+            direct_endpoint,
+        ))
         .await;
 
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
@@ -1544,7 +1503,10 @@ async fn relay_carries_business_when_direct_validation_completes_after_ingress()
     match relayed_one {
         RelayMessage::Data { from_node, data } => {
             assert_eq!(from_node, "node-a");
-            assert_eq!(remote_session.decrypt_from_bytes(&data).unwrap(), packet_one);
+            assert_eq!(
+                remote_session.decrypt_from_bytes(&data).unwrap(),
+                packet_one
+            );
         }
         other => panic!("expected relayed business data, got {other:?}"),
     }
@@ -1584,12 +1546,19 @@ async fn relay_carries_business_when_direct_validation_completes_after_ingress()
     match relayed_two {
         RelayMessage::Data { from_node, data } => {
             assert_eq!(from_node, "node-a");
-            assert_eq!(remote_session.decrypt_from_bytes(&data).unwrap(), packet_two);
+            assert_eq!(
+                remote_session.decrypt_from_bytes(&data).unwrap(),
+                packet_two
+            );
         }
         other => panic!("expected relayed business data, got {other:?}"),
     }
     let mut wire = vec![0u8; 2048];
-    assert!(timeout(Duration::from_millis(150), receiver.recv_from(&mut wire)).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(150), receiver.recv_from(&mut wire))
+            .await
+            .is_err()
+    );
     business_budget_assert_no_deadline_expiry(&timeline).await;
 
     let committed = peers
@@ -1600,11 +1569,7 @@ async fn relay_carries_business_when_direct_validation_completes_after_ingress()
         crate::peer::ActiveBusinessPath::Direct(_)
     ));
     assert_eq!(
-        peers
-            .get_connection("node-b")
-            .await
-            .unwrap()
-            .active_path(),
+        peers.get_connection("node-b").await.unwrap().active_path(),
         Some(peer::NetworkPath::Direct)
     );
 
@@ -1635,7 +1600,11 @@ async fn direct_budget_invalidation_falls_back_to_confirmed_relay_without_pendin
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = receiver.local_addr().unwrap();
     peers
-        .add_peer(&business_budget_peer("node-b", "10.20.0.2", direct_endpoint))
+        .add_peer(&business_budget_peer(
+            "node-b",
+            "10.20.0.2",
+            direct_endpoint,
+        ))
         .await;
     let peer_session_generation = peers
         .peer_session_generation_sync("node-b")
@@ -1754,9 +1723,10 @@ async fn direct_budget_invalidation_falls_back_to_confirmed_relay_without_pendin
     assert!(
         !timeline.snapshot().events.iter().any(|event| {
             event.event == "direct_business_budget_pending"
-                && event.detail.as_deref().is_some_and(|detail| {
-                    detail.contains("queued_bytes=")
-                })
+                && event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("queued_bytes="))
         }),
         "the fallback must not park the queue behind the revoked budget"
     );

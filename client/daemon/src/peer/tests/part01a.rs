@@ -137,7 +137,10 @@ async fn staged_probe_binding_keeps_outbound_old_until_authenticated_promotion()
             Some(old_shared),
         )
         .await;
-    let old_key = manager.probe_key_for_peer("peer-probe-rekey").await.unwrap();
+    let old_key = manager
+        .probe_key_for_peer("peer-probe-rekey")
+        .await
+        .unwrap();
 
     assert_eq!(
         manager
@@ -159,17 +162,22 @@ async fn staged_probe_binding_keeps_outbound_old_until_authenticated_promotion()
     let candidates = manager
         .probe_key_candidates_for_peer("peer-probe-rekey")
         .await;
-    assert!(candidates.iter().any(|candidate| {
-        candidate.role == ProbeKeyRole::Active && candidate.key == old_key
-    }));
+    assert!(candidates
+        .iter()
+        .any(|candidate| { candidate.role == ProbeKeyRole::Active && candidate.key == old_key }));
     assert!(candidates.iter().any(|candidate| {
         matches!(candidate.role, ProbeKeyRole::Pending { ref token } if token == "new-token")
     }));
 
-    assert!(manager
-        .confirm_pending_probe_session_binding("peer-probe-rekey", "new-token")
-        .await);
-    let new_key = manager.probe_key_for_peer("peer-probe-rekey").await.unwrap();
+    assert!(
+        manager
+            .confirm_pending_probe_session_binding("peer-probe-rekey", "new-token")
+            .await
+    );
+    let new_key = manager
+        .probe_key_for_peer("peer-probe-rekey")
+        .await
+        .unwrap();
     assert_ne!(new_key, old_key);
     let inbound_keys = manager.probe_keys_for_peer("peer-probe-rekey").await;
     assert!(inbound_keys.contains(&old_key));
@@ -291,15 +299,17 @@ async fn multiple_probe_tokens_are_retained_until_exact_token_promotion() {
         }));
     }
 
-    assert!(manager
-        .confirm_pending_probe_session_binding("peer-probe-multi", "token-b")
-        .await);
+    assert!(
+        manager
+            .confirm_pending_probe_session_binding("peer-probe-multi", "token-b")
+            .await
+    );
     let candidates = manager
         .probe_key_candidates_for_peer("peer-probe-multi")
         .await;
-    assert!(!candidates.iter().any(|candidate| {
-        matches!(candidate.role, ProbeKeyRole::Pending { .. })
-    }));
+    assert!(!candidates
+        .iter()
+        .any(|candidate| { matches!(candidate.role, ProbeKeyRole::Pending { .. }) }));
 }
 
 #[tokio::test]
@@ -313,7 +323,10 @@ async fn failed_initiator_probe_stage_does_not_promote_on_inbound_match() {
     manager
         .set_probe_session_id("peer-probe-pending", Some("old-session".to_string()))
         .await;
-    let old_key = manager.probe_key_for_peer("peer-probe-pending").await.unwrap();
+    let old_key = manager
+        .probe_key_for_peer("peer-probe-pending")
+        .await
+        .unwrap();
 
     assert_eq!(
         manager
@@ -327,16 +340,20 @@ async fn failed_initiator_probe_stage_does_not_promote_on_inbound_match() {
             .await,
         ProbeBindingStage::Staged
     );
-    assert!(!manager
-        .confirm_pending_probe_session_binding("peer-probe-pending", "pending-token")
-        .await);
+    assert!(
+        !manager
+            .confirm_pending_probe_session_binding("peer-probe-pending", "pending-token")
+            .await
+    );
     assert_eq!(
         manager.probe_key_for_peer("peer-probe-pending").await,
         Some(old_key)
     );
-    assert!(manager
-        .discard_pending_probe_session_binding("peer-probe-pending", "pending-token")
-        .await);
+    assert!(
+        manager
+            .discard_pending_probe_session_binding("peer-probe-pending", "pending-token")
+            .await
+    );
     assert_eq!(
         manager.probe_key_for_peer("peer-probe-pending").await,
         Some(old_key)

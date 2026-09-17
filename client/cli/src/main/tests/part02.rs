@@ -248,20 +248,59 @@ async fn login_saves_token_from_control_server() {
 #[test]
 fn parses_room_device_controls_and_rejects_unknown_actions() {
     for action in ["disconnect", "block", "unblock", "approve"] {
-        let cli = Cli::try_parse_from(["p2wlan", "room", "device-access", "12345678",
-            "--access", "access-a", "--action", action]).unwrap();
-        let Commands::Room { command: RoomCommand::DeviceAccess { access, action: parsed, .. } } = cli.command else {
+        let cli = Cli::try_parse_from([
+            "p2wlan",
+            "room",
+            "device-access",
+            "12345678",
+            "--access",
+            "access-a",
+            "--action",
+            action,
+        ])
+        .unwrap();
+        let Commands::Room {
+            command:
+                RoomCommand::DeviceAccess {
+                    access,
+                    action: parsed,
+                    ..
+                },
+        } = cli.command
+        else {
             panic!("expected device access command");
         };
         assert_eq!(access, "access-a");
         assert_eq!(parsed, action);
     }
-    assert!(Cli::try_parse_from(["p2wlan", "room", "device-access", "12345678",
-        "--access", "a", "--action", "unknown"]).is_err());
+    assert!(Cli::try_parse_from([
+        "p2wlan",
+        "room",
+        "device-access",
+        "12345678",
+        "--access",
+        "a",
+        "--action",
+        "unknown"
+    ])
+    .is_err());
     for required in ["true", "false"] {
-        let cli = Cli::try_parse_from(["p2wlan", "room", "device-approval", "12345678",
-            "--required", required]).unwrap();
-        let Commands::Room { command: RoomCommand::DeviceApproval { required: parsed, .. } } = cli.command else {
+        let cli = Cli::try_parse_from([
+            "p2wlan",
+            "room",
+            "device-approval",
+            "12345678",
+            "--required",
+            required,
+        ])
+        .unwrap();
+        let Commands::Room {
+            command:
+                RoomCommand::DeviceApproval {
+                    required: parsed, ..
+                },
+        } = cli.command
+        else {
             panic!("expected device approval command");
         };
         assert_eq!(parsed, required == "true");
@@ -270,7 +309,10 @@ fn parses_room_device_controls_and_rejects_unknown_actions() {
 
 #[test]
 fn room_disconnect_intent_preserves_auto_connect_preference() {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let directory = env::temp_dir().join(format!("p2wlan-room-intent-{unique}"));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("connection.json");
