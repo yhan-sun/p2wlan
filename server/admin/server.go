@@ -308,7 +308,11 @@ func parsePage(w http.ResponseWriter, r *http.Request) (int, int, bool) {
 }
 
 func setBrowserSecurityHeaders(w http.ResponseWriter) {
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	// React Flow positions nodes and account identity colors with style
+	// attributes. Keep script execution strictly same-origin while permitting
+	// style attributes only; inline scripts and inline <style> blocks remain
+	// disallowed by the policy.
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
