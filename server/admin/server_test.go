@@ -93,12 +93,19 @@ func TestDisabledConsoleIsNotDiscoverable(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	for _, path := range []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		res := httptest.NewRecorder()
-		mux.ServeHTTP(res, req)
-		if res.Code != http.StatusNotFound {
-			t.Fatalf("%s: expected 404, got %d", path, res.Code)
+	paths := []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/app.js", "/admin/index.html"}
+	methods := []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions}
+	for _, path := range paths {
+		for _, method := range methods {
+			req := httptest.NewRequest(method, path, nil)
+			res := httptest.NewRecorder()
+			mux.ServeHTTP(res, req)
+			// 405 would confirm that the route is registered even though the
+			// console is disabled, so the disabled surface must be 404 for
+			// every method, not only for GET.
+			if res.Code != http.StatusNotFound {
+				t.Fatalf("%s %s: expected 404, got %d", method, path, res.Code)
+			}
 		}
 	}
 }

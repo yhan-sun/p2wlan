@@ -80,6 +80,16 @@ func (s *Server) Enabled() bool {
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
+	if !s.enabled {
+		// Without a token the console does not exist, and the documented
+		// contract is that /admin and /admin/* answer 404. Register the paths
+		// without a method so every verb still answers 404: method-specific
+		// patterns would answer 405 instead, which would confirm to an
+		// unauthenticated caller that the admin surface is registered.
+		mux.HandleFunc("/admin", http.NotFound)
+		mux.HandleFunc("/admin/", http.NotFound)
+		return
+	}
 	mux.HandleFunc("GET /admin", s.redirectConsole)
 	mux.HandleFunc("GET /admin/api/v1/overview", s.requireAdmin(s.overview))
 	mux.HandleFunc("GET /admin/api/v1/accounts", s.requireAdmin(s.accounts))
