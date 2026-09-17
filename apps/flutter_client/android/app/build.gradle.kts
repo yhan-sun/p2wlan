@@ -12,7 +12,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.p2wlan_flutter_client"
+    namespace = "com.p2wlan.client"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -22,8 +22,9 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.p2wlan_flutter_client"
+        // Canonical identity for distributed P2WLAN Android builds. Changing
+        // this value creates a distinct installed application identity.
+        applicationId = "com.p2wlan.client"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
