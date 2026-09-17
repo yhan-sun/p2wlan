@@ -283,7 +283,7 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 		Scope:                    "global",
 		FocusAccountID:           accountID,
 		PathObservationAvailable: false,
-		PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; topology edges describe account membership, device attachment, and pending signaling only.",
+		PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; topology edges describe account membership, private default-device ownership, device attachment, and pending signaling only.",
 		Nodes:                    []AdminTopologyNode{},
 		Edges:                    []AdminTopologyEdge{},
 	}
@@ -406,6 +406,47 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 		return nil, err
 	}
 	if err := deviceRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// The legacy database has one shared row called "default", but product
+	// semantics explicitly keep that roster account-private. Drawing the shared
+	// row would falsely imply cross-account reachability; dropping it entirely
+	// would hide the most common personal devices. Render those devices directly
+	// under their owning account instead.
+	personalWhere := `d.network_id = 'default' AND d.user_id <> 'system'`
+	personalArgs := []any{}
+	if accountID != "" {
+		personalWhere += ` AND d.user_id = ?`
+		personalArgs = append(personalArgs, accountID)
+	}
+	personalRows, err := db.Query(`SELECT d.id, d.user_id, COALESCE(NULLIF(u.username, ''), u.email),
+		d.device_name, d.platform, d.virtual_ip, d.network_id, d.nat_type, d.relay_rtt_ms,
+		d.last_seen, COALESCE(d.app_version, ''), d.online
+		FROM devices d JOIN users u ON u.id = d.user_id
+		WHERE `+personalWhere+`
+		ORDER BY d.online DESC, d.device_name COLLATE NOCASE ASC`, personalArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("topology personal devices: %w", err)
+	}
+	for personalRows.Next() {
+		var id, userID, username, name, platform, virtualIP, networkID, natType, appVersion string
+		var relayRTT sql.NullInt64
+		var lastSeen int64
+		var onlineInt int
+		if err := personalRows.Scan(&id, &userID, &username, &name, &platform, &virtualIP, &networkID, &natType, &relayRTT, &lastSeen, &appVersion, &onlineInt); err != nil {
+			personalRows.Close()
+			return nil, fmt.Errorf("scan topology personal device: %w", err)
+		}
+		online := onlineInt == 1
+		deviceIDs[id] = struct{}{}
+		result.Nodes = append(result.Nodes, AdminTopologyNode{ID: "device:" + id, Kind: "device", Label: name, AccountID: userID, Username: username, NetworkID: networkID, VirtualIP: virtualIP, Platform: platform, NATType: natType, AppVersion: appVersion, RelayRTTMS: nullInt64Ptr(relayRTT), LastSeen: lastSeen, Online: &online, Focus: accountID != "" && userID == accountID})
+		result.Edges = append(result.Edges, AdminTopologyEdge{ID: "personal-attachment:" + id, Source: "account:" + userID, Target: "device:" + id, Kind: "attachment", Role: "private-default"})
+	}
+	if err := personalRows.Close(); err != nil {
+		return nil, err
+	}
+	if err := personalRows.Err(); err != nil {
 		return nil, err
 	}
 
