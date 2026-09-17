@@ -43,8 +43,11 @@ func TestGenerateMatchingSecureConfiguration(t *testing.T) {
 				}
 			}
 			c, r := envFile(t, filepath.Join(out, "control.env")), envFile(t, filepath.Join(out, "relay.env"))
-			if len(c["JWT_SECRET"]) != 64 || len(c["RELAY_REVOCATION_FEED_TOKEN"]) != 64 || c["RELAY_REVOCATION_FEED_TOKEN"] != r["RELAY_REVOCATION_FEED_TOKEN"] {
+			if len(c["JWT_SECRET"]) != 64 || len(c["CONTROL_ADMIN_TOKEN"]) != 64 || len(c["RELAY_REVOCATION_FEED_TOKEN"]) != 64 || c["RELAY_REVOCATION_FEED_TOKEN"] != r["RELAY_REVOCATION_FEED_TOKEN"] {
 				t.Fatal("credentials missing or mismatched")
+			}
+			if c["CONTROL_ADMIN_TOKEN"] == c["JWT_SECRET"] || c["CONTROL_ADMIN_TOKEN"] == c["RELAY_REVOCATION_FEED_TOKEN"] || c["JWT_SECRET"] == c["RELAY_REVOCATION_FEED_TOKEN"] {
+				t.Fatal("control, admin and relay credentials must be independently generated")
 			}
 
 			var raw map[string]map[string]string
@@ -69,7 +72,7 @@ func TestGenerateMatchingSecureConfiguration(t *testing.T) {
 			if err := generate(o); err == nil {
 				t.Fatal("existing deployment silently rotated")
 			}
-			if again := envFile(t, filepath.Join(out, "control.env")); again["JWT_SECRET"] != c["JWT_SECRET"] {
+			if again := envFile(t, filepath.Join(out, "control.env")); again["JWT_SECRET"] != c["JWT_SECRET"] || again["CONTROL_ADMIN_TOKEN"] != c["CONTROL_ADMIN_TOKEN"] {
 				t.Fatal("secrets overwritten")
 			}
 		})
