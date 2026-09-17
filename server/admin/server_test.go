@@ -26,6 +26,36 @@ func (fakeStore) AdminOverviewSnapshot() (*database.AdminOverview, error) {
 	}, nil
 }
 
+func (fakeStore) AdminAccounts(_ string, limit, offset int) (*database.AdminAccountPage, error) {
+	return &database.AdminAccountPage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminAccountSummary{{ID: "u1", Username: "alice", DeviceCount: 2, OnlineDevices: 1}}}, nil
+}
+
+func (fakeStore) AdminAccount(accountID string) (*database.AdminAccountDetail, error) {
+	if accountID == "missing" {
+		return nil, database.ErrAdminAccountNotFound
+	}
+	return &database.AdminAccountDetail{Account: database.AdminAccountSummary{ID: accountID, Username: "alice"}, Devices: []database.AdminDeviceSummary{}, Networks: []database.AdminNetworkSummary{}, Rooms: []database.AdminRoomSummary{}}, nil
+}
+
+func (fakeStore) AdminTopology(accountID string) (*database.AdminTopology, error) {
+	if accountID == "missing" {
+		return nil, database.ErrAdminAccountNotFound
+	}
+	scope := "global"
+	if accountID != "" {
+		scope = "account"
+	}
+	return &database.AdminTopology{
+		GeneratedAt:              10,
+		Scope:                    scope,
+		FocusAccountID:           accountID,
+		PathObservationAvailable: false,
+		PathObservationNote:      "path telemetry unavailable",
+		Nodes:                    []database.AdminTopologyNode{{ID: "account:u1", Kind: "account", AccountID: "u1", Label: "alice"}},
+		Edges:                    []database.AdminTopologyEdge{},
+	}, nil
+}
+
 func (fakeStore) AdminDevices(_ string, _ string, limit, offset int) (*database.AdminDevicePage, error) {
 	return &database.AdminDevicePage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminDeviceSummary{{ID: "d1", DeviceName: "desktop"}}}, nil
 }
@@ -63,7 +93,7 @@ func TestDisabledConsoleIsNotDiscoverable(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	for _, path := range []string{"/admin", "/admin/", "/admin/api/v1/runtime"} {
+	for _, path := range []string{"/admin", "/admin/", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		res := httptest.NewRecorder()
 		mux.ServeHTTP(res, req)
@@ -84,7 +114,7 @@ func TestConsoleServesEmbeddedUIWithSecurityHeaders(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", res.Code)
 	}
-	if !strings.Contains(res.Body.String(), "服务器管理") {
+	if !strings.Contains(res.Body.String(), "P2WLAN") {
 		t.Fatalf("expected embedded console HTML")
 	}
 	if got := res.Header().Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") {
@@ -101,10 +131,12 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	unauthorized := httptest.NewRecorder()
-	mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil))
-	if unauthorized.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", unauthorized.Code)
+	for _, path := range []string{"/admin/api/v1/overview", "/admin/api/v1/accounts", "/admin/api/v1/topology"} {
+		unauthorized := httptest.NewRecorder()
+		mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, path, nil))
+		if unauthorized.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: expected 401, got %d", path, unauthorized.Code)
+		}
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil)
@@ -119,6 +151,39 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	}
 	if strings.Contains(res.Body.String(), token) {
 		t.Fatal("admin token leaked into response")
+	}
+}
+
+func TestAdminAccountAndTopologyRoutes(t *testing.T) {
+	token := strings.Repeat("e", 32)
+	server := testServer(t, token)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	for _, tc := range []struct {
+		path     string
+		contains string
+	}{
+		{path: "/admin/api/v1/accounts", contains: `"username":"alice"`},
+		{path: "/admin/api/v1/accounts/u1", contains: `"id":"u1"`},
+		{path: "/admin/api/v1/topology", contains: `"scope":"global"`},
+		{path: "/admin/api/v1/accounts/u1/topology", contains: `"scope":"account"`},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), tc.contains) {
+			t.Fatalf("%s: unexpected response %d: %s", tc.path, res.Code, res.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/accounts/missing/topology", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("expected missing account topology to return 404, got %d", res.Code)
 	}
 }
 
