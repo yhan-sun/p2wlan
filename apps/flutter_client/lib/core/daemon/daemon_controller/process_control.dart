@@ -7,8 +7,25 @@ Future<void> rotateP2wlanLogFiles(File currentLog) async {
   if (!await currentLog.exists()) return;
 
   final previousLog = File('${currentLog.path}.1');
-  if (await previousLog.exists()) await previousLog.delete();
-  await currentLog.rename(previousLog.path);
+  if (await previousLog.exists()) {
+    try {
+      await previousLog.delete();
+    } catch (_) {}
+  }
+  try {
+    await currentLog.rename(previousLog.path);
+  } catch (_) {
+    // If rename fails (e.g. currentLog was created by an elevated process,
+    // or is held open, or NTFS ACL denies modify/rename to the interactive user),
+    // attempt to delete the old log file. Standard users typically have DELETE_CHILD
+    // on their own AppData directory even if the file itself has restrictive ACL.
+    try {
+      await currentLog.delete();
+    } catch (_) {
+      // If even delete fails, best-effort only: do not crash startup.
+      // Subsequent launch steps can truncate or append to the existing file.
+    }
+  }
 }
 
 extension DaemonControllerProcessControl on DaemonController {

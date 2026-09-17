@@ -41,10 +41,21 @@ DaemonStartupFailure classifyWindowsLaunchFailure(String rawError) {
   }
   if (raw.contains('ACL') ||
       normalized.contains('icacls') ||
-      normalized.contains('permission')) {
+      normalized.contains('permission') ||
+      normalized.contains('拒绝访问') ||
+      normalized.contains('errno = 5') ||
+      normalized.contains('os error: 5') ||
+      normalized.contains('pathaccessexception') ||
+      normalized.contains('unauthorizedaccessexception')) {
     return const DaemonStartupFailure(
       DaemonStartupFailureCode.aclFailure,
-      '无法为当前用户和本地 Administrators 组设置安全运行目录权限。',
+      '无法为当前用户和本地 Administrators 组设置安全运行目录权限或访问日志。',
+    );
+  }
+  if (normalized.contains('timed out') || normalized.contains('超时')) {
+    return const DaemonStartupFailure(
+      DaemonStartupFailureCode.uacLaunchFailed,
+      'Windows UAC 授权等待超时，请在系统提示中及时允许管理员授权后重试。',
     );
   }
   return const DaemonStartupFailure(
@@ -211,7 +222,10 @@ extension DaemonControllerElevation on DaemonController {
         // is the only producer-side identity; Dart validates it and writes the
         // canonical PID file as the interactive user.
         'Write-Output (\'$_windowsChildPidMarker\' + [string]\$child.Id)';
-    final result = await _runWindowsPowerShell(script);
+    final result = await _runWindowsPowerShell(
+      script,
+      timeout: const Duration(seconds: 45),
+    );
     if (result.exitCode != 0) {
       final stderr = result.stderr.toString().trim();
       throw StateError(stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr);

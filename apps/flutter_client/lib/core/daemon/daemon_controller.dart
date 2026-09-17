@@ -549,9 +549,23 @@ class DaemonController {
         // Pre-create and truncate as the interactive user. Elevated launches
         // must append to this file rather than creating an admin-owned file or
         // inheriting stale startup markers.
-        await File(logPath).writeAsString('', flush: true);
+        try {
+          await File(logPath).writeAsString('', flush: true);
+        } catch (_) {
+          try {
+            final logFile = File(logPath);
+            if (await logFile.exists()) {
+              await logFile.delete();
+              await logFile.writeAsString('', flush: true);
+            }
+          } catch (_) {
+            // Best effort; daemon process can append or create on launch.
+          }
+        }
         if (Platform.isWindows) {
-          await _restrictLaunchPath(logPath);
+          try {
+            await _restrictLaunchPath(logPath);
+          } catch (_) {}
         }
       }
       await _clearPidMarkerForStart(pidPath);
@@ -565,10 +579,13 @@ class DaemonController {
         '07 log_prepare ERROR',
         error,
       );
+      final rawCode = _failureCodeForError(error);
       return _startupFailure(
         startupTrace,
         stage: 7,
-        code: _failureCodeForError(error),
+        code: rawCode == DaemonStartupFailureCode.uacLaunchFailed
+            ? DaemonStartupFailureCode.aclFailure
+            : rawCode,
         message: _startFailureMessage(error),
       );
     }

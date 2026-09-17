@@ -274,6 +274,17 @@ void main() {
       classifyWindowsLaunchFailure('Windows ACL protection failed').code,
       DaemonStartupFailureCode.aclFailure,
     );
+    expect(
+      classifyWindowsLaunchFailure(
+        "PathAccessException: Cannot rename file to 'C:\\logs\\p2wlan-daemon.log.1', path = 'C:\\logs\\p2wlan-daemon.log' (OS Error: 拒绝访问。 errno = 5)",
+      ).code,
+      DaemonStartupFailureCode.aclFailure,
+    );
+    final timeoutFailure = classifyWindowsLaunchFailure(
+      'Windows helper timed out after 45000 milliseconds',
+    );
+    expect(timeoutFailure.code, DaemonStartupFailureCode.uacLaunchFailed);
+    expect(timeoutFailure.message, contains('超时'));
   });
 
   test('parses only the elevated child PID marker', () {
