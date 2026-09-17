@@ -20,12 +20,12 @@ def install(bundle: Path) -> None:
         raise ValueError('XDG_DATA_HOME must be an absolute path.')
     directory = data_home / 'applications'
     directory.mkdir(parents=True, exist_ok=True)
-    entry = directory / 'com.example.p2wlan_flutter_client.desktop'
+    entry = directory / 'com.p2wlan.diagnostics.desktop'
     contents = (
         '[Desktop Entry]\nType=Application\nName=P2WLAN\n'
         f'Exec="{escaped}" %u\nIcon=network-workgroup\nTerminal=false\n'
         'Categories=Network;\nMimeType=x-scheme-handler/p2wlan;\n'
-        'StartupWMClass=com.example.p2wlan_flutter_client\n'
+        'StartupWMClass=com.p2wlan.diagnostics\n'
     )
     temporary = entry.with_suffix('.desktop.tmp')
     temporary.write_text(contents, encoding='utf-8')
