@@ -59,6 +59,10 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 先用 p2wlan-config 在新目录生成匹配的 Control/Relay 配置，再按[配置参考](../reference/configuration.md)填入域名、证书和密钥。配置文件和数据库应由专用 p2wlan 用户拥有，权限分别限制为服务需要的最小范围。
 
+需要管理界面时，在受保护的 Control 环境文件中额外设置 `CONTROL_ADMIN_TOKEN=<至少32字符的独立随机令牌>`，然后重启 Control。管理台直接编译进 `p2wlan-control`，不需要 Node、独立静态站点或额外容器；入口为与 Control 同一 HTTPS origin 下的 `/admin/`。未设置该变量时入口返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
+
+管理员令牌不能与 `JWT_SECRET`、设备凭据、Relay ticket 或撤权 feed token 复用，也不要放入 URL、公开日志或反向代理访问日志字段。页面中的在线设备、Relay RTT、隧道和信令计数来自 Control 已提交状态，不等于真实 TUN、Direct/Relay 或业务应用已经端到端可达。
+
 Docker Compose 适合隔离验证或已建立镜像发布流程的部署。默认 Control 只发布到 loopback；容器以非 root、只读根文件系统和无额外 capability 运行。生产镜像必须来自固定发布摘要，不能在业务服务器上临时 build 未验证源码。
 
 Compose 镜像也包含 `p2wlan-db`，可在挂载的数据卷上生成一致性 SQLite 快照；`p2wlan-server backup/restore` 只适用于服务端归档的 systemd 管理路径。容器恢复前先停止 Control，再用同一镜像的 `p2wlan-db --verify` 验证快照，最后启动并检查服务。

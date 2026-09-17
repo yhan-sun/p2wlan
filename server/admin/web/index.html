@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="robots" content="noindex,nofollow">
+  <title>P2WLAN Control</title>
+  <link rel="stylesheet" href="/admin/app.css">
+</head>
+<body>
+  <section class="login-shell" id="loginView" hidden>
+    <div class="login-card">
+      <div class="brand-mark" aria-hidden="true">P2</div>
+      <div class="login-heading">
+        <p class="eyebrow">P2WLAN CONTROL</p>
+        <h1>服务器管理</h1>
+        <p>使用部署时配置的管理员令牌进入只读控制台。</p>
+      </div>
+      <form id="loginForm" autocomplete="off">
+        <label for="adminToken">管理员令牌</label>
+        <input id="adminToken" name="adminToken" type="password" minlength="32" required autocomplete="current-password" placeholder="CONTROL_ADMIN_TOKEN">
+        <p class="form-error" id="loginError" role="alert"></p>
+        <button class="button button-primary button-block" type="submit">进入控制台</button>
+      </form>
+      <p class="login-footnote">令牌仅保存在当前浏览器标签页会话中。</p>
+    </div>
+  </section>
+
+  <div class="app-shell" id="appView" hidden>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark brand-mark-small" aria-hidden="true">P2</div>
+        <div>
+          <strong>P2WLAN</strong>
+          <span>Control</span>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item is-active" type="button" data-view="overview"><span class="nav-icon">⌂</span>概览</button>
+        <button class="nav-item" type="button" data-view="devices"><span class="nav-icon">▣</span>设备</button>
+        <button class="nav-item" type="button" data-view="networks"><span class="nav-icon">◇</span>网络</button>
+        <button class="nav-item" type="button" data-view="rooms"><span class="nav-icon">□</span>房间</button>
+        <button class="nav-item" type="button" data-view="operations"><span class="nav-icon">≡</span>运行状态</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span class="status-dot"></span>
+        <div>
+          <strong>只读管理模式</strong>
+          <span>不会修改网络状态</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <p class="breadcrumb">P2WLAN / <span id="breadcrumbLabel">概览</span></p>
+          <h1 id="pageTitle">概览</h1>
+        </div>
+        <div class="topbar-actions">
+          <span class="last-updated" id="lastUpdated">尚未刷新</span>
+          <button class="button button-secondary" id="refreshButton" type="button">刷新</button>
+          <button class="button button-ghost" id="logoutButton" type="button">退出</button>
+        </div>
+      </header>
+
+      <div class="notice" id="globalNotice" hidden></div>
+
+      <section class="view is-visible" id="view-overview" aria-labelledby="pageTitle">
+        <div class="metric-grid">
+          <article class="metric-card">
+            <span class="metric-label">在线设备</span>
+            <div class="metric-value"><strong id="metricOnline">—</strong><span id="metricOnlineRatio">—</span></div>
+            <p>当前 Control 标记为在线</p>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">设备总数</span>
+            <div class="metric-value"><strong id="metricDevices">—</strong></div>
+            <p>已注册设备</p>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">网络</span>
+            <div class="metric-value"><strong id="metricNetworks">—</strong></div>
+            <p>不含系统默认网络</p>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">房间</span>
+            <div class="metric-value"><strong id="metricRooms">—</strong></div>
+            <p>当前房间数量</p>
+          </article>
+        </div>
+
+        <div class="content-grid">
+          <article class="panel panel-wide">
+            <div class="panel-header">
+              <div>
+                <h2>最近设备</h2>
+                <p>按最后上报时间排序，状态来自 Control 数据库。</p>
+              </div>
+              <button class="text-button" type="button" data-jump="devices">查看全部</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>设备</th><th>用户</th><th>网络</th><th>虚拟 IP</th><th>状态</th><th>最后活动</th></tr></thead>
+                <tbody id="recentDevicesBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <aside class="panel health-panel">
+            <div class="panel-header compact"><div><h2>服务状态</h2><p>当前进程</p></div><span class="health-badge">正常</span></div>
+            <dl class="key-values">
+              <div><dt>版本</dt><dd id="runtimeVersion">—</dd></div>
+              <div><dt>提交</dt><dd class="mono" id="runtimeCommit">—</dd></div>
+              <div><dt>运行时间</dt><dd id="runtimeUptime">—</dd></div>
+              <div><dt>用户</dt><dd id="metricUsers">—</dd></div>
+              <div><dt>活动隧道</dt><dd id="metricTunnels">—</dd></div>
+              <div><dt>待处理信令</dt><dd id="metricSignals">—</dd></div>
+            </dl>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-devices">
+        <article class="panel">
+          <div class="panel-header panel-header-tools">
+            <div><h2>设备</h2><p id="deviceCountLabel">加载中</p></div>
+            <div class="filters">
+              <input class="search-input" id="deviceSearch" type="search" placeholder="搜索设备、用户、IP 或网络">
+              <select id="deviceStatus" aria-label="设备状态">
+                <option value="all">全部状态</option>
+                <option value="online">在线</option>
+                <option value="offline">离线</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>设备</th><th>用户</th><th>网络</th><th>虚拟 IP</th><th>NAT</th><th>Relay RTT</th><th>状态</th><th>最后活动</th></tr></thead>
+              <tbody id="devicesBody"></tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <span id="devicePageLabel">—</span>
+            <div><button class="button button-secondary" id="devicePrev" type="button">上一页</button><button class="button button-secondary" id="deviceNext" type="button">下一页</button></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="view" id="view-networks">
+        <article class="panel">
+          <div class="panel-header"><div><h2>网络</h2><p id="networkCountLabel">加载中</p></div></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>名称</th><th>CIDR</th><th>所有者</th><th>成员</th><th>设备</th><th>在线</th><th>类型</th><th>创建时间</th></tr></thead>
+              <tbody id="networksBody"></tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <span id="networkPageLabel">—</span>
+            <div><button class="button button-secondary" id="networkPrev" type="button">上一页</button><button class="button button-secondary" id="networkNext" type="button">下一页</button></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="view" id="view-rooms">
+        <article class="panel">
+          <div class="panel-header"><div><h2>房间</h2><p id="roomCountLabel">加载中</p></div></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>名称</th><th>房间号</th><th>CIDR</th><th>所有者</th><th>成员</th><th>设备</th><th>在线</th><th>加入状态</th></tr></thead>
+              <tbody id="roomsBody"></tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <span id="roomPageLabel">—</span>
+            <div><button class="button button-secondary" id="roomPrev" type="button">上一页</button><button class="button button-secondary" id="roomNext" type="button">下一页</button></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="view" id="view-operations">
+        <div class="operations-grid">
+          <article class="panel">
+            <div class="panel-header"><div><h2>Control 进程</h2><p>该页面仅展示当前进程可确认的信息。</p></div><span class="health-badge">运行中</span></div>
+            <dl class="key-values key-values-large">
+              <div><dt>构建版本</dt><dd id="opsVersion">—</dd></div>
+              <div><dt>源码提交</dt><dd class="mono" id="opsCommit">—</dd></div>
+              <div><dt>启动时间</dt><dd id="opsStartedAt">—</dd></div>
+              <div><dt>运行时间</dt><dd id="opsUptime">—</dd></div>
+              <div><dt>管理权限</dt><dd>只读</dd></div>
+            </dl>
+          </article>
+          <article class="panel">
+            <div class="panel-header"><div><h2>控制面队列</h2><p>数据库中的当前计数，不代表业务数据面吞吐。</p></div></div>
+            <div class="ops-metrics">
+              <div><span>待处理信令</span><strong id="opsSignals">—</strong></div>
+              <div><span>活动隧道</span><strong id="opsTunnels">—</strong></div>
+              <div><span>在线设备</span><strong id="opsOnline">—</strong></div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/admin/app.js" defer></script>
+</body>
+</html>

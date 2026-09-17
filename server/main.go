@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yhan-sun/p2wlan/server/admin"
 	"github.com/yhan-sun/p2wlan/server/api"
 	"github.com/yhan-sun/p2wlan/server/auth"
 	"github.com/yhan-sun/p2wlan/server/database"
@@ -39,6 +40,7 @@ func main() {
 		fmt.Printf("p2wlan-control %s (%s)\n", buildVersion, buildCommit)
 		return
 	}
+	startedAt := time.Now()
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("P2PNet Control Server starting...")
 
@@ -82,9 +84,25 @@ func main() {
 		log.Fatalf("Invalid control configuration: %v", err)
 	}
 
+	// Initialize the optional, read-only administration console. The console
+	// uses an independent bearer token rather than extending user JWT privileges.
+	adminServer, err := admin.New(db, admin.Config{
+		Token:        getEnv("CONTROL_ADMIN_TOKEN", ""),
+		BuildVersion: buildVersion,
+		BuildCommit:  buildCommit,
+		StartedAt:    startedAt,
+	})
+	if err != nil {
+		log.Fatalf("Invalid admin console configuration: %v", err)
+	}
+
 	// HTTP mux
 	mux := http.NewServeMux()
+	adminServer.RegisterRoutes(mux)
 	apiServer.RegisterRoomRoutes(mux)
+	if adminServer.Enabled() {
+		log.Println("Admin console enabled at /admin/ (read-only)")
+	}
 
 	// Public / auth-free routes
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -200,10 +218,10 @@ func registerDeviceControlRoutes(mux *http.ServeMux, authService *auth.Service, 
 }
 
 // withCORS allows explicitly configured browser origins to call the control
-// API. The browser console was deleted and Flutter Web is out of scope, so
-// there is no default browser origin: only origins listed in
-// CONTROL_ALLOWED_ORIGINS (a comma list) are honored. The daemon and the
-// Flutter/tray/CLI clients are native and never send an Origin header.
+// API. The embedded admin console is same-origin and does not rely on CORS;
+// only origins listed in CONTROL_ALLOWED_ORIGINS (a comma list) are honored.
+// The daemon and the Flutter/tray/CLI clients are native and never send an
+// Origin header.
 func withCORS(next http.Handler) http.Handler {
 	allowed := parseAllowedOrigins(getEnv("CONTROL_ALLOWED_ORIGINS", ""))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

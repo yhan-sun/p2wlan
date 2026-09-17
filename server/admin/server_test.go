@@ -1,0 +1,159 @@
+package admin
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/yhan-sun/p2wlan/server/database"
+)
+
+type fakeStore struct{}
+
+func (fakeStore) AdminOverviewSnapshot() (*database.AdminOverview, error) {
+	return &database.AdminOverview{
+		GeneratedAt:    10,
+		Users:          3,
+		Networks:       2,
+		Rooms:          1,
+		Devices:        4,
+		OnlineDevices:  2,
+		ActiveTunnels:  1,
+		PendingSignals: 5,
+		RecentDevices:  []database.AdminDeviceSummary{{ID: "d1", DeviceName: "desktop", Online: true}},
+	}, nil
+}
+
+func (fakeStore) AdminDevices(_ string, _ string, limit, offset int) (*database.AdminDevicePage, error) {
+	return &database.AdminDevicePage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminDeviceSummary{{ID: "d1", DeviceName: "desktop"}}}, nil
+}
+
+func (fakeStore) AdminNetworks(limit, offset int) (*database.AdminNetworkPage, error) {
+	return &database.AdminNetworkPage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminNetworkSummary{{ID: "n1", Name: "home"}}}, nil
+}
+
+func (fakeStore) AdminRooms(limit, offset int) (*database.AdminRoomPage, error) {
+	return &database.AdminRoomPage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminRoomSummary{{ID: "r1", Name: "friends"}}}, nil
+}
+
+func testServer(t *testing.T, token string) *Server {
+	t.Helper()
+	server, err := New(fakeStore{}, Config{
+		Token:        token,
+		BuildVersion: "server-v1.2.3",
+		BuildCommit:  "0123456789abcdef",
+		StartedAt:    time.Now().Add(-90 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+func TestNewRejectsWeakAdminToken(t *testing.T) {
+	if _, err := New(fakeStore{}, Config{Token: "short"}); err == nil {
+		t.Fatal("expected short admin token to be rejected")
+	}
+}
+
+func TestDisabledConsoleIsNotDiscoverable(t *testing.T) {
+	server := testServer(t, "")
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	for _, path := range []string{"/admin", "/admin/", "/admin/api/v1/runtime"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusNotFound {
+			t.Fatalf("%s: expected 404, got %d", path, res.Code)
+		}
+	}
+}
+
+func TestConsoleServesEmbeddedUIWithSecurityHeaders(t *testing.T) {
+	server := testServer(t, strings.Repeat("a", 32))
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/", nil)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+	if !strings.Contains(res.Body.String(), "服务器管理") {
+		t.Fatalf("expected embedded console HTML")
+	}
+	if got := res.Header().Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") {
+		t.Fatalf("missing restrictive CSP: %q", got)
+	}
+	if got := res.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("expected no-store, got %q", got)
+	}
+}
+
+func TestAdminAPIRequiresBearerToken(t *testing.T) {
+	token := strings.Repeat("b", 32)
+	server := testServer(t, token)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	unauthorized := httptest.NewRecorder()
+	mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", unauthorized.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/overview", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", res.Code, res.Body.String())
+	}
+	if !strings.Contains(res.Body.String(), `"online_devices":2`) {
+		t.Fatalf("unexpected overview payload: %s", res.Body.String())
+	}
+	if strings.Contains(res.Body.String(), token) {
+		t.Fatal("admin token leaked into response")
+	}
+}
+
+func TestAdminPaginationRejectsOutOfRangeLimit(t *testing.T) {
+	token := strings.Repeat("c", 32)
+	server := testServer(t, token)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/devices?limit=201", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", res.Code)
+	}
+}
+
+func TestRuntimeUsesBuildIdentity(t *testing.T) {
+	token := strings.Repeat("d", 32)
+	server := testServer(t, token)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/runtime", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.Code)
+	}
+	body := res.Body.String()
+	for _, expected := range []string{`"build_version":"server-v1.2.3"`, `"build_commit":"0123456789abcdef"`, `"admin_mode":"read-only"`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("runtime response missing %s: %s", expected, body)
+		}
+	}
+}
