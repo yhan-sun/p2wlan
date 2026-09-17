@@ -11,6 +11,7 @@ import type {
 } from './types'
 
 const TOKEN_KEY = 'p2wlan-admin-token'
+const MAX_SERVER_PAGE = 200
 
 export class ApiError extends Error {
   status: number
@@ -64,12 +65,48 @@ export async function api<T>(path: string): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function accountPage(query: string, limit: number, offset: number): Promise<Page<AdminAccount>> {
+  const params = new URLSearchParams({ q: query, limit: String(limit), offset: String(offset) })
+  return api<Page<AdminAccount>>(`/accounts?${params}`)
+}
+
+async function fetchAllPages<T>(fetchPage: (limit: number, offset: number) => Promise<Page<T>>): Promise<Page<T>> {
+  const items: T[] = []
+  let offset = 0
+  let total = 0
+
+  do {
+    const page = await fetchPage(MAX_SERVER_PAGE, offset)
+    total = page.total
+    items.push(...page.items)
+    offset += page.items.length
+    if (page.items.length === 0) break
+  } while (offset < total)
+
+  return { total, limit: items.length, offset: 0, items }
+}
+
+async function allTopologyAccounts(): Promise<Page<AdminAccount>> {
+  return fetchAllPages((limit, offset) => accountPage('', limit, offset))
+}
+
+async function allNetworks(): Promise<Page<AdminNetwork>> {
+  return fetchAllPages((limit, offset) => api<Page<AdminNetwork>>(`/networks?limit=${limit}&offset=${offset}`))
+}
+
+async function allRooms(): Promise<Page<AdminRoom>> {
+  return fetchAllPages((limit, offset) => api<Page<AdminRoom>>(`/rooms?limit=${limit}&offset=${offset}`))
+}
+
 export const adminApi = {
   overview: () => api<AdminOverview>('/overview'),
   runtime: () => api<AdminRuntime>('/runtime'),
   accounts: (query = '', limit = 50, offset = 0) => {
-    const params = new URLSearchParams({ q: query, limit: String(limit), offset: String(offset) })
-    return api<Page<AdminAccount>>(`/accounts?${params}`)
+    // The topology selector intentionally asks for the server maximum (200).
+    // Treat that call as an all-account option request and continue paging so
+    // installations with hundreds or thousands of accounts remain navigable.
+    if (query === '' && limit === MAX_SERVER_PAGE && offset === 0) return allTopologyAccounts()
+    return accountPage(query, limit, offset)
   },
   account: (id: string) => api<AdminAccountDetail>(`/accounts/${encodeURIComponent(id)}`),
   topology: (accountId?: string) => accountId
@@ -79,6 +116,6 @@ export const adminApi = {
     const params = new URLSearchParams({ q: query, status, limit: String(limit), offset: String(offset) })
     return api<Page<AdminDevice>>(`/devices?${params}`)
   },
-  networks: (limit = 100, offset = 0) => api<Page<AdminNetwork>>(`/networks?limit=${limit}&offset=${offset}`),
-  rooms: (limit = 100, offset = 0) => api<Page<AdminRoom>>(`/rooms?limit=${limit}&offset=${offset}`),
+  networks: () => allNetworks(),
+  rooms: () => allRooms(),
 }
