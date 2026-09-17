@@ -24,8 +24,10 @@ var embeddedWeb embed.FS
 type Store interface {
 	AdminOverviewSnapshot() (*database.AdminOverview, error)
 	AdminAccounts(query string, limit, offset int) (*database.AdminAccountPage, error)
+	AdminAccountsCursor(query, afterID string, limit int) (*database.AdminAccountCursorPage, error)
 	AdminAccount(accountID string) (*database.AdminAccountDetail, error)
 	AdminTopology(accountID string) (*database.AdminTopology, error)
+	AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget int) (*database.AdminTopologyPage, error)
 	AdminDevices(query, status string, limit, offset int) (*database.AdminDevicePage, error)
 	AdminNetworks(limit, offset int) (*database.AdminNetworkPage, error)
 	AdminRooms(limit, offset int) (*database.AdminRoomPage, error)
@@ -93,6 +95,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin", s.redirectConsole)
 	mux.HandleFunc("GET /admin/api/v1/overview", s.requireAdmin(s.overview))
 	mux.HandleFunc("GET /admin/api/v1/accounts", s.requireAdmin(s.accounts))
+	mux.HandleFunc("GET /admin/api/v1/accounts/cursor", s.requireAdmin(s.accountsCursor))
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}/topology", s.requireAdmin(s.accountTopology))
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}", s.requireAdmin(s.account))
 	mux.HandleFunc("GET /admin/api/v1/topology", s.requireAdmin(s.topology))
@@ -199,6 +202,25 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 
+func (s *Server) accountsCursor(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseBoundedInt(r.URL.Query().Get("limit"), 25, 1, 200)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 200"})
+		return
+	}
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+	if len(cursor) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cursor is too long"})
+		return
+	}
+	value, err := s.store.AdminAccountsCursor(r.URL.Query().Get("q"), cursor, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load accounts"})
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
 func (s *Server) account(w http.ResponseWriter, r *http.Request) {
 	value, err := s.store.AdminAccount(r.PathValue("id"))
 	if errors.Is(err, database.ErrAdminAccountNotFound) {
@@ -212,8 +234,27 @@ func (s *Server) account(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 
-func (s *Server) topology(w http.ResponseWriter, _ *http.Request) {
-	value, err := s.store.AdminTopology("")
+func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
+	accountLimit, err := parseBoundedInt(r.URL.Query().Get("limit"), 12, 1, 50)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 50"})
+		return
+	}
+	nodeBudget, err := parseBoundedInt(r.URL.Query().Get("node_limit"), 600, 1, 2000)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_limit must be between 1 and 2000"})
+		return
+	}
+	if nodeBudget < accountLimit {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_limit must be greater than or equal to limit"})
+		return
+	}
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+	if len(cursor) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cursor is too long"})
+		return
+	}
+	value, err := s.store.AdminTopologyPage(cursor, accountLimit, nodeBudget)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load topology"})
 		return
@@ -290,6 +331,18 @@ func (s *Server) runtime(w http.ResponseWriter, _ *http.Request) {
 		"uptime_seconds": int64(uptime / time.Second),
 		"admin_mode":     "read-only",
 	})
+}
+
+func parseBoundedInt(raw string, fallback, minValue, maxValue int) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minValue || value > maxValue {
+		return 0, errors.New("value outside allowed range")
+	}
+	return value, nil
 }
 
 func parsePage(w http.ResponseWriter, r *http.Request) (int, int, bool) {

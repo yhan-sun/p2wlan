@@ -331,3 +331,168 @@ func TestAdminFocusTopologyKeepsDefaultOnlyAccount(t *testing.T) {
 		t.Fatalf("private default device must attach to its own account: %+v", topology.Edges)
 	}
 }
+
+
+func TestAdminTopologyPageUsesStableAccountCursor(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedAdminTestData(t, db)
+
+	first, err := db.AdminTopologyPage("", 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Complete || first.NextCursor == "" || first.LoadedAccounts != 1 || first.TotalAccounts != 2 {
+		t.Fatalf("unexpected first topology page: %+v", first)
+	}
+	firstAccounts := map[string]bool{}
+	for _, node := range first.Nodes {
+		if node.Kind == "account" {
+			firstAccounts[node.AccountID] = true
+		}
+	}
+	if len(firstAccounts) != 1 {
+		t.Fatalf("first page should contain one account: %+v", firstAccounts)
+	}
+
+	second, err := db.AdminTopologyPage(first.NextCursor, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Complete || second.NextCursor != "" || second.LoadedAccounts != 1 {
+		t.Fatalf("unexpected second topology page: %+v", second)
+	}
+	for _, node := range second.Nodes {
+		if node.Kind == "account" && firstAccounts[node.AccountID] {
+			t.Fatalf("account repeated across cursor pages: %s", node.AccountID)
+		}
+	}
+}
+
+func TestAdminTopologyPageReportsNodeBudgetInsteadOfSilentTruncation(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedAdminTestData(t, db)
+
+	page, err := db.AdminTopologyPage("", 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Partial || page.PartialReason != "node_budget" || page.Complete || page.NextCursor != "" {
+		t.Fatalf("budgeted page must explicitly report incompleteness: %+v", page)
+	}
+	if len(page.Nodes) != 2 {
+		t.Fatalf("node budget was not respected: got %d nodes", len(page.Nodes))
+	}
+}
+
+func TestAdminTopologyPageKeepsDefaultDevicesAccountPrivate(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedAdminTestData(t, db)
+	now := time.Now().Unix()
+	for _, statement := range []string{
+		fmt.Sprintf(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, last_seen, app_version, online, created_at) VALUES ('default-a', 'u1', 'default', 'pka', 'Alice Default', 'linux', '10.20.0.2', 'unknown', %d, '0.1.163', 1, 80)`, now),
+		fmt.Sprintf(`INSERT INTO devices (id, user_id, network_id, public_key, device_name, platform, virtual_ip, nat_type, last_seen, app_version, online, created_at) VALUES ('default-b', 'u2', 'default', 'pkb', 'Bob Default', 'linux', '10.20.0.3', 'unknown', %d, '0.1.163', 1, 81)`, now),
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := db.AdminTopologyPage("", 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accountID string
+	for _, node := range page.Nodes {
+		if node.Kind == "account" {
+			accountID = node.AccountID
+		}
+	}
+	if accountID == "" {
+		t.Fatal("page did not contain an account")
+	}
+	for _, node := range page.Nodes {
+		if node.Kind == "device" && node.NetworkID == "default" && node.AccountID != accountID {
+			t.Fatalf("page leaked another account's private default device: %+v", node)
+		}
+	}
+	for _, edge := range page.Edges {
+		if edge.Role == "private-default" && edge.Source != "account:"+accountID {
+			t.Fatalf("private default attachment crossed account boundary: %+v", edge)
+		}
+	}
+}
+
+
+func TestAdminAccountsCursorIsStableAcrossActivityChanges(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedAdminTestData(t, db)
+
+	first, err := db.AdminAccountsCursor("", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Items) != 1 || first.NextCursor == "" {
+		t.Fatalf("unexpected first cursor page: %+v", first)
+	}
+	firstID := first.Items[0].ID
+
+	// Heartbeats may reorder the old last_seen-sorted offset endpoint. The
+	// cursor endpoint is intentionally ordered only by immutable user ID.
+	if _, err := db.Exec(`UPDATE devices SET last_seen = ? WHERE user_id <> ?`, time.Now().Unix()+100, firstID); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := db.AdminAccountsCursor("", first.NextCursor, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Items) != 1 || second.Items[0].ID == firstID {
+		t.Fatalf("cursor page repeated account after activity change: first=%+v second=%+v", first, second)
+	}
+	if second.NextCursor != "" {
+		t.Fatalf("unexpected next cursor on final page: %+v", second)
+	}
+}
+
+
+func TestAdminTopologyPageCarriesCrossPageSignalsUntilTargetLoads(t *testing.T) {
+	db, err := New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedAdminTestData(t, db)
+
+	first, err := db.AdminTopologyPage("", 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Partial {
+		t.Fatalf("unexpected partial first page: %+v", first)
+	}
+	var crossPageSignal bool
+	for _, edge := range first.Edges {
+		if edge.Kind == "pending_signal" && edge.Source == "device:d2" && edge.Target == "device:d3" {
+			crossPageSignal = true
+		}
+	}
+	if !crossPageSignal {
+		t.Fatalf("cross-page signal must travel with either endpoint page: %+v", first.Edges)
+	}
+}

@@ -10,14 +10,29 @@ const ACCOUNT_COLORS = [
  * bounded instead of generating arbitrary RGB values so labels remain legible
  * on both the topology canvas and white table surfaces.
  */
-export function accountColor(id?: string): string {
-  if (!id) return '#64748b'
+function accountHash(id?: string): number {
+  if (!id) return 0
   let hash = 2166136261
   for (let i = 0; i < id.length; i += 1) {
     hash ^= id.charCodeAt(i)
     hash = Math.imul(hash, 16777619)
   }
-  return ACCOUNT_COLORS[(hash >>> 0) % ACCOUNT_COLORS.length]
+  return hash >>> 0
+}
+
+export function accountColor(id?: string): string {
+  if (!id) return '#64748b'
+  return ACCOUNT_COLORS[accountHash(id) % ACCOUNT_COLORS.length]
+}
+
+export function accountIdentity(id?: string): { color: string; code: string } {
+  if (!id) return { color: '#64748b', code: '--' }
+  const hash = accountHash(id)
+  // Color is intentionally bounded for contrast. The independent six-character base36 code
+  // is the second visual channel, so two accounts that share one of the 24
+  // colors are still distinguishable in the graph and legend.
+  const code = (hash % 2176782336).toString(36).toUpperCase().padStart(6, '0')
+  return { color: ACCOUNT_COLORS[hash % ACCOUNT_COLORS.length], code }
 }
 
 export function colorWithAlpha(hex: string, alpha: number): string {

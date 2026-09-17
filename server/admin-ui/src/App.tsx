@@ -11,7 +11,7 @@ import {
   useReactTable,
   type ColumnDef,
 } from '@tanstack/react-table'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   ArrowRight,
@@ -48,6 +48,7 @@ import {
 import { adminApi, ApiError, clearAdminToken, getAdminToken, setAdminToken, verifyAdminToken } from './api'
 import { accountColor, colorWithAlpha } from './colors'
 import { TopologyCanvas } from './TopologyCanvas'
+import { mergeTopologyPages } from './topologyPaging'
 import type {
   AdminAccount,
   AdminDevice,
@@ -182,6 +183,23 @@ function Pagination({ total, offset, limit, onChange }: { total: number; offset:
   </div></div>
 }
 
+function CursorPagination({ total, pageIndex, itemCount, limit, canNext, onPrev, onNext }: {
+  total: number
+  pageIndex: number
+  itemCount: number
+  limit: number
+  canNext: boolean
+  onPrev: () => void
+  onNext: () => void
+}) {
+  const start = itemCount === 0 ? 0 : pageIndex * limit + 1
+  const end = itemCount === 0 ? 0 : start + itemCount - 1
+  return <div className="pagination-v2"><span>{start}–{Math.min(end, total)} / {total}</span><div>
+    <button className="button secondary compact" disabled={pageIndex === 0} onClick={onPrev}><ChevronLeft size={15} />上一页</button>
+    <button className="button secondary compact" disabled={!canNext} onClick={onNext}>下一页<ChevronRight size={15} /></button>
+  </div></div>
+}
+
 function Login({ onSuccess }: { onSuccess: () => void }) {
   const [token, setToken] = useState('')
   const [error, setError] = useState('')
@@ -294,7 +312,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
 function Dashboard() {
   const overview = useQuery({ queryKey: ['overview'], queryFn: adminApi.overview, refetchInterval: 30_000 })
   const accounts = useQuery({ queryKey: ['accounts', 'recent'], queryFn: () => adminApi.accounts('', 6, 0), refetchInterval: 30_000 })
-  const topology = useQuery({ queryKey: ['topology', 'global'], queryFn: () => adminApi.topology(), refetchInterval: 30_000 })
+  const topology = useQuery({ queryKey: ['topology', 'dashboard'], queryFn: () => adminApi.topologyPage('', 6, 260), refetchInterval: 60_000 })
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: adminApi.runtime, refetchInterval: 30_000 })
   if (overview.isPending || accounts.isPending || topology.isPending || runtime.isPending) return <PendingBlock queries={[overview, accounts, topology, runtime]} label="正在读取 Control 状态…" />
   const error = overview.error || accounts.error || topology.error || runtime.error
@@ -310,7 +328,7 @@ function Dashboard() {
     </section>
 
     <section className="dashboard-grid">
-      <Panel className="dashboard-topology" title="全局拓扑" subtitle="账号 → 网络 / 房间 → 设备的真实 Control 关系" action={<Link className="text-link" to="/topology">打开全屏拓扑<ArrowRight size={14} /></Link>}>
+      <Panel className="dashboard-topology" title="全局拓扑预览" subtitle={`首批 ${topology.data.loaded_accounts} / ${topology.data.total_accounts} 个账号；完整视图按需加载`} action={<Link className="text-link" to="/topology">打开拓扑工作区<ArrowRight size={14} /></Link>}>
         <TopologyCanvas data={topology.data} compact />
       </Panel>
       <Panel className="health-card" title="Control" subtitle="当前服务进程" action={<span className="badge success"><span />正常</span>}>
@@ -350,10 +368,19 @@ function Dashboard() {
 function AccountsPage() {
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
-  const [offset, setOffset] = useState(0)
+  const [cursor, setCursor] = useState('')
+  const [cursorHistory, setCursorHistory] = useState<string[]>([])
   const debounced = useDebouncedValue(query)
-  useEffect(() => setOffset(0), [debounced])
-  const result = useQuery({ queryKey: ['accounts', debounced, offset], queryFn: () => adminApi.accounts(debounced, PAGE_SIZE, offset) })
+
+  useEffect(() => {
+    setCursor('')
+    setCursorHistory([])
+  }, [debounced])
+
+  const result = useQuery({
+    queryKey: ['accounts', 'cursor', debounced, cursor],
+    queryFn: () => adminApi.accountsCursor(debounced, cursor, PAGE_SIZE),
+  })
 
   const columns = useMemo<ColumnDef<AdminAccount, unknown>[]>(() => [
     { id: 'account', header: '账号', cell: ({ row }) => <div className="identity-cell"><AccountMark account={row.original} /><div><strong>{row.original.username}</strong><span>{row.original.email}</span></div></div> },
@@ -365,13 +392,34 @@ function AccountsPage() {
     { id: 'action', header: '', cell: () => <ChevronRight className="row-chevron" size={16} /> },
   ], [])
 
+  const next = () => {
+    if (!result.data?.next_cursor) return
+    setCursorHistory((history) => [...history, cursor])
+    setCursor(result.data.next_cursor)
+  }
+
+  const prev = () => {
+    const previous = cursorHistory[cursorHistory.length - 1]
+    if (previous === undefined) return
+    setCursor(previous)
+    setCursorHistory((history) => history.slice(0, -1))
+  }
+
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>所有账号</h2><p>从账号维度查看设备、网络、房间和共享拓扑。</p></div><div className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索用户名或邮箱" /></div></div>
+    <div className="page-intro"><div><h2>所有账号</h2><p>账号按稳定 ID 游标翻页；最近活动只用于展示，不参与分页排序。</p></div><div className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索用户名或邮箱" /></div></div>
     <Panel>
-      {result.isLoading ? <LoadingBlock /> : result.error ? <ErrorBlock error={result.error} /> : result.data && <>
+      {result.isPending ? <PendingBlock queries={[result]} /> : result.error ? <ErrorBlock error={result.error} /> : result.data ? <>
         <DataTable<AdminAccount> columns={columns} data={result.data.items} onRowClick={(account) => navigate(`/accounts/${encodeURIComponent(account.id)}`)} empty="没有符合条件的账号" />
-        <Pagination total={result.data.total} offset={offset} limit={PAGE_SIZE} onChange={setOffset} />
-      </>}
+        <CursorPagination
+          total={result.data.total}
+          pageIndex={cursorHistory.length}
+          itemCount={result.data.items.length}
+          limit={PAGE_SIZE}
+          canNext={Boolean(result.data.next_cursor)}
+          onPrev={prev}
+          onNext={next}
+        />
+      </> : <ErrorBlock error={new Error('Control 未返回账号列表。')} />}
     </Panel>
   </div>
 }
@@ -448,17 +496,47 @@ function AccountDetailPage() {
 function TopologyPage() {
   const [accountId, setAccountId] = useState('')
   const [search, setSearch] = useState('')
-  const accounts = useQuery({ queryKey: ['accounts', 'topology-filter'], queryFn: () => adminApi.accounts('', 200, 0) })
-  const topology = useQuery({ queryKey: ['topology', accountId || 'global'], queryFn: () => adminApi.topology(accountId || undefined) })
+  const debouncedSearch = useDebouncedValue(search)
+  const accounts = useQuery({
+    queryKey: ['accounts', 'topology-filter', debouncedSearch],
+    queryFn: () => adminApi.accounts(debouncedSearch, 50, 0),
+  })
+  const accountTopology = useQuery({
+    queryKey: ['topology', 'account', accountId],
+    queryFn: () => adminApi.topology(accountId),
+    enabled: Boolean(accountId),
+  })
+  const globalTopology = useInfiniteQuery({
+    queryKey: ['topology', 'global-paged'],
+    queryFn: ({ pageParam }) => adminApi.topologyPage(pageParam, 12, 600),
+    initialPageParam: '',
+    getNextPageParam: (lastPage) => lastPage.partial ? undefined : (lastPage.next_cursor || undefined),
+    enabled: !accountId,
+  })
+  const globalData = useMemo(
+    () => mergeTopologyPages(globalTopology.data?.pages ?? []),
+    [globalTopology.data?.pages],
+  )
+  const topologyData = accountId ? accountTopology.data : globalData
+  const topologyPending = accountId ? accountTopology.isPending : globalTopology.isPending
+  const topologyError = accountId ? accountTopology.error : globalTopology.error
 
   return <div className="page-stack topology-page-stack">
-    <div className="page-intro topology-toolbar"><div><h2>{accountId ? '账号拓扑' : '全局拓扑'}</h2><p>{accountId ? '保留共享网络中的对端账号和设备。' : '所有账号、网络、房间与设备的控制面关系。'}</p></div><div className="toolbar-controls">
+    <div className="page-intro topology-toolbar"><div><h2>{accountId ? '账号拓扑' : '全局拓扑'}</h2><p>{accountId ? '保留共享网络中的对端账号和设备。' : '全局图按稳定账号游标分批加载；需要精确完整上下文时下钻到单账号。'}</p></div><div className="toolbar-controls">
       <div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索账号、设备、IP、网络" /></div>
       <select className="select-field" value={accountId} onChange={(event) => setAccountId(event.target.value)}><option value="">全部账号</option>{accounts.data?.items.map((account) => <option value={account.id} key={account.id}>{account.username}</option>)}</select>
     </div></div>
     <Panel className="topology-main-panel">
-      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>颜色用于区分账号；绿色 / 灰色状态点表示设备在线状态。虚线只表示待处理 signaling，不代表 Relay 数据路径。</span></div>
-      <TopologyCanvas data={topology.data} loading={topology.isPending} error={topology.error instanceof Error ? topology.error.message : undefined} search={search} />
+      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>颜色只是一层账号标识；每个账号还有稳定短码用于消歧。绿色 / 灰色状态点表示设备在线状态，虚线只表示待处理 signaling，不代表 Relay 数据路径。</span></div>
+      {!accountId && globalData && <div className="topology-page-progress">
+        <span>已加载 {globalData.loaded_accounts} / {globalData.total_accounts} 个账号</span>
+        {globalData.partial
+          ? <span className="topology-partial-warning">当前切片达到 {globalData.partial_reason === 'edge_budget' ? '边' : '节点'}预算；请选择具体账号继续下钻。</span>
+          : globalTopology.hasNextPage
+            ? <button className="button secondary compact" onClick={() => globalTopology.fetchNextPage()} disabled={globalTopology.isFetchingNextPage}>{globalTopology.isFetchingNextPage ? '加载中…' : '加载更多账号'}</button>
+            : <span className="badge success"><span />全局账号已加载完成</span>}
+      </div>}
+      <TopologyCanvas data={topologyData} loading={topologyPending} error={topologyError instanceof Error ? topologyError.message : undefined} search={search} />
     </Panel>
   </div>
 }
@@ -489,16 +567,28 @@ function DevicesPage() {
 
 function NetworksPage() {
   const [tab, setTab] = useState<'networks' | 'rooms'>('networks')
-  const networks = useQuery({ queryKey: ['networks'], queryFn: () => adminApi.networks() })
-  const rooms = useQuery({ queryKey: ['rooms'], queryFn: () => adminApi.rooms() })
+  const [networkOffset, setNetworkOffset] = useState(0)
+  const [roomOffset, setRoomOffset] = useState(0)
+  const networks = useQuery({
+    queryKey: ['networks', networkOffset],
+    queryFn: () => adminApi.networks(PAGE_SIZE, networkOffset),
+  })
+  const rooms = useQuery({
+    queryKey: ['rooms', roomOffset],
+    queryFn: () => adminApi.rooms(PAGE_SIZE, roomOffset),
+  })
   const error = networks.error || rooms.error
   if (networks.isPending || rooms.isPending) return <PendingBlock queries={[networks, rooms]} />
   if (error) return <ErrorBlock error={error} />
   if (!networks.data || !rooms.data) return <ErrorBlock error={new Error('Control 未返回完整的网络与房间列表。')} />
+
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>网络与房间</h2><p>统一查看普通网络与房间网络的成员和设备规模。</p></div></div>
+    <div className="page-intro"><div><h2>网络与房间</h2><p>按页读取 Control 数据，避免大规模部署打开页面时一次扫完整个集合。</p></div></div>
     <div className="tabs-v2"><button className={tab === 'networks' ? 'active' : ''} onClick={() => setTab('networks')}>网络 {networks.data.total}</button><button className={tab === 'rooms' ? 'active' : ''} onClick={() => setTab('rooms')}>房间 {rooms.data.total}</button></div>
-    <Panel>{tab === 'networks' ? <NetworkTable networks={networks.data.items} /> : <RoomTable rooms={rooms.data.items} />}</Panel>
+    <Panel>{tab === 'networks'
+      ? <><NetworkTable networks={networks.data.items} /><Pagination total={networks.data.total} offset={networkOffset} limit={PAGE_SIZE} onChange={setNetworkOffset} /></>
+      : <><RoomTable rooms={rooms.data.items} /><Pagination total={rooms.data.total} offset={roomOffset} limit={PAGE_SIZE} onChange={setRoomOffset} /></>}
+    </Panel>
   </div>
 }
 
