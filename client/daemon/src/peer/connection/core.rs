@@ -263,14 +263,12 @@ pub struct PeerConnection {
     /// latest Direct commit. It is cleared with the Direct-set mirror on any
     /// non-Direct transition so a generic state change cannot resurrect a
     /// stale Hard↔Hard pair.
-    direct_pair_cache:
-        Option<Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>>,
+    direct_pair_cache: Option<Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>>,
     /// Manager-owned, no-await projection of the committed typed path state.
     /// The validation harness and future observability consumers read this
     /// instead of treating a contended diagnostics cache as path authority.
-    committed_business_path_cache: Option<
-        Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
-    >,
+    committed_business_path_cache:
+        Option<Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>>,
     /// Change stream for the committed-path projection. It is notified only
     /// after the reducer commit and its infallible side effects have completed
     /// under the connection writer.
@@ -335,7 +333,8 @@ impl PeerConnection {
             .remote_nat_profile
             .as_ref()
             .and_then(|profile| profile.observation_sequence);
-        let stable_endpoint = stable_endpoint.filter(|endpoint| is_public_probe_endpoint(*endpoint));
+        let stable_endpoint =
+            stable_endpoint.filter(|endpoint| is_public_probe_endpoint(*endpoint));
         let new_capabilities = NatCapabilities::from_fingerprint_hint(&hint, stable_endpoint);
         // A server-issued registration lifecycle is the outermost ordering
         // fence. A daemon restart may legitimately restart local `g` and `o`
@@ -368,40 +367,40 @@ impl PeerConnection {
             true
         } else {
             match (current_generation, incoming_generation) {
-            (Some(current), Some(incoming)) => {
-                if incoming < current {
-                    false
-                } else if incoming == current {
-                    if let Some(existing) = self.remote_nat_profile.as_ref() {
-                        let cur_m = existing.capabilities.mapping_behavior;
-                        let inc_m = new_capabilities.mapping_behavior;
-                        if cur_m != MappingBehavior::Unknown
-                            && inc_m != MappingBehavior::Unknown
-                            && cur_m != inc_m
-                        {
-                            return false;
+                (Some(current), Some(incoming)) => {
+                    if incoming < current {
+                        false
+                    } else if incoming == current {
+                        if let Some(existing) = self.remote_nat_profile.as_ref() {
+                            let cur_m = existing.capabilities.mapping_behavior;
+                            let inc_m = new_capabilities.mapping_behavior;
+                            if cur_m != MappingBehavior::Unknown
+                                && inc_m != MappingBehavior::Unknown
+                                && cur_m != inc_m
+                            {
+                                return false;
+                            }
+                            let cur_f = existing.capabilities.filtering_behavior;
+                            let inc_f = new_capabilities.filtering_behavior;
+                            if cur_f != FilteringBehavior::Unknown
+                                && inc_f != FilteringBehavior::Unknown
+                                && cur_f != inc_f
+                            {
+                                return false;
+                            }
+                            let cur_a = &existing.capabilities.allocation_model;
+                            let inc_a = &new_capabilities.allocation_model;
+                            if cur_a.is_some() && inc_a.is_some() && cur_a != inc_a {
+                                return false;
+                            }
                         }
-                        let cur_f = existing.capabilities.filtering_behavior;
-                        let inc_f = new_capabilities.filtering_behavior;
-                        if cur_f != FilteringBehavior::Unknown
-                            && inc_f != FilteringBehavior::Unknown
-                            && cur_f != inc_f
-                        {
-                            return false;
-                        }
-                        let cur_a = &existing.capabilities.allocation_model;
-                        let inc_a = &new_capabilities.allocation_model;
-                        if cur_a.is_some() && inc_a.is_some() && cur_a != inc_a {
-                            return false;
-                        }
+                        true
+                    } else {
+                        true
                     }
-                    true
-                } else {
-                    true
                 }
-            }
-            (Some(_), None) => false,
-            (None, _) => true,
+                (Some(_), None) => false,
+                (None, _) => true,
             }
         };
         if !accepts {
@@ -730,7 +729,10 @@ impl PeerConnection {
                 previous_state,
                 new_state,
             );
-            info!("Peer {} state: {} → {}", self.node_id, previous_state, new_state);
+            info!(
+                "Peer {} state: {} → {}",
+                self.node_id, previous_state, new_state
+            );
         }
         outcome
     }
@@ -745,7 +747,9 @@ impl PeerConnection {
     /// set inside its socket-state lock.
     fn sync_direct_cache(&self) {
         if let Some(cache) = &self.direct_cache {
-            let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if self.state == ConnectionState::Direct {
                 cache.insert(self.node_id.clone());
             } else {

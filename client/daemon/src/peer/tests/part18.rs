@@ -9,9 +9,11 @@ async fn candidate_refresh_relay_only_retention_commits_relay_fallback_mirror() 
         .add_peer(&test_peer("peer-relay-retention", direct_endpoint))
         .await;
     let generation = manager.current_network_generation().await;
-    assert!(manager
-        .confirm_relay_peer("peer-relay-retention", relay_endpoint, generation)
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer("peer-relay-retention", relay_endpoint, generation)
+            .await
+    );
     manager
         .record_direct_probe_success_with_latency(
             "peer-relay-retention",
@@ -96,24 +98,28 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
             Some(relay_connection_id),
         )
         .await;
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            peer_id,
-            relay_endpoint,
-            generation,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport(
+                peer_id,
+                relay_endpoint,
+                generation,
+                Some(relay_connection_id),
+            )
+            .await
+    );
 
     let before_relay_duplicate = manager.get_connection(peer_id).await.unwrap();
-    assert!(!manager
-        .confirm_relay_peer_with_transport(
-            peer_id,
-            relay_endpoint,
-            generation,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        !manager
+            .confirm_relay_peer_with_transport(
+                peer_id,
+                relay_endpoint,
+                generation,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let after_relay_duplicate = manager.get_connection(peer_id).await.unwrap();
     assert_eq!(
         after_relay_duplicate.path_state_snapshot(),
@@ -136,23 +142,27 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
         before_relay_duplicate.relay_health.last_success_at
     );
 
-    assert!(manager
-        .mark_relay_first_business_sent_for_generation_with_transport(
-            peer_id,
-            generation,
-            relay_endpoint,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_sent_for_generation_with_transport(
+                peer_id,
+                generation,
+                relay_endpoint,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let after_first_sent = manager.get_connection(peer_id).await.unwrap();
-    assert!(!manager
-        .mark_relay_first_business_sent_for_generation_with_transport(
-            peer_id,
-            generation,
-            relay_endpoint,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        !manager
+            .mark_relay_first_business_sent_for_generation_with_transport(
+                peer_id,
+                generation,
+                relay_endpoint,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let after_duplicate_sent = manager.get_connection(peer_id).await.unwrap();
     assert_eq!(
         after_duplicate_sent.path_state_snapshot(),
@@ -163,27 +173,33 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
         after_first_sent.relay_first.business_sent_generation
     );
     assert_eq!(
-        after_duplicate_sent.relay_first.business_exchange_generation,
+        after_duplicate_sent
+            .relay_first
+            .business_exchange_generation,
         after_first_sent.relay_first.business_exchange_generation
     );
 
-    assert!(manager
-        .mark_relay_first_business_received_for_generation_with_transport(
-            peer_id,
-            relay_endpoint,
-            generation,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        manager
+            .mark_relay_first_business_received_for_generation_with_transport(
+                peer_id,
+                relay_endpoint,
+                generation,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let after_first_received = manager.get_connection(peer_id).await.unwrap();
-    assert!(!manager
-        .mark_relay_first_business_received_for_generation_with_transport(
-            peer_id,
-            relay_endpoint,
-            generation,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        !manager
+            .mark_relay_first_business_received_for_generation_with_transport(
+                peer_id,
+                relay_endpoint,
+                generation,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let after_duplicate_received = manager.get_connection(peer_id).await.unwrap();
     assert_eq!(
         after_duplicate_received.path_state_snapshot(),
@@ -289,9 +305,8 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
     let bytes_sent = connection.bytes_sent;
     let direct_success_count = connection.direct_health.success_count;
     let direct_event_count = connection.direct_events.len();
-    let peer_online_duplicate = connection.commit_path_transition(
-        PathEvent::PeerOnline { epoch },
-        |connection| {
+    let peer_online_duplicate =
+        connection.commit_path_transition(PathEvent::PeerOnline { epoch }, |connection| {
             connection.bytes_sent = connection.bytes_sent.saturating_add(1);
             connection.direct_health.record_success();
             connection.record_direct_event(
@@ -302,9 +317,11 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
                 None,
                 "must not execute",
             );
-        },
+        });
+    assert_eq!(
+        peer_online_duplicate.decision,
+        PathTransitionDecision::Duplicate
     );
-    assert_eq!(peer_online_duplicate.decision, PathTransitionDecision::Duplicate);
     assert_eq!(connection.path_state_snapshot().revision, revision);
     assert_eq!(connection.bytes_sent, bytes_sent);
     assert_eq!(connection.direct_health.success_count, direct_success_count);
@@ -332,7 +349,10 @@ async fn duplicate_path_events_preserve_revision_counters_timestamps_and_markers
             connection.direct_health.record_success();
         },
     );
-    assert_eq!(generation_duplicate.decision, PathTransitionDecision::Duplicate);
+    assert_eq!(
+        generation_duplicate.decision,
+        PathTransitionDecision::Duplicate
+    );
     assert_eq!(
         connection.path_state_snapshot().revision,
         generation_revision
@@ -358,14 +378,16 @@ async fn independent_relay_health_observations_apply_once_each() {
             Some(relay_connection_id),
         )
         .await;
-    assert!(manager
-        .confirm_relay_peer_with_transport(
-            peer_id,
-            relay_endpoint,
-            generation,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        manager
+            .confirm_relay_peer_with_transport(
+                peer_id,
+                relay_endpoint,
+                generation,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let peer_session_generation = manager.peer_session_generation_sync(peer_id).unwrap();
 
     let observe = |request_id, owner_token| crate::relay_probe::RelayProbeToken {
@@ -374,62 +396,75 @@ async fn independent_relay_health_observations_apply_once_each() {
         request_id,
         owner_token,
     };
-    assert!(manager.register_relay_validation_expectation_at_write_boundary(
-        peer_id,
-        generation,
-        1,
-        101,
-        relay_endpoint,
-        relay_connection_id,
-        peer_session_generation,
-        Instant::now(),
-    ));
-    assert!(manager
-        .consume_relay_probe_ack_with_transport(
+    assert!(
+        manager.register_relay_validation_expectation_at_write_boundary(
             peer_id,
-            observe(1, 101),
+            generation,
+            1,
+            101,
             relay_endpoint,
-            Some(relay_connection_id),
+            relay_connection_id,
+            peer_session_generation,
+            Instant::now(),
         )
-        .await);
+    );
+    assert!(
+        manager
+            .consume_relay_probe_ack_with_transport(
+                peer_id,
+                observe(1, 101),
+                relay_endpoint,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let first = manager.get_connection(peer_id).await.unwrap();
     let first_revision = first.path_state_snapshot().revision;
     let first_success_count = first.relay_health.success_count;
     let first_success_at = first.relay_health.last_success_at;
 
-    assert!(!manager
-        .consume_relay_probe_ack_with_transport(
-            peer_id,
-            observe(1, 101),
-            relay_endpoint,
-            Some(relay_connection_id),
-        )
-        .await);
+    assert!(
+        !manager
+            .consume_relay_probe_ack_with_transport(
+                peer_id,
+                observe(1, 101),
+                relay_endpoint,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let duplicate = manager.get_connection(peer_id).await.unwrap();
     assert_eq!(duplicate.path_state_snapshot().revision, first_revision);
     assert_eq!(duplicate.relay_health.success_count, first_success_count);
     assert_eq!(duplicate.relay_health.last_success_at, first_success_at);
 
-    assert!(manager.register_relay_validation_expectation_at_write_boundary(
-        peer_id,
-        generation,
-        2,
-        102,
-        relay_endpoint,
-        relay_connection_id,
-        peer_session_generation,
-        Instant::now(),
-    ));
-    assert!(manager
-        .consume_relay_probe_ack_with_transport(
+    assert!(
+        manager.register_relay_validation_expectation_at_write_boundary(
             peer_id,
-            observe(2, 102),
+            generation,
+            2,
+            102,
             relay_endpoint,
-            Some(relay_connection_id),
+            relay_connection_id,
+            peer_session_generation,
+            Instant::now(),
         )
-        .await);
+    );
+    assert!(
+        manager
+            .consume_relay_probe_ack_with_transport(
+                peer_id,
+                observe(2, 102),
+                relay_endpoint,
+                Some(relay_connection_id),
+            )
+            .await
+    );
     let independent = manager.get_connection(peer_id).await.unwrap();
-    assert_eq!(independent.path_state_snapshot().revision, first_revision + 1);
+    assert_eq!(
+        independent.path_state_snapshot().revision,
+        first_revision + 1
+    );
     assert_eq!(
         independent.relay_health.success_count,
         first_success_count + 1

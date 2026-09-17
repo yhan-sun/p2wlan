@@ -864,9 +864,7 @@ impl PeerManager {
     ) -> Option<FreshGenerationReservation> {
         let mut epochs = self.recovery_epochs.write().await;
         let state = epochs.get_mut(peer_id)?;
-        if state.epoch != expected_epoch
-            || state.epoch_hard_hard_generation_quota_remaining == 0
-        {
+        if state.epoch != expected_epoch || state.epoch_hard_hard_generation_quota_remaining == 0 {
             return None;
         }
         state.epoch_hard_hard_generation_quota_remaining -= 1;
@@ -1258,8 +1256,7 @@ impl PeerManager {
                 sessions_remaining: state.epoch_sessions_remaining,
                 candidate_iterations_remaining: state.epoch_candidate_iterations_remaining,
                 fresh_generations_remaining: state.epoch_fresh_generation_quota_remaining,
-                hard_hard_generations_remaining: state
-                    .epoch_hard_hard_generation_quota_remaining,
+                hard_hard_generations_remaining: state.epoch_hard_hard_generation_quota_remaining,
                 http_remaining: state.epoch_http_quota_remaining,
                 budget_exhausted: state.budget_exhausted,
                 zero_send_streak: state.zero_send_streak,

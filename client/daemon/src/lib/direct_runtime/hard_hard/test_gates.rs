@@ -57,8 +57,9 @@ struct HardHardInitiatorResponseGate {
 }
 
 #[cfg(test)]
-static HARD_HARD_INITIATOR_RESPONSE_GATE: std::sync::Mutex<Option<Arc<HardHardInitiatorResponseGate>>> =
-    std::sync::Mutex::new(None);
+static HARD_HARD_INITIATOR_RESPONSE_GATE: std::sync::Mutex<
+    Option<Arc<HardHardInitiatorResponseGate>>,
+> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn install_hard_hard_initiator_response_gate_for_test() -> Arc<HardHardInitiatorResponseGate> {

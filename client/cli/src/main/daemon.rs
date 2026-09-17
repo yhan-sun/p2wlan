@@ -5,7 +5,9 @@ async fn start(config_path: &Path) -> Result<(), String> {
 async fn start_with_state_dir(config_path: &Path, instance_state_dir: &Path) -> Result<(), String> {
     let config = load_config(config_path)?;
     if config.control.server_url.trim().is_empty() {
-        return Err("尚未配置控制服务器，请先运行 p2wlan config set control https://你的服务器".to_string());
+        return Err(
+            "尚未配置控制服务器，请先运行 p2wlan config set control https://你的服务器".to_string(),
+        );
     }
     if config.control.auth_token.trim().is_empty()
         && config.control.device_credential.trim().is_empty()
@@ -136,21 +138,13 @@ async fn stop(config_path: &Path) -> Result<(), String> {
     stop_with_state_dir(config_path, &state_dir_for_config(config_path)).await
 }
 
-async fn stop_with_state_dir(
-    config_path: &Path,
-    instance_state_dir: &Path,
-) -> Result<(), String> {
+async fn stop_with_state_dir(config_path: &Path, instance_state_dir: &Path) -> Result<(), String> {
     let config = load_config(config_path)?;
     let url = format!(
         "http://{}/shutdown",
         normalized_diagnostics_bind(&config.diagnostics.bind)
     );
-    let response = diagnostics_request(
-        &url,
-        instance_state_dir,
-        reqwest::Method::POST,
-    )
-    .await;
+    let response = diagnostics_request(&url, instance_state_dir, reqwest::Method::POST).await;
     match response {
         Ok((status, _)) if status.is_success() => {
             println!("已发送停止请求。");

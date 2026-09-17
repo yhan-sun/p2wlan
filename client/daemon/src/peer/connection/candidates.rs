@@ -63,9 +63,7 @@ impl PeerConnection {
         let mut endpoints = Vec::new();
         for candidate in &self.candidates {
             if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
-                if self.remote_candidate_epoch != 0
-                    && !self.is_current_remote_endpoint(endpoint)
-                {
+                if self.remote_candidate_epoch != 0 && !self.is_current_remote_endpoint(endpoint) {
                     continue;
                 }
                 if !endpoints.contains(&endpoint) {
@@ -85,9 +83,7 @@ impl PeerConnection {
         let mut endpoints = Vec::new();
         for candidate in &self.candidates {
             if let Ok(endpoint) = candidate.parse::<SocketAddr>() {
-                if self.remote_candidate_epoch != 0
-                    && !self.is_current_remote_endpoint(endpoint)
-                {
+                if self.remote_candidate_epoch != 0 && !self.is_current_remote_endpoint(endpoint) {
                     continue;
                 }
                 if !endpoints.contains(&endpoint) {
@@ -96,9 +92,10 @@ impl PeerConnection {
             }
         }
         if endpoints.is_empty() {
-            if let Some(endpoint) = self.endpoint.filter(|endpoint| {
-                self.is_current_remote_endpoint(*endpoint)
-            }) {
+            if let Some(endpoint) = self
+                .endpoint
+                .filter(|endpoint| self.is_current_remote_endpoint(*endpoint))
+            {
                 endpoints.push(endpoint);
             }
         } else if let Some(endpoint) = self.endpoint {
@@ -197,10 +194,7 @@ impl PeerConnection {
     /// neighborhood of every advertised authoritative public endpoint into
     /// the preferred prefix so the very first bounded fast window can hit a
     /// post-hole neighbor instead of waiting for the slow birthday sweep.
-    pub(crate) fn preferred_fast_candidates(
-        &self,
-        candidates: &[SocketAddr],
-    ) -> Vec<SocketAddr> {
+    pub(crate) fn preferred_fast_candidates(&self, candidates: &[SocketAddr]) -> Vec<SocketAddr> {
         let on_link_hosts = candidates
             .iter()
             .copied()
@@ -304,10 +298,7 @@ impl PeerConnection {
             .unwrap_or(fallback)
     }
 
-    fn preferred_fast_candidates_from_sources(
-        &self,
-        candidates: &[SocketAddr],
-    ) -> Vec<SocketAddr> {
+    fn preferred_fast_candidates_from_sources(&self, candidates: &[SocketAddr]) -> Vec<SocketAddr> {
         candidates
             .iter()
             .copied()
@@ -425,11 +416,7 @@ impl PeerConnection {
             self.candidate_pairs[index].promote_source(source);
             return &mut self.candidate_pairs[index];
         }
-        let mut pair = CandidatePair::new_with_source(
-            endpoint,
-            local_generation,
-            source,
-        );
+        let mut pair = CandidatePair::new_with_source(endpoint, local_generation, source);
         pair.remote_candidate_epoch = self.remote_candidate_epoch;
         let insertion_index = self
             .candidate_pairs
@@ -457,11 +444,7 @@ impl PeerConnection {
             self.candidate_pairs[index].observe_source(source);
             return &mut self.candidate_pairs[index];
         }
-        let mut pair = CandidatePair::new_with_source(
-            endpoint,
-            local_generation,
-            source,
-        );
+        let mut pair = CandidatePair::new_with_source(endpoint, local_generation, source);
         pair.remote_candidate_epoch = self.remote_candidate_epoch;
         let insertion_index = self
             .candidate_pairs
@@ -922,8 +905,8 @@ impl PeerConnection {
         local_nat_profile: Option<&NatProfile>,
     ) -> bool {
         let local_hard_nat = local_nat_profile.is_some_and(is_hard_nat_profile);
-        let remote_scatter_risk = self
-            .candidate_targets_need_remote_scatter_pool(&self.probe_candidate_endpoints());
+        let remote_scatter_risk =
+            self.candidate_targets_need_remote_scatter_pool(&self.probe_candidate_endpoints());
         if !local_hard_nat && !remote_scatter_risk {
             return false;
         }
@@ -1003,11 +986,15 @@ impl PeerConnection {
 
     fn explicit_predicted_window_failed(&self, local_generation: u64) -> bool {
         let mut found_predicted = false;
-        for endpoint in self.candidate_sources.iter().filter_map(|(candidate, source)| {
-            (*source == CandidatePairSource::Predicted)
-                .then(|| candidate.parse::<SocketAddr>().ok())
-                .flatten()
-        }) {
+        for endpoint in self
+            .candidate_sources
+            .iter()
+            .filter_map(|(candidate, source)| {
+                (*source == CandidatePairSource::Predicted)
+                    .then(|| candidate.parse::<SocketAddr>().ok())
+                    .flatten()
+            })
+        {
             found_predicted = true;
             if !self.candidate_pairs.iter().any(|pair| {
                 pair.local_generation == local_generation
@@ -1021,10 +1008,7 @@ impl PeerConnection {
         found_predicted
     }
 
-    fn asymmetric_stable_remote_endpoints(
-        &self,
-        local_generation: u64,
-    ) -> Vec<SocketAddr> {
+    fn asymmetric_stable_remote_endpoints(&self, local_generation: u64) -> Vec<SocketAddr> {
         let mut endpoints = self
             .probe_candidate_endpoints()
             .into_iter()

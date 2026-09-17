@@ -235,10 +235,7 @@ fn candidate_generations_embed_the_incarnation_in_the_high_bits() {
     let new_process_first =
         next_candidate_generation_for_incarnation(1_742_987_654_322, 0).unwrap();
     assert!(new_process_first > old_process_late);
-    assert_eq!(
-        candidate_generation_incarnation(first),
-        Some(incarnation)
-    );
+    assert_eq!(candidate_generation_incarnation(first), Some(incarnation));
     assert_eq!(candidate_generation_incarnation(7), None);
 }
 
@@ -248,16 +245,20 @@ fn candidate_generation_incarnation_values_stay_within_positive_int64() {
     let value = next_candidate_generation_for_incarnation(incarnation, 0).unwrap();
     assert!(value < i64::MAX as u64);
     // The most extreme encodable generation also stays within i64.
-    let value =
-        next_candidate_generation_for_incarnation(incarnation, CANDIDATE_GENERATION_COUNTER_MASK - 1)
-            .unwrap();
+    let value = next_candidate_generation_for_incarnation(
+        incarnation,
+        CANDIDATE_GENERATION_COUNTER_MASK - 1,
+    )
+    .unwrap();
     assert!(value < i64::MAX as u64);
     // The maximum encodable incarnation still fits the signed int64 JSON path
     // (the all-ones 63-bit pattern is exactly i64::MAX).
     let max_incarnation = (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1;
-    let value =
-        next_candidate_generation_for_incarnation(max_incarnation, CANDIDATE_GENERATION_COUNTER_MASK - 1)
-            .unwrap();
+    let value = next_candidate_generation_for_incarnation(
+        max_incarnation,
+        CANDIDATE_GENERATION_COUNTER_MASK - 1,
+    )
+    .unwrap();
     assert!(value <= i64::MAX as u64);
 }
 
@@ -282,13 +283,11 @@ fn candidate_generation_degrades_to_legacy_zero_when_incarnation_outgrows_field(
         "the degradation is independent of the previous generation"
     );
     // Just below the limit still encodes.
-    assert!(
-        next_candidate_generation_for_incarnation(
-            (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1,
-            0,
-        )
-        .is_ok()
-    );
+    assert!(next_candidate_generation_for_incarnation(
+        (1u64 << CANDIDATE_GENERATION_INCARNATION_BITS) - 1,
+        0,
+    )
+    .is_ok());
     // The encodability gate used by the fresh label path agrees.
     assert!(!super::incarnation_fits_candidate_generation_encoding(
         1u64 << CANDIDATE_GENERATION_INCARNATION_BITS
@@ -309,10 +308,15 @@ fn candidate_generation_refuses_to_wrap_the_per_boot_counter() {
         Err(CandidateGenerationError::CounterExhausted(_))
     ));
     // One below the maximum still advances.
-    let value =
-        next_candidate_generation_for_incarnation(incarnation, CANDIDATE_GENERATION_COUNTER_MASK - 1)
-            .unwrap();
-    assert_eq!(value & CANDIDATE_GENERATION_COUNTER_MASK, CANDIDATE_GENERATION_COUNTER_MASK);
+    let value = next_candidate_generation_for_incarnation(
+        incarnation,
+        CANDIDATE_GENERATION_COUNTER_MASK - 1,
+    )
+    .unwrap();
+    assert_eq!(
+        value & CANDIDATE_GENERATION_COUNTER_MASK,
+        CANDIDATE_GENERATION_COUNTER_MASK
+    );
 }
 
 /// An untrustworthy incarnation (0: corrupt state, lost state, or no config
@@ -325,7 +329,10 @@ fn candidate_generation_refuses_to_wrap_the_per_boot_counter() {
 #[test]
 fn candidate_generation_with_untrustworthy_incarnation_is_legacy_compat_zero() {
     let value = next_candidate_generation_for_incarnation(0, 0).unwrap();
-    assert_eq!(value, 0, "incarnation 0 must degrade to the legacy no-metadata value");
+    assert_eq!(
+        value, 0,
+        "incarnation 0 must degrade to the legacy no-metadata value"
+    );
     assert_eq!(
         value & CANDIDATE_GENERATION_INCARNATION_FLAG,
         0,
@@ -338,7 +345,10 @@ fn candidate_generation_with_untrustworthy_incarnation_is_legacy_compat_zero() {
     // Once a real incarnation is available again the flagged space resumes
     // from a value that dominates every legacy generation the boot sent.
     let resumed = next_candidate_generation_for_incarnation(1_742_987_654_321, 0).unwrap();
-    assert!(resumed > 1_752_000_000_000, "the resumed incarnation space must be strictly above legacy values");
+    assert!(
+        resumed > 1_752_000_000_000,
+        "the resumed incarnation space must be strictly above legacy values"
+    );
 }
 
 /// Old-client -> new-client and new-client -> old-client ordering semantics:

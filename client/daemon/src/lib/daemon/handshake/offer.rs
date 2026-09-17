@@ -257,12 +257,14 @@ impl Daemon {
         // Identity comes from the synchronous lifecycle mirror, so this
         // admission check cannot queue behind control or connection state.
         // The per-peer arbiter still remains a short mutation turn only.
-        if !self
-            .signal_sender_identity_matches_peer(from_node_id, sender_public_key)
-        {
+        if !self.signal_sender_identity_matches_peer(from_node_id, sender_public_key) {
             let reason = if !self.peers.peer_exists_sync(from_node_id) {
                 "membership_revoked"
-            } else if self.peers.peer_session_generation_sync(from_node_id).is_none() {
+            } else if self
+                .peers
+                .peer_session_generation_sync(from_node_id)
+                .is_none()
+            {
                 "peer_lifecycle_pending"
             } else {
                 "sender_key_mismatch"
@@ -687,9 +689,7 @@ impl Daemon {
             ),
         )
         .await
-        .map_err(|_| {
-            DaemonError::Network(REASON_RESPONDER_SESSION_STAGE_TIMEOUT.to_string())
-        })?;
+        .map_err(|_| DaemonError::Network(REASON_RESPONDER_SESSION_STAGE_TIMEOUT.to_string()))?;
         let (had_active, responder_staged_new) = match initial_stage {
             ResponderSessionStage::Staged { had_active } => (had_active, true),
             ResponderSessionStage::ReplayableDuplicate { had_active } if cached_replay => {
@@ -707,8 +707,7 @@ impl Daemon {
                 .await
                 .map_err(|_| {
                     DaemonError::Network(REASON_RESPONDER_SESSION_STAGE_TIMEOUT.to_string())
-                })?
-                {
+                })? {
                     ResponderSessionStage::Staged { had_active } => (had_active, true),
                     ResponderSessionStage::ReplayableDuplicate { had_active } => {
                         (had_active, false)
@@ -1050,10 +1049,7 @@ impl Daemon {
                 self.peers.current_network_generation_sync()
             )),
         );
-        let Some(emit_guard) = self
-            .transport
-            .try_acquire_outbound_emit_guard(from_node_id)
-        else {
+        let Some(emit_guard) = self.transport.try_acquire_outbound_emit_guard(from_node_id) else {
             self.timeline.emit(
                 "peer_answer_commit_contended",
                 None,

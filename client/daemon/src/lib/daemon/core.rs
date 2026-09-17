@@ -179,18 +179,17 @@ impl Daemon {
         // unwritable state directory, or the counter exhausted): fresh-mapping
         // prediction is disabled rather than silently re-seeded from the wall
         // clock, which could regress below the high-water receivers recorded.
-        let boot_epoch_ms = crate::incarnation::take_prepared_or_next_boot_incarnation(&config)
-            .unwrap_or(0);
+        let boot_epoch_ms =
+            crate::incarnation::take_prepared_or_next_boot_incarnation(&config).unwrap_or(0);
         // An incarnation that outgrew the 41-bit candidate-generation
         // encoding field also disables fresh prediction (the label must never
         // wrap): ordinary signaling continues with the legacy generation 0.
-        let boot_epoch_ms = if crate::control::incarnation_fits_candidate_generation_encoding(
-            boot_epoch_ms,
-        ) {
-            boot_epoch_ms
-        } else {
-            0
-        };
+        let boot_epoch_ms =
+            if crate::control::incarnation_fits_candidate_generation_encoding(boot_epoch_ms) {
+                boot_epoch_ms
+            } else {
+                0
+            };
         if boot_epoch_ms == 0 {
             warn!(
                 "Fresh-mapping prediction is disabled for this boot (no trustworthy persistent incarnation or the incarnation outgrew its encoding field); ordinary punching continues"
@@ -226,8 +225,7 @@ impl Daemon {
         let udp_transport = Arc::new(RwLock::new(None));
         let (relay_available_tx, _relay_available_rx) = tokio::sync::watch::channel(false);
         let (path_setup_kick_tx, _path_setup_kick_rx) = tokio::sync::watch::channel(0u64);
-        let (handshake_retry_kick_tx, _handshake_retry_kick_rx) =
-            tokio::sync::watch::channel(0u64);
+        let (handshake_retry_kick_tx, _handshake_retry_kick_rx) = tokio::sync::watch::channel(0u64);
 
         // Register the punch-session canceller on the peer manager so a
         // stale/404 quarantined peer's in-flight recovery session is

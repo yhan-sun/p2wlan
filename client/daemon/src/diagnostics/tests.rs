@@ -58,32 +58,37 @@ mod tests {
         };
 
         // Missing -> Installed is the only "changed" outcome.
-        let (status, body) = route_repair_report(obs(RouteState::Missing), obs(RouteState::Installed));
+        let (status, body) =
+            route_repair_report(obs(RouteState::Missing), obs(RouteState::Installed));
         assert_eq!(status, 200);
         assert!(body.changed);
         assert!(body.attempted);
         assert_eq!(body.after, "installed");
 
         // Conflict -> Installed is a real change too.
-        let (status, body) = route_repair_report(obs(RouteState::Conflict), obs(RouteState::Installed));
+        let (status, body) =
+            route_repair_report(obs(RouteState::Conflict), obs(RouteState::Installed));
         assert_eq!(status, 200);
         assert!(body.changed);
 
         // Repair that leaves the route Missing (add failed) is NOT a success.
-        let (status, body) = route_repair_report(obs(RouteState::Missing), obs(RouteState::Missing));
+        let (status, body) =
+            route_repair_report(obs(RouteState::Missing), obs(RouteState::Missing));
         assert_eq!(status, 409);
         assert!(!body.changed);
         assert_eq!(body.reason, "add_failed");
 
         // A third-party conflict that is not removed is NOT a success, and the
         // caller must not be told the route is repaired.
-        let (status, body) = route_repair_report(obs(RouteState::Conflict), obs(RouteState::Conflict));
+        let (status, body) =
+            route_repair_report(obs(RouteState::Conflict), obs(RouteState::Conflict));
         assert_eq!(status, 409);
         assert!(!body.changed);
         assert_eq!(body.reason, "conflict_remains");
 
         // Unknown stays a failure, never a success.
-        let (status, body) = route_repair_report(obs(RouteState::Unknown), obs(RouteState::Unknown));
+        let (status, body) =
+            route_repair_report(obs(RouteState::Unknown), obs(RouteState::Unknown));
         assert_eq!(status, 503);
         assert!(!body.changed);
 
@@ -142,13 +147,10 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let worker = tokio::spawn(serve_speedtest(listener, shutdown_rx));
 
-        let result = run_speedtest_client(
-            addr,
-            "127.0.0.1".to_string(),
-            Duration::from_millis(600),
-        )
-        .await
-        .unwrap();
+        let result =
+            run_speedtest_client(addr, "127.0.0.1".to_string(), Duration::from_millis(600))
+                .await
+                .unwrap();
 
         assert!(result.download_bytes > 0);
         assert!(result.upload_bytes > 0);
@@ -242,7 +244,10 @@ mod tests {
             .await
             .unwrap();
         let mut health_response = String::new();
-        health_stream.read_to_string(&mut health_response).await.unwrap();
+        health_stream
+            .read_to_string(&mut health_response)
+            .await
+            .unwrap();
         assert!(health_response.starts_with("HTTP/1.1 200 OK"));
 
         let mut version_stream = TcpStream::connect(addr).await.unwrap();
@@ -251,7 +256,10 @@ mod tests {
             .await
             .unwrap();
         let mut version_response = String::new();
-        version_stream.read_to_string(&mut version_response).await.unwrap();
+        version_stream
+            .read_to_string(&mut version_response)
+            .await
+            .unwrap();
         assert!(version_response.starts_with("HTTP/1.1 200 OK"));
 
         let mut unauthenticated_status = TcpStream::connect(addr).await.unwrap();
@@ -275,7 +283,10 @@ mod tests {
             .await
             .unwrap();
         let mut wrong_status_response = String::new();
-        wrong_status.read_to_string(&mut wrong_status_response).await.unwrap();
+        wrong_status
+            .read_to_string(&mut wrong_status_response)
+            .await
+            .unwrap();
         assert!(wrong_status_response.starts_with("HTTP/1.1 401 Unauthorized"));
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -321,8 +332,7 @@ mod tests {
             assert_eq!(cached.peers.len(), snapshot.peers.len());
             assert_eq!(cached.shape, snapshot.peer_snapshot_shape);
             assert!(
-                cached.captured_at.elapsed().as_millis()
-                    >= snapshot.peer_snapshot_age_ms as u128
+                cached.captured_at.elapsed().as_millis() >= snapshot.peer_snapshot_age_ms as u128
             );
         }
 
@@ -330,10 +340,7 @@ mod tests {
         // reader, queue a writer behind it, then issue /status. Tokio blocks
         // new readers behind the queued writer; /status must use the validated
         // cache and remain HTTP 200 without waiting for either owner.
-        let connection_reader = context_probe
-            .peers
-            .hold_connections_reader_for_test()
-            .await;
+        let connection_reader = context_probe.peers.hold_connections_reader_for_test().await;
         let queued_writer_manager = context_probe.peers.clone();
         let writer_started = Arc::new(tokio::sync::Notify::new());
         let writer_started_task = writer_started.clone();
@@ -372,8 +379,7 @@ mod tests {
         .unwrap();
         assert!(contended_response.starts_with("HTTP/1.1 200 OK"));
         let contended_body = contended_response.split("\r\n\r\n").nth(1).unwrap();
-        let contended_snapshot: DiagnosticsSnapshot =
-            serde_json::from_str(contended_body).unwrap();
+        let contended_snapshot: DiagnosticsSnapshot = serde_json::from_str(contended_body).unwrap();
         assert!(contended_snapshot.peer_snapshot_stale);
         assert_eq!(contended_snapshot.peers.len(), snapshot.peers.len());
         assert_eq!(
@@ -510,7 +516,10 @@ mod tests {
             .await
             .unwrap();
         let mut logs_response = String::new();
-        logs_stream.read_to_string(&mut logs_response).await.unwrap();
+        logs_stream
+            .read_to_string(&mut logs_response)
+            .await
+            .unwrap();
         assert!(logs_response.starts_with("HTTP/1.1 401 Unauthorized"));
 
         let mut repair_stream = TcpStream::connect(addr).await.unwrap();
@@ -521,7 +530,10 @@ mod tests {
             .await
             .unwrap();
         let mut repair_response = String::new();
-        repair_stream.read_to_string(&mut repair_response).await.unwrap();
+        repair_stream
+            .read_to_string(&mut repair_response)
+            .await
+            .unwrap();
         assert!(repair_response.starts_with("HTTP/1.1 401 Unauthorized"));
 
         let mut disallowed_stream = TcpStream::connect(addr).await.unwrap();
@@ -577,12 +589,7 @@ mod tests {
             })
             .await;
         let stale = peers
-            .diagnostics_with_path_selection(
-                true,
-                false,
-                DIRECT_RETRY_BASE_INTERVAL,
-                None,
-            )
+            .diagnostics_with_path_selection(true, false, DIRECT_RETRY_BASE_INTERVAL, None)
             .await;
         assert!(peer_snapshot_core_matches(
             &stale,

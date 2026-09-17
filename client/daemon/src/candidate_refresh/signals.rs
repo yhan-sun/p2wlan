@@ -34,17 +34,13 @@ pub(super) fn advertised_udp_endpoint(
                 *index,
             )
         })
-        .filter(|(_, candidate)| {
-            !candidate.ip().is_unspecified() && !candidate.ip().is_loopback()
-        })
+        .filter(|(_, candidate)| !candidate.ip().is_unspecified() && !candidate.ip().is_loopback())
         .map(|(_, candidate)| candidate.to_string())
         .or_else(|| {
             candidates
                 .iter()
                 .filter_map(|candidate| candidate.parse::<SocketAddr>().ok())
-                .find(|candidate| {
-                    !candidate.ip().is_unspecified() && !candidate.ip().is_loopback()
-                })
+                .find(|candidate| !candidate.ip().is_unspecified() && !candidate.ip().is_loopback())
                 .map(|candidate| candidate.to_string())
         })
         .or_else(|| {
@@ -56,8 +52,7 @@ pub(super) fn advertised_udp_endpoint(
 fn advertised_candidate_rank(endpoint: SocketAddr, source: Option<&str>) -> u8 {
     let public = is_public_udp_candidate(endpoint);
     match source {
-        Some("manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping")
-            if public => 0,
+        Some("manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping") if public => 0,
         Some("stun_observed") if public => 1,
         Some("host") if !public => 2,
         Some("host") => 3,
@@ -124,7 +119,13 @@ fn control_udp_endpoint_rank(endpoint: &str, source: Option<&str>) -> u8 {
         Some("host") => endpoint
             .parse::<SocketAddr>()
             .ok()
-            .map(|endpoint| if is_public_udp_candidate(endpoint) { 4 } else { 3 })
+            .map(|endpoint| {
+                if is_public_udp_candidate(endpoint) {
+                    4
+                } else {
+                    3
+                }
+            })
             .unwrap_or(u8::MAX),
         Some("peer_reflexive" | "learned" | "predicted" | "birthday") => u8::MAX,
         Some("relay") => u8::MAX,
@@ -226,7 +227,11 @@ pub(crate) struct SignalCandidateContract {
 pub(crate) fn normalize_signal_candidates(
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
-) -> (Vec<String>, HashMap<String, String>, SignalCandidateContract) {
+) -> (
+    Vec<String>,
+    HashMap<String, String>,
+    SignalCandidateContract,
+) {
     normalize_signal_candidates_with_counts(
         candidates,
         candidate_sources,
@@ -243,7 +248,11 @@ pub(crate) fn normalize_signal_candidates_with_counts(
     candidate_sources: &HashMap<String, String>,
     requested_candidate_count: usize,
     generated_candidate_count: usize,
-) -> (Vec<String>, HashMap<String, String>, SignalCandidateContract) {
+) -> (
+    Vec<String>,
+    HashMap<String, String>,
+    SignalCandidateContract,
+) {
     let mut normalized_candidates = Vec::with_capacity(candidates.len());
     let mut seen = HashSet::with_capacity(candidates.len());
     for endpoint in candidates {
@@ -414,10 +423,7 @@ pub(super) fn truncate_signal_candidates(
         let fresh_host_reservation = retained_lan_hosts.len();
         let fresh_window = fresh_candidates
             .into_iter()
-            .take(
-                MAX_SIGNAL_CANDIDATES
-                    .saturating_sub(fresh_host_reservation),
-            )
+            .take(MAX_SIGNAL_CANDIDATES.saturating_sub(fresh_host_reservation))
             .collect::<Vec<_>>();
         let fresh_window_set = fresh_window.iter().cloned().collect::<HashSet<_>>();
         let fresh_budget = fresh_window.len();
@@ -504,10 +510,8 @@ fn compare_signal_candidates(
     original_order: &HashMap<String, usize>,
     predicted_order: &HashMap<String, usize>,
 ) -> std::cmp::Ordering {
-    let left_rank =
-        signal_candidate_rank(left, candidate_sources.get(left).map(String::as_str));
-    let right_rank =
-        signal_candidate_rank(right, candidate_sources.get(right).map(String::as_str));
+    let left_rank = signal_candidate_rank(left, candidate_sources.get(left).map(String::as_str));
+    let right_rank = signal_candidate_rank(right, candidate_sources.get(right).map(String::as_str));
     left_rank
         .cmp(&right_rank)
         .then_with(|| {
@@ -688,7 +692,8 @@ pub(super) fn prepare_signal_candidates_and_network_identity(
         candidates,
         candidate_sources,
     );
-    let current_network_identity = stable_network_candidate_signature(candidates, candidate_sources);
+    let current_network_identity =
+        stable_network_candidate_signature(candidates, candidate_sources);
     let network_identity = carry_forward_missing_network_identity(
         &previous_network_identity,
         current_network_identity,
@@ -751,10 +756,8 @@ pub(super) fn has_reliable_public_candidate(
         !profile.udp_blocked
             && profile.public_endpoint.is_some()
             && profile.public_endpoint.as_ref().is_some_and(|endpoint| {
-                has_real_public_candidate(
-                    std::slice::from_ref(endpoint),
-                    candidate_sources,
-                ) && candidates.iter().any(|candidate| candidate == endpoint)
+                has_real_public_candidate(std::slice::from_ref(endpoint), candidate_sources)
+                    && candidates.iter().any(|candidate| candidate == endpoint)
             })
     })
 }
@@ -860,18 +863,27 @@ pub(super) fn network_identity_changed(previous: &[String], next: &[String]) -> 
 
     let previous_other = previous
         .iter()
-        .filter(|entry| !CATEGORIES.iter().any(|category| entry.starts_with(category)))
+        .filter(|entry| {
+            !CATEGORIES
+                .iter()
+                .any(|category| entry.starts_with(category))
+        })
         .collect::<HashSet<_>>();
     let next_other = next
         .iter()
-        .filter(|entry| !CATEGORIES.iter().any(|category| entry.starts_with(category)))
+        .filter(|entry| {
+            !CATEGORIES
+                .iter()
+                .any(|category| entry.starts_with(category))
+        })
         .collect::<HashSet<_>>();
-    !previous_other.is_empty()
-        && !next_other.is_empty()
-        && previous_other.is_disjoint(&next_other)
+    !previous_other.is_empty() && !next_other.is_empty() && previous_other.is_disjoint(&next_other)
 }
 
-fn carry_forward_missing_network_identity(previous: &[String], mut current: Vec<String>) -> Vec<String> {
+fn carry_forward_missing_network_identity(
+    previous: &[String],
+    mut current: Vec<String>,
+) -> Vec<String> {
     const CATEGORIES: [&str; 3] = ["public-ip:", "physical-host-ip:", "mapped-ip:"];
     for category in CATEGORIES {
         if current.iter().any(|entry| entry.starts_with(category)) {
@@ -904,8 +916,14 @@ pub(super) fn candidate_set_change_reason(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let next_set = next_candidates.iter().map(String::as_str).collect::<HashSet<_>>();
-    let added = next_set.difference(&previous_set).copied().collect::<Vec<_>>();
+    let next_set = next_candidates
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let added = next_set
+        .difference(&previous_set)
+        .copied()
+        .collect::<Vec<_>>();
     let removed = previous_set
         .difference(&next_set)
         .copied()
@@ -1056,8 +1074,8 @@ pub(super) fn stable_network_candidate_signature(
                 // Only independently observed/mapped evidence is a public
                 // identity. A global-looking Host is still a physical Host
                 // identity, not proof of a public NAT mapping.
-                "stun_observed" | "manual" | "upnp" | "pcp" | "nat_pmp"
-                | "nat-pmp" | "port_mapping" => {
+                "stun_observed" | "manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp"
+                | "port_mapping" => {
                     signature.push(format!("public-ip:{}", addr.ip()));
                 }
                 "host" => signature.push(format!("physical-host-ip:{}", addr.ip())),

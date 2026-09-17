@@ -61,7 +61,12 @@ async fn test_client_idle_timeout() {
         .await
         .expect("timed out waiting for Closed")
         .expect("channel closed unexpectedly");
-    assert_eq!(msg2, RelayMessage::Closed { reason: RelayCloseReason::IdleTimeout });
+    assert_eq!(
+        msg2,
+        RelayMessage::Closed {
+            reason: RelayCloseReason::IdleTimeout
+        }
+    );
 }
 
 /// Verify that a working relay server (responds with Pong) does NOT trigger idle
@@ -99,7 +104,9 @@ async fn test_keepalive_prevents_idle_timeout() {
             Ok(Some(RelayMessage::Error { code, message })) => {
                 panic!("unexpected error during keepalive: code={code}, msg={message}");
             }
-            Ok(Some(RelayMessage::Closed { reason: RelayCloseReason::IdleTimeout })) => {
+            Ok(Some(RelayMessage::Closed {
+                reason: RelayCloseReason::IdleTimeout,
+            })) => {
                 panic!("connection closed unexpectedly during keepalive test");
             }
             Ok(Some(other)) => {

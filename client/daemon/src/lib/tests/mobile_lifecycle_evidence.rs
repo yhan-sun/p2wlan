@@ -53,12 +53,15 @@ mod mobile_lifecycle_evidence {
 
     #[tokio::test]
     async fn ml04_android_network_hint() {
-        let manager = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let manager =
+            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
         manager
             .advance_network_generation("initial wifi baseline")
             .await;
         let old = manager.current_network_generation().await;
-        let new = manager.advance_network_generation("android wifi to cellular hint").await;
+        let new = manager
+            .advance_network_generation("android wifi to cellular hint")
+            .await;
         assert_eq!(new, old + 1);
         emit(
             "ML-04",
@@ -73,9 +76,14 @@ mod mobile_lifecycle_evidence {
 
     #[tokio::test]
     async fn ml05_hotspot_network_hint() {
-        let manager = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
-        let old = manager.advance_network_generation("initial cellular baseline").await;
-        let new = manager.advance_network_generation("android cellular to hotspot hint").await;
+        let manager =
+            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let old = manager
+            .advance_network_generation("initial cellular baseline")
+            .await;
+        let new = manager
+            .advance_network_generation("android cellular to hotspot hint")
+            .await;
         assert_eq!(new, old + 1);
         emit(
             "ML-05",
@@ -90,9 +98,12 @@ mod mobile_lifecycle_evidence {
 
     #[tokio::test]
     async fn ml14_stale_candidate_result() {
-        let manager = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let manager =
+            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
         let endpoint = "203.0.113.10:51820".to_string();
-        manager.add_peer(&evidence_peer("peer-candidate", &endpoint)).await;
+        manager
+            .add_peer(&evidence_peer("peer-candidate", &endpoint))
+            .await;
         let candidates = vec![endpoint.clone()];
         let sources = HashMap::from([(endpoint.clone(), "stun_observed".to_string())]);
         assert_eq!(
@@ -134,7 +145,10 @@ mod mobile_lifecycle_evidence {
             .unwrap();
         let replacement_lease = publication.publish(replacement_udp).await;
         assert!(!publication.clear_if_owner(old_lease.owner()).await);
-        assert_eq!(publication.current_owner().await, Some(replacement_lease.owner()));
+        assert_eq!(
+            publication.current_owner().await,
+            Some(replacement_lease.owner())
+        );
         emit(
             "ML-15",
             "ml15_stale_socket_publication",
@@ -149,9 +163,12 @@ mod mobile_lifecycle_evidence {
 
     #[tokio::test]
     async fn ml16_relay_retention() {
-        let manager = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let manager =
+            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
         let endpoint: SocketAddr = "198.51.100.90:51831".parse().unwrap();
-        manager.add_peer(&evidence_peer("peer-relay", &endpoint.to_string())).await;
+        manager
+            .add_peer(&evidence_peer("peer-relay", &endpoint.to_string()))
+            .await;
         let generation = manager.current_network_generation().await;
         let relay_endpoint = "tcp://relay.test:18081";
         manager
@@ -165,10 +182,16 @@ mod mobile_lifecycle_evidence {
         manager
             .mark_relay_transport_ready("peer-relay", relay_endpoint, generation)
             .await;
-        assert!(manager.confirm_relay_peer("peer-relay", "tcp://relay.test:18081", generation).await);
-        assert!(manager
-            .mark_relay_first_business_sent_for_generation("peer-relay", generation)
-            .await);
+        assert!(
+            manager
+                .confirm_relay_peer("peer-relay", "tcp://relay.test:18081", generation)
+                .await
+        );
+        assert!(
+            manager
+                .mark_relay_first_business_sent_for_generation("peer-relay", generation)
+                .await
+        );
         manager
             .record_direct_probe_success_with_latency_for_generation_and_local_endpoint(
                 "peer-relay",
@@ -194,13 +217,19 @@ mod mobile_lifecycle_evidence {
             .await;
         let after_timeout = manager.get_connection("peer-relay").await.unwrap();
         assert_eq!(after_timeout.active_path(), Some(NetworkPath::Relay));
-        assert!(manager
-            .is_relay_peer_confirmed_for_generation("peer-relay", generation)
-            .await);
+        assert!(
+            manager
+                .is_relay_peer_confirmed_for_generation("peer-relay", generation)
+                .await
+        );
         emit(
             "ML-16",
             "ml16_relay_retention",
-            &["relay_retained", "candidate_refresh_started", "direct_reconfirmed"],
+            &[
+                "relay_retained",
+                "candidate_refresh_started",
+                "direct_reconfirmed",
+            ],
             json!({"network_generation": generation, "relay_connection_id": 77, "direct_validation_owner": "probe-1"}),
             json!({"network_generation": generation, "relay_connection_id": 77, "direct_validation_owner": "probe-2"}),
             "applied",
@@ -210,10 +239,13 @@ mod mobile_lifecycle_evidence {
 
     #[tokio::test]
     async fn ml17_direct_current_generation() {
-        let manager = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let manager =
+            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
         let old_endpoint: SocketAddr = "127.0.0.1:51824".parse().unwrap();
         let new_endpoint: SocketAddr = "127.0.0.1:51825".parse().unwrap();
-        manager.add_peer(&evidence_peer("peer-direct", &old_endpoint.to_string())).await;
+        manager
+            .add_peer(&evidence_peer("peer-direct", &old_endpoint.to_string()))
+            .await;
         let old_generation = manager.current_network_generation().await;
         manager
             .record_direct_probe_success_with_latency(
@@ -222,12 +254,49 @@ mod mobile_lifecycle_evidence {
                 Some(std::time::Duration::from_millis(5)),
             )
             .await;
-        assert!(manager.record_direct_success_for_generation("peer-direct", Some(old_endpoint), old_generation).await);
-        let new_generation = manager.advance_network_generation("evidence direct generation").await;
-        assert!(!manager.record_direct_success_for_generation("peer-direct", Some(old_endpoint), old_generation).await);
-        manager.add_candidates("peer-direct", &[new_endpoint.to_string()]).await;
-        assert!(manager.record_direct_probe_success_with_latency_for_generation("peer-direct", new_endpoint, Some(std::time::Duration::from_millis(7)), new_generation).await);
-        assert!(manager.record_direct_success_for_generation("peer-direct", Some(new_endpoint), new_generation).await);
+        assert!(
+            manager
+                .record_direct_success_for_generation(
+                    "peer-direct",
+                    Some(old_endpoint),
+                    old_generation
+                )
+                .await
+        );
+        let new_generation = manager
+            .advance_network_generation("evidence direct generation")
+            .await;
+        assert!(
+            !manager
+                .record_direct_success_for_generation(
+                    "peer-direct",
+                    Some(old_endpoint),
+                    old_generation
+                )
+                .await
+        );
+        manager
+            .add_candidates("peer-direct", &[new_endpoint.to_string()])
+            .await;
+        assert!(
+            manager
+                .record_direct_probe_success_with_latency_for_generation(
+                    "peer-direct",
+                    new_endpoint,
+                    Some(std::time::Duration::from_millis(7)),
+                    new_generation
+                )
+                .await
+        );
+        assert!(
+            manager
+                .record_direct_success_for_generation(
+                    "peer-direct",
+                    Some(new_endpoint),
+                    new_generation
+                )
+                .await
+        );
         let connection = manager.get_connection("peer-direct").await.unwrap();
         assert_eq!(connection.direct_generation, new_generation);
         emit(

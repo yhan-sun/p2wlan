@@ -139,7 +139,14 @@ fn set_interface_mtu(name: &str, mtu: u32) -> Result<()> {
 /// launch when this attempt opened an older adapter.
 fn rollback_interface_address(name: &str, addr: Ipv4Addr) {
     let output = hidden_command("netsh")
-        .args(["interface", "ipv4", "delete", "address", name, &addr.to_string()])
+        .args([
+            "interface",
+            "ipv4",
+            "delete",
+            "address",
+            name,
+            &addr.to_string(),
+        ])
         .output();
     match output {
         Ok(output) if output.status.success() => {

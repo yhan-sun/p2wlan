@@ -39,8 +39,8 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use p2pnet_tun::mock::MockTunController;
 use crate::transport::{OverlayIngress, OverlayIngressEvent};
+use p2pnet_tun::mock::MockTunController;
 
 /// Overlay payload magic ("P2WLOV"), shared with the transport-layer
 /// pre-filter so the ingress feed forwards exactly these payloads.
@@ -158,8 +158,7 @@ async fn fire_pending_bursts(
         })
         .collect();
     for (peer_id, virtual_ip) in targets {
-        if !overlay_any_path
-            && !overlay_direct_business_budget_ready(udp_transport, &peer_id).await
+        if !overlay_any_path && !overlay_direct_business_budget_ready(udp_transport, &peer_id).await
         {
             continue;
         }
@@ -265,10 +264,7 @@ fn build_pending_overlay_echo(
     })
 }
 
-async fn inject_pending_overlay_echo(
-    controller: &MockTunController,
-    echo: PendingOverlayEcho,
-) {
+async fn inject_pending_overlay_echo(controller: &MockTunController, echo: PendingOverlayEcho) {
     let PendingOverlayEcho {
         peer_id,
         virtual_ip,
@@ -285,11 +281,7 @@ async fn inject_pending_overlay_echo(
     }
 }
 
-fn committed_direct_ready_for_echo(
-    peers: &PeerManager,
-    peer_id: &str,
-    generation: u64,
-) -> bool {
+fn committed_direct_ready_for_echo(peers: &PeerManager, peer_id: &str, generation: u64) -> bool {
     peers
         .committed_business_path_snapshots_sync()
         .into_iter()
@@ -769,8 +761,7 @@ async fn send_overlay_payloads(
         *next_nonce = next_nonce.wrapping_add(1);
         *next_seq = next_seq.wrapping_add(1);
         let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, *next_nonce, *next_seq);
-        let Some(packet) =
-            build_udp_overlay_packet(local_vip, &virtual_ip, 39286, 39287, &payload)
+        let Some(packet) = build_udp_overlay_packet(local_vip, &virtual_ip, 39286, 39287, &payload)
         else {
             continue;
         };
@@ -903,9 +894,7 @@ async fn handle_overlay_ingress(
                     );
                     let direct_business_ready = direct_committed
                         && overlay_direct_business_budget_ready(udp_transport, &peer_id).await;
-                    if start_gate_released
-                        && (overlay_any_path || direct_business_ready)
-                    {
+                    if start_gate_released && (overlay_any_path || direct_business_ready) {
                         inject_pending_overlay_echo(controller, echo).await;
                     } else {
                         if pending_echoes.len() >= OVERLAY_PENDING_ECHO_CAP {
@@ -1148,10 +1137,15 @@ async fn verify_overlay_packet(
     if actual_checksum != expected_checksum {
         stats.received_invalid += 1;
         return OverlayVerdict::Invalid {
-            reason: format!("checksum mismatch: expected {expected_checksum:08x} got {actual_checksum:08x}"),
+            reason: format!(
+                "checksum mismatch: expected {expected_checksum:08x} got {actual_checksum:08x}"
+            ),
         };
     }
-    if seen.iter().any(|&(seen_nonce, seen_seq)| seen_nonce == nonce && seen_seq == seq) {
+    if seen
+        .iter()
+        .any(|&(seen_nonce, seen_seq)| seen_nonce == nonce && seen_seq == seq)
+    {
         stats.received_invalid += 1;
         return OverlayVerdict::Invalid {
             reason: format!("duplicate nonce/seq ({nonce:#x}/{seq})"),
@@ -1309,13 +1303,10 @@ mod overlay_validate_tests {
                 .confirm_relay_peer("peer-overlay-path", "tcp://relay.test:443", 0)
                 .await
         );
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            committed_path_changes.changed(),
-        )
-        .await
-        .expect("Relay commit must wake the overlay harness")
-        .expect("committed path stream must remain open");
+        tokio::time::timeout(Duration::from_secs(1), committed_path_changes.changed())
+            .await
+            .expect("Relay commit must wake the overlay harness")
+            .expect("committed path stream must remain open");
 
         let _connection_writer = manager.hold_connections_writer_for_test().await;
         let stale_under_contention = manager.diagnostics().await;
@@ -1353,36 +1344,26 @@ mod overlay_validate_tests {
             })
             .await;
         manager
-            .mark_relay_transport_ready(
-                "peer-strict-direct-echo",
-                "tcp://relay.test:443",
-                0,
-            )
+            .mark_relay_transport_ready("peer-strict-direct-echo", "tcp://relay.test:443", 0)
             .await;
         assert!(
             manager
-                .confirm_relay_peer(
-                    "peer-strict-direct-echo",
-                    "tcp://relay.test:443",
-                    0,
-                )
+                .confirm_relay_peer("peer-strict-direct-echo", "tcp://relay.test:443", 0,)
                 .await
         );
 
         let generation = manager.current_network_generation_sync();
         let (mut tun, controller) =
             p2pnet_tun::mock::MockTunDevice::new_pair("strict-direct-echo", 1420, "10.20.0.1");
-        let mut pending = VecDeque::from([
-            build_pending_overlay_echo(
-                "10.20.0.1",
-                "peer-strict-direct-echo".to_string(),
-                "10.20.0.2".to_string(),
-                generation,
-                0x1234_5678_9abc_def0,
-                42,
-            )
-            .expect("valid IPv4 addresses must build a pending echo"),
-        ]);
+        let mut pending = VecDeque::from([build_pending_overlay_echo(
+            "10.20.0.1",
+            "peer-strict-direct-echo".to_string(),
+            "10.20.0.2".to_string(),
+            generation,
+            0x1234_5678_9abc_def0,
+            42,
+        )
+        .expect("valid IPv4 addresses must build a pending echo")]);
 
         flush_pending_overlay_echoes(&controller, &manager, false, None, &mut pending).await;
         assert_eq!(
@@ -1412,7 +1393,10 @@ mod overlay_validate_tests {
         );
 
         flush_pending_overlay_echoes(&controller, &manager, false, None, &mut pending).await;
-        assert!(pending.is_empty(), "the Direct commit must release the echo");
+        assert!(
+            pending.is_empty(),
+            "the Direct commit must release the echo"
+        );
 
         let mut packet = [0u8; 512];
         let received = tokio::time::timeout(Duration::from_secs(1), tun.read(&mut packet))
@@ -1430,7 +1414,8 @@ mod overlay_validate_tests {
 
     #[test]
     fn overlay_payload_checksum_round_trip() {
-        let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, 0x1234_5678_9abc_def0u64, 42);
+        let payload =
+            build_overlay_payload(OVERLAY_DIRECTION_REQUEST, 0x1234_5678_9abc_def0u64, 42);
         let actual_checksum = u32::from_be_bytes(
             payload[OVERLAY_CHECKSUM_OFFSET..OVERLAY_CHECKSUM_OFFSET + 4]
                 .try_into()

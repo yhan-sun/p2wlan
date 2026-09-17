@@ -211,14 +211,10 @@ impl PeerConnection {
             duration_millis(DIRECT_TRIAL_WINDOW)
         );
         let mut expired = 0usize;
-        for pair in self
-            .candidate_pairs
-            .iter_mut()
-            .filter(|pair| {
-                pair.local_generation == local_generation
-                    && pair.remote_candidate_epoch == self.remote_candidate_epoch
-            })
-        {
+        for pair in self.candidate_pairs.iter_mut().filter(|pair| {
+            pair.local_generation == local_generation
+                && pair.remote_candidate_epoch == self.remote_candidate_epoch
+        }) {
             let old_state = pair.state;
             if pair.expire_stale_nomination(DIRECT_TRIAL_WINDOW, reason.clone(), local_endpoint) {
                 expired += 1;
@@ -254,14 +250,11 @@ impl PeerConnection {
         let peer_id = self.node_id.clone();
         let mut probed_sources = Vec::new();
         let mut failure_endpoints = self.candidate_endpoints();
-        let has_probed_pair = self
-            .candidate_pairs
-            .iter()
-            .any(|pair| {
-                pair.local_generation == local_generation
-                    && pair.remote_candidate_epoch == self.remote_candidate_epoch
-                    && pair.last_probe_at.is_some()
-            });
+        let has_probed_pair = self.candidate_pairs.iter().any(|pair| {
+            pair.local_generation == local_generation
+                && pair.remote_candidate_epoch == self.remote_candidate_epoch
+                && pair.last_probe_at.is_some()
+        });
         if has_probed_pair {
             let probed_transient_endpoints = self
                 .candidate_pairs
@@ -616,8 +609,8 @@ impl PeerConnection {
                 .candidate_pairs
                 .iter()
                 .any(should_retain_confirmed_direct_pair_on_candidate_refresh);
-        let retains_relay = self.relay_confirmed_at.is_some()
-            && self.relay_confirmed_endpoint.is_some();
+        let retains_relay =
+            self.relay_confirmed_at.is_some() && self.relay_confirmed_endpoint.is_some();
         let retained = match (retains_direct, retains_relay) {
             (false, false) => PathRetention::None,
             (true, false) => PathRetention::Direct,
@@ -634,10 +627,8 @@ impl PeerConnection {
         let outcome = self.commit_path_transition(
             PathEvent::NetworkGenerationAdvanced { epoch, retained },
             |conn| {
-                retained_confirmed_direct = conn.apply_candidate_refresh_generation_changed(
-                    local_generation,
-                    reason.clone(),
-                );
+                retained_confirmed_direct = conn
+                    .apply_candidate_refresh_generation_changed(local_generation, reason.clone());
                 if !retained_confirmed_direct {
                     conn.direct_health.record_generation_change(reason.clone());
                 }
@@ -779,7 +770,8 @@ impl PeerConnection {
             return false;
         }
         self.candidate_pairs.iter().any(|pair| {
-            pair.selected_at.is_some() && pair.state != CandidatePairState::Frozen
+            pair.selected_at.is_some()
+                && pair.state != CandidatePairState::Frozen
                 && pair.remote_candidate_epoch == self.remote_candidate_epoch
         })
     }

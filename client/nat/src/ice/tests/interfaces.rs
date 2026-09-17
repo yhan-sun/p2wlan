@@ -155,9 +155,7 @@ fn test_candidate_host_ip_filter() {
     assert!(is_candidate_host_ip(IpAddr::V6(
         "240e:34c:13d:3c6a::1".parse().unwrap()
     )));
-    assert!(is_candidate_host_ip(IpAddr::V6(
-        "fd00::1".parse().unwrap()
-    )));
+    assert!(is_candidate_host_ip(IpAddr::V6("fd00::1".parse().unwrap())));
     assert!(is_candidate_host_ip(IpAddr::V4(Ipv4Addr::new(
         192, 168, 2, 4
     ))));
@@ -170,8 +168,20 @@ fn test_candidate_interface_name_filter() {
     assert!(is_candidate_interface_name("Wi-Fi"));
 
     for name in [
-        "lo0", "utun6", "tun0", "tap0", "wg0", "p2pnet0", "p2wlan", "p2r-room1", "wintun", "docker0", "br-123",
-        "vethabc", "llw0", "awdl0",
+        "lo0",
+        "utun6",
+        "tun0",
+        "tap0",
+        "wg0",
+        "p2pnet0",
+        "p2wlan",
+        "p2r-room1",
+        "wintun",
+        "docker0",
+        "br-123",
+        "vethabc",
+        "llw0",
+        "awdl0",
     ] {
         assert!(!is_candidate_interface_name(name), "{name}");
     }

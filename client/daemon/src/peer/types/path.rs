@@ -174,7 +174,6 @@ impl PathSelection {
         self.relay_score = relay_score;
         self
     }
-
 }
 
 /// Explainable score used by the path selector.

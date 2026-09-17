@@ -10,7 +10,11 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
             println!("control = {}", config.control.server_url);
             println!(
                 "logged-in = {}",
-                if cli_session_available(path, &config)? { "yes" } else { "no" }
+                if cli_session_available(path, &config)? {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             println!("network = {}", config.network.network_id);
             println!("device-name = {}", config.node.device_name);

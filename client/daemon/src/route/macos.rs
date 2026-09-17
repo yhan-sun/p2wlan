@@ -47,9 +47,7 @@ impl RouteManager {
             return Ok(());
         }
 
-        info!(
-            "Route for {cidr} already exists on {interface} — treating as idempotent, not owned"
-        );
+        info!("Route for {cidr} already exists on {interface} — treating as idempotent, not owned");
         Ok(())
     }
 

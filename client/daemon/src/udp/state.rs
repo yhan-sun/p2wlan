@@ -224,9 +224,8 @@ pub(crate) struct ProbePostSendGateGuard {
 }
 
 #[cfg(test)]
-static PROBE_POST_SEND_GATE: std::sync::LazyLock<
-    std::sync::Mutex<Option<Arc<ProbePostSendGate>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+static PROBE_POST_SEND_GATE: std::sync::LazyLock<std::sync::Mutex<Option<Arc<ProbePostSendGate>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[cfg(test)]
 impl Drop for ProbePostSendGateGuard {
@@ -239,10 +238,8 @@ impl Drop for ProbePostSendGateGuard {
 }
 
 #[cfg(test)]
-pub(crate) fn install_probe_post_send_gate_for_test() -> (
-    Arc<ProbePostSendGate>,
-    ProbePostSendGateGuard,
-) {
+pub(crate) fn install_probe_post_send_gate_for_test(
+) -> (Arc<ProbePostSendGate>, ProbePostSendGateGuard) {
     let gate = Arc::new(ProbePostSendGate {
         reached: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -250,10 +247,7 @@ pub(crate) fn install_probe_post_send_gate_for_test() -> (
     *PROBE_POST_SEND_GATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
-    (
-        gate.clone(),
-        ProbePostSendGateGuard { gate },
-    )
+    (gate.clone(), ProbePostSendGateGuard { gate })
 }
 
 #[cfg(test)]
@@ -650,9 +644,7 @@ impl DirectValidationAckRejectReason {
             Self::SessionMissing => "direct_validation_ack_session_missing",
             Self::TargetCancelled => "direct_validation_ack_target_cancelled",
             Self::TargetGenerationMismatch => "direct_validation_ack_target_generation_mismatch",
-            Self::TargetPeerSessionMismatch => {
-                "direct_validation_ack_target_peer_session_mismatch"
-            }
+            Self::TargetPeerSessionMismatch => "direct_validation_ack_target_peer_session_mismatch",
             Self::TargetRemoteCandidateEpochMismatch => {
                 "direct_validation_ack_target_remote_candidate_epoch_mismatch"
             }
@@ -1091,8 +1083,6 @@ pub(crate) enum FreshMappingOutcome {
     /// caller must fall back to the legacy punch strategy.
     Rejected(FreshMappingRejection),
 }
-
-
 
 /// A successful fresh-mapping generation result.
 #[derive(Debug, Clone)]
@@ -1636,7 +1626,9 @@ impl BirthdaySweepFailureKind {
             ProbeSendFailureKind::NetworkGenerationChanged => Self::NetworkGenerationChanged,
             ProbeSendFailureKind::CandidateEpochChanged => Self::CandidateEpochChanged,
             ProbeSendFailureKind::LocalProfileGenerationChanged
-            | ProbeSendFailureKind::RemoteProfileGenerationChanged => Self::ProfileGenerationChanged,
+            | ProbeSendFailureKind::RemoteProfileGenerationChanged => {
+                Self::ProfileGenerationChanged
+            }
             ProbeSendFailureKind::PeerSessionChanged => Self::PeerSessionChanged,
             ProbeSendFailureKind::SessionRetired => Self::SessionRetired,
             ProbeSendFailureKind::SocketUnavailable => Self::SocketUnavailable,
@@ -1740,14 +1732,10 @@ impl BirthdayLiveRecorder {
         sent_at_ms: u64,
     ) {
         self.update(|progress| {
-            progress.counters.logical_probes_sent = progress
-                .counters
-                .logical_probes_sent
-                .saturating_add(1);
-            progress.counters.physical_datagrams_sent = progress
-                .counters
-                .physical_datagrams_sent
-                .saturating_add(1);
+            progress.counters.logical_probes_sent =
+                progress.counters.logical_probes_sent.saturating_add(1);
+            progress.counters.physical_datagrams_sent =
+                progress.counters.physical_datagrams_sent.saturating_add(1);
             progress.sent_target_endpoints.insert(target);
             let sent = progress.per_socket_sent.entry(socket_index).or_default();
             *sent = sent.saturating_add(1);
@@ -1757,16 +1745,10 @@ impl BirthdayLiveRecorder {
 
     /// Commit a compatibility datagram. It is physical-only: the logical
     /// Probe and unique target were already committed with the main packet.
-    pub(crate) fn record_compatibility_success(
-        &self,
-        socket_index: usize,
-        sent_at_ms: u64,
-    ) {
+    pub(crate) fn record_compatibility_success(&self, socket_index: usize, sent_at_ms: u64) {
         self.update(|progress| {
-            progress.counters.physical_datagrams_sent = progress
-                .counters
-                .physical_datagrams_sent
-                .saturating_add(1);
+            progress.counters.physical_datagrams_sent =
+                progress.counters.physical_datagrams_sent.saturating_add(1);
             let sent = progress.per_socket_sent.entry(socket_index).or_default();
             *sent = sent.saturating_add(1);
             Self::record_success_timestamp(progress, sent_at_ms);
@@ -1780,10 +1762,8 @@ impl BirthdayLiveRecorder {
                 .counters
                 .logical_probe_send_failures
                 .saturating_add(1);
-            progress.counters.physical_send_errors = progress
-                .counters
-                .physical_send_errors
-                .saturating_add(1);
+            progress.counters.physical_send_errors =
+                progress.counters.physical_send_errors.saturating_add(1);
         });
     }
 
@@ -1791,10 +1771,8 @@ impl BirthdayLiveRecorder {
     /// logical Probe remains successful because its main datagram succeeded.
     pub(crate) fn record_compatibility_error(&self) {
         self.update(|progress| {
-            progress.counters.physical_send_errors = progress
-                .counters
-                .physical_send_errors
-                .saturating_add(1);
+            progress.counters.physical_send_errors =
+                progress.counters.physical_send_errors.saturating_add(1);
             progress.counters.partial_physical_send_errors = progress
                 .counters
                 .partial_physical_send_errors

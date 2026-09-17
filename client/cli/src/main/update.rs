@@ -30,7 +30,9 @@ async fn update(config_path: &Path, args: UpdateArgs) -> Result<(), String> {
     }
 
     let daemon_running = match load_config(config_path) {
-        Ok(config) => fetch_status_at(&status_url(&config), &state_dir_for_config(config_path)).await.is_ok(),
+        Ok(config) => fetch_status_at(&status_url(&config), &state_dir_for_config(config_path))
+            .await
+            .is_ok(),
         Err(_) => false,
     };
 

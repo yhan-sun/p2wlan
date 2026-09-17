@@ -103,8 +103,7 @@ impl UdpTransport {
                     };
                     match lease_status {
                         NatMaintainerLeaseStatus::Active(deadline) => {
-                            let remaining =
-                                deadline.saturating_duration_since(Instant::now());
+                            let remaining = deadline.saturating_duration_since(Instant::now());
                             if !remaining.is_zero() {
                                 sleep(initial_delay.min(remaining)).await;
                             }
@@ -162,9 +161,8 @@ impl UdpTransport {
                                 sent = sent.saturating_add(1);
                                 transport
                                     .update_socket_diagnostics(socket_index, |metrics| {
-                                        metrics.nat_maintainer_probes_sent = metrics
-                                            .nat_maintainer_probes_sent
-                                            .saturating_add(1);
+                                        metrics.nat_maintainer_probes_sent =
+                                            metrics.nat_maintainer_probes_sent.saturating_add(1);
                                     })
                                     .await;
                                 peers.record_direct_probe_sent(&peer_id, endpoint).await;
@@ -208,8 +206,7 @@ impl UdpTransport {
                     };
                     match lease_status {
                         NatMaintainerLeaseStatus::Active(deadline) => {
-                            let remaining =
-                                deadline.saturating_duration_since(Instant::now());
+                            let remaining = deadline.saturating_duration_since(Instant::now());
                             sleep(interval.min(remaining)).await;
                         }
                         NatMaintainerLeaseStatus::Expired => break,
@@ -222,11 +219,7 @@ impl UdpTransport {
 
                 {
                     let mut maintainers = transport.nat_maintainers.lock().await;
-                    remove_nat_maintainer_lease_if_owned(
-                        &mut maintainers,
-                        &key,
-                        &worker_token,
-                    );
+                    remove_nat_maintainer_lease_if_owned(&mut maintainers, &key, &worker_token);
                 }
 
                 peers
@@ -545,12 +538,8 @@ impl UdpTransport {
             }
             PunchSocketPolicy::FastPrefixPool
             | PunchSocketPolicy::ActivePool
-            | PunchSocketPolicy::PrimaryOnly => {
-                MAX_PUNCH_PROBES_PER_SESSION
-            }
-            PunchSocketPolicy::RelayBackoffHeartbeat => {
-                RELAY_BACKOFF_HEARTBEAT_MAX_PROBES_PER_BEAT
-            }
+            | PunchSocketPolicy::PrimaryOnly => MAX_PUNCH_PROBES_PER_SESSION,
+            PunchSocketPolicy::RelayBackoffHeartbeat => RELAY_BACKOFF_HEARTBEAT_MAX_PROBES_PER_BEAT,
         };
         // The combined gate: Direct confirmed, a newer direct commit, or a
         // network-generation change aborts the sweep immediately.  The
@@ -667,11 +656,7 @@ impl UdpTransport {
                     }
                     if self
                         .peers
-                        .direct_probe_endpoint_quarantined(
-                            peer_id,
-                            candidate,
-                            generation_at_start,
-                        )
+                        .direct_probe_endpoint_quarantined(peer_id, candidate, generation_at_start)
                         .await
                     {
                         budget_skipped = budget_skipped.saturating_add(1);
@@ -906,9 +891,10 @@ impl UdpTransport {
                             if let Some(sent_at_ms) = sent.first_send_at_ms {
                                 first_send_at_ms.get_or_insert(sent_at_ms);
                             }
-                            let socket_datagrams = per_socket_sent.entry(sent.socket_index).or_default();
-                            *socket_datagrams = socket_datagrams
-                                .saturating_add(u32::from(sent.datagrams_sent));
+                            let socket_datagrams =
+                                per_socket_sent.entry(sent.socket_index).or_default();
+                            *socket_datagrams =
+                                socket_datagrams.saturating_add(u32::from(sent.datagrams_sent));
                             if socket_index == 0 {
                                 socket0_sent = socket0_sent.saturating_add(1);
                             } else {
@@ -1136,11 +1122,7 @@ impl UdpTransport {
     /// recursive (the worker block's future would contain the spawn
     /// function's future, which contains the worker block's future, ...)
     /// and could never satisfy `Send`.
-    fn try_spawn_relay_backoff_heartbeat_worker(
-        &self,
-        peer_id: &str,
-        interval: Duration,
-    ) -> bool {
+    fn try_spawn_relay_backoff_heartbeat_worker(&self, peer_id: &str, interval: Duration) -> bool {
         if interval.is_zero() {
             return false;
         }
@@ -1195,18 +1177,11 @@ impl UdpTransport {
                         {
                             return false;
                         }
-                        transport.relay_backoff_heartbeat_owner_valid_sync(
-                            &peer_id,
-                            owner_token,
-                        )
+                        transport.relay_backoff_heartbeat_owner_valid_sync(&peer_id, owner_token)
                     }
                 };
                 let _ = transport
-                    .punch_candidates_relay_backoff_heartbeat_gated(
-                        &peer_id,
-                        targets,
-                        &owner_gate,
-                    )
+                    .punch_candidates_relay_backoff_heartbeat_gated(&peer_id, targets, &owner_gate)
                     .await;
                 beats = beats.saturating_add(1);
                 if beats.is_multiple_of(15) {
@@ -1454,9 +1429,7 @@ impl UdpTransport {
     ) {
         let endpoint = target.map(|target| target.endpoint);
         let socket_index = target.map(|target| target.socket_index);
-        let target_group = target
-            .map(|target| target.group.label())
-            .unwrap_or("none");
+        let target_group = target.map(|target| target.group.label()).unwrap_or("none");
         let socket0_sent = if socket_index == Some(0) {
             packets_sent
         } else {
@@ -1583,9 +1556,9 @@ impl UdpTransport {
             .send_heartbeat_probe_from_socket(target.socket_index, peer_id, target.endpoint)
             .await
         {
-                Ok(sent) => {
-                    let packets_sent = u32::from(sent.datagrams_sent);
-                    reservation.commit(usize::from(sent.datagrams_sent));
+            Ok(sent) => {
+                let packets_sent = u32::from(sent.datagrams_sent);
+                reservation.commit(usize::from(sent.datagrams_sent));
                 self.peers
                     .record_direct_probe_sent(peer_id, target.endpoint)
                     .await;
@@ -1745,26 +1718,33 @@ impl UdpTransport {
     ) -> Result<usize> {
         let sent = std::future::poll_fn(|cx| {
             // Re-evaluate on EVERY readiness poll, including after socket backpressure.
-            if packet.room_authorization.as_ref().is_some_and(|permit| !permit.is_valid()) {
+            if packet
+                .room_authorization
+                .as_ref()
+                .is_some_and(|permit| !permit.is_valid())
+            {
                 return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied, "room send authorization expired or revoked")));
+                    std::io::ErrorKind::PermissionDenied,
+                    "room send authorization expired or revoked",
+                )));
             }
             socket.poll_send_to(cx, &packet.wire_bytes, endpoint)
-        }).await
-            .map_err(|e| {
-                if is_local_packet_too_large(&e) {
-                    DaemonError::UdpPacketTooLarge {
-                        peer_id: packet.peer_id.clone(),
-                        endpoint: endpoint.to_string(),
-                        datagram_size: packet.wire_bytes.len(),
-                    }
-                } else {
-                    DaemonError::Network(format!(
-                        "UDP send to {} for peer {} failed: {}",
-                        endpoint, packet.peer_id, e
-                    ))
+        })
+        .await
+        .map_err(|e| {
+            if is_local_packet_too_large(&e) {
+                DaemonError::UdpPacketTooLarge {
+                    peer_id: packet.peer_id.clone(),
+                    endpoint: endpoint.to_string(),
+                    datagram_size: packet.wire_bytes.len(),
                 }
-            })?;
+            } else {
+                DaemonError::Network(format!(
+                    "UDP send to {} for peer {} failed: {}",
+                    endpoint, packet.peer_id, e
+                ))
+            }
+        })?;
 
         if sent != packet.wire_bytes.len() {
             return Err(DaemonError::Network(format!(
@@ -1799,19 +1779,26 @@ impl UdpTransport {
     ) -> std::result::Result<(), crate::dplpmtud::DplpmtudProbeSendFailure> {
         let sent = std::future::poll_fn(|cx| {
             // Re-evaluate on EVERY readiness poll, including after socket backpressure.
-            if packet.room_authorization.as_ref().is_some_and(|permit| !permit.is_valid()) {
+            if packet
+                .room_authorization
+                .as_ref()
+                .is_some_and(|permit| !permit.is_valid())
+            {
                 return std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied, "room send authorization expired or revoked")));
+                    std::io::ErrorKind::PermissionDenied,
+                    "room send authorization expired or revoked",
+                )));
             }
             socket.poll_send_to(cx, &packet.wire_bytes, endpoint)
-        }).await
-            .map_err(|error| {
-                if is_local_packet_too_large(&error) {
-                    crate::dplpmtud::DplpmtudProbeSendFailure::LocalPacketTooLarge
-                } else {
-                    crate::dplpmtud::DplpmtudProbeSendFailure::TransientSend
-                }
-            })?;
+        })
+        .await
+        .map_err(|error| {
+            if is_local_packet_too_large(&error) {
+                crate::dplpmtud::DplpmtudProbeSendFailure::LocalPacketTooLarge
+            } else {
+                crate::dplpmtud::DplpmtudProbeSendFailure::TransientSend
+            }
+        })?;
 
         if sent != packet.wire_bytes.len() {
             return Err(crate::dplpmtud::DplpmtudProbeSendFailure::TransientSend);

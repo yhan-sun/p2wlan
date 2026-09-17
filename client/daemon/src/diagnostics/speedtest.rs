@@ -42,7 +42,10 @@ impl SpeedtestAdmission {
             return None;
         }
         *peers.entry(peer).or_default() += 1;
-        Some(SpeedtestPermit { admission: self.clone(), peer })
+        Some(SpeedtestPermit {
+            admission: self.clone(),
+            peer,
+        })
     }
 }
 
@@ -53,7 +56,11 @@ struct SpeedtestPermit {
 
 impl Drop for SpeedtestPermit {
     fn drop(&mut self) {
-        let mut peers = self.admission.peers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut peers = self
+            .admission
+            .peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(count) = peers.get_mut(&self.peer) {
             *count -= 1;
             if *count == 0 {
@@ -176,10 +183,14 @@ async fn read_speedtest_line(
         let mut line = Vec::with_capacity(limit);
         let mut byte = [0u8; 1];
         while line.len() < limit {
-            let n = stream.read(&mut byte).await
+            let n = stream
+                .read(&mut byte)
+                .await
                 .map_err(|e| DaemonError::Network(format!("speedtest line read failed: {e}")))?;
             if n == 0 {
-                return Err(DaemonError::Network("incomplete speedtest line".to_string()));
+                return Err(DaemonError::Network(
+                    "incomplete speedtest line".to_string(),
+                ));
             }
             if byte[0] == b'\n' {
                 return Ok(line);
@@ -187,7 +198,9 @@ async fn read_speedtest_line(
             line.push(byte[0]);
         }
         Err(DaemonError::Network("speedtest line too long".to_string()))
-    }).await.map_err(|_| DaemonError::Network("speedtest line timed out".to_string()))?
+    })
+    .await
+    .map_err(|_| DaemonError::Network("speedtest line timed out".to_string()))?
 }
 
 async fn read_speedtest_command(stream: &mut TcpStream) -> Result<(SpeedtestMode, Duration)> {
@@ -201,15 +214,23 @@ async fn read_speedtest_command(stream: &mut TcpStream) -> Result<(SpeedtestMode
     let mode = match parts.next().unwrap_or_default() {
         "download" => SpeedtestMode::Download,
         "upload" => SpeedtestMode::Upload,
-        other => return Err(DaemonError::Network(format!("invalid speedtest mode '{other}'"))),
+        other => {
+            return Err(DaemonError::Network(format!(
+                "invalid speedtest mode '{other}'"
+            )))
+        }
     };
     let duration_ms = match parts.next() {
-        Some(value) => value.parse::<u64>()
+        Some(value) => value
+            .parse::<u64>()
             .map_err(|_| DaemonError::Network("invalid speedtest duration".to_string()))?,
         None => SPEEDTEST_DEFAULT_DURATION_MS,
-    }.clamp(100, SPEEDTEST_MAX_DURATION_MS);
+    }
+    .clamp(100, SPEEDTEST_MAX_DURATION_MS);
     if parts.next().is_some() {
-        return Err(DaemonError::Network("invalid speedtest command".to_string()));
+        return Err(DaemonError::Network(
+            "invalid speedtest command".to_string(),
+        ));
     }
     Ok((mode, Duration::from_millis(duration_ms)))
 }
@@ -219,9 +240,17 @@ async fn send_speedtest_payload(stream: &mut TcpStream, duration: Duration) -> R
     let deadline = tokio::time::Instant::now() + duration;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout_at(deadline, stream.write(&payload)).await {
-            Ok(Ok(0)) => return Err(DaemonError::Network("speedtest download write returned zero".to_string())),
+            Ok(Ok(0)) => {
+                return Err(DaemonError::Network(
+                    "speedtest download write returned zero".to_string(),
+                ))
+            }
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => return Err(DaemonError::Network(format!("speedtest download write failed: {e}"))),
+            Ok(Err(e)) => {
+                return Err(DaemonError::Network(format!(
+                    "speedtest download write failed: {e}"
+                )))
+            }
             Err(_) => break,
         }
     }
@@ -238,8 +267,11 @@ async fn receive_speedtest_payload(stream: &mut TcpStream, duration: Duration) -
                 "speedtest upload exceeded total deadline".to_string(),
             ));
         }
-        let n = tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await
-            .map_err(|_| DaemonError::Network("speedtest upload exceeded total deadline".to_string()))?
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut buffer))
+            .await
+            .map_err(|_| {
+                DaemonError::Network("speedtest upload exceeded total deadline".to_string())
+            })?
             .map_err(|e| DaemonError::Network(format!("speedtest upload read failed: {e}")))?;
         if n == 0 {
             break;
@@ -247,7 +279,8 @@ async fn receive_speedtest_payload(stream: &mut TcpStream, duration: Duration) -
         bytes = bytes.saturating_add(n as u64);
     }
     let ack = format!("OK {bytes}\n");
-    timeout(SPEEDTEST_ACK_TIMEOUT, stream.write_all(ack.as_bytes())).await
+    timeout(SPEEDTEST_ACK_TIMEOUT, stream.write_all(ack.as_bytes()))
+        .await
         .map_err(|_| DaemonError::Network("speedtest upload ack timed out".to_string()))?
         .map_err(|e| DaemonError::Network(format!("speedtest upload ack failed: {e}")))?;
     Ok(())
@@ -265,15 +298,21 @@ async fn run_speedtest_from_query(
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(SPEEDTEST_DEFAULT_DURATION_MS)
         .clamp(SPEEDTEST_MIN_DURATION_MS, SPEEDTEST_MAX_DURATION_MS);
-    let parsed_ip = peer_virtual_ip.parse::<std::net::Ipv4Addr>()
+    let parsed_ip = peer_virtual_ip
+        .parse::<std::net::Ipv4Addr>()
         .map_err(|_| format!("invalid peer virtual IP '{peer_virtual_ip}'"))?;
     if peer_virtual_ip == context.config.network.virtual_ip {
         return Err("cannot speedtest the local virtual IP".to_string());
     }
-    let _permit = SPEEDTEST_CLIENT_SLOT.try_acquire()
+    let _permit = SPEEDTEST_CLIENT_SLOT
+        .try_acquire()
         .map_err(|_| "speedtest already running".to_string())?;
-    timeout(Duration::from_secs(2), ensure_peer_is_direct(&context, &peer_virtual_ip)).await
-        .map_err(|_| "speedtest peer validation timed out".to_string())??;
+    timeout(
+        Duration::from_secs(2),
+        ensure_peer_is_direct(&context, &peer_virtual_ip),
+    )
+    .await
+    .map_err(|_| "speedtest peer validation timed out".to_string())??;
     let addr = std::net::SocketAddr::from((parsed_ip, SPEEDTEST_PORT));
     run_speedtest_client(addr, peer_virtual_ip, Duration::from_millis(duration_ms)).await
 }
@@ -285,19 +324,26 @@ async fn ensure_peer_is_direct(
     let udp = context.udp_transport.read().await.clone();
     let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
     let relay_connected = context.relay_transport.read().await.is_some();
-    let peers = context.peers.diagnostics_with_path_selection(
-        context.config.relay.prefer_direct,
-        relay_connected,
-        DIRECT_RETRY_BASE_INTERVAL,
-        udp_local_endpoint,
-    ).await;
-    let peer = peers.into_iter().find(|peer| peer.virtual_ip == peer_virtual_ip)
+    let peers = context
+        .peers
+        .diagnostics_with_path_selection(
+            context.config.relay.prefer_direct,
+            relay_connected,
+            DIRECT_RETRY_BASE_INTERVAL,
+            udp_local_endpoint,
+        )
+        .await;
+    let peer = peers
+        .into_iter()
+        .find(|peer| peer.virtual_ip == peer_virtual_ip)
         .ok_or_else(|| format!("peer {peer_virtual_ip} is not in the current catalog"))?;
     if !peer.online {
         return Err(format!("peer {peer_virtual_ip} is offline"));
     }
     if peer.active_path != Some(NetworkPath::Direct) {
-        return Err(format!("peer {peer_virtual_ip} is not using a confirmed direct path"));
+        return Err(format!(
+            "peer {peer_virtual_ip} is not using a confirmed direct path"
+        ));
     }
     Ok(())
 }
@@ -320,20 +366,27 @@ async fn run_speedtest_client(
             download_bytes,
             upload_bytes,
         })
-    }).await.map_err(|_| "speedtest exceeded total deadline".to_string())?
+    })
+    .await
+    .map_err(|_| "speedtest exceeded total deadline".to_string())?
 }
 
 async fn speedtest_download(
     peer_addr: std::net::SocketAddr,
     duration: Duration,
 ) -> std::result::Result<u64, String> {
-    let mut stream = timeout(SPEEDTEST_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await
+    let mut stream = timeout(SPEEDTEST_CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
+        .await
         .map_err(|_| format!("speedtest connect to {peer_addr} timed out"))?
         .map_err(|e| format!("speedtest connect to {peer_addr} failed: {e}"))?;
     let command = format!("{SPEEDTEST_MAGIC} download {}\n", duration.as_millis());
-    timeout(SPEEDTEST_COMMAND_TIMEOUT, stream.write_all(command.as_bytes())).await
-        .map_err(|_| "speedtest download command timed out".to_string())?
-        .map_err(|e| format!("speedtest download command failed: {e}"))?;
+    timeout(
+        SPEEDTEST_COMMAND_TIMEOUT,
+        stream.write_all(command.as_bytes()),
+    )
+    .await
+    .map_err(|_| "speedtest download command timed out".to_string())?
+    .map_err(|e| format!("speedtest download command failed: {e}"))?;
     let deadline = tokio::time::Instant::now() + duration;
     let mut buffer = vec![0u8; SPEEDTEST_BUFFER_SIZE];
     let mut bytes = 0u64;
@@ -355,13 +408,18 @@ async fn speedtest_upload(
     peer_addr: std::net::SocketAddr,
     duration: Duration,
 ) -> std::result::Result<u64, String> {
-    let mut stream = timeout(SPEEDTEST_CONNECT_TIMEOUT, TcpStream::connect(peer_addr)).await
+    let mut stream = timeout(SPEEDTEST_CONNECT_TIMEOUT, TcpStream::connect(peer_addr))
+        .await
         .map_err(|_| format!("speedtest connect to {peer_addr} timed out"))?
         .map_err(|e| format!("speedtest connect to {peer_addr} failed: {e}"))?;
     let command = format!("{SPEEDTEST_MAGIC} upload {}\n", duration.as_millis());
-    timeout(SPEEDTEST_COMMAND_TIMEOUT, stream.write_all(command.as_bytes())).await
-        .map_err(|_| "speedtest upload command timed out".to_string())?
-        .map_err(|e| format!("speedtest upload command failed: {e}"))?;
+    timeout(
+        SPEEDTEST_COMMAND_TIMEOUT,
+        stream.write_all(command.as_bytes()),
+    )
+    .await
+    .map_err(|_| "speedtest upload command timed out".to_string())?
+    .map_err(|e| format!("speedtest upload command failed: {e}"))?;
     let payload = vec![0x5Au8; SPEEDTEST_BUFFER_SIZE];
     let deadline = tokio::time::Instant::now() + duration;
     let mut bytes = 0u64;
@@ -373,10 +431,12 @@ async fn speedtest_upload(
             Err(_) => break,
         }
     }
-    timeout(SPEEDTEST_ACK_TIMEOUT, stream.shutdown()).await
+    timeout(SPEEDTEST_ACK_TIMEOUT, stream.shutdown())
+        .await
         .map_err(|_| "speedtest upload shutdown timed out".to_string())?
         .map_err(|e| format!("speedtest upload shutdown failed: {e}"))?;
-    let ack = read_speedtest_line(&mut stream, 64, SPEEDTEST_ACK_TIMEOUT).await
+    let ack = read_speedtest_line(&mut stream, 64, SPEEDTEST_ACK_TIMEOUT)
+        .await
         .map_err(|e| format!("speedtest upload ack failed: {e}"))?;
     let confirmed = parse_speedtest_upload_ack(&ack)
         .ok_or_else(|| "speedtest upload acknowledgement is malformed".to_string())?;
@@ -468,7 +528,11 @@ mod speedtest_reliability_tests {
         let first = admission.acquire(peer).unwrap();
         let mut permits = vec![first, second];
         for suffix in 2..=7 {
-            permits.push(admission.acquire(format!("127.0.0.{suffix}").parse().unwrap()).unwrap());
+            permits.push(
+                admission
+                    .acquire(format!("127.0.0.{suffix}").parse().unwrap())
+                    .unwrap(),
+            );
         }
         assert!(admission.acquire("127.0.0.8".parse().unwrap()).is_none());
         drop(permits);
@@ -478,7 +542,14 @@ mod speedtest_reliability_tests {
     #[test]
     fn acknowledgements_require_exactly_a_valid_count() {
         assert_eq!(parse_speedtest_upload_ack(b"OK 123"), Some(123));
-        for ack in [b"".as_slice(), b"OK", b"OK -1", b"OK NaN", b"OK 2 extra", b"NO 3"] {
+        for ack in [
+            b"".as_slice(),
+            b"OK",
+            b"OK -1",
+            b"OK NaN",
+            b"OK 2 extra",
+            b"NO 3",
+        ] {
             assert_eq!(parse_speedtest_upload_ack(ack), None);
         }
     }
@@ -486,27 +557,42 @@ mod speedtest_reliability_tests {
     #[tokio::test]
     async fn stalled_download_write_stops_at_the_sample_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let _client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
-        timeout(Duration::from_secs(2), send_speedtest_payload(&mut server, Duration::from_millis(100)))
-            .await.unwrap().unwrap();
+        timeout(
+            Duration::from_secs(2),
+            send_speedtest_payload(&mut server, Duration::from_millis(100)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     #[tokio::test]
     async fn upload_receiver_has_a_total_deadline_even_with_an_open_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
         client.write_all(b"still connected").await.unwrap();
-        let result = timeout(Duration::from_secs(4), receive_speedtest_payload(&mut server, Duration::from_millis(100)))
-            .await.unwrap();
+        let result = timeout(
+            Duration::from_secs(4),
+            receive_speedtest_payload(&mut server, Duration::from_millis(100)),
+        )
+        .await
+        .unwrap();
         assert!(result.unwrap_err().to_string().contains("total deadline"));
     }
 
     #[tokio::test]
     async fn upload_receiver_bounds_a_continuous_writer() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
         let writer = tokio::spawn(async move {
             let payload = vec![0u8; SPEEDTEST_BUFFER_SIZE];
@@ -515,10 +601,15 @@ mod speedtest_reliability_tests {
         let result = timeout(
             Duration::from_secs(4),
             receive_speedtest_payload(&mut server, Duration::from_millis(100)),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert!(result.unwrap_err().to_string().contains("total deadline"));
         drop(server);
-        timeout(Duration::from_secs(1), writer).await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), writer)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -546,12 +637,21 @@ mod speedtest_reliability_tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(serve_speedtest(listener, shutdown_rx));
         let mut client = TcpStream::connect(addr).await.unwrap();
-        client.write_all(b"P2WLAN_SPEEDTEST upload 30000\n").await.unwrap();
+        client
+            .write_all(b"P2WLAN_SPEEDTEST upload 30000\n")
+            .await
+            .unwrap();
         tokio::task::yield_now().await;
         shutdown_tx.send(true).unwrap();
-        timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let mut byte = [0u8; 1];
-        let read = timeout(Duration::from_secs(1), client.read(&mut byte)).await.unwrap();
+        let read = timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .unwrap();
         assert!(matches!(read, Ok(0) | Err(_)));
     }
 
@@ -562,8 +662,10 @@ mod speedtest_reliability_tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(serve_speedtest(listener, shutdown_rx));
         for _ in 0..3 {
-            let result = run_speedtest_client(addr, "127.0.0.1".to_string(), Duration::from_millis(600))
-                .await.unwrap();
+            let result =
+                run_speedtest_client(addr, "127.0.0.1".to_string(), Duration::from_millis(600))
+                    .await
+                    .unwrap();
             assert!(result.download_bytes > 0);
             assert!(result.upload_bytes > 0);
         }

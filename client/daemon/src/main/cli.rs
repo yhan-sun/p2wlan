@@ -194,11 +194,7 @@ struct Cli {
 
     /// Hold generated overlay-validation business traffic until this regular
     /// file exists (independent harnesses only).
-    #[arg(
-        long,
-        name = "overlay-start-gate-file",
-        requires = "validate-overlay"
-    )]
+    #[arg(long, name = "overlay-start-gate-file", requires = "validate-overlay")]
     overlay_start_gate_file: Option<PathBuf>,
 
     /// With --validate-overlay, target every online peer with a WireGuard

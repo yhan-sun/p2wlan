@@ -143,8 +143,7 @@ fn stun_rediscovery_then_peer_reflexive_observation_is_stable() {
     let previous = vec![endpoint.clone()];
     let previous_sources = HashMap::from([(endpoint.clone(), "peer_reflexive".to_string())]);
     let mut refreshed = vec![endpoint.clone()];
-    let mut refreshed_sources =
-        HashMap::from([(endpoint.clone(), "stun_observed".to_string())]);
+    let mut refreshed_sources = HashMap::from([(endpoint.clone(), "stun_observed".to_string())]);
 
     preserve_peer_reflexive_candidates(
         &previous,
@@ -281,7 +280,9 @@ fn test_effective_relay_plaintext_policy_for_legacy_http_control() {
 #[test]
 fn test_relay_spec_plaintext_detection() {
     assert!(relay_spec_is_plaintext("default@control.example.com:18081"));
-    assert!(relay_spec_is_plaintext("default@tcp://control.example.com:18081"));
+    assert!(relay_spec_is_plaintext(
+        "default@tcp://control.example.com:18081"
+    ));
     assert!(!relay_spec_is_plaintext("cn@tls://relay.example.com:18081"));
 }
 

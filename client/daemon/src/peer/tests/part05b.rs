@@ -65,7 +65,10 @@ async fn score_policy_selects_confirmed_direct_when_direct_score_wins() {
     assert_eq!(selected.path, Some(NetworkPath::Direct));
     assert_eq!(selected.reason_code, REASON_PATH_SCORE_DIRECT);
     assert!(selected.direct_confirmed);
-    assert!(selected.direct_score.as_ref().unwrap().score > selected.relay_score.as_ref().unwrap().score);
+    assert!(
+        selected.direct_score.as_ref().unwrap().score
+            > selected.relay_score.as_ref().unwrap().score
+    );
 }
 
 #[tokio::test]
@@ -77,7 +80,11 @@ async fn score_policy_selects_peer_confirmed_relay_when_direct_score_loses() {
 
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     manager
-        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(700)))
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(700)),
+        )
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
     manager
@@ -107,7 +114,10 @@ async fn score_policy_selects_peer_confirmed_relay_when_direct_score_loses() {
     assert_eq!(selected.path, Some(NetworkPath::Relay));
     assert_eq!(selected.reason_code, REASON_PATH_SCORE_RELAY);
     assert!(!selected.direct_confirmed);
-    assert!(selected.relay_score.as_ref().unwrap().score > selected.direct_score.as_ref().unwrap().score);
+    assert!(
+        selected.relay_score.as_ref().unwrap().score
+            > selected.direct_score.as_ref().unwrap().score
+    );
 }
 
 #[tokio::test]
@@ -119,7 +129,11 @@ async fn direct_sticky_keeps_confirmed_direct_until_hard_liveness_failure() {
 
     manager.add_peer(&test_peer("peer1", endpoint)).await;
     manager
-        .record_direct_probe_success_with_latency("peer1", endpoint, Some(Duration::from_millis(700)))
+        .record_direct_probe_success_with_latency(
+            "peer1",
+            endpoint,
+            Some(Duration::from_millis(700)),
+        )
         .await;
     manager.record_direct_success("peer1", Some(endpoint)).await;
     manager

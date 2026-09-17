@@ -218,7 +218,12 @@ async fn wait_for_initial_candidate_set_from_store(
                 .read()
                 .await
                 .as_ref()
-                .map(|snapshot| (snapshot.candidates.clone(), snapshot.candidate_sources.clone()))
+                .map(|snapshot| {
+                    (
+                        snapshot.candidates.clone(),
+                        snapshot.candidate_sources.clone(),
+                    )
+                })
                 .unwrap_or_default();
             warn!(
                 "Proceeding with the provisional UDP candidate snapshot after the initial readiness budget elapsed ({} ms, candidates={})",

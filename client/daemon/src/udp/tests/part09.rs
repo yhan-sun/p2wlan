@@ -43,10 +43,7 @@ async fn learning_env(step: i16) -> (Arc<PeerManager>, Arc<UdpTransport>, Simula
 }
 
 /// Drive one accepted fresh-mapping generation against the simulated NAT.
-async fn run_one(
-    transport: &Arc<UdpTransport>,
-    nat: &SimulatedNat,
-) -> FreshMappingResult {
+async fn run_one(transport: &Arc<UdpTransport>, nat: &SimulatedNat) -> FreshMappingResult {
     let outcome = transport
         .run_fresh_mapping_generation(
             "peer-b",
@@ -98,7 +95,10 @@ async fn consecutive_step3_generations_use_learned_stride() {
     let _ = run_one(&transport, &nat).await;
     let _ = run_one(&transport, &nat).await;
 
-    assert!(has_model_event(&peers, "peer-b").await, "an accepted generation must record a fresh_mapping_model event");
+    assert!(
+        has_model_event(&peers, "peer-b").await,
+        "an accepted generation must record a fresh_mapping_model event"
+    );
     let detail = last_model_detail(&peers, "peer-b")
         .await
         .expect("a fresh_mapping_model event must be recorded for an accepted generation");
@@ -189,9 +189,7 @@ async fn network_generation_change_resets_learning_cache() {
 
     // A network-generation advance resets the cache: reading it at the new
     // generation finds no learned state (the estimate is back to None).
-    let new_generation = peers
-        .advance_network_generation("r2 reset test")
-        .await;
+    let new_generation = peers.advance_network_generation("r2 reset test").await;
     assert_eq!(new_generation, initial_generation + 1);
     assert!(
         !transport

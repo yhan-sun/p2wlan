@@ -70,7 +70,11 @@ async fn doctor(config_path: &Path) -> Result<(), String> {
     let has_device_session = !config.control.device_credential.trim().is_empty();
     println!(
         "登录：{}（账号会话={}，设备凭据={}）",
-        if has_user_session || has_device_session { "yes" } else { "no" },
+        if has_user_session || has_device_session {
+            "yes"
+        } else {
+            "no"
+        },
         if has_user_session { "yes" } else { "no" },
         if has_device_session { "yes" } else { "no" },
     );

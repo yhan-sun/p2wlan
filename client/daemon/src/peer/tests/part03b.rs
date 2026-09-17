@@ -556,7 +556,11 @@ async fn birthday_cursor_commits_when_planned_and_selected_counts_differ() {
         unique_target_ports: 3_072,
         wrapped: false,
     };
-    assert!(manager.commit_birthday_probe_cursor("peer1", &ramp, true).await);
+    assert!(
+        manager
+            .commit_birthday_probe_cursor("peer1", &ramp, true)
+            .await
+    );
     let plan = BirthdayProbePlan {
         local_generation: manager.current_network_generation().await,
         stable_side_unique_scatter: true,
@@ -626,8 +630,9 @@ async fn remote_port_churn_triggers_birthday_probe_targets() {
         .collect::<Vec<_>>();
     // The birthday window is generated in bounded per-plan slices: the
     // expected set mirrors the sliced budget exactly.
-    let sliced_budget = birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len())
-        .min(BIRTHDAY_PLAN_SLICE.saturating_sub(candidates.len()));
+    let sliced_budget =
+        birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len())
+            .min(BIRTHDAY_PLAN_SLICE.saturating_sub(candidates.len()));
     let expected_birthday_targets = birthday_probe_endpoints_for_bases(&bases, sliced_budget)
         .into_iter()
         .filter(|target| {
@@ -738,9 +743,10 @@ async fn port_dependent_remote_explicit_predicted_window_never_silences_stable_s
         "the wide scatter plan must be generated immediately, without waiting for the predicted window to fail"
     );
     assert!(
-        target_set.candidates.iter().any(|candidate| {
-            candidate.ip() == observed.ip() && !predicted.contains(candidate)
-        }),
+        target_set
+            .candidates
+            .iter()
+            .any(|candidate| { candidate.ip() == observed.ip() && !predicted.contains(candidate) }),
         "the scatter must reach ports outside the advertised prediction window"
     );
 }
@@ -787,20 +793,13 @@ async fn port_dependent_remote_predicted_stage_offers_full_192_unique_scatter_wi
     // Open the recovery epoch and advance Initial -> Predicted (one
     // zero-matched-ACK feedback round), the stage where the APD remote's wide
     // scatter is released.
-    let admission = manager
-        .recovery_epoch_admit("peer-r9-apd-stage")
-        .await;
-    assert!(matches!(
-        admission,
-        RecoveryAdmission::Accepted { .. }
-    ));
+    let admission = manager.recovery_epoch_admit("peer-r9-apd-stage").await;
+    assert!(matches!(admission, RecoveryAdmission::Accepted { .. }));
     manager
         .advance_recovery_stage_after_no_ack("peer-r9-apd-stage", "predicted window no ack")
         .await;
     assert_eq!(
-        manager
-            .recovery_stage_for("peer-r9-apd-stage")
-            .await,
+        manager.recovery_stage_for("peer-r9-apd-stage").await,
         RecoveryStage::Predicted
     );
 
@@ -862,8 +861,9 @@ async fn remote_port_churn_triggers_birthday_targets_in_synchronized_punch() {
         .collect::<Vec<_>>();
     // The birthday window is generated in bounded per-plan slices: the
     // expected set mirrors the sliced budget exactly.
-    let sliced_budget = birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len())
-        .min(BIRTHDAY_PLAN_SLICE.saturating_sub(candidates.len()));
+    let sliced_budget =
+        birthday_probe_budget_for_base_count(&TraversalHistory::default(), bases.len())
+            .min(BIRTHDAY_PLAN_SLICE.saturating_sub(candidates.len()));
     let expected_birthday_targets = birthday_probe_endpoints_for_bases(&bases, sliced_budget)
         .into_iter()
         .filter(|target| {
@@ -953,7 +953,9 @@ async fn hard_local_nat_treats_small_stun_pool_as_stable_remote() {
         stable_pool.len(),
         "a small authoritative STUN pool is fully covered: only one of the peer's socket mappings may be live, so the first burst must probe every advertised mapping"
     );
-    assert!(stable_pool.iter().all(|endpoint| targets.contains(endpoint)));
+    assert!(stable_pool
+        .iter()
+        .all(|endpoint| targets.contains(endpoint)));
 
     let maintainer_targets = manager.direct_nat_maintainer_targets_for("peer1").await;
     assert_eq!(maintainer_targets, targets);

@@ -95,8 +95,9 @@ fn is_recent_successful_direct_trial_pair_at(pair: &CandidatePair, now: Instant)
         return false;
     }
 
-    pair.last_success_at
-        .is_some_and(|last_success| now.saturating_duration_since(last_success) <= DIRECT_TRIAL_WINDOW)
+    pair.last_success_at.is_some_and(|last_success| {
+        now.saturating_duration_since(last_success) <= DIRECT_TRIAL_WINDOW
+    })
 }
 
 fn is_successful_low_latency_private_pair_at(pair: &CandidatePair, now: Instant) -> bool {
@@ -105,9 +106,9 @@ fn is_successful_low_latency_private_pair_at(pair: &CandidatePair, now: Instant)
         CandidatePairState::Selected | CandidatePairState::Succeeded
     ) && is_low_latency_direct_endpoint(pair.remote_endpoint)
         && pair.consecutive_failures == 0
-        && pair
-            .last_success_at
-            .is_some_and(|last_success| now.saturating_duration_since(last_success) <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+        && pair.last_success_at.is_some_and(|last_success| {
+            now.saturating_duration_since(last_success) <= RELAY_PEER_CONFIRMATION_MAX_AGE
+        })
         && pair
             .rtt_ewma_ms
             .or(pair.rtt_ms)
@@ -118,11 +119,10 @@ fn is_successful_low_latency_on_link_host_pair_at(pair: &CandidatePair, now: Ins
     matches!(
         pair.state,
         CandidatePairState::Selected | CandidatePairState::Succeeded
-    )
-        && pair.consecutive_failures == 0
-        && pair
-            .last_success_at
-            .is_some_and(|last_success| now.saturating_duration_since(last_success) <= RELAY_PEER_CONFIRMATION_MAX_AGE)
+    ) && pair.consecutive_failures == 0
+        && pair.last_success_at.is_some_and(|last_success| {
+            now.saturating_duration_since(last_success) <= RELAY_PEER_CONFIRMATION_MAX_AGE
+        })
         && pair
             .rtt_ewma_ms
             .or(pair.rtt_ms)
@@ -132,7 +132,10 @@ fn is_successful_low_latency_on_link_host_pair_at(pair: &CandidatePair, now: Ins
 fn candidate_pair_last_success_sort_key(
     pair: &CandidatePair,
 ) -> (bool, std::cmp::Reverse<Option<Instant>>) {
-    (pair.last_success_at.is_none(), std::cmp::Reverse(pair.last_success_at))
+    (
+        pair.last_success_at.is_none(),
+        std::cmp::Reverse(pair.last_success_at),
+    )
 }
 
 fn duration_millis(duration: Duration) -> u64 {

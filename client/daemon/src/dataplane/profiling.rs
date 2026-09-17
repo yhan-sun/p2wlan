@@ -238,7 +238,8 @@ impl DataplaneProfiler {
     }
 
     pub(crate) fn set_candidate_gather_active(&self, active: bool) {
-        self.candidate_gather_active.store(active, Ordering::Release);
+        self.candidate_gather_active
+            .store(active, Ordering::Release);
     }
 
     pub(crate) fn candidate_gather_active(&self) -> bool {
@@ -270,7 +271,11 @@ impl DataplaneProfiler {
         if !sampled {
             return;
         }
-        self.record_value(sampled, stage, duration.as_micros().min(u128::from(u64::MAX)) as u64);
+        self.record_value(
+            sampled,
+            stage,
+            duration.as_micros().min(u128::from(u64::MAX)) as u64,
+        );
     }
 
     pub(crate) fn record_value(&self, sampled: bool, stage: &'static str, value: u64) {
@@ -278,16 +283,20 @@ impl DataplaneProfiler {
             return;
         }
         let report = {
-            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let samples = state.stages.entry(stage).or_default();
             samples.total = samples.total.saturating_add(1);
             if samples.values.len() >= MAX_PROFILE_SAMPLES {
                 samples.values.pop_front();
             }
             samples.values.push_back(value);
-            samples.total.is_multiple_of(PROFILE_REPORT_EVERY).then(|| {
-                summarize_samples(samples)
-            })
+            samples
+                .total
+                .is_multiple_of(PROFILE_REPORT_EVERY)
+                .then(|| summarize_samples(samples))
         };
 
         if let Some((sample_count, p50_us, p95_us, p99_us, max_us)) = report {
@@ -322,7 +331,11 @@ impl DataplaneProfiler {
         }
         self.tail_events.fetch_add(1, Ordering::Relaxed);
 
-        let now_us = self.started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let now_us = self
+            .started_at
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         let previous = self.last_tail_event_us.load(Ordering::Relaxed);
         if previous != 0
             && now_us.saturating_sub(previous)
@@ -395,8 +408,14 @@ impl DataplaneProfiler {
     }
 
     fn maybe_report_summary(&self) {
-        let elapsed_us = self.started_at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        let interval_us = PROFILE_SUMMARY_INTERVAL.as_micros().min(u128::from(u64::MAX)) as u64;
+        let elapsed_us = self
+            .started_at
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let interval_us = PROFILE_SUMMARY_INTERVAL
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
         let previous = self.last_summary_us.load(Ordering::Relaxed);
         if elapsed_us < interval_us
             || (previous != 0 && elapsed_us.saturating_sub(previous) < interval_us)
@@ -409,7 +428,10 @@ impl DataplaneProfiler {
         }
 
         let summaries = {
-            let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state
                 .stages
                 .iter()
@@ -517,7 +539,10 @@ mod profiling_tests {
             dequeue.saturating_duration_since(enqueue),
         );
 
-        assert_eq!(stage_values(&profiler, "tx_outbound_queue_wait_us"), vec![42]);
+        assert_eq!(
+            stage_values(&profiler, "tx_outbound_queue_wait_us"),
+            vec![42]
+        );
     }
 
     #[test]
@@ -525,7 +550,11 @@ mod profiling_tests {
         let profiler = DataplaneProfiler::new();
         profiler.record_fast_path_hit();
         profiler.record(true, "tx_fast_path_lookup_us", Duration::from_micros(3));
-        profiler.record(true, "tx_slow_path_total_userspace_us", Duration::from_micros(9));
+        profiler.record(
+            true,
+            "tx_slow_path_total_userspace_us",
+            Duration::from_micros(9),
+        );
 
         assert_eq!(profiler.fast_path_counters().hits, 1);
         assert_eq!(stage_values(&profiler, "tx_fast_path_lookup_us"), vec![3]);
@@ -624,9 +653,16 @@ mod profiling_tests {
     fn p7_rx_queue_histogram_records_enqueue_to_dequeue_wait() {
         let profiler = DataplaneProfiler::new();
         profiler.record(true, "rx_decrypt_queue_wait_us", Duration::from_micros(31));
-        profiler.record(true, "rx_dataplane_inbound_queue_wait_us", Duration::from_micros(53));
+        profiler.record(
+            true,
+            "rx_dataplane_inbound_queue_wait_us",
+            Duration::from_micros(53),
+        );
 
-        assert_eq!(stage_values(&profiler, "rx_decrypt_queue_wait_us"), vec![31]);
+        assert_eq!(
+            stage_values(&profiler, "rx_decrypt_queue_wait_us"),
+            vec![31]
+        );
         assert_eq!(
             stage_values(&profiler, "rx_dataplane_inbound_queue_wait_us"),
             vec![53]
@@ -637,7 +673,11 @@ mod profiling_tests {
     fn p8_tun_write_metric_is_recorded_without_being_folded_into_queue_wait() {
         let profiler = DataplaneProfiler::new();
         profiler.record(true, "rx_tun_write_us", Duration::from_micros(71));
-        profiler.record(true, "rx_dataplane_inbound_queue_wait_us", Duration::from_micros(19));
+        profiler.record(
+            true,
+            "rx_dataplane_inbound_queue_wait_us",
+            Duration::from_micros(19),
+        );
 
         assert_eq!(stage_values(&profiler, "rx_tun_write_us"), vec![71]);
         assert_eq!(
@@ -827,7 +867,10 @@ mod profiling_tests {
         let samples = state.stages.get("queue_depth").expect("stage recorded");
         assert_eq!(samples.values.len(), MAX_PROFILE_SAMPLES);
         assert_eq!(samples.values.front(), Some(&3));
-        assert_eq!(samples.values.back(), Some(&(MAX_PROFILE_SAMPLES as u64 + 2)));
+        assert_eq!(
+            samples.values.back(),
+            Some(&(MAX_PROFILE_SAMPLES as u64 + 2))
+        );
     }
 
     #[test]

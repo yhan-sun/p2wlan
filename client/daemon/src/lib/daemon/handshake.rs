@@ -651,7 +651,10 @@ fn spawn_bounded_handshake_retransmission(
             timeline.emit(
                 "initiator_offer_retransmitted",
                 None,
-                retransmit_result.as_ref().err().map(|_| "control_plane_error"),
+                retransmit_result
+                    .as_ref()
+                    .err()
+                    .map(|_| "control_plane_error"),
                 Some(format!(
                     "peer={} pending_id={} attempt={} session_fp={} delivered={} is_rekey={}",
                     peer_id,

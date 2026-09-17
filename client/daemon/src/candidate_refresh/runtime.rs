@@ -566,9 +566,10 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     report.nat_profile.public_endpoint,
                     nat_publication.observation,
                 );
-                let endpoint = control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
-                    .or(advertised_endpoint)
-                    .unwrap_or_default();
+                let endpoint =
+                    control_udp_endpoint_from_candidates(&candidates, &candidate_sources)
+                        .or(advertised_endpoint)
+                        .unwrap_or_default();
                 let nat_type = report
                     .nat_profile
                     .control_label_with_generation_and_observation(

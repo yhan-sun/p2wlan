@@ -4,7 +4,9 @@ impl ControlClient {
             || config.network.manual
             || config.control.auth_token.trim().is_empty()
         {
-            return Err(DaemonError::Config("room registration requires an authenticated managed profile".into()));
+            return Err(DaemonError::Config(
+                "room registration requires an authenticated managed profile".into(),
+            ));
         }
         let http = control_http_client(config.control.proxy_mode)?;
         // Only Android's explicit room preparation calls this method. The
@@ -15,14 +17,20 @@ impl ControlClient {
             &normalize_http_base_url(&config.control.server_url),
             &config.control.auth_token,
             config,
-        ).await?;
-        let address = virtual_ip.parse::<std::net::Ipv4Addr>()
+        )
+        .await?;
+        let address = virtual_ip
+            .parse::<std::net::Ipv4Addr>()
             .map_err(|_| DaemonError::Network("invalid room address".into()))?;
         let octets = address.octets();
-        if octets[0] != 10 || octets[1] != 21 || !(1..=254).contains(&octets[3])
+        if octets[0] != 10
+            || octets[1] != 21
+            || !(1..=254).contains(&octets[3])
             || cidr != format!("10.21.{}.0/24", octets[2])
         {
-            return Err(DaemonError::Network("invalid room subnet assignment".into()));
+            return Err(DaemonError::Network(
+                "invalid room subnet assignment".into(),
+            ));
         }
         config.node.node_id = node_id;
         config.network.virtual_ip = virtual_ip;
@@ -108,7 +116,9 @@ impl ControlClient {
         let event_loop_ready = Arc::new(AtomicBool::new(false));
 
         let state = Arc::new(RwLock::new(ClientState {
-            room_authorization: Arc::new(crate::rooms::RoomAuthorization::new(&config.network.network_id)),
+            room_authorization: Arc::new(crate::rooms::RoomAuthorization::new(
+                &config.network.network_id,
+            )),
             registered: false,
             peers: HashMap::new(),
             virtual_ip: None,
@@ -171,9 +181,8 @@ impl ControlClient {
                 health: health.clone(),
                 state: state.clone(),
             };
-            let advertised_snapshot = Arc::new(std::sync::Mutex::new(
-                AdvertisedEndpointSnapshot::default(),
-            ));
+            let advertised_snapshot =
+                Arc::new(std::sync::Mutex::new(AdvertisedEndpointSnapshot::default()));
             let critical_advertised_snapshot = advertised_snapshot.clone();
             let critical = async move {
                 run_critical_control_loop(
@@ -376,7 +385,11 @@ impl ControlClient {
 
     #[cfg(test)]
     pub async fn set_peer_for_test(&self, peer: PeerInfo) {
-        self.state.write().await.peers.insert(peer.node_id.clone(), peer);
+        self.state
+            .write()
+            .await
+            .peers
+            .insert(peer.node_id.clone(), peer);
     }
 
     /// Get the assigned virtual IP.

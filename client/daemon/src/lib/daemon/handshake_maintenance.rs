@@ -117,7 +117,11 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let next_retry = retries.next_deadline().into_iter().chain(cleanups.not_before).min();
+        let next_retry = retries
+            .next_deadline()
+            .into_iter()
+            .chain(cleanups.not_before)
+            .min();
         tokio::select! {
             _ = tick.tick() => {}
             _ = async {
@@ -139,7 +143,9 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
         // the event-initiator revision also survives a coalesced notification.
         let retry_revision = {
             let state = pending.lock();
-            state.has_initiator_retries().then(|| state.retry_revision())
+            state
+                .has_initiator_retries()
+                .then(|| state.retry_revision())
         };
         if let Some(retry_revision) = retry_revision {
             handshake_retry_kick_tx.send_replace(retry_revision);
@@ -183,23 +189,39 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             let is_rekey = status.has_active;
             if !retries.entries.contains_key(&conn.node_id) {
                 if !status.has_active {
-                    debug!("No WireGuard session for {}; retrying handshake", conn.node_id);
+                    debug!(
+                        "No WireGuard session for {}; retrying handshake",
+                        conn.node_id
+                    );
                 } else if status.expired {
-                    info!("Session for peer {} expired; rekeying before dropping old session", conn.node_id);
+                    info!(
+                        "Session for peer {} expired; rekeying before dropping old session",
+                        conn.node_id
+                    );
                 } else {
-                    info!("Session for peer {} needs rekey (message/time threshold)", conn.node_id);
+                    info!(
+                        "Session for peer {} needs rekey (message/time threshold)",
+                        conn.node_id
+                    );
                 }
             }
             let control_peers = control.peers().await;
             let Some(peer_info) = control_peers.get(&conn.node_id) else {
-                retries.schedule(&conn.node_id, retry_identity, hard_deadline, "control_peer_unavailable", Instant::now());
+                retries.schedule(
+                    &conn.node_id,
+                    retry_identity,
+                    hard_deadline,
+                    "control_peer_unavailable",
+                    Instant::now(),
+                );
                 continue;
             };
             let Ok(private_key) = decode_x25519_key(&node_private_key, "node private key") else {
                 retries.remove(&conn.node_id);
                 continue;
             };
-            let Ok(peer_public) = decode_x25519_key(&peer_info.public_key, "peer public key") else {
+            let Ok(peer_public) = decode_x25519_key(&peer_info.public_key, "peer public key")
+            else {
                 retries.remove(&conn.node_id);
                 continue;
             };
@@ -229,19 +251,39 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                         retry_budget_reset,
                     } => (reservation, stale_session_id, retry_budget_reset),
                     MaintenanceInitiatorReservationOutcome::Busy => {
-                        retries.schedule(&conn.node_id, retry_identity, hard_deadline, "handshake_owner_busy", Instant::now());
+                        retries.schedule(
+                            &conn.node_id,
+                            retry_identity,
+                            hard_deadline,
+                            "handshake_owner_busy",
+                            Instant::now(),
+                        );
                         continue;
                     }
                     MaintenanceInitiatorReservationOutcome::Contended => {
-                        retries.schedule(&conn.node_id, retry_identity, hard_deadline, "handshake_reservation_contended", Instant::now());
+                        retries.schedule(
+                            &conn.node_id,
+                            retry_identity,
+                            hard_deadline,
+                            "handshake_reservation_contended",
+                            Instant::now(),
+                        );
                         continue;
                     }
                 };
             if retry_budget_reset {
-                warn!("Handshake for {} reached max attempts; resetting retry budget", conn.node_id);
+                warn!(
+                    "Handshake for {} reached max attempts; resetting retry budget",
+                    conn.node_id
+                );
             }
             if let Some(session_id) = stale_session_id {
-                cleanups.discard_or_defer(&peers, &conn.node_id, &session_id, peer_session_generation);
+                cleanups.discard_or_defer(
+                    &peers,
+                    &conn.node_id,
+                    &session_id,
+                    peer_session_generation,
+                );
             }
             // Rekey reads only the committed tuple, never a live STUN gather
             // or a refresh-mutex wait. First-session gathering is unchanged.
@@ -249,8 +291,16 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 match try_cached_maintenance_rekey_candidates(&candidate_snapshot) {
                     Some(cached) => Some(cached),
                     None => {
-                        pending.lock().cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                        retries.schedule(&conn.node_id, retry_identity, hard_deadline, "candidate_snapshot_contended", Instant::now());
+                        pending
+                            .lock()
+                            .cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                        retries.schedule(
+                            &conn.node_id,
+                            retry_identity,
+                            hard_deadline,
+                            "candidate_snapshot_contended",
+                            Instant::now(),
+                        );
                         continue;
                     }
                 }
@@ -258,9 +308,14 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 let _lease_guard = candidate_refresh_lock.lock().await;
                 let snapshot_state = candidate_snapshot.read().await.clone();
                 let leased = snapshot_state.as_ref().and_then(|snapshot| {
-                    (snapshot.initial_gather_complete && !snapshot.candidates.is_empty()).then(|| {
-                        (snapshot.candidates.clone(), snapshot.candidate_sources.clone())
-                    })
+                    (snapshot.initial_gather_complete && !snapshot.candidates.is_empty()).then(
+                        || {
+                            (
+                                snapshot.candidates.clone(),
+                                snapshot.candidate_sources.clone(),
+                            )
+                        },
+                    )
                 });
                 let startup_snapshot_is_provisional = snapshot_state
                     .as_ref()
@@ -301,7 +356,10 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
 
             let current_status = transport.session_status(&conn.node_id).await;
             if *reservation.cancellation.borrow()
-                || !peers.peer_session_is_current_sync(&conn.node_id, reservation.peer_session_generation)
+                || !peers.peer_session_is_current_sync(
+                    &conn.node_id,
+                    reservation.peer_session_generation,
+                )
                 || should_cancel_maintenance_offer(
                     is_rekey,
                     current_status.has_active,
@@ -310,7 +368,9 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     current_status.has_pending_responder,
                 )
             {
-                pending.lock().cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                pending
+                    .lock()
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                 retries.remove(&conn.node_id);
                 continue;
             }
@@ -326,25 +386,46 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 "publish",
             );
             let Ok(publish_guard) = handshake_arbiter.try_acquire(publish_identity) else {
-                pending.lock().cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                retries.schedule(&conn.node_id, retry_identity, hard_deadline, "publish_arbiter_contended", Instant::now());
+                pending
+                    .lock()
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                retries.schedule(
+                    &conn.node_id,
+                    retry_identity,
+                    hard_deadline,
+                    "publish_arbiter_contended",
+                    Instant::now(),
+                );
                 continue;
             };
             let Some(pending_id) = ({
                 let epoch_gate = peers.network_epoch_gate();
                 let Ok(_epoch_guard) = epoch_gate.try_lock() else {
                     drop(publish_guard);
-                    pending.lock().cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                    retries.schedule(&conn.node_id, retry_identity, hard_deadline, "publish_epoch_contended", Instant::now());
+                    pending
+                        .lock()
+                        .cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                    retries.schedule(
+                        &conn.node_id,
+                        retry_identity,
+                        hard_deadline,
+                        "publish_epoch_contended",
+                        Instant::now(),
+                    );
                     continue;
                 };
                 if *reservation.cancellation.borrow()
                     || peers.current_network_generation_sync() != handshake_generation
-                    || !peers.peer_session_is_current_sync(&conn.node_id, reservation.peer_session_generation)
+                    || !peers.peer_session_is_current_sync(
+                        &conn.node_id,
+                        reservation.peer_session_generation,
+                    )
                 {
                     drop(_epoch_guard);
                     drop(publish_guard);
-                    pending.lock().cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                    pending
+                        .lock()
+                        .cancel_reservation_if_current(&conn.node_id, reservation.owner);
                     retries.remove(&conn.node_id);
                     continue;
                 }
@@ -363,14 +444,25 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 drop(publish_guard);
                 inserted.flatten()
             }) else {
-                pending.lock().cancel_reservation_if_current(&conn.node_id, reservation.owner);
-                retries.schedule(&conn.node_id, retry_identity, hard_deadline, "pending_publish_unavailable", Instant::now());
+                pending
+                    .lock()
+                    .cancel_reservation_if_current(&conn.node_id, reservation.owner);
+                retries.schedule(
+                    &conn.node_id,
+                    retry_identity,
+                    hard_deadline,
+                    "pending_publish_unavailable",
+                    Instant::now(),
+                );
                 continue;
             };
             let pre_probe_status = transport.session_status(&conn.node_id).await;
             if *reservation.cancellation.borrow()
                 || peers.current_network_generation_sync() != handshake_generation
-                || !peers.peer_session_is_current_sync(&conn.node_id, reservation.peer_session_generation)
+                || !peers.peer_session_is_current_sync(
+                    &conn.node_id,
+                    reservation.peer_session_generation,
+                )
                 || should_cancel_maintenance_offer(
                     is_rekey,
                     pre_probe_status.has_active,
@@ -383,40 +475,73 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 retries.remove(&conn.node_id);
                 continue;
             }
-            match try_stage_maintenance_probe_binding(&peers, &conn.node_id, &reservation, &session_id) {
+            match try_stage_maintenance_probe_binding(
+                &peers,
+                &conn.node_id,
+                &reservation,
+                &session_id,
+            ) {
                 MaintenanceBindingOutcome::Staged => {}
                 MaintenanceBindingOutcome::Retry(reason) => {
                     // This attempt did not create a binding. There is nothing
                     // to roll back, especially not via a queued writer await.
                     pending.lock().remove_if_current(&conn.node_id, pending_id);
                     if !retries.entries.contains_key(&conn.node_id) {
-                        info!(event = "maintenance_binding_deferred", reason_code = reason, peer_fp = crate::transport::wire_fingerprint(conn.node_id.as_bytes()), "Probe binding preparation will retry");
+                        info!(
+                            event = "maintenance_binding_deferred",
+                            reason_code = reason,
+                            peer_fp = crate::transport::wire_fingerprint(conn.node_id.as_bytes()),
+                            "Probe binding preparation will retry"
+                        );
                     }
-                    retries.schedule(&conn.node_id, retry_identity, hard_deadline, reason, Instant::now());
+                    retries.schedule(
+                        &conn.node_id,
+                        retry_identity,
+                        hard_deadline,
+                        reason,
+                        Instant::now(),
+                    );
                     continue;
                 }
                 MaintenanceBindingOutcome::Cancel(reason) => {
                     pending.lock().remove_if_current(&conn.node_id, pending_id);
                     retries.remove(&conn.node_id);
-                    debug!(event = "maintenance_binding_cancelled", reason_code = reason, "Retired maintenance binding attempt");
+                    debug!(
+                        event = "maintenance_binding_cancelled",
+                        reason_code = reason,
+                        "Retired maintenance binding attempt"
+                    );
                     continue;
                 }
             }
 
             // Local prepare/publish contention must not consume a network
             // attempt. Count only an exact pending transaction ready to send.
-            let attempt_no = pending.try_with(|state| {
-                if !state.is_current(&conn.node_id, pending_id) {
-                    return None;
-                }
-                let attempts = state.attempts.entry(conn.node_id.clone()).or_insert(0);
-                *attempts = attempts.saturating_add(1);
-                Some(*attempts)
-            }).flatten();
+            let attempt_no = pending
+                .try_with(|state| {
+                    if !state.is_current(&conn.node_id, pending_id) {
+                        return None;
+                    }
+                    let attempts = state.attempts.entry(conn.node_id.clone()).or_insert(0);
+                    *attempts = attempts.saturating_add(1);
+                    Some(*attempts)
+                })
+                .flatten();
             let Some(attempt_no) = attempt_no else {
                 pending.lock().remove_if_current(&conn.node_id, pending_id);
-                cleanups.discard_or_defer(&peers, &conn.node_id, &session_id, peer_session_generation);
-                retries.schedule(&conn.node_id, retry_identity, hard_deadline, "pending_send_unavailable", Instant::now());
+                cleanups.discard_or_defer(
+                    &peers,
+                    &conn.node_id,
+                    &session_id,
+                    peer_session_generation,
+                );
+                retries.schedule(
+                    &conn.node_id,
+                    retry_identity,
+                    hard_deadline,
+                    "pending_send_unavailable",
+                    Instant::now(),
+                );
                 continue;
             };
             retries.remove(&conn.node_id);
@@ -436,7 +561,12 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
             .await
             else {
                 pending.lock().remove_if_current(&conn.node_id, pending_id);
-                cleanups.discard_or_defer(&peers, &conn.node_id, &session_id, peer_session_generation);
+                cleanups.discard_or_defer(
+                    &peers,
+                    &conn.node_id,
+                    &session_id,
+                    peer_session_generation,
+                );
                 continue;
             };
             if offer_result.is_ok() {
@@ -516,11 +646,16 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                     return;
                 }
 
-                if peers2.peer_session_is_current_sync(&timeout_peer, timeout_peer_session_generation) {
+                if peers2
+                    .peer_session_is_current_sync(&timeout_peer, timeout_peer_session_generation)
+                {
                     let status = transport2.session_status(&timeout_peer).await;
                     if !is_rekey
                         && !status.has_active
-                        && peers2.peer_session_is_current_sync(&timeout_peer, timeout_peer_session_generation)
+                        && peers2.peer_session_is_current_sync(
+                            &timeout_peer,
+                            timeout_peer_session_generation,
+                        )
                     {
                         warn!("Handshake timeout for peer {timeout_peer}");
                         let failed = peers2
@@ -546,7 +681,12 @@ async fn run_handshake_maintenance(ctx: HandshakeMaintenanceContext) {
                 }
                 // The binding's own TTL remains the bounded fallback if this
                 // independent timeout cannot perform immediate eager cleanup.
-                try_cleanup_maintenance_probe_binding(&peers2, &timeout_peer, &timeout_session_id, timeout_peer_session_generation);
+                try_cleanup_maintenance_probe_binding(
+                    &peers2,
+                    &timeout_peer,
+                    &timeout_session_id,
+                    timeout_peer_session_generation,
+                );
             });
         }
     }
@@ -603,15 +743,17 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         if !candidates.contains(&endpoint) {
             candidates.insert(0, endpoint.clone());
         }
-        candidate_sources.entry(endpoint.clone()).or_insert_with(|| {
-            if udp_advertise.is_some_and(|configured| {
-                !configured.trim().is_empty() && configured.trim() == endpoint
-            }) {
-                "manual".to_string()
-            } else {
-                "host".to_string()
-            }
-        });
+        candidate_sources
+            .entry(endpoint.clone())
+            .or_insert_with(|| {
+                if udp_advertise.is_some_and(|configured| {
+                    !configured.trim().is_empty() && configured.trim() == endpoint
+                }) {
+                    "manual".to_string()
+                } else {
+                    "host".to_string()
+                }
+            });
     }
 
     let previous_snapshot = candidate_snapshot.read().await.clone();
@@ -633,7 +775,8 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         .as_ref()
         .map(|snapshot| snapshot.network_identity.clone())
         .unwrap_or_default();
-    let should_advance_generation = network_identity_changed(&previous_network_identity, &next_network_identity);
+    let should_advance_generation =
+        network_identity_changed(&previous_network_identity, &next_network_identity);
     let changed = previous_candidates != candidates
         || previous_candidate_sources != candidate_sources
         || previous_network_identity != next_network_identity;
@@ -650,7 +793,9 @@ async fn refresh_candidate_cache_for_maintenance_signal(
         *local_candidate_sources.write().await = candidate_sources.clone();
         *local_network_identity.write().await = next_network_identity;
         if should_advance_generation {
-            peers.advance_network_generation("pre-signal UDP network identity changed").await;
+            peers
+                .advance_network_generation("pre-signal UDP network identity changed")
+                .await;
         }
         info!(
             "Pre-signal UDP candidates refreshed for {reason}; {} candidates (mapping={:?}, public={:?})",
@@ -662,10 +807,12 @@ async fn refresh_candidate_cache_for_maintenance_signal(
 
     if let Some(endpoint) = control_udp_endpoint_from_candidates(&candidates, &candidate_sources) {
         drop(refresh_guard);
-        let nat_type = report.nat_profile.control_label_with_generation_and_observation(
-            nat_publication.generation,
-            nat_publication.observation,
-        );
+        let nat_type = report
+            .nat_profile
+            .control_label_with_generation_and_observation(
+                nat_publication.generation,
+                nat_publication.observation,
+            );
         if let Err(err) = control.update_endpoint(&endpoint, &nat_type).await {
             warn!("Failed to publish pre-signal UDP endpoint '{endpoint}': {err}");
         }

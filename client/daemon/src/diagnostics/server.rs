@@ -178,11 +178,22 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
     if method == "GET" {
         if let Some(peer_id) = path.strip_prefix("/status/peer/") {
             if peer_id.is_empty() || peer_id.contains('/') {
-                write_response(&mut stream, 400, "text/plain", "invalid peer id\n", cors_origin)
-                    .await?;
+                write_response(
+                    &mut stream,
+                    400,
+                    "text/plain",
+                    "invalid peer id\n",
+                    cors_origin,
+                )
+                .await?;
                 return Ok(());
             }
-            match timeout(DIAGNOSTICS_SNAPSHOT_TIMEOUT, build_peer_scoped_snapshot(context, peer_id)).await {
+            match timeout(
+                DIAGNOSTICS_SNAPSHOT_TIMEOUT,
+                build_peer_scoped_snapshot(context, peer_id),
+            )
+            .await
+            {
                 Ok(snapshot) => {
                     let status = if snapshot.peer.is_some() { 200 } else { 404 };
                     let body = serde_json::to_string_pretty(&snapshot)?;
@@ -220,7 +231,8 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
         ("GET", "/status") => {
             match timeout(DIAGNOSTICS_SNAPSHOT_TIMEOUT, build_snapshot(context)).await {
                 Ok(snapshot) => {
-                    let body = serde_json::to_string_pretty(&StatusResponse::from_snapshot(snapshot))?;
+                    let body =
+                        serde_json::to_string_pretty(&StatusResponse::from_snapshot(snapshot))?;
                     write_response(&mut stream, 200, "application/json", &body, cors_origin)
                         .await?;
                 }
@@ -237,7 +249,9 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
                 &mut stream,
                 shutdown_rx,
                 run_speedtest_from_query(context, query),
-            ).await else {
+            )
+            .await
+            else {
                 return Ok(());
             };
             match result {
@@ -295,11 +309,7 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
                 query_param(query, "process_id").and_then(|v| v.parse::<u32>().ok());
             let poll = context
                 .status_events
-                .wait_or_poll_for_process(
-                    since,
-                    expected_process_id,
-                    Duration::from_secs(25),
-                )
+                .wait_or_poll_for_process(since, expected_process_id, Duration::from_secs(25))
                 .await;
             let body = serde_json::to_string_pretty(&EventsResponse::from_poll(poll))?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
@@ -443,9 +453,7 @@ fn is_supported_endpoint(method: &str, path: &str) -> bool {
     match (method, path) {
         ("GET", "/health" | "/status.version" | "/status.runtime" | "/status")
         | ("GET", "/routes" | "/events" | "/peers" | "/logs/tail")
-        | ("POST", "/speedtest" | "/shutdown" | "/routes/verify" | "/routes/repair") => {
-            true
-        }
+        | ("POST", "/speedtest" | "/shutdown" | "/routes/verify" | "/routes/repair") => true,
         ("GET", path) if path.starts_with("/status/peer/") => true,
         _ => false,
     }
@@ -466,17 +474,20 @@ async fn write_unauthorized(stream: &mut TcpStream, cors_origin: Option<&str>) -
 /// Extract a `Bearer <token>` value from the request's `Authorization` header,
 /// if present.
 fn bearer_token(request: &str) -> Option<&str> {
-    request.lines().take_while(|line| !line.is_empty()).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if !name.eq_ignore_ascii_case("authorization") {
-            return None;
-        }
-        let value = value.trim();
-        value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-            .map(str::trim)
-    })
+    request
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("authorization") {
+                return None;
+            }
+            let value = value.trim();
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                .map(str::trim)
+        })
 }
 
 /// Bounded tail of the daemon's own log file: read at most `max_bytes` from the
@@ -508,7 +519,8 @@ async fn bounded_log_tail(
             .await
             .map_err(|e| format!("failed to seek log file: {e}"))?;
     }
-    file.take(max_bytes).read_to_end(&mut buf)
+    file.take(max_bytes)
+        .read_to_end(&mut buf)
         .await
         .map_err(|e| format!("failed to read log file: {e}"))?;
     let text = String::from_utf8_lossy(&buf);
@@ -517,7 +529,10 @@ async fn bounded_log_tail(
 }
 
 fn speedtest_error_status(message: &str) -> u16 {
-    if message.contains("missing") || message.contains("invalid") || message.contains("local virtual IP") {
+    if message.contains("missing")
+        || message.contains("invalid")
+        || message.contains("local virtual IP")
+    {
         400
     } else if message.contains("offline")
         || message.contains("confirmed direct")

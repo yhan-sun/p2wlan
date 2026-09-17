@@ -152,5 +152,4 @@ async fn discover_pcp_udp_candidate(
             source: "pcp",
         })
         .ok_or_else(|| format!("gateway returned non-public endpoint {endpoint}"))
-
 }

@@ -436,12 +436,16 @@ async fn remote_candidate_refresh_defense_in_depth_rejects_mismatched_direct_gen
             Some(Duration::from_millis(6)),
         )
         .await;
-    manager.record_direct_success("peer1", Some(old_endpoint)).await;
+    manager
+        .record_direct_success("peer1", Some(old_endpoint))
+        .await;
 
     let generation = manager.current_network_generation().await;
     {
         let mut connections = manager.connections.write().await;
-        let connection = connections.get_mut("peer1").expect("peer must remain present");
+        let connection = connections
+            .get_mut("peer1")
+            .expect("peer must remain present");
         assert_eq!(connection.state, ConnectionState::Direct);
         // Synthetic invariant violation: public lifecycle APIs update Direct
         // state and direct_generation together under the shared epoch gate.

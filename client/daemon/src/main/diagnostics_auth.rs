@@ -86,7 +86,10 @@ impl Drop for DiagnosticsAuthGuard {
             Err(poisoned) => poisoned.into_inner(),
         };
         match auth_fs::remove_file(&self.path) {
-            Ok(()) => info!("Removed diagnostics auth token file {}", self.path.display()),
+            Ok(()) => info!(
+                "Removed diagnostics auth token file {}",
+                self.path.display()
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => warn!(
                 "Failed to remove diagnostics auth token file {}: {error}",
@@ -188,20 +191,15 @@ fn spawn_auth_file_repair(
             if auth_file_matches(&path, token.as_str()) {
                 continue;
             }
-            if let Err(error) = publish_auth_file(
-                &path,
-                token.as_str(),
-                diagnostics_client_sid.as_deref(),
-            ) {
+            if let Err(error) =
+                publish_auth_file(&path, token.as_str(), diagnostics_client_sid.as_deref())
+            {
                 warn!(
                     "Failed to repair diagnostics auth token file {}: {error}",
                     path.display()
                 );
             } else {
-                debug!(
-                    "Repaired diagnostics auth token file {}",
-                    path.display()
-                );
+                debug!("Repaired diagnostics auth token file {}", path.display());
             }
         }
     });
@@ -226,10 +224,7 @@ fn restrict_auth_file(
     diagnostics_client_sid: Option<&str>,
 ) -> std::io::Result<()> {
     let daemon_sid = current_windows_sid()?;
-    let mut grants = vec![
-        format!("*{daemon_sid}:F"),
-        "*S-1-5-32-544:F".to_string(),
-    ];
+    let mut grants = vec![format!("*{daemon_sid}:F"), "*S-1-5-32-544:F".to_string()];
     if let Some(client_sid) = diagnostics_client_sid.filter(|sid| is_windows_sid(sid)) {
         let grant = format!("*{client_sid}:F");
         if !grants.contains(&grant) {
@@ -301,6 +296,8 @@ fn current_windows_sid() -> std::io::Result<String> {
 fn is_windows_sid(value: &str) -> bool {
     let mut parts = value.split('-');
     matches!(parts.next(), Some("S"))
-        && parts.next().is_some_and(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        && parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
         && parts.all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }

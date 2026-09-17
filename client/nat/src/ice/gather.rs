@@ -54,9 +54,9 @@ pub async fn gather_candidate_report(
             match stun_client.binding_request(socket, server).await {
                 Ok(response) => {
                     let rtt_ms = duration_millis(started.elapsed());
-                    let reflexive = response.reflexive_address.filter(|address| {
-                        address.is_ipv4() == local_addr.ip().is_ipv4()
-                    });
+                    let reflexive = response
+                        .reflexive_address
+                        .filter(|address| address.is_ipv4() == local_addr.ip().is_ipv4());
                     observations.push(StunObservation {
                         server: server.to_string(),
                         mapped_address: reflexive.map(|addr| addr.to_string()),

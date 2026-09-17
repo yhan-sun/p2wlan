@@ -32,9 +32,14 @@ async fn liveness_ttl_expiry_reprobes() {
     let manager = PeerManager::new(test_config());
     let gen = manager.current_network_generation().await;
     let ttl_ms = manager.config.network.udp_liveness_ttl_ms; // 30000 by default
-    // Verdict aged past the TTL → probe IS due; evaluate returns None (expired).
+                                                             // Verdict aged past the TTL → probe IS due; evaluate returns None (expired).
     manager
-        .test_seed_liveness("peer-l", gen, LivenessVerdict::Blocked, ttl_ms as u64 + 1000)
+        .test_seed_liveness(
+            "peer-l",
+            gen,
+            LivenessVerdict::Blocked,
+            ttl_ms as u64 + 1000,
+        )
         .await;
     assert!(
         manager.liveness_probe_due("peer-l", gen).await,
@@ -71,7 +76,9 @@ async fn liveness_generation_change_invalidates_cache() {
 async fn liveness_blocked_applied_exactly_once_at_admit() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
-    manager.add_peer(&flood_peer_112("peer-fw", "10.20.0.3", endpoint)).await;
+    manager
+        .add_peer(&flood_peer_112("peer-fw", "10.20.0.3", endpoint))
+        .await;
     let gen = manager.current_network_generation().await;
 
     // Seed a fresh Blocked verdict BEFORE any admit (no epoch yet).
@@ -117,7 +124,9 @@ async fn liveness_blocked_applied_exactly_once_at_admit() {
 async fn liveness_ok_verdict_is_recorded_but_never_applied() {
     let manager = PeerManager::new(test_config());
     let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
-    manager.add_peer(&flood_peer_112("peer-ok", "10.20.0.3", endpoint)).await;
+    manager
+        .add_peer(&flood_peer_112("peer-ok", "10.20.0.3", endpoint))
+        .await;
     let gen = manager.current_network_generation().await;
 
     // Establish the epoch, then seed an Ok verdict (not Blocked).
@@ -148,7 +157,9 @@ async fn liveness_ok_verdict_is_recorded_but_never_applied() {
 async fn liveness_pre_flight_off_never_blocks() {
     let manager = PeerManager::new(test_config()); // pre_flight defaults false
     let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
-    manager.add_peer(&flood_peer_112("peer-pf", "10.20.0.3", endpoint)).await;
+    manager
+        .add_peer(&flood_peer_112("peer-pf", "10.20.0.3", endpoint))
+        .await;
     let gen = manager.current_network_generation().await;
     // Even with a fresh Blocked verdict, default-OFF pre-flight never skips.
     manager
@@ -167,14 +178,18 @@ async fn liveness_pre_flight_on_blocks_only_on_fresh_blocked() {
     let ttl_ms = config.network.udp_liveness_ttl_ms as u64;
     let manager = PeerManager::new(config);
     let endpoint: SocketAddr = "1.2.3.4:51850".parse().unwrap();
-    manager.add_peer(&flood_peer_112("peer-pf2", "10.20.0.3", endpoint)).await;
+    manager
+        .add_peer(&flood_peer_112("peer-pf2", "10.20.0.3", endpoint))
+        .await;
     let gen = manager.current_network_generation().await;
 
     // No cache → false (read-only: proceed with punch, do NOT spawn).
     assert!(!manager.pre_flight_liveness_blocked("peer-pf2", gen).await);
 
     // Fresh Ok → false (reachable, don't skip).
-    manager.test_seed_liveness("peer-pf2", gen, LivenessVerdict::Ok, 0).await;
+    manager
+        .test_seed_liveness("peer-pf2", gen, LivenessVerdict::Ok, 0)
+        .await;
     assert!(!manager.pre_flight_liveness_blocked("peer-pf2", gen).await);
 
     // Fresh Blocked → true (skip).
@@ -209,9 +224,15 @@ async fn scatter_extended_0ack_blocked_overwrites_reason_and_stops_scatter() {
 
     // (1) Establish the epoch and drive recovery to the wide-scan stage.
     let _ = manager.recovery_epoch_admit("peer-fw").await; // creates epoch (Initial)
-    manager.advance_recovery_stage_after_no_ack("peer-fw", "no-ack-1").await;
-    manager.advance_recovery_stage_after_no_ack("peer-fw", "no-ack-2").await;
-    manager.advance_recovery_stage_after_no_ack("peer-fw", "no-ack-3").await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-fw", "no-ack-1")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-fw", "no-ack-2")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-fw", "no-ack-3")
+        .await;
     assert_eq!(
         manager.recovery_stage_for("peer-fw").await,
         RecoveryStage::ScatterExtended,
@@ -269,14 +290,22 @@ async fn scatter_extended_0ack_ok_does_not_overwrite_or_stop_scatter() {
     let gen = manager.current_network_generation().await;
 
     let _ = manager.recovery_epoch_admit("peer-ok").await;
-    manager.advance_recovery_stage_after_no_ack("peer-ok", "n1").await;
-    manager.advance_recovery_stage_after_no_ack("peer-ok", "n2").await;
-    manager.advance_recovery_stage_after_no_ack("peer-ok", "n3").await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-ok", "n1")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-ok", "n2")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-ok", "n3")
+        .await;
     manager
         .record_direct_probe_batch_failure_for_generation("peer-ok", gen, "wide scan 0 ACK")
         .await;
     // Outbound UDP is reachable -> the 0-ACK is a NAT miss / C=0, NOT a firewall.
-    manager.test_seed_liveness("peer-ok", gen, LivenessVerdict::Ok, 0).await;
+    manager
+        .test_seed_liveness("peer-ok", gen, LivenessVerdict::Ok, 0)
+        .await;
     let _ = manager.recovery_epoch_admit("peer-ok").await;
 
     assert_eq!(
@@ -301,9 +330,15 @@ async fn scatter_extended_0ack_unknown_does_not_overwrite_or_stop_scatter() {
     let gen = manager.current_network_generation().await;
 
     let _ = manager.recovery_epoch_admit("peer-unk").await;
-    manager.advance_recovery_stage_after_no_ack("peer-unk", "n1").await;
-    manager.advance_recovery_stage_after_no_ack("peer-unk", "n2").await;
-    manager.advance_recovery_stage_after_no_ack("peer-unk", "n3").await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-unk", "n1")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-unk", "n2")
+        .await;
+    manager
+        .advance_recovery_stage_after_no_ack("peer-unk", "n3")
+        .await;
     manager
         .record_direct_probe_batch_failure_for_generation("peer-unk", gen, "wide scan 0 ACK")
         .await;
@@ -314,7 +349,10 @@ async fn scatter_extended_0ack_unknown_does_not_overwrite_or_stop_scatter() {
     let _ = manager.recovery_epoch_admit("peer-unk").await;
 
     assert_eq!(
-        manager.direct_health_error_code("peer-unk").await.as_deref(),
+        manager
+            .direct_health_error_code("peer-unk")
+            .await
+            .as_deref(),
         Some("direct_probe_failed"),
         "Unknown must NOT be treated as a firewall (a socket fault says nothing about egress)"
     );

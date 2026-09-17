@@ -30,7 +30,14 @@ pub(super) async fn register_device(
     base_url: &str,
     token: &str,
     config: &Config,
-) -> Result<(String, String, String, Vec<String>, Vec<RelayCatalogEntry>, Option<u64>)> {
+) -> Result<(
+    String,
+    String,
+    String,
+    Vec<String>,
+    Vec<RelayCatalogEntry>,
+    Option<u64>,
+)> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
         .timeout(CONTROL_REQUEST_TIMEOUT)
@@ -43,7 +50,9 @@ pub(super) async fn register_device(
     if !res.status().is_success() {
         let status = res.status();
         let (detail, error_code, registration_seq) = control_error_detail(res).await;
-        if let Some(error) = registration_conflict_error(status, error_code, registration_seq, &detail) {
+        if let Some(error) =
+            registration_conflict_error(status, error_code, registration_seq, &detail)
+        {
             return Err(error);
         }
         return Err(DaemonError::ControlPlane(format!(
@@ -81,12 +90,15 @@ pub(super) async fn register_device(
                     .into(),
             )
         })?;
-        let registration_seq = body.registration_seq.filter(|seq| *seq > 0).ok_or_else(|| {
-            DaemonError::ControlPlane(
+        let registration_seq = body
+            .registration_seq
+            .filter(|seq| *seq > 0)
+            .ok_or_else(|| {
+                DaemonError::ControlPlane(
                 "registration response included lifecycle data but omitted a valid registration_seq"
                     .into(),
             )
-        })?;
+            })?;
         if local_incarnation == 0 || server_incarnation != local_incarnation {
             return Err(DaemonError::ControlPlane(format!(
                 "registration conflict (registration_incarnation_mismatch) local={local_incarnation} server={server_incarnation}"
@@ -159,7 +171,11 @@ pub(super) async fn control_error_detail(
         return (status.to_string(), None, None);
     }
     match serde_json::from_str::<ControlErrorResponse>(&text) {
-        Ok(body) => (body.error.unwrap_or(text), body.error_code, body.registration_seq),
+        Ok(body) => (
+            body.error.unwrap_or(text),
+            body.error_code,
+            body.registration_seq,
+        ),
         Err(_) => (text, None, None),
     }
 }
@@ -225,7 +241,11 @@ pub(super) fn control_label_with_registration_seq(
         })
         .map(ToOwned::to_owned)
         .collect();
-    if fields.is_empty() || fields.iter().all(|field| field == "p2v2:" || field == "p2:") {
+    if fields.is_empty()
+        || fields
+            .iter()
+            .all(|field| field == "p2v2:" || field == "p2:")
+    {
         fields.clear();
         fields.push("p2v2:".to_string());
     }
@@ -281,20 +301,19 @@ pub(super) async fn update_endpoint(
     registration_seq: Option<u64>,
 ) -> Result<()> {
     let res = with_registration_sequence(
-        http
-        .patch(format!("{base_url}/api/v1/devices/{device_id}/endpoint"))
-        .timeout(CONTROL_REQUEST_TIMEOUT)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "endpoint": endpoint,
-            "nat_type": nat_type,
-            "relay_rtt_ms": relay_rtt_ms,
-        })),
+        http.patch(format!("{base_url}/api/v1/devices/{device_id}/endpoint"))
+            .timeout(CONTROL_REQUEST_TIMEOUT)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "endpoint": endpoint,
+                "nat_type": nat_type,
+                "relay_rtt_ms": relay_rtt_ms,
+            })),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("endpoint update request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("endpoint update request failed: {e}")))?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -330,18 +349,17 @@ pub(super) async fn release_presence(
     registration_seq: Option<u64>,
 ) -> Result<()> {
     let res = with_registration_sequence(
-        http
-        .post(format!("{base_url}/api/v1/devices/{device_id}/offline"))
-        .timeout(PRESENCE_RELEASE_TIMEOUT)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "registration_seq": registration_seq,
-        })),
+        http.post(format!("{base_url}/api/v1/devices/{device_id}/offline"))
+            .timeout(PRESENCE_RELEASE_TIMEOUT)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "registration_seq": registration_seq,
+            })),
         registration_seq,
     )
-        .send()
-        .await
-        .map_err(|e| DaemonError::ControlPlane(format!("presence release request failed: {e}")))?;
+    .send()
+    .await
+    .map_err(|e| DaemonError::ControlPlane(format!("presence release request failed: {e}")))?;
 
     if !res.status().is_success() {
         let status = res.status();

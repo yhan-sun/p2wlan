@@ -62,12 +62,15 @@ async fn wide_window_one_coverage_sends_every_candidate_once_per_socket() {
         "one coverage of a 64-port window from a 3-socket pool must send exactly 192 physical probes"
     );
     assert_eq!(
-        report.unique_target_endpoints as usize,
-        64,
+        report.unique_target_endpoints as usize, 64,
         "every one of the 64 window ports must be covered"
     );
     assert_eq!(
-        report.per_socket_sent.iter().map(|(_, count)| *count).collect::<Vec<_>>(),
+        report
+            .per_socket_sent
+            .iter()
+            .map(|(_, count)| *count)
+            .collect::<Vec<_>>(),
         vec![64, 64, 64],
         "each socket must cover the whole window exactly once"
     );
@@ -116,7 +119,9 @@ async fn wide_window_repeated_attempts_never_repeat_target_ports() {
 #[tokio::test]
 async fn wide_window_stops_within_one_probe_after_direct_commit() {
     let peers = peer_manager();
-    peers.add_peer(&peer("peer-direct", "10.20.0.9", None)).await;
+    peers
+        .add_peer(&peer("peer-direct", "10.20.0.9", None))
+        .await;
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
@@ -150,10 +155,7 @@ async fn wide_window_stops_within_one_probe_after_direct_commit() {
     // Give the sweep a head start (a batch or two), then promote Direct.
     tokio::time::sleep(Duration::from_millis(1)).await;
     peers
-        .record_direct_success(
-            "peer-direct",
-            Some("127.0.0.1:33001".parse().unwrap()),
-        )
+        .record_direct_success("peer-direct", Some("127.0.0.1:33001".parse().unwrap()))
         .await;
     let report = sweep.await.unwrap().unwrap();
 
@@ -163,8 +165,7 @@ async fn wide_window_stops_within_one_probe_after_direct_commit() {
         report.packets_sent
     );
     assert!(
-        !peers.is_direct_sync("peer-direct")
-            || report.packets_sent < 64 * 3,
+        !peers.is_direct_sync("peer-direct") || report.packets_sent < 64 * 3,
         "Direct promotion must preempt the rest of the window"
     );
 }
@@ -199,18 +200,12 @@ async fn wide_window_respects_per_peer_and_remote_ip_physical_budgets() {
         .collect::<Vec<SocketAddr>>();
 
     let report = transport
-        .punch_candidates_until_not_direct_report(
-            "peer-b",
-            candidates,
-            Duration::ZERO,
-            1,
-        )
+        .punch_candidates_until_not_direct_report("peer-b", candidates, Duration::ZERO, 1)
         .await
         .unwrap();
 
     assert_eq!(
-        report.packets_sent as usize,
-        24,
+        report.packets_sent as usize, 24,
         "the wide window must stop exactly at the shared per-remote-IP budget"
     );
     assert!(
@@ -263,7 +258,10 @@ async fn wide_window_probe_coverage_counts_unique_and_repeated_ports() {
         event.detail
     );
     assert!(
-        event.detail.contains(&format!("unique_target_ports={}", report.unique_target_endpoints)),
+        event.detail.contains(&format!(
+            "unique_target_ports={}",
+            report.unique_target_endpoints
+        )),
         "coverage telemetry must count the exact unique ports covered"
     );
     // The per-socket physical datagram accounting is explicit in the event.

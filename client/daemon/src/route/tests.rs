@@ -191,10 +191,7 @@ mod tests {
         assert_eq!(rm.owned_routes().len(), 1);
 
         // External actor moves it to p2pnet1 (simulate conflict, still owned).
-        conflicting
-            .lock()
-            .unwrap()
-            .push("10.20.0.0/16".to_string());
+        conflicting.lock().unwrap().push("10.20.0.0/16".to_string());
 
         let before = rm.describe_overlay_route("10.20.0.0/16");
         assert_eq!(before.state, RouteState::Conflict);

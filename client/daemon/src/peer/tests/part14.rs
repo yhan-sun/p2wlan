@@ -190,10 +190,8 @@ async fn preferred_fast_candidates_merge_advertised_neighborhood_without_predict
         .await;
 
     let conn = manager.get_connection("peer1").await.unwrap();
-    let candidates = conn.preferred_fast_candidates(&[
-        advertised,
-        "8.8.8.8:43012".parse().unwrap(),
-    ]);
+    let candidates =
+        conn.preferred_fast_candidates(&[advertised, "8.8.8.8:43012".parse().unwrap()]);
 
     assert!(
         !conn.has_explicit_predicted_window(),
@@ -244,11 +242,8 @@ async fn advertised_neighborhood_merge_skipped_when_predicted_window_exists() {
 
     let conn = manager.get_connection("peer1").await.unwrap();
     assert!(conn.has_explicit_predicted_window());
-    let candidates = conn.preferred_fast_candidates(&[
-        advertised,
-        predicted,
-        "8.8.8.8:42002".parse().unwrap(),
-    ]);
+    let candidates =
+        conn.preferred_fast_candidates(&[advertised, predicted, "8.8.8.8:42002".parse().unwrap()]);
 
     // The predicted source leads; the neighborhood merge is skipped.
     assert_eq!(candidates.first(), Some(&predicted));
@@ -343,7 +338,10 @@ fn destination_route_relevance_prefers_on_link_host_over_global_and_overlay_host
         None,
     );
 
-    assert_eq!(ordered.first().copied(), Some("10.23.176.16:58079".parse().unwrap()));
+    assert_eq!(
+        ordered.first().copied(),
+        Some("10.23.176.16:58079".parse().unwrap())
+    );
     assert!(ordered.contains(&"20.0.3.148:58079".parse().unwrap()));
     assert!(ordered.contains(&"100.127.99.28:58079".parse().unwrap()));
 }

@@ -98,15 +98,17 @@ async fn budget_exhausted_recovery_does_not_spin_or_rebuild_wide_plan() {
         .recovery_epoch_work_budget_report("peer-fail")
         .await
         .expect("epoch must exist");
-    assert_eq!(snapshot.plan_builds_remaining, RECOVERY_EPOCH_PLAN_BUILDS - 1);
+    assert_eq!(
+        snapshot.plan_builds_remaining,
+        RECOVERY_EPOCH_PLAN_BUILDS - 1
+    );
     assert_eq!(
         snapshot.sessions_remaining,
         RECOVERY_EPOCH_SESSIONS - 1,
         "one due tick consumes one session slot"
     );
     assert_eq!(
-        snapshot.candidate_iterations_remaining,
-        RECOVERY_EPOCH_CANDIDATE_ITERATIONS,
+        snapshot.candidate_iterations_remaining, RECOVERY_EPOCH_CANDIDATE_ITERATIONS,
         "the plan build itself does not enumerate candidates"
     );
 
@@ -139,12 +141,18 @@ async fn zero_send_probe_session_records_backoff_and_preserves_progress() {
     manager
         .record_zero_send_recovery_session("peer-fail", 3_072, 3_072, 3_072, "epoch_credit")
         .await;
-    let first = manager.recovery_epoch_work_budget_report("peer-fail").await.unwrap();
+    let first = manager
+        .recovery_epoch_work_budget_report("peer-fail")
+        .await
+        .unwrap();
     assert!(first.budget_exhausted);
     assert_eq!(first.zero_send_streak, 1);
     assert!(first.next_retry_at_ms_since_epoch.is_some());
 
-    let event1 = manager.recovery_last_budget_event("peer-fail").await.unwrap();
+    let event1 = manager
+        .recovery_last_budget_event("peer-fail")
+        .await
+        .unwrap();
     assert_eq!(event1.candidate_count, 3_072);
     assert_eq!(event1.visited, 3_072);
     assert_eq!(event1.sent, 0);
@@ -169,7 +177,10 @@ async fn zero_send_probe_session_records_backoff_and_preserves_progress() {
         .await
         .unwrap();
     assert_eq!(second.zero_send_streak, 2);
-    let event2 = manager.recovery_last_budget_event("peer-fail").await.unwrap();
+    let event2 = manager
+        .recovery_last_budget_event("peer-fail")
+        .await
+        .unwrap();
     assert_eq!(event2.candidate_count, 778);
     assert_eq!(event2.zero_send_streak, 2);
     assert!(
@@ -301,7 +312,10 @@ async fn stale_peer_not_found_is_quarantined_and_cannot_starve_direct_recovery()
     // And the churn must not start a new punch session either: the stale
     // target set stays frozen.
     assert!(
-        manager.direct_probe_targets_for("peer-stale").await.is_empty(),
+        manager
+            .direct_probe_targets_for("peer-stale")
+            .await
+            .is_empty(),
         "endpoint churn must not re-open synchronized punching for a quarantined peer"
     );
 
@@ -343,7 +357,11 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
 
     for _ in 0..3 {
         manager
-            .record_relay_failure("peer-online", "peer_not_found", "peer not found: peer-online")
+            .record_relay_failure(
+                "peer-online",
+                "peer_not_found",
+                "peer not found: peer-online",
+            )
             .await;
     }
     assert!(
@@ -390,8 +408,7 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
         "a transient 404 burst must contribute one bounded grace event"
     );
     assert_eq!(
-        peer_diagnostics.relay.failure_count,
-        1,
+        peer_diagnostics.relay.failure_count, 1,
         "a transient 404 burst must remain one peer-health failure sample"
     );
 
@@ -402,7 +419,11 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
     peer.last_seen = 11;
     manager.add_peer(&peer).await;
     manager
-        .record_relay_failure("peer-online", "peer_not_found", "peer not found: peer-online")
+        .record_relay_failure(
+            "peer-online",
+            "peer_not_found",
+            "peer not found: peer-online",
+        )
         .await;
     assert!(!manager.peer_quarantined("peer-online").await);
     assert!(manager.recovery_epoch_active("peer-online").await);
@@ -412,8 +433,7 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
         .find(|diagnostics| diagnostics.node_id == "peer-online")
         .unwrap();
     assert_eq!(
-        peer_diagnostics.relay.failure_count,
-        1,
+        peer_diagnostics.relay.failure_count, 1,
         "last_seen growth must not open a new 404 window for the same incarnation"
     );
 }
@@ -421,7 +441,11 @@ async fn online_relay_404_grace_preserves_recovery_and_deduplicates_transients()
 #[tokio::test]
 async fn offline_peer_not_found_bypasses_registration_grace() {
     let manager = PeerManager::new(test_config());
-    let mut peer = flood_peer_113("peer-offline", "10.20.0.7", "8.9.10.11:5001".parse().unwrap());
+    let mut peer = flood_peer_113(
+        "peer-offline",
+        "10.20.0.7",
+        "8.9.10.11:5001".parse().unwrap(),
+    );
     manager.add_peer(&peer).await;
     peer.online = false;
     peer.last_seen = 20;
@@ -561,7 +585,8 @@ async fn direct_restart_recovery_is_bounded_and_prioritized() {
         let restart_set = sets.iter().find(|set| set.peer_id == "peer-restart");
         if let Some(set) = restart_set {
             assert!(
-                !set.stable_remote_scatter || set.candidates.len() <= RECOVERY_STAGE_INITIAL_MAX_PROBES as usize,
+                !set.stable_remote_scatter
+                    || set.candidates.len() <= RECOVERY_STAGE_INITIAL_MAX_PROBES as usize,
                 "a relay-backed reclaim must stay bounded instead of wide-scattering"
             );
         }
@@ -598,11 +623,15 @@ async fn slow_probe_transport_confirmation_does_not_block_other_peer_state() {
     let release_for_confirm = Arc::clone(&release_transport);
     let confirm_task = tokio::spawn(async move {
         confirm_manager
-            .confirm_probe_and_transport_transaction("peer-slow-confirm", "slow-token", || async move {
-                started_for_confirm.notify_one();
-                release_for_confirm.notified().await;
-                true
-            })
+            .confirm_probe_and_transport_transaction(
+                "peer-slow-confirm",
+                "slow-token",
+                || async move {
+                    started_for_confirm.notify_one();
+                    release_for_confirm.notified().await;
+                    true
+                },
+            )
             .await
     });
 

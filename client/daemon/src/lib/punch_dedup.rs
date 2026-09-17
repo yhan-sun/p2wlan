@@ -241,8 +241,7 @@ impl PunchSessionPermit {
     /// synchronous handoff: no await can interleave between the worker's
     /// release and the cleanup owner's claim of the same record.
     pub(crate) fn clone_for_cleanup(&self) -> Self {
-        self.owner
-            .retain(&self.peer_id, self.session_id);
+        self.owner.retain(&self.peer_id, self.session_id);
         Self {
             owner: self.owner.clone(),
             peer_id: self.peer_id.clone(),

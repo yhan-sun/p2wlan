@@ -32,10 +32,7 @@ async fn add_heartbeat_peer(peers: &Arc<PeerManager>, node_id: &str, endpoint: S
     peers.update_state(node_id, ConnectionState::Relay).await;
 }
 
-async fn active_owner_token(
-    transport: &UdpTransport,
-    peer_id: &str,
-) -> Option<u64> {
+async fn active_owner_token(transport: &UdpTransport, peer_id: &str) -> Option<u64> {
     transport
         .relay_backoff_heartbeats
         .lock()
@@ -100,12 +97,10 @@ async fn cancel_then_immediate_replacement_never_overlaps_sending() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(registry.active.is_empty());
-        assert!(
-            registry
-                .quitting
-                .get("peer-b")
-                .is_some_and(|lease| lease.owner_token == first_owner)
-        );
+        assert!(registry
+            .quitting
+            .get("peer-b")
+            .is_some_and(|lease| lease.owner_token == first_owner));
         assert!(registry.pending_restarts.contains_key("peer-b"));
     }
     assert_eq!(
@@ -224,9 +219,11 @@ async fn cancel_mid_beat_old_worker_stops_before_next_send() {
 
     // Cancel while the worker is parked mid-beat and request a replacement.
     assert!(transport.cancel_relay_backoff_heartbeat("peer-b"));
-    assert!(!transport
-        .spawn_relay_backoff_heartbeat("peer-b", Duration::from_millis(50))
-        .await);
+    assert!(
+        !transport
+            .spawn_relay_backoff_heartbeat("peer-b", Duration::from_millis(50))
+            .await
+    );
     let first_owner = {
         let registry = transport
             .relay_backoff_heartbeats
@@ -311,9 +308,11 @@ async fn quit_handshake_ignores_direct_transition_during_cancel() {
     // revokes the active lease through the registered cancel hook, so no
     // explicit cancel is needed here.)
     peers.update_state("peer-b", ConnectionState::Direct).await;
-    assert!(!transport
-        .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
-        .await);
+    assert!(
+        !transport
+            .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
+            .await
+    );
 
     gate.release.wait().await;
     // Wait for the pending-restart worker to observe Direct and exit.
@@ -334,7 +333,10 @@ async fn quit_handshake_ignores_direct_transition_during_cancel() {
     }
     let (pending_empty, closed) =
         registry_state.expect("all workers must exit after the Direct transition");
-    assert!(pending_empty, "the pending restart must be consumed exactly once");
+    assert!(
+        pending_empty,
+        "the pending restart must be consumed exactly once"
+    );
     assert!(!closed);
     assert_eq!(
         count_pending_receiver_datagrams(&receiver).await,
@@ -372,9 +374,11 @@ async fn quit_handshake_ignores_peer_removal_during_cancel() {
     // The peer is removed while the worker is quitting: no replacement may
     // probe a peer that no longer exists.
     peers.remove_peer("peer-b").await;
-    assert!(!transport
-        .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
-        .await);
+    assert!(
+        !transport
+            .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
+            .await
+    );
 
     gate.release.wait().await;
     for _ in 0..100 {
@@ -427,9 +431,11 @@ async fn quit_handshake_ignores_relay_loss_during_cancel() {
     peers
         .invalidate_relay_transport("relay-a.test:28081", "transport_closed", "test loss")
         .await;
-    assert!(!transport
-        .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
-        .await);
+    assert!(
+        !transport
+            .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
+            .await
+    );
 
     gate.release.wait().await;
     for _ in 0..100 {
@@ -476,9 +482,11 @@ async fn multiple_restart_triggers_during_quit_start_exactly_one_worker() {
     // Several recovery triggers arrive during the quit handshake; they all
     // coalesce into ONE pending restart.
     for _ in 0..5 {
-        assert!(!transport
-            .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
-            .await);
+        assert!(
+            !transport
+                .spawn_relay_backoff_heartbeat("peer-b", Duration::from_secs(1))
+                .await
+        );
     }
     {
         let registry = transport

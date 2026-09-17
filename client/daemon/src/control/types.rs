@@ -956,50 +956,50 @@ impl AdvertisedEndpointSnapshot {
             true
         } else {
             match (self.generation, incoming_gen) {
-            (Some(current), Some(incoming)) => {
-                if incoming < current {
-                    false
-                } else if incoming == current {
-                    let current_hint = p2pnet_nat::parse_nat_hint(&self.nat_type);
-                    let incoming_hint = p2pnet_nat::parse_nat_hint(&nat_type);
-                    if current_hint.parsed && incoming_hint.parsed {
-                        if current_hint.mapping != p2pnet_nat::MappingBehavior::Unknown
-                            && incoming_hint.mapping != p2pnet_nat::MappingBehavior::Unknown
-                            && current_hint.mapping != incoming_hint.mapping
-                        {
+                (Some(current), Some(incoming)) => {
+                    if incoming < current {
+                        false
+                    } else if incoming == current {
+                        let current_hint = p2pnet_nat::parse_nat_hint(&self.nat_type);
+                        let incoming_hint = p2pnet_nat::parse_nat_hint(&nat_type);
+                        if current_hint.parsed && incoming_hint.parsed {
+                            if current_hint.mapping != p2pnet_nat::MappingBehavior::Unknown
+                                && incoming_hint.mapping != p2pnet_nat::MappingBehavior::Unknown
+                                && current_hint.mapping != incoming_hint.mapping
+                            {
+                                return;
+                            }
+                            if current_hint.filtering != p2pnet_nat::FilteringBehavior::Unknown
+                                && incoming_hint.filtering != p2pnet_nat::FilteringBehavior::Unknown
+                                && current_hint.filtering != incoming_hint.filtering
+                            {
+                                return;
+                            }
+                            if current_hint.allocation != p2pnet_nat::NatAllocation::Unknown
+                                && incoming_hint.allocation != p2pnet_nat::NatAllocation::Unknown
+                                && current_hint.allocation != incoming_hint.allocation
+                            {
+                                return;
+                            }
+                        }
+                        match (self.observation, incoming_observation) {
+                            (Some(current), Some(incoming)) if incoming < current => return,
+                            // Do not let an older cached label lose its real
+                            // observation fence and turn later heartbeats into a
+                            // pseudo-freshness source.
+                            (Some(_), None) => return,
+                            _ => {}
+                        }
+                        if endpoint.trim().is_empty() && !self.endpoint.trim().is_empty() {
                             return;
                         }
-                        if current_hint.filtering != p2pnet_nat::FilteringBehavior::Unknown
-                            && incoming_hint.filtering != p2pnet_nat::FilteringBehavior::Unknown
-                            && current_hint.filtering != incoming_hint.filtering
-                        {
-                            return;
-                        }
-                        if current_hint.allocation != p2pnet_nat::NatAllocation::Unknown
-                            && incoming_hint.allocation != p2pnet_nat::NatAllocation::Unknown
-                            && current_hint.allocation != incoming_hint.allocation
-                        {
-                            return;
-                        }
+                        true
+                    } else {
+                        true
                     }
-                    match (self.observation, incoming_observation) {
-                        (Some(current), Some(incoming)) if incoming < current => return,
-                        // Do not let an older cached label lose its real
-                        // observation fence and turn later heartbeats into a
-                        // pseudo-freshness source.
-                        (Some(_), None) => return,
-                        _ => {}
-                    }
-                    if endpoint.trim().is_empty() && !self.endpoint.trim().is_empty() {
-                        return;
-                    }
-                    true
-                } else {
-                    true
                 }
-            }
-            (Some(_), None) => false,
-            (None, _) => true,
+                (Some(_), None) => false,
+                (None, _) => true,
             }
         };
         if accepts {

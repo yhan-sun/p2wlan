@@ -5,11 +5,7 @@ fn predicted_sources(candidates: &[&str]) -> HashMap<String, CandidatePairSource
         .collect()
 }
 
-fn install_predicted_candidates(
-    conn: &mut PeerConnection,
-    candidates: &[&str],
-    generation: u64,
-) {
+fn install_predicted_candidates(conn: &mut PeerConnection, candidates: &[&str], generation: u64) {
     conn.candidate_sources = predicted_sources(candidates);
     conn.candidates = candidates.iter().map(|c| c.to_string()).collect();
     for (rank, candidate) in candidates.iter().enumerate() {
@@ -32,7 +28,11 @@ fn predicted_candidates_probe_in_signal_rank_order_not_port_order() {
     let generation = 0;
     install_predicted_candidates(
         &mut conn,
-        &["220.163.6.190:45394", "220.163.6.190:45393", "220.163.6.190:45395"],
+        &[
+            "220.163.6.190:45394",
+            "220.163.6.190:45393",
+            "220.163.6.190:45395",
+        ],
         generation,
     );
 
@@ -63,14 +63,20 @@ fn explicit_predicted_window_defers_birthday_fallback() {
     let generation = 0;
     install_predicted_candidates(
         &mut conn,
-        &["220.163.6.190:45393", "220.163.6.190:45394", "220.163.6.190:45395"],
+        &[
+            "220.163.6.190:45393",
+            "220.163.6.190:45394",
+            "220.163.6.190:45395",
+        ],
         generation,
     );
     // The peer also advertised a STUN-observed base, which anchors the
     // birthday sweep once the predicted window fails.
     conn.candidates.push("220.163.6.190:27676".to_string());
-    conn.candidate_sources
-        .insert("220.163.6.190:27676".to_string(), CandidatePairSource::StunObserved);
+    conn.candidate_sources.insert(
+        "220.163.6.190:27676".to_string(),
+        CandidatePairSource::StunObserved,
+    );
     let base: SocketAddr = "220.163.6.190:27676".parse().unwrap();
     conn.ensure_candidate_pair_with_source(base, generation, CandidatePairSource::StunObserved);
     let mut birthday_profile = NatProfile {
@@ -138,14 +144,10 @@ fn slow_relay_candidate_is_quarantined_until_a_new_observation() {
     let slow: SocketAddr = "203.0.113.10:41000".parse().unwrap();
     let fresh: SocketAddr = "203.0.113.10:41001".parse().unwrap();
     conn.candidates = vec![slow.to_string(), fresh.to_string()];
-    conn.candidate_sources.insert(
-        slow.to_string(),
-        CandidatePairSource::PeerReflexive,
-    );
-    conn.candidate_sources.insert(
-        fresh.to_string(),
-        CandidatePairSource::PeerReflexive,
-    );
+    conn.candidate_sources
+        .insert(slow.to_string(), CandidatePairSource::PeerReflexive);
+    conn.candidate_sources
+        .insert(fresh.to_string(), CandidatePairSource::PeerReflexive);
 
     conn.ensure_candidate_pair_with_source(slow, generation, CandidatePairSource::PeerReflexive)
         .record_slow_validation(

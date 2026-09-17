@@ -11,8 +11,8 @@ struct DaemonInstanceLock {
 
 impl DaemonInstanceLock {
     fn acquire(config_path: &Path) -> p2pnet_daemon::Result<Self> {
-        let config_path = std::fs::canonicalize(config_path)
-            .unwrap_or_else(|_| absolute_path(config_path));
+        let config_path =
+            std::fs::canonicalize(config_path).unwrap_or_else(|_| absolute_path(config_path));
         let path = daemon_lock_path(&config_path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {

@@ -30,17 +30,17 @@ async fn c0_fresh_pair_plan_targets_remote_fresh_not_historical() {
 
     assert_eq!(plan.local_fresh_endpoint, local_fresh);
     assert_eq!(
-        plan.bounded_targets,
-        remote_fresh,
+        plan.bounded_targets, remote_fresh,
         "the punch targets must be the remote FRESH predicted ports"
     );
     assert!(
-        !plan
-            .bounded_targets
-            .contains(&local_fresh),
+        !plan.bounded_targets.contains(&local_fresh),
         "the local fresh endpoint is a source identity, never a target"
     );
-    assert_eq!(plan.canonical_punch_at_ms, 1_780_100_000, "propagated canonical deadline honored");
+    assert_eq!(
+        plan.canonical_punch_at_ms, 1_780_100_000,
+        "propagated canonical deadline honored"
+    );
 }
 
 #[tokio::test]

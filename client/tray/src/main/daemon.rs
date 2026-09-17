@@ -7,10 +7,7 @@ fn stop_daemon() -> Result<(), Box<dyn Error>> {
     for attempt in 0..2 {
         let token = read_diagnostics_auth_token()
             .ok_or("diagnostics session token file is missing; daemon session may have changed")?;
-        let response = client
-            .post(&shutdown_url)
-            .bearer_auth(token)
-            .send()?;
+        let response = client.post(&shutdown_url).bearer_auth(token).send()?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
             continue;
         }
@@ -141,10 +138,9 @@ fn run_macos_sudo_once(command: &str, password: &[u8]) -> Result<(bool, bool), B
     }
     let output = child.wait_with_output()?;
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    let authentication_failed =
-        stderr.contains("incorrect password") ||
-        stderr.contains("sorry, try again") ||
-        stderr.contains("authentication failure");
+    let authentication_failed = stderr.contains("incorrect password")
+        || stderr.contains("sorry, try again")
+        || stderr.contains("authentication failure");
     Ok((output.status.success(), authentication_failed))
 }
 
@@ -258,7 +254,9 @@ fn write_ephemeral_launch_token(log_dir: &Path, token: &str) -> Result<PathBuf, 
     fs::create_dir_all(log_dir)?;
     #[cfg(unix)]
     {
-        let status = Command::new("chmod").args(["700", &log_dir.display().to_string()]).status()?;
+        let status = Command::new("chmod")
+            .args(["700", &log_dir.display().to_string()])
+            .status()?;
         if !status.success() {
             return Err("could not restrict tray runtime directory permissions".into());
         }

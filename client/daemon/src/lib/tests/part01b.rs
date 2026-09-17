@@ -77,10 +77,7 @@ fn advertised_udp_endpoint_prefers_public_candidate_over_private_host() {
             local,
             None,
             &["192.168.0.239:60482".to_string()],
-            &HashMap::from([(
-                "192.168.0.239:60482".to_string(),
-                "host".to_string(),
-            )]),
+            &HashMap::from([("192.168.0.239:60482".to_string(), "host".to_string(),)]),
             true,
         ),
         Some("192.168.0.239:60482".to_string())
@@ -209,7 +206,10 @@ fn signal_candidates_compact_volatile_public_ports_per_public_ip() {
 
     compact_volatile_public_signal_candidates(&mut candidates, &mut sources);
 
-    assert_eq!(candidates.len(), 1 + MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP + 2);
+    assert_eq!(
+        candidates.len(),
+        1 + MAX_SIGNAL_VOLATILE_PUBLIC_PER_PUBLIC_IP + 2
+    );
     assert!(candidates.contains(&"192.168.1.10:51820".to_string()));
     assert!(candidates.contains(&"1.1.1.1:42000".to_string()));
     assert!(candidates.contains(&"1.1.1.1:42009".to_string()));
@@ -312,8 +312,7 @@ fn fresh_window_survives_full_prepare_pipeline_alongside_96_ordinary_volatile() 
     }
     // The complete 24-port fresh prediction window, sender order preserved:
     // the first entry is the model's top-1 prediction.
-    let fresh_ports = (44_000..44_000 + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES)
-        .map(|port| port as u16);
+    let fresh_ports = (44_000..44_000 + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES).map(|port| port as u16);
     let mut fresh_endpoints = Vec::new();
     for port in fresh_ports {
         let endpoint = format!("8.8.8.8:{port}");
@@ -321,7 +320,10 @@ fn fresh_window_survives_full_prepare_pipeline_alongside_96_ordinary_volatile() 
         candidates.push(endpoint.clone());
         sources.insert(endpoint, fresh_label.clone());
     }
-    assert_eq!(candidates.len(), MAX_SIGNAL_CANDIDATES + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
+    assert_eq!(
+        candidates.len(),
+        MAX_SIGNAL_CANDIDATES + MAX_SIGNAL_FRESH_WINDOW_CANDIDATES
+    );
 
     // Run the whole prepare pipeline exactly like the runtime refresh path.
     let identity = prepare_signal_candidates_and_network_identity(
@@ -349,9 +351,9 @@ fn fresh_window_survives_full_prepare_pipeline_alongside_96_ordinary_volatile() 
     assert_eq!(candidates.len(), MAX_SIGNAL_FRESH_WINDOW_CANDIDATES);
     // Sources stay consistent with the surviving set.
     assert!(sources.keys().all(|endpoint| candidates.contains(endpoint)));
-    assert!(fresh_endpoints
-        .iter()
-        .all(|endpoint| sources.get(endpoint).is_some_and(|source| source == &fresh_label)));
+    assert!(fresh_endpoints.iter().all(|endpoint| sources
+        .get(endpoint)
+        .is_some_and(|source| source == &fresh_label)));
 }
 
 /// Compact must reserve the fresh window per public IP too: when ordinary
@@ -415,7 +417,10 @@ fn control_endpoint_selection_is_independent_of_proxy_policy() {
     // The proxy policy never enters the candidate-selection function; both
     // modes resolve to the same STUN-derived endpoint.
     assert_eq!(crate::config::ControlProxyMode::Direct.as_label(), "direct");
-    assert_eq!(crate::config::ControlProxyMode::Environment.as_label(), "environment");
+    assert_eq!(
+        crate::config::ControlProxyMode::Environment.as_label(),
+        "environment"
+    );
 }
 
 #[test]
@@ -469,7 +474,7 @@ fn signal_payload_json_keeps_stun_candidates_under_both_proxy_modes() {
     // mode, and the selected control endpoint stays the STUN-observed one.
     use std::collections::HashMap;
     let candidates = vec![
-        "8.8.8.8:41000".to_string(), // STUN-observed public endpoint
+        "8.8.8.8:41000".to_string(),      // STUN-observed public endpoint
         "192.168.1.10:51820".to_string(), // host candidate
     ];
     let sources = HashMap::from([
@@ -497,10 +502,12 @@ fn signal_payload_json_keeps_stun_candidates_under_both_proxy_modes() {
         .iter()
         .map(|c| c.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(json_candidates, candidates, "candidate JSON must be the STUN-derived list verbatim");
     assert_eq!(
-        payload["candidate_sources"]["8.8.8.8:41000"],
-        "stun_observed",
+        json_candidates, candidates,
+        "candidate JSON must be the STUN-derived list verbatim"
+    );
+    assert_eq!(
+        payload["candidate_sources"]["8.8.8.8:41000"], "stun_observed",
         "the STUN source label must survive into the JSON"
     );
     // Neither proxy mode rewrites the STUN-derived endpoint selection.

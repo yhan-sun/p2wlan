@@ -444,19 +444,15 @@ async fn committed_dynamic_socket_for_send_test(
         .attach_dynamic_punch_socket(peer_id, socket_index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        handoff
-            .commit_and_pin(transport, peer_id, socket_index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(handoff
+        .commit_and_pin(transport, peer_id, socket_index, 0, 1)
+        .await
+        .committed());
     assert!(handoff.finalize().await);
-    assert!(
-        transport
-            .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
-            .await
-            .is_some()
-    );
+    assert!(transport
+        .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
+        .await
+        .is_some());
     let _ = peers;
     socket_index
 }
@@ -1054,12 +1050,10 @@ async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends()
         .attach_dynamic_punch_socket("peer-b", socket_index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        handoff
-            .commit_and_pin(&transport, "peer-b", socket_index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(handoff
+        .commit_and_pin(&transport, "peer-b", socket_index, 0, 1)
+        .await
+        .committed());
     assert!(handoff.finalize().await);
     transport
         .detach_dynamic_socket_by_index(socket_index, "test_exact_socket_detached")
@@ -1970,12 +1964,10 @@ async fn dynamic_socket_cap_never_evicts_direct_peer_or_leaves_stale_affinity() 
         .attach_dynamic_punch_socket("peer-9", index9, socket9, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard9
-            .commit_and_pin(&transport, "peer-9", index9, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard9
+        .commit_and_pin(&transport, "peer-9", index9, 0, 1)
+        .await
+        .committed());
     transport
         .remember_peer_socket("peer-9", index9, SocketEvidence::Stamped(0))
         .await;
@@ -2049,12 +2041,10 @@ async fn network_generation_change_detaches_dynamic_socket_on_next_use() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard
-            .commit_and_pin(&transport, "peer-b", index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await
+        .committed());
     transport
         .remember_peer_socket("peer-b", index, SocketEvidence::Stamped(0))
         .await;
@@ -2735,12 +2725,10 @@ async fn dynamic_socket_cap_never_evicts_same_peer_predecessor() {
         .attach_dynamic_punch_socket("peer-0", predecessor_index, predecessor_socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        predecessor_guard
-            .commit_and_pin(&transport, "peer-0", predecessor_index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(predecessor_guard
+        .commit_and_pin(&transport, "peer-0", predecessor_index, 0, 1)
+        .await
+        .committed());
     transport
         .remember_peer_socket("peer-0", predecessor_index, SocketEvidence::Stamped(0))
         .await;
@@ -3272,12 +3260,10 @@ async fn older_generation_rollback_never_overwrites_newer_commit() {
         .attach_dynamic_punch_socket("peer-b", index_1, socket_1, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard_1
-            .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard_1
+        .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
+        .await
+        .committed());
     guard_1.finalize().await;
 
     // G2 commits (predecessor = G1).
@@ -3396,12 +3382,10 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
     }
 
     // Commit: now admissible.
-    assert!(
-        guard
-            .commit_and_pin(&transport, "peer-b", index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await
+        .committed());
     transport
         .remember_peer_socket("peer-b", index, SocketEvidence::Fresh)
         .await;
@@ -3427,12 +3411,10 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         .attach_dynamic_punch_socket("peer-c", index_c, socket_c, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard_c
-            .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard_c
+        .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
+        .await
+        .committed());
     transport
         .remember_peer_socket("peer-b", index_c, SocketEvidence::Fresh)
         .await;
@@ -3455,12 +3437,10 @@ async fn remember_peer_socket_validates_peer_ownership_phase_and_generation() {
         .attach_dynamic_punch_socket("peer-b", index_old, socket_old, 0, 2, None)
         .await
         .unwrap();
-    assert!(
-        guard_old
-            .commit_and_pin(&transport, "peer-b", index_old, 0, 2)
-            .await
-            .committed()
-    );
+    assert!(guard_old
+        .commit_and_pin(&transport, "peer-b", index_old, 0, 2)
+        .await
+        .committed());
     let committed_epoch = {
         let state = transport.socket_state.lock().await;
         state.affinity.get("peer-b").map(|pin| pin.epoch).unwrap()
@@ -3519,12 +3499,10 @@ async fn detached_dynamic_socket_fallback_ack_still_matches_on_actual_socket() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard
-            .commit_and_pin(&transport, "peer-b", index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await
+        .committed());
 
     let endpoint: SocketAddr = "127.0.0.1:59999".parse().unwrap();
     let generation = peers.current_network_generation().await;
@@ -3973,12 +3951,10 @@ async fn resolve_then_detach_ack_still_matches() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard
-            .commit_and_pin(&transport, "peer-b", index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await
+        .committed());
     guard.finalize().await;
 
     // Resolve with a send lease (what the probe path does), then detach the
@@ -4106,12 +4082,10 @@ async fn cross_peer_dynamic_socket_index_refused() {
         .attach_dynamic_punch_socket("peer-c", index_c, socket_c, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard_c
-            .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard_c
+        .commit_and_pin(&transport, "peer-c", index_c, 0, 1)
+        .await
+        .committed());
 
     // peer-b asks to send through peer-c's dynamic index: the resolver must
     // refuse (wrong owner) and fall back to peer-b's pool socket (index 0).
@@ -4654,12 +4628,10 @@ async fn finalized_socket_survives_immediate_guard_drop() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, Some(&cancellation))
         .await
         .unwrap();
-    assert!(
-        guard
-            .commit_and_pin(&transport, "peer-b", index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await
+        .committed());
 
     // The durable handoff completes BEFORE the cancellation is even fired:
     // the handshake waits for the watcher's ack, so no racing stop signal can
@@ -4775,12 +4747,10 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
         .attach_dynamic_punch_socket("peer-b", index_1, socket_1, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard_1
-            .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard_1
+        .commit_and_pin(&transport, "peer-b", index_1, 0, 1)
+        .await
+        .committed());
     guard_1.finalize().await;
 
     // G2 commits (predecessor = G1), then G3 commits on top of G2.
@@ -4790,12 +4760,10 @@ async fn rollback_detaches_own_socket_when_newer_owner_holds_affinity() {
         .attach_dynamic_punch_socket("peer-b", index_2, socket_2, 0, 2, Some(&cancellation_2))
         .await
         .unwrap();
-    assert!(
-        guard_2
-            .commit_and_pin(&transport, "peer-b", index_2, 0, 2)
-            .await
-            .committed()
-    );
+    assert!(guard_2
+        .commit_and_pin(&transport, "peer-b", index_2, 0, 2)
+        .await
+        .committed());
     let (index_3, socket_3) = transport.bind_fresh_punch_socket().await.unwrap();
     let guard_3 = transport
         .attach_dynamic_punch_socket("peer-b", index_3, socket_3, 0, 3, None)
@@ -4862,12 +4830,10 @@ async fn detach_keeps_reader_alive_until_pending_probe_ack() {
         .attach_dynamic_punch_socket("peer-b", index, socket, 0, 1, None)
         .await
         .unwrap();
-    assert!(
-        guard
-            .commit_and_pin(&transport, "peer-b", index, 0, 1)
-            .await
-            .committed()
-    );
+    assert!(guard
+        .commit_and_pin(&transport, "peer-b", index, 0, 1)
+        .await
+        .committed());
     guard.finalize().await;
 
     // Send a probe from the dynamic socket and detach it immediately, while

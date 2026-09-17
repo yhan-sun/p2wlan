@@ -40,10 +40,7 @@ impl TrayApp {
             return None;
         }
         let delta = u128::from(total_bytes - previous.total_bytes);
-        Some(
-            (delta * 1_000_000_000 / elapsed_nanos)
-                .min(u128::from(u64::MAX)) as u64,
-        )
+        Some((delta * 1_000_000_000 / elapsed_nanos).min(u128::from(u64::MAX)) as u64)
     }
 
     fn apply_state(&mut self) {
@@ -67,8 +64,8 @@ impl TrayApp {
             !self.last_state.running || self.last_state.busy,
         );
 
-        let icon = tray_icon_image(self.last_state.running)
-            .expect("static tray icon should be valid");
+        let icon =
+            tray_icon_image(self.last_state.running).expect("static tray icon should be valid");
         let _ = self.tray_icon.set_icon(&icon);
 
         let latency = format_tray_latency(self.last_state.latency_ms);
@@ -173,10 +170,7 @@ impl TrayApp {
 
     fn set_status(&mut self, text: impl AsRef<str>) {
         let text = text.as_ref();
-        self.last_state.status_label = text
-            .strip_prefix("状态：")
-            .unwrap_or(text)
-            .to_string();
+        self.last_state.status_label = text.strip_prefix("状态：").unwrap_or(text).to_string();
         self.apply_state();
         let _ = self.tray_icon.set_tooltip(text);
     }

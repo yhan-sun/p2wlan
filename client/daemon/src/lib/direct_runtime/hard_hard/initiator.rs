@@ -210,7 +210,8 @@ pub(crate) async fn spawn_hard_hard_initiator(
             &coordination.token,
             Some(&cancellation),
         )
-        .await else {
+        .await
+        else {
             if cancellation.is_cancelled() {
                 return;
             }
@@ -266,12 +267,9 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 .await;
             return;
         };
-        let Some(primary_socket) = hard_hard_measurement_primary_socket(
-            &peer_id,
-            &coordination.token,
-            &measurement,
-            plan,
-        ) else {
+        let Some(primary_socket) =
+            hard_hard_measurement_primary_socket(&peer_id, &coordination.token, &measurement, plan)
+        else {
             return;
         };
         peers
@@ -318,8 +316,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             generated_candidate_count: candidate_contract.generated_candidate_count,
             signaled_candidate_count: candidate_contract.signaled_candidate_count,
             birthday,
-            requested_socket_count:
-                hard_hard_measurement_requested_socket_count(&measurement),
+            requested_socket_count: hard_hard_measurement_requested_socket_count(&measurement),
             requested_socket_indices,
             prediction_window,
             remote_prediction: Vec::new(),
@@ -406,13 +403,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
         } else {
             false
         };
-        record_hard_hard_candidate_contract(
-            &peers,
-            &peer_id,
-            candidate_contract,
-            advertised,
-        )
-        .await;
+        record_hard_hard_candidate_contract(&peers, &peer_id, candidate_contract, advertised).await;
         if !advertised
             || peers.is_direct(&peer_id).await
             || cancellation.is_cancelled()
@@ -631,11 +622,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
     {
         let _ = peers
-            .hard_hard_retire_session(
-                &record.peer_id,
-                &record.session_id,
-                &record.session_token,
-            )
+            .hard_hard_retire_session(&record.peer_id, &record.session_id, &record.session_token)
             .await;
         return HardHardRemoteStart::Rejected;
     }
@@ -654,8 +641,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
         birthday_socket_indices,
         record.session_token.clone(),
         remote_prediction,
-        record
-            .requested_birthday_level,
+        record.requested_birthday_level,
         record.generated_candidate_count,
         record.signaled_candidate_count,
         punch_at_ms,
@@ -694,14 +680,13 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
                 .await;
         }
     } else {
-        let authenticated_winner =
-            hard_hard_authenticated_winner_for_cleanup(
-                &cleanup_udp,
-                &peers,
-                &peer_id,
-                &record.session_token,
-            )
-            .await;
+        let authenticated_winner = hard_hard_authenticated_winner_for_cleanup(
+            &cleanup_udp,
+            &peers,
+            &peer_id,
+            &record.session_token,
+        )
+        .await;
         let retained_socket = if authenticated_winner.is_some() {
             authenticated_winner
         } else if hard_hard_authenticated_socket_for_cleanup(&cleanup_udp, &peers, &fresh_socket)

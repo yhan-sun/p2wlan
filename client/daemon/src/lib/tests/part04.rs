@@ -28,7 +28,10 @@ fn sample_result() -> FreshMappingResult {
 }
 
 /// Mirrors `server/api/signal_handlers.go` validation for `candidate_sources`.
-fn assert_passes_control_plane_validation(candidates: &[String], sources: &HashMap<String, String>) {
+fn assert_passes_control_plane_validation(
+    candidates: &[String],
+    sources: &HashMap<String, String>,
+) {
     assert!(
         sources.len() <= candidates.len(),
         "too many candidate sources: {} > {}",
@@ -65,10 +68,7 @@ fn fresh_mapping_signal_payload_passes_control_plane_validation() {
         "220.163.6.190:45388".to_string(),
     ];
     let mut current_sources = HashMap::new();
-    current_sources.insert(
-        "192.168.2.10:58980".to_string(),
-        "host".to_string(),
-    );
+    current_sources.insert("192.168.2.10:58980".to_string(), "host".to_string());
     current_sources.insert(
         "220.163.6.190:45388".to_string(),
         "stun_observed".to_string(),
@@ -236,12 +236,8 @@ fn signal_payload_boundary_never_emits_more_than_server_cap() {
 fn fresh_mapping_signal_payload_without_public_ip_falls_back_to_unspecified_ip() {
     let mut result = sample_result();
     result.public_ip = None;
-    let (candidates, _sources) = build_fresh_mapping_signal_payload(
-        &result,
-        1_742_987_654_321,
-        &[],
-        &HashMap::new(),
-    );
+    let (candidates, _sources) =
+        build_fresh_mapping_signal_payload(&result, 1_742_987_654_321, &[], &HashMap::new());
     let first: SocketAddr = candidates[0].parse().unwrap();
     assert_eq!(first.port(), 45393);
 }

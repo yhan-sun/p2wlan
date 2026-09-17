@@ -369,8 +369,7 @@ fn merge_pool_candidates(
 ) -> u64 {
     let mut discovered_stun_mappings = 0u64;
     for candidate in candidates {
-        let is_stun_observed =
-            candidate.source == p2pnet_nat::CandidateSource::StunObserved;
+        let is_stun_observed = candidate.source == p2pnet_nat::CandidateSource::StunObserved;
         if is_stun_observed {
             discovered_stun_mappings = discovered_stun_mappings.saturating_add(1);
         }
@@ -384,9 +383,7 @@ fn merge_pool_candidates(
             // A later pool socket can observe a port that an earlier socket
             // merely predicted. Keep the endpoint once, but promote the
             // evidence so signaling and probe ranking treat it as real.
-            if is_stun_observed
-                && existing.source == p2pnet_nat::CandidateSource::Predicted
-            {
+            if is_stun_observed && existing.source == p2pnet_nat::CandidateSource::Predicted {
                 existing.source = p2pnet_nat::CandidateSource::StunObserved;
                 existing.candidate_type = candidate.candidate_type;
                 existing.priority = existing.priority.max(candidate.priority);

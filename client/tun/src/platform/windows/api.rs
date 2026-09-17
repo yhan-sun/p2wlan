@@ -26,8 +26,7 @@ type WintunCreateAdapterFunc = unsafe extern "C" fn(
     requested_guid: *const Guid,
 ) -> *mut std::ffi::c_void;
 
-type WintunOpenAdapterFunc =
-    unsafe extern "C" fn(name: *const u16) -> *mut std::ffi::c_void;
+type WintunOpenAdapterFunc = unsafe extern "C" fn(name: *const u16) -> *mut std::ffi::c_void;
 
 type WintunCloseAdapterFunc = unsafe extern "C" fn(adapter: *mut std::ffi::c_void);
 

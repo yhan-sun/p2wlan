@@ -13,21 +13,15 @@ impl PeerManager {
     ) -> bool {
         let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if validation.epoch.network_generation != self.current_network_generation_sync()
-            || !self.peer_session_is_current_sync(
-                node_id,
-                validation.epoch.peer_session_generation,
-            )
+            || !self.peer_session_is_current_sync(node_id, validation.epoch.peer_session_generation)
         {
             return false;
         }
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
-        conn.commit_path_transition(
-            PathEvent::DirectValidationStarted { validation },
-            |_| {},
-        )
-        .accepted()
+        conn.commit_path_transition(PathEvent::DirectValidationStarted { validation }, |_| {})
+            .accepted()
     }
 
     pub(crate) async fn finish_direct_validation_attempt(

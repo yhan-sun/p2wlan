@@ -168,9 +168,7 @@ impl From<&PathHealth> for PathHealthDiagnostics {
 /// Map a liveness verdict to its wire string form.  `LivenessVerdict` is a
 /// plain enum in the nat crate without `Serialize`, so the CLI-facing JSON
 /// carries the short "ok" / "blocked" / "unknown" label instead.
-fn liveness_verdict_string(
-    verdict: p2pnet_nat::outbound_liveness::LivenessVerdict,
-) -> String {
+fn liveness_verdict_string(verdict: p2pnet_nat::outbound_liveness::LivenessVerdict) -> String {
     match verdict {
         p2pnet_nat::outbound_liveness::LivenessVerdict::Ok => "ok".to_string(),
         p2pnet_nat::outbound_liveness::LivenessVerdict::Blocked => "blocked".to_string(),

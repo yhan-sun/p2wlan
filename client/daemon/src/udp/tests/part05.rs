@@ -64,7 +64,9 @@ async fn commit_fresh_evidence_then_cancellation_keeps_the_working_socket() {
         }
     })
     .await
-    .expect("the watcher must promote the evidenced socket to Finalized instead of rolling it back");
+    .expect(
+        "the watcher must promote the evidenced socket to Finalized instead of rolling it back",
+    );
     let state = transport.socket_state.lock().await;
     assert!(
         state.dynamic.contains_key(&result.socket_index),
@@ -87,9 +89,7 @@ async fn stale_udp_peerleft_cleanup_cancels_replacement_validation_owner() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
     ));
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.2", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
     let stale = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap();
@@ -104,9 +104,11 @@ async fn stale_udp_peerleft_cleanup_cancels_replacement_validation_owner() {
         DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
         _ => panic!("the active replacement transport must own the validation lease"),
     };
-    assert!(replacement
-        .expect_direct_validation_ack_owned("peer-b", 41, 0, owner, endpoint)
-        .await);
+    assert!(
+        replacement
+            .expect_direct_validation_ack_owned("peer-b", 41, 0, owner, endpoint)
+            .await
+    );
 
     stale
         .cleanup_peer_lifecycle("peer-b", "peer_left", true)
@@ -121,7 +123,9 @@ async fn stale_udp_peerleft_cleanup_cancels_replacement_validation_owner() {
         "PeerLeft via a stale UDP clone must revoke the replacement owner's session"
     );
     assert!(
-        !replacement.has_direct_validation_expectation("peer-b").await,
+        !replacement
+            .has_direct_validation_expectation("peer-b")
+            .await,
         "PeerLeft via a stale UDP clone must clear the replacement expectation"
     );
 }
@@ -129,9 +133,7 @@ async fn stale_udp_peerleft_cleanup_cancels_replacement_validation_owner() {
 #[tokio::test]
 async fn dplpmtud_ack_reverse_route_is_session_socket_and_lifecycle_bound() {
     let peers = peer_manager();
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.2", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap();
@@ -196,9 +198,7 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
     ));
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.2", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
         .await
         .unwrap();
@@ -210,8 +210,8 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
         DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
         _ => panic!("the first validation observation must own the session"),
     };
-    assert!(udp
-        .expect_direct_validation_ack_owned_on_socket(
+    assert!(
+        udp.expect_direct_validation_ack_owned_on_socket(
             "peer-b",
             0x4101,
             0,
@@ -219,7 +219,8 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
             endpoint,
             Some(0),
         )
-        .await);
+        .await
+    );
 
     let endpoint_rejection = udp
         .consume_direct_validation_ack(
@@ -240,30 +241,12 @@ async fn validation_ack_requires_exact_endpoint_and_socket() {
     );
     assert!(udp.has_direct_validation_expectation("peer-b").await);
     assert!(udp
-        .consume_direct_validation_ack(
-            "peer-b",
-            0x4101,
-            0,
-            owner,
-            0,
-            endpoint,
-            Some(1),
-            false,
-        )
+        .consume_direct_validation_ack("peer-b", 0x4101, 0, owner, 0, endpoint, Some(1), false,)
         .await
         .is_err());
     assert!(udp.has_direct_validation_expectation("peer-b").await);
     assert!(udp
-        .consume_direct_validation_ack(
-            "peer-b",
-            0x4101,
-            0,
-            owner,
-            0,
-            endpoint,
-            Some(0),
-            false,
-        )
+        .consume_direct_validation_ack("peer-b", 0x4101, 0, owner, 0, endpoint, Some(0), false,)
         .await
         .is_ok());
 }
@@ -325,12 +308,8 @@ async fn direct_validation_target_keeps_lan_over_public_churn() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
     ));
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.2", None))
-        .await;
-    peers
-        .add_peer(&peer("peer-c", "10.20.0.3", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
+    peers.add_peer(&peer("peer-c", "10.20.0.3", None)).await;
     peers
         .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
             "192.168.2.14".parse().unwrap(),
@@ -351,9 +330,10 @@ async fn direct_validation_target_keeps_lan_over_public_churn() {
         DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
         _ => panic!("the first LAN observation must own the validation session"),
     };
-    assert!(udp
-        .expect_direct_validation_ack_owned("peer-b", 0x5101, 0, lan_owner, lan_endpoint)
-        .await);
+    assert!(
+        udp.expect_direct_validation_ack_owned("peer-b", 0x5101, 0, lan_owner, lan_endpoint)
+            .await
+    );
     assert!(matches!(
         udp.begin_or_merge_direct_validation("peer-b", public_endpoint, 0)
             .await,
@@ -371,7 +351,8 @@ async fn direct_validation_target_keeps_lan_over_public_churn() {
         udp.has_direct_validation_expectation("peer-b").await,
         "same-class/public churn must not cancel an in-flight LAN expectation"
     );
-    udp.finish_direct_validation_session("peer-b", lan_owner).await;
+    udp.finish_direct_validation_session("peer-b", lan_owner)
+        .await;
 
     let public_owner = match udp
         .begin_or_merge_direct_validation("peer-c", public_endpoint, 0)
@@ -380,15 +361,10 @@ async fn direct_validation_target_keeps_lan_over_public_churn() {
         DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
         _ => panic!("the first public observation must own the validation session"),
     };
-    assert!(udp
-        .expect_direct_validation_ack_owned(
-            "peer-c",
-            0x5102,
-            0,
-            public_owner,
-            public_endpoint,
-        )
-        .await);
+    assert!(
+        udp.expect_direct_validation_ack_owned("peer-c", 0x5102, 0, public_owner, public_endpoint,)
+            .await
+    );
     assert!(matches!(
         udp.begin_or_merge_direct_validation("peer-c", lan_endpoint, 0)
             .await,
@@ -406,7 +382,8 @@ async fn direct_validation_target_keeps_lan_over_public_churn() {
         !udp.has_direct_validation_expectation("peer-c").await,
         "a public in-flight expectation must be revoked when LAN takes over"
     );
-    udp.finish_direct_validation_session("peer-c", public_owner).await;
+    udp.finish_direct_validation_session("peer-c", public_owner)
+        .await;
 }
 
 #[tokio::test]
@@ -414,9 +391,7 @@ async fn direct_validation_target_prefers_public_over_off_link_private() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
     ));
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.2", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
     peers
         .set_local_interface_networks(vec![p2pnet_nat::LocalNetwork::new(
             "192.168.1.10".parse().unwrap(),
@@ -472,9 +447,7 @@ async fn remote_candidate_refresh_cancels_direct_validation_owner() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
     ));
-    peers
-        .add_peer(&peer("peer-b", "10.20.0.2", None))
-        .await;
+    peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap();
@@ -501,15 +474,10 @@ async fn remote_candidate_refresh_cancels_direct_validation_owner() {
         DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
         _ => panic!("expected a validation owner"),
     };
-    assert!(udp
-        .expect_direct_validation_ack_owned(
-            "peer-b",
-            0x5101,
-            generation,
-            owner,
-            old_endpoint,
-        )
-        .await);
+    assert!(
+        udp.expect_direct_validation_ack_owned("peer-b", 0x5101, generation, owner, old_endpoint,)
+            .await
+    );
 
     assert!(matches!(
         peers
@@ -563,14 +531,11 @@ async fn stale_udp_offline_and_key_change_cleanup_cancel_replacement_validation_
     // Offline and public-key-change events use the same lifecycle cleanup
     // with `remove_connection = false`. Exercise both after a rebind so the
     // cleanup cannot accidentally operate only on the stale UDP clone.
-    for (reason, new_public_key) in [("peer_offline", None), ("public_key_changed", Some("pk2"))]
-    {
+    for (reason, new_public_key) in [("peer_offline", None), ("public_key_changed", Some("pk2"))] {
         let peers = Arc::new(PeerManager::new(
             Config::generate_default("https://ctrl.test", "net1").unwrap(),
         ));
-        peers
-            .add_peer(&peer("peer-b", "10.20.0.2", None))
-            .await;
+        peers.add_peer(&peer("peer-b", "10.20.0.2", None)).await;
         let stale = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
             .await
             .unwrap();
@@ -585,9 +550,11 @@ async fn stale_udp_offline_and_key_change_cleanup_cancel_replacement_validation_
             DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
             _ => panic!("the active replacement transport must own the validation lease"),
         };
-        assert!(replacement
-            .expect_direct_validation_ack_owned("peer-b", 42, 0, owner, endpoint)
-            .await);
+        assert!(
+            replacement
+                .expect_direct_validation_ack_owned("peer-b", 42, 0, owner, endpoint)
+                .await
+        );
 
         if let Some(public_key) = new_public_key {
             let mut updated = peer("peer-b", "10.20.0.2", None);
@@ -599,9 +566,7 @@ async fn stale_udp_offline_and_key_change_cleanup_cancel_replacement_validation_
             peers.add_peer(&updated).await;
         }
 
-        stale
-            .cleanup_peer_lifecycle("peer-b", reason, false)
-            .await;
+        stale.cleanup_peer_lifecycle("peer-b", reason, false).await;
 
         assert!(
             replacement
@@ -611,7 +576,9 @@ async fn stale_udp_offline_and_key_change_cleanup_cancel_replacement_validation_
             "{reason} via a stale UDP clone must revoke the replacement owner's session"
         );
         assert!(
-            !replacement.has_direct_validation_expectation("peer-b").await,
+            !replacement
+                .has_direct_validation_expectation("peer-b")
+                .await,
             "{reason} via a stale UDP clone must clear the replacement expectation"
         );
     }
@@ -908,5 +875,9 @@ fn triggered_check_is_peer_limited_across_endpoint_churn() {
         Some(newest),
         "the next admitted check must use the newest observed endpoint"
     );
-    assert_eq!(checks.len(), 1, "endpoint churn must not allocate peer state");
+    assert_eq!(
+        checks.len(),
+        1,
+        "endpoint churn must not allocate peer state"
+    );
 }

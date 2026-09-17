@@ -1,7 +1,5 @@
-
 async fn fetch_status_at(url: &str, instance_state_dir: &Path) -> Result<Value, String> {
-    let (status, body) =
-        diagnostics_request(url, instance_state_dir, reqwest::Method::GET).await?;
+    let (status, body) = diagnostics_request(url, instance_state_dir, reqwest::Method::GET).await?;
     if !status.is_success() {
         return Err(format!("本地诊断端点返回 HTTP {}", status));
     }

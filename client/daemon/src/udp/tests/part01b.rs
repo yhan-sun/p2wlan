@@ -219,8 +219,7 @@ async fn active_pool_sweep_is_bounded_by_session_cap_across_alternate_sockets() 
     for probe in pending.values() {
         per_socket[probe.socket_index] += 1;
     }
-    let expected_per_socket =
-        MAX_PUNCH_PROBES_PER_SESSION as usize / transport.socket_count();
+    let expected_per_socket = MAX_PUNCH_PROBES_PER_SESSION as usize / transport.socket_count();
     assert_eq!(
         per_socket,
         vec![expected_per_socket; transport.socket_count()]
@@ -269,7 +268,12 @@ async fn remote_scatter_pool_uses_all_bound_sockets_even_when_local_pool_inactiv
         .collect::<Vec<SocketAddr>>();
 
     let sent = transport
-        .punch_candidates_remote_scatter_pool_until_not_direct("peer-b", candidates, Duration::ZERO, 1)
+        .punch_candidates_remote_scatter_pool_until_not_direct(
+            "peer-b",
+            candidates,
+            Duration::ZERO,
+            1,
+        )
         .await
         .unwrap();
 
@@ -335,7 +339,12 @@ async fn remote_scatter_pool_exceeds_primary_session_cap_under_sliding_budget() 
         .collect::<Vec<SocketAddr>>();
 
     let sent = transport
-        .punch_candidates_remote_scatter_pool_until_not_direct("peer-b", candidates, Duration::from_secs(1), 5)
+        .punch_candidates_remote_scatter_pool_until_not_direct(
+            "peer-b",
+            candidates,
+            Duration::from_secs(1),
+            5,
+        )
         .await
         .unwrap();
 
@@ -423,7 +432,12 @@ async fn stable_unique_scatter_spends_budget_on_distinct_remote_ports() {
         .map(|offset| format!("127.0.0.1:{}", 23_000 + offset).parse().unwrap())
         .collect::<Vec<SocketAddr>>();
     let report = transport
-        .punch_candidates_stable_unique_scatter_until_not_direct("peer-b", candidates.clone(), Duration::ZERO, 1)
+        .punch_candidates_stable_unique_scatter_until_not_direct(
+            "peer-b",
+            candidates.clone(),
+            Duration::ZERO,
+            1,
+        )
         .await
         .unwrap();
 
@@ -835,10 +849,7 @@ async fn live_candidate_refresh_advertises_each_qualified_pool_mapping() {
                     .or_insert(next_port)
                     .saturating_add(1)
             };
-            let mapped = SocketAddr::new(
-                "203.0.113.7".parse().unwrap(),
-                mapped_port,
-            );
+            let mapped = SocketAddr::new("203.0.113.7".parse().unwrap(), mapped_port);
             let mut response =
                 StunMessage::with_transaction_id(BINDING_RESPONSE, request.transaction_id);
             response.add_attribute(StunAttribute::XorMappedAddress(mapped));
@@ -1093,12 +1104,7 @@ async fn direct_promotion_preempts_zero_delay_probe_burst() {
         let transport = transport.clone();
         tokio::spawn(async move {
             transport
-                .punch_candidates_until_not_direct(
-                    "peer-b",
-                    candidates,
-                    Duration::ZERO,
-                    1,
-                )
+                .punch_candidates_until_not_direct("peer-b", candidates, Duration::ZERO, 1)
                 .await
                 .unwrap()
         })

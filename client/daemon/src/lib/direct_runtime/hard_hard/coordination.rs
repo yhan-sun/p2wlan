@@ -291,10 +291,7 @@ fn hard_hard_model_label(kind: &p2pnet_nat::mapping::PortModelKind) -> &'static 
     }
 }
 
-fn hard_hard_prediction_limit(
-    kind: &p2pnet_nat::mapping::PortModelKind,
-    confidence: u8,
-) -> usize {
+fn hard_hard_prediction_limit(kind: &p2pnet_nat::mapping::PortModelKind, confidence: u8) -> usize {
     if matches!(
         kind,
         p2pnet_nat::mapping::PortModelKind::FixedStep { .. }

@@ -47,7 +47,9 @@ impl DirectValidationIngress {
     #[cfg(test)]
     fn new() -> Self {
         Self {
-            state: Arc::new(std::sync::Mutex::new(DirectValidationIngressState::default())),
+            state: Arc::new(std::sync::Mutex::new(
+                DirectValidationIngressState::default(),
+            )),
             notify: Arc::new(tokio::sync::Notify::new()),
             peers: None,
         }
@@ -55,7 +57,9 @@ impl DirectValidationIngress {
 
     fn with_peer_manager(peers: Arc<PeerManager>) -> Self {
         Self {
-            state: Arc::new(std::sync::Mutex::new(DirectValidationIngressState::default())),
+            state: Arc::new(std::sync::Mutex::new(
+                DirectValidationIngressState::default(),
+            )),
             notify: Arc::new(tokio::sync::Notify::new()),
             peers: Some(peers),
         }
@@ -64,9 +68,7 @@ impl DirectValidationIngress {
     fn target_priority(&self, peer_id: &str, endpoint: SocketAddr) -> u8 {
         self.peers
             .as_ref()
-            .and_then(|peers| {
-                peers.direct_validation_target_priority_sync(peer_id, endpoint)
-            })
+            .and_then(|peers| peers.direct_validation_target_priority_sync(peer_id, endpoint))
             .unwrap_or_else(|| {
                 // Focused ingress tests without a peer manager use the same
                 // public-vs-private fallback. In production, the manager
@@ -575,12 +577,11 @@ async fn run_direct_encrypted_validation_session(
             "direct_validation_cancelled",
             Some(lease_endpoint),
             Some(0),
-            format!(
-                "cancelled before start: local virtual IP '{local_virtual_ip}' is not IPv4"
-            ),
+            format!("cancelled before start: local virtual IP '{local_virtual_ip}' is not IPv4"),
         )
         .await;
-        udp.finish_direct_validation_session(&peer_id, owner_token).await;
+        udp.finish_direct_validation_session(&peer_id, owner_token)
+            .await;
         return;
     };
     let Some(connection) = peers.get_connection(&peer_id).await else {
@@ -595,7 +596,8 @@ async fn run_direct_encrypted_validation_session(
             "cancelled before start: peer connection disappeared",
         )
         .await;
-        udp.finish_direct_validation_session(&peer_id, owner_token).await;
+        udp.finish_direct_validation_session(&peer_id, owner_token)
+            .await;
         return;
     };
     let Ok(peer_ip) = connection.virtual_ip.parse::<Ipv4Addr>() else {
@@ -617,7 +619,8 @@ async fn run_direct_encrypted_validation_session(
             ),
         )
         .await;
-        udp.finish_direct_validation_session(&peer_id, owner_token).await;
+        udp.finish_direct_validation_session(&peer_id, owner_token)
+            .await;
         return;
     };
 
@@ -652,7 +655,8 @@ async fn run_direct_encrypted_validation_session(
             },
         )
         .await;
-        udp.finish_direct_validation_session(&peer_id, owner_token).await;
+        udp.finish_direct_validation_session(&peer_id, owner_token)
+            .await;
         return;
     };
     let initial_session_status = transport.session_status(&peer_id).await;
@@ -759,7 +763,8 @@ async fn run_direct_encrypted_validation_session(
                 },
             )
             .await;
-            udp.finish_direct_validation_session(&peer_id, owner_token).await;
+            udp.finish_direct_validation_session(&peer_id, owner_token)
+                .await;
             return;
         };
         if target.generation != generation {
@@ -777,7 +782,8 @@ async fn run_direct_encrypted_validation_session(
                 ),
             )
             .await;
-            udp.finish_direct_validation_session(&peer_id, owner_token).await;
+            udp.finish_direct_validation_session(&peer_id, owner_token)
+                .await;
             return;
         }
         let status = transport.session_status(&peer_id).await;
@@ -861,14 +867,14 @@ async fn run_direct_encrypted_validation_session(
                     ),
                 )
                 .await;
-            udp.finish_direct_validation_session(&peer_id, owner_token).await;
+            udp.finish_direct_validation_session(&peer_id, owner_token)
+                .await;
             return;
         }
         let _ = wait_for_validation_update(
             &mut target_rx,
-            DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL.min(
-                DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.saturating_sub(elapsed),
-            ),
+            DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL
+                .min(DIRECT_ENCRYPTED_VALIDATION_SESSION_WAIT.saturating_sub(elapsed)),
         )
         .await;
     }
@@ -1118,8 +1124,7 @@ async fn run_direct_encrypted_validation_session(
                 let ack_wait_started = Instant::now();
                 while ack_wait_started.elapsed() < DIRECT_VALIDATION_ACK_WAIT {
                     let Some(current) =
-                        current_validation_target(&peers, &peer_id, &target_rx, owner_token)
-                        .await
+                        current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
                     else {
                         if peers.is_direct_for_generation(&peer_id, generation).await {
                             terminal_stage = "direct_validation_completed";
@@ -1181,8 +1186,8 @@ async fn run_direct_encrypted_validation_session(
                     // for the next bounded attempt. This request was already
                     // sent to `endpoint`, so its ACK remains valid evidence
                     // within the same owner/generation/request lease.
-                    let remaining = DIRECT_VALIDATION_ACK_WAIT
-                        .saturating_sub(ack_wait_started.elapsed());
+                    let remaining =
+                        DIRECT_VALIDATION_ACK_WAIT.saturating_sub(ack_wait_started.elapsed());
                     let _ = wait_for_validation_update(
                         &mut target_rx,
                         DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL.min(remaining),
@@ -1377,5 +1382,6 @@ async fn run_direct_encrypted_validation_session(
         terminal_reason,
     )
     .await;
-    udp.finish_direct_validation_session(&peer_id, owner_token).await;
+    udp.finish_direct_validation_session(&peer_id, owner_token)
+        .await;
 }

@@ -73,19 +73,13 @@ impl HardHardCleanupCompletion {
     #[cfg(test)]
     async fn wait(&self) {
         loop {
-            if self
-                .completed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self
-                .completed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
             notified.await;
@@ -193,9 +187,7 @@ fn spawn_hard_hard_session_cleanup_with_owner(
         let expiry_woke = if descriptor.cancellation.is_cancelled() {
             false
         } else {
-            let delay = descriptor
-                .expires_at_ms
-                .saturating_sub(hard_hard_now_ms());
+            let delay = descriptor.expires_at_ms.saturating_sub(hard_hard_now_ms());
             tokio::select! {
                 biased;
                 _ = descriptor.cancellation.cancelled() => false,

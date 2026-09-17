@@ -97,8 +97,7 @@ async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
         let peers = trigger_peers_b.clone();
         let wg = trigger_wg_b.clone();
         tokio::spawn(async move {
-            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
-                .await;
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2").await;
         });
     }));
     let udp_b_addr = udp_b.local_addr().unwrap();
@@ -271,8 +270,7 @@ async fn matched_ack_fires_validation_trigger_and_both_sides_converge() {
         let peers = trigger_peers.clone();
         let wg = trigger_wg.clone();
         tokio::spawn(async move {
-            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.1")
-                .await;
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.1").await;
         });
     }));
     let udp_a_worker = tokio::spawn(udp_a.clone().run_inbound(udp_inbound_tx_a));
@@ -305,8 +303,7 @@ async fn matched_ack_fires_validation_trigger_and_both_sides_converge() {
         let peers = trigger_peers_b.clone();
         let wg = trigger_wg_b.clone();
         tokio::spawn(async move {
-            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
-                .await;
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2").await;
         });
     }));
     let udp_b_addr = udp_b.local_addr().unwrap();
@@ -326,12 +323,7 @@ async fn matched_ack_fires_validation_trigger_and_both_sides_converge() {
     // Drive real authenticated punch traffic both ways: each side ACKs the
     // other's punches, and every matched ACK must fire the daemon trigger.
     udp_a
-        .punch_candidates(
-            "node-b",
-            vec![udp_b_addr],
-            Duration::from_millis(50),
-            3,
-        )
+        .punch_candidates("node-b", vec![udp_b_addr], Duration::from_millis(50), 3)
         .await
         .expect("A must send its punches");
     udp_b
@@ -361,8 +353,12 @@ async fn matched_ack_fires_validation_trigger_and_both_sides_converge() {
         trigger_fired.load(std::sync::atomic::Ordering::SeqCst),
         peers_a.is_direct("node-b").await,
         peers_b.is_direct("node-a").await,
-        peers_a.direct_probe_success_count_for_generation("node-b", 0).await,
-        peers_b.direct_probe_success_count_for_generation("node-a", 0).await,
+        peers_a
+            .direct_probe_success_count_for_generation("node-b", 0)
+            .await,
+        peers_b
+            .direct_probe_success_count_for_generation("node-a", 0)
+            .await,
     );
     assert!(
         converged,
@@ -473,8 +469,7 @@ async fn responder_promotes_on_request_with_different_local_generation() {
         let peers = trigger_peers_b.clone();
         let wg = trigger_wg_b.clone();
         tokio::spawn(async move {
-            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
-                .await;
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2").await;
         });
     }));
     let udp_b_addr = udp_b.local_addr().unwrap();
@@ -493,7 +488,9 @@ async fn responder_promotes_on_request_with_different_local_generation() {
 
     // The responder's local generation is bumped AFTER the initiator is
     // already probing: the initiator's request token keeps generation 0.
-    let b_generation = peers_b.advance_network_generation("test candidate refresh").await;
+    let b_generation = peers_b
+        .advance_network_generation("test candidate refresh")
+        .await;
     assert!(b_generation > 0);
 
     run_direct_encrypted_validation(
@@ -949,8 +946,7 @@ async fn post_direct_inbound_punch_and_matched_ack_create_no_new_traversal_work(
         let peers = trigger_peers.clone();
         let wg = trigger_wg.clone();
         tokio::spawn(async move {
-            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.1")
-                .await;
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.1").await;
         });
     }));
     let udp_a_worker = tokio::spawn(udp_a.clone().run_inbound(udp_inbound_tx_a));
@@ -988,8 +984,7 @@ async fn post_direct_inbound_punch_and_matched_ack_create_no_new_traversal_work(
         let peers = trigger_b_peers.clone();
         let wg = trigger_b_wg.clone();
         tokio::spawn(async move {
-            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2")
-                .await;
+            run_direct_encrypted_validation(observation, udp, peers, wg, "10.20.0.2").await;
         });
     }));
     let udp_b_addr = udp_b.local_addr().unwrap();
@@ -1425,7 +1420,10 @@ async fn initiator_handshake_bounded_retransmission_fires_and_stops_on_answer() 
         .run_reserved_initiator_handshake(&peer_info, &mut reservation)
         .await
         .expect("initial handshake send should proceed");
-    assert!(punch_at.is_some(), "designated initiator must send initial offer");
+    assert!(
+        punch_at.is_some(),
+        "designated initiator must send initial offer"
+    );
 
     // Retransmission task is spawned with first interval 250ms.
     // Wait for the retransmission event to be emitted on the timeline.
@@ -1644,7 +1642,10 @@ async fn maintenance_rebuild_handshake_bounded_retransmission_fires_and_stops_on
         .iter()
         .filter(|e| e.event == "initiator_offer_retransmitted")
         .count();
-    assert_eq!(count_after_answer, count_later, "retransmission must stop once rebuild session is established");
+    assert_eq!(
+        count_after_answer, count_later,
+        "retransmission must stop once rebuild session is established"
+    );
 
     maintenance_task.abort();
 }
@@ -1685,23 +1686,35 @@ async fn maintenance_rekey_handshake_bounded_retransmission_survives_existing_se
     daemon.control.set_peer_for_test(peer_info.clone()).await;
 
     // Install an initial active session configured to require rekey immediately
-    let mut init_initiator =
-        HandshakeInitiator::new(daemon.local_identity().unwrap(), peer_identity.public_key(), None);
+    let mut init_initiator = HandshakeInitiator::new(
+        daemon.local_identity().unwrap(),
+        peer_identity.public_key(),
+        None,
+    );
     let init_initiation = init_initiator.create_initiation().unwrap();
     let mut init_responder = HandshakeResponder::new(peer_identity.clone(), None);
     let (init_response, _) = init_responder
         .consume_initiation_and_respond(&init_initiation)
         .unwrap();
     let old_keys = init_initiator.consume_response(&init_response).unwrap();
-    let old_session = TransportSession::new(old_keys)
-        .with_thresholds(0, Duration::ZERO, 1000, Duration::from_secs(60));
+    let old_session = TransportSession::new(old_keys).with_thresholds(
+        0,
+        Duration::ZERO,
+        1000,
+        Duration::from_secs(60),
+    );
     daemon
         .transport
         .add_session(&peer_info.node_id, old_session)
         .await;
 
     assert!(daemon.transport.has_session(&peer_info.node_id).await);
-    assert!(daemon.transport.session_needs_rekey(&peer_info.node_id).await);
+    assert!(
+        daemon
+            .transport
+            .session_needs_rekey(&peer_info.node_id)
+            .await
+    );
 
     let timeline = daemon.timeline.clone();
 
@@ -1737,11 +1750,10 @@ async fn maintenance_rekey_handshake_bounded_retransmission_survives_existing_se
     timeout(Duration::from_secs(2), async {
         loop {
             let snap = timeline.snapshot();
-            if snap
-                .events
-                .iter()
-                .any(|e| e.event == "initiator_offer_retransmitted" && e.detail.as_deref().unwrap_or("").contains("is_rekey=true"))
-            {
+            if snap.events.iter().any(|e| {
+                e.event == "initiator_offer_retransmitted"
+                    && e.detail.as_deref().unwrap_or("").contains("is_rekey=true")
+            }) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1799,15 +1811,10 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
     // target, then publish a fresher observation while that request is in
     // flight.  The ACK for the request already sent to `first_endpoint` must
     // remain consumable.
-    assert!(udp
-        .expect_direct_validation_ack_owned(
-            "node-b",
-            0x4201,
-            0,
-            owner_token,
-            first_endpoint,
-        )
-        .await);
+    assert!(
+        udp.expect_direct_validation_ack_owned("node-b", 0x4201, 0, owner_token, first_endpoint,)
+            .await
+    );
     assert!(matches!(
         udp.begin_or_merge_direct_validation("node-b", newest_endpoint, 0)
             .await,
@@ -1841,9 +1848,10 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
         .await
         .is_ok());
 
-    assert!(udp
-        .finish_direct_validation_session("node-b", owner_token)
-        .await);
+    assert!(
+        udp.finish_direct_validation_session("node-b", owner_token)
+            .await
+    );
     assert!(udp.direct_validation_target("node-b").await.is_none());
 
     let concurrent_spawns = (0..32u16)
@@ -1915,9 +1923,10 @@ async fn finishing_direct_validation_session_cancels_worker_receiver() {
     let target_rx = lease.target_rx;
     assert!(!target_rx.borrow().cancelled);
 
-    assert!(udp
-        .finish_direct_validation_session("node-b", lease.owner_token)
-        .await);
+    assert!(
+        udp.finish_direct_validation_session("node-b", lease.owner_token)
+            .await
+    );
     assert!(
         target_rx.borrow().cancelled,
         "finishing the owner must wake the worker's watch receiver with terminal cancellation"
@@ -1974,9 +1983,10 @@ async fn slow_relay_validation_cooldown_blocks_replacement_until_generation_chan
             .await,
         "a slow ACK behind a confirmed relay must suppress replacement owners"
     );
-    assert!(udp
-        .finish_direct_validation_session("node-b", owner_token)
-        .await);
+    assert!(
+        udp.finish_direct_validation_session("node-b", owner_token)
+            .await
+    );
     assert!(matches!(
         udp.begin_or_merge_direct_validation("node-b", endpoint, 0)
             .await,
@@ -1989,7 +1999,9 @@ async fn slow_relay_validation_cooldown_blocks_replacement_until_generation_chan
             .await,
         1
     );
-    let next = udp.begin_or_merge_direct_validation("node-b", endpoint, 1).await;
+    let next = udp
+        .begin_or_merge_direct_validation("node-b", endpoint, 1)
+        .await;
     assert!(
         matches!(next, crate::udp::DirectValidationSessionStart::Spawn(_)),
         "a new network generation must be able to restart relay-first Direct validation"
@@ -2034,9 +2046,10 @@ async fn direct_validation_owner_cleanup_cannot_remove_newer_expectation() {
             panic!("unexpected inactive first lease")
         }
     };
-    assert!(udp
-        .expect_direct_validation_ack_owned("node-b", 11, 0, first_owner, first_endpoint)
-        .await);
+    assert!(
+        udp.expect_direct_validation_ack_owned("node-b", 11, 0, first_owner, first_endpoint)
+            .await
+    );
 
     assert_eq!(
         peers
@@ -2061,9 +2074,10 @@ async fn direct_validation_owner_cleanup_cannot_remove_newer_expectation() {
         }
     };
     assert_ne!(first_owner, newest_owner);
-    assert!(udp
-        .expect_direct_validation_ack_owned("node-b", 12, 1, newest_owner, newest_endpoint)
-        .await);
+    assert!(
+        udp.expect_direct_validation_ack_owned("node-b", 12, 1, newest_owner, newest_endpoint)
+            .await
+    );
 
     assert!(
         !udp.clear_direct_validation_expectation_if_owned("node-b", first_owner)
@@ -2071,9 +2085,10 @@ async fn direct_validation_owner_cleanup_cannot_remove_newer_expectation() {
         "old worker cleanup must not remove the newer owner's expectation"
     );
     assert!(udp.has_direct_validation_expectation("node-b").await);
-    assert!(udp
-        .clear_direct_validation_expectation_if_owned("node-b", newest_owner)
-        .await);
+    assert!(
+        udp.clear_direct_validation_expectation_if_owned("node-b", newest_owner)
+            .await
+    );
     assert!(!udp.has_direct_validation_expectation("node-b").await);
 }
 
@@ -2113,11 +2128,17 @@ async fn network_generation_advance_cancels_old_validation_registry_owner() {
             panic!("unexpected inactive first lease")
         }
     };
-    assert!(udp
-        .expect_direct_validation_ack_owned("node-b", 23, 0, owner_token, endpoint)
-        .await);
+    assert!(
+        udp.expect_direct_validation_ack_owned("node-b", 23, 0, owner_token, endpoint)
+            .await
+    );
 
-    assert_eq!(peers.advance_network_generation("test validation registry").await, 1);
+    assert_eq!(
+        peers
+            .advance_network_generation("test validation registry")
+            .await,
+        1
+    );
     assert!(
         udp.direct_validation_target("node-b").await.is_none(),
         "advance must remove every old-generation worker owner"
@@ -2265,7 +2286,10 @@ async fn direct_validation_ingress_skips_replaced_peer_and_preserves_fifo() {
     // the scheduler has already taken node-b for lease handoff.  Exercise
     // that exact shape directly through the test-only helper.
     assert_eq!(
-        ingress.take_latest_for_peer("node-b").unwrap().observed_endpoint,
+        ingress
+            .take_latest_for_peer("node-b")
+            .unwrap()
+            .observed_endpoint,
         "127.0.0.1:44101".parse::<SocketAddr>().unwrap()
     );
 
@@ -2419,12 +2443,10 @@ async fn direct_validation_worker_cap_survives_udp_transport_replacement() {
     let old_udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), old_peers.clone())
         .await
         .unwrap();
-    let replacement_udp = UdpTransport::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        replacement_peers.clone(),
-    )
-    .await
-    .unwrap();
+    let replacement_udp =
+        UdpTransport::bind("127.0.0.1:0".parse().unwrap(), replacement_peers.clone())
+            .await
+            .unwrap();
     let (old_wireguard, _old_encrypted_rx) = WireGuardTransport::new();
     let (replacement_wireguard, _replacement_encrypted_rx) = WireGuardTransport::new();
     let permits = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2532,9 +2554,13 @@ async fn direct_validation_worker_cap_survives_udp_transport_replacement() {
         }
     })
     .await
-    .expect("the replacement worker must start after retired scheduler teardown releases its permit");
+    .expect(
+        "the replacement worker must start after retired scheduler teardown releases its permit",
+    );
 
-    replacement_udp.cancel_all_direct_validation_sessions().await;
+    replacement_udp
+        .cancel_all_direct_validation_sessions()
+        .await;
     replacement_scheduler.abort();
     let _ = replacement_scheduler.await;
 }
@@ -2860,7 +2886,10 @@ async fn peer_reflexive_slot_keeps_newest_endpoint_during_rate_limit_backoff() {
             .map(|observation| observation.observed_endpoint),
         Some(newest_endpoint)
     );
-    assert_eq!(slot.rate_limit_backoff, PEER_REFLEXIVE_SIGNAL_BACKOFF_INITIAL * 2);
+    assert_eq!(
+        slot.rate_limit_backoff,
+        PEER_REFLEXIVE_SIGNAL_BACKOFF_INITIAL * 2
+    );
     assert!(slot.next_signal_at.is_some_and(|next| next > now));
 }
 
@@ -2872,12 +2901,8 @@ fn peer_reflexive_rate_limit_backoff_doubles_and_caps() {
         first_retry.duration_since(now),
         PEER_REFLEXIVE_SIGNAL_BACKOFF_INITIAL
     );
-    assert_eq!(
-        first_next,
-        PEER_REFLEXIVE_SIGNAL_BACKOFF_INITIAL * 2
-    );
-    let (_, capped_next) =
-        peer_reflexive_rate_limit_window(PEER_REFLEXIVE_SIGNAL_BACKOFF_MAX, now);
+    assert_eq!(first_next, PEER_REFLEXIVE_SIGNAL_BACKOFF_INITIAL * 2);
+    let (_, capped_next) = peer_reflexive_rate_limit_window(PEER_REFLEXIVE_SIGNAL_BACKOFF_MAX, now);
     assert_eq!(capped_next, PEER_REFLEXIVE_SIGNAL_BACKOFF_MAX);
 }
 

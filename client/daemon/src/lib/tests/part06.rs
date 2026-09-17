@@ -2,11 +2,11 @@
 // v0.1.112: candidate snapshot lease + offer-ingress dedup
 // ============================================================
 
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
-use p2pnet_crypto::NodeIdentity;
 use crate::relay_runtime::relay_renewal_deadline;
+use p2pnet_crypto::NodeIdentity;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
@@ -20,9 +20,15 @@ async fn concurrent_initiators_share_one_candidate_snapshot_refresh() {
     let daemon = Arc::new(Daemon::new(
         Config::generate_default("http://ctrl.test", "net1").unwrap(),
     ));
-    let candidates = vec!["203.0.113.10:45393".to_string(), "203.0.113.10:45394".to_string()];
+    let candidates = vec![
+        "203.0.113.10:45393".to_string(),
+        "203.0.113.10:45394".to_string(),
+    ];
     let sources = HashMap::from([
-        ("203.0.113.10:45393".to_string(), "stun_observed".to_string()),
+        (
+            "203.0.113.10:45393".to_string(),
+            "stun_observed".to_string(),
+        ),
         ("203.0.113.10:45394".to_string(), "host".to_string()),
     ]);
     daemon
@@ -59,7 +65,11 @@ async fn concurrent_initiators_share_one_candidate_snapshot_refresh() {
     // fails without a UDP transport and falls back to the bounded OLD
     // snapshot via wait_for_local_candidate_set's committed set).
     daemon
-        .publish_candidate_snapshot_with_age(candidates.clone(), sources.clone(), Duration::from_secs(11))
+        .publish_candidate_snapshot_with_age(
+            candidates.clone(),
+            sources.clone(),
+            Duration::from_secs(11),
+        )
         .await;
     assert!(
         !daemon.candidate_snapshot_is_fresh().await,
@@ -82,10 +92,7 @@ async fn initial_handshake_candidate_gate_skips_provisional_host_snapshot() {
         Config::generate_default("http://ctrl.test", "net1").unwrap(),
     ));
     let provisional = vec!["192.168.1.20:40000".to_string()];
-    let provisional_sources = HashMap::from([(
-        provisional[0].clone(),
-        "host".to_string(),
-    )]);
+    let provisional_sources = HashMap::from([(provisional[0].clone(), "host".to_string())]);
     daemon
         .publish_candidate_snapshot_with_readiness(
             provisional,
@@ -140,7 +147,10 @@ async fn initial_handshake_candidate_gate_skips_provisional_host_snapshot() {
 async fn direct_rekey_uses_cached_candidates_without_live_stun_churn() {
     let daemon = Daemon::new(Config::generate_default("http://ctrl.test", "net1").unwrap());
     let candidates = vec!["203.0.113.10:45393".to_string()];
-    let sources = HashMap::from([("203.0.113.10:45393".to_string(), "stun_observed".to_string())]);
+    let sources = HashMap::from([(
+        "203.0.113.10:45393".to_string(),
+        "stun_observed".to_string(),
+    )]);
     daemon
         .publish_candidate_snapshot(candidates.clone(), sources.clone(), Vec::new())
         .await;
@@ -248,15 +258,11 @@ async fn duplicate_offer_has_no_candidate_apply_or_fresh_prediction_side_effect(
     send_offer(&control);
     timeout(Duration::from_secs(2), async {
         loop {
-            if peers
-                .get_connection("node-dupe")
-                .await
-                .is_some_and(|conn| {
-                    conn.direct_events
-                        .iter()
-                        .any(|event| event.stage == "peer_offer_ingress_suppressed")
-                })
-            {
+            if peers.get_connection("node-dupe").await.is_some_and(|conn| {
+                conn.direct_events
+                    .iter()
+                    .any(|event| event.stage == "peer_offer_ingress_suppressed")
+            }) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -301,7 +307,8 @@ async fn proactive_relay_ticket_renewal_has_no_transport_gap() {
     // not served as "valid" for a NEW selection, but the cache keeps the
     // expiry so the renewal task knows exactly when to refresh.
     let manager = PeerManager::new(Config::generate_default("http://ctrl.test", "net1").unwrap());
-    let mut transport = RelayTransport::connect_for_test("default", "tcp://relay.test:18081", Arc::new(manager));
+    let mut transport =
+        RelayTransport::connect_for_test("default", "tcp://relay.test:18081", Arc::new(manager));
     transport = transport.with_ticket_metadata("aud-1", "default", now + 300);
     let (audience, region, expires) = transport.ticket_expiry().unwrap();
     assert_eq!(expires, now + 300);

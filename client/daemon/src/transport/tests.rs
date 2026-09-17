@@ -112,7 +112,9 @@ mod tests {
             Some(source),
             None,
         ));
-        assert!(!should_request_direct_validation_after_decrypt(true, None, None));
+        assert!(!should_request_direct_validation_after_decrypt(
+            true, None, None
+        ));
         assert!(!should_request_direct_validation_after_decrypt(
             true,
             Some(source),
@@ -210,7 +212,10 @@ mod tests {
         let bytes = message.to_bytes();
         assert_eq!(wire_counter(&bytes), Some(message.counter));
         assert_eq!(wire_counter(&bytes[..15]), None);
-        assert_eq!(wire_counter(&[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(
+            wire_counter(&[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]),
+            None
+        );
     }
 
     #[test]
@@ -415,11 +420,7 @@ mod tests {
         )
     }
 
-    fn relay_probe_ack_packet(
-        generation: u64,
-        request_id: u16,
-        owner_token: u64,
-    ) -> Vec<u8> {
+    fn relay_probe_ack_packet(generation: u64, request_id: u16, owner_token: u64) -> Vec<u8> {
         Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 1),
             Ipv4Addr::new(10, 20, 0, 2),
@@ -434,11 +435,7 @@ mod tests {
         )
     }
 
-    fn path_commit_ack_packet(
-        generation: u64,
-        request_id: u16,
-        owner_token: u64,
-    ) -> Vec<u8> {
+    fn path_commit_ack_packet(generation: u64, request_id: u16, owner_token: u64) -> Vec<u8> {
         Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 1),
             Ipv4Addr::new(10, 20, 0, 2),
@@ -513,8 +510,8 @@ mod tests {
         let ingress_lock = transport.outbound_ingress_lock("peer-missing").await;
         let _ingress_guard = ingress_lock.lock().await;
         let packet = OutboundPacket {
-                room_authorization: None,
-                trace: None,
+            room_authorization: None,
+            trace: None,
             peer_id: "peer-missing".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -555,8 +552,8 @@ mod tests {
         let generation = peers.advance_network_generation("session_queue_test").await;
 
         let packet = OutboundPacket {
-                room_authorization: None,
-                trace: None,
+            room_authorization: None,
+            trace: None,
             peer_id: "peer-a".to_string(),
             dst_ip: "10.20.0.2".to_string(),
             packet: vec![1, 2, 3, 4],
@@ -617,8 +614,8 @@ mod tests {
             async move {
                 transport
                     .encrypt_or_queue_outbound(OutboundPacket {
-                room_authorization: None,
-                trace: None,
+                        room_authorization: None,
+                        trace: None,
                         peer_id: "peer-a".to_string(),
                         dst_ip: "10.20.0.1".to_string(),
                         packet,
@@ -660,8 +657,8 @@ mod tests {
         for sequence in 0..96u16 {
             assert!(transport
                 .encrypt_or_queue_outbound(OutboundPacket {
-                room_authorization: None,
-                trace: None,
+                    room_authorization: None,
+                    trace: None,
                     peer_id: "peer-a".to_string(),
                     dst_ip: "10.20.0.1".to_string(),
                     packet: Ipv4Packet::build_icmp_echo_request(
@@ -683,8 +680,8 @@ mod tests {
             async move { transport.run_outbound(dataplane_rx).await }
         });
         let live_packet = OutboundPacket {
-                room_authorization: None,
-                trace: None,
+            room_authorization: None,
+            trace: None,
             peer_id: "peer-a".to_string(),
             dst_ip: "10.20.0.1".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -764,8 +761,8 @@ mod tests {
         for sequence in 0..96u16 {
             assert!(transport
                 .encrypt_or_queue_outbound(OutboundPacket {
-                room_authorization: None,
-                trace: None,
+                    room_authorization: None,
+                    trace: None,
                     peer_id: "peer-a".to_string(),
                     dst_ip: "10.20.0.1".to_string(),
                     packet: Ipv4Packet::build_icmp_echo_request(
@@ -782,8 +779,8 @@ mod tests {
         }
 
         let filler = OutboundPacket {
-                room_authorization: None,
-                trace: None,
+            room_authorization: None,
+            trace: None,
             peer_id: "filler".to_string(),
             dst_ip: "10.20.0.254".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -831,8 +828,8 @@ mod tests {
         }
 
         let live_packet = OutboundPacket {
-                room_authorization: None,
-                trace: None,
+            room_authorization: None,
+            trace: None,
             peer_id: "peer-a".to_string(),
             dst_ip: "10.20.0.1".to_string(),
             packet: Ipv4Packet::build_icmp_echo_request(
@@ -952,7 +949,11 @@ mod tests {
 
         let mut replacement = tokio::spawn({
             let transport = transport.clone();
-            async move { transport.install_active_session("peer-a", None, new_local).await }
+            async move {
+                transport
+                    .install_active_session("peer-a", None, new_local)
+                    .await
+            }
         });
         assert!(
             timeout(Duration::from_millis(30), &mut replacement)
@@ -964,12 +965,10 @@ mod tests {
 
         drop(encrypted);
         drop(emit_guard);
-        assert!(
-            timeout(Duration::from_secs(1), &mut replacement)
-                .await
-                .expect("replacement must complete after the in-flight send releases")
-                .expect("replacement task must not panic")
-        );
+        assert!(timeout(Duration::from_secs(1), &mut replacement)
+            .await
+            .expect("replacement must complete after the in-flight send releases")
+            .expect("replacement task must not panic"));
 
         let packet = Ipv4Packet::build_icmp_echo_request(
             Ipv4Addr::new(10, 20, 0, 2),
@@ -1019,7 +1018,11 @@ mod tests {
             .expect("the active session must be eligible before replacement");
         let mut replacement = tokio::spawn({
             let transport = transport.clone();
-            async move { transport.install_active_session("peer-a", None, new_local).await }
+            async move {
+                transport
+                    .install_active_session("peer-a", None, new_local)
+                    .await
+            }
         });
         assert!(
             timeout(Duration::from_millis(30), &mut replacement)
@@ -1028,12 +1031,10 @@ mod tests {
             "session replacement must wait for the evidence commit fence"
         );
         drop(evidence_guard);
-        assert!(
-            timeout(Duration::from_secs(1), &mut replacement)
-                .await
-                .expect("replacement must complete after evidence commit")
-                .expect("replacement task must not panic")
-        );
+        assert!(timeout(Duration::from_secs(1), &mut replacement)
+            .await
+            .expect("replacement must complete after evidence commit")
+            .expect("replacement task must not panic"));
         assert!(
             !transport
                 .session_instance_is_current("peer-a", Some(session_instance))
@@ -1084,7 +1085,9 @@ mod tests {
         assert!(!inbound.from_previous_session);
         assert!(inbound.session_instance.is_some());
         assert_eq!(
-            transport.session_instance_state("peer-a", old_instance).await,
+            transport
+                .session_instance_state("peer-a", old_instance)
+                .await,
             (true, false),
             "the old overlap key remains receive-only and cannot be current evidence"
         );
@@ -1107,7 +1110,9 @@ mod tests {
 
         transport.remove_session("peer-a").await;
         assert_eq!(
-            transport.session_instance_state("peer-a", old_instance).await,
+            transport
+                .session_instance_state("peer-a", old_instance)
+                .await,
             (false, false),
             "removing a peer must retire every old session instance"
         );
@@ -1165,7 +1170,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let new_generation = peers.advance_network_generation("queued_packet_handover").await;
+        let new_generation = peers
+            .advance_network_generation("queued_packet_handover")
+            .await;
         assert_eq!(new_generation, old_generation + 1);
 
         let worker = tokio::spawn({
@@ -1385,7 +1392,9 @@ mod tests {
                 .await,
             ResponderSessionCommit::PendingConfirmation
         );
-        transport.expire_pending_responder_for_test("peer-a", "expired-token").await;
+        transport
+            .expire_pending_responder_for_test("peer-a", "expired-token")
+            .await;
 
         assert_eq!(
             transport
@@ -1492,7 +1501,9 @@ mod tests {
                 .await,
             ResponderSessionCommit::PendingConfirmation
         );
-        transport.expire_pending_responder_for_test("peer-a", "expired-before-initiator").await;
+        transport
+            .expire_pending_responder_for_test("peer-a", "expired-before-initiator")
+            .await;
         assert!(
             !transport
                 .session_status("peer-a")
@@ -1771,8 +1782,8 @@ mod tests {
                 transport
                     .encrypt_and_emit_outbound(
                         OutboundPacket {
-                room_authorization: None,
-                trace: None,
+                            room_authorization: None,
+                            trace: None,
                             peer_id: "peer-a".to_string(),
                             dst_ip: "10.20.0.1".to_string(),
                             packet: second,
@@ -1828,8 +1839,8 @@ mod tests {
         let emitted = transport
             .encrypt_and_emit_outbound_with_lock_timeout(
                 OutboundPacket {
-                room_authorization: None,
-                trace: None,
+                    room_authorization: None,
+                    trace: None,
                     peer_id: "peer-a".to_string(),
                     dst_ip: "10.20.0.1".to_string(),
                     packet: vec![0],
@@ -1925,8 +1936,8 @@ mod tests {
                 transport
                     .encrypt_and_emit_outbound(
                         OutboundPacket {
-                room_authorization: None,
-                trace: None,
+                            room_authorization: None,
+                            trace: None,
                             peer_id: "peer-a".to_string(),
                             dst_ip: "10.20.0.1".to_string(),
                             packet: Ipv4Packet::build_icmp_echo_request(
@@ -1959,8 +1970,8 @@ mod tests {
                     transport
                         .encrypt_and_emit_outbound(
                             OutboundPacket {
-                room_authorization: None,
-                trace: None,
+                                room_authorization: None,
+                                trace: None,
                                 peer_id: "peer-a".to_string(),
                                 dst_ip: "10.20.0.1".to_string(),
                                 packet: Ipv4Packet::build_icmp_echo_request(
@@ -2117,7 +2128,8 @@ mod tests {
             "an internal rekey confirmation must not confirm Relay delivery"
         );
         assert_eq!(
-            connection.active_path(), None,
+            connection.active_path(),
+            None,
             "Relay observation metadata must not activate the Relay path"
         );
 
@@ -2175,11 +2187,7 @@ mod tests {
         let (transport, _raw_outbound_rx) = WireGuardTransport::new();
         assert_eq!(
             transport
-                .stage_responder_session(
-                    peer_id,
-                    responder_token.to_string(),
-                    local_session,
-                )
+                .stage_responder_session(peer_id, responder_token.to_string(), local_session,)
                 .await,
             ResponderSessionStage::Staged { had_active: false }
         );
@@ -2237,12 +2245,7 @@ mod tests {
                 Ipv4Addr::new(10, 20, 0, 1),
                 request_id,
                 1,
-                &crate::relay_probe::build_relay_probe_payload(
-                    kind,
-                    0,
-                    request_id,
-                    owner_token,
-                ),
+                &crate::relay_probe::build_relay_probe_payload(kind, 0, request_id, owner_token),
             )
         };
         let envelope = |wire_bytes| ReceivedEncryptedPacket {
@@ -2469,7 +2472,10 @@ mod tests {
             .expect("inbound actor panicked")
             .expect("inbound actor failed");
         assert!(!local_peers.is_relay_peer_confirmed(peer_id).await);
-        assert!(inbound_rx.try_recv().is_err(), "control Probes leaked to TUN");
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "control Probes leaked to TUN"
+        );
         let session_status = transport.session_status(peer_id).await;
         assert!(session_status.has_active);
         assert!(!session_status.has_pending_responder);
@@ -2490,24 +2496,28 @@ mod tests {
                 Some(harness.relay_connection_id),
             )
             .await;
-        assert!(harness
-            .peers
-            .confirm_relay_peer_with_transport(
-                "peer-a",
-                &harness.relay_endpoint,
-                0,
-                Some(harness.relay_connection_id),
-            )
-            .await);
-        assert!(harness
-            .peers
-            .mark_relay_first_business_sent_for_generation_with_transport(
-                "peer-a",
-                0,
-                &harness.relay_endpoint,
-                Some(harness.relay_connection_id),
-            )
-            .await);
+        assert!(
+            harness
+                .peers
+                .confirm_relay_peer_with_transport(
+                    "peer-a",
+                    &harness.relay_endpoint,
+                    0,
+                    Some(harness.relay_connection_id),
+                )
+                .await
+        );
+        assert!(
+            harness
+                .peers
+                .mark_relay_first_business_sent_for_generation_with_transport(
+                    "peer-a",
+                    0,
+                    &harness.relay_endpoint,
+                    Some(harness.relay_connection_id),
+                )
+                .await
+        );
 
         let reader = HeldConnectionReader::acquire(&harness.peers).await;
         let business = relay_business_packet(0x7101, b"relay-business-under-reader");
@@ -2528,14 +2538,8 @@ mod tests {
         harness.recv_business(&retry).await;
 
         let connection = harness.peers.get_connection("peer-a").await.unwrap();
-        assert_eq!(
-            connection.relay_first.business_received_generation,
-            Some(0)
-        );
-        assert_eq!(
-            connection.relay_first.business_exchange_generation,
-            Some(0)
-        );
+        assert_eq!(connection.relay_first.business_received_generation, Some(0));
+        assert_eq!(connection.relay_first.business_exchange_generation, Some(0));
         assert_eq!(connection.first_usable_generation, Some(0));
         assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
         assert!(!harness
@@ -2601,10 +2605,7 @@ mod tests {
             connection.relay_confirmed_connection_id,
             Some(harness.relay_connection_id)
         );
-        assert_eq!(
-            connection.relay_first.business_received_generation,
-            Some(0)
-        );
+        assert_eq!(connection.relay_first.business_received_generation, Some(0));
         assert_eq!(connection.first_usable_generation, Some(0));
         assert_eq!(connection.first_usable_path, Some(NetworkPath::Relay));
         assert!(!harness.peers.relay_probe_expectation_present("peer-a"));
@@ -2626,15 +2627,17 @@ mod tests {
                 Some(harness.relay_connection_id),
             )
             .await;
-        assert!(harness
-            .peers
-            .confirm_relay_peer_with_transport(
-                "peer-a",
-                &harness.relay_endpoint,
-                0,
-                Some(harness.relay_connection_id),
-            )
-            .await);
+        assert!(
+            harness
+                .peers
+                .confirm_relay_peer_with_transport(
+                    "peer-a",
+                    &harness.relay_endpoint,
+                    0,
+                    Some(harness.relay_connection_id),
+                )
+                .await
+        );
         let peer_session_generation = harness
             .peers
             .peer_session_generation_sync("peer-a")
@@ -2940,7 +2943,8 @@ mod tests {
         }));
         assert!(events
             .iter()
-            .any(|event| event.event == "first_usable_path" && event.path.as_deref() == Some("relay")));
+            .any(|event| event.event == "first_usable_path"
+                && event.path.as_deref() == Some("relay")));
 
         drop(encrypted_tx);
         worker.await.unwrap().unwrap();
@@ -2965,11 +2969,8 @@ mod tests {
             .await;
 
         let relay_endpoint = "tls://relay.test:443";
-        let relay = crate::relay::RelayTransport::connect_for_test(
-            "test",
-            relay_endpoint,
-            peers.clone(),
-        );
+        let relay =
+            crate::relay::RelayTransport::connect_for_test("test", relay_endpoint, peers.clone());
         let relay_connection_id = relay.connection_id();
         peers
             .mark_relay_transport_ready_with_transport(
@@ -2979,14 +2980,16 @@ mod tests {
                 Some(relay_connection_id),
             )
             .await;
-        assert!(peers
-            .confirm_relay_peer_with_transport(
-                "peer-a",
-                relay_endpoint,
-                0,
-                Some(relay_connection_id),
-            )
-            .await);
+        assert!(
+            peers
+                .confirm_relay_peer_with_transport(
+                    "peer-a",
+                    relay_endpoint,
+                    0,
+                    Some(relay_connection_id),
+                )
+                .await
+        );
 
         let timeline = crate::connection_timeline::ConnectionTimeline::new("node-a", 1);
         peers.set_timeline(timeline.clone());
@@ -3996,11 +3999,10 @@ mod tests {
             .await
             .expect("the primary UDP socket must exist");
         let receiving_endpoint = receiving_socket.local_addr().unwrap();
-        let sink = tokio::net::UdpSocket::bind(
-            "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
-        )
-            .await
-            .unwrap();
+        let sink =
+            tokio::net::UdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .await
+                .unwrap();
 
         // Simulate a concurrent peer-reflexive observation that moved the
         // normal affinity to pool socket 1.  The request below was received
@@ -4049,13 +4051,11 @@ mod tests {
             .await;
 
         let mut encrypted_ack = [0u8; 2048];
-        let (_, observed_source) = timeout(
-            Duration::from_secs(1),
-            sink.recv_from(&mut encrypted_ack),
-        )
-        .await
-        .expect("the validation ACK must reach the local UDP sink")
-        .unwrap();
+        let (_, observed_source) =
+            timeout(Duration::from_secs(1), sink.recv_from(&mut encrypted_ack))
+                .await
+                .expect("the validation ACK must reach the local UDP sink")
+                .unwrap();
         assert_eq!(
             observed_source, receiving_endpoint,
             "a validation ACK must preserve the NAT mapping of the receiving socket"
@@ -4089,11 +4089,10 @@ mod tests {
             .unwrap();
         let (socket_index, dynamic_socket) = udp.bind_fresh_punch_socket().await.unwrap();
         let dynamic_endpoint = dynamic_socket.local_addr().unwrap();
-        let sink = tokio::net::UdpSocket::bind(
-            "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
-        )
-        .await
-        .unwrap();
+        let sink =
+            tokio::net::UdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .await
+                .unwrap();
         let source = sink.local_addr().unwrap();
         let token = crate::transport::DirectValidationToken {
             kind: crate::transport::DirectValidationKind::Request,
@@ -4136,16 +4135,13 @@ mod tests {
             .await;
 
         let mut encrypted_ack = [0u8; 2048];
-        let (_, observed_source) = timeout(
-            Duration::from_secs(1),
-            sink.recv_from(&mut encrypted_ack),
-        )
-        .await
-        .expect("the ACK must use the queued dynamic socket handle")
-        .unwrap();
+        let (_, observed_source) =
+            timeout(Duration::from_secs(1), sink.recv_from(&mut encrypted_ack))
+                .await
+                .expect("the ACK must use the queued dynamic socket handle")
+                .unwrap();
         assert_eq!(
-            observed_source,
-            dynamic_endpoint,
+            observed_source, dynamic_endpoint,
             "a detached dynamic validation request must retain its original source mapping"
         );
     }
@@ -4163,10 +4159,8 @@ mod tests {
         let peers = Arc::new(PeerManager::new(
             Config::generate_default("https://ctrl.test", "net1").unwrap(),
         ));
-        let request_endpoint: std::net::SocketAddr =
-            "198.51.100.44:46004".parse().unwrap();
-        let observed_endpoint: std::net::SocketAddr =
-            "198.51.100.44:46005".parse().unwrap();
+        let request_endpoint: std::net::SocketAddr = "198.51.100.44:46004".parse().unwrap();
+        let observed_endpoint: std::net::SocketAddr = "198.51.100.44:46005".parse().unwrap();
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),
@@ -4672,19 +4666,44 @@ mod tests {
                 peer_index: 77,
             });
             assert!(matches!(
-                transport.stage_responder_session("peer", token.clone(), local).await,
+                transport
+                    .stage_responder_session("peer", token.clone(), local)
+                    .await,
                 ResponderSessionStage::Staged { .. },
             ));
             senders.insert(token, remote);
         }
-        let token = transport.last_pending_responder_token_for_test("peer").await;
+        let token = transport
+            .last_pending_responder_token_for_test("peer")
+            .await;
         let plaintext = b"authenticated-last-colliding-key";
-        let encrypted = senders.get_mut(&token).unwrap().encrypt(plaintext).unwrap().to_bytes();
-        let inbound = transport.decrypt_inbound(&encrypted).await.unwrap().unwrap();
+        let encrypted = senders
+            .get_mut(&token)
+            .unwrap()
+            .encrypt(plaintext)
+            .unwrap()
+            .to_bytes();
+        let inbound = transport
+            .decrypt_inbound(&encrypted)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(inbound.peer_id, "peer");
         assert_eq!(inbound.packet, plaintext);
         assert!(!inbound.from_previous_session);
-        assert_eq!(transport.active_responder_token_for_test("peer").await.as_deref(), Some(token.as_str()));
-        assert_eq!(transport.session_status("peer").await.pending_responder_count, 0);
+        assert_eq!(
+            transport
+                .active_responder_token_for_test("peer")
+                .await
+                .as_deref(),
+            Some(token.as_str())
+        );
+        assert_eq!(
+            transport
+                .session_status("peer")
+                .await
+                .pending_responder_count,
+            0
+        );
     }
 }

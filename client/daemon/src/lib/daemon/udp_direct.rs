@@ -844,10 +844,8 @@ async fn run_udp_direct_instance(
     // superseded worker gets `false` here and therefore cannot erase the
     // replacement published by a newer owner.
     udp.cancel_all_direct_validation_sessions().await;
-    udp.dplpmtud_runtime().close(
-        "udp_transport_withdrawn",
-        tokio::time::Instant::now(),
-    );
+    udp.dplpmtud_runtime()
+        .close("udp_transport_withdrawn", tokio::time::Instant::now());
     udp.cancel_all_relay_backoff_heartbeats();
     let withdrew_current = udp_transport_publication
         .clear_if_owner(lease.owner())
@@ -1126,8 +1124,7 @@ async fn run_dplpmtud_worker(
     let notify = lease.notify.clone();
     let mut cancel_rx = lease.cancel_rx;
     let publication_owner = udp.inbound_publication_owner();
-    let hard_deadline =
-        tokio::time::Instant::now() + crate::dplpmtud::DPLPMTUD_WORKER_MAX_LIFETIME;
+    let hard_deadline = tokio::time::Instant::now() + crate::dplpmtud::DPLPMTUD_WORKER_MAX_LIFETIME;
 
     emit_dplpmtud_timeline(
         &peers,
@@ -1153,9 +1150,7 @@ async fn run_dplpmtud_worker(
             break;
         }
 
-        if let Some(plan) =
-            runtime.schedule_probe(&peer_id, &identity, worker_owner_token, now)
-        {
+        if let Some(plan) = runtime.schedule_probe(&peer_id, &identity, worker_owner_token, now) {
             if !runtime.outstanding_is_current(&plan) {
                 continue;
             }
@@ -1238,9 +1233,9 @@ async fn run_dplpmtud_worker(
                         )
                         .await
                 }
-                Err(error) => Err(
-                    crate::dplpmtud::DplpmtudProbeSendFailure::from(DaemonError::Network(error)),
-                ),
+                Err(error) => Err(crate::dplpmtud::DplpmtudProbeSendFailure::from(
+                    DaemonError::Network(error),
+                )),
             };
 
             match send_result {
@@ -1315,8 +1310,7 @@ async fn run_dplpmtud_worker(
         };
         if matches!(
             state,
-            crate::dplpmtud::DplpmtudState::Disabled
-                | crate::dplpmtud::DplpmtudState::Unsupported
+            crate::dplpmtud::DplpmtudState::Disabled | crate::dplpmtud::DplpmtudState::Unsupported
         ) {
             break;
         }
@@ -1531,12 +1525,8 @@ mod udp_direct_tests {
             ..Default::default()
         };
         assert_eq!(
-            direct_socket_interface_for_bind(
-                &environment,
-                "127.0.0.1:0".parse().unwrap(),
-                true,
-            )
-            .unwrap(),
+            direct_socket_interface_for_bind(&environment, "127.0.0.1:0".parse().unwrap(), true,)
+                .unwrap(),
             None
         );
     }
@@ -1548,12 +1538,8 @@ mod udp_direct_tests {
             ..Default::default()
         };
         assert_eq!(
-            direct_socket_interface_for_bind(
-                &environment,
-                "127.0.0.1:0".parse().unwrap(),
-                false,
-            )
-            .unwrap(),
+            direct_socket_interface_for_bind(&environment, "127.0.0.1:0".parse().unwrap(), false,)
+                .unwrap(),
             Some("eth0".to_string())
         );
     }
@@ -1565,12 +1551,8 @@ mod udp_direct_tests {
             ..Default::default()
         };
         assert_eq!(
-            direct_socket_interface_for_bind(
-                &environment,
-                "0.0.0.0:0".parse().unwrap(),
-                true,
-            )
-            .unwrap(),
+            direct_socket_interface_for_bind(&environment, "0.0.0.0:0".parse().unwrap(), true,)
+                .unwrap(),
             Some("eth0".to_string())
         );
     }
@@ -1626,9 +1608,7 @@ mod udp_direct_tests {
             excluded_interfaces: Vec::new(),
             shutdown_rx,
             android_network_change_rx: None,
-            android_network_change_observed: Arc::new(
-                std::sync::atomic::AtomicU64::new(0),
-            ),
+            android_network_change_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

@@ -166,10 +166,7 @@ impl PeerManager {
                 || conn.state == ConnectionState::Closed
                 || self.peer_quarantined_sync(node_id)
             {
-                return finish(
-                    RelayReadyCommitOutcome::Rejected,
-                    Some(connections_wait_us),
-                );
+                return finish(RelayReadyCommitOutcome::Rejected, Some(connections_wait_us));
             }
             let endpoint_changed = conn.relay_ready_endpoint.as_deref() != Some(relay_endpoint);
             let transport_replaced = relay_connection_id.is_some_and(|new_id| {
@@ -265,18 +262,12 @@ impl PeerManager {
                     },
                 );
                 if !outcome.accepted() {
-                    return finish(
-                        RelayReadyCommitOutcome::Rejected,
-                        Some(connections_wait_us),
-                    );
+                    return finish(RelayReadyCommitOutcome::Rejected, Some(connections_wait_us));
                 }
                 commit_outcome = RelayReadyCommitOutcome::Committed;
             }
         } else {
-            return finish(
-                RelayReadyCommitOutcome::Rejected,
-                Some(connections_wait_us),
-            );
+            return finish(RelayReadyCommitOutcome::Rejected, Some(connections_wait_us));
         }
         drop(connections);
         if let Some((previous_endpoint, previous_generation, previous_connection_id)) =

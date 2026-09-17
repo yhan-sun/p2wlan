@@ -1,63 +1,187 @@
-name: Temporary Include Format Committer
+name: CI
 
 on:
   push:
-    branches: [chore/include-format-export-20260917]
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: temporary-include-format-committer
-  cancel-in-progress: true
+  # A commit validation (push / pull_request) and a periodic health check
+  # (schedule / workflow_dispatch) are different obligations for the same
+  # ref. Sharing one concurrency group let a scheduled run cancel an
+  # in-flight commit validation, so each event class gets its own group and
+  # only a pull request cancels its own superseded predecessors.
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  commit_format_fix:
-    name: Format and commit inherited include sources
-    runs-on: ubuntu-24.04
+  rust:
+    name: Rust Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Install Linux Desktop Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            xdotool \
+            patchelf
+      - name: Rust Fmt Check
+        run: cargo fmt --all --check
+      - name: Rust Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust API documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked -p p2wlan-daemon --lib --no-deps --all-features
+      - name: Rust Tests (general suite)
+        run: cargo test --workspace --all-targets -- --test-threads=1 --skip hard_hard_
+      - name: Rust Tests (Hard↔Hard isolated suite)
+        run: python3 scripts/quality/run_rust_tests.py hard_hard_ --each
+      - name: Linux route gate tests
+        run: "python3 scripts/quality/run_rust_tests.py route::tests::"
+      - name: Rust Linux Target Cross-Compile Check
+        run: |
+          rustup target add x86_64-unknown-linux-gnu
+          cargo check --target x86_64-unknown-linux-gnu
+      - name: Build Identity Gate
+        # The built daemon must report the exact commit CI checked out, and
+        # --version must carry that commit too. A drift here means
+        # /status.version could no longer prove which build is running.
+        run: |
+          cargo build -p p2wlan-daemon
+          HEAD_SHA="$(git rev-parse HEAD)"
+          IDENTITY_JSON="$(target/debug/p2wlan-daemon --build-info)"
+          IDENTITY_SHA="$(printf '%s' "$IDENTITY_JSON" | sed -n 's/.*"git_commit": "\([^"]*\)".*/\1/p' | head -1)"
+          if [[ "$IDENTITY_SHA" != "$HEAD_SHA" ]]; then
+            echo "build identity mismatch: daemon=$IDENTITY_SHA checkout=$HEAD_SHA" >&2
+            exit 1
+          fi
+          target/debug/p2wlan-daemon --version | grep -q "$HEAD_SHA" || {
+            echo "--version must embed the git commit" >&2
+            exit 1
+          }
+          BIN_SHA="$(shasum -a 256 target/debug/p2wlan-daemon | awk '{print $1}')"
+          REPORTED_SHA="$(printf '%s' "$IDENTITY_JSON" | sed -n 's/.*"binary_sha256": "\([^"]*\)".*/\1/p' | head -1)"
+          if [[ "$BIN_SHA" != "$REPORTED_SHA" ]]; then
+            echo "binary_sha256 mismatch: reported=$REPORTED_SHA actual=$BIN_SHA" >&2
+            exit 1
+          fi
+          echo "build identity gate PASS (commit=$HEAD_SHA sha=$BIN_SHA)"
+
+  rust_windows:
+    name: Rust Check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Rust Clippy (Windows)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust Fmt Check (Windows)
+        run: cargo fmt --all -- --check
+      - name: Rust Tests (Windows, general suite)
+        run: cargo test --workspace -- --test-threads=1 --skip hard_hard_
+      - name: Rust Tests (Windows, Hard↔Hard isolated suite)
+        run: python scripts/quality/run_rust_tests.py hard_hard_ --each
+
+  go:
+    name: Go Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Setup Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "1.26.6"
+      - name: Go Vet
+        working-directory: server
+        run: go vet ./...
+      - name: Go Test
+        working-directory: server
+        run: go test ./... -count=1
+
+  repository_policy:
+    name: Repository policy and security scan
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-
-      - name: Install repository Rustfmt
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          components: rustfmt
-
-      - name: Format every inherited drift entry
-        shell: bash
+      - name: Test quality gates
+        run: python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
+      - name: Verify repository contracts
+        env:
+          P2WLAN_QUALITY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          set -euo pipefail
-          edition="$(python3 - <<'PY'
-          import sys
-          sys.path.insert(0, '.')
-          from scripts.quality.check_include_format import workspace_edition
-          print(workspace_edition())
-          PY
-          )"
-          while read -r kind path; do
-            [[ "$kind" == drift ]] || continue
-            rustfmt --edition "$edition" "$path"
-          done < <(grep -E '^(drift|fragment) ' scripts/quality/include_format_baseline.txt)
-          python3 scripts/quality/check_include_format.py --update-baseline
+          python3 scripts/docs/verify_repository.py
+          python3 scripts/quality/check_code_health.py
           python3 scripts/quality/check_include_format.py
-          git diff --check
-          test "$(grep -c '^drift ' scripts/quality/include_format_baseline.txt || true)" -eq 0
-          test "$(grep -c '^fragment ' scripts/quality/include_format_baseline.txt || true)" -eq 1
-          test "$(git diff --name-only | wc -l | tr -d ' ')" -eq 167
+          bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
+          sh -n scripts/install-linux-cli.sh
+          python3 -m py_compile scripts/docs/verify_repository.py scripts/quality/check_code_health.py scripts/quality/run_rust_tests.py scripts/quality/check_required_gates.py scripts/quality/check_include_format.py scripts/dplpmtud/select_component_artifact.py scripts/dplpmtud/aggregate_evidence.py scripts/dplpmtud/collect_evidence.py scripts/nat-sim/select_attempt_evidence.py scripts/release/verify_release_set.py scripts/release/write_artifact_metadata.py
+          python3 scripts/release/test_release_set.py
+          test -x apps/flutter_client/android/gradlew
+          printf '%s  %s\n' 76805e32c009c0cf0dd5d206bddc9fb22ea42e84db904b764f3047de095493f3 apps/flutter_client/android/gradle/wrapper/gradle-wrapper.jar | sha256sum -c -
+          grep -q '^distributionSha256Sum=b84e04fa845fecba48551f425957641074fcc00a88a84d2aae5808743b35fc85$' apps/flutter_client/android/gradle/wrapper/gradle-wrapper.properties
+      - name: Verify log format compatibility
+        run: |
+          python3 scripts/dual-end/test-log-format-compatibility.py
+          python3 scripts/dual-end/test-production-availability-parser.py
+          bash -n scripts/dual-end/mini-air-smoke.sh
+          bash -n scripts/nat-sim/nat-sim-smoke.sh
+      - name: Assert web GUI dependencies are absent
+        run: |
+          test ! -e package.json
+          test ! -e pnpm-lock.yaml
+          test ! -e pnpm-workspace.yaml
+          test ! -e vite.config.ts
+      - name: Scan for deleted React/Vite origins
+        run: |
+          legacy_port=327
+          if git grep -nE "react-dom|from [\"']react[\"']|@vitejs|vite/client|pnpm run|localhost:14${legacy_port}" -- . ':!docs/**' ':!*.md' ':!.github/workflows/**'; then
+            echo "deleted React/Vite/legacy-origin reference found" >&2
+            exit 1
+          fi
+      - name: Scan production credential transport
+        run: |
+          if git grep -nE 'localStorage|sessionStorage|--token([ =]|$)|p2wlan-daemon\.token' -- \
+            'apps/flutter_client/lib/**' \
+            'client/**' \
+            'scripts/**' \
+            ':!scripts/dual-end/mini-air-smoke.sh'; then
+            echo "unsafe production credential transport found" >&2
+            exit 1
+          fi
 
-      - name: Restore permanent CI and create the source-only commit
+  required:
+    name: CI Required
+    if: always()
+    needs: [rust, rust_windows, go, repository_policy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce required job results
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main --depth=1
-          git checkout origin/main -- .github/workflows/ci.yml
-          git diff --check
-          test "$(git diff HEAD --name-only | wc -l | tr -d ' ')" -eq 168
-          test "$(git diff HEAD --name-only | grep -Ev '^(\.github/workflows/ci\.yml|scripts/quality/include_format_baseline\.txt|client/.*\.rs)$' | wc -l | tr -d ' ')" -eq 0
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add client scripts/quality/include_format_baseline.txt .github/workflows/ci.yml
-          git commit -m 'chore:清零 include! Rust 格式历史漂移'
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          test "${{ needs.rust.result }}" = "success"
+          test "${{ needs.rust_windows.result }}" = "success"
+          test "${{ needs.go.result }}" = "success"
+          test "${{ needs.repository_policy.result }}" = "success"
+          echo "all required CI jobs succeeded"

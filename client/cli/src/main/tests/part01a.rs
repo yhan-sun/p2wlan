@@ -561,8 +561,8 @@ fn parses_route_room_and_support_commands() {
     .unwrap();
     assert!(matches!(room.command, Commands::Room { .. }));
 
-    let support = Cli::try_parse_from(["p2wlan", "support-bundle", "--include-rooms=false"])
-        .unwrap();
+    let support =
+        Cli::try_parse_from(["p2wlan", "support-bundle", "--include-rooms=false"]).unwrap();
     let Commands::SupportBundle(args) = support.command else {
         panic!("expected support-bundle command");
     };
