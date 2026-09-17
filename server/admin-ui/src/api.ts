@@ -7,7 +7,10 @@ import type {
   AdminRoom,
   AdminRuntime,
   AdminTopology,
+  AdminTopologyPage,
+  CursorPage,
   Page,
+  TopologyView,
 } from './types'
 
 const TOKEN_KEY = 'p2wlan-admin-token'
@@ -51,11 +54,12 @@ export async function verifyAdminToken(token: string): Promise<void> {
   if (!response.ok) throw new ApiError(response.status, await parseError(response))
 }
 
-export async function api<T>(path: string): Promise<T> {
+export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
   const token = getAdminToken()
   const response = await fetch(`/admin/api/v1${path}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
     cache: 'no-store',
+    signal,
   })
   if (response.status === 401) {
     clearAdminToken()
@@ -70,6 +74,9 @@ async function accountPage(query: string, limit: number, offset: number): Promis
   return api<Page<AdminAccount>>(`/accounts?${params}`)
 }
 
+// Legacy all-page helpers remain for compatibility with code outside the
+// console's primary list routes. New interactive pages use the cursor methods
+// below so a mutable last_seen value cannot shift offset boundaries.
 async function fetchAllPages<T>(fetchPage: (limit: number, offset: number) => Promise<Page<T>>): Promise<Page<T>> {
   const items: T[] = []
   let offset = 0
@@ -86,36 +93,59 @@ async function fetchAllPages<T>(fetchPage: (limit: number, offset: number) => Pr
   return { total, limit: items.length, offset: 0, items }
 }
 
-async function allTopologyAccounts(): Promise<Page<AdminAccount>> {
-  return fetchAllPages((limit, offset) => accountPage('', limit, offset))
-}
-
-async function allNetworks(): Promise<Page<AdminNetwork>> {
-  return fetchAllPages((limit, offset) => api<Page<AdminNetwork>>(`/networks?limit=${limit}&offset=${offset}`))
-}
-
-async function allRooms(): Promise<Page<AdminRoom>> {
-  return fetchAllPages((limit, offset) => api<Page<AdminRoom>>(`/rooms?limit=${limit}&offset=${offset}`))
+function cursorParams(limit: number, cursor = ''): URLSearchParams {
+  const params = new URLSearchParams({ pagination: 'cursor', limit: String(limit) })
+  if (cursor) params.set('cursor', cursor)
+  return params
 }
 
 export const adminApi = {
   overview: () => api<AdminOverview>('/overview'),
   runtime: () => api<AdminRuntime>('/runtime'),
-  accounts: (query = '', limit = 50, offset = 0) => {
-    // The topology selector intentionally asks for the server maximum (200).
-    // Treat that call as an all-account option request and continue paging so
-    // installations with hundreds or thousands of accounts remain navigable.
-    if (query === '' && limit === MAX_SERVER_PAGE && offset === 0) return allTopologyAccounts()
-    return accountPage(query, limit, offset)
+
+  // Kept for the bounded dashboard "recent accounts" card.
+  accounts: (query = '', limit = 50, offset = 0) => accountPage(query, limit, offset),
+
+  accountsCursor: (query = '', limit = 50, cursor = '', signal?: AbortSignal) => {
+    const params = cursorParams(limit, cursor)
+    params.set('q', query)
+    return api<CursorPage<AdminAccount>>(`/accounts?${params}`, signal)
   },
   account: (id: string) => api<AdminAccountDetail>(`/accounts/${encodeURIComponent(id)}`),
+
+  // The old full topology endpoint remains available for API compatibility;
+  // the console exclusively uses topologyPage so server work is bounded.
   topology: (accountId?: string) => accountId
     ? api<AdminTopology>(`/accounts/${encodeURIComponent(accountId)}/topology`)
     : api<AdminTopology>('/topology'),
+  topologyPage: (accountId: string | undefined, view: TopologyView, cursor = '', limit = 100, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ view, limit: String(limit) })
+    if (cursor) params.set('cursor', cursor)
+    const base = accountId
+      ? `/accounts/${encodeURIComponent(accountId)}/topology`
+      : '/topology'
+    return api<AdminTopologyPage>(`${base}?${params}`, signal)
+  },
+
   devices: (query = '', status = 'all', limit = 50, offset = 0) => {
     const params = new URLSearchParams({ q: query, status, limit: String(limit), offset: String(offset) })
     return api<Page<AdminDevice>>(`/devices?${params}`)
   },
-  networks: () => allNetworks(),
-  rooms: () => allRooms(),
+  devicesCursor: (query = '', status = 'all', limit = 50, cursor = '', signal?: AbortSignal) => {
+    const params = cursorParams(limit, cursor)
+    params.set('q', query)
+    params.set('status', status)
+    return api<CursorPage<AdminDevice>>(`/devices?${params}`, signal)
+  },
+
+  networks: () => fetchAllPages((limit, offset) => api<Page<AdminNetwork>>(`/networks?limit=${limit}&offset=${offset}`)),
+  rooms: () => fetchAllPages((limit, offset) => api<Page<AdminRoom>>(`/rooms?limit=${limit}&offset=${offset}`)),
+  networksCursor: (limit = 50, cursor = '', signal?: AbortSignal) => {
+    const params = cursorParams(limit, cursor)
+    return api<CursorPage<AdminNetwork>>(`/networks?${params}`, signal)
+  },
+  roomsCursor: (limit = 50, cursor = '', signal?: AbortSignal) => {
+    const params = cursorParams(limit, cursor)
+    return api<CursorPage<AdminRoom>>(`/rooms?${params}`, signal)
+  },
 }
