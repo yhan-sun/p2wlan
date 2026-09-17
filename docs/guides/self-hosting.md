@@ -20,7 +20,7 @@
 | 运行形态 | 自动验证范围 | 边界 |
 | --- | --- | --- |
 | Linux 原生服务 | Ubuntu 22.04 上执行 Go vet、race/full tests、Control/Relay 双进程认证 smoke、IPv6 TLS/撤权验证和 manager contract | 这是固定服务端归档与 systemd manager 的主要验证路径 |
-| 管理台前端 | 固定 Node 版本安装 lockfile 依赖，执行 TypeScript typecheck、Vite production build，并校验构建后的静态产物 | Node 只属于构建链，不进入生产服务器运行时 |
+| 管理台前端 | 固定 Node 版本安装依赖，执行 TypeScript typecheck、Vite production build，并校验构建后的静态产物；服务端发布任务会在 Go 编译前再次构建管理台 | Node 只属于构建链，不进入生产服务器运行时 |
 | Linux 静态服务端二进制 | Ubuntu 20.04 容器验证 `CGO_ENABLED=0` 产物没有动态 loader，并能执行 `--version` | 只证明基础 loader 兼容，不等于 Ubuntu 20.04 上完整 systemd、网络和业务链路已验收 |
 | Docker Compose | Ubuntu 22.04 runner 构建实际 Debian bookworm 镜像、启动 Control/Relay、检查 readyz，并验证 SQLite 数据卷重启持久性 | 生产部署仍应使用固定镜像摘要并自行完成公网、TLS 和恢复演练 |
 | Windows 服务端代码 | `windows-latest` 执行 Go vet/tests 和真实 Control/Relay 双进程 smoke | 当前固定 `server-vX.Y.Z` 发布归档不是 Windows 安装包，因此 Windows 不属于公开的固定归档部署路径 |
@@ -60,9 +60,9 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 先用 p2wlan-config 在新目录生成匹配的 Control/Relay 配置，再按[配置参考](../reference/configuration.md)填入域名、证书和密钥。配置文件和数据库应由专用 p2wlan 用户拥有，权限分别限制为服务需要的最小范围。
 
-需要管理界面时，在受保护的 Control 环境文件中额外设置 `CONTROL_ADMIN_TOKEN=<至少32字符的独立随机令牌>`，然后重启 Control。管理台直接编译进 `p2wlan-control`，不需要在部署服务器安装 Node、运行独立静态站点或增加额外容器；入口为与 Control 同一 HTTPS origin 下的 `/admin/`。未设置该变量时入口返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
+`p2wlan-config` 会和 JWT、Relay 凭据一起生成独立的 256-bit `CONTROL_ADMIN_TOKEN` 并写入受保护的 `control.env`，因此标准自托管流程不需要再手工制造管理台凭据。生成器不会把这些秘密打印到 stdout，也不会覆盖已有部署。管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；如果部署者希望完全关闭管理面，删除 `CONTROL_ADMIN_TOKEN` 后重启 Control 即可，此时 `/admin` 与 `/admin/*` 返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
 
-管理台源码位于 `server/admin-ui/`；CI 使用固定 Node 版本将其构建到 `server/admin/web/`，随后 Go 将该目录嵌入 Control。发布流程消费已验证的静态产物，因此服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
+管理台源码位于 `server/admin-ui/`；CI 使用固定 Node 版本将其构建到 `server/admin/web/`，服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证最终归档不会因为仓库中残留的旧静态文件而携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
 
 管理员令牌不能与 `JWT_SECRET`、设备凭据、Relay ticket 或撤权 feed token 复用，也不要放入 URL、公开日志或反向代理访问日志字段。页面中的账号、membership、设备挂载、在线状态、Relay RTT、隧道和 signaling 来自 Control 已提交状态；当前页面不会把这些字段推断成真实 Direct/Relay 路径，也不等于 TUN 或业务应用已经端到端可达。
 
