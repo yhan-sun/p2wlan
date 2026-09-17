@@ -25,12 +25,13 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { accountColor, colorWithAlpha } from './colors'
+import { accountColor, accountIdentityCode, colorWithAlpha } from './colors'
 import type { AdminTopology, AdminTopologyNode } from './types'
 
 interface TopologyCanvasProps {
   data?: AdminTopology
   loading?: boolean
+  streaming?: boolean
   error?: string
   search?: string
   compact?: boolean
@@ -58,10 +59,12 @@ function nodeIcon(node: AdminTopologyNode) {
 }
 
 function nodeMeta(node: AdminTopologyNode): string {
-  if (node.kind === 'account') return node.focus ? '当前账号' : '账号'
+  if (node.kind === 'account') {
+    return [node.focus ? '当前账号' : '账号', `#${accountIdentityCode(node.account_id)}`].join(' · ')
+  }
   if (node.kind === 'room') return [node.room_code && `#${node.room_code}`, node.cidr].filter(Boolean).join(' · ')
   if (node.kind === 'network') return node.cidr || '网络'
-  return [node.virtual_ip, node.platform].filter(Boolean).join(' · ')
+  return [node.username && `@${node.username}`, node.virtual_ip, node.platform].filter(Boolean).join(' · ')
 }
 
 function ownerColor(node: AdminTopologyNode): string {
@@ -86,15 +89,18 @@ function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
   )
 }
 
-interface GraphOptions {
-  search: string
+interface LayoutOptions {
   showOffline: boolean
   showSignals: boolean
 }
 
-function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]; edges: Edge[] } {
-  const { search, showOffline, showSignals } = options
-  const normalizedSearch = search.trim().toLowerCase()
+interface GraphResult {
+  nodes: Node[]
+  edges: Edge[]
+}
+
+function buildLayoutGraph(data: AdminTopology, options: LayoutOptions): GraphResult {
+  const { showOffline, showSignals } = options
   const sourceNodes = new Map(data.nodes.map((node) => [node.id, node]))
   const visibleSourceNodes = data.nodes.filter((node) => showOffline || node.kind !== 'device' || node.online)
   const visibleIds = new Set(visibleSourceNodes.map((node) => node.id))
@@ -102,13 +108,6 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     if (!visibleIds.has(edge.source) || !visibleIds.has(edge.target)) return false
     return showSignals || edge.kind !== 'pending_signal'
   })
-
-  const matches = (node: AdminTopologyNode) => {
-    if (!normalizedSearch) return true
-    return [node.label, node.username, node.virtual_ip, node.cidr, node.room_code, node.platform]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(normalizedSearch))
-  }
 
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
@@ -123,7 +122,6 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     const size = dimensions[node.kind]
     const point = graph.node(node.id) as { x: number; y: number } | undefined
     const color = ownerColor(node)
-    const isMatch = matches(node)
     const neutral = node.kind === 'network' || node.kind === 'room'
     return {
       id: node.id,
@@ -143,8 +141,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
           ? `0 0 0 4px ${colorWithAlpha(color, 0.1)}, 0 10px 28px rgba(15, 23, 42, .09)`
           : '0 5px 18px rgba(15, 23, 42, .055)',
         color: '#0f172a',
-        opacity: isMatch ? 1 : 0.16,
-        transition: 'opacity 150ms ease, box-shadow 150ms ease',
+        opacity: 1,
       },
       draggable: false,
       selectable: true,
@@ -156,7 +153,6 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     const target = sourceNodes.get(edge.target)
     const colorSource = edge.kind === 'attachment' ? target : source
     const color = colorSource ? ownerColor(colorSource) : '#94a3b8'
-    const endpointsMatch = !normalizedSearch || Boolean((source && matches(source)) || (target && matches(target)))
     const isSignal = edge.kind === 'pending_signal'
     return {
       id: edge.id,
@@ -168,7 +164,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
         stroke: isSignal ? '#d97706' : color,
         strokeWidth: isSignal ? 1.7 : edge.kind === 'membership' ? 2 : 1.5,
         strokeDasharray: isSignal ? '7 6' : undefined,
-        opacity: endpointsMatch ? (isSignal ? 0.78 : 0.46) : 0.07,
+        opacity: isSignal ? 0.78 : 0.46,
       },
       markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: '#d97706', width: 14, height: 14 } : undefined,
       label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type || 'signal'} ×${edge.count}` : undefined,
@@ -180,8 +176,40 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
   return { nodes, edges }
 }
 
+function applySearchHighlight(graph: GraphResult, data: AdminTopology, search: string): GraphResult {
+  const normalized = search.trim().toLowerCase()
+  if (!normalized) return graph
+  const sourceNodes = new Map(data.nodes.map((node) => [node.id, node]))
+  const matches = (node?: AdminTopologyNode) => Boolean(node && [
+    node.label,
+    node.username,
+    node.virtual_ip,
+    node.cidr,
+    node.room_code,
+    node.platform,
+    node.account_id && accountIdentityCode(node.account_id),
+  ].filter(Boolean).some((value) => String(value).toLowerCase().includes(normalized)))
+
+  return {
+    nodes: graph.nodes.map((node) => ({
+      ...node,
+      style: { ...node.style, opacity: matches(sourceNodes.get(node.id)) ? 1 : 0.14 },
+    })),
+    edges: graph.edges.map((edge) => {
+      const sourceMatch = matches(sourceNodes.get(edge.source))
+      const targetMatch = matches(sourceNodes.get(edge.target))
+      const isSignal = sourceNodes.has(edge.source) && data.edges.find((item) => item.id === edge.id)?.kind === 'pending_signal'
+      return {
+        ...edge,
+        style: { ...edge.style, opacity: sourceMatch || targetMatch ? (isSignal ? 0.78 : 0.46) : 0.06 },
+      }
+    }),
+  }
+}
+
 function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () => void }) {
   const color = ownerColor(node)
+  const identity = node.account_id || node.owner_id
   return (
     <aside className="topology-detail" aria-label="拓扑节点详情">
       <button className="icon-button topology-detail-close" onClick={onClose} aria-label="关闭详情"><X size={16} /></button>
@@ -189,6 +217,7 @@ function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () =
       <h3>{node.label}</h3>
       {node.username && node.kind !== 'account' && <p className="topology-detail-owner">账号 · {node.username}</p>}
       <dl>
+        {identity && <div><dt>账号短码</dt><dd className="mono">#{accountIdentityCode(identity)}</dd></div>}
         {node.virtual_ip && <div><dt>Virtual IP</dt><dd className="mono">{node.virtual_ip}</dd></div>}
         {node.cidr && <div><dt>CIDR</dt><dd className="mono">{node.cidr}</dd></div>}
         {node.room_code && <div><dt>房间号</dt><dd className="mono">{node.room_code}</dd></div>}
@@ -208,27 +237,36 @@ function TopologySummary({ data }: { data: AdminTopology }) {
     networks: data.nodes.filter((node) => node.kind === 'network' || node.kind === 'room').length,
     devices: data.nodes.filter((node) => node.kind === 'device').length,
     online: data.nodes.filter((node) => node.kind === 'device' && node.online).length,
+    memberships: data.edges.filter((edge) => edge.kind === 'membership').length,
   }), [data])
   return <div className="topology-summary" aria-label="拓扑摘要">
     <span><strong>{counts.accounts}</strong>账号</span>
     <span><strong>{counts.networks}</strong>网络</span>
-    <span><strong>{counts.online}/{counts.devices}</strong>设备在线</span>
+    {data.view === 'summary'
+      ? <span><strong>{counts.memberships}</strong>成员关系</span>
+      : <span><strong>{counts.online}/{counts.devices}</strong>设备在线</span>}
   </div>
 }
 
-export function TopologyCanvas({ data, loading, error, search = '', compact = false }: TopologyCanvasProps) {
+export function TopologyCanvas({ data, loading, streaming = false, error, search = '', compact = false }: TopologyCanvasProps) {
   const [fullscreen, setFullscreen] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showOffline, setShowOffline] = useState(true)
   const [showSignals, setShowSignals] = useState(true)
+  // Dagre is intentionally isolated from search. Typing in the search box now
+  // updates only presentation opacity and never recomputes graph coordinates.
+  const layoutGraph = useMemo(
+    () => data ? buildLayoutGraph(data, { showOffline, showSignals }) : { nodes: [], edges: [] },
+    [data, showOffline, showSignals],
+  )
   const graph = useMemo(
-    () => data ? buildGraph(data, { search, showOffline, showSignals }) : { nodes: [], edges: [] },
-    [data, search, showOffline, showSignals],
+    () => data ? applySearchHighlight(layoutGraph, data, search) : layoutGraph,
+    [layoutGraph, data, search],
   )
   const selected = data?.nodes.find((node) => node.id === selectedId)
   const accounts = useMemo(() => data?.nodes.filter((node) => node.kind === 'account') ?? [], [data])
 
-  if (loading) return <div className="topology-state"><div className="spinner" />正在构建拓扑…</div>
+  if (loading && !data) return <div className="topology-state"><div className="spinner" />正在构建拓扑…</div>
   if (error) return <div className="topology-state error"><CircleAlert size={18} />{error}</div>
   if (!data || data.nodes.length === 0) return <div className="topology-state"><Box size={18} />暂无可展示的拓扑数据</div>
 
@@ -262,14 +300,16 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         />}
       </ReactFlow>
 
+      {streaming && <div className="topology-streaming"><span className="spinner" />正在续传拓扑快照</div>}
+
       <div className="topology-canvas-actions">
         {!compact && <>
-          <button className={`topology-filter-button ${showOffline ? 'active' : ''}`} onClick={() => setShowOffline((value) => !value)} title="显示或隐藏离线设备">
+          {data.view !== 'summary' && <button className={`topology-filter-button ${showOffline ? 'active' : ''}`} onClick={() => setShowOffline((value) => !value)} title="显示或隐藏离线设备">
             {showOffline ? <Eye size={15} /> : <EyeOff size={15} />}离线设备
-          </button>
-          <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title="显示或隐藏待处理信令">
+          </button>}
+          {data.view !== 'summary' && <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title="显示或隐藏待处理信令">
             <RadioTower size={15} />待处理信令
-          </button>
+          </button>}
         </>}
         <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
           {fullscreen ? <Shrink size={16} /> : <Expand size={16} />}
@@ -279,18 +319,19 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
       <TopologySummary data={data} />
 
       {!compact && <aside className="topology-legend">
-        <div className="topology-legend-heading">账号颜色</div>
+        <div className="topology-legend-heading">账号身份</div>
         <div className="topology-account-legend-list">
           {accounts.map((account) => (
             <div className="legend-row" key={account.id}>
               <span className="legend-color" style={{ background: accountColor(account.account_id) }} />
-              <span title={account.label}>{account.label}</span>
+              <span className="legend-account-name" title={account.label}>{account.label}</span>
+              <code className="legend-account-code">#{accountIdentityCode(account.account_id)}</code>
             </div>
           ))}
         </div>
         <div className="topology-legend-heading edge-heading">关系</div>
         <div className="legend-row"><span className="legend-line solid" />成员 / 设备挂载</div>
-        <div className="legend-row"><span className="legend-line dashed" />待处理信令</div>
+        {data.view !== 'summary' && <div className="legend-row"><span className="legend-line dashed" />待处理信令</div>}
       </aside>}
 
       {selected && <DetailPanel node={selected} onClose={() => setSelectedId(null)} />}
