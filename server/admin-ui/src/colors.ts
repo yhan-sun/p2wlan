@@ -1,8 +1,15 @@
 const ACCOUNT_COLORS = [
-  '#2563eb', '#7c3aed', '#db2777', '#0891b2', '#059669', '#d97706',
+  '#2563eb', '#7c3aed', '#0891b2', '#059669', '#d97706', '#db2777',
   '#4f46e5', '#0f766e', '#9333ea', '#c2410c', '#0369a1', '#be123c',
+  '#1d4ed8', '#6d28d9', '#0e7490', '#047857', '#b45309', '#be185d',
+  '#4338ca', '#115e59', '#7e22ce', '#9a3412', '#075985', '#9f1239',
 ]
 
+/**
+ * Returns a stable, high-contrast account color. The palette is intentionally
+ * bounded instead of generating arbitrary RGB values so labels remain legible
+ * on both the topology canvas and white table surfaces.
+ */
 export function accountColor(id?: string): string {
   if (!id) return '#64748b'
   let hash = 2166136261
@@ -10,7 +17,7 @@ export function accountColor(id?: string): string {
     hash ^= id.charCodeAt(i)
     hash = Math.imul(hash, 16777619)
   }
-  return ACCOUNT_COLORS[Math.abs(hash) % ACCOUNT_COLORS.length]
+  return ACCOUNT_COLORS[(hash >>> 0) % ACCOUNT_COLORS.length]
 }
 
 export function colorWithAlpha(hex: string, alpha: number): string {
