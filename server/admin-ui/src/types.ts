@@ -85,8 +85,17 @@ export interface Page<T> {
   items: T[]
 }
 
+export interface CursorPage<T> {
+  total: number
+  limit: number
+  snapshot_at: number
+  next_cursor?: string
+  items: T[]
+}
+
 export type TopologyNodeKind = 'account' | 'network' | 'room' | 'device'
 export type TopologyEdgeKind = 'membership' | 'attachment' | 'pending_signal'
+export type TopologyView = 'summary' | 'full'
 
 export interface AdminTopologyNode {
   id: string
@@ -122,10 +131,28 @@ export interface AdminTopologyEdge {
 
 export interface AdminTopology {
   generated_at: number
+  snapshot_at?: number
   scope: 'global' | 'account'
+  view?: TopologyView
   focus_account_id?: string
   path_observation_available: boolean
   path_observation_note: string
+  complete?: boolean
+  nodes: AdminTopologyNode[]
+  edges: AdminTopologyEdge[]
+}
+
+export interface AdminTopologyPage {
+  generated_at: number
+  snapshot_at: number
+  scope: 'global' | 'account'
+  view: TopologyView
+  phase: string
+  focus_account_id?: string
+  path_observation_available: boolean
+  path_observation_note: string
+  complete: boolean
+  next_cursor?: string
   nodes: AdminTopologyNode[]
   edges: AdminTopologyEdge[]
 }
