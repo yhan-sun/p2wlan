@@ -241,6 +241,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         fitViewOptions={{ padding: compact ? 0.12 : 0.18, maxZoom: 1.05 }}
         minZoom={0.18}
         maxZoom={1.7}
+        onlyRenderVisibleElements
         nodesConnectable={false}
         nodesDraggable={false}
         onPaneClick={() => setSelectedId(null)}
