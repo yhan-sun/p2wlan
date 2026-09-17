@@ -622,6 +622,56 @@ sample_relay_status_pair() {
   record_relay_status_code b "${b_code:-000}"
 }
 
+# The Relay confirmation barrier needs the full authenticated JSON snapshots,
+# not only HTTP codes. Fetch both sides concurrently so a busy shared runner
+# cannot charge two independent diagnostics timeouts against one topology
+# deadline. The two subshells persist only result metadata; tokens never leave
+# their existing files and every JSON snapshot still goes through the same
+# fail-closed schema validation as a serial fetch.
+fetch_relay_barrier_status_pair() {
+  local request_timeout="$1"
+  local a_meta="$ROUND_DIR/.barrier-a-fetch"
+  local b_meta="$ROUND_DIR/.barrier-b-fetch"
+  local a_pid b_pid
+
+  (
+    local ok=0
+    if fetch_required_json \
+        "http://127.0.0.1:$DIAG_A_PORT/status" \
+        "$ROUND_DIR/node-a.barrier.status.json" status \
+        "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" "$request_timeout"; then
+      ok=1
+    fi
+    printf '%s\n%s\n%s\n' "$ok" "${FETCH_HTTP_STATUS:-000}" "${FETCH_REASON_CODE:-}" >"$a_meta"
+  ) &
+  a_pid=$!
+  (
+    local ok=0
+    if fetch_required_json \
+        "http://127.0.0.1:$DIAG_B_PORT/status" \
+        "$ROUND_DIR/node-b.barrier.status.json" status \
+        "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" "$request_timeout"; then
+      ok=1
+    fi
+    printf '%s\n%s\n%s\n' "$ok" "${FETCH_HTTP_STATUS:-000}" "${FETCH_REASON_CODE:-}" >"$b_meta"
+  ) &
+  b_pid=$!
+
+  wait "$a_pid"
+  wait "$b_pid"
+
+  mapfile -t barrier_a_meta <"$a_meta"
+  mapfile -t barrier_b_meta <"$b_meta"
+  rm -f "$a_meta" "$b_meta"
+
+  BARRIER_FETCH_A_OK=${barrier_a_meta[0]:-0}
+  BARRIER_FETCH_A_HTTP=${barrier_a_meta[1]:-000}
+  BARRIER_FETCH_A_REASON=${barrier_a_meta[2]:-}
+  BARRIER_FETCH_B_OK=${barrier_b_meta[0]:-0}
+  BARRIER_FETCH_B_HTTP=${barrier_b_meta[1]:-000}
+  BARRIER_FETCH_B_REASON=${barrier_b_meta[2]:-}
+}
+
 # A topology run introduces no one-shot Relay owner tasks. Every supervised
 # critical task present in the final status must still be running, unfinished,
 # and error-free; this turns a silent task exit into a Relay acceptance failure.
@@ -705,49 +755,36 @@ wait_for_relay_confirmation_barrier() {
     fi
     if (( request_timeout > 5 )); then request_timeout=5; fi
     if (( request_timeout < 1 )); then request_timeout=1; fi
-    if fetch_required_json \
-        "http://127.0.0.1:$DIAG_A_PORT/status" \
-        "$ROUND_DIR/node-a.barrier.status.json" status \
-        "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" "$request_timeout"; then
-      a_http=$FETCH_HTTP_STATUS
-      if [[ "$(node_task_health_ok "$ROUND_DIR/node-a.barrier.status.json")" == 1 ]]; then
-        a_tasks=true
-      else
-        result=task_failed
-        reason=critical_tasks_unhealthy
-        break
-      fi
-    else
-      a_http=${FETCH_HTTP_STATUS:-000}
+
+    fetch_relay_barrier_status_pair "$request_timeout"
+    a_http=${BARRIER_FETCH_A_HTTP:-000}
+    b_http=${BARRIER_FETCH_B_HTTP:-000}
+
+    if [[ "${BARRIER_FETCH_A_OK:-0}" != 1 ]]; then
       result=http_failure
-      reason=${FETCH_REASON_CODE:-status_unavailable}
+      reason=${BARRIER_FETCH_A_REASON:-status_unavailable}
       [[ "$reason" == status_schema_invalid ]] && result=schema_invalid
       break
     fi
-
-    request_timeout=$((deadline - SECONDS))
-    if (( request_timeout > ROUND_DEADLINE - SECONDS )); then
-      request_timeout=$((ROUND_DEADLINE - SECONDS))
-    fi
-    if (( request_timeout > 5 )); then request_timeout=5; fi
-    if (( request_timeout < 1 )); then request_timeout=1; fi
-    if fetch_required_json \
-        "http://127.0.0.1:$DIAG_B_PORT/status" \
-        "$ROUND_DIR/node-b.barrier.status.json" status \
-        "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" "$request_timeout"; then
-      b_http=$FETCH_HTTP_STATUS
-      if [[ "$(node_task_health_ok "$ROUND_DIR/node-b.barrier.status.json")" == 1 ]]; then
-        b_tasks=true
-      else
-        result=task_failed
-        reason=critical_tasks_unhealthy
-        break
-      fi
+    if [[ "$(node_task_health_ok "$ROUND_DIR/node-a.barrier.status.json")" == 1 ]]; then
+      a_tasks=true
     else
-      b_http=${FETCH_HTTP_STATUS:-000}
+      result=task_failed
+      reason=critical_tasks_unhealthy
+      break
+    fi
+
+    if [[ "${BARRIER_FETCH_B_OK:-0}" != 1 ]]; then
       result=http_failure
-      reason=${FETCH_REASON_CODE:-status_unavailable}
+      reason=${BARRIER_FETCH_B_REASON:-status_unavailable}
       [[ "$reason" == status_schema_invalid ]] && result=schema_invalid
+      break
+    fi
+    if [[ "$(node_task_health_ok "$ROUND_DIR/node-b.barrier.status.json")" == 1 ]]; then
+      b_tasks=true
+    else
+      result=task_failed
+      reason=critical_tasks_unhealthy
       break
     fi
 
