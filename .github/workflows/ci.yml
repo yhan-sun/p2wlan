@@ -172,9 +172,18 @@ jobs:
 
   include_format_export:
     name: Include format fix export
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.head_ref == 'chore/include-format-export-20260917' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
       - name: Install Rustfmt
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
@@ -209,6 +218,26 @@ jobs:
           printf '%s\n' "$(git rev-parse HEAD)" > "$out/source-head.txt"
           test "$(grep -c '^drift ' scripts/quality/include_format_baseline.txt || true)" -eq 0
           test "$(grep -c '^fragment ' scripts/quality/include_format_baseline.txt || true)" -eq 1
+      - name: Restore the permanent workflow before committing
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main --depth=1
+          git checkout origin/main -- .github/workflows/ci.yml
+          git diff --check
+          test "$(git diff --name-only | grep -c '^\.github/workflows/ci.yml$' || true)" -eq 0
+          test "$(git diff --name-only | wc -l | tr -d ' ')" -eq 167
+      - name: Commit the formatted sources to the fixed temporary branch
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add client scripts/quality/include_format_baseline.txt .github/workflows/ci.yml
+          git commit -m 'chore:清零 include! Rust 格式历史漂移'
+          git push origin "HEAD:${TARGET_BRANCH}"
       - name: Upload formatted include sources
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
