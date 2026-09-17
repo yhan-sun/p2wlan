@@ -93,7 +93,7 @@ func TestDisabledConsoleIsNotDiscoverable(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	for _, path := range []string{"/admin", "/admin/", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology"} {
+	for _, path := range []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		res := httptest.NewRecorder()
 		mux.ServeHTTP(res, req)
@@ -108,20 +108,28 @@ func TestConsoleServesEmbeddedUIWithSecurityHeaders(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	req := httptest.NewRequest(http.MethodGet, "/admin/", nil)
-	res := httptest.NewRecorder()
-	mux.ServeHTTP(res, req)
-	if res.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", res.Code)
+	for _, path := range []string{"/admin/", "/admin/accounts/u1", "/admin/topology"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d", path, res.Code)
+		}
+		if !strings.Contains(res.Body.String(), "P2WLAN") {
+			t.Fatalf("%s: expected embedded console HTML", path)
+		}
+		if got := res.Header().Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") {
+			t.Fatalf("%s: missing restrictive CSP: %q", path, got)
+		}
+		if got := res.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("%s: expected no-store, got %q", path, got)
+		}
 	}
-	if !strings.Contains(res.Body.String(), "P2WLAN") {
-		t.Fatalf("expected embedded console HTML")
-	}
-	if got := res.Header().Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") {
-		t.Fatalf("missing restrictive CSP: %q", got)
-	}
-	if got := res.Header().Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("expected no-store, got %q", got)
+
+	asset := httptest.NewRecorder()
+	mux.ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/admin/missing.js", nil))
+	if asset.Code != http.StatusNotFound {
+		t.Fatalf("unknown admin asset: expected 404, got %d", asset.Code)
 	}
 }
 
