@@ -86,7 +86,7 @@ func adminAccountColumns() string {
 		COALESCE(NULLIF(u.username, ''), u.email),
 		u.email,
 		(SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id),
-		(SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.online = 1),
+		(SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND ` + adminOnlineLeaseSQL("d") + `),
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.user_id = u.id AND m.network_id <> 'default'),
 		(SELECT COUNT(*) FROM network_memberships m JOIN rooms r ON r.network_id = m.network_id WHERE m.user_id = u.id),
 		COALESCE((SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = u.id), 0),
@@ -125,12 +125,14 @@ func (db *DB) AdminAccounts(query string, limit, offset int) (*AdminAccountPage,
 	if err := db.QueryRow(`SELECT COUNT(*) FROM users u WHERE `+where, args...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count admin accounts: %w", err)
 	}
+	accountArgs := append([]any{adminOnlineCutoff()}, args...)
+	accountArgs = append(accountArgs, limit, offset)
 	rows, err := db.Query(`SELECT `+adminAccountColumns()+`
 		FROM users u
 		WHERE `+where+`
 		ORDER BY COALESCE((SELECT MAX(d.last_seen) FROM devices d WHERE d.user_id = u.id), 0) DESC,
-			COALESCE(NULLIF(u.username, ''), u.email) COLLATE NOCASE ASC
-		LIMIT ? OFFSET ?`, append(args, limit, offset)...)
+			COALESCE(NULLIF(u.username, ''), u.email) COLLATE NOCASE ASC, u.id ASC
+		LIMIT ? OFFSET ?`, accountArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list admin accounts: %w", err)
 	}
@@ -154,8 +156,9 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 	if accountID == "" || accountID == "system" {
 		return nil, ErrAdminAccountNotFound
 	}
+	cutoff := adminOnlineCutoff()
 	account, err := scanAdminAccount(db.QueryRow(`SELECT `+adminAccountColumns()+`
-		FROM users u WHERE u.id = ? AND u.id <> 'system'`, accountID))
+		FROM users u WHERE u.id = ? AND u.id <> 'system'`, cutoff, accountID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrAdminAccountNotFound
 	}
@@ -175,12 +178,12 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 		JOIN users u ON u.id = d.user_id
 		LEFT JOIN networks n ON n.id = d.network_id
 		WHERE d.user_id = ?
-		ORDER BY d.online DESC, d.last_seen DESC, d.device_name COLLATE NOCASE ASC`, accountID)
+		ORDER BY `+adminOnlineLeaseSQL("d")+` DESC, d.last_seen DESC, d.device_name COLLATE NOCASE ASC, d.id ASC`, accountID, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("load admin account devices: %w", err)
 	}
 	for deviceRows.Next() {
-		item, scanErr := scanAdminDevice(deviceRows)
+		item, scanErr := scanAdminDevice(deviceRows, cutoff)
 		if scanErr != nil {
 			deviceRows.Close()
 			return nil, fmt.Errorf("scan admin account device: %w", scanErr)
@@ -199,14 +202,14 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 		COALESCE(NULLIF(owner.username, ''), owner.email),
 		(SELECT COUNT(*) FROM network_memberships m2 WHERE m2.network_id = n.id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id AND d.online = 1),
+		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id AND `+adminOnlineLeaseSQL("d")+`),
 		EXISTS(SELECT 1 FROM rooms r WHERE r.network_id = n.id),
 		n.created_at
 		FROM network_memberships m
 		JOIN networks n ON n.id = m.network_id
 		JOIN users owner ON owner.id = n.owner_id
 		WHERE m.user_id = ? AND n.id <> 'default'
-		ORDER BY n.name COLLATE NOCASE ASC`, accountID)
+		ORDER BY n.name COLLATE NOCASE ASC, n.id ASC`, cutoff, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("load admin account networks: %w", err)
 	}
@@ -232,14 +235,14 @@ func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
 		COALESCE(NULLIF(owner.username, ''), owner.email),
 		(SELECT COUNT(*) FROM network_memberships m2 WHERE m2.network_id = r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id AND d.online = 1),
+		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id AND `+adminOnlineLeaseSQL("d")+`),
 		r.join_locked, r.created_at
 		FROM network_memberships m
 		JOIN rooms r ON r.network_id = m.network_id
 		JOIN networks n ON n.id = r.network_id
 		JOIN users owner ON owner.id = r.owner_id
 		WHERE m.user_id = ?
-		ORDER BY n.name COLLATE NOCASE ASC`, accountID)
+		ORDER BY n.name COLLATE NOCASE ASC, r.network_id ASC`, cutoff, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("load admin account rooms: %w", err)
 	}
@@ -290,6 +293,7 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 	if accountID != "" {
 		result.Scope = "account"
 	}
+	cutoff := adminOnlineCutoff()
 
 	accountWhere := `u.id <> 'system'`
 	networkWhere := `n.id <> 'default'`
@@ -310,7 +314,7 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 
 	accountRows, err := db.Query(`SELECT u.id, COALESCE(NULLIF(u.username, ''), u.email)
 		FROM users u WHERE `+accountWhere+`
-		ORDER BY COALESCE(NULLIF(u.username, ''), u.email) COLLATE NOCASE ASC`, accountArgs...)
+		ORDER BY COALESCE(NULLIF(u.username, ''), u.email) COLLATE NOCASE ASC, u.id ASC`, accountArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("topology accounts: %w", err)
 	}
@@ -333,7 +337,7 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 		EXISTS(SELECT 1 FROM rooms r WHERE r.network_id = n.id),
 		COALESCE((SELECT r.room_code FROM rooms r WHERE r.network_id = n.id), '')
 		FROM networks n WHERE `+networkWhere+`
-		ORDER BY n.name COLLATE NOCASE ASC`, networkArgs...)
+		ORDER BY n.name COLLATE NOCASE ASC, n.id ASC`, networkArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("topology networks: %w", err)
 	}
@@ -379,12 +383,13 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 	}
 
 	deviceIDs := map[string]struct{}{}
+	deviceArgs = append(deviceArgs, cutoff)
 	deviceRows, err := db.Query(`SELECT d.id, d.user_id, COALESCE(NULLIF(u.username, ''), u.email),
 		d.device_name, d.platform, d.virtual_ip, d.network_id, d.nat_type, d.relay_rtt_ms,
 		d.last_seen, COALESCE(d.app_version, ''), d.online
 		FROM devices d JOIN users u ON u.id = d.user_id
 		WHERE `+deviceWhere+`
-		ORDER BY d.online DESC, d.device_name COLLATE NOCASE ASC`, deviceArgs...)
+		ORDER BY `+adminOnlineLeaseSQL("d")+` DESC, d.device_name COLLATE NOCASE ASC, d.id ASC`, deviceArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("topology devices: %w", err)
 	}
@@ -397,7 +402,7 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 			deviceRows.Close()
 			return nil, fmt.Errorf("scan topology device: %w", err)
 		}
-		online := onlineInt == 1
+		online := adminDeviceOnline(int64(onlineInt), lastSeen, cutoff)
 		deviceIDs[id] = struct{}{}
 		result.Nodes = append(result.Nodes, AdminTopologyNode{ID: "device:" + id, Kind: "device", Label: name, AccountID: userID, Username: username, NetworkID: networkID, VirtualIP: virtualIP, Platform: platform, NATType: natType, AppVersion: appVersion, RelayRTTMS: nullInt64Ptr(relayRTT), LastSeen: lastSeen, Online: &online, Focus: accountID != "" && userID == accountID})
 		result.Edges = append(result.Edges, AdminTopologyEdge{ID: "attachment:" + id, Source: "network:" + networkID, Target: "device:" + id, Kind: "attachment"})
@@ -420,12 +425,13 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 		personalWhere += ` AND d.user_id = ?`
 		personalArgs = append(personalArgs, accountID)
 	}
+	personalArgs = append(personalArgs, cutoff)
 	personalRows, err := db.Query(`SELECT d.id, d.user_id, COALESCE(NULLIF(u.username, ''), u.email),
 		d.device_name, d.platform, d.virtual_ip, d.network_id, d.nat_type, d.relay_rtt_ms,
 		d.last_seen, COALESCE(d.app_version, ''), d.online
 		FROM devices d JOIN users u ON u.id = d.user_id
 		WHERE `+personalWhere+`
-		ORDER BY d.online DESC, d.device_name COLLATE NOCASE ASC`, personalArgs...)
+		ORDER BY `+adminOnlineLeaseSQL("d")+` DESC, d.device_name COLLATE NOCASE ASC, d.id ASC`, personalArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("topology personal devices: %w", err)
 	}
@@ -438,7 +444,7 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 			personalRows.Close()
 			return nil, fmt.Errorf("scan topology personal device: %w", err)
 		}
-		online := onlineInt == 1
+		online := adminDeviceOnline(int64(onlineInt), lastSeen, cutoff)
 		deviceIDs[id] = struct{}{}
 		result.Nodes = append(result.Nodes, AdminTopologyNode{ID: "device:" + id, Kind: "device", Label: name, AccountID: userID, Username: username, NetworkID: networkID, VirtualIP: virtualIP, Platform: platform, NATType: natType, AppVersion: appVersion, RelayRTTMS: nullInt64Ptr(relayRTT), LastSeen: lastSeen, Online: &online, Focus: accountID != "" && userID == accountID})
 		result.Edges = append(result.Edges, AdminTopologyEdge{ID: "personal-attachment:" + id, Source: "account:" + userID, Target: "device:" + id, Kind: "attachment", Role: "private-default"})
@@ -452,7 +458,8 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 
 	// Signaling is durable coordination state, not proof of a connected data path.
 	signalRows, err := db.Query(`SELECT from_node_id, to_node_id, type, COUNT(*), MAX(created_at)
-		FROM signals GROUP BY from_node_id, to_node_id, type ORDER BY MAX(created_at) DESC`)
+		FROM signals GROUP BY from_node_id, to_node_id, type
+		ORDER BY MAX(created_at) DESC, from_node_id ASC, to_node_id ASC, type ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("topology pending signals: %w", err)
 	}

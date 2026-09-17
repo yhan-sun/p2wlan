@@ -104,6 +104,26 @@ func normalizeAdminPage(limit, offset int) (int, int) {
 	return limit, offset
 }
 
+// adminOnlineCutoff is the lease boundary bound to adminOnlineLeaseSQL.
+func adminOnlineCutoff() int64 {
+	return time.Now().Unix() - DeviceOnlineTTL
+}
+
+// adminOnlineLeaseSQL builds the device-online predicate that mirrors the
+// authoritative lease semantics in listDevices. Device online state has exactly
+// one owner: a heartbeat lease that expires after DeviceOnlineTTL. Admin queries
+// must not read the raw online column directly, because only a graceful daemon
+// shutdown clears that flag and an abnormal exit would otherwise be reported as
+// online forever. Callers bind adminOnlineCutoff() for the "?" placeholder.
+func adminOnlineLeaseSQL(alias string) string {
+	return fmt.Sprintf("(%s.online = 1 AND %s.last_seen > 0 AND %s.last_seen >= ?)", alias, alias, alias)
+}
+
+// adminDeviceOnline applies the same lease rule to a row already read into Go.
+func adminDeviceOnline(online, lastSeen int64, cutoff int64) bool {
+	return online == 1 && lastSeen > 0 && lastSeen >= cutoff
+}
+
 func adminDeviceColumns() string {
 	return `d.id,
 		COALESCE(NULLIF(u.username, ''), u.email),
@@ -119,7 +139,7 @@ func adminDeviceColumns() string {
 		d.online`
 }
 
-func scanAdminDevice(row interface{ Scan(...any) error }) (AdminDeviceSummary, error) {
+func scanAdminDevice(row interface{ Scan(...any) error }, cutoff int64) (AdminDeviceSummary, error) {
 	var item AdminDeviceSummary
 	var online int
 	var relayRTT sql.NullInt64
@@ -140,7 +160,7 @@ func scanAdminDevice(row interface{ Scan(...any) error }) (AdminDeviceSummary, e
 	if err != nil {
 		return AdminDeviceSummary{}, err
 	}
-	item.Online = online == 1
+	item.Online = adminDeviceOnline(int64(online), item.LastSeen, cutoff)
 	item.RelayRTTMS = nullInt64Ptr(relayRTT)
 	return item, nil
 }
@@ -155,15 +175,16 @@ func (db *DB) AdminOverviewSnapshot() (*AdminOverview, error) {
 	defer tx.Rollback()
 
 	result := &AdminOverview{GeneratedAt: time.Now().Unix(), RecentDevices: []AdminDeviceSummary{}}
+	cutoff := adminOnlineCutoff()
 	countQuery := `SELECT
 		(SELECT COUNT(*) FROM users WHERE id <> 'system'),
 		(SELECT COUNT(*) FROM networks WHERE id <> 'default'),
 		(SELECT COUNT(*) FROM rooms),
 		(SELECT COUNT(*) FROM devices),
-		(SELECT COUNT(*) FROM devices WHERE online = 1),
+		(SELECT COUNT(*) FROM devices WHERE ` + adminOnlineLeaseSQL("devices") + `),
 		(SELECT COUNT(*) FROM tunnels WHERE active = 1),
 		(SELECT COUNT(*) FROM signals)`
-	if err := tx.QueryRow(countQuery).Scan(
+	if err := tx.QueryRow(countQuery, cutoff).Scan(
 		&result.Users,
 		&result.Networks,
 		&result.Rooms,
@@ -185,7 +206,7 @@ func (db *DB) AdminOverviewSnapshot() (*AdminOverview, error) {
 		return nil, fmt.Errorf("admin recent devices: %w", err)
 	}
 	for rows.Next() {
-		item, scanErr := scanAdminDevice(rows)
+		item, scanErr := scanAdminDevice(rows, cutoff)
 		if scanErr != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan admin recent device: %w", scanErr)
@@ -214,6 +235,7 @@ func (db *DB) AdminDevices(query, status string, limit, offset int) (*AdminDevic
 
 	where := []string{"1 = 1"}
 	args := make([]any, 0, 8)
+	cutoff := adminOnlineCutoff()
 	if query != "" {
 		where = append(where, `(d.device_name LIKE ? ESCAPE '!' OR COALESCE(NULLIF(u.username, ''), u.email) LIKE ? ESCAPE '!' OR d.virtual_ip LIKE ? ESCAPE '!' OR COALESCE(n.name, '') LIKE ? ESCAPE '!')`)
 		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query)
@@ -222,9 +244,11 @@ func (db *DB) AdminDevices(query, status string, limit, offset int) (*AdminDevic
 	}
 	switch status {
 	case "online":
-		where = append(where, "d.online = 1")
+		where = append(where, adminOnlineLeaseSQL("d"))
+		args = append(args, cutoff)
 	case "offline":
-		where = append(where, "d.online = 0")
+		where = append(where, "NOT "+adminOnlineLeaseSQL("d"))
+		args = append(args, cutoff)
 	case "", "all":
 	default:
 		return nil, ErrInvalidAdminDeviceStatus
@@ -241,13 +265,13 @@ func (db *DB) AdminDevices(query, status string, limit, offset int) (*AdminDevic
 		return nil, fmt.Errorf("count admin devices: %w", err)
 	}
 
-	listArgs := append(append([]any(nil), args...), limit, offset)
+	listArgs := append(append([]any(nil), args...), cutoff, limit, offset)
 	rows, err := db.Query(`SELECT `+adminDeviceColumns()+`
 		FROM devices d
 		JOIN users u ON u.id = d.user_id
 		LEFT JOIN networks n ON n.id = d.network_id
 		WHERE `+clause+`
-		ORDER BY d.online DESC, d.last_seen DESC, d.device_name COLLATE NOCASE ASC
+		ORDER BY `+adminOnlineLeaseSQL("d")+` DESC, d.last_seen DESC, d.device_name COLLATE NOCASE ASC, d.id ASC
 		LIMIT ? OFFSET ?`, listArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list admin devices: %w", err)
@@ -256,7 +280,7 @@ func (db *DB) AdminDevices(query, status string, limit, offset int) (*AdminDevic
 
 	items := make([]AdminDeviceSummary, 0, min(limit, total))
 	for rows.Next() {
-		item, scanErr := scanAdminDevice(rows)
+		item, scanErr := scanAdminDevice(rows, cutoff)
 		if scanErr != nil {
 			return nil, fmt.Errorf("scan admin device: %w", scanErr)
 		}
@@ -274,6 +298,7 @@ func (db *DB) AdminNetworks(limit, offset int) (*AdminNetworkPage, error) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM networks WHERE id <> 'default'`).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count admin networks: %w", err)
 	}
+	cutoff := adminOnlineCutoff()
 	rows, err := db.Query(`SELECT
 		n.id,
 		n.name,
@@ -281,14 +306,14 @@ func (db *DB) AdminNetworks(limit, offset int) (*AdminNetworkPage, error) {
 		COALESCE(NULLIF(u.username, ''), u.email),
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id = n.id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id AND d.online = 1),
+		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id AND `+adminOnlineLeaseSQL("d")+`),
 		EXISTS(SELECT 1 FROM rooms r WHERE r.network_id = n.id),
 		n.created_at
 		FROM networks n
 		JOIN users u ON u.id = n.owner_id
 		WHERE n.id <> 'default'
-		ORDER BY n.created_at DESC, n.name COLLATE NOCASE ASC
-		LIMIT ? OFFSET ?`, limit, offset)
+		ORDER BY n.created_at DESC, n.name COLLATE NOCASE ASC, n.id ASC
+		LIMIT ? OFFSET ?`, cutoff, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list admin networks: %w", err)
 	}
@@ -315,6 +340,7 @@ func (db *DB) AdminRooms(limit, offset int) (*AdminRoomPage, error) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM rooms`).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count admin rooms: %w", err)
 	}
+	cutoff := adminOnlineCutoff()
 	rows, err := db.Query(`SELECT
 		r.network_id,
 		r.room_code,
@@ -323,14 +349,14 @@ func (db *DB) AdminRooms(limit, offset int) (*AdminRoomPage, error) {
 		COALESCE(NULLIF(u.username, ''), u.email),
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id = r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id AND d.online = 1),
+		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id AND `+adminOnlineLeaseSQL("d")+`),
 		r.join_locked,
 		r.created_at
 		FROM rooms r
 		JOIN networks n ON n.id = r.network_id
 		JOIN users u ON u.id = r.owner_id
-		ORDER BY r.created_at DESC, n.name COLLATE NOCASE ASC
-		LIMIT ? OFFSET ?`, limit, offset)
+		ORDER BY r.created_at DESC, n.name COLLATE NOCASE ASC, r.network_id ASC
+		LIMIT ? OFFSET ?`, cutoff, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list admin rooms: %w", err)
 	}
