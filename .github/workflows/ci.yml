@@ -54,7 +54,8 @@ jobs:
           git fetch --no-tags origin main --depth=1
           git checkout origin/main -- .github/workflows/ci.yml
           git diff --check
-          test "$(git diff --name-only | wc -l | tr -d ' ')" -eq 168
+          test "$(git diff HEAD --name-only | wc -l | tr -d ' ')" -eq 168
+          test "$(git diff HEAD --name-only | grep -Ev '^(\.github/workflows/ci\.yml|scripts/quality/include_format_baseline\.txt|client/.*\.rs)$' | wc -l | tr -d ' ')" -eq 0
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add client scripts/quality/include_format_baseline.txt .github/workflows/ci.yml
