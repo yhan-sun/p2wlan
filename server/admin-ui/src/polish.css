@@ -1,0 +1,318 @@
+/* Final product polish layered on top of the base control-plane styles.
+ * Keep this file focused on readability, dense-data ergonomics and topology
+ * controls so the visual system can evolve without coupling it to graph logic.
+ */
+
+:root {
+  --content-max: 1720px;
+}
+
+/* The first pass was visually too compressed for an operations console.
+ * Keep density, but do not make administrators read 8px table text. */
+.page-stack {
+  max-width: var(--content-max);
+}
+
+.page-intro h2 {
+  font-size: 20px;
+}
+
+.page-intro p,
+.panel-v2-header p,
+.metric-copy p,
+.search-field input,
+.select-field,
+.text-link {
+  font-size: 12px;
+}
+
+.panel-v2-header h2 {
+  font-size: 14px;
+}
+
+.metric-copy > span,
+.detail-list dt,
+.detail-list dd {
+  font-size: 11px;
+}
+
+.metric-copy strong {
+  font-size: 27px;
+}
+
+.identity-cell strong,
+.primary-secondary strong,
+.ratio-cell strong,
+.recent-account-main strong,
+.recent-account-stat strong {
+  font-size: 12px;
+}
+
+.identity-cell span,
+.primary-secondary span,
+.ratio-cell span,
+.recent-account-main span,
+.recent-account-stat span,
+.recent-account-time {
+  font-size: 10px;
+}
+
+.data-table th {
+  height: 43px;
+  font-size: 10px;
+}
+
+.data-table td {
+  height: 58px;
+  font-size: 11px;
+}
+
+.status-label,
+.pagination-v2,
+.badge {
+  font-size: 10px;
+}
+
+.tabs-v2 button {
+  font-size: 11px;
+}
+
+.account-color-label,
+.topology-detail-type,
+.topology-legend-heading,
+.system-hero span {
+  font-size: 9px;
+}
+
+.account-hero-copy p,
+.account-hero-stats span,
+.topology-node-copy > span,
+.topology-detail-owner,
+.topology-detail dt,
+.topology-detail dd,
+.truth-notice,
+.control-summary-grid small,
+.system-metrics span {
+  font-size: 10px;
+}
+
+.topology-node-title-row strong {
+  font-size: 12px;
+}
+
+/* Topology command bar. It deliberately stays small and neutral; account
+ * identity belongs to graph colors, not toolbar chrome. */
+.topology-canvas-actions {
+  position: absolute;
+  z-index: 9;
+  top: 12px;
+  right: 52px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.topology-filter-button {
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid rgba(208, 213, 221, .9);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .94);
+  color: #667085;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, .045);
+  backdrop-filter: blur(8px);
+  font-size: 10px;
+  font-weight: 650;
+  transition: border-color .14s ease, background .14s ease, color .14s ease, box-shadow .14s ease;
+}
+
+.topology-filter-button:hover {
+  border-color: #b9c2cf;
+  color: #344054;
+  background: #fff;
+}
+
+.topology-filter-button.active {
+  border-color: #bfd1f7;
+  color: #245fca;
+  background: #f4f7ff;
+  box-shadow: 0 4px 12px rgba(47, 111, 236, .07);
+}
+
+/* A compact factual summary makes very large graphs readable before zooming. */
+.topology-summary {
+  position: absolute;
+  z-index: 7;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid rgba(208, 213, 221, .88);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .94);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, .06);
+  backdrop-filter: blur(8px);
+}
+
+.topology-summary span {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  border-right: 1px solid #edf0f3;
+  color: #667085;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.topology-summary span:last-child {
+  border-right: 0;
+}
+
+.topology-summary strong {
+  color: #344054;
+  font-size: 10px;
+}
+
+/* Hundreds of accounts should not turn the legend into a page-sized overlay. */
+.topology-account-legend-list {
+  max-height: min(230px, 32vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.topology-account-legend-list .legend-row span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topology-legend {
+  max-height: min(390px, calc(100% - 96px));
+}
+
+.legend-row {
+  font-size: 9px;
+}
+
+/* React Flow controls live at bottom-left; move the summary far enough right
+ * so the two remain independently clickable. */
+.topology-canvas .react-flow__controls {
+  left: 12px !important;
+  bottom: 54px !important;
+}
+
+.topology-detail {
+  right: 12px;
+  top: 54px;
+  width: min(292px, calc(100% - 24px));
+}
+
+.topology-detail h3 {
+  max-width: 220px;
+  font-size: 15px;
+}
+
+.topology-detail dl div {
+  min-height: 39px;
+}
+
+/* Make the selected graph object obvious without using status colors for
+ * identity. React Flow adds this class to selected nodes. */
+.react-flow__node.selected {
+  z-index: 3 !important;
+}
+
+.react-flow__node.selected > div {
+  outline: 2px solid rgba(47, 111, 236, .22);
+  outline-offset: 2px;
+}
+
+/* Long account/device tables need a stable header while operators scan. */
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.data-table tbody tr.clickable:focus-within td,
+.data-table tbody tr.clickable:hover td {
+  background: #f8faff;
+}
+
+/* Fullscreen topology is a real workspace rather than a modal-looking card. */
+.topology-canvas.fullscreen {
+  inset: 10px;
+  background: #f8fafc;
+}
+
+.topology-canvas.fullscreen .topology-detail {
+  top: 54px;
+}
+
+@media (max-width: 900px) {
+  .topology-canvas-actions {
+    right: 50px;
+  }
+
+  .topology-filter-button {
+    padding: 0 8px;
+  }
+
+  .topology-summary {
+    left: 10px;
+    bottom: 10px;
+  }
+}
+
+@media (max-width: 650px) {
+  .data-table th,
+  .data-table td {
+    font-size: 10px;
+  }
+
+  .topology-canvas-actions {
+    left: 10px;
+    right: 48px;
+    justify-content: flex-end;
+  }
+
+  .topology-filter-button {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+    font-size: 0;
+  }
+
+  .topology-filter-button svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .topology-summary {
+    display: none;
+  }
+
+  .topology-canvas .react-flow__controls {
+    bottom: 12px !important;
+  }
+
+  .topology-detail {
+    left: 10px;
+    right: 10px;
+    top: auto;
+    bottom: 10px;
+    width: auto;
+    max-height: min(360px, 55vh);
+    overflow-y: auto;
+  }
+}
