@@ -58,14 +58,14 @@ class LogFormatCompatibility(unittest.TestCase):
         pair = shell_function(NAT, 'fetch_relay_barrier_status_pair')
         barrier = shell_function(NAT, 'wait_for_relay_confirmation_barrier')
 
-        self.assertEqual(pair.count('fetch_required_json \\\n'), 2)
+        self.assertEqual(pair.count('fetch_required_json'), 2)
         self.assertGreaterEqual(pair.count(') &'), 2)
         self.assertIn('a_pid=$!', pair)
         self.assertIn('b_pid=$!', pair)
         self.assertIn('wait "$a_pid"', pair)
         self.assertIn('wait "$b_pid"', pair)
         self.assertIn('fetch_relay_barrier_status_pair "$request_timeout"', barrier)
-        self.assertNotIn('fetch_required_json \\\n', barrier)
+        self.assertNotIn('fetch_required_json', barrier)
 
     def test_nat_barrier_keeps_original_deadline_instead_of_extending_it(self):
         barrier = shell_function(NAT, 'wait_for_relay_confirmation_barrier')
