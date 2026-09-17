@@ -60,9 +60,13 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 先用 p2wlan-config 在新目录生成匹配的 Control/Relay 配置，再按[配置参考](../reference/configuration.md)填入域名、证书和密钥。配置文件和数据库应由专用 p2wlan 用户拥有，权限分别限制为服务需要的最小范围。
 
-`p2wlan-config` 会和 JWT、Relay 凭据一起生成独立的 256-bit `CONTROL_ADMIN_TOKEN` 并写入受保护的 `control.env`，因此标准自托管流程不需要再手工制造管理台凭据。生成器不会把这些秘密打印到 stdout，也不会覆盖已有部署。管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；如果部署者希望完全关闭管理面，删除 `CONTROL_ADMIN_TOKEN` 后重启 Control 即可，此时 `/admin` 与 `/admin/*` 返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
+`p2wlan-config` 会和 JWT、Relay 凭据一起生成独立的 256-bit `CONTROL_ADMIN_TOKEN` 并写入受保护的 `control.env`，因此使用 `p2wlan-config` 的部署不需要手工制造管理台凭据。生成器不会把这些秘密打印到 stdout，也不会覆盖已有部署。
 
-管理台源码位于 `server/admin-ui/`；CI 使用固定 Node 版本将其构建到 `server/admin/web/`，服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证最终归档不会因为仓库中残留的旧静态文件而携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
+使用发布归档的 `install-server.sh` 安装时，`p2wlan-server init` 生成的是最小 `control.env`（只有监听、数据库、日志目录和 `JWT_SECRET`），其中不含 `CONTROL_ADMIN_TOKEN`，因此这类部署默认没有管理台。要启用管理台，请在 `control.env` 中追加 `CONTROL_ADMIN_TOKEN=$(openssl rand -hex 32)` 后重启 Control。
+
+管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
+
+管理台源码位于 `server/admin-ui/`；CI 按锁文件执行 `npm ci` 并重新构建，再与仓库中已提交的 `server/admin/web/` 逐字节比对，因此源码改动后忘记重新构建会被 CI 拦下。服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证发布归档和本地 `go build` 都不会携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
 
 管理员令牌不能与 `JWT_SECRET`、设备凭据、Relay ticket 或撤权 feed token 复用，也不要放入 URL、公开日志或反向代理访问日志字段。页面中的账号、membership、设备挂载、在线状态、Relay RTT、隧道和 signaling 来自 Control 已提交状态；当前页面不会把这些字段推断成真实 Direct/Relay 路径，也不等于 TUN 或业务应用已经端到端可达。
 

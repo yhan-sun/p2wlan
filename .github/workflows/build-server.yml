@@ -55,13 +55,12 @@ jobs:
           node-version: "22.16.0"
           cache: npm
           cache-dependency-path: server/admin-ui/package-lock.json
-        continue-on-error: true
 
       - name: Build embedded admin UI
         working-directory: server/admin-ui
         run: |
           set -euo pipefail
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm run typecheck
           npm run build
           test -s ../admin/web/index.html
