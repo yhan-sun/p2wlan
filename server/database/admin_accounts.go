@@ -577,7 +577,6 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 	return result, nil
 }
 
-
 func normalizeAdminTopologyPage(accountLimit, nodeBudget int) (int, int) {
 	if accountLimit <= 0 {
 		accountLimit = adminTopologyDefaultAccountLimit
@@ -701,7 +700,10 @@ func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget 
 	if err != nil {
 		return nil, fmt.Errorf("page topology networks: %w", err)
 	}
-	type networkRow struct{ id, name, cidr, ownerID, roomCode string; isRoom int }
+	type networkRow struct {
+		id, name, cidr, ownerID, roomCode string
+		isRoom                            int
+	}
 	networks := make([]networkRow, 0, remainingNodes+1)
 	for networkRows.Next() {
 		var item networkRow
@@ -758,7 +760,7 @@ func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget 
 					return nil, fmt.Errorf("scan topology page membership: %w", err)
 				}
 				memberships = append(memberships, AdminTopologyEdge{
-					ID: "membership:" + userID + ":" + networkID,
+					ID:     "membership:" + userID + ":" + networkID,
 					Source: "account:" + userID, Target: "network:" + networkID,
 					Kind: "membership", Role: role,
 				})
@@ -794,9 +796,9 @@ func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget 
 	}
 	type deviceRow struct {
 		id, userID, username, name, platform, virtualIP, networkID, natType, appVersion string
-		relayRTT sql.NullInt64
-		lastSeen int64
-		onlineInt int
+		relayRTT                                                                        sql.NullInt64
+		lastSeen                                                                        int64
+		onlineInt                                                                       int
 	}
 	devices := make([]deviceRow, 0, remainingNodes+1)
 	for deviceRows.Next() {
@@ -885,7 +887,7 @@ func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget 
 					return nil, fmt.Errorf("scan topology page signal: %w", err)
 				}
 				signals = append(signals, AdminTopologyEdge{
-					ID: fmt.Sprintf("signal:%s:%s:%s", fromID, toID, signalType),
+					ID:     fmt.Sprintf("signal:%s:%s:%s", fromID, toID, signalType),
 					Source: "device:" + fromID, Target: "device:" + toID,
 					Kind: "pending_signal", SignalType: signalType, Count: count, CreatedAt: createdAt,
 				})

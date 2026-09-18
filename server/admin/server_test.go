@@ -63,19 +63,19 @@ func (fakeStore) AdminTopology(accountID string) (*database.AdminTopology, error
 func (fakeStore) AdminTopologyPage(after string, accountLimit, nodeBudget int) (*database.AdminTopologyPage, error) {
 	return &database.AdminTopologyPage{
 		AdminTopology: database.AdminTopology{
-			GeneratedAt: 10,
-			Scope: "global",
+			GeneratedAt:              10,
+			Scope:                    "global",
 			PathObservationAvailable: false,
-			PathObservationNote: "path telemetry unavailable",
-			Nodes: []database.AdminTopologyNode{{ID: "account:u1", Kind: "account", AccountID: "u1", Label: "alice"}},
-			Edges: []database.AdminTopologyEdge{},
+			PathObservationNote:      "path telemetry unavailable",
+			Nodes:                    []database.AdminTopologyNode{{ID: "account:u1", Kind: "account", AccountID: "u1", Label: "alice"}},
+			Edges:                    []database.AdminTopologyEdge{},
 		},
-		NextCursor: "",
-		Complete: true,
+		NextCursor:     "",
+		Complete:       true,
 		LoadedAccounts: 1,
-		TotalAccounts: 1,
-		NodeBudget: nodeBudget,
-		EdgeBudget: 4000,
+		TotalAccounts:  1,
+		NodeBudget:     nodeBudget,
+		EdgeBudget:     4000,
 	}, nil
 }
 

@@ -332,7 +332,6 @@ func TestAdminFocusTopologyKeepsDefaultOnlyAccount(t *testing.T) {
 	}
 }
 
-
 func TestAdminTopologyPageUsesStableAccountCursor(t *testing.T) {
 	db, err := New(":memory:")
 	if err != nil {
@@ -434,7 +433,6 @@ func TestAdminTopologyPageKeepsDefaultDevicesAccountPrivate(t *testing.T) {
 	}
 }
 
-
 func TestAdminAccountsCursorIsStableAcrossActivityChanges(t *testing.T) {
 	db, err := New(":memory:")
 	if err != nil {
@@ -469,7 +467,6 @@ func TestAdminAccountsCursorIsStableAcrossActivityChanges(t *testing.T) {
 		t.Fatalf("unexpected next cursor on final page: %+v", second)
 	}
 }
-
 
 func TestAdminTopologyPageCarriesCrossPageSignalsUntilTargetLoads(t *testing.T) {
 	db, err := New(":memory:")
