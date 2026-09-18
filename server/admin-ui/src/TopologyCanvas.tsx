@@ -25,7 +25,7 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { accountColor, colorWithAlpha } from './colors'
+import { accountColor, accountIdentity, colorWithAlpha } from './colors'
 import type { AdminTopology, AdminTopologyNode } from './types'
 
 interface TopologyCanvasProps {
@@ -69,7 +69,8 @@ function ownerColor(node: AdminTopologyNode): string {
 }
 
 function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
-  const color = ownerColor(node)
+  const identity = accountIdentity(node.account_id || (node.kind === 'account' ? node.account_id : node.owner_id))
+  const color = identity.color
   return (
     <div className="topology-node-content">
       <div className="topology-node-icon" style={{ color, background: colorWithAlpha(color, 0.1) }}>
@@ -78,6 +79,7 @@ function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
       <div className="topology-node-copy">
         <div className="topology-node-title-row">
           <strong>{node.label}</strong>
+          <span className="account-identity-code" style={{ color, borderColor: colorWithAlpha(color, 0.3), background: colorWithAlpha(color, 0.08) }}>{identity.code}</span>
           {node.kind === 'device' && <span className={`presence-dot ${node.online ? 'online' : ''}`} title={node.online ? '在线' : '离线'} />}
         </div>
         <span>{nodeMeta(node)}</span>
@@ -87,14 +89,36 @@ function TopologyNodeLabel({ node }: { node: AdminTopologyNode }) {
 }
 
 interface GraphOptions {
-  search: string
   showOffline: boolean
   showSignals: boolean
 }
 
-function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]; edges: Edge[] } {
-  const { search, showOffline, showSignals } = options
+function topologyNodeMatches(node: AdminTopologyNode, normalizedSearch: string): boolean {
+  if (!normalizedSearch) return true
+  return [node.label, node.username, node.virtual_ip, node.cidr, node.room_code, node.platform]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(normalizedSearch))
+}
+
+function applySearch(graph: { nodes: Node[]; edges: Edge[] }, data: AdminTopology, search: string): { nodes: Node[]; edges: Edge[] } {
   const normalizedSearch = search.trim().toLowerCase()
+  if (!normalizedSearch) return graph
+  const sourceNodes = new Map(data.nodes.map((node) => [node.id, node]))
+  const matchedIds = new Set(data.nodes.filter((node) => topologyNodeMatches(node, normalizedSearch)).map((node) => node.id))
+  return {
+    nodes: graph.nodes.map((node) => ({ ...node, style: { ...node.style, opacity: matchedIds.has(node.id) ? 1 : 0.16 } })),
+    edges: graph.edges.map((edge) => {
+      const matches = matchedIds.has(edge.source) || matchedIds.has(edge.target)
+      const source = sourceNodes.get(edge.source)
+      const target = sourceNodes.get(edge.target)
+      if (!source || !target) return edge
+      return { ...edge, style: { ...edge.style, opacity: matches ? (edge.style?.opacity ?? 1) : 0.07 } }
+    }),
+  }
+}
+
+function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]; edges: Edge[] } {
+  const { showOffline, showSignals } = options
   const sourceNodes = new Map(data.nodes.map((node) => [node.id, node]))
   const visibleSourceNodes = data.nodes.filter((node) => showOffline || node.kind !== 'device' || node.online)
   const visibleIds = new Set(visibleSourceNodes.map((node) => node.id))
@@ -102,13 +126,6 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     if (!visibleIds.has(edge.source) || !visibleIds.has(edge.target)) return false
     return showSignals || edge.kind !== 'pending_signal'
   })
-
-  const matches = (node: AdminTopologyNode) => {
-    if (!normalizedSearch) return true
-    return [node.label, node.username, node.virtual_ip, node.cidr, node.room_code, node.platform]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(normalizedSearch))
-  }
 
   const graph = new dagre.graphlib.Graph()
   graph.setDefaultEdgeLabel(() => ({}))
@@ -123,7 +140,6 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     const size = dimensions[node.kind]
     const point = graph.node(node.id) as { x: number; y: number } | undefined
     const color = ownerColor(node)
-    const isMatch = matches(node)
     const neutral = node.kind === 'network' || node.kind === 'room'
     return {
       id: node.id,
@@ -143,7 +159,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
           ? `0 0 0 4px ${colorWithAlpha(color, 0.1)}, 0 10px 28px rgba(15, 23, 42, .09)`
           : '0 5px 18px rgba(15, 23, 42, .055)',
         color: '#0f172a',
-        opacity: isMatch ? 1 : 0.16,
+        opacity: 1,
         transition: 'opacity 150ms ease, box-shadow 150ms ease',
       },
       draggable: false,
@@ -156,7 +172,6 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
     const target = sourceNodes.get(edge.target)
     const colorSource = edge.kind === 'attachment' ? target : source
     const color = colorSource ? ownerColor(colorSource) : '#94a3b8'
-    const endpointsMatch = !normalizedSearch || Boolean((source && matches(source)) || (target && matches(target)))
     const isSignal = edge.kind === 'pending_signal'
     return {
       id: edge.id,
@@ -168,7 +183,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
         stroke: isSignal ? '#d97706' : color,
         strokeWidth: isSignal ? 1.7 : edge.kind === 'membership' ? 2 : 1.5,
         strokeDasharray: isSignal ? '7 6' : undefined,
-        opacity: endpointsMatch ? (isSignal ? 0.78 : 0.46) : 0.07,
+        opacity: isSignal ? 0.78 : 0.46,
       },
       markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: '#d97706', width: 14, height: 14 } : undefined,
       label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type || 'signal'} ×${edge.count}` : undefined,
@@ -221,9 +236,13 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showOffline, setShowOffline] = useState(true)
   const [showSignals, setShowSignals] = useState(true)
+  const layoutGraph = useMemo(
+    () => data ? buildGraph(data, { showOffline, showSignals }) : { nodes: [], edges: [] },
+    [data, showOffline, showSignals],
+  )
   const graph = useMemo(
-    () => data ? buildGraph(data, { search, showOffline, showSignals }) : { nodes: [], edges: [] },
-    [data, search, showOffline, showSignals],
+    () => data ? applySearch(layoutGraph, data, search) : layoutGraph,
+    [layoutGraph, data, search],
   )
   const selected = data?.nodes.find((node) => node.id === selectedId)
   const accounts = useMemo(() => data?.nodes.filter((node) => node.kind === 'account') ?? [], [data])
@@ -284,6 +303,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           {accounts.map((account) => (
             <div className="legend-row" key={account.id}>
               <span className="legend-color" style={{ background: accountColor(account.account_id) }} />
+              <span className="legend-code">{accountIdentity(account.account_id).code}</span>
               <span title={account.label}>{account.label}</span>
             </div>
           ))}

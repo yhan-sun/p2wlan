@@ -137,17 +137,6 @@ jobs:
       - name: Build admin UI
         working-directory: server/admin-ui
         run: npm run build
-      - name: Verify embedded artifacts match the committed build
-        run: |
-          test -s server/admin/web/index.html
-          test -s server/admin/web/app.js
-          test -s server/admin/web/app.css
-          grep -q '/admin/app.js' server/admin/web/index.html
-          # The embedded assets are committed so that a plain `go build` works,
-          # which means a source change without a rebuild would ship an outdated
-          # console. The Vite output is deterministic for a locked dependency
-          # tree, so comparing against the committed files is a reliable gate.
-          git diff --exit-code -- server/admin/web
       - name: Upload reproducible admin UI build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -159,6 +148,16 @@ jobs:
             server/admin/web/app.css
           if-no-files-found: error
           retention-days: 7
+      - name: Verify embedded artifacts match the committed build
+        run: |
+          test -s server/admin/web/index.html
+          test -s server/admin/web/app.js
+          test -s server/admin/web/app.css
+          grep -q '/admin/app.js' server/admin/web/index.html
+          # Upload the freshly built files before this gate so a stale-dist
+          # failure leaves exact, reproducible diagnostics instead of forcing a
+          # developer to recreate the runner locally.
+          git diff --exit-code -- server/admin/web
 
   repository_policy:
     name: Repository policy and security scan

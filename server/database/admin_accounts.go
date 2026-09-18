@@ -29,6 +29,13 @@ type AdminAccountPage struct {
 	Items  []AdminAccountSummary `json:"items"`
 }
 
+type AdminAccountCursorPage struct {
+	Total      int                   `json:"total"`
+	Limit      int                   `json:"limit"`
+	NextCursor string                `json:"next_cursor,omitempty"`
+	Items      []AdminAccountSummary `json:"items"`
+}
+
 type AdminAccountDetail struct {
 	Account  AdminAccountSummary   `json:"account"`
 	Devices  []AdminDeviceSummary  `json:"devices"`
@@ -47,6 +54,30 @@ type AdminTopology struct {
 	PathObservationNote      string              `json:"path_observation_note"`
 	Nodes                    []AdminTopologyNode `json:"nodes"`
 	Edges                    []AdminTopologyEdge `json:"edges"`
+}
+
+const (
+	adminTopologyDefaultAccountLimit = 12
+	adminTopologyMaxAccountLimit     = 50
+	adminTopologyDefaultNodeBudget   = 600
+	adminTopologyMaxNodeBudget       = 2000
+	adminTopologyGlobalEdgeBudget    = 4000
+)
+
+// AdminTopologyPage is the bounded global-topology contract. Pagination is by
+// immutable account ID rather than a mutable activity timestamp. Node/edge
+// budgets never silently truncate: Partial and PartialReason tell the caller
+// to narrow the scope (normally to one account) before claiming completeness.
+type AdminTopologyPage struct {
+	AdminTopology
+	NextCursor     string `json:"next_cursor,omitempty"`
+	Complete       bool   `json:"complete"`
+	Partial        bool   `json:"partial"`
+	PartialReason  string `json:"partial_reason,omitempty"`
+	LoadedAccounts int    `json:"loaded_accounts"`
+	TotalAccounts  int    `json:"total_accounts"`
+	NodeBudget     int    `json:"node_budget"`
+	EdgeBudget     int    `json:"edge_budget"`
 }
 
 type AdminTopologyNode struct {
@@ -149,6 +180,63 @@ func (db *DB) AdminAccounts(query string, limit, offset int) (*AdminAccountPage,
 		return nil, err
 	}
 	return &AdminAccountPage{Total: total, Limit: limit, Offset: offset, Items: items}, nil
+}
+
+func (db *DB) AdminAccountsCursor(query, afterID string, limit int) (*AdminAccountCursorPage, error) {
+	limit, _ = normalizeAdminPage(limit, 0)
+	query = strings.TrimSpace(query)
+	afterID = strings.TrimSpace(afterID)
+	where := `u.id <> 'system' AND u.id > ?`
+	whereArgs := []any{afterID}
+	if query != "" {
+		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query)
+		pattern := "%" + escaped + "%"
+		where += ` AND (COALESCE(NULLIF(u.username, ''), u.email) LIKE ? ESCAPE '!' OR u.email LIKE ? ESCAPE '!')`
+		whereArgs = append(whereArgs, pattern, pattern)
+	}
+
+	countWhere := `u.id <> 'system'`
+	countArgs := []any{}
+	if query != "" {
+		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query)
+		pattern := "%" + escaped + "%"
+		countWhere += ` AND (COALESCE(NULLIF(u.username, ''), u.email) LIKE ? ESCAPE '!' OR u.email LIKE ? ESCAPE '!')`
+		countArgs = append(countArgs, pattern, pattern)
+	}
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users u WHERE `+countWhere, countArgs...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("count cursor admin accounts: %w", err)
+	}
+
+	args := []any{adminOnlineCutoff()}
+	args = append(args, whereArgs...)
+	args = append(args, limit+1)
+	rows, err := db.Query(`SELECT `+adminAccountColumns()+`
+		FROM users u
+		WHERE `+where+`
+		ORDER BY u.id ASC
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("cursor list admin accounts: %w", err)
+	}
+	defer rows.Close()
+	items := make([]AdminAccountSummary, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanAdminAccount(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan cursor admin account: %w", scanErr)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	page := &AdminAccountCursorPage{Total: total, Limit: limit, Items: items}
+	if len(items) > limit {
+		page.Items = items[:limit]
+		page.NextCursor = page.Items[len(page.Items)-1].ID
+	}
+	return page, nil
 }
 
 func (db *DB) AdminAccount(accountID string) (*AdminAccountDetail, error) {
@@ -487,4 +575,338 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 	}
 
 	return result, nil
+}
+
+func normalizeAdminTopologyPage(accountLimit, nodeBudget int) (int, int) {
+	if accountLimit <= 0 {
+		accountLimit = adminTopologyDefaultAccountLimit
+	}
+	if accountLimit > adminTopologyMaxAccountLimit {
+		accountLimit = adminTopologyMaxAccountLimit
+	}
+	if nodeBudget <= 0 {
+		nodeBudget = adminTopologyDefaultNodeBudget
+	}
+	if nodeBudget > adminTopologyMaxNodeBudget {
+		nodeBudget = adminTopologyMaxNodeBudget
+	}
+	if nodeBudget < accountLimit {
+		nodeBudget = accountLimit
+	}
+	return accountLimit, nodeBudget
+}
+
+func adminTopologyPlaceholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
+}
+
+func stringsToAny(values []string) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		out = append(out, value)
+	}
+	return out
+}
+
+// AdminTopologyPage returns one bounded global slice. A page owns a stable set
+// of account IDs; explicit network nodes may repeat across pages and are
+// intentionally mergeable by ID on the frontend. Shared peers from accounts
+// outside the current page are not synthesized. Account-scoped AdminTopology
+// remains the precise drill-down view.
+func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget int) (*AdminTopologyPage, error) {
+	accountLimit, nodeBudget = normalizeAdminTopologyPage(accountLimit, nodeBudget)
+	afterAccountID = strings.TrimSpace(afterAccountID)
+
+	var totalAccounts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE id <> 'system'`).Scan(&totalAccounts); err != nil {
+		return nil, fmt.Errorf("count topology accounts: %w", err)
+	}
+
+	rows, err := db.Query(`SELECT id, COALESCE(NULLIF(username, ''), email)
+		FROM users
+		WHERE id <> 'system' AND id > ?
+		ORDER BY id ASC
+		LIMIT ?`, afterAccountID, accountLimit+1)
+	if err != nil {
+		return nil, fmt.Errorf("page topology accounts: %w", err)
+	}
+	defer rows.Close()
+
+	type accountRow struct{ id, username string }
+	accounts := make([]accountRow, 0, accountLimit+1)
+	for rows.Next() {
+		var item accountRow
+		if err := rows.Scan(&item.id, &item.username); err != nil {
+			return nil, fmt.Errorf("scan topology page account: %w", err)
+		}
+		accounts = append(accounts, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	hasMore := len(accounts) > accountLimit
+	if hasMore {
+		accounts = accounts[:accountLimit]
+	}
+	page := &AdminTopologyPage{
+		AdminTopology: AdminTopology{
+			GeneratedAt:              time.Now().Unix(),
+			Scope:                    "global",
+			PathObservationAvailable: false,
+			PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; global pages describe account ownership, explicit network membership, device attachment, and pending signaling only.",
+			Nodes:                    []AdminTopologyNode{},
+			Edges:                    []AdminTopologyEdge{},
+		},
+		LoadedAccounts: len(accounts),
+		TotalAccounts:  totalAccounts,
+		NodeBudget:     nodeBudget,
+		EdgeBudget:     adminTopologyGlobalEdgeBudget,
+	}
+	if len(accounts) == 0 {
+		page.Complete = true
+		return page, nil
+	}
+
+	accountIDs := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		accountIDs = append(accountIDs, account.id)
+		page.Nodes = append(page.Nodes, AdminTopologyNode{
+			ID: "account:" + account.id, Kind: "account", Label: account.username,
+			AccountID: account.id, Username: account.username,
+		})
+	}
+	remainingNodes := nodeBudget - len(page.Nodes)
+	if remainingNodes <= 0 {
+		page.Partial = true
+		page.PartialReason = "node_budget"
+		return page, nil
+	}
+
+	accountPlaceholders := adminTopologyPlaceholders(len(accountIDs))
+	networkArgs := stringsToAny(accountIDs)
+	networkArgs = append(networkArgs, remainingNodes+1)
+	networkRows, err := db.Query(`SELECT DISTINCT n.id, n.name, n.cidr, n.owner_id,
+		EXISTS(SELECT 1 FROM rooms r WHERE r.network_id = n.id),
+		COALESCE((SELECT r.room_code FROM rooms r WHERE r.network_id = n.id), '')
+		FROM networks n
+		JOIN network_memberships m ON m.network_id = n.id
+		WHERE n.id <> 'default' AND m.user_id IN (`+accountPlaceholders+`)
+		ORDER BY n.id ASC
+		LIMIT ?`, networkArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("page topology networks: %w", err)
+	}
+	type networkRow struct {
+		id, name, cidr, ownerID, roomCode string
+		isRoom                            int
+	}
+	networks := make([]networkRow, 0, remainingNodes+1)
+	for networkRows.Next() {
+		var item networkRow
+		if err := networkRows.Scan(&item.id, &item.name, &item.cidr, &item.ownerID, &item.isRoom, &item.roomCode); err != nil {
+			networkRows.Close()
+			return nil, fmt.Errorf("scan topology page network: %w", err)
+		}
+		networks = append(networks, item)
+	}
+	if err := networkRows.Close(); err != nil {
+		return nil, err
+	}
+	if len(networks) > remainingNodes {
+		networks = networks[:remainingNodes]
+		page.Partial = true
+		page.PartialReason = "node_budget"
+	}
+
+	networkIDs := make([]string, 0, len(networks))
+	for _, network := range networks {
+		kind := "network"
+		if network.isRoom == 1 {
+			kind = "room"
+		}
+		networkIDs = append(networkIDs, network.id)
+		page.Nodes = append(page.Nodes, AdminTopologyNode{
+			ID: "network:" + network.id, Kind: kind, Label: network.name,
+			OwnerID: network.ownerID, NetworkID: network.id, NetworkKind: kind,
+			CIDR: network.cidr, RoomCode: network.roomCode,
+		})
+	}
+
+	if len(networkIDs) > 0 {
+		remainingEdges := adminTopologyGlobalEdgeBudget - len(page.Edges)
+		if remainingEdges <= 0 {
+			page.Partial = true
+			page.PartialReason = "edge_budget"
+		} else {
+			membershipArgs := append(stringsToAny(accountIDs), stringsToAny(networkIDs)...)
+			membershipArgs = append(membershipArgs, remainingEdges+1)
+			membershipRows, err := db.Query(`SELECT user_id, network_id, COALESCE(role, 'member')
+				FROM network_memberships
+				WHERE user_id IN (`+accountPlaceholders+`) AND network_id IN (`+adminTopologyPlaceholders(len(networkIDs))+`)
+				ORDER BY network_id, user_id
+				LIMIT ?`, membershipArgs...)
+			if err != nil {
+				return nil, fmt.Errorf("page topology memberships: %w", err)
+			}
+			memberships := make([]AdminTopologyEdge, 0, min(remainingEdges+1, 128))
+			for membershipRows.Next() {
+				var userID, networkID, role string
+				if err := membershipRows.Scan(&userID, &networkID, &role); err != nil {
+					membershipRows.Close()
+					return nil, fmt.Errorf("scan topology page membership: %w", err)
+				}
+				memberships = append(memberships, AdminTopologyEdge{
+					ID:     "membership:" + userID + ":" + networkID,
+					Source: "account:" + userID, Target: "network:" + networkID,
+					Kind: "membership", Role: role,
+				})
+			}
+			if err := membershipRows.Close(); err != nil {
+				return nil, err
+			}
+			if len(memberships) > remainingEdges {
+				memberships = memberships[:remainingEdges]
+				page.Partial = true
+				page.PartialReason = "edge_budget"
+			}
+			page.Edges = append(page.Edges, memberships...)
+		}
+	}
+
+	if page.Partial {
+		return page, nil
+	}
+	remainingNodes = nodeBudget - len(page.Nodes)
+	cutoff := adminOnlineCutoff()
+	deviceArgs := stringsToAny(accountIDs)
+	deviceArgs = append(deviceArgs, cutoff, remainingNodes+1)
+	deviceRows, err := db.Query(`SELECT d.id, d.user_id, COALESCE(NULLIF(u.username, ''), u.email),
+		d.device_name, d.platform, d.virtual_ip, d.network_id, d.nat_type, d.relay_rtt_ms,
+		d.last_seen, COALESCE(d.app_version, ''), d.online
+		FROM devices d JOIN users u ON u.id = d.user_id
+		WHERE d.user_id IN (`+accountPlaceholders+`)
+		ORDER BY `+adminOnlineLeaseSQL("d")+` DESC, d.id ASC
+		LIMIT ?`, deviceArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("page topology devices: %w", err)
+	}
+	type deviceRow struct {
+		id, userID, username, name, platform, virtualIP, networkID, natType, appVersion string
+		relayRTT                                                                        sql.NullInt64
+		lastSeen                                                                        int64
+		onlineInt                                                                       int
+	}
+	devices := make([]deviceRow, 0, remainingNodes+1)
+	for deviceRows.Next() {
+		var item deviceRow
+		if err := deviceRows.Scan(&item.id, &item.userID, &item.username, &item.name, &item.platform, &item.virtualIP, &item.networkID, &item.natType, &item.relayRTT, &item.lastSeen, &item.appVersion, &item.onlineInt); err != nil {
+			deviceRows.Close()
+			return nil, fmt.Errorf("scan topology page device: %w", err)
+		}
+		devices = append(devices, item)
+	}
+	if err := deviceRows.Close(); err != nil {
+		return nil, err
+	}
+	if len(devices) > remainingNodes {
+		devices = devices[:remainingNodes]
+		page.Partial = true
+		page.PartialReason = "node_budget"
+	}
+	remainingEdgeSlots := adminTopologyGlobalEdgeBudget - len(page.Edges)
+	if remainingEdgeSlots < 0 {
+		remainingEdgeSlots = 0
+	}
+	if len(devices) > remainingEdgeSlots {
+		devices = devices[:remainingEdgeSlots]
+		page.Partial = true
+		page.PartialReason = "edge_budget"
+	}
+
+	networkSet := make(map[string]struct{}, len(networkIDs))
+	for _, id := range networkIDs {
+		networkSet[id] = struct{}{}
+	}
+	deviceIDs := make([]string, 0, len(devices))
+	for _, device := range devices {
+		online := adminDeviceOnline(int64(device.onlineInt), device.lastSeen, cutoff)
+		deviceIDs = append(deviceIDs, device.id)
+		page.Nodes = append(page.Nodes, AdminTopologyNode{
+			ID: "device:" + device.id, Kind: "device", Label: device.name,
+			AccountID: device.userID, Username: device.username, NetworkID: device.networkID,
+			VirtualIP: device.virtualIP, Platform: device.platform, NATType: device.natType,
+			AppVersion: device.appVersion, RelayRTTMS: nullInt64Ptr(device.relayRTT),
+			LastSeen: device.lastSeen, Online: &online,
+		})
+		target := "account:" + device.userID
+		role := "private-default"
+		if device.networkID != "default" {
+			if _, ok := networkSet[device.networkID]; !ok {
+				page.Partial = true
+				page.PartialReason = "node_budget"
+				continue
+			}
+			target = "network:" + device.networkID
+			role = ""
+		}
+		page.Edges = append(page.Edges, AdminTopologyEdge{
+			ID: "page-attachment:" + device.id, Source: target, Target: "device:" + device.id,
+			Kind: "attachment", Role: role,
+		})
+	}
+
+	if !page.Partial && len(deviceIDs) > 0 {
+		remainingEdges := adminTopologyGlobalEdgeBudget - len(page.Edges)
+		if remainingEdges <= 0 {
+			page.Partial = true
+			page.PartialReason = "edge_budget"
+		} else {
+			devicePlaceholders := adminTopologyPlaceholders(len(deviceIDs))
+			signalArgs := append(stringsToAny(deviceIDs), stringsToAny(deviceIDs)...)
+			signalArgs = append(signalArgs, remainingEdges+1)
+			signalRows, err := db.Query(`SELECT from_node_id, to_node_id, type, COUNT(*), MAX(created_at)
+				FROM signals
+				WHERE from_node_id IN (`+devicePlaceholders+`) OR to_node_id IN (`+devicePlaceholders+`)
+				GROUP BY from_node_id, to_node_id, type
+				ORDER BY MAX(created_at) DESC
+				LIMIT ?`, signalArgs...)
+			if err != nil {
+				return nil, fmt.Errorf("page topology signals: %w", err)
+			}
+			signals := make([]AdminTopologyEdge, 0, min(remainingEdges+1, 128))
+			for signalRows.Next() {
+				var fromID, toID, signalType string
+				var count int
+				var createdAt int64
+				if err := signalRows.Scan(&fromID, &toID, &signalType, &count, &createdAt); err != nil {
+					signalRows.Close()
+					return nil, fmt.Errorf("scan topology page signal: %w", err)
+				}
+				signals = append(signals, AdminTopologyEdge{
+					ID:     fmt.Sprintf("signal:%s:%s:%s", fromID, toID, signalType),
+					Source: "device:" + fromID, Target: "device:" + toID,
+					Kind: "pending_signal", SignalType: signalType, Count: count, CreatedAt: createdAt,
+				})
+			}
+			if err := signalRows.Close(); err != nil {
+				return nil, err
+			}
+			if len(signals) > remainingEdges {
+				signals = signals[:remainingEdges]
+				page.Partial = true
+				page.PartialReason = "edge_budget"
+			}
+			page.Edges = append(page.Edges, signals...)
+		}
+	}
+
+	if !page.Partial && hasMore {
+		page.NextCursor = accounts[len(accounts)-1].id
+	}
+	page.Complete = !page.Partial && !hasMore
+	return page, nil
 }

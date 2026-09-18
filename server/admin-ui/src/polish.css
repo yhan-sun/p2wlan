@@ -328,3 +328,62 @@
   background: #98a2b3;
   box-shadow: 0 0 0 3px rgba(152, 162, 179, .16);
 }
+
+
+.account-identity-code {
+  flex: 0 0 auto;
+  min-width: 24px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 5px;
+  border: 1px solid;
+  border-radius: 5px;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: .04em;
+}
+
+.legend-code {
+  min-width: 22px;
+  color: #667085;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.topology-page-progress {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: #fbfcfe;
+  color: #667085;
+  font-size: 11px;
+}
+
+.topology-page-progress > .button,
+.topology-page-progress > .badge {
+  margin-left: auto;
+}
+
+.topology-partial-warning {
+  margin-left: auto;
+  color: #9a5b05;
+  font-weight: 600;
+}
+
+@media (max-width: 650px) {
+  .topology-page-progress {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .topology-page-progress > .button,
+  .topology-page-progress > .badge,
+  .topology-partial-warning {
+    margin-left: 0;
+  }
+}

@@ -30,6 +30,10 @@ func (fakeStore) AdminAccounts(_ string, limit, offset int) (*database.AdminAcco
 	return &database.AdminAccountPage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminAccountSummary{{ID: "u1", Username: "alice", DeviceCount: 2, OnlineDevices: 1}}}, nil
 }
 
+func (fakeStore) AdminAccountsCursor(_ string, _ string, limit int) (*database.AdminAccountCursorPage, error) {
+	return &database.AdminAccountCursorPage{Total: 1, Limit: limit, Items: []database.AdminAccountSummary{{ID: "u1", Username: "alice", DeviceCount: 2, OnlineDevices: 1}}}, nil
+}
+
 func (fakeStore) AdminAccount(accountID string) (*database.AdminAccountDetail, error) {
 	if accountID == "missing" {
 		return nil, database.ErrAdminAccountNotFound
@@ -53,6 +57,25 @@ func (fakeStore) AdminTopology(accountID string) (*database.AdminTopology, error
 		PathObservationNote:      "path telemetry unavailable",
 		Nodes:                    []database.AdminTopologyNode{{ID: "account:u1", Kind: "account", AccountID: "u1", Label: "alice"}},
 		Edges:                    []database.AdminTopologyEdge{},
+	}, nil
+}
+
+func (fakeStore) AdminTopologyPage(after string, accountLimit, nodeBudget int) (*database.AdminTopologyPage, error) {
+	return &database.AdminTopologyPage{
+		AdminTopology: database.AdminTopology{
+			GeneratedAt:              10,
+			Scope:                    "global",
+			PathObservationAvailable: false,
+			PathObservationNote:      "path telemetry unavailable",
+			Nodes:                    []database.AdminTopologyNode{{ID: "account:u1", Kind: "account", AccountID: "u1", Label: "alice"}},
+			Edges:                    []database.AdminTopologyEdge{},
+		},
+		NextCursor:     "",
+		Complete:       true,
+		LoadedAccounts: 1,
+		TotalAccounts:  1,
+		NodeBudget:     nodeBudget,
+		EdgeBudget:     4000,
 	}, nil
 }
 
@@ -169,6 +192,29 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	}
 }
 
+func TestAdminAccountCursorRoute(t *testing.T) {
+	token := strings.Repeat("g", 32)
+	server := testServer(t, token)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/accounts/cursor?limit=25", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"username":"alice"`) {
+		t.Fatalf("unexpected account cursor response %d: %s", res.Code, res.Body.String())
+	}
+
+	bad := httptest.NewRequest(http.MethodGet, "/admin/api/v1/accounts/cursor?cursor="+strings.Repeat("x", 129), nil)
+	bad.Header.Set("Authorization", "Bearer "+token)
+	badRes := httptest.NewRecorder()
+	mux.ServeHTTP(badRes, bad)
+	if badRes.Code != http.StatusBadRequest {
+		t.Fatalf("expected oversized cursor to fail, got %d", badRes.Code)
+	}
+}
+
 func TestAdminAccountAndTopologyRoutes(t *testing.T) {
 	token := strings.Repeat("e", 32)
 	server := testServer(t, token)
@@ -199,6 +245,37 @@ func TestAdminAccountAndTopologyRoutes(t *testing.T) {
 	mux.ServeHTTP(res, req)
 	if res.Code != http.StatusNotFound {
 		t.Fatalf("expected missing account topology to return 404, got %d", res.Code)
+	}
+}
+
+func TestAdminTopologyPaginationValidation(t *testing.T) {
+	token := strings.Repeat("f", 32)
+	server := testServer(t, token)
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	for _, path := range []string{
+		"/admin/api/v1/topology?limit=0",
+		"/admin/api/v1/topology?limit=51",
+		"/admin/api/v1/topology?node_limit=2001",
+		"/admin/api/v1/topology?limit=12&node_limit=5",
+		"/admin/api/v1/topology?cursor=" + strings.Repeat("x", 129),
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", path, res.Code, res.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/topology?limit=12&node_limit=600", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"complete":true`) {
+		t.Fatalf("unexpected topology page response %d: %s", res.Code, res.Body.String())
 	}
 }
 

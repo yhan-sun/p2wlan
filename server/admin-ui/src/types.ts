@@ -85,6 +85,13 @@ export interface Page<T> {
   items: T[]
 }
 
+export interface CursorPage<T> {
+  total: number
+  limit: number
+  next_cursor?: string
+  items: T[]
+}
+
 export type TopologyNodeKind = 'account' | 'network' | 'room' | 'device'
 export type TopologyEdgeKind = 'membership' | 'attachment' | 'pending_signal'
 
@@ -128,4 +135,15 @@ export interface AdminTopology {
   path_observation_note: string
   nodes: AdminTopologyNode[]
   edges: AdminTopologyEdge[]
+}
+
+export interface AdminTopologyPage extends AdminTopology {
+  next_cursor?: string
+  complete: boolean
+  partial: boolean
+  partial_reason?: 'node_budget' | 'edge_budget' | string
+  loaded_accounts: number
+  total_accounts: number
+  node_budget: number
+  edge_budget: number
 }
