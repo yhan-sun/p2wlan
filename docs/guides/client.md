@@ -4,6 +4,12 @@
 
 优先使用 GitHub Release 的固定版本包。安装脚本只负责安装公开的客户端文件，不包含 Control 地址、账号或凭据。
 
+## 检查客户端更新
+
+桌面和移动客户端启动后会异步检查一次 GitHub 上的客户端正式 Release；也可以在“设置 → 诊断与关于 → 检查更新”中手动检查。客户端只接受 `vX.Y.Z` 标签，服务端的 `server-vX.Y.Z` 标签不会被当作客户端版本。
+
+发现新版本时，客户端显示当前版本和最新版本，用户确认后打开对应的 GitHub Release 页面。更新检查失败不会阻止客户端启动，也不会自动下载、替换或安装任何程序；手动安装仍使用固定版本 Release 包。
+
 常用 CLI：
 
     p2wlan config set control https://control.example.com

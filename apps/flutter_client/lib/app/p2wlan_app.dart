@@ -19,6 +19,8 @@ import '../core/models/diagnostics_models.dart';
 import '../core/platform/windows_startup_registration.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
+import '../core/update/update_models.dart';
+import '../core/update/update_service.dart';
 import '../features/auth/login_page.dart';
 import '../core/rooms/room_profiles.dart';
 import '../features/onboarding/onboarding_page.dart';
@@ -35,6 +37,8 @@ class P2WlanApp extends StatefulWidget {
     this.settingsStore,
     this.diagnosticsApi,
     this.daemonController,
+    this.updateService,
+    this.autoCheckForUpdates = true,
     this.enableDesktopTray = false,
     this.enableDesktopTaskbarStatus = false,
     this.connectAfterLoginStartup = false,
@@ -46,6 +50,8 @@ class P2WlanApp extends StatefulWidget {
   final SettingsStore? settingsStore;
   final DiagnosticsApi? diagnosticsApi;
   final DaemonController? daemonController;
+  final UpdateService? updateService;
+  final bool autoCheckForUpdates;
   final bool enableDesktopTray;
   final bool enableDesktopTaskbarStatus;
 
@@ -68,11 +74,15 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
   bool _openingRoomLink = false;
   var _ready = false;
   var _authenticated = false;
+  late final UpdateService _updateService;
+  UpdateCheckResult? _automaticUpdateResult;
+  var _automaticUpdateCheckStarted = false;
 
   @override
   void initState() {
     super.initState();
     _settingsStore = widget.settingsStore ?? SettingsStore();
+    _updateService = widget.updateService ?? UpdateService();
     _statusStore = StatusStore(
       settingsStore: _settingsStore,
       diagnosticsApi: widget.diagnosticsApi ?? DiagnosticsApi(),
@@ -121,6 +131,7 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
       setState(() => _ready = true);
     }
     writeDesktopTrayLifecycleTrace('bootstrap.ready');
+    _scheduleAutomaticUpdateCheck();
     if (widget.enableDesktopTray && DesktopTrayController.isSupported) {
       writeDesktopTrayLifecycleTrace('bootstrap.tray-controller.begin');
       _desktopTrayController = DesktopTrayController(
@@ -178,6 +189,53 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
     )) {
       unawaited(_statusStore.startDaemon());
     }
+  }
+
+  void _scheduleAutomaticUpdateCheck() {
+    if (!widget.autoCheckForUpdates || _automaticUpdateCheckStarted) return;
+    _automaticUpdateCheckStarted = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_runAutomaticUpdateCheck());
+    });
+  }
+
+  Future<void> _runAutomaticUpdateCheck() async {
+    late final UpdateCheckResult result;
+    try {
+      result = await _updateService.check();
+    } on Object {
+      // Update checks are deliberately non-critical. A transport or plugin
+      // failure must never escape the startup task or affect the shell.
+      return;
+    }
+    if (!mounted || !result.hasUpdate) return;
+    final latestTag = result.update!.version.tag;
+    if (_automaticUpdateResult?.update?.version.tag == latestTag) return;
+    setState(() => _automaticUpdateResult = result);
+  }
+
+  void _dismissAutomaticUpdate() {
+    if (!mounted) return;
+    setState(() => _automaticUpdateResult = null);
+  }
+
+  Future<void> _openAutomaticUpdate() async {
+    final result = _automaticUpdateResult;
+    final update = result?.update;
+    if (update == null) return;
+    final opened = await _updateService.openRelease(update);
+    if (!mounted) return;
+    if (opened) {
+      setState(() => _automaticUpdateResult = null);
+      return;
+    }
+    showAppNotice(
+      _navigatorKey.currentState?.overlay?.context ?? context,
+      content: Text(
+        AppStrings.fromCode(_settingsStore.settings.languageCode)
+            .updateOpenFailed,
+      ),
+    );
   }
 
   bool get _isWindowsTrayNoAdapterExitTest {
@@ -321,6 +379,10 @@ class _P2WlanAppState extends State<P2WlanApp> with WidgetsBindingObserver {
                           statusStore: _statusStore,
                           capabilities: _capabilities,
                           onLogout: _logout,
+                          updateService: _updateService,
+                          updateResult: _automaticUpdateResult,
+                          onOpenUpdate: _openAutomaticUpdate,
+                          onDismissUpdate: _dismissAutomaticUpdate,
                         )
                 : LoginPage(
                     settingsStore: _settingsStore,
