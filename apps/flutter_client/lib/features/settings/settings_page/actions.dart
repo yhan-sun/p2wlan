@@ -246,6 +246,45 @@ extension _SettingsPageActions on _SettingsPageState {
     await _saveCategory(SettingsCategory.developer);
   }
 
+  Future<void> _checkForUpdates() async {
+    if (_checkingForUpdates) return;
+    _updateState(() {
+      _checkingForUpdates = true;
+      _updateCheckResult = null;
+    });
+    try {
+      final result = await _updateService.check();
+      if (mounted) _updateState(() => _updateCheckResult = result);
+    } catch (_) {
+      if (mounted) {
+        _updateState(
+          () => _updateCheckResult = UpdateCheckResult(
+            status: UpdateCheckStatus.networkError,
+            currentAppVersion: ClientBuildInfo.current.appVersion,
+            error: const UpdateCheckError(
+              UpdateCheckErrorCode.transport,
+              'The release request failed.',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) _updateState(() => _checkingForUpdates = false);
+    }
+  }
+
+  Future<void> _openUpdateRelease(UpdateCheckResult result) async {
+    final update = result.update;
+    if (update == null) return;
+    final opened = await _updateService.openRelease(update);
+    if (!opened && mounted) {
+      final strings = AppStrings.fromCode(
+        widget.settingsStore.settings.languageCode,
+      );
+      showAppNotice(context, content: Text(strings.updateOpenFailed));
+    }
+  }
+
   Future<void> _uploadCurrentSessionLogs() async {
     if (_uploadingLogs) return;
     final strings = AppStrings.fromCode(

@@ -12,11 +12,14 @@ import '../core/capabilities/platform_capabilities.dart';
 import '../core/models/diagnostics_models.dart';
 import '../core/state/settings_store.dart';
 import '../core/state/status_store.dart';
+import '../core/update/update_models.dart';
+import '../core/update/update_service.dart';
 import '../features/dashboard/dashboard_page.dart';
 import '../features/diagnostics/diagnostics_page.dart';
 import '../features/nodes/nodes_page.dart';
 import '../features/rooms/rooms_page.dart';
 import '../features/settings/settings_page.dart';
+import '../features/update/update_banner.dart';
 import '../shared/layout/app_breakpoints.dart';
 import '../shared/widgets/app_nav_rail.dart';
 import '../shared/widgets/desktop_sidebar.dart';
@@ -32,6 +35,10 @@ class P2WlanShell extends StatefulWidget {
     this.roomInvitation,
     this.onRoomInvitationHandled,
     this.capabilities,
+    this.updateService,
+    this.updateResult,
+    this.onOpenUpdate,
+    this.onDismissUpdate,
   });
 
   final SettingsStore settingsStore;
@@ -43,6 +50,10 @@ class P2WlanShell extends StatefulWidget {
   /// Platform capability override (primarily for tests); defaults to the
   /// current runtime platform.
   final PlatformCapabilities? capabilities;
+  final UpdateService? updateService;
+  final UpdateCheckResult? updateResult;
+  final VoidCallback? onOpenUpdate;
+  final VoidCallback? onDismissUpdate;
 
   @override
   State<P2WlanShell> createState() => _P2WlanShellState();
@@ -126,6 +137,15 @@ class _P2WlanShellState extends State<P2WlanShell> {
         final useBottomNav =
             breakpoint == AppBreakpoint.compact && !_isDesktopShell;
 
+        final shellBody = useBottomNav
+            ? _buildBody(showPageHeader: false)
+            : Row(
+                children: [
+                  _buildNavigation(strings, useDesktopSidebar),
+                  const VerticalDivider(width: 1),
+                  Expanded(child: _buildBody(showPageHeader: true)),
+                ],
+              );
         return PopScope<Object?>(
           canPop: _section == P2WlanSection.home,
           onPopInvokedWithResult: (didPop, result) {
@@ -133,15 +153,19 @@ class _P2WlanShellState extends State<P2WlanShell> {
           },
           child: Scaffold(
             appBar: _buildTopBar(strings, useBottomNav, useDesktopSidebar),
-            body: useBottomNav
-                ? _buildBody(showPageHeader: false)
-                : Row(
-                    children: [
-                      _buildNavigation(strings, useDesktopSidebar),
-                      const VerticalDivider(width: 1),
-                      Expanded(child: _buildBody(showPageHeader: true)),
-                    ],
+            body: Column(
+              children: [
+                if (widget.updateResult != null &&
+                    widget.onOpenUpdate != null &&
+                    widget.onDismissUpdate != null)
+                  UpdateBanner(
+                    result: widget.updateResult!,
+                    onOpen: widget.onOpenUpdate!,
+                    onDismiss: widget.onDismissUpdate!,
                   ),
+                Expanded(child: shellBody),
+              ],
+            ),
             bottomNavigationBar: useBottomNav ? _buildBottomNav(strings) : null,
           ),
         );
@@ -267,6 +291,7 @@ class _P2WlanShellState extends State<P2WlanShell> {
         capabilities: widget.capabilities,
         onLogout: widget.onLogout,
         onDirtyChanged: (dirty) => _settingsDirty = dirty,
+        updateService: widget.updateService,
         showHeader: showPageHeader,
       ),
     };

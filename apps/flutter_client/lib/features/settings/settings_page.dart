@@ -19,6 +19,8 @@ import '../../core/models/diagnostics_models.dart';
 import '../../core/platform/windows_startup_registration.dart';
 import '../../core/state/settings_store.dart';
 import '../../core/state/status_store.dart';
+import '../../core/update/update_models.dart';
+import '../../core/update/update_service.dart';
 import '../../shared/widgets/app_back_button.dart';
 import '../../shared/widgets/app_select.dart';
 
@@ -65,6 +67,7 @@ class SettingsPage extends StatefulWidget {
     required this.statusStore,
     this.capabilities,
     this.controlApi,
+    this.updateService,
     this.onLogout,
     this.onDirtyChanged,
     this.controller,
@@ -82,6 +85,10 @@ class SettingsPage extends StatefulWidget {
   /// Optional auth client override used by tests and embedded shells. When
   /// omitted, the page owns a short-lived client for support-log uploads.
   final ControlApi? controlApi;
+
+  /// Optional update service override used by tests. Production callers can
+  /// omit it to use the fixed GitHub Releases client.
+  final UpdateService? updateService;
 
   final VoidCallback? onLogout;
 
@@ -106,6 +113,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late final PlatformCapabilities _capabilities;
   late final ControlApi _controlApi;
   late final bool _ownsControlApi;
+  late final UpdateService _updateService;
   late final StartupRegistration _startupRegistration;
   late final TextEditingController _diagnosticsUrlController;
   late final TextEditingController _controlServerController;
@@ -130,6 +138,8 @@ class _SettingsPageState extends State<SettingsPage> {
   var _closeBehavior = defaultCloseBehavior;
   var _showTokenField = false;
   var _uploadingLogs = false;
+  var _checkingForUpdates = false;
+  UpdateCheckResult? _updateCheckResult;
   String? _immediateSaved;
   String? _immediateError;
   String? _logUploadError;
@@ -183,6 +193,7 @@ class _SettingsPageState extends State<SettingsPage> {
         widget.startupRegistration ?? WindowsStartupRegistration();
     _ownsControlApi = widget.controlApi == null;
     _controlApi = widget.controlApi ?? ControlApi();
+    _updateService = widget.updateService ?? UpdateService();
     _statusViewNotifier = ValueNotifier(_statusProjection(widget.statusStore));
     widget.statusStore.addListener(_onStatusChanged);
     final settings = widget.settingsStore.settings;
@@ -386,13 +397,21 @@ class _SettingsPageState extends State<SettingsPage> {
       SettingsCategory.accountNetwork => _describeCredential(strings),
       SettingsCategory.advancedNetwork =>
         _manualMode ? strings.manualMode : 'MTU ${_mtuController.text.trim()}',
-      SettingsCategory.developer =>
-        !_capabilities.canControlLocalDaemon
-            ? widget.statusStore.daemonController.clientBuildInfo.appVersion
-            : widget.statusStore.daemonReachable
-            ? strings.daemonRunning
-            : strings.daemonStopped,
+      SettingsCategory.developer => _developerSummary(strings),
     };
+  }
+
+  String _developerSummary(AppStrings strings) {
+    final result = _updateCheckResult;
+    if (result?.hasUpdate == true) {
+      return strings.updateAvailableStatus(result!.update!.version.tag);
+    }
+    if (!_capabilities.canControlLocalDaemon) {
+      return widget.statusStore.daemonController.clientBuildInfo.appVersion;
+    }
+    return widget.statusStore.daemonReachable
+        ? strings.daemonRunning
+        : strings.daemonStopped;
   }
 
   List<SettingsCategory> get _visibleCategories =>

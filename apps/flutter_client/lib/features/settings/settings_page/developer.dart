@@ -12,6 +12,7 @@ class _DeveloperSection extends StatelessWidget {
     final clientBuild = daemon.clientBuildInfo;
     final daemonBuild = daemon.lastDaemonBuildInfo;
     final canControl = state._capabilities.canControlLocalDaemon;
+    final updateResult = state._updateCheckResult;
     final details = <(String, String)>[
       (strings.clientBuildIdentity, clientBuild.appVersion),
       (strings.buildCommitLabel, clientBuild.gitCommit),
@@ -38,6 +39,52 @@ class _DeveloperSection extends StatelessWidget {
               label: strings.settingsAppVersion,
               value: clientBuild.appVersion,
             ),
+            _PreferenceRow(
+              label: strings.checkForUpdates,
+              subtitle: _updateStatus(state, strings),
+              trailing: OutlinedButton.icon(
+                key: const Key('settings-check-for-updates'),
+                onPressed: state._checkingForUpdates
+                    ? null
+                    : state._checkForUpdates,
+                icon: state._checkingForUpdates
+                    ? const SizedBox.square(
+                        dimension: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh_rounded, size: 16),
+                label: Text(
+                  state._checkingForUpdates
+                      ? strings.checkingForUpdates
+                      : strings.checkForUpdates,
+                ),
+              ),
+            ),
+            if (updateResult?.currentVersion != null)
+              _SettingsValue(
+                label: strings.currentVersionLabel,
+                value: updateResult!.currentAppVersion,
+              ),
+            if (updateResult?.update != null)
+              _SettingsValue(
+                label: strings.latestVersionLabel,
+                value: updateResult!.update!.version.tag,
+              ),
+            if (updateResult?.hasUpdate == true)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: FilledButton.icon(
+                  key: const Key('settings-view-update'),
+                  onPressed: () => state._openUpdateRelease(updateResult!),
+                  icon: const Icon(Icons.open_in_new_rounded, size: 16),
+                  label: Text(strings.viewNewVersion),
+                ),
+              ),
+            if (updateResult?.status == UpdateCheckStatus.networkError ||
+                updateResult?.status == UpdateCheckStatus.invalidRelease)
+              _SettingsErrorNotice(
+                message: _updateErrorText(updateResult!, strings),
+              ),
             if (canControl)
               _PreferenceRow(
                 label: strings.localService,
@@ -179,5 +226,28 @@ class _DeveloperSection extends StatelessWidget {
         ],
       ],
     );
+  }
+
+  String _updateStatus(_SettingsPageState state, AppStrings strings) {
+    if (state._checkingForUpdates) return strings.checkingForUpdates;
+    final result = state._updateCheckResult;
+    if (result == null) return strings.updateNotChecked;
+    return switch (result.status) {
+      UpdateCheckStatus.upToDate => strings.updateUpToDate,
+      UpdateCheckStatus.updateAvailable => strings.updateAvailableStatus(
+        result.update!.version.tag,
+      ),
+      UpdateCheckStatus.developmentBuild => strings.updateDevelopmentBuild,
+      UpdateCheckStatus.invalidRelease => strings.updateInvalidRelease,
+      UpdateCheckStatus.networkError => strings.updateCheckFailed,
+    };
+  }
+
+  String _updateErrorText(UpdateCheckResult result, AppStrings strings) {
+    return switch (result.status) {
+      UpdateCheckStatus.invalidRelease => strings.updateInvalidRelease,
+      UpdateCheckStatus.networkError => strings.updateCheckFailed,
+      _ => strings.updateCheckFailed,
+    };
   }
 }

@@ -6,6 +6,7 @@ Future<_Stores> _pumpSettings(
   required _FakeDiagnosticsApi api,
   PlatformCapabilities? capabilities,
   VoidCallback? onLogout,
+  UpdateService? updateService,
   Size physicalSize = const Size(800, 2400),
 }) async {
   tester.view.physicalSize = physicalSize;
@@ -21,6 +22,7 @@ Future<_Stores> _pumpSettings(
         statusStore: stores.statusStore,
         capabilities: capabilities,
         onLogout: onLogout,
+        updateService: updateService,
       ),
     ),
   );

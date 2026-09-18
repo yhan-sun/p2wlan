@@ -23,6 +23,8 @@ import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
 import 'package:p2wlan_flutter_client/core/security/secure_token_repository.dart';
 import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
+import 'package:p2wlan_flutter_client/core/update/update_models.dart';
+import 'package:p2wlan_flutter_client/core/update/update_service.dart';
 import 'package:p2wlan_flutter_client/features/dashboard/dashboard_page.dart';
 import 'package:p2wlan_flutter_client/features/diagnostics/diagnostics_page.dart';
 import 'package:p2wlan_flutter_client/features/auth/login_page.dart';
@@ -47,6 +49,7 @@ part 'p15_widget/design_system_tests.dart';
 part 'p15_widget/localization_tests.dart';
 part 'p15_widget/final_regression_tests.dart';
 part 'p15_widget/phase7_tests.dart';
+part 'p15_widget/update_checker_tests.dart';
 part 'p15_widget/helpers.dart';
 
 void main() {
@@ -63,4 +66,5 @@ void main() {
   _registerLocalizationTests();
   _registerFinalRegressionTests();
   _registerPhase7Tests();
+  _registerUpdateCheckerTests();
 }
