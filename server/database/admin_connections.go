@@ -90,8 +90,12 @@ type AdminConnectionTransitionFilter struct {
 
 // AdminConnections lists authoritative path observations reported by daemons.
 // Observations are directional and filtered according to the caller's criteria.
+// Freshness is expressed in SQL before pagination so polling a bounded page does
+// not materialize every observation in a large deployment.
 func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) (*AdminConnectionPage, error) {
 	limit, offset = normalizeAdminPage(limit, offset)
+	now := time.Now().Unix()
+	freshCutoff := now - DeviceOnlineTTL
 
 	var conditions []string
 	var args []interface{}
@@ -132,6 +136,16 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 		}
 	}
 
+	freshSQL := "(rd.online = 1 AND rd.last_seen > 0 AND rd.last_seen >= ? AND o.received_at >= ?)"
+	switch strings.ToLower(strings.TrimSpace(filter.Freshness)) {
+	case "fresh":
+		conditions = append(conditions, freshSQL)
+		args = append(args, freshCutoff, freshCutoff)
+	case "stale":
+		conditions = append(conditions, "NOT "+freshSQL)
+		args = append(args, freshCutoff, freshCutoff)
+	}
+
 	whereClause := ""
 	if len(conditions) > 0 {
 		whereClause = "WHERE " + strings.Join(conditions, " AND ")
@@ -146,9 +160,11 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 		JOIN networks n ON o.network_id = n.id
 		` + whereClause
 
-	now := time.Now().Unix()
+	var total int
+	if err := db.QueryRow("SELECT COUNT(*) "+baseQuery, args...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("count admin connections: %w", err)
+	}
 
-	// Query all matching rows to calculate freshness correctly and filter if needed
 	query := `
 		SELECT
 			o.schema_version,
@@ -182,15 +198,17 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 			o.observation_revision
 		` + baseQuery + `
 		ORDER BY o.received_at DESC, o.reporting_device_id ASC, o.remote_device_id ASC
+		LIMIT ? OFFSET ?
 	`
+	queryArgs := append(append([]interface{}{}, args...), limit, offset)
 
-	rows, err := db.Query(query, args...)
+	rows, err := db.Query(query, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query admin connections: %w", err)
 	}
 	defer rows.Close()
 
-	var allItems []AdminConnectionSummary
+	items := make([]AdminConnectionSummary, 0, limit)
 	for rows.Next() {
 		var item AdminConnectionSummary
 		item.Directional = true
@@ -264,8 +282,8 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 			item.LastValidationRTTMS = &v
 		}
 
-		reporterOnline := reportingOnline == 1 && reportingLastSeen > 0 && (now-reportingLastSeen <= DeviceOnlineTTL)
-		timeFresh := (now - item.ReceivedAt <= DeviceOnlineTTL)
+		reporterOnline := reportingOnline == 1 && reportingLastSeen > 0 && reportingLastSeen >= freshCutoff
+		timeFresh := item.ReceivedAt >= freshCutoff
 		item.Fresh = reporterOnline && timeFresh
 
 		if !reporterOnline {
@@ -276,39 +294,17 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 			item.Freshness = "fresh"
 		}
 
-		if filter.Freshness == "fresh" && !item.Fresh {
-			continue
-		}
-		if filter.Freshness == "stale" && item.Fresh {
-			continue
-		}
-
-		allItems = append(allItems, item)
+		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate admin connections: %w", err)
-	}
-
-	total := len(allItems)
-	start := offset
-	if start > total {
-		start = total
-	}
-	end := start + limit
-	if end > total {
-		end = total
-	}
-
-	pageItems := allItems[start:end]
-	if pageItems == nil {
-		pageItems = []AdminConnectionSummary{}
 	}
 
 	return &AdminConnectionPage{
 		Total:  total,
 		Limit:  limit,
 		Offset: offset,
-		Items:  pageItems,
+		Items:  items,
 	}, nil
 }
 
