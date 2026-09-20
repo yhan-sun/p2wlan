@@ -506,10 +506,9 @@ function AccountDetailPage() {
 function RelationshipsPage() {
   const [accountId, setAccountId] = useState('')
   const [search, setSearch] = useState('')
-  const debouncedSearch = useDebouncedValue(search)
   const accounts = useQuery({
-    queryKey: ['accounts', 'relationship-filter', debouncedSearch],
-    queryFn: () => adminApi.accounts(debouncedSearch, 50, 0),
+    queryKey: ['accounts', 'relationship-scope'],
+    queryFn: () => adminApi.accounts('', 50, 0),
   })
   const accountTopology = useQuery({
     queryKey: ['relationships', 'account', accountId],
