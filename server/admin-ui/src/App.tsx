@@ -47,6 +47,7 @@ import {
 } from 'react-router-dom'
 import { adminApi, ApiError, clearAdminToken, getAdminToken, setAdminToken, verifyAdminToken } from './api'
 import { accountColor, colorWithAlpha } from './colors'
+import { ConnectionsPage } from './ConnectionsPage'
 import { TopologyCanvas } from './TopologyCanvas'
 import { mergeTopologyPages } from './topologyPaging'
 import type {
@@ -229,7 +230,7 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
   return <main className="login-page-v2">
     <section className="login-brand-side">
       <div className="brand-lockup large"><div className="brand-symbol"><Waypoints size={22} /></div><div><strong>P2WLAN</strong><span>Control</span></div></div>
-      <div className="login-brand-copy"><span className="eyebrow-v2">SELF-HOSTED CONTROL PLANE</span><h1>看清每一个账号，<br />也看清资源关系。</h1><p>账号、设备、网络、房间和控制面资源关系统一在一个只读运维界面中。</p></div>
+      <div className="login-brand-copy"><span className="eyebrow-v2">SELF-HOSTED CONTROL PLANE</span><h1>资源关系和真实路径，<br />各自说清楚。</h1><p>Control 资源关系与 daemon 权威连接观测分开呈现，保持只读运维边界。</p></div>
       <div className="login-security"><ShieldCheck size={17} /><span>管理权限与用户 JWT / 设备凭据完全隔离</span></div>
     </section>
     <section className="login-form-side">
@@ -256,6 +257,7 @@ const navGroups = [
   { label: 'NETWORK', items: [
     { to: '/devices', icon: <MonitorSmartphone size={17} />, label: '设备' },
     { to: '/networks', icon: <Network size={17} />, label: '网络与房间' },
+    { to: '/connections', icon: <RadioTower size={17} />, label: 'Connections' },
     { to: '/relationships', icon: <Waypoints size={17} />, label: '资源关系' },
   ] },
   { label: 'OPERATIONS', items: [
@@ -267,6 +269,7 @@ function pageMeta(pathname: string): { title: string; eyebrow: string } {
   if (pathname.startsWith('/accounts/')) return { title: '账号详情', eyebrow: 'ACCOUNTS' }
   if (pathname === '/accounts') return { title: '账号', eyebrow: 'ACCOUNTS' }
   if (pathname === '/relationships') return { title: '资源关系', eyebrow: 'RELATIONSHIPS' }
+  if (pathname === '/connections') return { title: 'Connections', eyebrow: 'NETWORK' }
   if (pathname === '/devices') return { title: '设备', eyebrow: 'DEVICES' }
   if (pathname === '/networks') return { title: '网络与房间', eyebrow: 'NETWORK' }
   if (pathname === '/system') return { title: '运行健康', eyebrow: 'OPERATIONS' }
@@ -348,7 +351,7 @@ function Dashboard() {
           {overview.data.pending_signals > 0
             ? <div className="attention-item warning"><RadioTower size={17} /><div><strong>{overview.data.pending_signals} 条待处理 signaling</strong><span>这是控制面协调状态，不代表 Relay 或 Direct 数据路径。</span></div><Link to="/relationships">查看关系</Link></div>
             : <div className="attention-item success"><CircleCheck size={17} /><div><strong>没有待处理 signaling</strong><span>Control 当前未记录积压的协调消息。</span></div></div>}
-          <div className="attention-item neutral"><Waypoints size={17} /><div><strong>实时 Direct / Relay 路径不在 Control</strong><span>资源关系页不会把 membership、RTT 或 signaling 冒充实时网络拓扑。</span></div><Link to="/relationships">了解</Link></div>
+          <div className="attention-item neutral"><Waypoints size={17} /><div><strong>权威路径与资源关系已分离</strong><span>Connections 只读取 daemon committed observation；资源关系仍只表达 membership / attachment。</span></div><Link to="/connections">查看连接</Link></div>
         </div>
       </Panel>
     </section>
@@ -494,7 +497,7 @@ function AccountDetailPage() {
     </div>
 
     {tab === 'topology' && <Panel title={`${account.username} 的资源关系`} subtitle="包含该账号以及共享网络 / 房间中的对端账号和设备">
-      <PathNotice data={topology.data} fallback="这是 Control 资源关系图：只展示成员关系、设备挂载和可选的待处理 signaling。Control 当前不持久化 daemon 的实时 Direct / Relay 业务路径，因此这里不是实时网络拓扑。" />
+      <PathNotice data={topology.data} fallback="这是 Control 资源关系图：只展示成员关系、设备挂载和可选的待处理 signaling。daemon 权威路径观测保存在独立的 Connections 工作区，这里不会把它们混成资源关系。" />
       <TopologyCanvas data={topology.data} loading={topology.isPending} error={topology.error instanceof Error ? topology.error.message : undefined} />
     </Panel>}
     {tab === 'devices' && <Panel><DeviceTable devices={detail.data.devices} /></Panel>}
@@ -536,7 +539,7 @@ function RelationshipsPage() {
       <select className="select-field" value={accountId} onChange={(event) => setAccountId(event.target.value)}><option value="">全部账号</option>{accounts.data?.items.map((account) => <option value={account.id} key={account.id}>{account.username}</option>)}</select>
     </div></div>
     <Panel className="topology-main-panel">
-      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>这里的连线表示 membership、设备挂载等控制面资源关系。待处理 signaling 默认隐藏，并且即使显示也不代表 Relay / Direct 数据路径。真实路径以 daemon 路径观测和实际虚拟 IP 业务验证为准。</span></div>
+      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>这里的连线表示 membership、设备挂载等控制面资源关系。待处理 signaling 默认隐藏；daemon 权威 Direct / Relay 路径请到 Connections 查看，二者不会互相推断。</span></div>
       {!accountId && globalData && <div className="topology-page-progress">
         <span>已加载 {globalData.loaded_accounts} / {globalData.total_accounts} 个账号</span>
         {globalData.partial
@@ -635,6 +638,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
       <Route path="accounts/:id" element={<AccountDetailPage />} />
       <Route path="relationships" element={<RelationshipsPage />} />
       <Route path="topology" element={<Navigate to="/relationships" replace />} />
+      <Route path="connections" element={<ConnectionsPage />} />
       <Route path="devices" element={<DevicesPage />} />
       <Route path="networks" element={<NetworksPage />} />
       <Route path="system" element={<SystemPage />} />

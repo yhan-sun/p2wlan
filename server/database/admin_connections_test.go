@@ -27,6 +27,9 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 	// Setup users, networks, devices
 	u1, _ := db.CreateUser("user1@example.com", "hash1")
 	u2, _ := db.CreateUser("user2@example.com", "hash2")
+	if _, err := db.Exec("UPDATE users SET username = CASE id WHEN ? THEN 'alice-path-owner' WHEN ? THEN 'bob-path-owner' END WHERE id IN (?, ?)", u1.ID, u2.ID, u1.ID, u2.ID); err != nil {
+		t.Fatalf("set connection test usernames: %v", err)
+	}
 
 	net1, _ := db.CreateNetwork(u1.ID, "Net 1", "10.20.0.0/16")
 	net2, _ := db.CreateNetwork(u2.ID, "Net 2", "10.30.0.0/16")
@@ -138,6 +141,20 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 		t.Fatalf("expected 2 connections involving device A, got %d", devAPage.Total)
 	}
 
+	// Text search is applied server-side across device, account, and network labels.
+	searchDevice, _ := db.AdminConnections(AdminConnectionFilter{Query: "device a"}, 10, 0)
+	if searchDevice.Total != 2 {
+		t.Fatalf("expected 2 directional connections involving Device A, got %d", searchDevice.Total)
+	}
+	searchNetwork, _ := db.AdminConnections(AdminConnectionFilter{Query: "net 2"}, 10, 0)
+	if searchNetwork.Total != 1 {
+		t.Fatalf("expected 1 connection matching Net 2, got %d", searchNetwork.Total)
+	}
+	searchUser, _ := db.AdminConnections(AdminConnectionFilter{Query: "alice-path-owner"}, 10, 0)
+	if searchUser.Total != 2 {
+		t.Fatalf("expected 2 connections matching reporting/remote username, got %d", searchUser.Total)
+	}
+
 	// 29. Path filter
 	directPage, _ := db.AdminConnections(AdminConnectionFilter{Path: "direct"}, 10, 0)
 	if directPage.Total != 2 {
@@ -159,6 +176,50 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 	}
 	if p1.Items[0].ReportingDeviceID == p2.Items[0].ReportingDeviceID && p1.Items[0].RemoteDeviceID == p2.Items[0].RemoteDeviceID {
 		t.Fatalf("pagination overlap detected between page 1 and page 2")
+	}
+
+	// Freshness filtering is applied before pagination. Mark C's reporter lease
+	// stale and verify the SQL filter preserves the original classification.
+	if _, err := db.Exec("UPDATE devices SET last_seen = ? WHERE id = ?", time.Now().Unix()-DeviceOnlineTTL-5, devC.ID); err != nil {
+		t.Fatalf("expire reporter heartbeat: %v", err)
+	}
+	freshPage, err := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 10, 0)
+	if err != nil {
+		t.Fatalf("fresh connections: %v", err)
+	}
+	if freshPage.Total != 2 || len(freshPage.Items) != 2 {
+		t.Fatalf("expected 2 fresh connections, got total=%d len=%d", freshPage.Total, len(freshPage.Items))
+	}
+	stalePage, err := db.AdminConnections(AdminConnectionFilter{Freshness: "stale"}, 10, 0)
+	if err != nil {
+		t.Fatalf("stale connections: %v", err)
+	}
+	if stalePage.Total != 1 || len(stalePage.Items) != 1 || stalePage.Items[0].ReportingDeviceID != devC.ID || stalePage.Items[0].Fresh || stalePage.Items[0].Freshness != "reporter_offline" {
+		t.Fatalf("unexpected stale connection page: %+v", stalePage)
+	}
+
+	// A live reporter with an expired received_at is stale rather than offline.
+	if _, err := db.Exec("UPDATE devices SET last_seen = ? WHERE id = ?", time.Now().Unix(), devC.ID); err != nil {
+		t.Fatalf("restore reporter heartbeat: %v", err)
+	}
+	if _, err := db.Exec("UPDATE peer_path_observations SET received_at = ? WHERE reporting_device_id = ?", time.Now().Unix()-DeviceOnlineTTL-5, devC.ID); err != nil {
+		t.Fatalf("expire path observation: %v", err)
+	}
+	staleObservationPage, err := db.AdminConnections(AdminConnectionFilter{Freshness: "stale"}, 10, 0)
+	if err != nil {
+		t.Fatalf("stale observation connections: %v", err)
+	}
+	if staleObservationPage.Total != 1 || len(staleObservationPage.Items) != 1 || staleObservationPage.Items[0].ReportingDeviceID != devC.ID || staleObservationPage.Items[0].Freshness != "stale" {
+		t.Fatalf("expected stale-but-online observation, got %+v", staleObservationPage)
+	}
+
+	freshFirst, _ := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 1, 0)
+	freshSecond, _ := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 1, 1)
+	if freshFirst.Total != 2 || freshSecond.Total != 2 || len(freshFirst.Items) != 1 || len(freshSecond.Items) != 1 {
+		t.Fatalf("unexpected fresh pagination: first=%+v second=%+v", freshFirst, freshSecond)
+	}
+	if freshFirst.Items[0].ReportingDeviceID == freshSecond.Items[0].ReportingDeviceID && freshFirst.Items[0].RemoteDeviceID == freshSecond.Items[0].RemoteDeviceID {
+		t.Fatalf("fresh pagination overlap detected")
 	}
 }
 

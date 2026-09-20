@@ -23,12 +23,15 @@ Control 可选提供 `/admin/` 只读管理台。只有配置独立的 `CONTROL_
 
 管理台还展示 Control 数据库和当前 Control 进程能直接确认的网络、房间、设备、活动隧道、待处理信令和构建信息。设备的 `online`、Relay RTT 或 Control 健康状态都不能单独证明虚拟 IP 业务已经双向可达。
 
-### 连接与路径观测 API
+### Connections 与路径观测
 
-Control 提供只读 Admin Connections API，查询由客户端 daemon 权威上报的真实活动路径快照与迁移历史。接口需要管理员令牌（`Authorization: Bearer <CONTROL_ADMIN_TOKEN>`）：
+管理台的 **Connections** 工作区与“资源关系”是两个独立视图：资源关系回答账号、网络、房间和设备之间的 membership / attachment；Connections 只读取客户端 daemon 已提交并由 Control 持久化的单向活动路径观测，不根据 signaling、Relay RTT 或 membership 推断 Direct / Relay。
 
-- `GET /admin/api/v1/connections`：查询当前各对端连接的最新路径快照（来自 `peer_path_observations` 表）。支持按 `network_id`、`account_id`、`device_id`、`path`（如 direct/relay/connecting/probing/fallback_relay/failed/none）以及新鲜度 `max_age_seconds` 进行过滤；支持基于稳定游标的 `limit` 与 `cursor` 分页。每个条目均包含 reporting 设备、remote 设备、网络、路径类型、新鲜度、权威状态所有者、peer 会话代际与更新时间。
-- `GET /admin/api/v1/connection-transitions`：查询对端路径迁移历史（来自 `peer_path_transitions` 表，每对设备受限保留最多 50 条最近记录）。支持按 `reporting_device_id`、`remote_device_id`、`network_id` 过滤，并支持 `limit` 与 `cursor` 分页。每个迁移事件记录源路径、目标路径、触发原因（如 direct_upgrade、keepalive_timeout、initial_connect 等）、代际围栏信息与记录时间戳。
+Connections 默认使用列表视图，支持服务端搜索设备名、账号名或网络名，并按 `network_id`、`account_id`、`device_id`、`path`（direct / relay / none）与 `freshness`（fresh / stale）过滤。`GET /admin/api/v1/connections` 使用 `limit` / `offset` 分页。条目始终保持方向性：`A → B` 与 `B → A` 是两个独立观测；stale 或 reporter offline 的记录只表示最后一次已知路径，不等于当前仍存在活动连接。
+
+选择单个网络后可切换到 Live Topology。拓扑默认只画 fresh authoritative observations；显式开启 stale 后才以弱化虚线显示旧观测。大规模网络受前端明确的连接预算保护，达到预算会提示收紧搜索或路径过滤，不会静默把局部图声称为完整网络。
+
+点击连接列表行或拓扑边会打开当前方向的只读详情与迁移时间线。`GET /admin/api/v1/connection-transitions` 按 `reporting_device_id`、`remote_device_id`、`network_id` 查询，并使用 `limit` / `cursor` 分页；每对设备最多保留 50 条最近迁移记录。路径观测仍不证明远端具体应用端口一定可达，最终业务判断需要实际虚拟 IP 流量验证。
 
 管理台与 Control 使用同一 origin，不需要额外 CORS 放行。公网访问必须继续经过可信 HTTPS 反向代理；浏览器中的管理员令牌按敏感凭据处理，用完后退出管理台并关闭共享终端中的会话。
 

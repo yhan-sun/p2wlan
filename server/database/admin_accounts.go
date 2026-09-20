@@ -378,7 +378,7 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 		Scope:                    "global",
 		FocusAccountID:           accountID,
 		PathObservationAvailable: false,
-		PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; this relationship graph describes account membership, private default-device ownership, device attachment, and pending signaling only.",
+		PathObservationNote:      "This relationship graph does not include daemon-reported Direct/Relay path observations; Connections presents those authoritative directional snapshots separately.",
 		Nodes:                    []AdminTopologyNode{},
 		Edges:                    []AdminTopologyEdge{},
 	}
@@ -662,7 +662,7 @@ func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget 
 			GraphKind:                "control_relationships",
 			Scope:                    "global",
 			PathObservationAvailable: false,
-			PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; global relationship pages describe account ownership, explicit network membership, device attachment, and pending signaling only.",
+			PathObservationNote:      "Global relationship pages contain account ownership, explicit network membership, device attachment, and pending signaling only; daemon-reported path observations remain separate in Connections.",
 			Nodes:                    []AdminTopologyNode{},
 			Edges:                    []AdminTopologyEdge{},
 		},

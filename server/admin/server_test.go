@@ -99,6 +99,16 @@ func (fakeStore) AdminConnectionTransitions(_ database.AdminConnectionTransition
 	return &database.AdminConnectionTransitionPage{Limit: limit, Items: []database.AdminConnectionTransitionSummary{{ReportingDeviceID: "d1", RemoteDeviceID: "d2"}}}, nil
 }
 
+type connectionFilterStore struct {
+	fakeStore
+	filter database.AdminConnectionFilter
+}
+
+func (s *connectionFilterStore) AdminConnections(filter database.AdminConnectionFilter, limit, offset int) (*database.AdminConnectionPage, error) {
+	s.filter = filter
+	return s.fakeStore.AdminConnections(filter, limit, offset)
+}
+
 func testServer(t *testing.T, token string) *Server {
 	t.Helper()
 	server, err := New(fakeStore{}, Config{
@@ -124,7 +134,7 @@ func TestDisabledConsoleIsNotDiscoverable(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	paths := []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/app.js", "/admin/index.html"}
+	paths := []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/connections", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions", "/admin/app.js", "/admin/index.html"}
 	methods := []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions}
 	for _, path := range paths {
 		for _, method := range methods {
@@ -146,7 +156,7 @@ func TestConsoleServesEmbeddedUIWithSecurityHeaders(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	for _, path := range []string{"/admin/", "/admin/accounts/u1", "/admin/topology"} {
+	for _, path := range []string{"/admin/", "/admin/accounts/u1", "/admin/topology", "/admin/connections"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		res := httptest.NewRecorder()
 		mux.ServeHTTP(res, req)
@@ -177,7 +187,7 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	for _, path := range []string{"/admin/api/v1/overview", "/admin/api/v1/accounts", "/admin/api/v1/topology"} {
+	for _, path := range []string{"/admin/api/v1/overview", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions"} {
 		unauthorized := httptest.NewRecorder()
 		mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, path, nil))
 		if unauthorized.Code != http.StatusUnauthorized {
@@ -284,6 +294,33 @@ func TestAdminTopologyPaginationValidation(t *testing.T) {
 	mux.ServeHTTP(res, req)
 	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"complete":true`) {
 		t.Fatalf("unexpected topology page response %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestAdminConnectionsPassesSearchAndDirectionalFilters(t *testing.T) {
+	token := strings.Repeat("q", 32)
+	store := &connectionFilterStore{}
+	server, err := New(store, Config{
+		Token:        token,
+		BuildVersion: "server-v1.2.3",
+		BuildCommit:  "0123456789abcdef",
+		StartedAt:    time.Now().Add(-90 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/v1/connections?q=%20Alice%20Laptop%20&network_id=n1&reporting_device_id=d1&remote_device_id=d2&path=direct&freshness=fresh&limit=25&offset=0", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res := httptest.NewRecorder()
+	mux.ServeHTTP(res, req)
+	if res.Code != http.StatusOK {
+		t.Fatalf("unexpected connections response %d: %s", res.Code, res.Body.String())
+	}
+	if store.filter.Query != "Alice Laptop" || store.filter.NetworkID != "n1" || store.filter.ReportingDeviceID != "d1" || store.filter.RemoteDeviceID != "d2" || store.filter.Path != "direct" || store.filter.Freshness != "fresh" {
+		t.Fatalf("unexpected connection filter: %+v", store.filter)
 	}
 }
 

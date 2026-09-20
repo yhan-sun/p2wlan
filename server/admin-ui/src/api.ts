@@ -1,6 +1,9 @@
 import type {
   AdminAccount,
   AdminAccountDetail,
+  AdminConnectionFilters,
+  AdminConnectionPage,
+  AdminConnectionTransitionPage,
   AdminDevice,
   AdminNetwork,
   AdminOverview,
@@ -95,4 +98,26 @@ export const adminApi = {
   },
   networks: (limit = 50, offset = 0) => api<Page<AdminNetwork>>(`/networks?limit=${limit}&offset=${offset}`),
   rooms: (limit = 50, offset = 0) => api<Page<AdminRoom>>(`/rooms?limit=${limit}&offset=${offset}`),
+  connections: (filters: AdminConnectionFilters = {}, limit = 25, offset = 0) => {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+    if (filters.query) params.set('q', filters.query)
+    if (filters.networkId) params.set('network_id', filters.networkId)
+    if (filters.accountId) params.set('account_id', filters.accountId)
+    if (filters.deviceId) params.set('device_id', filters.deviceId)
+    if (filters.reportingDeviceId) params.set('reporting_device_id', filters.reportingDeviceId)
+    if (filters.remoteDeviceId) params.set('remote_device_id', filters.remoteDeviceId)
+    if (filters.path) params.set('path', filters.path)
+    if (filters.freshness) params.set('freshness', filters.freshness)
+    return api<AdminConnectionPage>(`/connections?${params}`)
+  },
+  connectionTransitions: (reportingDeviceId: string, remoteDeviceId: string, networkId: string, limit = 20, cursor = '') => {
+    const params = new URLSearchParams({
+      reporting_device_id: reportingDeviceId,
+      remote_device_id: remoteDeviceId,
+      network_id: networkId,
+      limit: String(limit),
+    })
+    if (cursor) params.set('cursor', cursor)
+    return api<AdminConnectionTransitionPage>(`/connection-transitions?${params}`)
+  },
 }

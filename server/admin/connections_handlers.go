@@ -14,6 +14,7 @@ func (s *Server) connections(w http.ResponseWriter, r *http.Request) {
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
 	filter := database.AdminConnectionFilter{
+		Query:             strings.TrimSpace(r.URL.Query().Get("q")),
 		NetworkID:         strings.TrimSpace(r.URL.Query().Get("network_id")),
 		AccountID:         strings.TrimSpace(r.URL.Query().Get("account_id")),
 		DeviceID:          strings.TrimSpace(r.URL.Query().Get("device_id")),
