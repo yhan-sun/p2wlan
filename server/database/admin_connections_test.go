@@ -198,6 +198,21 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 		t.Fatalf("unexpected stale connection page: %+v", stalePage)
 	}
 
+	// A live reporter with an expired received_at is stale rather than offline.
+	if _, err := db.Exec("UPDATE devices SET last_seen = ? WHERE id = ?", time.Now().Unix(), devC.ID); err != nil {
+		t.Fatalf("restore reporter heartbeat: %v", err)
+	}
+	if _, err := db.Exec("UPDATE peer_path_observations SET received_at = ? WHERE reporting_device_id = ?", time.Now().Unix()-DeviceOnlineTTL-5, devC.ID); err != nil {
+		t.Fatalf("expire path observation: %v", err)
+	}
+	staleObservationPage, err := db.AdminConnections(AdminConnectionFilter{Freshness: "stale"}, 10, 0)
+	if err != nil {
+		t.Fatalf("stale observation connections: %v", err)
+	}
+	if staleObservationPage.Total != 1 || len(staleObservationPage.Items) != 1 || staleObservationPage.Items[0].ReportingDeviceID != devC.ID || staleObservationPage.Items[0].Freshness != "stale" {
+		t.Fatalf("expected stale-but-online observation, got %+v", staleObservationPage)
+	}
+
 	freshFirst, _ := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 1, 0)
 	freshSecond, _ := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 1, 1)
 	if freshFirst.Total != 2 || freshSecond.Total != 2 || len(freshFirst.Items) != 1 || len(freshSecond.Items) != 1 {
