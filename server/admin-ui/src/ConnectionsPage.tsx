@@ -60,7 +60,7 @@ function formatMilliseconds(value?: number): string {
   return `${Math.round(seconds / 6) / 10} min`
 }
 
-function pathLabel(path?: string): string {
+function pathLabel(path?: string | null): string {
   if (!path) return 'None'
   if (path === 'direct') return 'Direct'
   if (path === 'relay') return 'Relay'
