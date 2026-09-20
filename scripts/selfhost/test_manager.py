@@ -86,6 +86,12 @@ exit 0
         self.assertIn('restore failed; original database, configuration and service state were restored', manager)
         self.assertIn('rollback target is incomplete', manager)
         self.assertNotIn('systemctl stop p2wlan-control.service || true', manager)
+        self.assertIn('"CONTROL_ADMIN_TOKEN=$(openssl rand -hex 32)"', manager)
+        self.assertIn('setup_server()', manager)
+        self.assertIn('doctor_server()', manager)
+        self.assertIn('p2wlan-db" --verify "$db_path"', manager)
+        self.assertIn('openssl x509 -checkend 604800', manager)
+        self.assertIn('Result: $failures failure(s), $warnings warning(s)', manager)
 
 
 if __name__ == '__main__':
