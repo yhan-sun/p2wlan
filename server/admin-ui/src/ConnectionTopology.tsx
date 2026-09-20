@@ -38,7 +38,7 @@ function connectionKey(connection: AdminConnection): string {
   return `${connection.network_id}:${connection.reporting_device_id}:${connection.remote_device_id}`
 }
 
-function pathLabel(path?: string): string {
+function pathLabel(path?: string | null): string {
   if (!path) return 'None'
   if (path === 'direct') return 'Direct'
   if (path === 'relay') return 'Relay'
