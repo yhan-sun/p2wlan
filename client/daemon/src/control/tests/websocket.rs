@@ -190,8 +190,14 @@ async fn signal_websocket_exchanges_active_path_telemetry_when_advertised() {
             assert_eq!(parsed["type"], "path_telemetry");
             assert_eq!(parsed["payload"]["device_id"], "node-tele");
             assert_eq!(parsed["payload"]["network_id"], "network-tele");
-            assert_eq!(parsed["payload"]["observations"][0]["remote_device_id"], "remote-peer");
-            assert_eq!(parsed["payload"]["observations"][0]["current_path"], "direct");
+            assert_eq!(
+                parsed["payload"]["observations"][0]["remote_device_id"],
+                "remote-peer"
+            );
+            assert_eq!(
+                parsed["payload"]["observations"][0]["current_path"],
+                "direct"
+            );
 
             // 3. Reply with path_telemetry_ack
             socket
@@ -219,7 +225,10 @@ async fn signal_websocket_exchanges_active_path_telemetry_when_advertised() {
     let client_connected = connected.clone();
     let base_url = format!("http://{address}");
 
-    let hub = Arc::new(PathTelemetryHub::new("node-tele".into(), "network-tele".into()));
+    let hub = Arc::new(PathTelemetryHub::new(
+        "node-tele".into(),
+        "network-tele".into(),
+    ));
     let snap = PathObservabilitySnapshot {
         current_path: Some(NetworkPath::Direct),
         path_state_revision: 1,

@@ -387,6 +387,28 @@ dependency_overrides:
             )
             self.assertEqual(flutter_outdated_triage.run(report)["result"], "fail")
 
+    def test_direct_constraint_pinned_does_not_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.write_outdated(
+                Path(tmp),
+                [
+                    {
+                        "package": "direct_dep",
+                        "kind": "direct",
+                        "current": {"version": "0.5.3"},
+                        "upgradable": {"version": "0.5.3"},
+                        "resolvable": {"version": "0.7.0"},
+                        "latest": {"version": "0.7.0"},
+                    }
+                ],
+            )
+            evidence = flutter_outdated_triage.run(report)
+            self.assertEqual(evidence["result"], "pass")
+            self.assertEqual(
+                evidence["packages"][0]["classification"],
+                "direct_constraint_or_sdk_pinned",
+            )
+
     def test_discontinued_package_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report = self.write_outdated(

@@ -67,6 +67,12 @@ def classify(package: dict[str, Any]) -> dict[str, Any] | None:
         classification = "current_version_retracted"
         reason = "The resolved version is retracted and is not release-admissible."
         blocker = True
+    elif kind in DIRECT_KINDS and upgradable and current and upgradable == current:
+        classification = "direct_constraint_or_sdk_pinned"
+        reason = (
+            "Latest differs, but current constraints or the Flutter SDK do not "
+            "resolve a newer version."
+        )
     elif kind in DIRECT_KINDS and current and resolvable and current != resolvable:
         classification = "direct_resolvable_upgrade_required"
         reason = (

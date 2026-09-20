@@ -16,7 +16,24 @@ use crate::error::{DaemonError, Result};
 
 pub const TELEMETRY_HTTP_PATH: &str = "/api/v1/telemetry/paths";
 pub const TELEMETRY_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
-pub const TELEMETRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub const TELEMETRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// RAII handle for the background telemetry worker that aborts on drop.
+pub struct PathTelemetryWorkerTask {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl PathTelemetryWorkerTask {
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for PathTelemetryWorkerTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
 
 /// Active-path telemetry HTTP delivery client.
 #[derive(Clone)]
@@ -43,7 +60,7 @@ impl PathTelemetrySender {
         }
     }
 
-    /// Whether the server is known to support path telemetry.
+    /// Check if telemetry endpoint is supported by the server.
     pub fn is_supported(&self) -> bool {
         self.telemetry_supported.load(Ordering::Acquire)
     }
@@ -104,11 +121,8 @@ impl PathTelemetrySender {
     }
 
     /// Spawn a background task to flush dirty path telemetry periodically or on notification.
-    pub fn spawn_worker(
-        self: Arc<Self>,
-        ws_active: Arc<AtomicBool>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    pub fn spawn_worker(self: Arc<Self>, ws_active: Arc<AtomicBool>) -> PathTelemetryWorkerTask {
+        let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(TELEMETRY_FLUSH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -127,6 +141,7 @@ impl PathTelemetrySender {
                     let _ = self.flush_http().await;
                 }
             }
-        })
+        });
+        PathTelemetryWorkerTask { handle }
     }
 }

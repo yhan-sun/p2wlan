@@ -826,10 +826,7 @@ impl PeerConnection {
     }
 
     /// Attach the active-path telemetry hub.
-    pub(crate) fn attach_telemetry_hub(
-        &mut self,
-        hub: Arc<path_telemetry::PathTelemetryHub>,
-    ) {
+    pub(crate) fn attach_telemetry_hub(&mut self, hub: Arc<path_telemetry::PathTelemetryHub>) {
         self.telemetry_hub = Some(hub);
         self.sync_path_telemetry();
     }
