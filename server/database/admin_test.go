@@ -161,7 +161,7 @@ func TestAdminAccountTopologyIncludesSharedPeersWithoutInventingPath(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if topology.Scope != "account" || topology.FocusAccountID != "u1" || topology.PathObservationAvailable {
+	if topology.GraphKind != "control_relationships" || topology.Scope != "account" || topology.FocusAccountID != "u1" || topology.PathObservationAvailable {
 		t.Fatalf("unexpected topology metadata: %+v", topology)
 	}
 
@@ -207,7 +207,7 @@ func TestAdminGlobalTopologyContainsAllAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if topology.Scope != "global" || topology.PathObservationAvailable {
+	if topology.GraphKind != "control_relationships" || topology.Scope != "global" || topology.PathObservationAvailable {
 		t.Fatalf("unexpected global topology metadata: %+v", topology)
 	}
 	accounts := map[string]bool{}
