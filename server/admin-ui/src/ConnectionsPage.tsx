@@ -25,10 +25,6 @@ import type { AdminConnection, AdminConnectionTransition } from './types'
 const PAGE_SIZE = 25
 const TOPOLOGY_LIMIT = 100
 
-function connectionKey(connection: Pick<AdminConnection, 'network_id' | 'reporting_device_id' | 'remote_device_id'>): string {
-  return `${connection.network_id}:${connection.reporting_device_id}:${connection.remote_device_id}`
-}
-
 function formatAgo(unix?: number): string {
   if (!unix) return '—'
   const seconds = Math.max(0, Math.floor(Date.now() / 1000) - unix)
