@@ -103,17 +103,25 @@ function topologyNodeMatches(node: AdminTopologyNode, normalizedSearch: string):
 function applySearch(graph: { nodes: Node[]; edges: Edge[] }, data: AdminTopology, search: string): { nodes: Node[]; edges: Edge[] } {
   const normalizedSearch = search.trim().toLowerCase()
   if (!normalizedSearch) return graph
-  const sourceNodes = new Map(data.nodes.map((node) => [node.id, node]))
-  const matchedIds = new Set(data.nodes.filter((node) => topologyNodeMatches(node, normalizedSearch)).map((node) => node.id))
+
+  const matchedIds = new Set(
+    data.nodes.filter((node) => topologyNodeMatches(node, normalizedSearch)).map((node) => node.id),
+  )
+  if (matchedIds.size === 0) return { nodes: [], edges: [] }
+
+  // A search result is useful only with enough local context to explain why the
+  // resource is in this graph. Keep the direct one-hop neighborhood and hide
+  // unrelated branches instead of leaving a low-opacity hairball behind.
+  const contextIds = new Set(matchedIds)
+  for (const edge of graph.edges) {
+    if (matchedIds.has(edge.source) || matchedIds.has(edge.target)) {
+      contextIds.add(edge.source)
+      contextIds.add(edge.target)
+    }
+  }
   return {
-    nodes: graph.nodes.map((node) => ({ ...node, style: { ...node.style, opacity: matchedIds.has(node.id) ? 1 : 0.16 } })),
-    edges: graph.edges.map((edge) => {
-      const matches = matchedIds.has(edge.source) || matchedIds.has(edge.target)
-      const source = sourceNodes.get(edge.source)
-      const target = sourceNodes.get(edge.target)
-      if (!source || !target) return edge
-      return { ...edge, style: { ...edge.style, opacity: matches ? (edge.style?.opacity ?? 1) : 0.07 } }
-    }),
+    nodes: graph.nodes.filter((node) => contextIds.has(node.id)),
+    edges: graph.edges.filter((edge) => contextIds.has(edge.source) && contextIds.has(edge.target)),
   }
 }
 
@@ -198,7 +206,7 @@ function buildGraph(data: AdminTopology, options: GraphOptions): { nodes: Node[]
 function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () => void }) {
   const color = ownerColor(node)
   return (
-    <aside className="topology-detail" aria-label="拓扑节点详情">
+    <aside className="topology-detail" aria-label="关系图节点详情">
       <button className="icon-button topology-detail-close" onClick={onClose} aria-label="关闭详情"><X size={16} /></button>
       <div className="topology-detail-type" style={{ color }}>{node.kind.toUpperCase()}</div>
       <h3>{node.label}</h3>
@@ -235,7 +243,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
   const [fullscreen, setFullscreen] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [showOffline, setShowOffline] = useState(true)
-  const [showSignals, setShowSignals] = useState(true)
+  const [showSignals, setShowSignals] = useState(false)
   const layoutGraph = useMemo(
     () => data ? buildGraph(data, { showOffline, showSignals }) : { nodes: [], edges: [] },
     [data, showOffline, showSignals],
@@ -247,9 +255,10 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
   const selected = data?.nodes.find((node) => node.id === selectedId)
   const accounts = useMemo(() => data?.nodes.filter((node) => node.kind === 'account') ?? [], [data])
 
-  if (loading) return <div className="topology-state"><div className="spinner" />正在构建拓扑…</div>
+  if (loading) return <div className="topology-state"><div className="spinner" />正在构建资源关系图…</div>
   if (error) return <div className="topology-state error"><CircleAlert size={18} />{error}</div>
-  if (!data || data.nodes.length === 0) return <div className="topology-state"><Box size={18} />暂无可展示的拓扑数据</div>
+  if (!data || data.nodes.length === 0) return <div className="topology-state"><Box size={18} />暂无可展示的资源关系</div>
+  if (search.trim() && graph.nodes.length === 0) return <div className="topology-state"><Box size={18} />没有匹配的账号、设备、IP 或网络</div>
 
   return (
     <div className={`topology-canvas ${compact ? 'compact' : ''} ${fullscreen ? 'fullscreen' : ''}`}>
@@ -286,8 +295,8 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
           <button className={`topology-filter-button ${showOffline ? 'active' : ''}`} onClick={() => setShowOffline((value) => !value)} title="显示或隐藏离线设备">
             {showOffline ? <Eye size={15} /> : <EyeOff size={15} />}离线设备
           </button>
-          <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title="显示或隐藏待处理信令">
-            <RadioTower size={15} />待处理信令
+          <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title="显示或隐藏控制面的待处理信令">
+            <RadioTower size={15} />控制信令
           </button>
         </>}
         <button className="icon-button topology-fullscreen-button" onClick={() => setFullscreen((value) => !value)} aria-label={fullscreen ? '退出全屏' : '全屏'}>
@@ -298,7 +307,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
       <TopologySummary data={data} />
 
       {!compact && <aside className="topology-legend">
-        <div className="topology-legend-heading">账号颜色</div>
+        <div className="topology-legend-heading">账号标识</div>
         <div className="topology-account-legend-list">
           {accounts.map((account) => (
             <div className="legend-row" key={account.id}>
@@ -308,9 +317,9 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
             </div>
           ))}
         </div>
-        <div className="topology-legend-heading edge-heading">关系</div>
+        <div className="topology-legend-heading edge-heading">资源关系</div>
         <div className="legend-row"><span className="legend-line solid" />成员 / 设备挂载</div>
-        <div className="legend-row"><span className="legend-line dashed" />待处理信令</div>
+        <div className="legend-row"><span className="legend-line dashed" />待处理 signaling（控制面）</div>
       </aside>}
 
       {selected && <DetailPanel node={selected} onClose={() => setSelectedId(null)} />}
