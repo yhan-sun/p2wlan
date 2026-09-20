@@ -68,6 +68,7 @@ type AdminConnectionHealthAlert struct {
 	RemoteUsername        string   `json:"remote_username"`
 	NetworkID             string   `json:"network_id"`
 	NetworkName           string   `json:"network_name"`
+	Lifecycle             string   `json:"lifecycle"`
 	CurrentPath           *string  `json:"current_path"`
 	Fresh                 bool     `json:"fresh"`
 	Freshness             string   `json:"freshness"`
@@ -180,6 +181,7 @@ scoped AS (
 		remu.username AS remote_username,
 		o.network_id,
 		n.name AS network_name,
+		o.lifecycle,
 		o.current_path,
 		o.received_at,
 		o.last_validation_rtt_ms,
@@ -224,6 +226,7 @@ func (db *DB) adminConnectionObservationHealthSummary(filter AdminConnectionHeal
 	query := fmt.Sprintf(`
 WITH scoped AS (
 	SELECT
+		o.lifecycle,
 		o.current_path,
 		o.last_validation_rtt_ms,
 		CASE
@@ -249,7 +252,7 @@ SELECT
 	COALESCE(SUM(CASE WHEN reporter_online = 0 THEN 1 ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN fresh = 1 AND current_path = 'direct' THEN 1 ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN fresh = 1 AND current_path = 'relay' THEN 1 ELSE 0 END), 0),
-	COALESCE(SUM(CASE WHEN fresh = 1 AND (current_path IS NULL OR current_path = '') THEN 1 ELSE 0 END), 0),
+	COALESCE(SUM(CASE WHEN fresh = 1 AND lifecycle = 'online' AND (current_path IS NULL OR current_path = '') THEN 1 ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN fresh = 1 AND last_validation_rtt_ms IS NOT NULL THEN 1 ELSE 0 END), 0),
 	CAST(ROUND(AVG(CASE WHEN fresh = 1 THEN last_validation_rtt_ms END)) AS INTEGER),
 	MAX(CASE WHEN fresh = 1 THEN last_validation_rtt_ms END)
@@ -298,7 +301,7 @@ SELECT
 	COALESCE(SUM(CASE WHEN recent_direct_failures + recent_relay_failures >= ? THEN 1 ELSE 0 END), 0),
 	COALESCE(SUM(CASE
 		WHEN fresh = 0
-			OR (fresh = 1 AND (current_path IS NULL OR current_path = ''))
+			OR (fresh = 1 AND lifecycle = 'online' AND (current_path IS NULL OR current_path = ''))
 			OR recent_path_switches >= ?
 			OR recent_direct_failures + recent_relay_failures >= ?
 		THEN 1 ELSE 0 END), 0)
@@ -340,6 +343,7 @@ SELECT
 	remote_username,
 	network_id,
 	network_name,
+	lifecycle,
 	current_path,
 	received_at,
 	last_validation_rtt_ms,
@@ -352,12 +356,12 @@ SELECT
 FROM scoped
 WHERE
 	fresh = 0
-	OR (fresh = 1 AND (current_path IS NULL OR current_path = ''))
+	OR (fresh = 1 AND lifecycle = 'online' AND (current_path IS NULL OR current_path = ''))
 	OR recent_path_switches >= ?
 	OR recent_direct_failures + recent_relay_failures >= ?
 ORDER BY
 	CASE
-		WHEN (fresh = 1 AND (current_path IS NULL OR current_path = ''))
+		WHEN (fresh = 1 AND lifecycle = 'online' AND (current_path IS NULL OR current_path = ''))
 			OR recent_path_switches >= ?
 			OR recent_direct_failures + recent_relay_failures >= ?
 		THEN 0 ELSE 1
@@ -401,6 +405,7 @@ LIMIT ?
 			&item.RemoteUsername,
 			&item.NetworkID,
 			&item.NetworkName,
+			&item.Lifecycle,
 			&currentPath,
 			&item.ReceivedAt,
 			&lastValidationRTT,
@@ -435,7 +440,7 @@ LIMIT ?
 		}
 
 		warning := false
-		if item.Fresh && item.CurrentPath == nil {
+		if item.Fresh && item.Lifecycle == "online" && item.CurrentPath == nil {
 			item.Signals = append(item.Signals, "no_active_path")
 			warning = true
 		}
