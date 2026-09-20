@@ -135,7 +135,7 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
     const hasReverse = (pairCounts.get(pair) ?? 0) > 1
     const lexicalForward = connection.reporting_device_id.localeCompare(connection.remote_device_id) < 0
     const stroke = kind === 'direct' ? '#16803d' : kind === 'relay' ? '#2563eb' : '#98a2b3'
-    const label = `${pathLabel(connection.current_path)}${connection.last_validation_rtt_ms !== undefined ? ` · ${connection.last_validation_rtt_ms} ms` : ''}${connection.fresh ? '' : ' · stale'}`
+    const label = `${pathLabel(connection.current_path)}${connection.last_validation_rtt_ms !== undefined ? ` · 验证 ${connection.last_validation_rtt_ms} ms` : ''}${connection.fresh ? '' : ' · stale'}`
     return {
       id: connectionKey(connection),
       source: connection.reporting_device_id,
