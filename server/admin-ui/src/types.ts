@@ -164,8 +164,8 @@ export interface AdminConnection {
   network_id: string
   network_name: string
   lifecycle: string
-  current_path?: string
-  previous_path?: string
+  current_path: string | null
+  previous_path: string | null
   transition_reason: string
   direct_state?: string
   relay_state?: string
@@ -193,8 +193,8 @@ export interface AdminConnectionTransition {
   remote_device_id: string
   network_id: string
   lifecycle: string
-  current_path?: string
-  previous_path?: string
+  current_path: string | null
+  previous_path: string | null
   transition_reason: string
   selected_path_mtu?: number
   observed_at: number
