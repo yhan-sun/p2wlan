@@ -210,4 +210,12 @@ echo "Installed p2wlan-daemon to $INSTALL_DIR/p2wlan-daemon"
 if [ -x "$INSTALL_DIR/p2wlan" ]; then
   "$INSTALL_DIR/p2wlan" --version
 fi
-echo "Run 'p2wlan help' to get started."
+cat <<'EOF'
+Next steps:
+  1. p2wlan config set control https://control.example.com
+  2. p2wlan login -u your-name
+  3. p2wlan up
+  4. p2wlan doctor
+
+Use your deployment's real trusted Control URL. Login/configuration should run as your normal user, not with sudo.
+EOF

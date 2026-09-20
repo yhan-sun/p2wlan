@@ -8,8 +8,9 @@
     sudo p2wlan-server update --version server-vX.Y.Z
     sudo p2wlan-server verify --service all
     sudo p2wlan-server check --service all
+    sudo p2wlan-server doctor --service all
 
-升级不会覆盖配置目录和数据目录。更新前后记录准确版本、源码提交、归档 checksum 和健康检查结果。
+升级不会覆盖配置目录和数据目录。更新前后记录准确版本、源码提交、归档 checksum、服务健康检查和 doctor 结果。doctor 的主机级检查仍不替代真实客户端/TUN/公网入口验收。
 
 ## 备份
 

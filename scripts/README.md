@@ -15,6 +15,7 @@
 | `release/verify_release_identity.py` | build-info、版本、commit、SHA 和 dirty gate | 否 | release workflow 的 fail-closed gate |
 | `staging/validate_staging_config.py` | staging catalog、TLS、audience/region 和 key 配置校验 | 否 | 默认只读，不部署、不重启 |
 | `deploy-server.sh` | 从 Release/Actions 包上传服务端，或让服务器自行拉取版本 | 是 | SSH 密码由 OpenSSH 交互读取；`--start` 才启用服务并做健康检查 |
+| `p2wlan-server` | 固定归档的本机服务管理、初始化、诊断、备份与恢复 | 否 | `setup` 补齐部署初始化，`doctor` 分层检查本机运行条件，不替代真实公网/TUN 验收 |
 
 每个主要入口旁边都有同名 Markdown，例如 `mini-air-smoke.sh` 对应
 `mini-air-smoke.md`。Markdown 记录前提、用法、输出字段、结果解释和限制。

@@ -229,7 +229,7 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
   return <main className="login-page-v2">
     <section className="login-brand-side">
       <div className="brand-lockup large"><div className="brand-symbol"><Waypoints size={22} /></div><div><strong>P2WLAN</strong><span>Control</span></div></div>
-      <div className="login-brand-copy"><span className="eyebrow-v2">SELF-HOSTED CONTROL PLANE</span><h1>看清每一个账号，<br />也看清整张网络。</h1><p>账号、设备、网络、房间和控制面拓扑统一在一个只读管理界面中。</p></div>
+      <div className="login-brand-copy"><span className="eyebrow-v2">SELF-HOSTED CONTROL PLANE</span><h1>看清每一个账号，<br />也看清资源关系。</h1><p>账号、设备、网络、房间和控制面资源关系统一在一个只读运维界面中。</p></div>
       <div className="login-security"><ShieldCheck size={17} /><span>管理权限与用户 JWT / 设备凭据完全隔离</span></div>
     </section>
     <section className="login-form-side">
@@ -252,24 +252,24 @@ const navGroups = [
   { label: 'GENERAL', items: [
     { to: '/', end: true, icon: <LayoutDashboard size={17} />, label: '概览' },
     { to: '/accounts', icon: <Users size={17} />, label: '账号' },
-    { to: '/topology', icon: <Waypoints size={17} />, label: '拓扑' },
   ] },
   { label: 'NETWORK', items: [
     { to: '/devices', icon: <MonitorSmartphone size={17} />, label: '设备' },
     { to: '/networks', icon: <Network size={17} />, label: '网络与房间' },
+    { to: '/relationships', icon: <Waypoints size={17} />, label: '资源关系' },
   ] },
-  { label: 'SYSTEM', items: [
-    { to: '/system', icon: <Activity size={17} />, label: '运行状态' },
+  { label: 'OPERATIONS', items: [
+    { to: '/system', icon: <Activity size={17} />, label: '运行健康' },
   ] },
 ]
 
 function pageMeta(pathname: string): { title: string; eyebrow: string } {
   if (pathname.startsWith('/accounts/')) return { title: '账号详情', eyebrow: 'ACCOUNTS' }
   if (pathname === '/accounts') return { title: '账号', eyebrow: 'ACCOUNTS' }
-  if (pathname === '/topology') return { title: '网络拓扑', eyebrow: 'TOPOLOGY' }
+  if (pathname === '/relationships') return { title: '资源关系', eyebrow: 'RELATIONSHIPS' }
   if (pathname === '/devices') return { title: '设备', eyebrow: 'DEVICES' }
   if (pathname === '/networks') return { title: '网络与房间', eyebrow: 'NETWORK' }
-  if (pathname === '/system') return { title: '运行状态', eyebrow: 'SYSTEM' }
+  if (pathname === '/system') return { title: '运行健康', eyebrow: 'OPERATIONS' }
   return { title: '概览', eyebrow: 'OVERVIEW' }
 }
 
@@ -312,39 +312,50 @@ function Shell({ onLogout }: { onLogout: () => void }) {
 function Dashboard() {
   const overview = useQuery({ queryKey: ['overview'], queryFn: adminApi.overview, refetchInterval: 30_000 })
   const accounts = useQuery({ queryKey: ['accounts', 'recent'], queryFn: () => adminApi.accounts('', 6, 0), refetchInterval: 30_000 })
-  const topology = useQuery({ queryKey: ['topology', 'dashboard'], queryFn: () => adminApi.topologyPage('', 6, 260), refetchInterval: 60_000 })
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: adminApi.runtime, refetchInterval: 30_000 })
-  if (overview.isPending || accounts.isPending || topology.isPending || runtime.isPending) return <PendingBlock queries={[overview, accounts, topology, runtime]} label="正在读取 Control 状态…" />
-  const error = overview.error || accounts.error || topology.error || runtime.error
+  if (overview.isPending || accounts.isPending || runtime.isPending) return <PendingBlock queries={[overview, accounts, runtime]} label="正在读取 Control 状态…" />
+  const error = overview.error || accounts.error || runtime.error
   if (error) return <ErrorBlock error={error} />
-  if (!overview.data || !accounts.data || !topology.data || !runtime.data) return <ErrorBlock error={new Error('Control 未返回完整快照，请刷新重试。')} />
+  if (!overview.data || !accounts.data || !runtime.data) return <ErrorBlock error={new Error('Control 未返回完整快照，请刷新重试。')} />
+
+  const offlineDevices = Math.max(0, overview.data.devices - overview.data.online_devices)
 
   return <div className="page-stack">
     <section className="metrics-grid-v2">
       <MetricCard icon={<Users size={18} />} label="账号" value={overview.data.users} meta="Control 中的非系统账号" />
-      <MetricCard icon={<MonitorSmartphone size={18} />} label="设备" value={overview.data.devices} meta={<><span className="positive-text">{overview.data.online_devices} 在线</span> · {overview.data.devices - overview.data.online_devices} 离线</>} />
-      <MetricCard icon={<Network size={18} />} label="网络" value={overview.data.networks} meta={`${overview.data.rooms} 个房间网络`} />
-      <MetricCard icon={<Activity size={18} />} label="控制面" value={overview.data.pending_signals} meta={`${overview.data.active_tunnels} 个活动隧道 · 待处理信令`} />
+      <MetricCard icon={<MonitorSmartphone size={18} />} label="设备在线" value={<>{overview.data.online_devices}/{overview.data.devices}</>} meta={offlineDevices ? <>{offlineDevices} 台离线</> : '全部设备在线'} />
+      <MetricCard icon={<Network size={18} />} label="网络" value={overview.data.networks} meta={<>{overview.data.rooms} 个房间网络</>} />
+      <MetricCard icon={<Activity size={18} />} label="待处理信令" value={overview.data.pending_signals} meta={<>{overview.data.active_tunnels} 个 Control 活动隧道</>} />
     </section>
 
-    <section className="dashboard-grid">
-      <Panel className="dashboard-topology" title="全局拓扑预览" subtitle={`首批 ${topology.data.loaded_accounts} / ${topology.data.total_accounts} 个账号；完整视图按需加载`} action={<Link className="text-link" to="/topology">打开拓扑工作区<ArrowRight size={14} /></Link>}>
-        <TopologyCanvas data={topology.data} compact />
-      </Panel>
-      <Panel className="health-card" title="Control" subtitle="当前服务进程" action={<span className="badge success"><span />正常</span>}>
+    <section className="dashboard-grid operations-grid">
+      <Panel className="health-card" title="Control 运行健康" subtitle="这里只展示 Control 能直接确认的事实" action={<span className="badge success"><span />可响应</span>}>
         <div className="health-runtime-big"><div className="health-runtime-icon"><Server size={22} /></div><div><span>运行时间</span><strong>{formatDuration(runtime.data.uptime_seconds)}</strong></div></div>
         <dl className="detail-list compact">
           <div><dt>版本</dt><dd>{runtime.data.build_version}</dd></div>
           <div><dt>提交</dt><dd className="mono">{runtime.data.build_commit.slice(0, 10)}</dd></div>
           <div><dt>启动时间</dt><dd>{formatDate(runtime.data.started_at)}</dd></div>
-          <div><dt>权限</dt><dd>只读</dd></div>
+          <div><dt>管理权限</dt><dd>只读</dd></div>
         </dl>
+        <Link className="text-link panel-footer-link" to="/system">查看运行健康<ArrowRight size={14} /></Link>
+      </Panel>
+
+      <Panel title="需要关注" subtitle="按当前 Control 快照生成，不推断真实数据面故障">
+        <div className="attention-list">
+          {offlineDevices > 0
+            ? <div className="attention-item warning"><CircleAlert size={17} /><div><strong>{offlineDevices} 台设备当前离线</strong><span>可到设备页按在线状态筛选，结合最后活动时间排查。</span></div><Link to="/devices">查看</Link></div>
+            : <div className="attention-item success"><CircleCheck size={17} /><div><strong>设备在线状态正常</strong><span>当前快照中没有离线设备。</span></div></div>}
+          {overview.data.pending_signals > 0
+            ? <div className="attention-item warning"><RadioTower size={17} /><div><strong>{overview.data.pending_signals} 条待处理 signaling</strong><span>这是控制面协调状态，不代表 Relay 或 Direct 数据路径。</span></div><Link to="/relationships">查看关系</Link></div>
+            : <div className="attention-item success"><CircleCheck size={17} /><div><strong>没有待处理 signaling</strong><span>Control 当前未记录积压的协调消息。</span></div></div>}
+          <div className="attention-item neutral"><Waypoints size={17} /><div><strong>实时 Direct / Relay 路径不在 Control</strong><span>资源关系页不会把 membership、RTT 或 signaling 冒充实时网络拓扑。</span></div><Link to="/relationships">了解</Link></div>
+        </div>
       </Panel>
     </section>
 
     <section className="dashboard-lower-grid">
       <Panel title="最近账号" subtitle="按设备最后活动时间排序" action={<Link className="text-link" to="/accounts">全部账号<ArrowRight size={14} /></Link>}>
-        <div className="recent-account-list">{accounts.data.items.map((account) => <Link className="recent-account-row" to={`/accounts/${encodeURIComponent(account.id)}`} key={account.id}>
+        <div className="recent-account-list">{accounts.data.items.map((account) => <Link className="recent-account-row" to={'/accounts/' + encodeURIComponent(account.id)} key={account.id}>
           <AccountMark account={account} />
           <div className="recent-account-main"><strong>{account.username}</strong><span>{account.email}</span></div>
           <div className="recent-account-stat"><strong>{account.online_devices}/{account.device_count}</strong><span>在线设备</span></div>
@@ -353,7 +364,7 @@ function Dashboard() {
           <ChevronRight size={15} />
         </Link>)}</div>
       </Panel>
-      <Panel title="控制面摘要" subtitle="这些计数不是数据面吞吐">
+      <Panel title="控制面摘要" subtitle="计数不等于端到端业务可达">
         <div className="control-summary-grid">
           <div><span className="summary-icon"><Activity size={17} /></span><strong>{overview.data.pending_signals}</strong><small>待处理信令</small></div>
           <div><span className="summary-icon"><Waypoints size={17} /></span><strong>{overview.data.active_tunnels}</strong><small>活动隧道</small></div>
@@ -364,7 +375,6 @@ function Dashboard() {
     </section>
   </div>
 }
-
 function AccountsPage() {
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
@@ -480,11 +490,11 @@ function AccountDetailPage() {
     </section>
 
     <div className="tabs-v2">
-      {([['topology', '拓扑'], ['devices', `设备 ${account.device_count}`], ['networks', `网络 ${account.network_count}`], ['rooms', `房间 ${account.room_count}`]] as const).map(([value, label]) => <button key={value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{label}</button>)}
+      {([['topology', '关系'], ['devices', `设备 ${account.device_count}`], ['networks', `网络 ${account.network_count}`], ['rooms', `房间 ${account.room_count}`]] as const).map(([value, label]) => <button key={value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{label}</button>)}
     </div>
 
-    {tab === 'topology' && <Panel title={`${account.username} 的拓扑`} subtitle="包含该账号以及共享网络 / 房间中的对端账号和设备">
-      <PathNotice data={topology.data} fallback="Control 当前没有持久化 daemon 的实时 Direct / Relay 业务路径，因此这里只展示成员关系、设备挂载关系和待处理信令，不伪造连接路径。" />
+    {tab === 'topology' && <Panel title={`${account.username} 的资源关系`} subtitle="包含该账号以及共享网络 / 房间中的对端账号和设备">
+      <PathNotice data={topology.data} fallback="这是 Control 资源关系图：只展示成员关系、设备挂载和可选的待处理 signaling。Control 当前不持久化 daemon 的实时 Direct / Relay 业务路径，因此这里不是实时网络拓扑。" />
       <TopologyCanvas data={topology.data} loading={topology.isPending} error={topology.error instanceof Error ? topology.error.message : undefined} />
     </Panel>}
     {tab === 'devices' && <Panel><DeviceTable devices={detail.data.devices} /></Panel>}
@@ -493,21 +503,20 @@ function AccountDetailPage() {
   </div>
 }
 
-function TopologyPage() {
+function RelationshipsPage() {
   const [accountId, setAccountId] = useState('')
   const [search, setSearch] = useState('')
-  const debouncedSearch = useDebouncedValue(search)
   const accounts = useQuery({
-    queryKey: ['accounts', 'topology-filter', debouncedSearch],
-    queryFn: () => adminApi.accounts(debouncedSearch, 50, 0),
+    queryKey: ['accounts', 'relationship-scope'],
+    queryFn: () => adminApi.accounts('', 50, 0),
   })
   const accountTopology = useQuery({
-    queryKey: ['topology', 'account', accountId],
+    queryKey: ['relationships', 'account', accountId],
     queryFn: () => adminApi.topology(accountId),
     enabled: Boolean(accountId),
   })
   const globalTopology = useInfiniteQuery({
-    queryKey: ['topology', 'global-paged'],
+    queryKey: ['relationships', 'global-paged'],
     queryFn: ({ pageParam }) => adminApi.topologyPage(pageParam, 12, 600),
     initialPageParam: '',
     getNextPageParam: (lastPage) => lastPage.partial ? undefined : (lastPage.next_cursor || undefined),
@@ -517,17 +526,17 @@ function TopologyPage() {
     () => mergeTopologyPages(globalTopology.data?.pages ?? []),
     [globalTopology.data?.pages],
   )
-  const topologyData = accountId ? accountTopology.data : globalData
-  const topologyPending = accountId ? accountTopology.isPending : globalTopology.isPending
-  const topologyError = accountId ? accountTopology.error : globalTopology.error
+  const relationshipData = accountId ? accountTopology.data : globalData
+  const relationshipPending = accountId ? accountTopology.isPending : globalTopology.isPending
+  const relationshipError = accountId ? accountTopology.error : globalTopology.error
 
   return <div className="page-stack topology-page-stack">
-    <div className="page-intro topology-toolbar"><div><h2>{accountId ? '账号拓扑' : '全局拓扑'}</h2><p>{accountId ? '保留共享网络中的对端账号和设备。' : '全局图按稳定账号游标分批加载；需要精确完整上下文时下钻到单账号。'}</p></div><div className="toolbar-controls">
+    <div className="page-intro topology-toolbar"><div><h2>{accountId ? '账号资源关系' : '全局资源关系'}</h2><p>{accountId ? '展示账号、共享网络 / 房间和设备之间的控制面关系。' : '这是资源关系工作区，不是实时 Direct / Relay 网络拓扑；大规模部署按账号游标分批加载。'}</p></div><div className="toolbar-controls">
       <div className="search-field"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索账号、设备、IP、网络" /></div>
       <select className="select-field" value={accountId} onChange={(event) => setAccountId(event.target.value)}><option value="">全部账号</option>{accounts.data?.items.map((account) => <option value={account.id} key={account.id}>{account.username}</option>)}</select>
     </div></div>
     <Panel className="topology-main-panel">
-      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>颜色只是一层账号标识；每个账号还有稳定短码用于消歧。绿色 / 灰色状态点表示设备在线状态，虚线只表示待处理 signaling，不代表 Relay 数据路径。</span></div>
+      <div className="truth-notice topology-truth"><CircleAlert size={15} /><span>这里的连线表示 membership、设备挂载等控制面资源关系。待处理 signaling 默认隐藏，并且即使显示也不代表 Relay / Direct 数据路径。真实路径以 daemon 路径观测和实际虚拟 IP 业务验证为准。</span></div>
       {!accountId && globalData && <div className="topology-page-progress">
         <span>已加载 {globalData.loaded_accounts} / {globalData.total_accounts} 个账号</span>
         {globalData.partial
@@ -536,11 +545,10 @@ function TopologyPage() {
             ? <button className="button secondary compact" onClick={() => globalTopology.fetchNextPage()} disabled={globalTopology.isFetchingNextPage}>{globalTopology.isFetchingNextPage ? '加载中…' : '加载更多账号'}</button>
             : <span className="badge success"><span />全局账号已加载完成</span>}
       </div>}
-      <TopologyCanvas data={topologyData} loading={topologyPending} error={topologyError instanceof Error ? topologyError.message : undefined} search={search} />
+      <TopologyCanvas data={relationshipData} loading={relationshipPending} error={relationshipError instanceof Error ? relationshipError.message : undefined} search={search} />
     </Panel>
   </div>
 }
-
 function DevicesPage() {
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('all')
@@ -600,7 +608,7 @@ function SystemPage() {
   if (error) return <ErrorBlock error={error} />
   if (!runtime.data || !overview.data) return <ErrorBlock error={new Error('Control 未返回完整的运行状态快照。')} />
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>Control 运行状态</h2><p>只展示当前 Control 进程与数据库能直接确认的事实。</p></div><span className="badge success large"><span />运行中</span></div>
+    <div className="page-intro"><div><h2>Control 运行健康</h2><p>这里只展示 Control 进程与数据库能直接确认的事实；Relay TLS、systemd、SQLite 完整性和备份请在部署主机运行 <code>p2wlan-server doctor</code>。</p></div><span className="badge success large"><span />运行中</span></div>
     <section className="system-grid">
       <Panel title="进程" subtitle="构建与启动信息">
         <div className="system-hero"><div className="system-hero-icon"><Server size={26} /></div><div><span>UPTIME</span><strong>{formatDuration(runtime.data.uptime_seconds)}</strong></div></div>
@@ -613,7 +621,7 @@ function SystemPage() {
       </Panel>
       <Panel title="控制面状态" subtitle="不是业务数据面吞吐">
         <div className="system-metrics"><div><span>待处理信令</span><strong>{overview.data.pending_signals}</strong></div><div><span>活动隧道</span><strong>{overview.data.active_tunnels}</strong></div><div><span>在线设备</span><strong>{overview.data.online_devices}</strong></div><div><span>账号</span><strong>{overview.data.users}</strong></div></div>
-        <div className="truth-notice system-notice"><CircleAlert size={15} /><span>Control healthy、设备 online、Relay RTT 都不能单独证明真实 TUN 或应用流量已经端到端可达。</span></div>
+        <div className="truth-notice system-notice"><CircleAlert size={15} /><span>Control healthy、设备 online、Relay RTT 都不能单独证明真实 TUN 或应用流量已经端到端可达。主机级部署问题使用 p2wlan-server doctor 分层检查。</span></div>
       </Panel>
     </section>
   </div>
@@ -625,7 +633,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
       <Route index element={<Dashboard />} />
       <Route path="accounts" element={<AccountsPage />} />
       <Route path="accounts/:id" element={<AccountDetailPage />} />
-      <Route path="topology" element={<TopologyPage />} />
+      <Route path="relationships" element={<RelationshipsPage />} />
+      <Route path="topology" element={<Navigate to="/relationships" replace />} />
       <Route path="devices" element={<DevicesPage />} />
       <Route path="networks" element={<NetworksPage />} />
       <Route path="system" element={<SystemPage />} />

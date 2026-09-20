@@ -14,6 +14,8 @@ class ManagerHealthTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.config = self.root / 'config'
         self.config.mkdir()
+        self.data = self.root / 'data'
+        self.data.mkdir()
         release = self.root / 'release'
         release.mkdir()
         (self.root / 'current').symlink_to(release, target_is_directory=True)
@@ -21,17 +23,28 @@ class ManagerHealthTests(unittest.TestCase):
         self.bin.mkdir()
         for name in ('p2wlan-control', 'p2wlan-relay'):
             self.executable(release / name, '#!/bin/sh\necho test-binary\n')
+        self.executable(release / 'p2wlan-db', '#!/bin/sh\n[ "$1" = --verify ]\n')
         self.executable(self.bin / 'systemctl', '#!/bin/sh\nexit 0\n')
+        self.executable(self.bin / 'id', '#!/bin/sh\nif [ "$1" = "-u" ]; then echo 0; else exec /usr/bin/id "$@"; fi\n')
         self.executable(self.bin / 'curl', '''#!/bin/sh
 printf '%s\\n' "$*" >> "$HEALTH_CALLS"
 case "$*" in *'/readyz'*) [ "${FAIL_RELAY:-0}" = 0 ] || exit 22;; esac
 exit 0
 ''')
-        (self.config / 'control.env').write_text('PORT=18080\nCONTROL_BIND=127.0.0.1:18080\n')
+        (self.config / 'control.env').write_text(
+            'PORT=18080\n'
+            'CONTROL_BIND=127.0.0.1:18080\n'
+            f'DB_PATH={self.data / "p2pnet.db"}\n'
+            f'CONTROL_ADMIN_TOKEN={"a" * 64}\n'
+        )
+        (self.data / 'p2pnet.db').write_text('test-db')
         (self.config / 'relay.env').write_text('RELAY_METRICS_BIND=127.0.0.1:18082\n')
+        self.systemd = self.root / 'systemd'
+        self.systemd.mkdir()
         self.env = dict(os.environ, PATH=str(self.bin)+os.pathsep+os.environ['PATH'],
                         P2WLAN_SERVER_ROOT=str(self.root), P2WLAN_SERVER_CONFIG=str(self.config),
-                        HEALTH_CALLS=str(self.root/'calls'))
+                        P2WLAN_SERVER_DATA=str(self.data), HEALTH_CALLS=str(self.root/'calls'),
+                        P2WLAN_SYSTEMD_DIR=str(self.systemd))
 
     @staticmethod
     def executable(path, content):
@@ -72,6 +85,42 @@ exit 0
         self.assertIn('http://[::1]:18082/readyz', calls)
         self.assertNotIn('/health', calls)
 
+    def test_doctor_control_reports_layered_health_without_treating_warnings_as_failure(self):
+        result = subprocess.run(
+            ['bash', str(ROOT/'scripts/p2wlan-server'), 'doctor', '--service', 'control'],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('PASS  release bundle', result.stdout)
+        self.assertIn('PASS  selected systemd services are active', result.stdout)
+        self.assertIn('PASS  admin console credential is configured', result.stdout)
+        self.assertIn('PASS  SQLite integrity verification passed', result.stdout)
+        self.assertIn('WARN  no managed backup snapshot was found', result.stdout)
+        self.assertIn('Result: 0 failure(s)', result.stdout)
+
+    def test_doctor_rejects_short_admin_credential(self):
+        (self.config/'control.env').write_text(
+            'PORT=18080\n'
+            'CONTROL_BIND=127.0.0.1:18080\n'
+            f'DB_PATH={self.data / "p2pnet.db"}\n'
+            'CONTROL_ADMIN_TOKEN=short\n'
+        )
+        result = subprocess.run(
+            ['bash', str(ROOT/'scripts/p2wlan-server'), 'doctor', '--service', 'control'],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('CONTROL_ADMIN_TOKEN is shorter than the server minimum', result.stdout)
+        self.assertIn('Result: 1 failure(s)', result.stdout)
+
+    def test_doctor_relay_fails_closed_when_tls_files_are_not_configured(self):
+        result = subprocess.run(
+            ['bash', str(ROOT/'scripts/p2wlan-server'), 'doctor', '--service', 'relay'],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Relay TLS certificate/key are not configured as readable files', result.stdout)
+
     def test_backup_restore_and_rollback_contracts_are_explicit(self):
         manager = (ROOT/'scripts/p2wlan-server').read_text()
         self.assertIn('p2wlan-db" --source "$db_path" --output', manager)
@@ -86,6 +135,12 @@ exit 0
         self.assertIn('restore failed; original database, configuration and service state were restored', manager)
         self.assertIn('rollback target is incomplete', manager)
         self.assertNotIn('systemctl stop p2wlan-control.service || true', manager)
+        self.assertIn('"CONTROL_ADMIN_TOKEN=$(openssl rand -hex 32)"', manager)
+        self.assertIn('setup_server()', manager)
+        self.assertIn('doctor_server()', manager)
+        self.assertIn('p2wlan-db" --verify "$db_path"', manager)
+        self.assertIn('openssl x509 -checkend 604800', manager)
+        self.assertIn('Result: $failures failure(s), $warnings warning(s)', manager)
 
 
 if __name__ == '__main__':

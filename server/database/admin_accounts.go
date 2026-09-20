@@ -43,11 +43,14 @@ type AdminAccountDetail struct {
 	Rooms    []AdminRoomSummary    `json:"rooms"`
 }
 
-// AdminTopology is a logical control-plane graph. It deliberately does not
-// claim a current Direct/Relay business path because that state is owned by the
-// daemon and is not persisted by Control today.
+// AdminTopology is a logical control-plane relationship graph. It deliberately
+// does not claim a current Direct/Relay business path because that state is
+// owned by the daemon and is not persisted by Control today. GraphKind is
+// explicit so clients cannot silently relabel this relationship model as a
+// live network topology.
 type AdminTopology struct {
 	GeneratedAt              int64               `json:"generated_at"`
+	GraphKind                string              `json:"graph_kind"`
 	Scope                    string              `json:"scope"`
 	FocusAccountID           string              `json:"focus_account_id,omitempty"`
 	PathObservationAvailable bool                `json:"path_observation_available"`
@@ -371,10 +374,11 @@ func (db *DB) AdminTopology(accountID string) (*AdminTopology, error) {
 
 	result := &AdminTopology{
 		GeneratedAt:              time.Now().Unix(),
+		GraphKind:                "control_relationships",
 		Scope:                    "global",
 		FocusAccountID:           accountID,
 		PathObservationAvailable: false,
-		PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; topology edges describe account membership, private default-device ownership, device attachment, and pending signaling only.",
+		PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; this relationship graph describes account membership, private default-device ownership, device attachment, and pending signaling only.",
 		Nodes:                    []AdminTopologyNode{},
 		Edges:                    []AdminTopologyEdge{},
 	}
@@ -655,9 +659,10 @@ func (db *DB) AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget 
 	page := &AdminTopologyPage{
 		AdminTopology: AdminTopology{
 			GeneratedAt:              time.Now().Unix(),
+			GraphKind:                "control_relationships",
 			Scope:                    "global",
 			PathObservationAvailable: false,
-			PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; global pages describe account ownership, explicit network membership, device attachment, and pending signaling only.",
+			PathObservationNote:      "Control does not persist the daemon's current Direct/Relay business path; global relationship pages describe account ownership, explicit network membership, device attachment, and pending signaling only.",
 			Nodes:                    []AdminTopologyNode{},
 			Edges:                    []AdminTopologyEdge{},
 		},

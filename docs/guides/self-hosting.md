@@ -62,7 +62,7 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 `p2wlan-config` 会和 JWT、Relay 凭据一起生成独立的 256-bit `CONTROL_ADMIN_TOKEN` 并写入受保护的 `control.env`，因此使用 `p2wlan-config` 的部署不需要手工制造管理台凭据。生成器不会把这些秘密打印到 stdout，也不会覆盖已有部署。
 
-使用发布归档的 `install-server.sh` 安装时，`p2wlan-server init` 生成的是最小 `control.env`（只有监听、数据库、日志目录和 `JWT_SECRET`），其中不含 `CONTROL_ADMIN_TOKEN`，因此这类部署默认没有管理台。要启用管理台，请在 `control.env` 中追加 `CONTROL_ADMIN_TOKEN=$(openssl rand -hex 32)` 后重启 Control。
+使用发布归档的 `install-server.sh` 安装时，`p2wlan-server init` 会为新部署分别生成 `JWT_SECRET` 和独立的 256-bit `CONTROL_ADMIN_TOKEN`，因此固定归档的标准安装路径默认具备管理台凭据，同时仍只在 Control 的受保护配置文件中保存秘密。对于早期已经存在、但缺少管理台凭据的部署，可以显式运行 `sudo p2wlan-server setup --role all` 补齐这一项；该命令不会轮换已有 JWT、Relay、TLS 或其他凭据。
 
 管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
 
@@ -78,5 +78,6 @@ Compose 镜像也包含 `p2wlan-db`，可在挂载的数据卷上生成一致性
 
     sudo p2wlan-server verify --service all
     sudo p2wlan-server check --service all
+    sudo p2wlan-server doctor --service all
 
-这些命令分别检查归档内容、版本和 Control/Relay 健康状态。它们不代替真实客户端、TUN、NAT、公网 TLS 或业务连通性验证。
+`verify` 检查发布归档和版本，`check` 检查本机 Control/Relay 健康端点，`doctor` 在此基础上继续检查 systemd、Admin 凭据、SQLite 完整性、Relay TLS 文件、备份和数据盘空间。它们都不代替真实客户端、TUN、NAT、公网 TLS 入口或业务连通性验证。
