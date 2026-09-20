@@ -27,6 +27,9 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 	// Setup users, networks, devices
 	u1, _ := db.CreateUser("user1@example.com", "hash1")
 	u2, _ := db.CreateUser("user2@example.com", "hash2")
+	if _, err := db.Exec("UPDATE users SET username = CASE id WHEN ? THEN 'alice-path-owner' WHEN ? THEN 'bob-path-owner' END WHERE id IN (?, ?)", u1.ID, u2.ID, u1.ID, u2.ID); err != nil {
+		t.Fatalf("set connection test usernames: %v", err)
+	}
 
 	net1, _ := db.CreateNetwork(u1.ID, "Net 1", "10.20.0.0/16")
 	net2, _ := db.CreateNetwork(u2.ID, "Net 2", "10.30.0.0/16")
@@ -147,9 +150,9 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 	if searchNetwork.Total != 1 {
 		t.Fatalf("expected 1 connection matching Net 2, got %d", searchNetwork.Total)
 	}
-	searchUser, _ := db.AdminConnections(AdminConnectionFilter{Query: u1.Username}, 10, 0)
+	searchUser, _ := db.AdminConnections(AdminConnectionFilter{Query: "alice-path-owner"}, 10, 0)
 	if searchUser.Total != 2 {
-		t.Fatalf("expected 2 connections matching user 1, got %d", searchUser.Total)
+		t.Fatalf("expected 2 connections matching reporting/remote username, got %d", searchUser.Total)
 	}
 
 	// 29. Path filter
