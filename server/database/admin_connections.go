@@ -49,6 +49,7 @@ type AdminConnectionPage struct {
 }
 
 type AdminConnectionFilter struct {
+	Query             string
 	NetworkID         string
 	AccountID         string
 	DeviceID          string
@@ -94,6 +95,12 @@ func (db *DB) AdminConnections(filter AdminConnectionFilter, limit, offset int) 
 
 	var conditions []string
 	var args []interface{}
+
+	if query := strings.ToLower(strings.TrimSpace(filter.Query)); query != "" {
+		like := "%" + query + "%"
+		conditions = append(conditions, "(LOWER(rd.device_name) LIKE ? OR LOWER(remd.device_name) LIKE ? OR LOWER(ru.username) LIKE ? OR LOWER(remu.username) LIKE ? OR LOWER(n.name) LIKE ?)")
+		args = append(args, like, like, like, like, like)
+	}
 
 	if filter.NetworkID != "" {
 		conditions = append(conditions, "o.network_id = ?")
