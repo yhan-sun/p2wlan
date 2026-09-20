@@ -177,6 +177,35 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 	if p1.Items[0].ReportingDeviceID == p2.Items[0].ReportingDeviceID && p1.Items[0].RemoteDeviceID == p2.Items[0].RemoteDeviceID {
 		t.Fatalf("pagination overlap detected between page 1 and page 2")
 	}
+
+	// Freshness filtering is applied before pagination. Mark C's reporter lease
+	// stale and verify the SQL filter preserves the original classification.
+	if _, err := db.Exec("UPDATE devices SET last_seen = ? WHERE id = ?", time.Now().Unix()-DeviceOnlineTTL-5, devC.ID); err != nil {
+		t.Fatalf("expire reporter heartbeat: %v", err)
+	}
+	freshPage, err := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 10, 0)
+	if err != nil {
+		t.Fatalf("fresh connections: %v", err)
+	}
+	if freshPage.Total != 2 || len(freshPage.Items) != 2 {
+		t.Fatalf("expected 2 fresh connections, got total=%d len=%d", freshPage.Total, len(freshPage.Items))
+	}
+	stalePage, err := db.AdminConnections(AdminConnectionFilter{Freshness: "stale"}, 10, 0)
+	if err != nil {
+		t.Fatalf("stale connections: %v", err)
+	}
+	if stalePage.Total != 1 || len(stalePage.Items) != 1 || stalePage.Items[0].ReportingDeviceID != devC.ID || stalePage.Items[0].Fresh || stalePage.Items[0].Freshness != "reporter_offline" {
+		t.Fatalf("unexpected stale connection page: %+v", stalePage)
+	}
+
+	freshFirst, _ := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 1, 0)
+	freshSecond, _ := db.AdminConnections(AdminConnectionFilter{Freshness: "fresh"}, 1, 1)
+	if freshFirst.Total != 2 || freshSecond.Total != 2 || len(freshFirst.Items) != 1 || len(freshSecond.Items) != 1 {
+		t.Fatalf("unexpected fresh pagination: first=%+v second=%+v", freshFirst, freshSecond)
+	}
+	if freshFirst.Items[0].ReportingDeviceID == freshSecond.Items[0].ReportingDeviceID && freshFirst.Items[0].RemoteDeviceID == freshSecond.Items[0].RemoteDeviceID {
+		t.Fatalf("fresh pagination overlap detected")
+	}
 }
 
 // TestAdminConnectionTransitionsCursorOrdering tests scenario 35: transition history ordering and cursor.
