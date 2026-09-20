@@ -25,6 +25,7 @@ class ManagerHealthTests(unittest.TestCase):
             self.executable(release / name, '#!/bin/sh\necho test-binary\n')
         self.executable(release / 'p2wlan-db', '#!/bin/sh\n[ "$1" = --verify ]\n')
         self.executable(self.bin / 'systemctl', '#!/bin/sh\nexit 0\n')
+        self.executable(self.bin / 'id', '#!/bin/sh\nif [ "$1" = "-u" ]; then echo 0; else exec /usr/bin/id "$@"; fi\n')
         self.executable(self.bin / 'curl', '''#!/bin/sh
 printf '%s\\n' "$*" >> "$HEALTH_CALLS"
 case "$*" in *'/readyz'*) [ "${FAIL_RELAY:-0}" = 0 ] || exit 22;; esac
