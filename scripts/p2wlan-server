@@ -13,6 +13,8 @@ p2wlan-server - self-hosted control/relay manager
 
 Usage:
   sudo p2wlan-server init [--role control|relay|all]
+  sudo p2wlan-server setup [--role control|relay|all]
+  sudo p2wlan-server doctor [--service control|relay|all]
   sudo p2wlan-server start [--service control|relay|all]
   sudo p2wlan-server stop [--service control|relay|all]
   sudo p2wlan-server restart [--service control|relay|all]
@@ -206,7 +208,14 @@ init_server() {
   fi
   if [ ! -f "$CONFIG_DIR/control.env" ]; then
     install -m 0600 /dev/null "$CONFIG_DIR/control.env"
-    printf '%s\n' "PORT=18080" "CONTROL_BIND=127.0.0.1:18080" "DB_PATH=$DATA_DIR/p2pnet.db" "LOG_UPLOAD_DIR=$DATA_DIR/log-uploads" "JWT_SECRET=$(openssl rand -hex 32)" >> "$CONFIG_DIR/control.env"
+    command -v openssl >/dev/null 2>&1 || die "openssl is required to generate deployment credentials"
+    printf '%s\n' \
+      "PORT=18080" \
+      "CONTROL_BIND=127.0.0.1:18080" \
+      "DB_PATH=$DATA_DIR/p2pnet.db" \
+      "LOG_UPLOAD_DIR=$DATA_DIR/log-uploads" \
+      "JWT_SECRET=$(openssl rand -hex 32)" \
+      "CONTROL_ADMIN_TOKEN=$(openssl rand -hex 32)" >> "$CONFIG_DIR/control.env"
   fi
   if [ ! -f "$CONFIG_DIR/relay.env" ]; then
     install -m 0600 /dev/null "$CONFIG_DIR/relay.env"
@@ -223,6 +232,186 @@ init_server() {
   esac
   if systemd_available; then systemctl daemon-reload; fi
   echo "initialized role=$role config=$CONFIG_DIR data=$DATA_DIR"
+}
+
+
+setup_server() {
+  need_root
+  local role=all
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --role)
+        [ "$#" -ge 2 ] || die "--role requires control, relay, or all"
+        role=$2
+        shift 2
+        ;;
+      *) die "unknown setup option: $1" ;;
+    esac
+  done
+
+  init_server "$role"
+
+  # Older installs may have been initialized before the admin console existed.
+  # setup is an explicit operator action, so it may fill this one missing
+  # credential without rotating JWT, Relay, TLS, or any existing secret.
+  if [ -f "$CONFIG_DIR/control.env" ]; then
+    local admin_token
+    admin_token=$(env_value "$CONFIG_DIR/control.env" CONTROL_ADMIN_TOKEN)
+    if [ -z "$admin_token" ]; then
+      command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the admin credential"
+      printf 'CONTROL_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" >> "$CONFIG_DIR/control.env"
+      chmod 0600 "$CONFIG_DIR/control.env"
+      chown p2wlan:p2wlan "$CONFIG_DIR/control.env"
+      echo "admin console credential created in $CONFIG_DIR/control.env"
+    elif [ "${#admin_token}" -lt 32 ]; then
+      die "existing CONTROL_ADMIN_TOKEN is shorter than 32 characters; replace it explicitly before continuing"
+    fi
+  fi
+
+  if [ -L "$CURRENT_LINK" ]; then
+    verify_server "$role"
+  else
+    echo "release is not installed yet; install a fixed server-vX.Y.Z archive before starting services"
+  fi
+  echo "setup ready. Configure trusted HTTPS/WSS and Relay TLS, then run: sudo p2wlan-server doctor --service $role"
+}
+
+doctor_line() {
+  printf '  %-5s %s\n' "$1" "$2"
+}
+
+doctor_server() {
+  need_root
+  local selected=all
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --service)
+        [ "$#" -ge 2 ] || die "--service requires control, relay, or all"
+        selected=$2
+        shift 2
+        ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+  done
+  case "$selected" in control|relay|all) ;; *) die "service must be control, relay, or all" ;; esac
+
+  local failures=0
+  local warnings=0
+  local check_control=0
+  local check_relay=0
+  case "$selected" in
+    control) check_control=1 ;;
+    relay) check_relay=1 ;;
+    all) check_control=1; check_relay=1 ;;
+  esac
+
+  echo "P2WLAN Server Doctor"
+
+  if [ -L "$CURRENT_LINK" ] && verify_server "$selected" >/dev/null 2>&1; then
+    doctor_line PASS "release bundle and executable identity are readable"
+  else
+    doctor_line FAIL "release bundle is missing or invalid"
+    failures=$((failures + 1))
+  fi
+
+  if systemd_available; then
+    local units_ok=1
+    while IFS= read -r unit; do
+      if ! systemctl cat "$unit" >/dev/null 2>&1 || ! systemctl is-active --quiet "$unit"; then
+        doctor_line FAIL "$unit is not installed and active"
+        units_ok=0
+        failures=$((failures + 1))
+      fi
+    done < <(service_list "$selected")
+    if [ "$units_ok" -eq 1 ]; then
+      doctor_line PASS "selected systemd services are active"
+    fi
+  else
+    doctor_line FAIL "systemd is unavailable; fixed server archives are validated on the systemd deployment path"
+    failures=$((failures + 1))
+  fi
+
+  if command -v curl >/dev/null 2>&1 && check_server "$selected" >/dev/null 2>&1; then
+    doctor_line PASS "selected local health/readiness endpoints respond"
+  else
+    doctor_line FAIL "local health/readiness checks failed; run p2wlan-server check --service $selected for details"
+    failures=$((failures + 1))
+  fi
+
+  if [ "$check_control" -eq 1 ]; then
+    local admin_token
+    admin_token=$(env_value "$CONFIG_DIR/control.env" CONTROL_ADMIN_TOKEN)
+    if [ -z "$admin_token" ]; then
+      doctor_line WARN "admin console is disabled because CONTROL_ADMIN_TOKEN is empty"
+      warnings=$((warnings + 1))
+    elif [ "${#admin_token}" -lt 32 ]; then
+      doctor_line FAIL "CONTROL_ADMIN_TOKEN is shorter than the server minimum"
+      failures=$((failures + 1))
+    else
+      doctor_line PASS "admin console credential is configured"
+    fi
+
+    local db_path
+    db_path=$(resolve_db_path)
+    if [ -f "$db_path" ]; then
+      if [ -x "$CURRENT_LINK/p2wlan-db" ] && "$CURRENT_LINK/p2wlan-db" --verify "$db_path" >/dev/null 2>&1; then
+        doctor_line PASS "SQLite integrity verification passed"
+      else
+        doctor_line FAIL "SQLite integrity verification failed"
+        failures=$((failures + 1))
+      fi
+    else
+      doctor_line WARN "database file does not exist yet: $db_path"
+      warnings=$((warnings + 1))
+    fi
+  fi
+
+  if [ "$check_relay" -eq 1 ]; then
+    local cert key
+    cert=$(env_value "$CONFIG_DIR/relay.env" RELAY_TLS_CERT)
+    key=$(env_value "$CONFIG_DIR/relay.env" RELAY_TLS_KEY)
+    if [ -n "$cert" ] && [ -n "$key" ] && [ -f "$cert" ] && [ -f "$key" ]; then
+      if command -v openssl >/dev/null 2>&1 && openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
+        if openssl x509 -checkend 604800 -noout -in "$cert" >/dev/null 2>&1; then
+          doctor_line PASS "Relay TLS certificate is readable and valid for more than 7 days"
+        else
+          doctor_line WARN "Relay TLS certificate expires within 7 days or is already expired"
+          warnings=$((warnings + 1))
+        fi
+      else
+        doctor_line FAIL "Relay TLS certificate cannot be parsed"
+        failures=$((failures + 1))
+      fi
+    else
+      doctor_line FAIL "Relay TLS certificate/key are not configured as readable files"
+      failures=$((failures + 1))
+    fi
+  fi
+
+  local latest_backup=
+  if [ -d "$DATA_DIR/backups" ]; then
+    latest_backup=$(find "$DATA_DIR/backups" -mindepth 1 -maxdepth 1 -type d -name 'p2wlan-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+  fi
+  if [ -n "$latest_backup" ]; then
+    doctor_line PASS "backup snapshot exists: $(basename "$latest_backup")"
+  else
+    doctor_line WARN "no managed backup snapshot was found"
+    warnings=$((warnings + 1))
+  fi
+
+  if command -v df >/dev/null 2>&1 && [ -d "$DATA_DIR" ]; then
+    local available_kb
+    available_kb=$(df -Pk "$DATA_DIR" | awk 'NR == 2 {print $4}')
+    if [ -n "$available_kb" ] && [ "$available_kb" -lt 1048576 ] 2>/dev/null; then
+      doctor_line WARN "less than 1 GiB is available on the data filesystem"
+      warnings=$((warnings + 1))
+    else
+      doctor_line PASS "data filesystem has at least 1 GiB available"
+    fi
+  fi
+
+  echo "Result: $failures failure(s), $warnings warning(s)"
+  [ "$failures" -eq 0 ]
 }
 
 archive_install() {
@@ -582,6 +771,8 @@ case "$cmd" in
     [ "${1:-}" = --role ] && role=${2:?missing role}
     init_server "$role"
     ;;
+  setup) setup_server "$@" ;;
+  doctor) doctor_server "$@" ;;
   start)
     selected=all
     while [ "$#" -gt 0 ]; do
