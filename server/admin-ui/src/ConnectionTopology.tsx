@@ -19,7 +19,6 @@ const NODE_HEIGHT = 76
 interface ConnectionTopologyProps {
   connections: AdminConnection[]
   networkName: string
-  search?: string
   showStale: boolean
   partial?: boolean
   onShowStaleChange: (value: boolean) => void
@@ -52,8 +51,7 @@ function pathClass(connection: AdminConnection): string {
   return 'unknown'
 }
 
-function buildGraph(connections: AdminConnection[], search: string): { nodes: Node[]; edges: Edge[] } {
-  const normalizedSearch = search.trim().toLowerCase()
+function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edge[] } {
   const devices = new Map<string, DeviceNodeData>()
 
   for (const connection of connections) {
@@ -79,24 +77,8 @@ function buildGraph(connections: AdminConnection[], search: string): { nodes: No
     devices.set(remote.id, remote)
   }
 
-  let visibleConnections = connections
-  let visibleDeviceIDs = new Set(devices.keys())
-  if (normalizedSearch) {
-    const matched = new Set(
-      [...devices.values()]
-        .filter((device) => [device.name, device.username].some((value) => value.toLowerCase().includes(normalizedSearch)))
-        .map((device) => device.id),
-    )
-    if (matched.size === 0) return { nodes: [], edges: [] }
-    visibleConnections = connections.filter(
-      (connection) => matched.has(connection.reporting_device_id) || matched.has(connection.remote_device_id),
-    )
-    visibleDeviceIDs = new Set<string>()
-    for (const connection of visibleConnections) {
-      visibleDeviceIDs.add(connection.reporting_device_id)
-      visibleDeviceIDs.add(connection.remote_device_id)
-    }
-  }
+  const visibleConnections = connections
+  const visibleDeviceIDs = new Set(devices.keys())
 
   const sortedDevices = [...devices.values()]
     .filter((device) => visibleDeviceIDs.has(device.id))
@@ -182,24 +164,19 @@ function buildGraph(connections: AdminConnection[], search: string): { nodes: No
 export function ConnectionTopology({
   connections,
   networkName,
-  search = '',
   showStale,
   partial = false,
   onShowStaleChange,
   onSelect,
 }: ConnectionTopologyProps) {
   const [fullscreen, setFullscreen] = useState(false)
-  const graph = useMemo(() => buildGraph(connections, search), [connections, search])
+  const graph = useMemo(() => buildGraph(connections), [connections])
 
   if (connections.length === 0) {
     return <div className="connection-topology-empty">
       <CircleAlert size={18} />
       <div><strong>暂无可展示的连接</strong><span>只有 daemon 权威上报的路径观测才会生成连接边。</span></div>
     </div>
-  }
-
-  if (search.trim() && graph.nodes.length === 0) {
-    return <div className="connection-topology-empty"><CircleAlert size={18} />没有匹配的设备连接。</div>
   }
 
   return <div className={`connection-topology ${fullscreen ? 'fullscreen' : ''}`}>
