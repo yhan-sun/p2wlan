@@ -129,6 +129,7 @@ export interface AdminTopologyEdge {
 
 export interface AdminTopology {
   generated_at: number
+  graph_kind: 'control_relationships'
   scope: 'global' | 'account'
   focus_account_id?: string
   path_observation_available: boolean
