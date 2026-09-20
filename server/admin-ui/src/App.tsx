@@ -229,7 +229,7 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
   return <main className="login-page-v2">
     <section className="login-brand-side">
       <div className="brand-lockup large"><div className="brand-symbol"><Waypoints size={22} /></div><div><strong>P2WLAN</strong><span>Control</span></div></div>
-      <div className="login-brand-copy"><span className="eyebrow-v2">SELF-HOSTED CONTROL PLANE</span><h1>看清每一个账号，<br />也看清整张网络。</h1><p>账号、设备、网络、房间和控制面资源关系统一在一个只读运维界面中。</p></div>
+      <div className="login-brand-copy"><span className="eyebrow-v2">SELF-HOSTED CONTROL PLANE</span><h1>看清每一个账号，<br />也看清资源关系。</h1><p>账号、设备、网络、房间和控制面资源关系统一在一个只读运维界面中。</p></div>
       <div className="login-security"><ShieldCheck size={17} /><span>管理权限与用户 JWT / 设备凭据完全隔离</span></div>
     </section>
     <section className="login-form-side">
@@ -609,7 +609,7 @@ function SystemPage() {
   if (error) return <ErrorBlock error={error} />
   if (!runtime.data || !overview.data) return <ErrorBlock error={new Error('Control 未返回完整的运行状态快照。')} />
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>Control 运行状态</h2><p>只展示当前 Control 进程与数据库能直接确认的事实。</p></div><span className="badge success large"><span />运行中</span></div>
+    <div className="page-intro"><div><h2>Control 运行健康</h2><p>这里只展示 Control 进程与数据库能直接确认的事实；Relay TLS、systemd、SQLite 完整性和备份请在部署主机运行 <code>p2wlan-server doctor</code>。</p></div><span className="badge success large"><span />运行中</span></div>
     <section className="system-grid">
       <Panel title="进程" subtitle="构建与启动信息">
         <div className="system-hero"><div className="system-hero-icon"><Server size={26} /></div><div><span>UPTIME</span><strong>{formatDuration(runtime.data.uptime_seconds)}</strong></div></div>
@@ -622,7 +622,7 @@ function SystemPage() {
       </Panel>
       <Panel title="控制面状态" subtitle="不是业务数据面吞吐">
         <div className="system-metrics"><div><span>待处理信令</span><strong>{overview.data.pending_signals}</strong></div><div><span>活动隧道</span><strong>{overview.data.active_tunnels}</strong></div><div><span>在线设备</span><strong>{overview.data.online_devices}</strong></div><div><span>账号</span><strong>{overview.data.users}</strong></div></div>
-        <div className="truth-notice system-notice"><CircleAlert size={15} /><span>Control healthy、设备 online、Relay RTT 都不能单独证明真实 TUN 或应用流量已经端到端可达。</span></div>
+        <div className="truth-notice system-notice"><CircleAlert size={15} /><span>Control healthy、设备 online、Relay RTT 都不能单独证明真实 TUN 或应用流量已经端到端可达。主机级部署问题使用 p2wlan-server doctor 分层检查。</span></div>
       </Panel>
     </section>
   </div>
