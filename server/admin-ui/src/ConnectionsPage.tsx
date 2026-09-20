@@ -332,7 +332,6 @@ export function ConnectionsPage() {
         <ConnectionTopology
           connections={topology.data.items}
           networkName={selectedNetwork?.name ?? networkId}
-          search={debouncedQuery}
           showStale={showStaleTopology}
           partial={topology.data.total > topology.data.items.length}
           onShowStaleChange={setShowStaleTopology}
