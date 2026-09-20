@@ -148,3 +148,73 @@ export interface AdminTopologyPage extends AdminTopology {
   node_budget: number
   edge_budget: number
 }
+
+
+export interface AdminConnection {
+  schema_version: number
+  directional: true
+  reporting_device_id: string
+  reporting_device_name: string
+  reporting_user_id: string
+  reporting_username: string
+  remote_device_id: string
+  remote_device_name: string
+  remote_user_id: string
+  remote_username: string
+  network_id: string
+  network_name: string
+  lifecycle: string
+  current_path?: string
+  previous_path?: string
+  transition_reason: string
+  direct_state?: string
+  relay_state?: string
+  recovery_state?: string
+  relay_server?: string
+  selected_path_mtu?: number
+  selected_udp_datagram_size?: number
+  last_handshake_age_ms?: number
+  last_validation_rtt_ms?: number
+  path_age_ms: number
+  observed_at: number
+  received_at: number
+  fresh: boolean
+  freshness: 'fresh' | 'stale' | 'reporter_offline' | string
+  observation_revision: number
+}
+
+export interface AdminConnectionPage extends Page<AdminConnection> {}
+
+export interface AdminConnectionTransition {
+  id: string
+  schema_version: number
+  directional: true
+  reporting_device_id: string
+  remote_device_id: string
+  network_id: string
+  lifecycle: string
+  current_path?: string
+  previous_path?: string
+  transition_reason: string
+  selected_path_mtu?: number
+  observed_at: number
+  created_at: number
+  observation_revision: number
+}
+
+export interface AdminConnectionTransitionPage {
+  limit: number
+  next_cursor?: string
+  items: AdminConnectionTransition[]
+}
+
+export interface AdminConnectionFilters {
+  query?: string
+  networkId?: string
+  accountId?: string
+  deviceId?: string
+  reportingDeviceId?: string
+  remoteDeviceId?: string
+  path?: string
+  freshness?: 'fresh' | 'stale' | ''
+}
