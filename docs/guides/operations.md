@@ -33,6 +33,22 @@ Connections 默认使用列表视图，支持服务端搜索设备名、账号�
 
 点击连接列表行或拓扑边会打开当前方向的只读详情与迁移时间线。`GET /admin/api/v1/connection-transitions` 按 `reporting_device_id`、`remote_device_id`、`network_id` 查询，并使用 `limit` / `cursor` 分页；每对设备最多保留 50 条最近迁移记录。路径观测仍不证明远端具体应用端口一定可达，最终业务判断需要实际虚拟 IP 流量验证。
 
+### Connection Health 与 attention signals
+
+`GET /admin/api/v1/connection-health` 在请求时从 latest authoritative observations 和受限 transition history 派生运维信号，不新增独立 health 状态机，也不持久化告警状态。接口支持 `network_id`、`account_id` / `user_id`、`device_id` 作用域；`window_seconds` 默认 3600 秒，可选 60–86400 秒；`limit` 只限制返回的 attention connection 数量，默认 50、最大 100，同时响应保留准确的 `alerts_total`。
+
+summary 分开统计 fresh、stale、reporter offline、fresh Direct、fresh Relay、fresh no-path，以及窗口内 Direct↔Relay path switch、显式 Direct/Relay failure reason 和 validation RTT 样本。Relay 本身是正常路径类别，不会因为当前路径为 Relay 就产生告警；`last_validation_rtt_ms` 及其聚合也只表示最近一次验证样本，不是持续实时 RTT。
+
+attention signal 是固定、可解释的条件：
+
+- `reporter_offline`：上报端 heartbeat lease 已失效；
+- `stale_observation`：上报端仍在线，但最新路径观测已超过 freshness lease；
+- `no_active_path`：观测仍 fresh，但 daemon 没有 committed active path；
+- `frequent_path_switching`：请求窗口内至少 4 次已记录的 Direct↔Relay 切换；
+- `repeated_path_failures`：请求窗口内至少 3 次显式 `direct_probe_failed` / `direct_path_failed` / `relay_path_failed`。
+
+阈值会随响应一起返回，不作为隐藏评分。transition history 每个方向最多保留 50 条，因此在极端高频切换超过保留上限时，窗口派生计数可能是下界；该接口不应被解释为完整长期时序分析。
+
 管理台与 Control 使用同一 origin，不需要额外 CORS 放行。公网访问必须继续经过可信 HTTPS 反向代理；浏览器中的管理员令牌按敏感凭据处理，用完后退出管理台并关闭共享终端中的会话。
 
 ## 日志与证书
