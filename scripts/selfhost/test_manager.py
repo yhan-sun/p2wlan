@@ -39,9 +39,12 @@ exit 0
         )
         (self.data / 'p2pnet.db').write_text('test-db')
         (self.config / 'relay.env').write_text('RELAY_METRICS_BIND=127.0.0.1:18082\n')
+        self.systemd = self.root / 'systemd'
+        self.systemd.mkdir()
         self.env = dict(os.environ, PATH=str(self.bin)+os.pathsep+os.environ['PATH'],
                         P2WLAN_SERVER_ROOT=str(self.root), P2WLAN_SERVER_CONFIG=str(self.config),
-                        P2WLAN_SERVER_DATA=str(self.data), HEALTH_CALLS=str(self.root/'calls'))
+                        P2WLAN_SERVER_DATA=str(self.data), HEALTH_CALLS=str(self.root/'calls'),
+                        P2WLAN_SYSTEMD_DIR=str(self.systemd))
 
     @staticmethod
     def executable(path, content):

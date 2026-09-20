@@ -45,7 +45,7 @@ service_list() {
   esac
 }
 
-systemd_available() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+systemd_available() { command -v systemctl >/dev/null 2>&1 && [ -d "${P2WLAN_SYSTEMD_DIR:-/run/systemd/system}" ]; }
 restart_services() {
   local selected=${1:-all}
   if ! systemd_available; then return 0; fi
