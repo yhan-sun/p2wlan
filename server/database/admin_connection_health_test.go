@@ -122,6 +122,14 @@ func TestAdminConnectionHealthDerivesBoundedOperationalSignals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	devK, err := db.CreateDevice(user1ID, net1ID, "pub-key-k", "Device K", "linux", "10.20.0.10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	devL, err := db.CreateDevice(user1ID, net1ID, "pub-key-l", "Device L", "linux", "10.20.0.11")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	user2, err := db.CreateUser("health-relay@example.com", "hash2")
 	if err != nil {
@@ -147,6 +155,7 @@ func TestAdminConnectionHealthDerivesBoundedOperationalSignals(t *testing.T) {
 		devC.ID, devD.ID,
 		devE.ID, devF.ID,
 		devG.ID, devH.ID,
+		devK.ID, devL.ID,
 		devI.ID, devJ.ID,
 	)
 
@@ -196,6 +205,27 @@ func TestAdminConnectionHealthDerivesBoundedOperationalSignals(t *testing.T) {
 		t.Fatalf("expire observation: %v", err)
 	}
 
+	// K -> L is a fresh observation whose peer lifecycle is explicitly offline.
+	// No active path is expected here and must not become a no_active_path warning.
+	offlineObs := PathObservation{
+		SchemaVersion:         PathTelemetrySchemaVersion,
+		RemoteDeviceID:        devL.ID,
+		NetworkID:             net1ID,
+		ObservationRevision:   1,
+		NetworkGeneration:     1,
+		PeerSessionGeneration: 1,
+		RemoteCandidateEpoch:  1,
+		Lifecycle:             "offline",
+		CurrentPath:           nil,
+		PreviousPath:          nil,
+		TransitionReason:      "peer_left",
+		ObservedAt:            time.Now().Unix(),
+	}
+	offlineSummary, err := db.RecordPathObservations(devK.ID, net1ID, 1, []PathObservation{offlineObs}, false)
+	if err != nil || offlineSummary.Accepted != 1 {
+		t.Fatalf("record expected-offline observation: summary=%+v err=%v", offlineSummary, err)
+	}
+
 	// I -> J is a healthy, static Relay observation in another network. Relay
 	// usage is a factual path category and must not be treated as an alert.
 	recordHealthObservation(t, db, devI.ID, devJ.ID, net2.ID, 1, strPtr("relay"), nil, "relay_peer_confirmed", uint64Ptr(40))
@@ -205,8 +235,8 @@ func TestAdminConnectionHealthDerivesBoundedOperationalSignals(t *testing.T) {
 		t.Fatalf("AdminConnectionHealth: %v", err)
 	}
 
-	if health.Summary.TotalObservations != 5 ||
-		health.Summary.FreshObservations != 3 ||
+	if health.Summary.TotalObservations != 6 ||
+		health.Summary.FreshObservations != 4 ||
 		health.Summary.StaleObservations != 1 ||
 		health.Summary.ReporterOfflineObservations != 1 {
 		t.Fatalf("unexpected observation summary: %+v", health.Summary)
@@ -252,6 +282,11 @@ func TestAdminConnectionHealthDerivesBoundedOperationalSignals(t *testing.T) {
 	stale := findHealthAlert(t, health.Alerts, devG.ID)
 	if stale.Severity != "info" || stale.Freshness != "stale" || !hasHealthSignal(stale, "stale_observation") {
 		t.Fatalf("unexpected stale alert: %+v", stale)
+	}
+	for _, alert := range health.Alerts {
+		if alert.ReportingDeviceID == devK.ID {
+			t.Fatalf("offline lifecycle with no path must not alert: %+v", alert)
+		}
 	}
 
 	relayOnly, err := db.AdminConnectionHealth(AdminConnectionHealthFilter{NetworkID: net2.ID})
