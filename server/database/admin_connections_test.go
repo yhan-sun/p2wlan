@@ -138,6 +138,20 @@ func TestAdminConnectionsFilteringAndPagination(t *testing.T) {
 		t.Fatalf("expected 2 connections involving device A, got %d", devAPage.Total)
 	}
 
+	// Text search is applied server-side across device, account, and network labels.
+	searchDevice, _ := db.AdminConnections(AdminConnectionFilter{Query: "device a"}, 10, 0)
+	if searchDevice.Total != 2 {
+		t.Fatalf("expected 2 directional connections involving Device A, got %d", searchDevice.Total)
+	}
+	searchNetwork, _ := db.AdminConnections(AdminConnectionFilter{Query: "net 2"}, 10, 0)
+	if searchNetwork.Total != 1 {
+		t.Fatalf("expected 1 connection matching Net 2, got %d", searchNetwork.Total)
+	}
+	searchUser, _ := db.AdminConnections(AdminConnectionFilter{Query: u1.Username}, 10, 0)
+	if searchUser.Total != 2 {
+		t.Fatalf("expected 2 connections matching user 1, got %d", searchUser.Total)
+	}
+
 	// 29. Path filter
 	directPage, _ := db.AdminConnections(AdminConnectionFilter{Path: "direct"}, 10, 0)
 	if directPage.Total != 2 {
