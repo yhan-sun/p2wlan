@@ -89,4 +89,7 @@ P2WLAN_SERVER_ROOT="$INSTALL_ROOT" P2WLAN_SERVER_CONFIG="$CONFIG_DIR" P2WLAN_SER
   "$manager_path" init --role "$ROLE"
 P2WLAN_SERVER_ROOT="$INSTALL_ROOT" P2WLAN_SERVER_CONFIG="$CONFIG_DIR" P2WLAN_SERVER_DATA="$DATA_DIR" \
   "$manager_path" update --archive "$ARCHIVE"
-echo "P2WLAN server installed. Configure relay catalog/TLS in $CONFIG_DIR before enabling public traffic."
+echo "P2WLAN server installed."
+echo "Admin console credential is stored in $CONFIG_DIR/control.env; do not print or share it."
+echo "Configure trusted HTTPS/WSS and Relay TLS before enabling public traffic."
+echo "Then run: sudo p2wlan-server doctor --service $ROLE"
