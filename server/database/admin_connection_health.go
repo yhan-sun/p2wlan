@@ -92,6 +92,11 @@ type AdminConnectionHealth struct {
 	Alerts                    []AdminConnectionHealthAlert    `json:"alerts"`
 }
 
+type connectionHealthQuerier interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
 func normalizeConnectionHealthFilter(filter AdminConnectionHealthFilter) (AdminConnectionHealthFilter, error) {
 	if filter.WindowSeconds == 0 {
 		filter.WindowSeconds = DefaultConnectionHealthWindowSeconds
@@ -217,7 +222,7 @@ scoped AS (
 	return cte, args
 }
 
-func (db *DB) adminConnectionObservationHealthSummary(filter AdminConnectionHealthFilter, generatedAt int64) (AdminConnectionHealthSummary, error) {
+func adminConnectionObservationHealthSummary(q connectionHealthQuerier, filter AdminConnectionHealthFilter, generatedAt int64) (AdminConnectionHealthSummary, error) {
 	freshCutoff := generatedAt - DeviceOnlineTTL
 	scopeSQL, scopeArgs := connectionHealthScope(filter)
 	args := []interface{}{freshCutoff, freshCutoff, freshCutoff}
@@ -264,7 +269,7 @@ FROM scoped
 		avgRTT  sql.NullInt64
 		maxRTT  sql.NullInt64
 	)
-	err := db.QueryRow(query, args...).Scan(
+	err := q.QueryRow(query, args...).Scan(
 		&summary.TotalObservations,
 		&summary.FreshObservations,
 		&summary.StaleObservations,
@@ -290,7 +295,7 @@ FROM scoped
 	return summary, nil
 }
 
-func (db *DB) adminConnectionTransitionHealthSummary(filter AdminConnectionHealthFilter, generatedAt int64, summary *AdminConnectionHealthSummary) (int, error) {
+func adminConnectionTransitionHealthSummary(q connectionHealthQuerier, filter AdminConnectionHealthFilter, generatedAt int64, summary *AdminConnectionHealthSummary) (int, error) {
 	cte, args := connectionHealthCTE(filter, generatedAt)
 	query := cte + `
 SELECT
@@ -315,7 +320,7 @@ FROM scoped
 	)
 
 	var alertsTotal int
-	err := db.QueryRow(query, args...).Scan(
+	err := q.QueryRow(query, args...).Scan(
 		&summary.RecentPathSwitches,
 		&summary.RecentDirectFailures,
 		&summary.RecentRelayFailures,
@@ -329,7 +334,7 @@ FROM scoped
 	return alertsTotal, nil
 }
 
-func (db *DB) adminConnectionHealthAlerts(filter AdminConnectionHealthFilter, generatedAt int64) ([]AdminConnectionHealthAlert, error) {
+func adminConnectionHealthAlerts(q connectionHealthQuerier, filter AdminConnectionHealthFilter, generatedAt int64) ([]AdminConnectionHealthAlert, error) {
 	cte, args := connectionHealthCTE(filter, generatedAt)
 	query := cte + `
 SELECT
@@ -379,7 +384,7 @@ LIMIT ?
 		filter.AlertLimit,
 	)
 
-	rows, err := db.Query(query, args...)
+	rows, err := q.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query connection health alerts: %w", err)
 	}
@@ -475,17 +480,29 @@ func (db *DB) AdminConnectionHealth(filter AdminConnectionHealthFilter) (*AdminC
 	}
 	generatedAt := time.Now().Unix()
 
-	summary, err := db.adminConnectionObservationHealthSummary(filter, generatedAt)
+	// Keep the three aggregate reads on one SQLite snapshot. WAL allows
+	// telemetry writers to continue while this short read transaction is open,
+	// and alerts_total cannot drift away from the returned alert list mid-request.
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin connection health snapshot: %w", err)
+	}
+	defer tx.Rollback()
+
+	summary, err := adminConnectionObservationHealthSummary(tx, filter, generatedAt)
 	if err != nil {
 		return nil, err
 	}
-	alertsTotal, err := db.adminConnectionTransitionHealthSummary(filter, generatedAt, &summary)
+	alertsTotal, err := adminConnectionTransitionHealthSummary(tx, filter, generatedAt, &summary)
 	if err != nil {
 		return nil, err
 	}
-	alerts, err := db.adminConnectionHealthAlerts(filter, generatedAt)
+	alerts, err := adminConnectionHealthAlerts(tx, filter, generatedAt)
 	if err != nil {
 		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit connection health snapshot: %w", err)
 	}
 
 	return &AdminConnectionHealth{
