@@ -165,6 +165,7 @@ func migratePathTelemetry(db *sql.DB) error {
 
 	CREATE INDEX IF NOT EXISTS idx_peer_path_trans_pair ON peer_path_transitions(reporting_device_id, remote_device_id, network_id, created_at DESC);
 	CREATE INDEX IF NOT EXISTS idx_peer_path_trans_created ON peer_path_transitions(created_at);
+	CREATE INDEX IF NOT EXISTS idx_peer_path_trans_network_created ON peer_path_transitions(network_id, created_at DESC);
 	`
 	_, err := db.Exec(schema)
 	return err
