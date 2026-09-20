@@ -241,7 +241,7 @@ func TestAdminConnectionHealthDerivesBoundedOperationalSignals(t *testing.T) {
 		health.Summary.ReporterOfflineObservations != 1 {
 		t.Fatalf("unexpected observation summary: %+v", health.Summary)
 	}
-	if health.Summary.FreshDirect != 0 || health.Summary.FreshRelay != 2 || health.Summary.FreshNoPath != 1 {
+	if health.Summary.FreshDirect != 0 || health.Summary.FreshRelay != 2 || health.Summary.FreshOnlineNoPath != 1 {
 		t.Fatalf("unexpected fresh path distribution: %+v", health.Summary)
 	}
 	if health.Summary.ValidationRTTSamples != 2 ||
