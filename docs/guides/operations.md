@@ -37,7 +37,7 @@ Connections 默认使用列表视图，支持服务端搜索设备名、账号�
 
 `GET /admin/api/v1/connection-health` 在请求时从 latest authoritative observations 和受限 transition history 派生运维信号，不新增独立 health 状态机，也不持久化告警状态。接口支持 `network_id`、`account_id` / `user_id`、`device_id` 作用域；`window_seconds` 默认 3600 秒，可选 60–86400 秒；`limit` 只限制返回的 attention connection 数量，默认 50、最大 100，同时响应保留准确的 `alerts_total`。
 
-summary 分开统计 fresh、stale、reporter offline、fresh Direct、fresh Relay、fresh no-path，以及窗口内 Direct↔Relay path switch、显式 Direct/Relay failure reason 和 validation RTT 样本。Relay 本身是正常路径类别，不会因为当前路径为 Relay 就产生告警；`last_validation_rtt_ms` 及其聚合也只表示最近一次验证样本，不是持续实时 RTT。
+summary 分开统计 fresh、stale、reporter offline、fresh Direct、fresh Relay、`fresh_online_no_path`，以及窗口内 Direct↔Relay path switch、显式 Direct/Relay failure reason 和 validation RTT 样本。`fresh_online_no_path` 只统计 lifecycle=`online` 且没有 committed path 的 fresh observation。Relay 本身是正常路径类别，不会因为当前路径为 Relay 就产生告警；`last_validation_rtt_ms` 及其聚合也只表示最近一次验证样本，不是持续实时 RTT。
 
 attention signal 是固定、可解释的条件：
 
