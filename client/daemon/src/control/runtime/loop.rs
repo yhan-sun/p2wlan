@@ -12,6 +12,7 @@ async fn run_control_loop(
     health: Option<Arc<crate::tasks::HealthState>>,
     advertised_snapshot: Arc<std::sync::Mutex<AdvertisedEndpointSnapshot>>,
     event_loop_ready: Arc<AtomicBool>,
+    telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
 ) {
     let base_url = normalize_http_base_url(&config.control.server_url);
 
@@ -69,6 +70,12 @@ async fn run_control_loop(
                         }));
                         if let Some(health) = health.as_ref() {
                             health.mark_device_lease_success().await;
+                        }
+                        if let Some(hub) = &telemetry_hub {
+                            hub.set_ids(node_id.clone(), config.network.network_id.clone());
+                            if let Some(seq) = registration_seq {
+                                hub.set_registration_seq(seq);
+                            }
                         }
                         timeline.emit(
                             "control_registered",
@@ -362,7 +369,18 @@ async fn run_control_loop(
                 registration_seq,
                 signal_wake_tx.clone(),
                 signal_ws_connected.clone(),
+                telemetry_hub.clone(),
             )
+        });
+        let _telemetry_sender = token.starts_with("dc-").then(|| {
+            telemetry_hub.as_ref().map(|hub| {
+                let sender = Arc::new(crate::peer::PathTelemetrySender::new(
+                    hub.clone(),
+                    base_url.clone(),
+                    token.clone(),
+                ));
+                sender.spawn_worker(signal_ws_connected.clone())
+            })
         });
         drop(signal_wake_tx);
 

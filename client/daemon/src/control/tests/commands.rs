@@ -276,6 +276,7 @@ async fn network_changed_aborts_signaling_and_re_registers() {
         Some(4),
         wake_tx,
         connected.clone(),
+        None,
     );
 
     let disposition = harness

@@ -208,6 +208,7 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		"registration_seq":         device.RegistrationSeq,
 		"registration_incarnation": device.RegistrationIncarnation,
 		"relay_servers":            s.relayServers,
+		"capabilities":             []string{"path_telemetry_v1"},
 	}
 
 	// Include relay catalog for new clients that support it

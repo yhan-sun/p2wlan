@@ -201,6 +201,8 @@ impl Daemon {
         // spend time on a peer/UDP handover and must not be the only writer of
         // the control-plane heartbeat timestamp.
         let health = tasks::HealthState::new();
+        let punch_attempts = PunchAttemptDeduplicator::default();
+        let peers = Arc::new(PeerManager::new(config.clone()));
         let (control, control_rx) = ControlClient::new_with_health(
             &config,
             control_enabled,
@@ -208,6 +210,7 @@ impl Daemon {
             Some(relay_selection.clone()),
             timeline.clone(),
             Some(health.clone()),
+            Some(peers.telemetry_hub()),
         );
         let (transport, outbound_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
@@ -231,8 +234,6 @@ impl Daemon {
         // stale/404 quarantined peer's in-flight recovery session is
         // cancelled authoritatively (the daemon's own `punch_attempts` is
         // the same deduplicator the daemon hands to the punch tasks).
-        let punch_attempts = PunchAttemptDeduplicator::default();
-        let peers = Arc::new(PeerManager::new(config.clone()));
         let pending_handshakes = Arc::new(PendingHandshakeStore::default());
         peers.set_timeline(timeline.clone());
         transport.set_outbound_loss_context(&peers, timeline.clone());

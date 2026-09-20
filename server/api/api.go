@@ -60,7 +60,7 @@ func NewServerFromEnv(authService *auth.Service, hub *signaling.Hub, db *databas
 		log.Printf("Relay ticket signer active: kid=%s fingerprint=%s", signer.ActiveKid(), signer.Fingerprint())
 	}
 
-	return &Server{
+	s := &Server{
 		auth:                     authService,
 		hub:                      hub,
 		db:                       db,
@@ -71,7 +71,13 @@ func NewServerFromEnv(authService *auth.Service, hub *signaling.Hub, db *databas
 		relayRevocationFeedToken: strings.TrimSpace(os.Getenv("RELAY_REVOCATION_FEED_TOKEN")),
 		signalNotifier:           newSignalNotifier(),
 		registrationSessionLocks: newRegistrationSessionLocks(),
-	}, nil
+	}
+	if hub != nil {
+		hub.SetTelemetryHandler(func(reportingDeviceID, networkID string, registrationSeq int64, payload []byte) (interface{}, error) {
+			return s.IngestPathTelemetryPayload(reportingDeviceID, networkID, registrationSeq, payload)
+		})
+	}
+	return s, nil
 }
 
 func parseRelayServers() []string {

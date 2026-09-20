@@ -19,9 +19,16 @@ Control 可选提供 `/admin/` 只读管理台。只有配置独立的 `CONTROL_
 
 大规模部署中，全局拓扑按稳定账号 ID 游标分批读取，并受明确的节点/边预算保护。响应会返回已加载账号数、是否完整以及预算不足原因；达到预算时管理台显示“不完整”并要求下钻到具体账号，而不是静默截断后仍声称全局图完整。账号列表同样使用稳定 ID 游标，因此设备心跳改变 `last_seen` 时不会导致翻页重复或漏行。网络和房间列表按页读取，不在打开页面时一次扫描全部记录。
 
-资源关系图中的账号颜色只用于稳定区分身份；设备的绿色/灰色状态点表示 Control 记录的 online 状态；待处理 signaling 默认隐藏，打开后以琥珀色虚线显示。搜索会只保留匹配资源及其一跳上下文，避免把不相关分支继续留成低透明度“毛线团”。当前 Control 不持久化 daemon 选中的实时 Direct/Relay 业务路径，因此管理台不会把 `relay_rtt_ms`、候选信息或 signaling 推断成 Direct/Relay 连接。要判断真实数据面路径和端到端可达性，仍以 daemon 路径观测、客户端诊断和实际业务流量为准。
+资源关系图中的账号颜色只用于稳定区分身份；设备的绿色/灰色状态点表示 Control 记录的 online 状态；待处理 signaling 默认隐藏，打开后以琥珀色虚线显示。搜索会只保留匹配资源及其一跳上下文，避免把不相关分支继续留成低透明度“毛线团”。资源关系图只展示 Control 确认的资源拓扑，不会把 `relay_rtt_ms`、候选信息或 signaling 猜测推断成数据面连接。真实数据面活动路径完全由各 daemon 端点权威上报并持久化，不与资源关系图混淆。
 
 管理台还展示 Control 数据库和当前 Control 进程能直接确认的网络、房间、设备、活动隧道、待处理信令和构建信息。设备的 `online`、Relay RTT 或 Control 健康状态都不能单独证明虚拟 IP 业务已经双向可达。
+
+### 连接与路径观测 API
+
+Control 提供只读 Admin Connections API，查询由客户端 daemon 权威上报的真实活动路径快照与迁移历史。接口需要管理员令牌（`Authorization: Bearer <CONTROL_ADMIN_TOKEN>`）：
+
+- `GET /admin/api/v1/connections`：查询当前各对端连接的最新路径快照（来自 `peer_path_observations` 表）。支持按 `network_id`、`account_id`、`device_id`、`path`（如 direct/relay/connecting/probing/fallback_relay/failed/none）以及新鲜度 `max_age_seconds` 进行过滤；支持基于稳定游标的 `limit` 与 `cursor` 分页。每个条目均包含 reporting 设备、remote 设备、网络、路径类型、新鲜度、权威状态所有者、peer 会话代际与更新时间。
+- `GET /admin/api/v1/connection-transitions`：查询对端路径迁移历史（来自 `peer_path_transitions` 表，每对设备受限保留最多 50 条最近记录）。支持按 `reporting_device_id`、`remote_device_id`、`network_id` 过滤，并支持 `limit` 与 `cursor` 分页。每个迁移事件记录源路径、目标路径、触发原因（如 direct_upgrade、keepalive_timeout、initial_connect 等）、代际围栏信息与记录时间戳。
 
 管理台与 Control 使用同一 origin，不需要额外 CORS 放行。公网访问必须继续经过可信 HTTPS 反向代理；浏览器中的管理员令牌按敏感凭据处理，用完后退出管理台并关闭共享终端中的会话。
 

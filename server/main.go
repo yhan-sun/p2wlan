@@ -209,6 +209,9 @@ func registerDeviceControlRoutes(mux *http.ServeMux, authService *auth.Service, 
 	// Backward-compat: endpoint update accepts user JWT (anyAuth).
 	mux.HandleFunc("PATCH /api/v1/devices/{id}/endpoint", anySessionAuth(apiServer.UpdateDeviceEndpoint))
 
+	// Authoritative daemon path telemetry route.
+	mux.HandleFunc("POST /api/v1/telemetry/paths", anySessionAuth(apiServer.SubmitPathTelemetry))
+
 	// Device-authenticated WebSocket wake-up channel. Signal payloads remain
 	// durable in the database and are consumed through GET /api/v1/signals.
 	signalWS := deviceAuth(signaling.ServeWS(hub, apiServer.WebSocketRegistrationSessionGuard()))

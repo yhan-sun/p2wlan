@@ -115,6 +115,10 @@ struct SignalWebSocketMessage {
     sequence: u64,
     #[serde(default)]
     server_time_ms: u64,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    sent_at: i64,
 }
 
 pub(super) struct SignalWebSocketTask {
@@ -136,6 +140,7 @@ impl Drop for SignalWebSocketTask {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_signal_websocket(
     base_url: &str,
     token: &str,
@@ -144,6 +149,7 @@ pub(super) fn spawn_signal_websocket(
     registration_seq: Option<u64>,
     wake_tx: mpsc::Sender<()>,
     connected: Arc<AtomicBool>,
+    telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
 ) -> SignalWebSocketTask {
     let lifecycle = SignalConnectionLifecycle::new(connected);
     let task_lifecycle = lifecycle.clone();
@@ -160,6 +166,7 @@ pub(super) fn spawn_signal_websocket(
             registration_seq,
             wake_tx,
             task_lifecycle,
+            telemetry_hub,
         )
         .await;
     });
@@ -167,6 +174,7 @@ pub(super) fn spawn_signal_websocket(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_signal_websocket(
     base_url: &str,
     token: &str,
@@ -175,6 +183,7 @@ pub(super) async fn run_signal_websocket(
     registration_seq: Option<u64>,
     wake_tx: mpsc::Sender<()>,
     connected: Arc<AtomicBool>,
+    telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
 ) {
     run_signal_websocket_with_lifecycle(
         base_url,
@@ -184,10 +193,12 @@ pub(super) async fn run_signal_websocket(
         registration_seq,
         wake_tx,
         SignalConnectionLifecycle::new(connected),
+        telemetry_hub,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_signal_websocket_with_lifecycle(
     base_url: &str,
     token: &str,
@@ -196,6 +207,7 @@ async fn run_signal_websocket_with_lifecycle(
     registration_seq: Option<u64>,
     wake_tx: mpsc::Sender<()>,
     lifecycle: SignalConnectionLifecycle,
+    telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
 ) {
     let ws_url = match signal_websocket_url(base_url) {
         Ok(url) => url,
@@ -301,6 +313,7 @@ async fn run_signal_websocket_with_lifecycle(
                     info!("WebSocket signaling connected at {ws_url}");
                     attempt = 0;
                     let mut ready = false;
+                    let mut server_has_telemetry = false;
                     let mut last_sequence = 0u64;
                     let mut last_message_at = std::time::Instant::now();
                     let mut next_route_check =
@@ -316,7 +329,62 @@ async fn run_signal_websocket_with_lifecycle(
                         }
                         let route_wait = next_route_check.saturating_duration_since(now);
                         let wait = idle_remaining.min(route_wait);
-                        let next_message = time::timeout(wait, socket.next()).await;
+
+                        let next_message = async { time::timeout(wait, socket.next()).await };
+                        let telemetry_wait = async {
+                            if ready && server_has_telemetry {
+                                if let Some(hub) = &telemetry_hub {
+                                    if !hub.has_dirty() {
+                                        hub.wait_for_dirty().await;
+                                    }
+                                    return true;
+                                }
+                            }
+                            std::future::pending::<bool>().await
+                        };
+
+                        let (next_message, send_telemetry) = tokio::select! {
+                            msg = next_message => (Some(msg), false),
+                            _ = telemetry_wait => (None, true),
+                        };
+
+                        if send_telemetry {
+                            if let Some(hub) = &telemetry_hub {
+                                let batch = hub.drain_dirty(32);
+                                if !batch.is_empty() {
+                                    let frame = hub.build_frame(batch);
+                                    if let Ok(text) = serde_json::to_string(&frame) {
+                                        let count = frame.payload.observations.len();
+                                        match time::timeout(
+                                            SIGNAL_WS_WRITE_TIMEOUT,
+                                            socket.send(WebSocketMessage::Text(text.into())),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(())) => {
+                                                hub.record_sent_batch(count);
+                                            }
+                                            Ok(Err(err)) => {
+                                                hub.record_send_failure();
+                                                warn!("Failed to send WebSocket path telemetry: {err}");
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                hub.record_send_failure();
+                                                warn!("WebSocket path telemetry write timed out");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        let next_message = match next_message {
+                            Some(msg) => msg,
+                            None => continue,
+                        };
 
                         let now = std::time::Instant::now();
                         if now >= next_route_check {
@@ -353,7 +421,7 @@ async fn run_signal_websocket_with_lifecycle(
                         };
                         match message {
                             WebSocketMessage::Text(text) => {
-                                if text.len() > 4096 {
+                                if text.len() > 65536 {
                                     warn!("WebSocket signaling message exceeded client limit");
                                     break;
                                 }
@@ -388,6 +456,39 @@ async fn run_signal_websocket_with_lifecycle(
                                         if !lifecycle.mark_connected(connection_generation) {
                                             break;
                                         }
+                                        server_has_telemetry = message
+                                            .capabilities
+                                            .iter()
+                                            .any(|c| c == "path_telemetry_v1");
+                                        if server_has_telemetry {
+                                            debug!(
+                                                "WebSocket signaling enabled active-path telemetry (path_telemetry_v1) for node {}",
+                                                expected_node_id
+                                            );
+                                            if let Some(hub) = &telemetry_hub {
+                                                hub.mark_all_dirty();
+                                                let batch = hub.drain_dirty(32);
+                                                if !batch.is_empty() {
+                                                    let frame = hub.build_frame(batch);
+                                                    if let Ok(text) = serde_json::to_string(&frame)
+                                                    {
+                                                        let count =
+                                                            frame.payload.observations.len();
+                                                        if (time::timeout(
+                                                            SIGNAL_WS_WRITE_TIMEOUT,
+                                                            socket.send(WebSocketMessage::Text(
+                                                                text.into(),
+                                                            )),
+                                                        )
+                                                        .await)
+                                                            .is_ok()
+                                                        {
+                                                            hub.record_sent_batch(count);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         debug!(
                                             "WebSocket signaling ready for node {} at server_time_ms={}",
                                             expected_node_id, message.server_time_ms
@@ -407,6 +508,11 @@ async fn run_signal_websocket_with_lifecycle(
                                         last_sequence = message.sequence;
                                         if wake_tx.try_send(()).is_err() && wake_tx.is_closed() {
                                             return;
+                                        }
+                                    }
+                                    "path_telemetry_ack" if ready => {
+                                        if let Some(hub) = &telemetry_hub {
+                                            hub.record_ack(message.sent_at);
                                         }
                                     }
                                     other => {

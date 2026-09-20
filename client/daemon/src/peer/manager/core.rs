@@ -109,8 +109,17 @@ impl PeerManager {
             outbound_loss_default: Arc::new(tokio::sync::Mutex::new(
                 OutboundLossCounters::default(),
             )),
+            telemetry_hub: Arc::new(path_telemetry::PathTelemetryHub::new(
+                config.node.node_id.clone(),
+                config.network.network_id.clone(),
+            )),
             config,
         }
+    }
+
+    /// Return a handle to the authoritative active-path telemetry hub.
+    pub fn telemetry_hub(&self) -> Arc<path_telemetry::PathTelemetryHub> {
+        self.telemetry_hub.clone()
     }
 
     /// Remember a negotiated capability at the WireGuard peer-session scope.
