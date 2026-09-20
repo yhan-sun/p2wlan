@@ -43,7 +43,7 @@ attention signal 是固定、可解释的条件：
 
 - `reporter_offline`：上报端 heartbeat lease 已失效；
 - `stale_observation`：上报端仍在线，但最新路径观测已超过 freshness lease；
-- `no_active_path`：观测仍 fresh，但 daemon 没有 committed active path；
+- `no_active_path`：观测仍 fresh、peer lifecycle 为 `online`，但 daemon 没有 committed active path；明确 `offline` / `unbound` 的 peer 没有路径不会被误报；
 - `frequent_path_switching`：请求窗口内至少 4 次已记录的 Direct↔Relay 切换；
 - `repeated_path_failures`：请求窗口内至少 3 次显式 `direct_probe_failed` / `direct_path_failed` / `relay_path_failed`。
 
