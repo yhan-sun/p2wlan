@@ -44,7 +44,7 @@ type AdminConnectionHealthSummary struct {
 	ReporterOfflineObservations   int     `json:"reporter_offline_observations"`
 	FreshDirect                   int     `json:"fresh_direct"`
 	FreshRelay                    int     `json:"fresh_relay"`
-	FreshNoPath                   int     `json:"fresh_no_path"`
+	FreshOnlineNoPath             int     `json:"fresh_online_no_path"`
 	ValidationRTTSamples          int     `json:"validation_rtt_samples"`
 	AverageValidationRTTMS        *uint64 `json:"average_validation_rtt_ms,omitempty"`
 	MaxValidationRTTMS            *uint64 `json:"max_validation_rtt_ms,omitempty"`
@@ -271,7 +271,7 @@ FROM scoped
 		&summary.ReporterOfflineObservations,
 		&summary.FreshDirect,
 		&summary.FreshRelay,
-		&summary.FreshNoPath,
+		&summary.FreshOnlineNoPath,
 		&summary.ValidationRTTSamples,
 		&avgRTT,
 		&maxRTT,
