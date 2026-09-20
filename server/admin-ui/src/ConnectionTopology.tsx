@@ -52,9 +52,10 @@ function pathClass(connection: AdminConnection): string {
 }
 
 function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edge[] } {
+  const activeConnections = connections.filter((connection) => Boolean(connection.current_path))
   const devices = new Map<string, DeviceNodeData>()
 
-  for (const connection of connections) {
+  for (const connection of activeConnections) {
     const reporting = devices.get(connection.reporting_device_id) ?? {
       id: connection.reporting_device_id,
       name: connection.reporting_device_name,
@@ -77,7 +78,7 @@ function buildGraph(connections: AdminConnection[]): { nodes: Node[]; edges: Edg
     devices.set(remote.id, remote)
   }
 
-  const visibleConnections = connections
+  const visibleConnections = activeConnections
   const visibleDeviceIDs = new Set(devices.keys())
 
   const sortedDevices = [...devices.values()]
@@ -172,16 +173,18 @@ export function ConnectionTopology({
   const [fullscreen, setFullscreen] = useState(false)
   const graph = useMemo(() => buildGraph(connections), [connections])
 
-  if (connections.length === 0) {
+  const activeConnectionCount = connections.filter((connection) => Boolean(connection.current_path)).length
+
+  if (activeConnectionCount === 0) {
     return <div className="connection-topology-empty">
       <CircleAlert size={18} />
-      <div><strong>暂无可展示的连接</strong><span>只有 daemon 权威上报的路径观测才会生成连接边。</span></div>
+      <div><strong>暂无活动路径</strong><span>只有 daemon 权威上报且 current_path 非空的观测才会生成连接边；None 观测仍保留在列表中用于诊断。</span></div>
     </div>
   }
 
   return <div className={`connection-topology ${fullscreen ? 'fullscreen' : ''}`}>
     <div className="connection-topology-head">
-      <div><strong>{networkName}</strong><span>{connections.length} 条 directional observation{partial ? ' · 当前视图已截断' : ''}</span></div>
+      <div><strong>{networkName}</strong><span>{activeConnectionCount} 条活动 directional path{partial ? ' · 当前视图已截断' : ''}</span></div>
       <div>
         <button className={`topology-filter-button ${showStale ? 'active' : ''}`} onClick={() => onShowStaleChange(!showStale)}>
           {showStale ? <Eye size={15} /> : <EyeOff size={15} />}Stale
