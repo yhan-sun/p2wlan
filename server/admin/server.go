@@ -33,6 +33,7 @@ type Store interface {
 	AdminRooms(limit, offset int) (*database.AdminRoomPage, error)
 	AdminConnections(filter database.AdminConnectionFilter, limit, offset int) (*database.AdminConnectionPage, error)
 	AdminConnectionTransitions(filter database.AdminConnectionTransitionFilter, limit int, cursor string) (*database.AdminConnectionTransitionPage, error)
+	AdminConnectionHealth(filter database.AdminConnectionHealthFilter) (*database.AdminConnectionHealth, error)
 }
 
 type Config struct {
@@ -106,6 +107,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/v1/rooms", s.requireAdmin(s.rooms))
 	mux.HandleFunc("GET /admin/api/v1/connections", s.requireAdmin(s.connections))
 	mux.HandleFunc("GET /admin/api/v1/connection-transitions", s.requireAdmin(s.connectionTransitions))
+	mux.HandleFunc("GET /admin/api/v1/connection-health", s.requireAdmin(s.connectionHealth))
 	mux.HandleFunc("GET /admin/api/v1/runtime", s.requireAdmin(s.runtime))
 	mux.HandleFunc("GET /admin/", s.serveConsole)
 }
