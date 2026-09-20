@@ -186,7 +186,7 @@ function ConnectionDrawer({
       <dl className="connection-detail-list">
         <div><dt>From</dt><dd>{current.reporting_device_name}<small>{current.reporting_username}</small></dd></div>
         <div><dt>To</dt><dd>{current.remote_device_name}<small>{current.remote_username}</small></dd></div>
-        <div><dt>RTT</dt><dd>{current.last_validation_rtt_ms === undefined ? '—' : `${current.last_validation_rtt_ms} ms`}</dd></div>
+        <div><dt>验证 RTT</dt><dd>{current.last_validation_rtt_ms === undefined ? '—' : `${current.last_validation_rtt_ms} ms`}</dd></div>
         <div><dt>Path age</dt><dd>{formatMilliseconds(current.path_age_ms)}</dd></div>
         <div><dt>Last observed</dt><dd>{formatAgo(current.received_at)}</dd></div>
         <div><dt>Lifecycle</dt><dd>{current.lifecycle || '—'}</dd></div>
@@ -274,7 +274,7 @@ export function ConnectionsPage() {
     { id: 'network', header: '网络', cell: ({ row }) => <div className="primary-secondary"><strong>{row.original.network_name}</strong><span className="mono">{row.original.network_id}</span></div> },
     { id: 'path', header: '路径', cell: ({ row }) => <PathBadge connection={row.original} /> },
     { id: 'fresh', header: '观测', cell: ({ row }) => <FreshnessBadge connection={row.original} /> },
-    { id: 'rtt', header: 'RTT', cell: ({ row }) => row.original.last_validation_rtt_ms === undefined ? '—' : `${row.original.last_validation_rtt_ms} ms` },
+    { id: 'rtt', header: '验证 RTT', cell: ({ row }) => row.original.last_validation_rtt_ms === undefined ? '—' : `${row.original.last_validation_rtt_ms} ms` },
     { id: 'age', header: 'Path age', cell: ({ row }) => formatMilliseconds(row.original.path_age_ms) },
     { id: 'reason', header: '原因', cell: ({ row }) => <span className="connection-reason" title={row.original.transition_reason}>{reasonLabel(row.original.transition_reason)}</span> },
     { id: 'observed', header: '最后观测', cell: ({ row }) => formatAgo(row.original.received_at) },
