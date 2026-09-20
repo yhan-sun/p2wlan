@@ -706,6 +706,8 @@ pub struct PeerManager {
     outbound_loss_default: Arc<tokio::sync::Mutex<OutboundLossCounters>>,
     /// Configuration.
     config: Config,
+    /// Authoritative active-path telemetry hub.
+    pub(crate) telemetry_hub: Arc<path_telemetry::PathTelemetryHub>,
 }
 
 /// Aggregate counter of lost outbound business packets for one reason code.

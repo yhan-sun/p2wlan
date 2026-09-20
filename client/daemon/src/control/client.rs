@@ -88,14 +88,16 @@ impl ControlClient {
             relay_selection,
             timeline,
             None,
+            None,
         )
     }
 
     /// Create a control client and attach the daemon health state directly to
     /// the HTTP polling runtime.  The control event consumer also handles the
-    /// same health events, but it may be busy processing a peer handover; the
-    /// polling task must be able to refresh the health timestamp independently
-    /// so a slow data-plane transition cannot produce a false stale warning.
+    /// heartbeat and route recovery; having the runtime update the heartbeat
+    /// timestamp prevents normal message processing from reporting false
+    /// control-plane stalls.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_health(
         config: &Config,
         enabled: bool,
@@ -103,6 +105,7 @@ impl ControlClient {
         relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
         timeline: Arc<ConnectionTimeline>,
         health: Option<Arc<crate::tasks::HealthState>>,
+        telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -216,6 +219,7 @@ impl ControlClient {
                     health,
                     advertised_snapshot,
                     event_loop_ready,
+                    telemetry_hub,
                 )
                 .await;
             };

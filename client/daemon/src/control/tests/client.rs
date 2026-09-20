@@ -1549,6 +1549,7 @@ async fn critical_endpoint_publish_bypasses_stalled_ordinary_lane() {
         None,
         ConnectionTimeline::new("test-node", 0),
         Some(health.clone()),
+        None,
     );
     server.wait_registered().await;
     health.set_device_lease_healthy(false);
@@ -1651,6 +1652,7 @@ async fn failed_critical_endpoint_publish_invalidates_only_device_lease() {
         None,
         ConnectionTimeline::new("test-node", 0),
         Some(health.clone()),
+        None,
     );
     server.wait_registered().await;
 

@@ -273,6 +273,8 @@ pub struct PeerConnection {
     /// after the reducer commit and its infallible side effects have completed
     /// under the connection writer.
     committed_business_path_change_tx: Option<tokio::sync::watch::Sender<u64>>,
+    /// Authoritative active-path telemetry hub.
+    telemetry_hub: Option<Arc<path_telemetry::PathTelemetryHub>>,
 }
 
 impl PeerConnection {
@@ -552,6 +554,7 @@ impl PeerConnection {
             direct_pair_cache: None,
             committed_business_path_cache: None,
             committed_business_path_change_tx: None,
+            telemetry_hub: None,
         }
     }
 
@@ -708,6 +711,7 @@ impl PeerConnection {
         }
         self.sync_direct_cache();
         self.sync_committed_business_path_cache();
+        self.sync_path_telemetry();
 
         if previous_state != new_state || previous_active != current_active {
             info!(target: "p2pnet_daemon::peer::connection",
@@ -819,6 +823,20 @@ impl PeerConnection {
         self.committed_business_path_cache = Some(cache);
         self.committed_business_path_change_tx = Some(changes);
         self.sync_committed_business_path_cache();
+    }
+
+    /// Attach the active-path telemetry hub.
+    pub(crate) fn attach_telemetry_hub(&mut self, hub: Arc<path_telemetry::PathTelemetryHub>) {
+        self.telemetry_hub = Some(hub);
+        self.sync_path_telemetry();
+    }
+
+    /// Synchronize authoritative active-path state to the telemetry hub.
+    pub(crate) fn sync_path_telemetry(&self) {
+        if let Some(hub) = &self.telemetry_hub {
+            let snapshot = self.path_observability.snapshot(self);
+            hub.enqueue(&self.node_id, &snapshot);
+        }
     }
 
     /// Current selected traffic path, if active.

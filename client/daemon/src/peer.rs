@@ -651,6 +651,12 @@ pub use path_observability::{
     PathTransitionDiagnostics, PathValidationDiagnostics,
 };
 
+pub mod path_telemetry;
+pub use path_telemetry::{
+    PathTelemetryAckFrame, PathTelemetryFrame, PathTelemetryHub, PathTelemetryMetrics,
+    PathTelemetryObservation, PathTelemetryPayload, PathTelemetrySender,
+};
+
 mod path_state_machine;
 pub(crate) use path_state_machine::{
     ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,

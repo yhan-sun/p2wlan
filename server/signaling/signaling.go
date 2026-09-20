@@ -27,7 +27,7 @@ const (
 	ProtocolVersion         = 1
 	DefaultMaxConnections   = 10_000
 	sendQueueCapacity       = 64
-	readLimitBytes          = 4 << 10
+	readLimitBytes          = 64 << 10
 	writeWait               = 5 * time.Second
 	upgradeHandshakeTimeout = 5 * time.Second
 	pongWait                = 45 * time.Second
@@ -40,12 +40,13 @@ var (
 )
 
 type serverMessage struct {
-	Type            string `json:"type"`
-	ProtocolVersion int    `json:"protocol_version"`
-	NodeID          string `json:"node_id,omitempty"`
-	NetworkID       string `json:"network_id,omitempty"`
-	Sequence        uint64 `json:"sequence,omitempty"`
-	ServerTimeMS    int64  `json:"server_time_ms"`
+	Type            string   `json:"type"`
+	ProtocolVersion int      `json:"protocol_version"`
+	NodeID          string   `json:"node_id,omitempty"`
+	NetworkID       string   `json:"network_id,omitempty"`
+	Sequence        uint64   `json:"sequence,omitempty"`
+	ServerTimeMS    int64    `json:"server_time_ms"`
+	Capabilities    []string `json:"capabilities,omitempty"`
 }
 
 type closeRequest struct {
@@ -69,23 +70,33 @@ type Client struct {
 	send       chan []byte
 	done       chan struct{}
 	closeReq   chan closeRequest
-	writerDone chan struct{}
-	stopOnce   sync.Once
-	nodeID     string
-	networkID  string
-	expiresAt  time.Time
-	sequence   atomic.Uint64
+	writerDone      chan struct{}
+	stopOnce        sync.Once
+	nodeID          string
+	networkID       string
+	registrationSeq int64
+	expiresAt       time.Time
+	sequence        atomic.Uint64
 }
+
+type TelemetryHandler func(reportingDeviceID, networkID string, registrationSeq int64, payload []byte) (interface{}, error)
 
 // Hub keeps at most one live WebSocket per device. It intentionally contains
 // no signal payloads; those remain durable in the database.
 type Hub struct {
-	mu             sync.RWMutex
-	clients        map[string]*Client
-	maxConnections int
-	activeClients  int
-	closed         bool
-	connections    sync.WaitGroup
+	mu               sync.RWMutex
+	clients          map[string]*Client
+	telemetryHandler TelemetryHandler
+	maxConnections   int
+	activeClients    int
+	closed           bool
+	connections      sync.WaitGroup
+}
+
+func (h *Hub) SetTelemetryHandler(handler TelemetryHandler) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.telemetryHandler = handler
 }
 
 func NewHub() *Hub {
@@ -273,16 +284,18 @@ func ServeWS(hub *Hub, guards ...UpgradeGuard) http.HandlerFunc {
 			return
 		}
 
+		regSeq := parseRegistrationSequence(r)
 		client := &Client{
-			hub:        hub,
-			conn:       conn,
-			send:       make(chan []byte, sendQueueCapacity),
-			done:       make(chan struct{}),
-			closeReq:   make(chan closeRequest, 1),
-			writerDone: make(chan struct{}),
-			nodeID:     claims.DeviceID,
-			networkID:  claims.NetworkID,
-			expiresAt:  time.Unix(claims.ExpiresAt, 0),
+			hub:             hub,
+			conn:            conn,
+			send:            make(chan []byte, sendQueueCapacity),
+			done:            make(chan struct{}),
+			closeReq:        make(chan closeRequest, 1),
+			writerDone:      make(chan struct{}),
+			nodeID:          claims.DeviceID,
+			networkID:       claims.NetworkID,
+			registrationSeq: regSeq,
+			expiresAt:       time.Unix(claims.ExpiresAt, 0),
 		}
 		previous, err := hub.register(client)
 		// Registration session fencing only needs to cover validation through
@@ -312,6 +325,7 @@ func ServeWS(hub *Hub, guards ...UpgradeGuard) http.HandlerFunc {
 			NodeID:          client.nodeID,
 			NetworkID:       client.networkID,
 			ServerTimeMS:    time.Now().UnixMilli(),
+			Capabilities:    []string{"path_telemetry_v1"},
 		})
 		if !client.enqueue(ready) {
 			hub.unregister(client)
@@ -337,11 +351,26 @@ func (c *Client) readPump() {
 		return c.conn.SetReadDeadline(c.readDeadline())
 	})
 	for {
-		messageType, _, err := c.conn.ReadMessage()
+		messageType, data, err := c.conn.ReadMessage()
 		if err != nil {
 			return
 		}
-		if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
+		if messageType == websocket.BinaryMessage {
+			c.requestClose(websocket.CloseUnsupportedData, "binary message unsupported")
+			return
+		}
+		if messageType == websocket.TextMessage {
+			var msg struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(data, &msg); err != nil {
+				c.requestClose(websocket.ClosePolicyViolation, "invalid message format")
+				return
+			}
+			if msg.Type == "path_telemetry" {
+				c.hub.handleTelemetry(c, data)
+				continue
+			}
 			c.requestClose(websocket.CloseUnsupportedData, "server-to-client notification channel")
 			return
 		}
@@ -429,4 +458,32 @@ func (h *Hub) Disconnect(nodeID string) {
 		client.stop()
 		client.requestClose(websocket.ClosePolicyViolation, "device authorization changed")
 	}
+}
+
+func (h *Hub) handleTelemetry(c *Client, data []byte) {
+	h.mu.RLock()
+	handler := h.telemetryHandler
+	isCurrent := (h.clients[c.nodeID] == c)
+	h.mu.RUnlock()
+	if !isCurrent || handler == nil {
+		return
+	}
+	result, err := handler(c.nodeID, c.networkID, c.registrationSeq, data)
+	if err == nil && result != nil {
+		if ackBytes, err := json.Marshal(result); err == nil {
+			c.enqueue(ackBytes)
+		}
+	}
+}
+
+func parseRegistrationSequence(r *http.Request) int64 {
+	values := r.Header.Values(auth.RegistrationSequenceHeader)
+	if len(values) != 1 {
+		return 0
+	}
+	seq, err := strconv.ParseInt(values[0], 10, 64)
+	if err != nil || seq <= 0 {
+		return 0
+	}
+	return seq
 }

@@ -91,6 +91,14 @@ func (fakeStore) AdminRooms(limit, offset int) (*database.AdminRoomPage, error) 
 	return &database.AdminRoomPage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminRoomSummary{{ID: "r1", Name: "friends"}}}, nil
 }
 
+func (fakeStore) AdminConnections(_ database.AdminConnectionFilter, limit, offset int) (*database.AdminConnectionPage, error) {
+	return &database.AdminConnectionPage{Total: 1, Limit: limit, Offset: offset, Items: []database.AdminConnectionSummary{{ReportingDeviceID: "d1", RemoteDeviceID: "d2"}}}, nil
+}
+
+func (fakeStore) AdminConnectionTransitions(_ database.AdminConnectionTransitionFilter, limit int, _ string) (*database.AdminConnectionTransitionPage, error) {
+	return &database.AdminConnectionTransitionPage{Limit: limit, Items: []database.AdminConnectionTransitionSummary{{ReportingDeviceID: "d1", RemoteDeviceID: "d2"}}}, nil
+}
+
 func testServer(t *testing.T, token string) *Server {
 	t.Helper()
 	server, err := New(fakeStore{}, Config{

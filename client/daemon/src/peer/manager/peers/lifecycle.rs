@@ -171,6 +171,7 @@ impl PeerManager {
             self.committed_business_paths.clone(),
             self.committed_business_path_change_tx.clone(),
         );
+        conn.attach_telemetry_hub(self.telemetry_hub.clone());
 
         let old_virtual_ip = conn.virtual_ip.clone();
         let old_public_key = conn.public_key.clone();

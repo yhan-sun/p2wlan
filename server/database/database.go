@@ -92,6 +92,11 @@ func New(path string) (*DB, error) {
 		return nil, fmt.Errorf("migrate rooms: %w", err)
 	}
 
+	if err := migratePathTelemetry(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate path telemetry: %w", err)
+	}
+
 	return &DB{db}, nil
 }
 
