@@ -177,6 +177,7 @@ p2wlan support-bundle --upload
 ```bash
 sudo ./scripts/install-server.sh --version server-vX.Y.Z --role all
 sudo p2wlan-server status
+sudo p2wlan-server doctor --service all
 sudo p2wlan-server update --version server-vX.Y.Z
 sudo p2wlan-server backup
 sudo p2wlan-server rollback
