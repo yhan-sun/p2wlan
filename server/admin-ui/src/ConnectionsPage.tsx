@@ -229,11 +229,20 @@ export function ConnectionsPage() {
     setOffset(0)
   }, [debouncedQuery, networkId, path, freshness])
 
-  const networks = useQuery({
+  const networks = useInfiniteQuery({
     queryKey: ['connections', 'networks'],
-    queryFn: () => adminApi.networks(100, 0),
+    queryFn: ({ pageParam }) => adminApi.networks(100, pageParam),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage) => {
+      const nextOffset = lastPage.offset + lastPage.items.length
+      return nextOffset < lastPage.total ? nextOffset : undefined
+    },
     staleTime: 60_000,
   })
+  const networkItems = useMemo(
+    () => networks.data?.pages.flatMap((page) => page.items) ?? [],
+    [networks.data?.pages],
+  )
 
   const result = useQuery({
     queryKey: ['connections', 'table', debouncedQuery, networkId, path, freshness, offset],
@@ -258,7 +267,7 @@ export function ConnectionsPage() {
     refetchInterval: 10_000,
   })
 
-  const selectedNetwork = networks.data?.items.find((network) => network.id === networkId)
+  const selectedNetwork = networkItems.find((network) => network.id === networkId)
 
   const columns = useMemo<ColumnDef<AdminConnection, unknown>[]>(() => [
     { id: 'direction', header: '方向', cell: ({ row }) => <ConnectionDirection connection={row.original} /> },
@@ -291,7 +300,7 @@ export function ConnectionsPage() {
       <label className="search-field connections-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索设备、账号或网络" aria-label="搜索连接" /></label>
       <select className="select-field" value={networkId} onChange={(event) => setNetworkId(event.target.value)} aria-label="按网络过滤">
         <option value="">全部网络</option>
-        {networks.data?.items.map((network) => <option key={network.id} value={network.id}>{network.name}</option>)}
+        {networkItems.map((network) => <option key={network.id} value={network.id}>{network.name}</option>)}
       </select>
       <select className="select-field" value={path} onChange={(event) => setPath(event.target.value)} aria-label="按路径过滤">
         <option value="">全部路径</option>
@@ -304,7 +313,11 @@ export function ConnectionsPage() {
         <option value="fresh">Fresh</option>
         <option value="stale">Stale / reporter offline</option>
       </select>}
-      {networks.data && networks.data.total > networks.data.items.length && <span className="connections-filter-note">网络选择器仅显示前 {networks.data.items.length} 项</span>}
+      {networks.hasNextPage && <button
+        className="button secondary compact"
+        onClick={() => networks.fetchNextPage()}
+        disabled={networks.isFetchingNextPage}
+      >{networks.isFetchingNextPage ? '加载中…' : '加载更多网络'}</button>}
     </div>
 
     {view === 'table' ? <section className="panel-v2 connections-panel">
