@@ -176,7 +176,7 @@ func TestDisabledConsoleIsNotDiscoverable(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	paths := []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/connections", "/admin/health", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions", "/admin/api/v1/connection-health", "/admin/api/v1/connection-trends", "/admin/api/v1/connection-health", "/admin/api/v1/connection-trends", "/admin/app.js", "/admin/index.html"}
+	paths := []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/connections", "/admin/health", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions", "/admin/api/v1/connection-health", "/admin/api/v1/connection-trends", "/admin/app.js", "/admin/index.html"}
 	methods := []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions}
 	for _, path := range paths {
 		for _, method := range methods {
@@ -229,7 +229,7 @@ func TestAdminAPIRequiresBearerToken(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	for _, path := range []string{"/admin/api/v1/overview", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions"} {
+	for _, path := range []string{"/admin/api/v1/overview", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions", "/admin/api/v1/connection-health", "/admin/api/v1/connection-trends"} {
 		unauthorized := httptest.NewRecorder()
 		mux.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, path, nil))
 		if unauthorized.Code != http.StatusUnauthorized {
