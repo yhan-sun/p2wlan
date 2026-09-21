@@ -1,0 +1,157 @@
+name: Direct-first implementation verification
+
+on:
+  push:
+    branches: [feat/direct-first-nat-20260921]
+    paths: [.github/workflows/direct-first-apply.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/feat/direct-first-nat-20260921'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.apply.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify and apply exact source patch
+        id: apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, lzma, pathlib, re, subprocess
+          root = pathlib.Path('.github/direct-first-patch')
+          encoded = ''.join((root / f'part-{i:02d}.b64').read_text().strip() for i in range(3))
+          patch = lzma.decompress(base64.b64decode(encoded, validate=True), memlimit=134217728)
+          assert len(patch) == 86615, 'patch length mismatch'
+          assert hashlib.sha256(patch).hexdigest() == 'cd4c10d556c1b7b55a36a038695ca88c09de913c11e99a441a18594a3c2a0552', 'patch digest mismatch'
+          sections = re.split(r'(?m)^diff --git ', patch.decode())[1:]
+          assert 1 <= len(sections) <= 64
+          for section in sections:
+              header = section.splitlines()[0]
+              match = re.fullmatch(r'a/(\S+) b/(\S+)', header)
+              assert match and match[1] == match[2], 'unexpected rename or path'
+              path = match[1]
+              assert path.startswith(('client/', 'server/', 'docs/', 'scripts/')) and '..' not in path.split('/')
+              index = re.search(r'(?m)^index ([a-f0-9]{40})\.\.([a-f0-9]{40})', section)
+              assert index, 'full blob identity required'
+              before = subprocess.run(['git', 'rev-parse', '--verify', f'HEAD:{path}'], capture_output=True, text=True)
+              if index[1] == '0' * 40:
+                  assert before.returncode != 0 and not pathlib.Path(path).exists(), path
+              else:
+                  assert before.returncode == 0 and before.stdout.strip() == index[1], path
+          target = pathlib.Path('/tmp/direct-first.patch')
+          target.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--unidiff-zero', '--index', str(target)], check=True)
+          subprocess.run(['git', 'apply', '--unidiff-zero', '--index', str(target)], check=True)
+          for section in sections:
+              path = re.fullmatch(r'a/(\S+) b/(\S+)', section.splitlines()[0])[1]
+              expected = re.search(r'(?m)^index [a-f0-9]{40}\.\.([a-f0-9]{40})', section)[1]
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              assert actual == expected, f'post-apply identity mismatch: {path}'
+          print(f'Applied {len(sections)} verified source changes')
+          PY
+          git rm -r --ignore-unmatch .github/direct-first-patch .github/workflows/direct-first-snapshot.yml .github/workflows/direct-first-toolchain.yml .github/workflows/direct-first-apply.yml
+          git diff --cached --check
+          python3 scripts/docs/verify_repository.py
+          python3 scripts/quality/check_code_health.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat:落实直连优先准入与双对称预测边界修复'
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/feat/direct-first-nat-20260921
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  verify:
+    needs: apply
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.apply.outputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Compile exact daemon tests and record identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/SOURCE_COMMIT
+          cargo test --locked -p p2wlan-daemon --lib --no-run --message-format=json > evidence/build.jsonl 2> evidence/build.stderr
+          python3 - <<'PY'
+          import importlib.util, json, pathlib, shutil, hashlib
+          spec = importlib.util.spec_from_file_location('runner', 'scripts/quality/run_rust_tests.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          messages = [json.loads(line) for line in pathlib.Path('evidence/build.jsonl').read_text().splitlines()]
+          binaries = module.test_executables(messages)
+          assert len(binaries) == 1
+          out = pathlib.Path('evidence/daemon-tests')
+          shutil.copy2(binaries.pop(), out)
+          pathlib.Path('evidence/daemon-tests.sha256').write_text(hashlib.sha256(out.read_bytes()).hexdigest() + '  daemon-tests\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: direct-first-test-binary-${{ needs.apply.outputs.source_sha }}
+          path: |
+            evidence/daemon-tests
+            evidence/daemon-tests.sha256
+            evidence/SOURCE_COMMIT
+          retention-days: 1
+          if-no-files-found: error
+      - name: Direct-first, target-IP budget, and fallback regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/quality/run_rust_tests.py direct_first --each | tee evidence/direct-first.log
+          python3 scripts/quality/run_rust_tests.py destination_budget --each | tee evidence/destination-budget.log
+          python3 scripts/quality/run_rust_tests.py direct_budget_invalidation_falls_back_to_confirmed_relay_without_pending --each | tee evidence/mtu-fallback.log
+          cargo test --locked -p p2pnet-nat | tee evidence/nat.log
+          cargo test --locked -p p2wlan-cli | tee evidence/cli.log
+      - name: Repository contracts and format
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          python3 scripts/quality/check_include_format.py
+          python3 scripts/docs/verify_repository.py
+          python3 scripts/quality/check_code_health.py --base-ref origin/main
+          python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
+          bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
+          cargo clippy --locked -p p2wlan-daemon -p p2pnet-nat -p p2wlan-cli --all-targets -- -D warnings
+      - name: Daemon general and isolated HardHard regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p p2wlan-daemon --lib -- --test-threads=1 --skip hard_hard_ | tee evidence/daemon-general.log
+          python3 scripts/quality/run_rust_tests.py hard_hard_ --each | tee evidence/hard-hard.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: direct-first-verification-${{ needs.apply.outputs.source_sha }}
+          path: |
+            evidence/SOURCE_COMMIT
+            evidence/*.log
+            evidence/*.stderr
+            evidence/*.jsonl
+          retention-days: 7
+          if-no-files-found: warn
