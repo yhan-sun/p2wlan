@@ -172,14 +172,8 @@ func connectionMetricDeltaForObservation(
 	}
 	rtt := *validationRTT
 	delta.ValidationRTTSamples = 1
-	const maxSQLiteInt64 = uint64(^uint64(0) >> 1)
-	if rtt > maxSQLiteInt64 {
-		delta.ValidationRTTSumMS = int64(maxSQLiteInt64)
-		delta.ValidationRTTMaxMS = int64(maxSQLiteInt64)
-	} else {
-		delta.ValidationRTTSumMS = int64(rtt)
-		delta.ValidationRTTMaxMS = int64(rtt)
-	}
+	delta.ValidationRTTSumMS = int64(rtt)
+	delta.ValidationRTTMaxMS = int64(rtt)
 	if rtt <= 50 {
 		delta.RTTLE50 = 1
 	}
@@ -372,7 +366,9 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 	if filter.NetworkID != "" {
 		conditions = append(conditions, "network_id = ?")
 		args = append(args, filter.NetworkID)
-		_ = db.QueryRow(`SELECT name FROM networks WHERE id = ?`, filter.NetworkID).Scan(&networkName)
+		if err := db.QueryRow(`SELECT name FROM networks WHERE id = ?`, filter.NetworkID).Scan(&networkName); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("query connection trend network: %w", err)
+		}
 	}
 
 	query := `
