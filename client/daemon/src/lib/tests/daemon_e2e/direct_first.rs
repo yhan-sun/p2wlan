@@ -127,6 +127,8 @@ async fn run_direct_first_queued_business_case(establish_direct: bool) {
         );
         worker.abort();
         forwarder.abort();
+        let _ = worker.await;
+        let _ = forwarder.await;
         server.shutdown().await;
         return;
     }
@@ -150,7 +152,59 @@ async fn run_direct_first_queued_business_case(establish_direct: bool) {
         peers.select_path_for_data("node-b", true, true).await.path,
         Some(peer::NetworkPath::Direct)
     );
+
+    // Unlike a synthetic validation/BASE ACK fixture, a real business
+    // ciphertext has now left the outbound owner and been decrypted here.
+    // Recovery must not replay the first-connection preference window.
+    assert!(started.elapsed() < crate::peer::DIRECT_FIRST_WINDOW);
+    assert!(peers
+        .is_relay_business_admitted_for_generation("node-b", generation)
+        .await);
+    peers
+        .record_direct_failure("node-b", "established Direct recovery regression")
+        .await;
+    assert_eq!(
+        peers.select_path_for_data("node-b", true, true).await.path,
+        Some(peer::NetworkPath::Relay)
+    );
+    let recovery_packet = Ipv4Packet::build_icmp_echo_request(
+        "10.20.0.1".parse().unwrap(),
+        "10.20.0.2".parse().unwrap(),
+        1,
+        2,
+        &[5, 6, 7, 8],
+    );
+    dataplane_tx
+        .send(OutboundPacket {
+            room_authorization: None,
+            trace: None,
+            peer_id: "node-b".to_string(),
+            dst_ip: "10.20.0.2".to_string(),
+            packet: recovery_packet.clone(),
+        })
+        .await
+        .unwrap();
+    let relayed = tokio::time::timeout(Duration::from_secs(1), relay_rx.recv())
+        .await
+        .expect("established Direct failure must not incur a new cold-start wait")
+        .expect("confirmed standby must remain connected");
+    let RelayMessage::Data { from_node, data } = relayed else {
+        panic!("expected encrypted recovery business data, got {relayed:?}");
+    };
+    assert_eq!(from_node, "node-a");
+    assert_eq!(
+        remote_session.decrypt_from_bytes(&data).unwrap(),
+        recovery_packet
+    );
+    assert!(started.elapsed() < crate::peer::DIRECT_FIRST_WINDOW);
+    assert!(relay_rx.try_recv().is_err());
+    assert!(matches!(
+        sink.try_recv_from(&mut buf),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
     worker.abort();
     forwarder.abort();
+    let _ = worker.await;
+    let _ = forwarder.await;
     server.shutdown().await;
 }
