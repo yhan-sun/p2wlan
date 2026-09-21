@@ -646,7 +646,7 @@ fetch_relay_barrier_status_pair() {
   local request_timeout="$1"
   local a_meta="$ROUND_DIR/.barrier-a-fetch"
   local b_meta="$ROUND_DIR/.barrier-b-fetch"
-  local a_pid b_pid
+  local a_pid b_pid a_ok a_http a_reason b_ok b_http b_reason
 
   (
     local ok=0
@@ -674,16 +674,24 @@ fetch_relay_barrier_status_pair() {
   wait "$a_pid"
   wait "$b_pid"
 
-  mapfile -t barrier_a_meta <"$a_meta"
-  mapfile -t barrier_b_meta <"$b_meta"
+  {
+    IFS= read -r a_ok || a_ok=0
+    IFS= read -r a_http || a_http=000
+    IFS= read -r a_reason || a_reason=""
+  } <"$a_meta"
+  {
+    IFS= read -r b_ok || b_ok=0
+    IFS= read -r b_http || b_http=000
+    IFS= read -r b_reason || b_reason=""
+  } <"$b_meta"
   rm -f "$a_meta" "$b_meta"
 
-  BARRIER_FETCH_A_OK=${barrier_a_meta[0]:-0}
-  BARRIER_FETCH_A_HTTP=${barrier_a_meta[1]:-000}
-  BARRIER_FETCH_A_REASON=${barrier_a_meta[2]:-}
-  BARRIER_FETCH_B_OK=${barrier_b_meta[0]:-0}
-  BARRIER_FETCH_B_HTTP=${barrier_b_meta[1]:-000}
-  BARRIER_FETCH_B_REASON=${barrier_b_meta[2]:-}
+  BARRIER_FETCH_A_OK=${a_ok:-0}
+  BARRIER_FETCH_A_HTTP=${a_http:-000}
+  BARRIER_FETCH_A_REASON=${a_reason:-}
+  BARRIER_FETCH_B_OK=${b_ok:-0}
+  BARRIER_FETCH_B_HTTP=${b_http:-000}
+  BARRIER_FETCH_B_REASON=${b_reason:-}
 }
 
 # A topology run introduces no one-shot Relay owner tasks. Every supervised
