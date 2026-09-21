@@ -68,6 +68,15 @@ assert DIRECT_ORDER_SPEC.loader is not None
 DIRECT_ORDER = importlib.util.module_from_spec(DIRECT_ORDER_SPEC)
 DIRECT_ORDER_SPEC.loader.exec_module(DIRECT_ORDER)
 
+PORT_RESERVATION_PATH = Path(__file__).with_name("reserve_port_block.py")
+PORT_RESERVATION_SPEC = importlib.util.spec_from_file_location(
+    "p2wlan_nat_port_reservation", PORT_RESERVATION_PATH
+)
+assert PORT_RESERVATION_SPEC is not None
+assert PORT_RESERVATION_SPEC.loader is not None
+PORT_RESERVATION = importlib.util.module_from_spec(PORT_RESERVATION_SPEC)
+PORT_RESERVATION_SPEC.loader.exec_module(PORT_RESERVATION)
+
 
 class CaptureProtocol(asyncio.DatagramProtocol):
     def __init__(self):
@@ -84,6 +93,58 @@ def unused_udp_port():
         return probe.getsockname()[1]
     finally:
         probe.close()
+
+
+class PortReservationTests(unittest.TestCase):
+    @staticmethod
+    def free_two_slot_base():
+        relay_count = 2
+        stride = 10
+        for base in range(12000, 19000, stride * 2):
+            ports = PORT_RESERVATION.required_ports(base, relay_count)
+            ports += PORT_RESERVATION.required_ports(base + stride, relay_count)
+            if PORT_RESERVATION.ports_are_available(ports):
+                return base, stride, relay_count
+        raise AssertionError("no two-slot TCP port block available for allocator test")
+
+    def test_bound_port_is_skipped(self):
+        base, stride, relay_count = self.free_two_slot_base()
+        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupied.bind(("127.0.0.1", base))
+        occupied.listen(1)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                selected, reservation = PORT_RESERVATION.reserve_port_block(
+                    Path(directory), 0, relay_count, base, stride, 2
+                )
+                try:
+                    self.assertEqual(selected, base + stride)
+                finally:
+                    PORT_RESERVATION.release_port_block(reservation)
+        finally:
+            occupied.close()
+
+    def test_parallel_reservations_lock_every_required_port(self):
+        base, stride, relay_count = self.free_two_slot_base()
+        with tempfile.TemporaryDirectory() as directory:
+            lock_root = Path(directory)
+            first_port, first = PORT_RESERVATION.reserve_port_block(
+                lock_root, 0, relay_count, base, stride, 2
+            )
+            second_port, second = PORT_RESERVATION.reserve_port_block(
+                lock_root, 0, relay_count, base, stride, 2
+            )
+            try:
+                self.assertEqual(first_port, base)
+                self.assertEqual(second_port, base + stride)
+                first_locks = set((first / "port-locks").read_text().splitlines())
+                second_locks = set((second / "port-locks").read_text().splitlines())
+                self.assertTrue(first_locks)
+                self.assertTrue(second_locks)
+                self.assertTrue(first_locks.isdisjoint(second_locks))
+            finally:
+                PORT_RESERVATION.release_port_block(second)
+                PORT_RESERVATION.release_port_block(first)
 
 
 class StunEncodingTests(unittest.TestCase):

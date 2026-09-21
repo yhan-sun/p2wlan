@@ -459,15 +459,38 @@ impl UdpTransport {
         // an expectation after it has already been removed from the session
         // registry.
         let sessions = self.direct_validation.sessions.lock().await;
-        let active_owner = sessions.get(peer_id).is_some_and(|session| {
-            let target = *session.target_tx.borrow();
-            !target.cancelled
+        let active_target = sessions
+            .get(peer_id)
+            .map(|session| *session.target_tx.borrow());
+        let active_owner = if let Some(target) = active_target {
+            let same_owner = !target.cancelled
                 && target.generation == expectation.generation
                 && target.peer_session_generation == expectation.peer_session_generation
                 && target.remote_candidate_epoch == expectation.remote_candidate_epoch
-                && target.owner_token == expectation.owner_token
-                && expectation.endpoint == Some(target.endpoint)
-        });
+                && target.owner_token == expectation.owner_token;
+            let endpoint_compatible = if expectation.endpoint == Some(target.endpoint) {
+                true
+            } else if let Some(request_endpoint) = expectation.endpoint {
+                // The worker may snapshot a target immediately before a
+                // same-class observation updates the registry. The request
+                // still owns that old tuple; reject it only when the newer
+                // target is an on-link upgrade that deliberately supersedes
+                // lower-priority in-flight evidence.
+                !self
+                    .peers
+                    .is_direct_validation_target_on_link_upgrade(
+                        peer_id,
+                        request_endpoint,
+                        target.endpoint,
+                    )
+                    .await
+            } else {
+                false
+            };
+            same_owner && endpoint_compatible
+        } else {
+            false
+        };
         if !active_owner {
             return false;
         }

@@ -29,9 +29,26 @@ MODE=${MODE:-direct}
   NAT_SIM_RUST_LOG=${NAT_SIM_RUST_LOG:-info,p2pnet_daemon::transport=debug,p2pnet_daemon::network_outbound=debug,p2pnet_daemon::relay=debug,p2pnet_daemon::relay_runtime=debug,p2pnet_daemon::connection_timeline=debug,p2pnet_daemon::direct_validation=debug,p2pnet_daemon::peer::connection=debug,p2pnet_daemon::peer::connection::events=debug,p2pnet_daemon::peer::manager::relay=debug,p2pnet_relay::client=debug}
 ROUNDS=${ROUNDS:-5}
 NAT_SEED_BASE=${NAT_SEED_BASE:-20260806}
- # Avoid collisions between locally parallel/recent smoke invocations.  The
- # caller may still pin PORT/RELAY_PORT/RELAY_METRICS_PORT explicitly.
-PORT=${PORT:-$((38080 + ($$ % 1000) * 10))}
+# Number of relay candidates offered in the catalog. With RELAY_FAILOVER=1,
+# the ACTIVE relay is killed after the round's first confirmation and the
+# daemon must fail over to another candidate and re-confirm.
+RELAY_COUNT=${RELAY_COUNT:-1}
+# Avoid collisions between parallel smoke invocations and unrelated clients
+# using the Linux ephemeral range. The reservation helper atomically locks
+# every control/relay/metrics/diagnostics port and rejects ports that are
+# already bound. An explicit PORT keeps the caller-controlled behavior.
+PORT_LOCK_DIR=""
+if [[ -z "${PORT:-}" ]]; then
+  PORT_RESERVATION=$(python3 "$ROOT_DIR/scripts/nat-sim/reserve_port_block.py" \
+    --lock-root "${TMPDIR:-/tmp}/p2wlan-natsim-port-locks" \
+    --seed "$$" --relay-count "$RELAY_COUNT")
+  PORT=$(printf '%s\n' "$PORT_RESERVATION" | sed -n '1p')
+  PORT_LOCK_DIR=$(printf '%s\n' "$PORT_RESERVATION" | sed -n '2p')
+  if ! [[ "$PORT" =~ ^[0-9]+$ && -d "$PORT_LOCK_DIR" ]]; then
+    echo "[nat-sim] failed to parse reserved port block" >&2
+    exit 2
+  fi
+fi
 RELAY_PORT=${RELAY_PORT:-$((PORT + 1))}
 RELAY_METRICS_PORT=${RELAY_METRICS_PORT:-$((PORT + 1001))}
 DIAG_A_PORT=${DIAG_A_PORT:-$((PORT + 301))}
@@ -81,10 +98,6 @@ RELAY_DELAY_MS=${RELAY_DELAY_MS:-0}
 # Kill and restart the relay mid-round and require the overlay to recover
 # (relay disconnect/reconnect verification).
 RELAY_KILL_RESTART=${RELAY_KILL_RESTART:-0}
-# Number of relay candidates offered in the catalog.  With RELAY_FAILOVER=1,
-# the ACTIVE relay is killed after the round's first confirmation and the
-# daemon must fail over to another candidate and re-confirm.
-RELAY_COUNT=${RELAY_COUNT:-1}
 RELAY_FAILOVER=${RELAY_FAILOVER:-0}
 # Failure-injection hooks exercise the harness' own observability gate.  They
 # deliberately make a required endpoint unavailable or malformed; the smoke
@@ -833,12 +846,18 @@ stop_round_processes() {
 
 cleanup() {
   stop_round_processes
+  if [[ -n "$PORT_LOCK_DIR" ]]; then
+    python3 "$ROOT_DIR/scripts/nat-sim/reserve_port_block.py" \
+      --release "$PORT_LOCK_DIR" || true
+    PORT_LOCK_DIR=""
+  fi
   echo "[nat-sim] artifacts retained: $BASE_DIR" >&2
 }
 trap cleanup EXIT
 
 echo "[nat-sim] mode=$MODE isolated network id: $NETWORK_ID"
 echo "[nat-sim] exact_head_sha=${NAT_TOPOLOGY_HEAD_SHA:-unknown} replica=${NAT_TOPOLOGY_REPLICA:-1}"
+echo "[nat-sim] reserved control port base: $PORT"
 echo "[nat-sim] traversal flags: strict_filtering=$STRICT_FILTERING fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
 echo "[nat-sim] building control server, relay and daemon..."
 (

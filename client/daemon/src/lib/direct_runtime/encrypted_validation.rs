@@ -1157,13 +1157,22 @@ async fn run_direct_encrypted_validation_session(
                         stop_worker = true;
                         break;
                     }
-                    if current.endpoint != endpoint {
-                        // The target changed class while this request was in
-                        // flight (normally public -> LAN).  Withdraw the old
-                        // expectation before the ACK can promote the wrong
-                        // path, then let the outer bounded loop retry the
-                        // policy-preferred endpoint.  Same-class churn keeps
-                        // the old expectation valid until its normal timeout.
+                    if current.endpoint != endpoint
+                        && peers
+                            .is_direct_validation_target_on_link_upgrade(
+                                &peer_id,
+                                endpoint,
+                                current.endpoint,
+                            )
+                            .await
+                    {
+                        // Only a reachability-class upgrade (normally public
+                        // -> LAN) supersedes a request that is already on the
+                        // wire. Same-class endpoint churn merely selects the
+                        // destination for the next bounded attempt: clearing
+                        // the current expectation here would make a valid,
+                        // slightly delayed ACK race the next request id and
+                        // could starve Direct promotion indefinitely.
                         udp.clear_direct_validation_expectation_if_owned(&peer_id, owner_token)
                             .await;
                         record_validation_event(
