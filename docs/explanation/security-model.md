@@ -14,7 +14,7 @@
 - 遥测仅传输抽象路径类型（direct、relay、connecting、probing、fallback_relay、failed、none）、往返 RTT、握手代际围栏标识与迁移原因代码。
 - 绝不持久化或传输任何 IP 地址、端口、候选 endpoint、WireGuard 密钥、对称会话密钥或报文载荷。
 - Control 校验上报端设备的会话凭据（WebSocket 认证或设备 token）、设备所属权与网络归属，并通过五级代际围栏（`registration_seq` > `network_generation` > `peer_session_generation` > `remote_candidate_epoch` > `observation_revision`）防御陈旧、越权或重放的路径上报。
-- 只有持有 `CONTROL_ADMIN_TOKEN` 的管理员可通过只读 Admin Connections API 检索路径观测记录与受限历史迁移，普通节点不能任意拉取其他节点的路径观测。
+- 只有持有 `CONTROL_ADMIN_TOKEN` 的管理员可通过只读 Admin Connections API 检索路径观测记录、受限历史迁移和小时级趋势聚合，普通节点不能任意拉取其他节点的路径观测。趋势表只保存 network ID、小时 bucket、计数与 RTT histogram，不长期保存 peer/device ID、IP、endpoint、密钥或业务载荷。
 
 ## 运维边界
 

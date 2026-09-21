@@ -53,6 +53,14 @@ attention signal 是固定、可解释的条件：
 
 Needs attention 列表逐条显示服务端返回的固定 signal 和阈值相关计数。点击某一项会读取相同 `(network, reporting device, remote device)` 的最新 directional Connection，并打开与 Connections 工作区共用的只读详情 / transition timeline；Health UI 不维护第二份连接详情或路径状态。
 
+### Connection Trends
+
+`GET /admin/api/v1/connection-trends` 提供 1 小时粒度、最多 30 天的只读长期趋势基础数据。默认 `window_hours=24`，允许 1–720；可传 `network_id` 下钻单个 network，不传时按小时聚合所有 network。
+
+趋势字段包括 accepted committed-observation samples、Direct/Relay/no-path samples、真实 Direct↔Relay switch、显式 Direct/Relay failure，以及 validation RTT count/average/max、固定 histogram 和 p50/p95 histogram upper bound。这里的 observation samples 不是路径在线时长比例；duplicate/rejected、显式 resync 与新 registration owner 的首个重同步快照不制造趋势样本。p50/p95 也不是原始 RTT 明细计算出的精确分位数。超过 10 秒的 RTT 进入 overflow bucket，超过 24 小时的异常输入直接忽略；如果目标 percentile 落入 overflow，API 不返回虚假的数值上界。
+
+小时 rollup 每个 network 每小时只有一行并保留 720 小时；不会长期保存 peer/device 级事件明细。当前只提供趋势存储与 API，管理台尚不绘制长期趋势图。
+
 管理台与 Control 使用同一 origin，不需要额外 CORS 放行。公网访问必须继续经过可信 HTTPS 反向代理；浏览器中的管理员令牌按敏感凭据处理，用完后退出管理台并关闭共享终端中的会话。
 
 ## 日志与证书

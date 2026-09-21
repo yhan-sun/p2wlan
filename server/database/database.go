@@ -97,6 +97,11 @@ func New(path string) (*DB, error) {
 		return nil, fmt.Errorf("migrate path telemetry: %w", err)
 	}
 
+	if err := migrateConnectionMetrics(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate connection metrics: %w", err)
+	}
+
 	return &DB{db}, nil
 }
 
