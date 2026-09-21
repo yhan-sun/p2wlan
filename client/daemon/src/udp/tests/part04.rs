@@ -1045,6 +1045,13 @@ async fn exact_dynamic_socket_all_physical_failures_keep_target_progress() {
 #[tokio::test]
 async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends() {
     let (peers, transport, _nat) = generation_env().await;
+    let generation = peers.current_network_generation().await;
+    assert!(
+        peers
+            .confirm_relay_peer("peer-b", "tcp://relay.test:18081", generation)
+            .await
+    );
+
     let (socket_index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
     let handoff = transport
         .attach_dynamic_punch_socket("peer-b", socket_index, socket, 0, 1, None)
@@ -1079,9 +1086,23 @@ async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends()
     assert!(!peers.is_direct("peer-b").await);
     assert_eq!(
         peers.select_path_for_data("peer-b", true, true).await.path,
-        Some(NetworkPath::Relay),
-        "a detached exact Hard↔Hard socket must leave Relay as the data path"
+        None,
+        "losing a speculative socket cannot bypass the first Direct window"
     );
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let selection = peers.select_path_for_data("peer-b", true, true).await;
+            assert_ne!(selection.path, Some(NetworkPath::Direct));
+            if selection.path == Some(NetworkPath::Relay) {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("confirmed Relay must become usable after the bounded Direct window");
+    assert!(!peers.is_direct("peer-b").await);
+    assert_eq!(transport.dynamic_socket_count().await, 0);
 }
 
 #[tokio::test]
