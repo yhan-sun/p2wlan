@@ -1,0 +1,291 @@
+name: Direct-first business readiness regression
+
+on:
+  push:
+    branches: [feat/direct-first-nat-20260921]
+    paths: [.github/workflows/direct-first-readiness-regression.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/feat/direct-first-nat-20260921'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.apply.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt
+      - name: Apply exact state-machine and regression changes
+        id: apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = a0412dd2e6c3d13bdb2d0d6736f24e8d004184bb
+          python3 - <<'PY'
+          import pathlib, subprocess
+          expected = {
+              'client/daemon/src/peer/path_state_machine.rs': '04d97e5d4e97b94914cbe15a87d524d43866a9b3',
+              'client/daemon/src/peer/tests/direct_first.rs': '13705baed9b8b4d9274241046d5af73ee62a4857',
+          }
+          for path, blob in expected.items():
+              assert subprocess.check_output(['git', 'rev-parse', 'HEAD:' + path], text=True).strip() == blob
+          p = pathlib.Path('client/daemon/src/peer/path_state_machine.rs')
+          text = p.read_text()
+          old = '''        if previous_active.is_some() {
+                      if let Some(window) = next.direct_first.as_mut() {
+                          window.released = true;
+                      }
+                  }
+          '''
+          assert text.count(old) == 2
+          text = text.replace(old, '''        // Preserve the original admission deadline across epoch changes.
+                  // DirectCommitted can precede its managed business MTU budget;
+                  // only DirectFirstSatisfied (or the deadline) releases startup.
+          ''')
+          old = '        Self::set_projection_after_epoch_change(next, previous_active, epoch);'
+          assert text.count(old) == 2
+          text = text.replace(old, '''        if self.direct_first_pending() && matches!(next.active, ActiveBusinessPath::Relay(_)) {
+                      next.active = ActiveBusinessPath::Unavailable;
+                  }
+          ''' + old)
+          old = '''            // A failed established Direct path uses warm Relay immediately;
+                      // recovery must not replay a cold-start wait.
+                      if let Some(window) = next.direct_first.as_mut() {
+                          window.released = true;
+                      }
+                      let relay = next.relay.confirmed_identity().cloned();'''
+          assert text.count(old) == 1
+          text = text.replace(old, '''            // A business-ready Direct path has already satisfied startup and
+                      // falls back immediately. An ACK-only path whose MTU budget
+                      // never became usable must not turn a probe failure into an
+                      // early release of the connection's first Direct window.
+                      let relay = if self.direct_first_pending() {
+                          None
+                      } else {
+                          next.relay.confirmed_identity().cloned()
+                      };''')
+          old = '    fn state_is_valid(state: &PathState) -> bool {\n'
+          assert text.count(old) == 1
+          text = text.replace(old, old + '''        // Standby readiness is never first-business permission. Keep this
+                  // invariant in the authoritative reducer, not just its selector.
+                  if state.direct_first.is_some_and(|window| !window.released)
+                      && matches!(state.active, ActiveBusinessPath::Relay(_))
+                  {
+                      return false;
+                  }
+          ''')
+          p.write_text(text)
+          p = pathlib.Path('client/daemon/src/peer/tests/direct_first.rs')
+          text = p.read_text()
+          old = '''    commit(&mut machine, PathEvent::DirectCommitted { validation });
+              assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: epoch() }).accepted());'''
+          assert text.count(old) == 1
+          text = text.replace(old, '''    commit(&mut machine, PathEvent::DirectCommitted { validation });
+              assert!(commit(&mut machine, PathEvent::DirectFirstSatisfied { validation }).accepted());
+              assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: epoch() }).accepted());''')
+          assert 'fn acknowledged_before_business_budget' not in text
+          text += '''
+          fn acknowledged_before_business_budget(now: Instant) -> (PathStateMachine, DirectValidationIdentity) {
+              let mut machine = started(now);
+              confirm_relay(&mut machine);
+              let validation = DirectValidationIdentity::compatibility(
+                  epoch(), Some("198.51.100.1:40000".parse().unwrap()),
+              );
+              assert!(commit(&mut machine, PathEvent::DirectCommitted { validation }).accepted());
+              assert!(machine.direct_first_pending());
+              (machine, validation)
+          }
+
+          fn assert_original_direct_deadline(machine: &mut PathStateMachine, current: PathEpoch, now: Instant) {
+              assert!(machine.direct_first_pending());
+              assert_eq!(machine.active_path(), None);
+              assert!(commit(machine, PathEvent::DirectFirstDeadline {
+                  epoch: current, now: now + Duration::from_millis(4999),
+              }).accepted());
+              assert!(machine.direct_first_pending());
+              assert_eq!(machine.active_path(), None);
+              assert!(commit(machine, PathEvent::DirectFirstDeadline {
+                  epoch: current, now: now + Duration::from_secs(5),
+              }).accepted());
+              assert!(!machine.direct_first_pending());
+              assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
+          }
+
+          #[test]
+          fn direct_first_ack_only_candidate_refresh_cannot_release_business_protection() {
+              for continuity in [DirectCandidateContinuity::Invalidate, DirectCandidateContinuity::RetainCommitted] {
+                  let now = Instant::now();
+                  let (mut machine, old_validation) = acknowledged_before_business_budget(now);
+                  let refreshed = PathEpoch { remote_candidate_epoch: 2, ..epoch() };
+                  assert!(commit(&mut machine, PathEvent::RemoteCandidateEpochAdvanced {
+                      epoch: refreshed, direct: continuity,
+                  }).accepted());
+                  assert!(machine.direct_first_pending());
+                  assert!(!commit(&mut machine, PathEvent::DirectFirstSatisfied {
+                      validation: old_validation,
+                  }).accepted());
+                  assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: refreshed }).accepted());
+                  assert_original_direct_deadline(&mut machine, refreshed, now);
+              }
+          }
+
+          #[test]
+          fn direct_first_ack_only_network_change_cannot_release_business_protection() {
+              use crate::peer::path_state_machine::PathRetention;
+              for retained in [PathRetention::Relay, PathRetention::DirectAndRelay] {
+                  let now = Instant::now();
+                  let (mut machine, old_validation) = acknowledged_before_business_budget(now);
+                  let refreshed = PathEpoch { network_generation: 2, ..epoch() };
+                  assert!(commit(&mut machine, PathEvent::NetworkGenerationAdvanced {
+                      epoch: refreshed, retained,
+                  }).accepted());
+                  assert!(machine.direct_first_pending());
+                  assert!(!commit(&mut machine, PathEvent::DirectFirstSatisfied {
+                      validation: old_validation,
+                  }).accepted());
+                  assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: refreshed }).accepted());
+                  assert_original_direct_deadline(&mut machine, refreshed, now);
+              }
+          }
+
+          #[test]
+          fn direct_first_ack_only_failure_does_not_masquerade_as_established_path_failure() {
+              let now = Instant::now();
+              let (mut machine, _) = acknowledged_before_business_budget(now);
+              assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: epoch() }).accepted());
+              assert_original_direct_deadline(&mut machine, epoch(), now);
+          }
+
+          #[test]
+          fn direct_first_business_ready_candidate_refresh_never_restarts_cold_wait() {
+              for continuity in [DirectCandidateContinuity::Invalidate, DirectCandidateContinuity::RetainCommitted] {
+                  let (mut machine, validation) = acknowledged_before_business_budget(Instant::now());
+                  assert!(commit(&mut machine, PathEvent::DirectFirstSatisfied { validation }).accepted());
+                  let refreshed = PathEpoch { remote_candidate_epoch: 2, ..epoch() };
+                  assert!(commit(&mut machine, PathEvent::RemoteCandidateEpochAdvanced {
+                      epoch: refreshed, direct: continuity,
+                  }).accepted());
+                  assert!(!machine.direct_first_pending());
+                  assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: refreshed }).accepted());
+                  assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
+              }
+          }
+
+          #[test]
+          fn direct_first_business_ready_network_change_never_restarts_cold_wait() {
+              use crate::peer::path_state_machine::PathRetention;
+              for retained in [PathRetention::Relay, PathRetention::DirectAndRelay] {
+                  let (mut machine, validation) = acknowledged_before_business_budget(Instant::now());
+                  assert!(commit(&mut machine, PathEvent::DirectFirstSatisfied { validation }).accepted());
+                  let refreshed = PathEpoch { network_generation: 2, ..epoch() };
+                  assert!(commit(&mut machine, PathEvent::NetworkGenerationAdvanced {
+                      epoch: refreshed, retained,
+                  }).accepted());
+                  assert!(!machine.direct_first_pending());
+                  assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: refreshed }).accepted());
+                  assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
+              }
+          }
+          '''
+          p.write_text(text)
+          for path in expected:
+              subprocess.run(['rustfmt', '--edition', '2021', '--config', 'skip_children=true', path], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          pathlib.Path('.github/workflows/direct-first-readiness-regression.yml').unlink()
+          subprocess.run(['git', 'add', '--', *expected, '.github/workflows/direct-first-readiness-regression.yml'], check=True)
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat:保持未就绪Direct在代次刷新和路径失败后的首次保护'
+          cat > "$RUNNER_TEMP/p2wlan-askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$RUNNER_TEMP/p2wlan-askpass"
+          GIT_ASKPASS="$RUNNER_TEMP/p2wlan-askpass" GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/feat/direct-first-nat-20260921
+          rm "$RUNNER_TEMP/p2wlan-askpass"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: apply
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.apply.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Record exact source and compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/SOURCE_COMMIT
+          cargo test --locked -p p2wlan-daemon --lib --no-run --message-format=json > evidence/build.jsonl 2> evidence/build.stderr
+      - name: DirectFirst and NAT boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/quality/run_rust_tests.py direct_first --each | tee evidence/direct-first.log
+          python3 scripts/quality/run_rust_tests.py relay_availability_does_not_cancel_punch_generation --each | tee evidence/relay-standby.log
+          python3 scripts/quality/run_rust_tests.py destination_budget --each | tee evidence/destination-budget.log
+          cargo test --locked -p p2pnet-nat | tee evidence/nat.log
+          cargo test --locked -p p2wlan-cli | tee evidence/cli.log
+      - name: Repository contracts
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            cargo fmt --all --check
+            python3 scripts/quality/check_include_format.py
+            python3 scripts/docs/verify_repository.py
+            python3 scripts/quality/check_code_health.py --base-ref origin/main
+            python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
+            bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
+            cargo clippy --locked -p p2wlan-daemon -p p2pnet-nat -p p2wlan-cli --all-targets -- -D warnings
+          } 2>&1 | tee evidence/contracts.log
+      - name: General daemon regressions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 900 cargo test --locked -p p2wlan-daemon --lib -- --test-threads=1 --skip hard_hard_ | tee evidence/daemon-general.log
+      - name: Isolated HardHard regressions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 900 python3 scripts/quality/run_rust_tests.py hard_hard_ --each | tee evidence/hard-hard.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: direct-first-readiness-${{ needs.apply.outputs.source_sha }}
+          path: evidence/
+          retention-days: 7
+          if-no-files-found: warn
