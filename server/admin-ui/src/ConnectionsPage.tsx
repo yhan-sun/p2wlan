@@ -7,6 +7,7 @@ import {
 } from '@tanstack/react-table'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import {
+  AlertTriangle,
   ArrowDownRight,
   ChevronLeft,
   ChevronRight,
@@ -18,6 +19,7 @@ import {
   Waypoints,
   X,
 } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { adminApi } from './api'
 import { ConnectionTopology } from './ConnectionTopology'
 import type { AdminConnection, AdminConnectionTransition } from './types'
@@ -290,9 +292,12 @@ export function ConnectionsPage() {
   return <div className="page-stack connections-page">
     <div className="page-intro connections-intro">
       <div><h2>Connections</h2><p>路径只来自 daemon 已提交的权威单向观测；Fresh 表示观测仍在有效 lease 内，不代表目标应用本身一定可达。</p></div>
-      <div className="connections-view-switch" role="group" aria-label="连接视图">
-        <button className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}><Table2 size={15} />列表</button>
-        <button className={view === 'topology' ? 'active' : ''} onClick={() => setView('topology')}><Waypoints size={15} />Live topology</button>
+      <div className="connections-intro-actions">
+        <Link className="button secondary compact" to="/health"><AlertTriangle size={15} />Needs attention</Link>
+        <div className="connections-view-switch" role="group" aria-label="连接视图">
+          <button className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}><Table2 size={15} />列表</button>
+          <button className={view === 'topology' ? 'active' : ''} onClick={() => setView('topology')}><Waypoints size={15} />Live topology</button>
+        </div>
       </div>
     </div>
 
