@@ -157,9 +157,11 @@ async fn run_direct_first_queued_business_case(establish_direct: bool) {
     // ciphertext has now left the outbound owner and been decrypted here.
     // Recovery must not replay the first-connection preference window.
     assert!(started.elapsed() < crate::peer::DIRECT_FIRST_WINDOW);
-    assert!(peers
-        .is_relay_business_admitted_for_generation("node-b", generation)
-        .await);
+    assert!(
+        peers
+            .is_relay_business_admitted_for_generation("node-b", generation)
+            .await
+    );
     peers
         .record_direct_failure("node-b", "established Direct recovery regression")
         .await;
