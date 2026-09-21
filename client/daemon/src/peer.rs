@@ -543,6 +543,7 @@ pub const REASON_PATH_DIRECT_CONFIRMED: &str = "path_direct_confirmed";
 /// Path selector kept an encrypted-confirmed Direct pair under the
 /// `direct-sticky` policy.
 pub const REASON_PATH_DIRECT_STICKY: &str = "path_direct_sticky";
+pub const REASON_PATH_DIRECT_FIRST_WAIT: &str = "path_direct_first_wait";
 /// Path selector selected Direct because the configured score policy ranked
 /// it at least as well as the confirmed Relay path.
 pub const REASON_PATH_SCORE_DIRECT: &str = "path_score_direct";
@@ -662,7 +663,7 @@ pub(crate) use path_state_machine::{
     ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,
     PathEpoch, PathEvent, PathRetention, PathStateMachine, PathStateMachineSnapshot,
     PathTransitionOutcome, PeerPathLifecycle, RelayBusinessObservation, RelayConnectionIdentity,
-    RelayHealthObservationIdentity,
+    RelayHealthObservationIdentity, DIRECT_FIRST_WINDOW,
 };
 
 include!("peer/connection/core.rs");

@@ -327,6 +327,9 @@ impl PeerManager {
                     PathEvent::PeerLeft { epoch }
                 };
                 conn.commit_path_transition(event, |_| {});
+                if conn.online {
+                    conn.start_direct_first(epoch, self.config.relay.effective_path_policy(true));
+                }
             } else {
                 warn!(
                     "Peer lifecycle generation exhausted while resetting remote incarnation for {node_id}; authentication disabled"

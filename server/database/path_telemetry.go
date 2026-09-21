@@ -10,9 +10,9 @@ import (
 )
 
 const (
-	PathTelemetrySchemaVersion       = 1
-	MaxTransitionsPerPair            = 50
-	MaxPathTelemetryValidationRTTMS  = 24 * 60 * 60 * 1000
+	PathTelemetrySchemaVersion      = 1
+	MaxTransitionsPerPair           = 50
+	MaxPathTelemetryValidationRTTMS = 24 * 60 * 60 * 1000
 )
 
 var (
@@ -64,6 +64,9 @@ type PathTelemetryIngestSummary struct {
 var validTransitionReasons = map[string]struct{}{
 	"initial":                         {},
 	"peer_online":                     {},
+	"direct_first_started":            {},
+	"direct_first_satisfied":          true,
+	"direct_first_deadline":           {},
 	"peer_left":                       {},
 	"identity_reset":                  {},
 	"network_generation_advanced":     {},

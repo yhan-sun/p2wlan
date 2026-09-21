@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use p2pnet_nat::{
     build_authenticated_punch_ack, build_authenticated_punch_packet_with_nomination,

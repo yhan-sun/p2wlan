@@ -278,6 +278,38 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
+    fn start_direct_first(&mut self, epoch: PathEpoch, policy: crate::config::PathPolicy) {
+        if policy == crate::config::PathPolicy::DirectFirst
+            && !self.path_state_machine.direct_first_configured()
+        {
+            self.commit_path_transition(
+                PathEvent::DirectFirstStarted {
+                    epoch,
+                    now: Instant::now(),
+                },
+                |_| {},
+            );
+        }
+    }
+
+    fn advance_direct_first_deadline(&mut self, generation: u64) {
+        let now = Instant::now();
+        if !self.path_state_machine.direct_first_deadline_due(now) {
+            return;
+        }
+        if let Some(epoch) = self
+            .path_state_machine
+            .current_epoch()
+            .filter(|epoch| epoch.network_generation == generation)
+        {
+            self.commit_path_transition(PathEvent::DirectFirstDeadline { epoch, now }, |_| {});
+        }
+    }
+
+    fn direct_first_pending(&self) -> bool {
+        self.path_state_machine.direct_first_pending()
+    }
+
     pub(crate) fn remote_candidate_epoch(&self) -> u64 {
         self.remote_candidate_epoch
     }

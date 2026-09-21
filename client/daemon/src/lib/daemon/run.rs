@@ -334,17 +334,12 @@ impl Daemon {
         let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
         let punch_attempts = self.config.network.punch_attempts;
 
-        let relay_startup_wait = if relay_candidates_present {
-            RelayStartupWait {
-                timeout: Some(Duration::from_millis(
-                    self.config.relay.relay_startup_timeout_ms.max(1),
-                )),
-            }
-        } else {
-            // No relay candidates are configured or expected: the first packet
-            // degrades to direct-only immediately with a stable reason code
-            // instead of waiting for a relay that will never start.
-            RelayStartupWait { timeout: None }
+        let relay_startup_wait = RelayStartupWait {
+            relay_expected: relay_candidates_present,
+            timeout: self
+                .config
+                .relay
+                .startup_wait_timeout(relay_candidates_present),
         };
         let relay_available_rx = self.relay_available_tx.subscribe();
         // Kick signal for the forced-relay probe loop: bumped by the outbound

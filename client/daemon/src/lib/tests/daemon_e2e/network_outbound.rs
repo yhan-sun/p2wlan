@@ -8,9 +8,11 @@ async fn test_network_outbound_relay_ignores_missing_direct_business_budget_when
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
             node_id: "node-b".to_string(),
@@ -67,6 +69,7 @@ async fn test_network_outbound_relay_ignores_missing_direct_business_budget_when
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(500)),
         },
         relay_probe_kick_tx,
@@ -121,9 +124,11 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
     let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = direct_sink.local_addr().unwrap();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
             node_id: "node-b".to_string(),
@@ -178,6 +183,7 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(500)),
         },
         relay_probe_kick_tx,
@@ -298,6 +304,7 @@ async fn test_network_outbound_promotes_direct_before_relay_slot_is_published() 
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -1342,6 +1349,7 @@ async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_deliver
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(200)),
         },
         relay_probe_kick_tx,
@@ -1452,7 +1460,10 @@ async fn test_network_outbound_direct_only_degrades_immediately_with_stable_reas
         udp_transport,
         relay_transport,
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));
@@ -1557,6 +1568,7 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -1666,6 +1678,7 @@ async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() 
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(200)),
         },
         relay_probe_kick_tx,
@@ -1782,6 +1795,7 @@ async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_neve
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(4)),
         },
         relay_probe_kick_tx,
@@ -1889,6 +1903,7 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(150)),
         },
         relay_probe_kick_tx,
@@ -2219,6 +2234,7 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -2401,6 +2417,7 @@ async fn run_burst_confirmation_replay_test(count: usize) {
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(5)),
         },
         relay_probe_kick_tx,
@@ -2596,6 +2613,7 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -2751,6 +2769,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(30)),
         },
         relay_probe_kick_tx,
@@ -2928,6 +2947,7 @@ async fn test_network_outbound_worker_shutdown_counts_parked_packets() {
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(30)),
         },
         relay_probe_kick_tx,

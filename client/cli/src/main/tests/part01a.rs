@@ -535,7 +535,11 @@ fn path_policy_updates_direct_selection_mode() {
     assert_eq!(config.relay.path_policy, PathPolicy::RelayOnly);
     set_config_value(&mut config, "prefer-direct", "on").unwrap();
     assert!(config.relay.prefer_direct);
-    assert_eq!(config.relay.path_policy, PathPolicy::Auto);
+    assert_eq!(config.relay.path_policy, PathPolicy::DirectFirst);
+    set_config_value(&mut config, "path-policy", "direct-first").unwrap();
+    assert_eq!(config.relay.path_policy, PathPolicy::DirectFirst);
+    set_config_value(&mut config, "relay-policy", "direct").unwrap();
+    assert_eq!(config.relay.path_policy, PathPolicy::DirectFirst);
 }
 
 #[test]

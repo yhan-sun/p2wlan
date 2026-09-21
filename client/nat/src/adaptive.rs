@@ -78,7 +78,7 @@ pub struct StepLearner {
     diffs: VecDeque<i16>,
     /// Current fused estimate (signed), or `None` before any observation.
     estimate: Option<i16>,
-    /// Running maximum of the diff-channel mode coverage (0.0..=1.0).
+    /// Recent diff-channel mode coverage (0.0..=1.0).
     confidence: f64,
     /// Number of times the fused estimate changed (learning trajectory).
     revision_count: u32,
@@ -143,11 +143,11 @@ impl StepLearner {
         self.recompute(Some(coverage));
     }
 
-    /// Fold one peer-advertised stride value.  Non-positive values are
-    /// ignored.  The advertised channel is the authoritative one, so it is
-    /// EWMA-smoothed with the higher `ALPHA_ADVERT` weight.
+    /// Fold one signed advertised stride. Zero conveys no allocation step.
+    /// Callers own source authentication and allocator-range validation; the
+    /// public i16 API preserves both directions, including reverse allocation.
     pub fn observe_advertised(&mut self, step: i16) {
-        if step <= 0 {
+        if step == 0 {
             return;
         }
         let smoothed = match self.advert_est {
@@ -165,7 +165,7 @@ impl StepLearner {
         self.estimate
     }
 
-    /// Confidence in the estimate: the running maximum diff-channel mode
+    /// Confidence in the estimate: the recent diff-channel mode
     /// coverage, in `0.0..=1.0`.
     pub fn confidence(&self) -> f64 {
         self.confidence
@@ -216,7 +216,9 @@ impl StepLearner {
         }
         self.estimate = Some(new);
         if let Some(cov) = diff_cov {
-            self.confidence = self.confidence.max(cov).min(1.0);
+            // Coverage describes the current bounded window, not its best
+            // historical fit and not a calibrated traversal probability.
+            self.confidence = cov.clamp(0.0, 1.0);
         }
     }
 }
@@ -452,16 +454,15 @@ mod tests {
     }
 
     #[test]
-    fn nonpositive_advertised_is_ignored() {
+    fn zero_advertised_is_ignored() {
         let mut learner = StepLearner::new();
         learner.observe_advertised(5);
         let before = (learner.estimate(), learner.revision_count());
         learner.observe_advertised(0);
-        learner.observe_advertised(-1);
         assert_eq!(
             (learner.estimate(), learner.revision_count()),
             before,
-            "zero/negative advertised steps must not touch the estimate"
+            "zero advertised steps must not touch the estimate"
         );
     }
 

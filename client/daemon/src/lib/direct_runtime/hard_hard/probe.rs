@@ -198,11 +198,8 @@ fn hard_hard_measurement_payload(
                 crate::candidate_refresh::normalize_signal_candidates_with_counts(
                     &candidates,
                     &sources,
-                    result
-                        .predicted_ports
-                        .len()
-                        .min(HARD_HARD_MAX_PREDICTION_TARGETS),
-                    candidates.len(),
+                    result.predicted_ports.len(),
+                    result.predicted_ports.len(),
                 );
             (!candidates.is_empty()).then_some(HardHardMeasurementPayload {
                 candidates,
@@ -263,13 +260,15 @@ async fn record_hard_hard_candidate_contract(
             Some(contract.signaled_candidate_count),
             None,
             format!(
-                "requested_candidate_count={} generated_candidate_count={} deduplicated_candidate_count={} signaled_candidate_count={} cap={} capped={} candidate_source_count={} reason={} signaling_result={}",
+                "requested_candidate_count={} generated_candidate_count={} deduplicated_candidate_count={} signaled_candidate_count={} cap={} capped={} input_candidate_count={} pre_normalization_reduced_count={} candidate_source_count={} reason={} signaling_result={}",
                 contract.requested_candidate_count,
                 contract.generated_candidate_count,
                 contract.deduplicated_candidate_count,
                 contract.signaled_candidate_count,
                 contract.cap,
                 contract.capped,
+                contract.input_candidate_count,
+                contract.pre_normalization_reduced_count,
                 contract.candidate_source_count,
                 contract.reason,
                 if signaling_accepted { "accepted" } else { "failed" },

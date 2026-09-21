@@ -181,6 +181,7 @@ pub(super) async fn start_handshake_control_capture() -> HandshakeControlCapture
 }
 
 mod control_event_contention;
+mod direct_first;
 mod handshake_arbiter;
 mod handshake_contention;
 mod incarnation_fencing;

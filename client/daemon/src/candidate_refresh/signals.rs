@@ -210,6 +210,10 @@ pub(super) fn candidate_endpoints_from_report(
 pub(crate) struct SignalCandidateContract {
     pub(crate) requested_candidate_count: usize,
     pub(crate) generated_candidate_count: usize,
+    /// Count actually received by this boundary, after caller-side pruning.
+    pub(crate) input_candidate_count: usize,
+    /// Reduction before this normalizer; not necessarily a wire-size limit.
+    pub(crate) pre_normalization_reduced_count: usize,
     pub(crate) deduplicated_candidate_count: usize,
     pub(crate) signaled_candidate_count: usize,
     pub(crate) cap: usize,
@@ -281,6 +285,8 @@ pub(crate) fn normalize_signal_candidates_with_counts(
     let contract = SignalCandidateContract {
         requested_candidate_count,
         generated_candidate_count,
+        input_candidate_count: candidates.len(),
+        pre_normalization_reduced_count: generated_candidate_count.saturating_sub(candidates.len()),
         deduplicated_candidate_count,
         signaled_candidate_count: normalized_candidates.len(),
         cap: MAX_SIGNAL_CANDIDATES,

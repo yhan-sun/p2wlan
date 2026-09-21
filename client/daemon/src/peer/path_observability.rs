@@ -437,7 +437,10 @@ impl PathObservabilityState {
 
     fn record_applied_event(&mut self, event: &PathEvent, now: Instant) {
         match event {
-            PathEvent::PeerOnline { .. } => {}
+            PathEvent::PeerOnline { .. }
+            | PathEvent::DirectFirstStarted { .. }
+            | PathEvent::DirectFirstDeadline { .. }
+            | PathEvent::DirectFirstSatisfied { .. } => {}
             PathEvent::PeerLeft { .. } | PathEvent::IdentityReset => {
                 self.metrics.lifecycle_resets = self.metrics.lifecycle_resets.saturating_add(1);
                 self.direct_attempt_started = None;
@@ -605,6 +608,9 @@ fn latest_candidate_punch(
 
 fn event_kind(event: &PathEvent) -> &'static str {
     match event {
+        PathEvent::DirectFirstStarted { .. } => "direct_first_started",
+        PathEvent::DirectFirstDeadline { .. } => "direct_first_deadline",
+        PathEvent::DirectFirstSatisfied { .. } => "direct_first_satisfied",
         PathEvent::PeerOnline { .. } => "peer_online",
         PathEvent::PeerLeft { .. } => "peer_left",
         PathEvent::IdentityReset => "identity_reset",

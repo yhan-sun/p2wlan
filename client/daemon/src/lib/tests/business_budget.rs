@@ -472,7 +472,10 @@ async fn direct_business_budget_production_path_e2e() {
         udp_slot.clone(),
         relay_slot,
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));
@@ -869,7 +872,10 @@ async fn direct_business_would_block_is_paced_deadline_bounded_and_peer_isolated
         Arc::new(RwLock::new(Some(udp.clone()))),
         Arc::new(RwLock::new(None)),
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));
@@ -1113,7 +1119,10 @@ async fn direct_business_ipv6_budget_floor_is_fail_closed_without_invalid_ptb() 
         Arc::new(RwLock::new(Some(udp.clone()))),
         Arc::new(RwLock::new(None)),
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));
@@ -1249,9 +1258,13 @@ async fn direct_business_commit_keeps_confirmed_relay_carrier_until_budget_confi
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // Explicit legacy carrier policy; Direct-first has a separate
+        // wire-level no-Relay-prelude regression.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = receiver.local_addr().unwrap();
     peers
@@ -1318,7 +1331,10 @@ async fn direct_business_commit_keeps_confirmed_relay_carrier_until_budget_confi
         Arc::new(RwLock::new(Some(udp.clone()))),
         Arc::new(RwLock::new(Some(relay_a))),
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));
@@ -1428,9 +1444,13 @@ async fn relay_carries_business_when_direct_validation_completes_after_ingress()
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // Explicit legacy carrier policy; Direct-first has a separate
+        // wire-level no-Relay-prelude regression.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = receiver.local_addr().unwrap();
     peers
@@ -1479,7 +1499,10 @@ async fn relay_carries_business_when_direct_validation_completes_after_ingress()
         Arc::new(RwLock::new(Some(udp.clone()))),
         Arc::new(RwLock::new(Some(relay_a))),
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));
@@ -1660,7 +1683,10 @@ async fn direct_budget_invalidation_falls_back_to_confirmed_relay_without_pendin
         Arc::new(RwLock::new(Some(udp.clone()))),
         Arc::new(RwLock::new(Some(relay_a))),
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));

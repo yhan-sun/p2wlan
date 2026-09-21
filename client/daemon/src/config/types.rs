@@ -409,22 +409,14 @@ pub struct RelayConfig {
     /// Whether to prefer direct P2P over relay.
     #[serde(default = "default_true")]
     pub prefer_direct: bool,
-    /// Data-path selection policy. `auto` preserves the relay-first safety
-    /// behavior, `score` compares encrypted-confirmed paths, and
-    /// `direct-sticky` keeps a healthy encrypted-confirmed Direct path after
-    /// the startup relay-first gate until a hard liveness failure.
-    /// `relay-only` is the explicit Relay fallback.
+    /// `direct-first` is the default: reserve a bounded initial Direct window,
+    /// then keep healthy authenticated Direct sticky. Explicit `auto`, `score`,
+    /// `direct-sticky` and `relay-only` retain their existing compatibility rules.
     #[serde(default)]
     pub path_policy: PathPolicy,
-    /// Bounded time the first business packet waits for a relay transport to
-    /// become available before it is dropped with a stable diagnostic reason.
-    ///
-    /// This replaces the old, never-enforced `fallback_timeout_ms` ("timeout
-    /// for direct connection attempt before falling back to relay").  Relay is
-    /// never deliberately delayed by this value: once a relay transport is
-    /// connected, outbound packets use it immediately.  Old configs that still
-    /// carry `fallback_timeout_ms` are read as this field (backward-compatible
-    /// parse), and the field is serialized under the new name.
+    /// Additional bounded queue wait for Relay availability. Direct-first adds
+    /// its initial window; this value alone never authorizes an unconfirmed path.
+    /// `fallback_timeout_ms` remains a read alias for older configuration files.
     #[serde(default = "default_relay_timeout", alias = "fallback_timeout_ms")]
     pub relay_startup_timeout_ms: u64,
     /// Whether to allow insecure plaintext TCP to relay (default: false, development only).
@@ -443,8 +435,11 @@ pub struct RelayConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PathPolicy {
-    /// Relay-first safety gate plus the existing Direct quality fallback.
+    /// Bounded initial Direct attempt, followed by sticky authenticated Direct.
+    /// Relay may be prepared concurrently but cannot carry first business early.
     #[default]
+    DirectFirst,
+    /// Legacy immediate Relay fallback plus the existing Direct quality policy.
     Auto,
     /// Select between encrypted-confirmed Direct and peer-confirmed Relay by
     /// their explainable health scores, with hysteresis.
@@ -459,6 +454,7 @@ pub enum PathPolicy {
 impl PathPolicy {
     pub fn as_label(self) -> &'static str {
         match self {
+            Self::DirectFirst => "direct-first",
             Self::Auto => "auto",
             Self::Score => "score",
             Self::DirectSticky => "direct-sticky",
@@ -468,6 +464,25 @@ impl PathPolicy {
 }
 
 impl RelayConfig {
+    /// Overall first-packet queue budget. Keep the Direct protection window
+    /// separate from Relay availability; no Relay must still allow Direct setup.
+    pub(crate) fn startup_wait_timeout(&self, relay_expected: bool) -> Option<std::time::Duration> {
+        let relay =
+            std::time::Duration::from_millis(self.relay_startup_timeout_ms.clamp(1, 60_000));
+        if self.effective_path_policy(true) == PathPolicy::DirectFirst {
+            Some(
+                crate::peer::DIRECT_FIRST_WINDOW
+                    + if relay_expected {
+                        relay
+                    } else {
+                        std::time::Duration::ZERO
+                    },
+            )
+        } else {
+            relay_expected.then_some(relay)
+        }
+    }
+
     /// Resolve the effective policy while preserving the meaning of the
     /// legacy `prefer_direct=false` field in old configuration files.
     pub fn effective_path_policy(&self, prefer_direct_override: bool) -> PathPolicy {
