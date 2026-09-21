@@ -125,7 +125,7 @@ function TransitionRow({ transition }: { transition: AdminConnectionTransition }
   </div>
 }
 
-function ConnectionDrawer({
+export function ConnectionDrawer({
   connection,
   onClose,
 }: {
