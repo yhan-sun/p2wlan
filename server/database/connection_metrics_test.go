@@ -63,12 +63,20 @@ func TestConnectionMetricsRollupFollowsAcceptedTelemetry(t *testing.T) {
 		t.Fatalf("second telemetry: summary=%+v err=%v", secondSummary, err)
 	}
 
-	// A new registration owner may replay the same latest snapshot during full
-	// resync. It refreshes authoritative latest state but must not become a
-	// new long-term trend sample.
-	resyncSummary, err := db.RecordPathObservations(devAID, netID, 2, []PathObservation{second}, true)
+	// A new registration owner may replay the same latest snapshot after
+	// takeover. Current Rust wire does not mark mark_all_dirty() payloads with
+	// is_resync, so owner advancement itself fences the long-term trend sample.
+	resyncSummary, err := db.RecordPathObservations(devAID, netID, 2, []PathObservation{second}, false)
 	if err != nil || resyncSummary.Accepted != 1 {
-		t.Fatalf("resync telemetry: summary=%+v err=%v", resyncSummary, err)
+		t.Fatalf("owner-advance resync telemetry: summary=%+v err=%v", resyncSummary, err)
+	}
+
+	// An explicit resync marker remains excluded too.
+	explicitResync := second
+	explicitResync.ObservationRevision = 3
+	explicitSummary, err := db.RecordPathObservations(devAID, netID, 2, []PathObservation{explicitResync}, true)
+	if err != nil || explicitSummary.Accepted != 1 {
+		t.Fatalf("explicit resync telemetry: summary=%+v err=%v", explicitSummary, err)
 	}
 
 	trends, err := db.AdminConnectionTrends(AdminConnectionTrendsFilter{NetworkID: netID, WindowHours: 1})
