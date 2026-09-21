@@ -1,0 +1,150 @@
+name: Direct-first compatibility verification
+
+on:
+  push:
+    branches: [feat/direct-first-nat-20260921]
+    paths: [.github/workflows/direct-first-compat.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/feat/direct-first-nat-20260921'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.apply.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Apply exact compatibility regression patch
+        id: apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, lzma, pathlib, re, subprocess
+          encoded = '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'
+          patch = lzma.decompress(base64.b64decode(encoded, validate=True), memlimit=134217728)
+          assert len(patch) == 14548
+          assert hashlib.sha256(patch).hexdigest() == 'f44ce71ae4b215cf1af6e145f5048362cf13cf24358dc401614fcab233cdd9d4'
+          sections = re.split(r'(?m)^diff --git ', patch.decode())[1:]
+          assert len(sections) == 10
+          for section in sections:
+              match = re.fullmatch(r'a/(\S+) b/(\S+)', section.splitlines()[0])
+              assert match and match[1] == match[2]
+              path = match[1]
+              assert path.startswith('client/') and '..' not in path.split('/')
+              before = re.search(r'(?m)^index ([a-f0-9]{40})\.\.([a-f0-9]{40})', section)
+              assert before
+              assert subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip() == before[1]
+          target = pathlib.Path('/tmp/direct-first-compat.patch')
+          target.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--unidiff-zero', '--index', str(target)], check=True)
+          subprocess.run(['git', 'apply', '--unidiff-zero', '--index', str(target)], check=True)
+          for section in sections:
+              path = re.fullmatch(r'a/(\S+) b/(\S+)', section.splitlines()[0])[1]
+              expected = re.search(r'(?m)^index [a-f0-9]{40}\.\.([a-f0-9]{40})', section)[1]
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == expected
+          PY
+          git rm .github/workflows/direct-first-compat.yml
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat:补齐直连优先与旧策略兼容回归'
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/feat/direct-first-nat-20260921
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  verify:
+    needs: apply
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.apply.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          components: rustfmt, clippy
+      - name: Compile exact test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/SOURCE_COMMIT
+          cargo test --locked -p p2wlan-daemon --lib --no-run --message-format=json > evidence/build.jsonl 2> evidence/build.stderr
+          python3 - <<'PY'
+          import hashlib, importlib.util, json, pathlib, shutil
+          spec = importlib.util.spec_from_file_location('runner', 'scripts/quality/run_rust_tests.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          binaries = module.test_executables([json.loads(line) for line in pathlib.Path('evidence/build.jsonl').read_text().splitlines()])
+          assert len(binaries) == 1
+          out = pathlib.Path('evidence/daemon-tests')
+          shutil.copy2(binaries.pop(), out)
+          pathlib.Path('evidence/daemon-tests.sha256').write_text(hashlib.sha256(out.read_bytes()).hexdigest() + '  daemon-tests\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: direct-first-test-binary-${{ needs.apply.outputs.source_sha }}
+          path: |
+            evidence/daemon-tests
+            evidence/daemon-tests.sha256
+            evidence/SOURCE_COMMIT
+          retention-days: 1
+          if-no-files-found: error
+      - name: Focused and NAT regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/quality/run_rust_tests.py direct_first --each | tee evidence/direct-first.log
+          python3 scripts/quality/run_rust_tests.py destination_budget --each | tee evidence/destination-budget.log
+          cargo test --locked -p p2pnet-nat | tee evidence/nat.log
+          cargo test --locked -p p2wlan-cli | tee evidence/cli.log
+      - name: Repository contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          python3 scripts/quality/check_include_format.py
+          python3 scripts/docs/verify_repository.py
+          python3 scripts/quality/check_code_health.py --base-ref origin/main
+          python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
+          bash -n scripts/install-server.sh scripts/deploy-server.sh scripts/p2wlan-server
+          cargo clippy --locked -p p2wlan-daemon -p p2pnet-nat -p p2wlan-cli --all-targets -- -D warnings
+      - name: General daemon regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 900 cargo test --locked -p p2wlan-daemon --lib -- --test-threads=1 --skip hard_hard_ | tee evidence/daemon-general.log
+      - name: Isolated HardHard regressions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 900 python3 scripts/quality/run_rust_tests.py hard_hard_ --each | tee evidence/hard-hard.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: direct-first-verification-${{ needs.apply.outputs.source_sha }}
+          path: |
+            evidence/SOURCE_COMMIT
+            evidence/*.log
+            evidence/*.stderr
+            evidence/*.jsonl
+          retention-days: 7
+          if-no-files-found: warn
