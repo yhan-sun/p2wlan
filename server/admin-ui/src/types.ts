@@ -218,3 +218,79 @@ export interface AdminConnectionFilters {
   path?: string
   freshness?: 'fresh' | 'stale' | ''
 }
+
+
+export interface AdminConnectionHealthThresholds {
+  frequent_path_switches: number
+  repeated_path_failures: number
+}
+
+export interface AdminConnectionHealthSummary {
+  total_observations: number
+  fresh_observations: number
+  stale_observations: number
+  reporter_offline_observations: number
+  fresh_direct: number
+  fresh_relay: number
+  fresh_online_no_path: number
+  validation_rtt_samples: number
+  average_validation_rtt_ms?: number
+  max_validation_rtt_ms?: number
+  recent_path_switches: number
+  recent_direct_failures: number
+  recent_relay_failures: number
+  frequent_switching_connections: number
+  repeated_failure_connections: number
+}
+
+export type AdminConnectionHealthSignal =
+  | 'reporter_offline'
+  | 'stale_observation'
+  | 'no_active_path'
+  | 'frequent_path_switching'
+  | 'repeated_path_failures'
+  | string
+
+export interface AdminConnectionHealthAlert {
+  severity: 'warning' | 'info' | string
+  signals: AdminConnectionHealthSignal[]
+  reporting_device_id: string
+  reporting_device_name: string
+  reporting_user_id: string
+  reporting_username: string
+  remote_device_id: string
+  remote_device_name: string
+  remote_user_id: string
+  remote_username: string
+  network_id: string
+  network_name: string
+  lifecycle: string
+  current_path: string | null
+  fresh: boolean
+  freshness: 'fresh' | 'stale' | 'reporter_offline' | string
+  received_at: number
+  last_validation_rtt_ms?: number
+  recent_path_switches: number
+  recent_direct_failures: number
+  recent_relay_failures: number
+  last_transition_at?: number
+}
+
+export interface AdminConnectionHealth {
+  schema_version: number
+  generated_at: number
+  window_seconds: number
+  history_limit_per_direction: number
+  thresholds: AdminConnectionHealthThresholds
+  summary: AdminConnectionHealthSummary
+  alerts_total: number
+  alerts_limit: number
+  alerts: AdminConnectionHealthAlert[]
+}
+
+export interface AdminConnectionHealthFilters {
+  networkId?: string
+  accountId?: string
+  deviceId?: string
+  windowSeconds?: number
+}
