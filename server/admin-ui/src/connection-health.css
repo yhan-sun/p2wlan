@@ -8,6 +8,12 @@
   align-items: flex-start;
 }
 
+.connections-intro-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .health-window-switch {
   display: inline-flex;
   padding: 3px;
@@ -457,6 +463,11 @@
   .connection-health-intro {
     gap: 14px;
     flex-direction: column;
+  }
+
+  .connections-intro-actions {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .health-toolbar {
