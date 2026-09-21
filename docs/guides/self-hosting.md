@@ -68,7 +68,7 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 管理台源码位于 `server/admin-ui/`；CI 按锁文件执行 `npm ci` 并重新构建，再与仓库中已提交的 `server/admin/web/` 逐字节比对，因此源码改动后忘记重新构建会被 CI 拦下。服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证发布归档和本地 `go build` 都不会携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
 
-管理员令牌不能与 `JWT_SECRET`、设备凭据、Relay ticket 或撤权 feed token 复用，也不要放入 URL、公开日志或反向代理访问日志字段。资源关系页面中的账号、membership、设备挂载、在线状态和 signaling 来自 Control 资源状态，不会据此推断数据面路径；Connections 页面只读取 daemon 经 `path_telemetry_v1` 权威上报的路径快照与迁移历史。即使 observation 仍 fresh，也不等于目标 TUN 上的具体业务应用一定端到端可达。
+管理员令牌不能与 `JWT_SECRET`、设备凭据、Relay ticket 或撤权 feed token 复用，也不要放入 URL、公开日志或反向代理访问日志字段。资源关系页面中的账号、membership、设备挂载、在线状态和 signaling 来自 Control 资源状态，不会据此推断数据面路径；Connections 页面只读取 daemon 经 `path_telemetry_v1` 权威上报的路径快照与迁移历史；连接健康页面再基于这些已持久化事实和受限历史显示请求时 attention signals，不增加独立路径或告警状态。即使 observation 仍 fresh，也不等于目标 TUN 上的具体业务应用一定端到端可达。
 
 Docker Compose 适合隔离验证或已建立镜像发布流程的部署。默认 Control 只发布到 loopback；容器以非 root、只读根文件系统和无额外 capability 运行。生产镜像必须来自固定发布摘要，不能在业务服务器上临时 build 未验证源码。
 
