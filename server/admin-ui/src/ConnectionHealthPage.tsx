@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { type ReactNode, useMemo, useState } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import {
   Activity,
@@ -67,10 +67,10 @@ function HealthMetric({
   value,
   meta,
 }: {
-  icon: React.ReactNode
+  icon: ReactNode
   label: string
-  value: React.ReactNode
-  meta: React.ReactNode
+  value: ReactNode
+  meta: ReactNode
 }) {
   return <article className="connection-health-metric">
     <span className="connection-health-metric-icon">{icon}</span>
