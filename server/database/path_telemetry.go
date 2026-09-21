@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	PathTelemetrySchemaVersion = 1
-	MaxTransitionsPerPair      = 50
+	PathTelemetrySchemaVersion       = 1
+	MaxTransitionsPerPair            = 50
+	MaxPathTelemetryValidationRTTMS  = 24 * 60 * 60 * 1000
 )
 
 var (
@@ -120,20 +121,21 @@ func normalizedSelectedPathMTU(obs PathObservation) *uint32 {
 }
 
 func normalizedValidationRTT(obs PathObservation, currentPath *string) *uint64 {
+	var value *uint64
 	if obs.LastValidationRTTMS != nil {
-		return obs.LastValidationRTTMS
+		value = obs.LastValidationRTTMS
+	} else if currentPath != nil {
+		switch *currentPath {
+		case "direct":
+			value = obs.LastDirectLatencyMS
+		case "relay":
+			value = obs.LastRelayLatencyMS
+		}
 	}
-	if currentPath == nil {
+	if value == nil || *value > MaxPathTelemetryValidationRTTMS {
 		return nil
 	}
-	switch *currentPath {
-	case "direct":
-		return obs.LastDirectLatencyMS
-	case "relay":
-		return obs.LastRelayLatencyMS
-	default:
-		return nil
-	}
+	return value
 }
 
 func migratePathTelemetry(db *sql.DB) error {
