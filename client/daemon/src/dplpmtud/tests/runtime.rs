@@ -225,12 +225,16 @@ async fn assert_failed_direct_revokes_budget(business_ready: bool) {
         .add_peer(&peer_info("peer", "10.20.0.2", remote_endpoint))
         .await;
     let generation = peers.current_network_generation_sync();
-    assert!(peers
-        .confirm_relay_peer("peer", "relay.test:443", generation)
-        .await);
-    assert!(!peers
-        .is_relay_business_admitted_for_generation("peer", generation)
-        .await);
+    assert!(
+        peers
+            .confirm_relay_peer("peer", "relay.test:443", generation)
+            .await
+    );
+    assert!(
+        !peers
+            .is_relay_business_admitted_for_generation("peer", generation)
+            .await
+    );
     let identity = commit_test_direct_path(
         &peers,
         &udp,
@@ -260,9 +264,11 @@ async fn assert_failed_direct_revokes_budget(business_ready: bool) {
         runtime.with_current_direct_business_token(&old_token, || ()),
         Some(())
     );
-    assert!(!peers
-        .is_relay_business_admitted_for_generation("peer", generation)
-        .await);
+    assert!(
+        !peers
+            .is_relay_business_admitted_for_generation("peer", generation)
+            .await
+    );
 
     if business_ready {
         // This DPLPMTUD-focused fixture supplies the outbound owner's
