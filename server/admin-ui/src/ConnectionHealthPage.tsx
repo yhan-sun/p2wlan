@@ -8,7 +8,6 @@ import {
   CircleCheck,
   Clock3,
   Gauge,
-  Network,
   RadioTower,
   RefreshCw,
   Route,
