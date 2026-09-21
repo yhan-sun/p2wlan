@@ -250,6 +250,7 @@ export function ConnectionHealthPage() {
 
     {selectedAlert && selectedConnection.isPending && <div className="health-selection-loading"><div className="spinner" />正在打开 directional connection…</div>}
     {selectedAlert && selectedConnection.error && <div className="health-selection-error"><CircleAlert size={15} />无法读取该连接的最新快照；它可能已被移除。</div>}
+    {selectedAlert && selectedConnection.data && selectedConnection.data.items.length === 0 && <div className="health-selection-error"><CircleAlert size={15} />该 directional observation 已不存在；刷新 Health 后会移除这条旧 attention item。</div>}
     {selected && <ConnectionDrawer connection={selected} onClose={() => setSelectedAlert(null)} />}
   </div>
 }
