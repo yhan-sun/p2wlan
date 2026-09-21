@@ -358,6 +358,12 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 	currentBucket := connectionMetricBucketStart(generatedAt)
 	startBucket := currentBucket - int64(filter.WindowHours-1)*ConnectionMetricsBucketSeconds
 
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin connection trends snapshot: %w", err)
+	}
+	defer tx.Rollback()
+
 	var (
 		networkName string
 		conditions  = []string{"bucket_start >= ?", "bucket_start <= ?"}
@@ -366,7 +372,7 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 	if filter.NetworkID != "" {
 		conditions = append(conditions, "network_id = ?")
 		args = append(args, filter.NetworkID)
-		if err := db.QueryRow(`SELECT name FROM networks WHERE id = ?`, filter.NetworkID).Scan(&networkName); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRow(`SELECT name FROM networks WHERE id = ?`, filter.NetworkID).Scan(&networkName); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("query connection trend network: %w", err)
 		}
 	}
@@ -397,11 +403,10 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 		GROUP BY bucket_start
 		ORDER BY bucket_start ASC
 	`
-	rows, err := db.Query(query, args...)
+	rows, err := tx.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query connection trends: %w", err)
 	}
-	defer rows.Close()
 
 	observed := make(map[int64]AdminConnectionTrendBucket, filter.WindowHours)
 	for rows.Next() {
@@ -436,7 +441,14 @@ func (db *DB) AdminConnectionTrends(filter AdminConnectionTrendsFilter) (*AdminC
 		observed[bucket.BucketStart] = bucket
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return nil, fmt.Errorf("iterate connection trends: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close connection trends rows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit connection trends snapshot: %w", err)
 	}
 
 	buckets := make([]AdminConnectionTrendBucket, 0, filter.WindowHours)
