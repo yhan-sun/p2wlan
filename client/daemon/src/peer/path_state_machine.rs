@@ -1092,11 +1092,9 @@ impl PathStateMachine {
         }
 
         let previous_active = self.state.active.network_path();
-        if previous_active.is_some() {
-            if let Some(window) = next.direct_first.as_mut() {
-                window.released = true;
-            }
-        }
+        // Preserve the original admission deadline across epoch changes.
+        // DirectCommitted can precede its managed business MTU budget;
+        // only DirectFirstSatisfied (or the deadline) releases startup.
         next.epoch = Some(epoch);
         next.relay = if retained.keeps_relay() {
             self.state.relay.with_epoch(epoch)
@@ -1122,6 +1120,9 @@ impl PathStateMachine {
                 .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay),
             _ => ActiveBusinessPath::Unavailable,
         };
+        if self.direct_first_pending() && matches!(next.active, ActiveBusinessPath::Relay(_)) {
+            next.active = ActiveBusinessPath::Unavailable;
+        }
         Self::set_projection_after_epoch_change(next, previous_active, epoch);
         if previous_active == Some(NetworkPath::Direct)
             && next.active.network_path() == Some(NetworkPath::Relay)
@@ -1156,11 +1157,9 @@ impl PathStateMachine {
         }
 
         let previous_active = self.state.active.network_path();
-        if previous_active.is_some() {
-            if let Some(window) = next.direct_first.as_mut() {
-                window.released = true;
-            }
-        }
+        // Preserve the original admission deadline across epoch changes.
+        // DirectCommitted can precede its managed business MTU budget;
+        // only DirectFirstSatisfied (or the deadline) releases startup.
         next.epoch = Some(epoch);
         // Relay delivery is not invalidated by a candidate refresh, but its
         // state stamp is rebased so future old-candidate events fail closed.
@@ -1187,6 +1186,9 @@ impl PathStateMachine {
                 .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay),
             (ActiveBusinessPath::Unavailable, _) => ActiveBusinessPath::Unavailable,
         };
+        if self.direct_first_pending() && matches!(next.active, ActiveBusinessPath::Relay(_)) {
+            next.active = ActiveBusinessPath::Unavailable;
+        }
         Self::set_projection_after_epoch_change(next, previous_active, epoch);
         Ok(())
     }
@@ -1469,12 +1471,15 @@ impl PathStateMachine {
         let direct_was_active = matches!(self.state.active, ActiveBusinessPath::Direct(_));
         next.direct = DirectPathState::Idle;
         if direct_was_active {
-            // A failed established Direct path uses warm Relay immediately;
-            // recovery must not replay a cold-start wait.
-            if let Some(window) = next.direct_first.as_mut() {
-                window.released = true;
-            }
-            let relay = next.relay.confirmed_identity().cloned();
+            // A business-ready Direct path has already satisfied startup and
+            // falls back immediately. An ACK-only path whose MTU budget
+            // never became usable must not turn a probe failure into an
+            // early release of the connection's first Direct window.
+            let relay = if self.direct_first_pending() {
+                None
+            } else {
+                next.relay.confirmed_identity().cloned()
+            };
             next.active = relay
                 .clone()
                 .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay);
@@ -1671,6 +1676,13 @@ impl PathStateMachine {
     }
 
     fn state_is_valid(state: &PathState) -> bool {
+        // Standby readiness is never first-business permission. Keep this
+        // invariant in the authoritative reducer, not just its selector.
+        if state.direct_first.is_some_and(|window| !window.released)
+            && matches!(state.active, ActiveBusinessPath::Relay(_))
+        {
+            return false;
+        }
         if state.lifecycle == PeerPathLifecycle::Unbound {
             return state.epoch.is_none()
                 && matches!(state.active, ActiveBusinessPath::Unavailable)

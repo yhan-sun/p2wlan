@@ -184,6 +184,7 @@ fn direct_first_failed_established_path_falls_back_without_cold_wait() {
         Some("198.51.100.1:40000".parse().unwrap()),
     );
     commit(&mut machine, PathEvent::DirectCommitted { validation });
+    assert!(commit(&mut machine, PathEvent::DirectFirstSatisfied { validation }).accepted());
     assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: epoch() }).accepted());
     assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
     assert!(!machine.direct_first_pending());
@@ -362,4 +363,185 @@ fn direct_first_business_readiness_requires_the_exact_committed_validation() {
     assert!(commit(&mut machine, PathEvent::DirectFirstSatisfied { validation }).accepted());
     assert!(!machine.direct_first_pending());
     assert_eq!(machine.active_path(), Some(NetworkPath::Direct));
+}
+
+fn acknowledged_before_business_budget(
+    now: Instant,
+) -> (PathStateMachine, DirectValidationIdentity) {
+    let mut machine = started(now);
+    confirm_relay(&mut machine);
+    let validation = DirectValidationIdentity::compatibility(
+        epoch(),
+        Some("198.51.100.1:40000".parse().unwrap()),
+    );
+    assert!(commit(&mut machine, PathEvent::DirectCommitted { validation }).accepted());
+    assert!(machine.direct_first_pending());
+    (machine, validation)
+}
+
+fn assert_original_direct_deadline(
+    machine: &mut PathStateMachine,
+    current: PathEpoch,
+    now: Instant,
+) {
+    assert!(machine.direct_first_pending());
+    assert_eq!(machine.active_path(), None);
+    assert!(commit(
+        machine,
+        PathEvent::DirectFirstDeadline {
+            epoch: current,
+            now: now + Duration::from_millis(4999),
+        }
+    )
+    .accepted());
+    assert!(machine.direct_first_pending());
+    assert_eq!(machine.active_path(), None);
+    assert!(commit(
+        machine,
+        PathEvent::DirectFirstDeadline {
+            epoch: current,
+            now: now + Duration::from_secs(5),
+        }
+    )
+    .accepted());
+    assert!(!machine.direct_first_pending());
+    assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
+}
+
+#[test]
+fn direct_first_ack_only_candidate_refresh_cannot_release_business_protection() {
+    for continuity in [
+        DirectCandidateContinuity::Invalidate,
+        DirectCandidateContinuity::RetainCommitted,
+    ] {
+        let now = Instant::now();
+        let (mut machine, old_validation) = acknowledged_before_business_budget(now);
+        let refreshed = PathEpoch {
+            remote_candidate_epoch: 2,
+            ..epoch()
+        };
+        assert!(commit(
+            &mut machine,
+            PathEvent::RemoteCandidateEpochAdvanced {
+                epoch: refreshed,
+                direct: continuity,
+            }
+        )
+        .accepted());
+        assert!(machine.direct_first_pending());
+        assert!(!commit(
+            &mut machine,
+            PathEvent::DirectFirstSatisfied {
+                validation: old_validation,
+            }
+        )
+        .accepted());
+        assert!(commit(
+            &mut machine,
+            PathEvent::DirectPathFailed { epoch: refreshed }
+        )
+        .accepted());
+        assert_original_direct_deadline(&mut machine, refreshed, now);
+    }
+}
+
+#[test]
+fn direct_first_ack_only_network_change_cannot_release_business_protection() {
+    use crate::peer::path_state_machine::PathRetention;
+    for retained in [PathRetention::Relay, PathRetention::DirectAndRelay] {
+        let now = Instant::now();
+        let (mut machine, old_validation) = acknowledged_before_business_budget(now);
+        let refreshed = PathEpoch {
+            network_generation: 2,
+            ..epoch()
+        };
+        assert!(commit(
+            &mut machine,
+            PathEvent::NetworkGenerationAdvanced {
+                epoch: refreshed,
+                retained,
+            }
+        )
+        .accepted());
+        assert!(machine.direct_first_pending());
+        assert!(!commit(
+            &mut machine,
+            PathEvent::DirectFirstSatisfied {
+                validation: old_validation,
+            }
+        )
+        .accepted());
+        assert!(commit(
+            &mut machine,
+            PathEvent::DirectPathFailed { epoch: refreshed }
+        )
+        .accepted());
+        assert_original_direct_deadline(&mut machine, refreshed, now);
+    }
+}
+
+#[test]
+fn direct_first_ack_only_failure_does_not_masquerade_as_established_path_failure() {
+    let now = Instant::now();
+    let (mut machine, _) = acknowledged_before_business_budget(now);
+    assert!(commit(&mut machine, PathEvent::DirectPathFailed { epoch: epoch() }).accepted());
+    assert_original_direct_deadline(&mut machine, epoch(), now);
+}
+
+#[test]
+fn direct_first_business_ready_candidate_refresh_never_restarts_cold_wait() {
+    for continuity in [
+        DirectCandidateContinuity::Invalidate,
+        DirectCandidateContinuity::RetainCommitted,
+    ] {
+        let (mut machine, validation) = acknowledged_before_business_budget(Instant::now());
+        assert!(commit(&mut machine, PathEvent::DirectFirstSatisfied { validation }).accepted());
+        let refreshed = PathEpoch {
+            remote_candidate_epoch: 2,
+            ..epoch()
+        };
+        assert!(commit(
+            &mut machine,
+            PathEvent::RemoteCandidateEpochAdvanced {
+                epoch: refreshed,
+                direct: continuity,
+            }
+        )
+        .accepted());
+        assert!(!machine.direct_first_pending());
+        assert!(commit(
+            &mut machine,
+            PathEvent::DirectPathFailed { epoch: refreshed }
+        )
+        .accepted());
+        assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
+    }
+}
+
+#[test]
+fn direct_first_business_ready_network_change_never_restarts_cold_wait() {
+    use crate::peer::path_state_machine::PathRetention;
+    for retained in [PathRetention::Relay, PathRetention::DirectAndRelay] {
+        let (mut machine, validation) = acknowledged_before_business_budget(Instant::now());
+        assert!(commit(&mut machine, PathEvent::DirectFirstSatisfied { validation }).accepted());
+        let refreshed = PathEpoch {
+            network_generation: 2,
+            ..epoch()
+        };
+        assert!(commit(
+            &mut machine,
+            PathEvent::NetworkGenerationAdvanced {
+                epoch: refreshed,
+                retained,
+            }
+        )
+        .accepted());
+        assert!(!machine.direct_first_pending());
+        assert!(commit(
+            &mut machine,
+            PathEvent::DirectPathFailed { epoch: refreshed }
+        )
+        .accepted());
+        assert_eq!(machine.active_path(), Some(NetworkPath::Relay));
+    }
 }
