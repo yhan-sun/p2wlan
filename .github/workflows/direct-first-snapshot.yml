@@ -1,0 +1,37 @@
+name: Direct-first source snapshot
+
+on:
+  push:
+    branches: [feat/direct-first-nat-20260921]
+    paths: [.github/workflows/direct-first-snapshot.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.repository == 'yhan-sun/p2wlan' && github.ref == 'refs/heads/feat/direct-first-nat-20260921'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Export committed source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --short --branch
+          git archive --format=tar --output=source.tar HEAD
+          sha256sum source.tar > source.tar.sha256
+          git rev-parse HEAD > SOURCE_COMMIT
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: direct-first-source-${{ github.sha }}
+          path: |
+            source.tar
+            source.tar.sha256
+            SOURCE_COMMIT
+          retention-days: 1
+          if-no-files-found: error
