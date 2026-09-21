@@ -14,7 +14,7 @@
 | RELAY_TICKET_TTL | Relay ticket 的短期有效期，不是账号 token 的有效期。 |
 | RELAY_REVOCATION_FEED_TOKEN | Control 与 Relay 之间独立的撤权凭据。 |
 
-`CONTROL_ADMIN_TOKEN` 只开启同一 Control origin 下的只读管理台及 Admin API（包括 `/admin/api/v1/connections` 与 `/admin/api/v1/connection-transitions`）。管理页不会把令牌写回响应，也不会把用户 JWT 提升为全局管理员权限；公网访问时仍必须由可信 HTTPS 反向代理保护 Control。`p2wlan-config` 与固定服务端归档的 `p2wlan-server init` 都会为新部署生成独立随机值并只写入私有 `control.env`；早期缺少该项的部署可显式运行 `p2wlan-server setup` 补齐，而不会轮换已有 JWT / Relay / TLS 凭据。删除该变量并重启 Control 即可关闭管理台。
+`CONTROL_ADMIN_TOKEN` 只开启同一 Control origin 下的只读管理台及 Admin API（包括 `/admin/api/v1/connections`、`/admin/api/v1/connection-transitions` 与 `/admin/api/v1/connection-health`）。管理页不会把令牌写回响应，也不会把用户 JWT 提升为全局管理员权限；公网访问时仍必须由可信 HTTPS 反向代理保护 Control。`p2wlan-config` 与固定服务端归档的 `p2wlan-server init` 都会为新部署生成独立随机值并只写入私有 `control.env`；早期缺少该项的部署可显式运行 `p2wlan-server setup` 补齐，而不会轮换已有 JWT / Relay / TLS 凭据。删除该变量并重启 Control 即可关闭管理台。
 
 Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemetry_v1` 能力；客户端同样支持该能力时，启用基于信令长连接的路径遥测通道（并在不可用时自动降级为 HTTP POST `/api/v1/telemetry/paths`）。
 
