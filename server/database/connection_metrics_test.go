@@ -252,3 +252,47 @@ func TestConnectionMetricsPercentileOverflowDoesNotFabricateBound(t *testing.T) 
 		t.Fatalf("p10 should be bounded by 10s, got %+v", got)
 	}
 }
+
+
+func TestConnectionMetricsDropsAbsurdValidationRTT(t *testing.T) {
+	db, _, netID, devAID, devBID := setupTelemetryTestDB(t)
+	absurd := uint64(MaxPathTelemetryValidationRTTMS + 1)
+	obs := PathObservation{
+		SchemaVersion:         PathTelemetrySchemaVersion,
+		RemoteDeviceID:        devBID,
+		NetworkID:             netID,
+		ObservationRevision:   1,
+		NetworkGeneration:     1,
+		PeerSessionGeneration: 1,
+		RemoteCandidateEpoch:  1,
+		Lifecycle:             "online",
+		CurrentPath:           strPtr("direct"),
+		TransitionReason:      "direct_committed",
+		LastDirectLatencyMS:   &absurd,
+		ObservedAt:            time.Now().Unix(),
+	}
+	summary, err := db.RecordPathObservations(devAID, netID, 1, []PathObservation{obs}, false)
+	if err != nil || summary.Accepted != 1 {
+		t.Fatalf("telemetry with absurd RTT should keep path state but drop RTT sample: summary=%+v err=%v", summary, err)
+	}
+
+	page, err := db.AdminConnections(AdminConnectionFilter{ReportingDeviceID: devAID}, 10, 0)
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("AdminConnections: page=%+v err=%v", page, err)
+	}
+	if page.Items[0].LastValidationRTTMS != nil {
+		t.Fatalf("absurd RTT must not reach authoritative snapshot: %v", *page.Items[0].LastValidationRTTMS)
+	}
+
+	trends, err := db.AdminConnectionTrends(AdminConnectionTrendsFilter{NetworkID: netID, WindowHours: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := trends.Buckets[0]
+	if bucket.AcceptedObservationSamples != 1 || bucket.DirectObservationSamples != 1 {
+		t.Fatalf("path sample should still be counted: %+v", bucket)
+	}
+	if bucket.ValidationRTTSamples != 0 || bucket.AverageValidationRTTMS != nil || bucket.MaxValidationRTTMS != nil {
+		t.Fatalf("absurd RTT must not enter rollup: %+v", bucket)
+	}
+}
