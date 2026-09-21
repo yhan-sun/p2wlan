@@ -141,6 +141,7 @@ impl PeerManager {
         let mut cancel_heartbeat_after_lock = false;
         let mut revoke_relay_after_lock = false;
         let mut clear_hard_hard_after_lock = false;
+        let mut direct_first_deadline_changed = false;
         let mut ip_map = match self.ip_to_node.try_write() {
             Ok(ip_map) => {
                 lock_trace.acquired(PeerUpdateLockResource::IpToNodeWrite);
@@ -491,7 +492,8 @@ impl PeerManager {
             };
             conn.commit_path_transition(event, |_| {});
             if conn.online {
-                conn.start_direct_first(epoch, self.config.relay.effective_path_policy(true));
+                direct_first_deadline_changed |=
+                    conn.start_direct_first(epoch, self.config.relay.effective_path_policy(true));
             }
         } else {
             warn!(
@@ -508,6 +510,10 @@ impl PeerManager {
         lock_trace.released(PeerUpdateLockResource::IpToNodeWrite);
         lock_trace.released(PeerUpdateLockResource::ConnectionsWrite);
         lock_trace.released(PeerUpdateLockResource::NetworkEpochGate);
+        if direct_first_deadline_changed {
+            self.direct_first_deadline_change_tx
+                .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+        }
         if clear_hard_hard_after_lock {
             self.clear_hard_hard_sessions(Some(&info.node_id)).await;
         }

@@ -1,5 +1,130 @@
 use super::*;
 
+fn direct_first_timer_peer(node_id: &str, public_key: &str) -> control::PeerInfo {
+    control::PeerInfo {
+        node_id: node_id.to_string(),
+        device_name: String::new(),
+        app_version: String::new(),
+        public_key: public_key.to_string(),
+        endpoint: "198.51.100.10:41000".to_string(),
+        nat_type: "Unknown".to_string(),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        last_seen: 0,
+        relay_rtt_ms: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_first_deadline_progresses_without_business_ingress() {
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&direct_first_timer_peer("node-b", "pk-b"))
+        .await;
+    let generation = peers.current_network_generation_sync();
+    assert!(
+        peers
+            .confirm_relay_peer("node-b", "relay.test:443", generation)
+            .await
+    );
+    assert_eq!(
+        peers
+            .committed_business_path_snapshot_sync("node-b")
+            .and_then(|snapshot| snapshot.active_path()),
+        None,
+        "confirmed Relay must remain standby during the DirectFirst window"
+    );
+
+    let mut path_changes = peers.subscribe_committed_business_path_changes();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let deadline_owner = tokio::spawn(run_direct_first_deadline_loop(peers.clone(), shutdown_rx));
+    tokio::task::yield_now().await;
+    tokio::time::advance(crate::peer::DIRECT_FIRST_WINDOW - Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        peers
+            .committed_business_path_snapshot_sync("node-b")
+            .and_then(|snapshot| snapshot.active_path()),
+        None,
+        "Relay was admitted before the complete DirectFirst budget elapsed"
+    );
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    path_changes
+        .changed()
+        .await
+        .expect("deadline commit must publish the active Relay path");
+    assert_eq!(
+        peers
+            .committed_business_path_snapshot_sync("node-b")
+            .and_then(|snapshot| snapshot.active_path()),
+        Some(peer::NetworkPath::Relay)
+    );
+
+    shutdown_tx.send_replace(true);
+    deadline_owner
+        .await
+        .expect("deadline owner must stop through its bounded shutdown channel");
+}
+
+#[tokio::test]
+async fn retired_direct_first_deadline_cannot_release_replacement_peer() {
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::DirectFirst;
+    let peers = PeerManager::new(config);
+    peers
+        .add_peer(&direct_first_timer_peer("node-b", "pk-old"))
+        .await;
+    let retired_deadline = peers
+        .try_next_direct_first_deadline()
+        .expect("connection map must be observable")
+        .expect("old peer must own a DirectFirst deadline");
+
+    peers.remove_peer("node-b").await;
+    peers
+        .add_peer(&direct_first_timer_peer("node-b", "pk-new"))
+        .await;
+    let replacement_deadline = peers
+        .try_next_direct_first_deadline()
+        .expect("connection map must be observable")
+        .expect("replacement peer must own its own DirectFirst deadline");
+    assert!(replacement_deadline > retired_deadline);
+    let generation = peers.current_network_generation_sync();
+    assert!(
+        peers
+            .confirm_relay_peer("node-b", "relay.test:443", generation)
+            .await
+    );
+
+    assert_eq!(
+        peers
+            .try_advance_direct_first_deadlines_at(retired_deadline)
+            .expect("deadline commit must not contend"),
+        0,
+        "a retired peer timer must be fenced from the replacement lifecycle"
+    );
+    assert_eq!(
+        peers
+            .committed_business_path_snapshot_sync("node-b")
+            .and_then(|snapshot| snapshot.active_path()),
+        None
+    );
+    assert_eq!(
+        peers
+            .try_advance_direct_first_deadlines_at(replacement_deadline)
+            .expect("replacement deadline commit must not contend"),
+        1
+    );
+    assert_eq!(
+        peers
+            .committed_business_path_snapshot_sync("node-b")
+            .and_then(|snapshot| snapshot.active_path()),
+        Some(peer::NetworkPath::Relay)
+    );
+}
+
 /// Check real emitted ciphertext, not only the selector's diagnostic label.
 /// A warm, authenticated Relay must not steal the first application payload.
 #[tokio::test]

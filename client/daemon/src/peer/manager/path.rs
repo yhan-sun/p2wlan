@@ -1,4 +1,42 @@
 impl PeerManager {
+    /// Subscribe to DirectFirst deadline-set changes. The authoritative
+    /// deadlines remain inside each connection's path state machine; this is
+    /// only a latest-value wakeup for the single supervised timer owner.
+    pub(crate) fn subscribe_direct_first_deadline_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        self.direct_first_deadline_change_tx.subscribe()
+    }
+
+    /// Read the earliest pending DirectFirst deadline without joining
+    /// Tokio's fair reader queue. A contended connection map is retried by the
+    /// supervised timer owner, so this observer can never stand in front of a
+    /// lifecycle writer.
+    pub(crate) fn try_next_direct_first_deadline(&self) -> Result<Option<Instant>, ()> {
+        let connections = self.connections.try_read().map_err(|_| ())?;
+        Ok(connections
+            .values()
+            .filter_map(|connection| connection.path_state_machine.direct_first_deadline())
+            .min())
+    }
+
+    /// Commit every due DirectFirst deadline under the canonical
+    /// network-epoch -> connection-writer transaction. This is deliberately
+    /// try-only: the supervised owner retries after a short cancellable delay
+    /// rather than adding another fair writer waiter during lifecycle churn.
+    pub(crate) fn try_advance_direct_first_deadlines_at(&self, now: Instant) -> Result<usize, ()> {
+        let _epoch_guard = self.network_epoch_gate.try_lock().map_err(|_| ())?;
+        let mut connections = self.connections.try_write().map_err(|_| ())?;
+        let generation = self.current_network_generation_sync();
+        let mut advanced = 0usize;
+        for connection in connections.values_mut() {
+            if connection.online && connection.advance_direct_first_deadline_at(generation, now) {
+                advanced = advanced.saturating_add(1);
+            }
+        }
+        Ok(advanced)
+    }
+
     /// Select the data path for one outbound encrypted packet.
     pub async fn select_path_for_data(
         &self,

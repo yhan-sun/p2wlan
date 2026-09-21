@@ -130,7 +130,7 @@ use diagnostics::{
 };
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
-use network_outbound::{run_network_outbound, RelayStartupWait};
+use network_outbound::{run_direct_first_deadline_loop, run_network_outbound, RelayStartupWait};
 #[cfg(target_os = "android")]
 use p2pnet_tun::AndroidTunMode;
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};

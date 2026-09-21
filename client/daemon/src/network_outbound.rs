@@ -101,6 +101,87 @@ use crate::udp::{
 
 const OUTBOUND_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+/// A contended deadline observation/commit is advisory work and must never
+/// join the fair connection-map queue. Retry promptly while remaining
+/// cancellable by daemon shutdown and lifecycle wakeups.
+const DIRECT_FIRST_DEADLINE_RETRY: Duration = Duration::from_millis(10);
+
+/// Own DirectFirst wall-clock progression independently of application
+/// traffic. Without this task an idle peer could wait forever: the validation
+/// harness (and a real app with no queued packets yet) waits for an active
+/// path, while the old deadline was advanced only from the packet admission
+/// path. The path reducer remains the sole authority; this task only submits
+/// the typed deadline event under its exact current epoch.
+pub(crate) async fn run_direct_first_deadline_loop(
+    peers: Arc<PeerManager>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut changes = peers.subscribe_direct_first_deadline_changes();
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            return;
+        }
+        let deadline = match peers.try_next_direct_first_deadline() {
+            Ok(deadline) => deadline,
+            Err(()) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(DIRECT_FIRST_DEADLINE_RETRY) => {}
+                    changed = changes.changed() => {
+                        if changed.is_err() { return; }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow_and_update() { return; }
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(deadline) = deadline else {
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() { return; }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow_and_update() { return; }
+                }
+            }
+            continue;
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                loop {
+                    // Commit against the deadline that actually fired.  This
+                    // is both monotonic and deterministic under Tokio's
+                    // paused-time tests; contention is a scheduling delay,
+                    // not a reason to rewrite the authoritative deadline.
+                    match peers.try_advance_direct_first_deadlines_at(deadline) {
+                        Ok(_) => break,
+                        Err(()) => {
+                            tokio::select! {
+                                _ = tokio::time::sleep(DIRECT_FIRST_DEADLINE_RETRY) => {}
+                                changed = changes.changed() => {
+                                    if changed.is_err() { return; }
+                                    break;
+                                }
+                                changed = shutdown_rx.changed() => {
+                                    if changed.is_err() || *shutdown_rx.borrow_and_update() { return; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            changed = changes.changed() => {
+                if changed.is_err() { return; }
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow_and_update() { return; }
+            }
+        }
+    }
+}
+
 /// Bound a single path send so a stalled relay TCP write can never block the
 /// shared outbound worker (per-peer waits are already event-driven; this
 /// bounds the per-packet SEND).  The per-peer emit lock is held for at most

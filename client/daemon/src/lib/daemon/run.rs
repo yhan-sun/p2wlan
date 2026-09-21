@@ -372,6 +372,13 @@ impl Daemon {
             .await;
         self.task_manager
             .spawn(
+                "direct-first-deadline",
+                false,
+                run_direct_first_deadline_loop(self.peers.clone(), self.shutdown_rx.clone()),
+            )
+            .await;
+        self.task_manager
+            .spawn(
                 "direct-probe",
                 false,
                 run_direct_probe_loop(

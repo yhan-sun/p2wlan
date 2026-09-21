@@ -28,6 +28,7 @@ impl PeerManager {
         traversal_history: TraversalHistory,
     ) -> Self {
         let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
+        let (direct_first_deadline_change_tx, _) = tokio::sync::watch::channel(0);
         let (dplpmtud_capability_tx, _) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
         let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
         let (ip_to_node_snapshot, _) =
@@ -51,6 +52,7 @@ impl PeerManager {
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             committed_business_path_change_tx,
+            direct_first_deadline_change_tx,
             dplpmtud_capability_tx,
             direct_business_budget_change_tx,
             local_mtu_feedback_tx,

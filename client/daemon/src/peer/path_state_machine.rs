@@ -770,6 +770,13 @@ impl PathStateMachine {
             .is_some_and(|window| !window.released && now >= window.deadline)
     }
 
+    pub(crate) fn direct_first_deadline(&self) -> Option<Instant> {
+        self.state
+            .direct_first
+            .filter(|window| !window.released)
+            .map(|window| window.deadline)
+    }
+
     /// Pure reducer: no compatibility mirror or transport side effect is
     /// touched until `PeerConnection::commit_path_transition` accepts it.
     pub(crate) fn reduce(&self, event: PathEvent) -> PathTransition {
