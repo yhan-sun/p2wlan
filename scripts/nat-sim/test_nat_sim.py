@@ -199,7 +199,7 @@ class NatEvidenceContractTests(unittest.TestCase):
             "relay_first_business_exchange_generation": 1 if expected_path == "relay" else None,
         }
         summary = {
-            "schema_version": 1,
+            "schema_version": 2,
             "peer_id": "node-b",
             "path": expected_path,
             "network_generation": 1,
@@ -207,6 +207,7 @@ class NatEvidenceContractTests(unittest.TestCase):
             "transition_revision": 3,
             "relay_ready_at_ms": 10,
             "first_usable_delta_ms": 10,
+            "direct_first_remaining_ms_at_relay_ready": 2500,
             "business_sent": True,
             "business_received": True,
             "business_exchange": True,
@@ -232,6 +233,7 @@ class NatEvidenceContractTests(unittest.TestCase):
                         "at_ms": 10,
                         "peer_id": "node-b",
                         "connection_generation": 1,
+                        "direct_first_remaining_ms": 2500,
                     },
                     {
                         "event": "first_usable_path",
@@ -251,6 +253,25 @@ class NatEvidenceContractTests(unittest.TestCase):
                 ]
             },
         }
+
+    @staticmethod
+    def _set_first_usable_timing(
+        status: dict, *, ready_at_ms: int, delta_ms: int, remaining_ms: int | None
+    ) -> None:
+        timeline = status["connection_timeline"]
+        summary = timeline["first_usable_summaries"][0]
+        summary["relay_ready_at_ms"] = ready_at_ms
+        summary["first_usable_at_ms"] = ready_at_ms + delta_ms
+        summary["first_usable_delta_ms"] = delta_ms
+        summary["direct_first_remaining_ms_at_relay_ready"] = remaining_ms
+        for event in timeline["events"]:
+            if event["event"] == "relay_transport_ready_peer":
+                event["at_ms"] = ready_at_ms
+                event["direct_first_remaining_ms"] = remaining_ms
+            elif event["event"] == "first_usable_path":
+                event["at_ms"] = ready_at_ms + delta_ms
+        status["captured_at_ms"] = ready_at_ms + delta_ms + 10
+        status["uptime_ms"] = status["captured_at_ms"]
 
     def _write_record(self, root: Path, topology: str, replica: int) -> dict:
         expected_path = "relay" if topology == "relay-blackhole" else "direct"
@@ -386,6 +407,199 @@ class NatEvidenceContractTests(unittest.TestCase):
             self.assertEqual(record["result"], "pass")
             self.assertEqual(record["observed"]["a"]["first_usable"]["delta_ms"], 10)
             self.assertFalse(record["observed"]["a"]["first_usable"]["baseline_after_transition"])
+
+    def test_relay_budget_adds_remaining_direct_first_protection_without_rewriting_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                self._set_first_usable_timing(
+                    final, ready_at_ms=10, delta_ms=4800, remaining_ms=2000
+                )
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "pass")
+            first_usable = record["observed"]["a"]["first_usable"]
+            self.assertEqual(first_usable["relay_ready_at_ms"], 10)
+            self.assertEqual(first_usable["first_usable_at_ms"], 4810)
+            self.assertEqual(first_usable["delta_ms"], 4800)
+            self.assertEqual(first_usable["slo_base_ms"], 3000)
+            self.assertEqual(first_usable["budget_direct_first_remaining_ms"], 2000)
+            self.assertEqual(first_usable["budget_ms"], 5000)
+            scenario, _, replica = AGGREGATE_EVIDENCE.validate_record(
+                record, self.SOURCE_SHA, self.WORKFLOW_SHA
+            )
+            self.assertEqual(scenario, "relay-blackhole:replica-1:round-1")
+            self.assertEqual(replica, 1)
+
+            forged = copy.deepcopy(record)
+            forged["observed"]["a"]["first_usable"]["budget_ms"] = 5001
+            with self.assertRaisesRegex(ValueError, "a_budget_mismatch"):
+                AGGREGATE_EVIDENCE.validate_record(
+                    forged, self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+            forged = copy.deepcopy(record)
+            forged["observed"]["a"]["first_usable"][
+                "budget_direct_first_remaining_ms"
+            ] = 2001
+            forged["observed"]["a"]["first_usable"]["budget_ms"] = 5001
+            with self.assertRaisesRegex(ValueError, "a_budget_source_mismatch"):
+                AGGREGATE_EVIDENCE.validate_record(
+                    forged, self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+    def test_relay_budget_uses_paired_maximum_remaining_direct_first_protection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            self._set_first_usable_timing(
+                final_a, ready_at_ms=10, delta_ms=3252, remaining_ms=0
+            )
+            self._set_first_usable_timing(
+                final_b, ready_at_ms=10, delta_ms=3751, remaining_ms=3013
+            )
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "pass")
+            first_a = record["observed"]["a"]["first_usable"]
+            first_b = record["observed"]["b"]["first_usable"]
+            self.assertEqual(first_a["direct_first_remaining_ms_at_relay_ready"], 0)
+            self.assertEqual(first_a["budget_direct_first_remaining_ms"], 3013)
+            self.assertEqual(first_a["budget_ms"], 6013)
+            self.assertEqual(first_b["direct_first_remaining_ms_at_relay_ready"], 3013)
+            self.assertEqual(first_b["budget_direct_first_remaining_ms"], 3013)
+            self.assertEqual(first_b["budget_ms"], 6013)
+            AGGREGATE_EVIDENCE.validate_record(
+                record, self.SOURCE_SHA, self.WORKFLOW_SHA
+            )
+
+    def test_relay_delta_over_remaining_protection_budget_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                self._set_first_usable_timing(
+                    final, ready_at_ms=10, delta_ms=5001, remaining_ms=2000
+                )
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "relay_first_slo_exceeded")
+            self.assertEqual(record["observed"]["a"]["first_usable"]["delta_ms"], 5001)
+            self.assertEqual(record["observed"]["a"]["first_usable"]["budget_ms"], 5000)
+
+    def test_direct_topology_keeps_fixed_three_second_slo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "direct")
+            final_b = self._status(1235, "direct")
+            for final in (final_a, final_b):
+                self._set_first_usable_timing(
+                    final, ready_at_ms=10, delta_ms=4000, remaining_ms=5000
+                )
+            record = self._build_record(
+                root,
+                "direct-cold-start",
+                1,
+                self._status(1234, "direct", revision=1),
+                self._status(1235, "direct", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "relay_first_slo_exceeded")
+            self.assertEqual(
+                record["observed"]["a"]["first_usable"][
+                    "budget_direct_first_remaining_ms"
+                ],
+                0,
+            )
+            self.assertEqual(record["observed"]["a"]["first_usable"]["budget_ms"], 3000)
+
+    def test_direct_aggregate_rejects_expanded_protection_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._build_record(
+                root,
+                "direct-cold-start",
+                1,
+                self._status(1234, "direct", revision=1),
+                self._status(1235, "direct", revision=1),
+                self._status(1234, "direct"),
+                self._status(1235, "direct"),
+            )
+            record["observed"]["a"]["first_usable"]["budget_ms"] = 5500
+            with self.assertRaisesRegex(ValueError, "a_budget_mismatch"):
+                AGGREGATE_EVIDENCE.validate_record(
+                    record, self.SOURCE_SHA, self.WORKFLOW_SHA
+                )
+
+    def test_impossible_remaining_protection_is_parser_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                self._set_first_usable_timing(
+                    final, ready_at_ms=10, delta_ms=4800, remaining_ms=5001
+                )
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "evidence_parser_loss")
+
+    def test_missing_relay_remaining_protection_is_parser_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_a = self._status(1234, "relay")
+            final_b = self._status(1235, "relay")
+            for final in (final_a, final_b):
+                self._set_first_usable_timing(
+                    final, ready_at_ms=10, delta_ms=2500, remaining_ms=None
+                )
+            record = self._build_record(
+                root,
+                "relay-blackhole",
+                1,
+                self._status(1234, "relay", revision=1),
+                self._status(1235, "relay", revision=1),
+                final_a,
+                final_b,
+            )
+            self.assertEqual(record["result"], "fail")
+            self.assertEqual(record["decision"]["reason_code"], "evidence_parser_loss")
 
     def test_transition_before_baseline_requires_persistent_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1251,7 +1465,11 @@ class TransientClassifierTests(unittest.TestCase):
         "overlay_ok=0 a_direct=0 b_direct=0 a_overlay=67 b_overlay=2 "
         "a_relay_confirmed=1 b_relay_confirmed=1 "
         "a_ingress=relay:tcp://127.0.0.1:43801 b_ingress=relay:tcp://127.0.0.1:43801 "
-        "a_delta_ms=177 b_delta_ms=3 sum_delta_ms=180 drops_a=0 drops_b=0 "
+        "a_delta_ms=177 b_delta_ms=3 a_budget_ms=6500 b_budget_ms=6500 "
+        "a_direct_first_remaining_ms=3500 b_direct_first_remaining_ms=3500 "
+        "a_budget_direct_first_remaining_ms=3500 "
+        "b_budget_direct_first_remaining_ms=3500 "
+        "slo_base_ms=3000 sum_delta_ms=180 drops_a=0 drops_b=0 "
         "replay_a=0 replay_b=0 invalid_a=0 invalid_b=0 burst_a=0 burst_b=0 "
         "burst_bad_a=2 burst_bad_b=2 status_http_200_a=156/156 status_http_200_b=156/156 "
         "status_always_200_a=1 status_always_200_b=1 task_health_a=1 task_health_b=1 "
@@ -1315,7 +1533,7 @@ class TransientClassifierTests(unittest.TestCase):
     def _failed_evidence(reason="relay_business_gate_failed"):
         topology = "relay-blackhole"
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "repository": "yhan-sun/p2wlan",
             "source_head_sha": "1" * 40,
             "workflow_sha": "2" * 40,

@@ -18,9 +18,11 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ATTEMPT_SCHEMA_VERSION = 1
 REPOSITORY = "yhan-sun/p2wlan"
+RELAY_READY_TO_USABLE_SLO_MS = 3000
+DIRECT_FIRST_WINDOW_MS = 5000
 EXPECTED_TOPOLOGIES = {
     "direct-cold-start": {1},
     "relay-blackhole": {1, 2, 3, 4, 5},
@@ -99,12 +101,52 @@ def _require_pass_side(
     path = first.get("path")
     if not isinstance(path, str) or path != expected_path:
         raise ValueError(f"{label}_first_usable_path_mismatch")
-    for field in ("first_usable_at_ms", "transition_revision", "delta_ms"):
+    for field in (
+        "relay_ready_at_ms",
+        "first_usable_at_ms",
+        "transition_revision",
+        "delta_ms",
+        "budget_direct_first_remaining_ms",
+        "slo_base_ms",
+        "budget_ms",
+    ):
         if type(first.get(field)) is not int or first[field] < 0:
             raise ValueError(f"{label}_{field}_missing")
     if first["transition_revision"] == 0:
         raise ValueError(f"{label}_transition_revision_missing")
-    if first["delta_ms"] > 3000:
+    if first["first_usable_at_ms"] < first["relay_ready_at_ms"] or first["delta_ms"] != (
+        first["first_usable_at_ms"] - first["relay_ready_at_ms"]
+    ):
+        raise ValueError(f"{label}_delta_timestamp_mismatch")
+    if first["slo_base_ms"] != RELAY_READY_TO_USABLE_SLO_MS:
+        raise ValueError(f"{label}_slo_base_mismatch")
+    direct_first_remaining_ms = first.get("direct_first_remaining_ms_at_relay_ready")
+    budget_direct_first_remaining_ms = first["budget_direct_first_remaining_ms"]
+    if expected_path == "relay":
+        if (
+            type(direct_first_remaining_ms) is not int
+            or direct_first_remaining_ms < 0
+            or direct_first_remaining_ms > DIRECT_FIRST_WINDOW_MS
+        ):
+            raise ValueError(f"{label}_direct_first_remaining_invalid")
+        if budget_direct_first_remaining_ms > DIRECT_FIRST_WINDOW_MS:
+            raise ValueError(f"{label}_budget_direct_first_remaining_invalid")
+        expected_budget_ms = (
+            RELAY_READY_TO_USABLE_SLO_MS + budget_direct_first_remaining_ms
+        )
+    else:
+        if direct_first_remaining_ms is not None and (
+            type(direct_first_remaining_ms) is not int
+            or direct_first_remaining_ms < 0
+            or direct_first_remaining_ms > DIRECT_FIRST_WINDOW_MS
+        ):
+            raise ValueError(f"{label}_direct_first_remaining_invalid")
+        if budget_direct_first_remaining_ms != 0:
+            raise ValueError(f"{label}_budget_direct_first_remaining_invalid")
+        expected_budget_ms = RELAY_READY_TO_USABLE_SLO_MS
+    if first["budget_ms"] != expected_budget_ms:
+        raise ValueError(f"{label}_budget_mismatch")
+    if first["delta_ms"] > first["budget_ms"]:
         raise ValueError(f"{label}_delta_exceeded")
     source = first.get("source")
     if not isinstance(source, str) or source not in {"persistent_summary", "event"}:
@@ -223,6 +265,23 @@ def validate_record(
         "b",
         expected_path,
     )
+    first_a = observed["a"]["first_usable"]
+    first_b = observed["b"]["first_usable"]
+    if expected_path == "relay":
+        expected_budget_remaining_ms = max(
+            first_a["direct_first_remaining_ms_at_relay_ready"],
+            first_b["direct_first_remaining_ms_at_relay_ready"],
+        )
+        if (
+            first_a["budget_direct_first_remaining_ms"]
+            != expected_budget_remaining_ms
+        ):
+            raise ValueError("a_budget_source_mismatch")
+        if (
+            first_b["budget_direct_first_remaining_ms"]
+            != expected_budget_remaining_ms
+        ):
+            raise ValueError("b_budget_source_mismatch")
     if collector.get("revision_converged") is not True:
         raise ValueError("aggregate_revision_not_converged")
     if invariants.get("same_source_head") is not True or invariants.get("same_workflow_sha") is not True:

@@ -39,7 +39,7 @@ pub const TIMELINE_MAX_EVENTS: usize = 512;
 /// timeline is intentionally a bounded ring and may evict the transition that
 /// proved usability; this summary remains available to `/status` after that
 /// eviction and carries the status revision fence used by the NAT harness.
-pub const FIRST_USABLE_SUMMARY_SCHEMA_VERSION: u32 = 1;
+pub const FIRST_USABLE_SUMMARY_SCHEMA_VERSION: u32 = 2;
 pub const FIRST_USABLE_SUMMARY_MAX_ENTRIES: usize = 1024;
 
 /// One recorded timeline event (serializable, bounded).
@@ -75,6 +75,11 @@ pub struct ConnectionTimelineEvent {
     /// unknown revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_revision: Option<u64>,
+    /// Authoritative DirectFirst protection remaining when Relay became ready.
+    /// This is captured once at the Relay-ready commit and never reconstructed
+    /// from the later first-usable timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_first_remaining_ms: Option<u64>,
 }
 
 /// Persistent, per-peer/per-network-generation first-usable commit summary.
@@ -102,6 +107,11 @@ pub struct FirstUsableEvidenceSummary {
     pub relay_ready_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_usable_delta_ms: Option<u64>,
+    /// DirectFirst protection remaining at the exact Relay-ready commit.  The
+    /// NAT gate adds its independent 3000-ms post-protection SLO to this raw
+    /// value; the raw ready/usable timestamps and delta remain unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_first_remaining_ms_at_relay_ready: Option<u64>,
     /// Business evidence dimensions are explicit so a collector cannot treat
     /// `relay_connected` or `relay_peer_confirmed` as first usability.
     #[serde(default)]
@@ -142,7 +152,7 @@ pub struct ConnectionTimeline {
     first_usable_summaries: Mutex<VecDeque<FirstUsableEvidenceSummary>>,
     /// Same-peer/same-generation relay-ready times used to compute a local
     /// delta even when the ready event later leaves the bounded event ring.
-    relay_ready_at_ms: Mutex<HashMap<(String, u64), u64>>,
+    relay_ready_timing: Mutex<HashMap<(String, u64), RelayReadyTiming>>,
     /// Events that must be emitted at most once per scope.  The scope is a
     /// stable string (`""` for process-level milestones, `peer:<id>:<generation>`
     /// for per-peer + generation milestones), so a first-milestone can never be
@@ -157,6 +167,12 @@ pub struct ConnectionTimeline {
     /// outside the bounded event ring so reconnects remain observable after
     /// older timeline entries have been evicted.
     control_registration_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayReadyTiming {
+    at_ms: u64,
+    direct_first_remaining_ms: Option<u64>,
 }
 
 impl ConnectionTimeline {
@@ -180,7 +196,7 @@ impl ConnectionTimeline {
             started_at: Instant::now(),
             events: Mutex::new(VecDeque::new()),
             first_usable_summaries: Mutex::new(VecDeque::new()),
-            relay_ready_at_ms: Mutex::new(HashMap::new()),
+            relay_ready_timing: Mutex::new(HashMap::new()),
             first_events: Mutex::new(HashSet::new()),
             status_events: Mutex::new(None),
             control_registration_count: AtomicU64::new(0),
@@ -232,14 +248,20 @@ impl ConnectionTimeline {
                 (fields.peer_id.as_ref(), fields.connection_generation)
             {
                 let mut ready_times = self
-                    .relay_ready_at_ms
+                    .relay_ready_timing
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                ready_times.insert((peer_id.clone(), generation), at_ms);
+                ready_times.insert(
+                    (peer_id.clone(), generation),
+                    RelayReadyTiming {
+                        at_ms,
+                        direct_first_remaining_ms: fields.direct_first_remaining_ms,
+                    },
+                );
                 while ready_times.len() > FIRST_USABLE_SUMMARY_MAX_ENTRIES {
                     let Some(oldest_key) = ready_times
                         .iter()
-                        .min_by_key(|(_, timestamp)| **timestamp)
+                        .min_by_key(|(_, timing)| timing.at_ms)
                         .map(|(key, _)| key.clone())
                     else {
                         break;
@@ -279,6 +301,7 @@ impl ConnectionTimeline {
             relay_id: fields.relay_id,
             relay_region: fields.relay_region,
             transition_revision: (revision != 0).then_some(revision),
+            direct_first_remaining_ms: fields.direct_first_remaining_ms,
         });
         while events.len() > TIMELINE_MAX_EVENTS {
             events.pop_front();
@@ -443,12 +466,13 @@ impl ConnectionTimeline {
         let (at_ms, transition_revision) =
             self.record_event("first_usable_path", Some(path), reason_code, detail.clone());
         let ready_key = (peer_id.to_string(), generation);
-        let relay_ready_at_ms = self
-            .relay_ready_at_ms
+        let relay_ready_timing = self
+            .relay_ready_timing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&ready_key)
             .copied();
+        let relay_ready_at_ms = relay_ready_timing.map(|timing| timing.at_ms);
         let first_usable_delta_ms = relay_ready_at_ms
             .filter(|ready_at_ms| at_ms >= *ready_at_ms)
             .map(|ready_at_ms| at_ms.saturating_sub(ready_at_ms));
@@ -461,6 +485,8 @@ impl ConnectionTimeline {
             transition_revision,
             relay_ready_at_ms,
             first_usable_delta_ms,
+            direct_first_remaining_ms_at_relay_ready: relay_ready_timing
+                .and_then(|timing| timing.direct_first_remaining_ms),
             business_sent,
             business_received,
             business_exchange,
@@ -537,6 +563,7 @@ struct TimelineDetailFields {
     path_id: Option<String>,
     relay_id: Option<String>,
     relay_region: Option<String>,
+    direct_first_remaining_ms: Option<u64>,
 }
 
 fn safe_test_run_id() -> Option<String> {
@@ -572,6 +599,8 @@ fn parse_detail_fields(detail: &str) -> TimelineDetailFields {
         path_id: detail_value(detail, &["path_id"]),
         relay_id: detail_value(detail, &["relay_id", "relay_endpoint", "endpoint"]),
         relay_region: detail_value(detail, &["relay_region", "region"]),
+        direct_first_remaining_ms: detail_value(detail, &["direct_first_remaining_ms"])
+            .and_then(|value| value.parse().ok()),
     }
 }
 
@@ -737,8 +766,7 @@ mod tests {
             Some("relay"),
             None,
             Some(
-                "peer=node-b generation=7 relay_endpoint=relay.test relay_connection_id=12"
-                    .to_string(),
+                "peer=node-b generation=7 relay_endpoint=relay.test relay_connection_id=12 direct_first_remaining_ms=4200".to_string(),
             ),
         );
         assert!(timeline.emit_first_usable(
@@ -770,6 +798,15 @@ mod tests {
         let summary = &snapshot.first_usable_summaries[0];
         assert_eq!(summary.schema_version, FIRST_USABLE_SUMMARY_SCHEMA_VERSION);
         assert_eq!(summary.transition_revision, 2);
+        assert_eq!(summary.direct_first_remaining_ms_at_relay_ready, Some(4200));
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .find(|event| event.event == "relay_transport_ready_peer")
+                .and_then(|event| event.direct_first_remaining_ms),
+            Some(4200)
+        );
         assert_eq!(
             snapshot
                 .events

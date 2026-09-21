@@ -74,8 +74,9 @@ if [[ "$OVERLAY_BURST" -eq 0 && "$MODE" == "relay-only" ]]; then
   OVERLAY_BURST=256
 fi
 # Artificial per-frame relay forwarding delay in ms (slow-relay diagnostics;
-# the relay observes the full one-way delay).  Informational: a delayed relay
-# cannot meet the 3000ms SLO, so no PASS/FAIL claim is made for it.
+# the relay observes the full one-way delay). Informational: a delayed relay
+# that exceeds the remaining DirectFirst protection plus the 3000ms post-wait
+# SLO cannot pass, so no availability claim is made for this diagnostic mode.
 RELAY_DELAY_MS=${RELAY_DELAY_MS:-0}
 # Kill and restart the relay mid-round and require the overlay to recover
 # (relay disconnect/reconnect verification).
@@ -1295,7 +1296,11 @@ for round in $(seq 1 "$ROUNDS"); do
     --expected-path "$EXPECTED_PATH" \
     --overlay-burst "$OVERLAY_BURST" \
     --output "$ROUND_DIR/nat-evidence.json"
-  read -r EVIDENCE_PASS EVIDENCE_REASON EVIDENCE_A_DELTA EVIDENCE_B_DELTA < <(
+  read -r EVIDENCE_PASS EVIDENCE_REASON EVIDENCE_A_DELTA EVIDENCE_B_DELTA \
+    EVIDENCE_A_BUDGET EVIDENCE_B_BUDGET \
+    EVIDENCE_A_DIRECT_FIRST_REMAINING EVIDENCE_B_DIRECT_FIRST_REMAINING \
+    EVIDENCE_A_BUDGET_DIRECT_FIRST_REMAINING \
+    EVIDENCE_B_BUDGET_DIRECT_FIRST_REMAINING < <(
     python3 - "$ROUND_DIR/nat-evidence.json" <<'PY'
 import json
 import sys
@@ -1307,11 +1312,42 @@ try:
     reason = record.get("decision", {}).get("reason_code") or "none"
     a_delta = observed["a"]["first_usable"].get("delta_ms")
     b_delta = observed["b"]["first_usable"].get("delta_ms")
+    a_budget = observed["a"]["first_usable"].get("budget_ms")
+    b_budget = observed["b"]["first_usable"].get("budget_ms")
+    a_remaining = observed["a"]["first_usable"].get(
+        "direct_first_remaining_ms_at_relay_ready"
+    )
+    b_remaining = observed["b"]["first_usable"].get(
+        "direct_first_remaining_ms_at_relay_ready"
+    )
+    a_budget_remaining = observed["a"]["first_usable"].get(
+        "budget_direct_first_remaining_ms"
+    )
+    b_budget_remaining = observed["b"]["first_usable"].get(
+        "budget_direct_first_remaining_ms"
+    )
     a_delta = a_delta if isinstance(a_delta, int) else -1
     b_delta = b_delta if isinstance(b_delta, int) else -1
-    print(int(result), reason, a_delta, b_delta)
+    a_budget = a_budget if isinstance(a_budget, int) else -1
+    b_budget = b_budget if isinstance(b_budget, int) else -1
+    a_remaining = a_remaining if isinstance(a_remaining, int) else -1
+    b_remaining = b_remaining if isinstance(b_remaining, int) else -1
+    a_budget_remaining = a_budget_remaining if isinstance(a_budget_remaining, int) else -1
+    b_budget_remaining = b_budget_remaining if isinstance(b_budget_remaining, int) else -1
+    print(
+        int(result),
+        reason,
+        a_delta,
+        b_delta,
+        a_budget,
+        b_budget,
+        a_remaining,
+        b_remaining,
+        a_budget_remaining,
+        b_budget_remaining,
+    )
 except Exception:
-    print("0 collector_record_invalid -1 -1")
+    print("0 collector_record_invalid -1 -1 -1 -1 -1 -1 -1 -1")
 PY
   )
 
@@ -1321,31 +1357,58 @@ PY
   # machines or promotes a log-only timestamp to acceptance evidence.
   A_DELTA="$EVIDENCE_A_DELTA"
   B_DELTA="$EVIDENCE_B_DELTA"
+  A_BUDGET="$EVIDENCE_A_BUDGET"
+  B_BUDGET="$EVIDENCE_B_BUDGET"
+  A_DIRECT_FIRST_REMAINING="$EVIDENCE_A_DIRECT_FIRST_REMAINING"
+  B_DIRECT_FIRST_REMAINING="$EVIDENCE_B_DIRECT_FIRST_REMAINING"
+  A_BUDGET_DIRECT_FIRST_REMAINING="$EVIDENCE_A_BUDGET_DIRECT_FIRST_REMAINING"
+  B_BUDGET_DIRECT_FIRST_REMAINING="$EVIDENCE_B_BUDGET_DIRECT_FIRST_REMAINING"
   DELTA_OK=1
-  if [[ -z "$A_DELTA" || -z "$B_DELTA" ]]; then
-    if [[ "$MODE" == "relay-only" ]]; then
-      echo "[nat-sim] ROUND $round: FAIL reason_code=${EVIDENCE_REASON:-first_usable_delta_missing} a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
-      DELTA_OK=0
-      overall=1
-      A_DELTA=-1
-      B_DELTA=-1
-      SUM_DELTA=-1
-    else
-      echo "[nat-sim] ROUND $round: FAIL reason_code=${EVIDENCE_REASON:-first_usable_delta_missing} a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing}" >&2
-      DELTA_OK=0
-      overall=1
-      A_DELTA=-1
-      B_DELTA=-1
-      SUM_DELTA=-1
-    fi
+  BUDGET_EVIDENCE_OK=1
+  if [[ -z "$A_DELTA" || -z "$B_DELTA" || -z "$A_BUDGET" || -z "$B_BUDGET" \
+        || "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 \
+        || "$A_BUDGET" -lt 0 || "$B_BUDGET" -lt 0 ]]; then
+    echo "[nat-sim] ROUND $round: FAIL reason_code=${EVIDENCE_REASON:-first_usable_delta_missing} a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing} a_budget_ms=${A_BUDGET:-missing} b_budget_ms=${B_BUDGET:-missing}" >&2
+    DELTA_OK=0
+    overall=1
+    A_DELTA=${A_DELTA:--1}
+    B_DELTA=${B_DELTA:--1}
+    A_BUDGET=${A_BUDGET:--1}
+    B_BUDGET=${B_BUDGET:--1}
+    A_DIRECT_FIRST_REMAINING=${A_DIRECT_FIRST_REMAINING:--1}
+    B_DIRECT_FIRST_REMAINING=${B_DIRECT_FIRST_REMAINING:--1}
+    A_BUDGET_DIRECT_FIRST_REMAINING=${A_BUDGET_DIRECT_FIRST_REMAINING:--1}
+    B_BUDGET_DIRECT_FIRST_REMAINING=${B_BUDGET_DIRECT_FIRST_REMAINING:--1}
+    SUM_DELTA=-1
   else
     SUM_DELTA=$((A_DELTA + B_DELTA))
     DELTA_SUMS+=("$SUM_DELTA")
   fi
 
+  # Depending on Relay-ready order and initial business/echo direction, either
+  # endpoint's protection can gate first ingress. Pair the authoritative
+  # remainders by their maximum and reject missing or forged budget evidence.
+  if [[ "$MODE" == "relay-only" && "$DELTA_OK" -eq 1 ]]; then
+    PAIRED_DIRECT_FIRST_REMAINING="$A_DIRECT_FIRST_REMAINING"
+    if [[ "$B_DIRECT_FIRST_REMAINING" -gt "$PAIRED_DIRECT_FIRST_REMAINING" ]]; then
+      PAIRED_DIRECT_FIRST_REMAINING="$B_DIRECT_FIRST_REMAINING"
+    fi
+    if [[ "$A_DIRECT_FIRST_REMAINING" -lt 0 || "$A_DIRECT_FIRST_REMAINING" -gt 5000 \
+          || "$B_DIRECT_FIRST_REMAINING" -lt 0 || "$B_DIRECT_FIRST_REMAINING" -gt 5000 \
+          || "$A_BUDGET_DIRECT_FIRST_REMAINING" -ne "$PAIRED_DIRECT_FIRST_REMAINING" \
+          || "$B_BUDGET_DIRECT_FIRST_REMAINING" -ne "$PAIRED_DIRECT_FIRST_REMAINING" \
+          || "$A_BUDGET" -ne $((3000 + A_BUDGET_DIRECT_FIRST_REMAINING)) \
+          || "$B_BUDGET" -ne $((3000 + B_BUDGET_DIRECT_FIRST_REMAINING)) ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=evidence_parser_loss a_budget_ms=$A_BUDGET b_budget_ms=$B_BUDGET a_direct_first_remaining_ms=$A_DIRECT_FIRST_REMAINING b_direct_first_remaining_ms=$B_DIRECT_FIRST_REMAINING a_budget_direct_first_remaining_ms=$A_BUDGET_DIRECT_FIRST_REMAINING b_budget_direct_first_remaining_ms=$B_BUDGET_DIRECT_FIRST_REMAINING slo_base_ms=3000" >&2
+      BUDGET_EVIDENCE_OK=0
+      overall=1
+    fi
+  fi
+
   if [[ "$MODE" == "relay-only" && "$RELAY_DELAY_MS" -gt 0 ]]; then
-    if [[ "$DELTA_OK" -ne 1 || "$A_DELTA" -gt 3000 || "$B_DELTA" -gt 3000 ]]; then
-      echo "[nat-sim] ROUND $round: FAIL reason_code=relay_first_slo_exceeded slow_relay_delay_ms=$RELAY_DELAY_MS a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA slo_ms=3000" >&2
+    if [[ "$DELTA_OK" -ne 1 || "$BUDGET_EVIDENCE_OK" -ne 1 \
+          || "$A_DELTA" -gt "$A_BUDGET" || "$B_DELTA" -gt "$B_BUDGET" ]]; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=relay_first_slo_exceeded slow_relay_delay_ms=$RELAY_DELAY_MS a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA a_budget_ms=$A_BUDGET b_budget_ms=$B_BUDGET a_direct_first_remaining_ms=$A_DIRECT_FIRST_REMAINING b_direct_first_remaining_ms=$B_DIRECT_FIRST_REMAINING a_budget_direct_first_remaining_ms=$A_BUDGET_DIRECT_FIRST_REMAINING b_budget_direct_first_remaining_ms=$B_BUDGET_DIRECT_FIRST_REMAINING slo_base_ms=3000" >&2
       overall=1
     else
       echo "[nat-sim] ROUND $round: FAIL reason_code=slow_relay_test_not_exercised delay_ms=$RELAY_DELAY_MS" >&2
@@ -1370,7 +1433,8 @@ PY
     #     ingress);
     #   - BOTH sides' first usable path had real relay ingress (ingress=relay:),
     #     which by construction required a locally-sent, matching-nonce echo;
-    #   - each daemon's OWN monotonic relay-ready -> usable delta <= 3000ms;
+    #   - each daemon's OWN monotonic relay-ready -> usable delta is at most
+    #     the authoritative remaining DirectFirst protection plus 3000ms;
     #   - zero structured outbound drops, zero WireGuard replay rejects and
     #     zero overlay duplicate/invalid on BOTH sides;
     #   - when OVERLAY_BURST is set: the full burst completed on BOTH sides.
@@ -1423,12 +1487,19 @@ except Exception:
       relay_direct_ok=1
     fi
     if [[ "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 && "$DELTA_OK" -eq 1 \
+          && "$BUDGET_EVIDENCE_OK" -eq 1 \
           && "$EVIDENCE_PASS" -eq 1 \
           && "$overlay_ok" -eq 1 && "$relay_direct_ok" -eq 1 \
           && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \
           && "$a_relay_first" -eq 1 && "$b_relay_first" -eq 1 \
-          && "$A_DELTA" -ge 0 && "$A_DELTA" -le 3000 \
-          && "$B_DELTA" -ge 0 && "$B_DELTA" -le 3000 \
+          && "$A_DIRECT_FIRST_REMAINING" -ge 0 && "$A_DIRECT_FIRST_REMAINING" -le 5000 \
+          && "$B_DIRECT_FIRST_REMAINING" -ge 0 && "$B_DIRECT_FIRST_REMAINING" -le 5000 \
+          && "$A_BUDGET_DIRECT_FIRST_REMAINING" -eq "$PAIRED_DIRECT_FIRST_REMAINING" \
+          && "$B_BUDGET_DIRECT_FIRST_REMAINING" -eq "$PAIRED_DIRECT_FIRST_REMAINING" \
+          && "$A_BUDGET" -eq $((3000 + A_BUDGET_DIRECT_FIRST_REMAINING)) \
+          && "$B_BUDGET" -eq $((3000 + B_BUDGET_DIRECT_FIRST_REMAINING)) \
+          && "$A_DELTA" -ge 0 && "$A_DELTA" -le "$A_BUDGET" \
+          && "$B_DELTA" -ge 0 && "$B_DELTA" -le "$B_BUDGET" \
           && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \
           && "$A_REPLAY" -eq 0 && "$B_REPLAY" -eq 0 \
           && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 \
@@ -1436,7 +1507,7 @@ except Exception:
           && "$A_STATUS_ALWAYS_200" -eq 1 && "$B_STATUS_ALWAYS_200" -eq 1 \
           && "$A_TASKS_OK" -eq 1 && "$B_TASKS_OK" -eq 1 \
           && "$BURST_OK" -eq 1 ]]; then
-      echo "[nat-sim] ROUND $round: PASS relay_first_evidence overlay_ok=1 a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT task_leak_a=$((1 - A_TASKS_OK)) task_leak_b=$((1 - B_TASKS_OK)) elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
+      echo "[nat-sim] ROUND $round: PASS relay_first_evidence overlay_ok=1 a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA a_budget_ms=$A_BUDGET b_budget_ms=$B_BUDGET a_direct_first_remaining_ms=$A_DIRECT_FIRST_REMAINING b_direct_first_remaining_ms=$B_DIRECT_FIRST_REMAINING a_budget_direct_first_remaining_ms=$A_BUDGET_DIRECT_FIRST_REMAINING b_budget_direct_first_remaining_ms=$B_BUDGET_DIRECT_FIRST_REMAINING slo_base_ms=3000 sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT task_leak_a=$((1 - A_TASKS_OK)) task_leak_b=$((1 - B_TASKS_OK)) elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} evidence=$ROUND_DIR/evidence.log"
     else
       RELAY_REASON=relay_business_gate_failed
       if [[ "$A_DIRECT" -ne 0 || "$B_DIRECT" -ne 0 ]]; then
@@ -1445,9 +1516,11 @@ except Exception:
         RELAY_REASON=relay_confirmation_missing
       elif [[ "$a_relay_first" -ne 1 || "$b_relay_first" -ne 1 ]]; then
         RELAY_REASON=first_usable_path_mismatch
+      elif [[ "$BUDGET_EVIDENCE_OK" -ne 1 ]]; then
+        RELAY_REASON=evidence_parser_loss
       elif [[ "$DELTA_OK" -ne 1 || "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 ]]; then
         RELAY_REASON=first_usable_delta_missing
-      elif [[ "$A_DELTA" -gt 3000 || "$B_DELTA" -gt 3000 ]]; then
+      elif [[ "$A_DELTA" -gt "$A_BUDGET" || "$B_DELTA" -gt "$B_BUDGET" ]]; then
         RELAY_REASON=relay_first_slo_exceeded
       elif [[ "$A_DROPS" -ne 0 || "$B_DROPS" -ne 0 ]]; then
         RELAY_REASON=outbound_drop
@@ -1464,7 +1537,7 @@ except Exception:
       elif [[ "$overlay_ok" -ne 1 ]]; then
         RELAY_REASON=overlay_verification_failed
       fi
-      echo "[nat-sim] ROUND $round: FAIL reason_code=$RELAY_REASON relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT status_always_200_a=$A_STATUS_ALWAYS_200 status_always_200_b=$B_STATUS_ALWAYS_200 task_health_a=$A_TASKS_OK task_health_b=$B_TASKS_OK elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= 3000ms, zero drops/replay/invalid, burst complete, status always HTTP 200, no supervised task exit)"
+      echo "[nat-sim] ROUND $round: FAIL reason_code=$RELAY_REASON relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA a_budget_ms=$A_BUDGET b_budget_ms=$B_BUDGET a_direct_first_remaining_ms=$A_DIRECT_FIRST_REMAINING b_direct_first_remaining_ms=$B_DIRECT_FIRST_REMAINING a_budget_direct_first_remaining_ms=$A_BUDGET_DIRECT_FIRST_REMAINING b_budget_direct_first_remaining_ms=$B_BUDGET_DIRECT_FIRST_REMAINING slo_base_ms=3000 sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT status_always_200_a=$A_STATUS_ALWAYS_200 status_always_200_b=$B_STATUS_ALWAYS_200 task_health_a=$A_TASKS_OK task_health_b=$B_TASKS_OK elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= paired maximum remaining DirectFirst protection + 3000ms, zero drops/replay/invalid, burst complete, status always HTTP 200, no supervised task exit)"
       overall=1
     fi
   else
@@ -1524,8 +1597,9 @@ except Exception:
     [[ "$A_INGRESS" == "direct" ]] && a_direct_business=1
     [[ "$B_INGRESS" == "direct" ]] && b_direct_business=1
     if [[ "$direct_ok" -eq 1 && "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 \
-          && "$DELTA_OK" -eq 1 && "$A_DELTA" -ge 0 && "$A_DELTA" -le 3000 \
-          && "$B_DELTA" -ge 0 && "$B_DELTA" -le 3000 \
+          && "$DELTA_OK" -eq 1 && "$A_BUDGET" -eq 3000 && "$B_BUDGET" -eq 3000 \
+          && "$A_DELTA" -ge 0 && "$A_DELTA" -le "$A_BUDGET" \
+          && "$B_DELTA" -ge 0 && "$B_DELTA" -le "$B_BUDGET" \
           && "$A_RELAY_CONFIRMED" -ge 1 && "$B_RELAY_CONFIRMED" -ge 1 \
           && "$direct_order_timestamps_ok" -eq 1 \
           && "$direct_before_business_ok" -eq 1 \
@@ -1542,7 +1616,9 @@ except Exception:
         DIRECT_REASON="direct_overlay_unverified"
       elif [[ "$DELTA_OK" -ne 1 || "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 ]]; then
         DIRECT_REASON="first_usable_delta_missing"
-      elif [[ "$A_DELTA" -gt 3000 || "$B_DELTA" -gt 3000 ]]; then
+      elif [[ "$A_BUDGET" -ne 3000 || "$B_BUDGET" -ne 3000 ]]; then
+        DIRECT_REASON="evidence_parser_loss"
+      elif [[ "$A_DELTA" -gt "$A_BUDGET" || "$B_DELTA" -gt "$B_BUDGET" ]]; then
         DIRECT_REASON="relay_first_slo_exceeded"
       elif [[ "$A_RELAY_CONFIRMED" -lt 1 || "$B_RELAY_CONFIRMED" -lt 1 ]]; then
         DIRECT_REASON="relay_confirmation_missing"

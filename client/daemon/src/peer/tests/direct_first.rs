@@ -248,6 +248,42 @@ fn direct_first_queue_timeout_does_not_invent_a_relay() {
 }
 
 #[tokio::test]
+async fn relay_ready_timeline_captures_authoritative_direct_first_remaining_window() {
+    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let manager = PeerManager::new(config);
+    let timeline = crate::connection_timeline::ConnectionTimeline::new("node-a", 0);
+    manager.set_timeline(timeline.clone());
+    manager
+        .add_peer(&test_peer(
+            "peer-direct-first",
+            "198.51.100.9:41000".parse().unwrap(),
+        ))
+        .await;
+    let generation = manager.current_network_generation().await;
+
+    manager
+        .mark_relay_transport_ready_with_transport(
+            "peer-direct-first",
+            "relay.test:443",
+            generation,
+            Some(17),
+        )
+        .await;
+
+    let event = timeline
+        .snapshot()
+        .events
+        .into_iter()
+        .find(|event| event.event == "relay_transport_ready_peer")
+        .expect("relay-ready must emit structured timing evidence");
+    let remaining_ms = event
+        .direct_first_remaining_ms
+        .expect("DirectFirst remaining time must never be omitted");
+    assert!(remaining_ms > 0);
+    assert!(remaining_ms <= DIRECT_FIRST_WINDOW.as_millis() as u64);
+}
+
+#[tokio::test]
 async fn direct_first_manager_blocks_relay_but_admits_one_way_confirmed_direct() {
     let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
     let manager = PeerManager::new(config);
