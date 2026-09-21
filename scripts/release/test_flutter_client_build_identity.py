@@ -1498,6 +1498,21 @@ test "$(sed -n 's/^P2WLAN_SOURCE_GIT_COMMIT=//p' "$snapshot")" = "$P2WLAN_TEST_C
                 workflow_path,
             )
 
+    def test_package_macos_workflow_uses_identity_wrapper(self):
+        workflow_path = ".github/workflows/package-test.yml"
+        workflow = (ROOT / workflow_path).read_text(encoding="utf-8")
+        macos_job = workflow_job(workflow, "  macos-arm64:\n")
+        self.assertRegex(
+            macos_job,
+            r"(?m)^\s*bash\s+[^\n]*scripts/release/build_flutter_client\.sh macos(?:\s|$)",
+            workflow_path,
+        )
+        self.assertNotRegex(
+            macos_job,
+            r"(?m)^\s*(?:run:\s+)?flutter build macos(?:\s|$)",
+            workflow_path,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
