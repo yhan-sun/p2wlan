@@ -310,6 +310,7 @@ func (db *DB) RecordPathObservations(
 			return nil, fmt.Errorf("inspecting existing observation: %w", scanErr)
 		}
 
+		ownerAdvanced := exists && registrationSeq > existing.RegistrationSeq
 		if exists {
 			// Fencing hierarchy:
 			// 1. Session registration sequence (server-issued owner identity)
@@ -367,7 +368,8 @@ func (db *DB) RecordPathObservations(
 			if currPath != nil {
 				incomingCurrentPath = *currPath
 			}
-			pathSwitched = existingCurrentPath != "" &&
+			pathSwitched = !ownerAdvanced &&
+				existingCurrentPath != "" &&
 				incomingCurrentPath != "" &&
 				existingCurrentPath != incomingCurrentPath
 
@@ -480,10 +482,10 @@ func (db *DB) RecordPathObservations(
 		delta := connectionMetricDeltaForObservation(
 			currPath,
 			pathSwitched,
-			recordTransition,
+			recordTransition && !ownerAdvanced,
 			obsReason,
 			validationRTT,
-			isResync,
+			isResync || ownerAdvanced,
 		)
 		if err := upsertConnectionMetricHourly(tx, networkID, now, delta); err != nil {
 			return nil, err
