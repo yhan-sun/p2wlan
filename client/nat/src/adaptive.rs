@@ -1,11 +1,10 @@
 //! Adaptive prediction enhancements for fresh-mapping models.
 //!
-//! This is a semantic 1:1 migration of the two stateful helpers validated in
-//! `scripts/punch-research/predict.py` (S1.2/S1.3): a dual-channel EWMA step
-//! learner and a reverse-allocation pattern detector.  Both are per-public-IP
-//! state: the daemon resets them when the local public IP or network
-//! generation changes, because a different allocator instance means none of
-//! the learned stride or direction is transferable.
+//! A dual-channel EWMA step learner and a reverse-allocation pattern
+//! detector, originally based on `scripts/punch-research/predict.py`.
+//! Both are per-public-IP state: the daemon resets them when the local
+//! public IP or network generation changes, because a different allocator
+//! instance means none of the learned stride or direction is transferable.
 //!
 //! Neither type is a model in its own right — they only refine the stride a
 //! [`crate::mapping::PortModel`] already identified and widen the candidate
@@ -18,8 +17,7 @@ use std::collections::VecDeque;
 /// mode, mirroring `StepLearner(mode_window=8)`.
 const DIFF_MODE_WINDOW: usize = 8;
 
-/// Bounded ring of raw positive diffs fed to the mode + EWMA (maxlen 32 in the
-/// reference implementation).
+/// Bounded ring of signed non-zero diffs fed to the mode + EWMA.
 const DIFF_BUFFER: usize = 32;
 
 /// Bounded ring of observed peer ports kept for direction detection (maxlen 32).
@@ -78,7 +76,8 @@ pub struct StepLearner {
     diffs: VecDeque<i16>,
     /// Current fused estimate (signed), or `None` before any observation.
     estimate: Option<i16>,
-    /// Running maximum of the diff-channel mode coverage (0.0..=1.0).
+    /// Most recent diff-window mode coverage (0.0..=1.0), not a calibrated
+    /// probability that the next allocation will match the estimate.
     confidence: f64,
     /// Number of times the fused estimate changed (learning trajectory).
     revision_count: u32,
@@ -165,8 +164,9 @@ impl StepLearner {
         self.estimate
     }
 
-    /// Confidence in the estimate: the running maximum diff-channel mode
-    /// coverage, in `0.0..=1.0`.
+    /// Most recent diff-window mode coverage, in `0.0..=1.0`.
+    /// This may decrease as new samples disagree. It is a descriptive score,
+    /// not a success probability; a one-sample window also has coverage 1.
     pub fn confidence(&self) -> f64 {
         self.confidence
     }
@@ -212,11 +212,15 @@ impl StepLearner {
         };
         let new = est.round() as i16;
         if self.estimate != Some(new) {
-            self.revision_count += 1;
+            self.revision_count = self.revision_count.saturating_add(1);
         }
         self.estimate = Some(new);
         if let Some(cov) = diff_cov {
-            self.confidence = self.confidence.max(cov).min(1.0);
+            // The first observation has coverage 1. Keeping a historical
+            // maximum would pin every learner to 1 even after its allocator
+            // becomes noisy. Advertisement-only updates leave this empirical
+            // window score unchanged because they add no diff observations.
+            self.confidence = cov.clamp(0.0, 1.0);
         }
     }
 }
@@ -261,9 +265,9 @@ impl ReverseDetector {
     /// Record one observed peer port (in allocation order) and reclassify.
     ///
     /// The classification is recomputed from the sign of every consecutive
-    /// (wrap-normalized) difference over the stored ports, restricted to the
-    /// last `window` signs.  Fewer than three ports is not enough evidence, so
-    /// the pattern holds at its default `Forward`.
+    /// (wrap-normalized) difference between consecutive observed ports over the
+    /// stored ports, restricted to the last `window` signs. Fewer than three
+    /// ports is not enough evidence, so the pattern holds at its default.
     pub fn observe_port(&mut self, port: u16) {
         self.ports.push_back(port);
         if self.ports.len() > PORT_BUFFER {
@@ -518,6 +522,50 @@ mod tests {
         learner.observe_advertised(5);
         // 0.6*5 + 0.4*3 = 4.2 -> 4.
         assert_eq!(learner.estimate(), Some(4));
+    }
+
+    #[test]
+    fn confidence_falls_when_recent_samples_disagree() {
+        let mut learner = StepLearner::new();
+        learner.observe_diff(3);
+        assert_eq!(learner.confidence(), 1.0);
+        learner.observe_diff(4);
+        assert_eq!(learner.confidence(), 0.5);
+        learner.observe_diff(5);
+        assert_eq!(learner.confidence(), 1.0 / 3.0);
+    }
+
+    #[test]
+    fn confidence_recovers_only_as_noisy_samples_leave_the_window() {
+        let mut learner = StepLearner::new();
+        for diff in 1..=DIFF_MODE_WINDOW as i16 {
+            learner.observe_diff(diff);
+        }
+        assert_eq!(learner.confidence(), 1.0 / DIFF_MODE_WINDOW as f64);
+        for _ in 0..DIFF_MODE_WINDOW {
+            learner.observe_diff(-3);
+        }
+        assert_eq!(learner.confidence(), 1.0);
+    }
+
+    #[test]
+    fn advertisements_do_not_inflate_observed_window_coverage() {
+        let mut learner = StepLearner::new();
+        learner.observe_diff(3);
+        learner.observe_diff(4);
+        learner.observe_advertised(5);
+        assert_eq!(learner.confidence(), 0.5);
+        learner.observe_diff(0);
+        assert_eq!(learner.confidence(), 0.5);
+    }
+
+    #[test]
+    fn revision_count_saturates_instead_of_overflowing() {
+        let mut learner = StepLearner::new();
+        learner.revision_count = u32::MAX;
+        learner.observe_diff(3);
+        assert_eq!(learner.estimate(), Some(3));
+        assert_eq!(learner.revision_count(), u32::MAX);
     }
 
     // ---- ReverseDetector ----
