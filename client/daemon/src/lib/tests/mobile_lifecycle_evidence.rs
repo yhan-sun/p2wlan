@@ -163,8 +163,12 @@ mod mobile_lifecycle_evidence {
 
     #[tokio::test]
     async fn ml16_relay_retention() {
-        let manager =
-            PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        let manager = PeerManager::new({
+            // This regression exercises the explicit legacy Auto policy.
+            let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+            config.relay.path_policy = crate::config::PathPolicy::Auto;
+            config
+        });
         let endpoint: SocketAddr = "198.51.100.90:51831".parse().unwrap();
         manager
             .add_peer(&evidence_peer("peer-relay", &endpoint.to_string()))

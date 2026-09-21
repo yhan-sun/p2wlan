@@ -1273,10 +1273,13 @@ mod overlay_validate_tests {
         use crate::control::PeerInfo;
         use crate::peer::NetworkPath;
 
-        let manager = PeerManager::new(
-            Config::generate_default("http://ctrl.test", "default")
-                .expect("test config must build"),
-        );
+        let manager = PeerManager::new({
+            // This regression exercises the explicit legacy Auto policy.
+            let mut config = Config::generate_default("http://ctrl.test", "default")
+                .expect("test config must build");
+            config.relay.path_policy = crate::config::PathPolicy::Auto;
+            config
+        });
         manager
             .add_peer(&PeerInfo {
                 node_id: "peer-overlay-path".to_string(),

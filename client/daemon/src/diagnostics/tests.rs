@@ -4,7 +4,7 @@ mod tests {
 
     use super::*;
     use crate::control::PeerInfo;
-    use crate::peer::{REASON_DIRECT_PROBE_FAILED, REASON_PATH_UNAVAILABLE};
+    use crate::peer::REASON_DIRECT_PROBE_FAILED;
 
     #[test]
     fn no_browser_cors_is_never_emitted_for_any_origin() {
@@ -427,7 +427,10 @@ mod tests {
             .current_path_selection
             .as_ref()
             .expect("current path selection should be included in /status");
-        assert_eq!(current_path.reason_code, REASON_PATH_UNAVAILABLE);
+        assert_eq!(
+            current_path.reason_code,
+            crate::peer::REASON_PATH_DIRECT_FIRST_WAIT
+        );
 
         let mut events_stream = TcpStream::connect(addr).await.unwrap();
         let previous_process_id = std::process::id().wrapping_add(1);

@@ -727,7 +727,12 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
         })
     };
 
-    let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+    let mut config = {
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    };
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-local".to_string();
     let daemon = Arc::new(Daemon::new(config));
@@ -771,9 +776,12 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
         p2pnet_relay::RelayClient::connect(&relay_endpoint, peer_id)
             .await
             .unwrap();
-    let remote_peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let remote_peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     remote_peers
         .add_peer(&control::PeerInfo {
             node_id: "node-local".to_string(),
@@ -1511,9 +1519,12 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     for (peer_id, vip) in [("node-b", "10.20.0.2"), ("node-c", "10.20.0.3")] {
         peers
             .add_peer(&control::PeerInfo {
@@ -1857,9 +1868,12 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
             node_id: "node-b".to_string(),
@@ -1987,7 +2001,12 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
     // + owner, within TTL) may confirm it.  A stale/foreign ACK no-ops, and a
     // relay 404 / transport invalidation revokes the confirmation so a later
     // relay must re-probe.
-    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let config = {
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    };
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
@@ -2189,9 +2208,12 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
             node_id: "node-b".to_string(),
@@ -2559,9 +2581,12 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
             node_id: "node-b".to_string(),

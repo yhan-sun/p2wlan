@@ -1936,20 +1936,21 @@ mod tests {
     }
 
     #[test]
-    fn learning_matching_negative_estimate_still_overrides() {
-        // Counterpart guard: when the learned estimate shares the model's
-        // direction it must still override the step (the cross-batch reading is
-        // more current).  Model step -3, learned -7 -> the top candidate is
-        // last - 7, not last - 3.
+    fn learning_matching_negative_estimate_retains_both_hypotheses() {
+        // Same direction does not establish which batch is more current.
+        // Preserve the fresh -3 successor and include the learned -7 walk
+        // as a secondary hypothesis without expanding the total budget.
         let model = build_model(&[30000, 29997, 29994], Some(ip()), 1000);
         assert!(matches!(model.kind, PortModelKind::FixedStep { step: -3 }));
+        let baseline = predict_ports_with_learning(&model, 29994, 0, 0, None, true);
         let predicted = predict_ports_with_learning(&model, 29994, 0, 0, Some(-7), true);
-        assert_eq!(
-            predicted.first().map(|c| c.port),
-            Some(29987),
-            "a same-direction negative estimate must still override the model step, got {:?}",
-            predicted
-        );
+        assert_eq!(predicted[0], baseline[0]);
+        assert_eq!(predicted[0].port, 29991);
+        assert_eq!(predicted.len(), baseline.len());
+        assert!(predicted.iter().any(|candidate| {
+            candidate.port == 29987
+                && matches!(candidate.reason, PredictionReason::LearnedSuccessor { .. })
+        }));
     }
 
     // ---- P0-3: port 0 is never a candidate ----

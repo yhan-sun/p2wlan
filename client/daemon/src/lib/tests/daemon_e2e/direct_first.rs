@@ -4,6 +4,15 @@ use super::*;
 /// A warm, authenticated Relay must not steal the first application payload.
 #[tokio::test]
 async fn direct_first_queued_business_uses_direct_without_relay_prelude() {
+    run_direct_first_queued_business_case(true).await;
+}
+
+#[tokio::test]
+async fn direct_first_queued_business_falls_back_only_after_its_bounded_window() {
+    run_direct_first_queued_business_case(false).await;
+}
+
+async fn run_direct_first_queued_business_case(establish_direct: bool) {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
     let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -14,6 +23,7 @@ async fn direct_first_queued_business_uses_direct_without_relay_prelude() {
         timeout: config.relay.startup_wait_timeout(true),
     };
     let peers = Arc::new(PeerManager::new(config));
+    let started = std::time::Instant::now();
     peers
         .add_peer(&control::PeerInfo {
             node_id: "node-b".to_string(),
@@ -98,6 +108,28 @@ async fn direct_first_queued_business_uses_direct_without_relay_prelude() {
             .await
             .is_err()
     );
+    if !establish_direct {
+        // Use the production timer and FIFO, not a test-only state override.
+        // The configured queue lease outlives the first Direct attempt.
+        let relayed = tokio::time::timeout(Duration::from_secs(7), relay_rx.recv())
+            .await
+            .expect("bounded Direct attempt must fall back before the queue expires")
+            .expect("Relay stays connected");
+        assert!(started.elapsed() >= crate::peer::DIRECT_FIRST_WINDOW);
+        let RelayMessage::Data { from_node, data } = relayed else {
+            panic!("expected encrypted business data, got {relayed:?}");
+        };
+        assert_eq!(from_node, "node-a");
+        assert_eq!(remote_session.decrypt_from_bytes(&data).unwrap(), packet);
+        assert_eq!(
+            peers.select_path_for_data("node-b", true, true).await.path,
+            Some(peer::NetworkPath::Relay)
+        );
+        worker.abort();
+        forwarder.abort();
+        server.shutdown().await;
+        return;
+    }
     // Inject the existing authoritative validation commit; no application
     // packet has ever arrived in the reverse direction or through Relay.
     peers.record_direct_success("node-b", Some(endpoint)).await;
