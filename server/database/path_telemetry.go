@@ -34,6 +34,7 @@ type PathObservation struct {
 	TransitionReason        string  `json:"transition_reason"`
 	PathAgeMS               uint64  `json:"path_age_ms"`
 	SelectedPathMTU         *uint32 `json:"selected_path_mtu,omitempty"`
+	SelectedMTU             *uint32 `json:"selected_mtu,omitempty"`
 	SelectedUDPDatagramSize *uint32 `json:"selected_udp_datagram_size,omitempty"`
 	DirectState             string  `json:"direct_state,omitempty"`
 	RelayState              string  `json:"relay_state,omitempty"`
@@ -41,6 +42,8 @@ type PathObservation struct {
 	RelayServer             string  `json:"relay_server,omitempty"`
 	LastHandshakeAgeMS      *uint64 `json:"last_handshake_age_ms,omitempty"`
 	LastValidationRTTMS     *uint64 `json:"last_validation_rtt_ms,omitempty"`
+	LastDirectLatencyMS     *uint64 `json:"last_direct_latency_ms,omitempty"`
+	LastRelayLatencyMS      *uint64 `json:"last_relay_latency_ms,omitempty"`
 	ObservedAt              int64   `json:"observed_at"`
 }
 
@@ -106,6 +109,30 @@ func sanitizeLifecycle(l string) string {
 		return l
 	default:
 		return "unbound"
+	}
+}
+
+func normalizedSelectedPathMTU(obs PathObservation) *uint32 {
+	if obs.SelectedPathMTU != nil {
+		return obs.SelectedPathMTU
+	}
+	return obs.SelectedMTU
+}
+
+func normalizedValidationRTT(obs PathObservation, currentPath *string) *uint64 {
+	if obs.LastValidationRTTMS != nil {
+		return obs.LastValidationRTTMS
+	}
+	if currentPath == nil {
+		return nil
+	}
+	switch *currentPath {
+	case "direct":
+		return obs.LastDirectLatencyMS
+	case "relay":
+		return obs.LastRelayLatencyMS
+	default:
+		return nil
 	}
 }
 
@@ -252,6 +279,8 @@ func (db *DB) RecordPathObservations(
 		currPath := sanitizePath(obs.CurrentPath)
 		prevPath := sanitizePath(obs.PreviousPath)
 		lifecycle := sanitizeLifecycle(obs.Lifecycle)
+		selectedPathMTU := normalizedSelectedPathMTU(obs)
+		validationRTT := normalizedValidationRTT(obs, currPath)
 
 		// Check existing observation
 		var existing existingPathObservation
@@ -320,8 +349,11 @@ func (db *DB) RecordPathObservations(
 			// registrationSeq > existing.RegistrationSeq falls through to ACCEPT
 		}
 
-		// Accepted: determine if a transition should be recorded
+		// Accepted: determine if a transition should be recorded. The long-term
+		// path-switch metric is intentionally narrower than transition history:
+		// only an observed Direct<->Relay change counts as a path switch.
 		var recordTransition bool
+		var pathSwitched bool
 		if !exists {
 			recordTransition = true
 		} else {
@@ -333,6 +365,9 @@ func (db *DB) RecordPathObservations(
 			if currPath != nil {
 				incomingCurrentPath = *currPath
 			}
+			pathSwitched = existingCurrentPath != "" &&
+				incomingCurrentPath != "" &&
+				existingCurrentPath != incomingCurrentPath
 
 			if existingCurrentPath != incomingCurrentPath ||
 				existing.Lifecycle != lifecycle ||
@@ -362,7 +397,7 @@ func (db *DB) RecordPathObservations(
 				PathTelemetrySchemaVersion, registrationSeq, obs.ObservationRevision,
 				obs.NetworkGeneration, obs.PeerSessionGeneration, obs.RemoteCandidateEpoch,
 				lifecycle, currPath, prevPath, obsReason,
-				obs.SelectedPathMTU, obs.ObservedAt, now,
+				selectedPathMTU, obs.ObservedAt, now,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("insert transition: %w", err)
@@ -431,16 +466,32 @@ func (db *DB) RecordPathObservations(
 			PathTelemetrySchemaVersion, registrationSeq, obs.ObservationRevision,
 			obs.NetworkGeneration, obs.PeerSessionGeneration, obs.RemoteCandidateEpoch,
 			lifecycle, currPath, prevPath, obsReason,
-			obs.PathAgeMS, obs.SelectedPathMTU, obs.SelectedUDPDatagramSize,
+			obs.PathAgeMS, selectedPathMTU, obs.SelectedUDPDatagramSize,
 			obs.DirectState, obs.RelayState, obs.RecoveryState, obs.RelayServer,
-			obs.LastHandshakeAgeMS, obs.LastValidationRTTMS,
+			obs.LastHandshakeAgeMS, validationRTT,
 			obs.ObservedAt, now,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("upsert observation: %w", err)
 		}
 
+		delta := connectionMetricDeltaForObservation(
+			currPath,
+			pathSwitched,
+			recordTransition,
+			obsReason,
+			validationRTT,
+			isResync,
+		)
+		if err := upsertConnectionMetricHourly(tx, networkID, now, delta); err != nil {
+			return nil, err
+		}
+
 		summary.Accepted++
+	}
+
+	if err := pruneConnectionMetrics(tx, now); err != nil {
+		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
