@@ -5,6 +5,7 @@ import '@xyflow/react/dist/style.css'
 import './styles.css'
 import './polish.css'
 import './connections.css'
+import './connection-health.css'
 import App from './App'
 
 const queryClient = new QueryClient({

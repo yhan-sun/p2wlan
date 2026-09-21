@@ -49,6 +49,10 @@ attention signal 是固定、可解释的条件：
 
 阈值会随响应一起返回，不作为隐藏评分。transition history 每个方向最多保留 50 条，因此在极端高频切换超过保留上限时，窗口派生计数可能是下界；该接口不应被解释为完整长期时序分析。
 
+管理台提供独立的 **连接健康** 工作区消费该接口。Dashboard 只展示最近 1 小时的轻量摘要；`/admin/health` 支持按 Network scope 查看 1h / 6h / 24h 窗口，直接展示 fresh / stale / reporter offline、Direct / Relay、online-no-path、路径切换、显式失败与 validation RTT 样本。页面不会计算综合健康分，也不会把 Relay 本身着色成故障。
+
+Needs attention 列表逐条显示服务端返回的固定 signal 和阈值相关计数。点击某一项会读取相同 `(network, reporting device, remote device)` 的最新 directional Connection，并打开与 Connections 工作区共用的只读详情 / transition timeline；Health UI 不维护第二份连接详情或路径状态。
+
 管理台与 Control 使用同一 origin，不需要额外 CORS 放行。公网访问必须继续经过可信 HTTPS 反向代理；浏览器中的管理员令牌按敏感凭据处理，用完后退出管理台并关闭共享终端中的会话。
 
 ## 日志与证书

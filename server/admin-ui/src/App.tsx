@@ -20,6 +20,7 @@ import {
   CircleAlert,
   CircleCheck,
   Clock3,
+  Gauge,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -48,6 +49,7 @@ import {
 import { adminApi, ApiError, clearAdminToken, getAdminToken, setAdminToken, verifyAdminToken } from './api'
 import { accountColor, colorWithAlpha } from './colors'
 import { ConnectionsPage } from './ConnectionsPage'
+import { ConnectionHealthPage } from './ConnectionHealthPage'
 import { TopologyCanvas } from './TopologyCanvas'
 import { mergeTopologyPages } from './topologyPaging'
 import type {
@@ -261,6 +263,7 @@ const navGroups = [
     { to: '/relationships', icon: <Waypoints size={17} />, label: '资源关系' },
   ] },
   { label: 'OPERATIONS', items: [
+    { to: '/health', icon: <Gauge size={17} />, label: '连接健康' },
     { to: '/system', icon: <Activity size={17} />, label: '运行健康' },
   ] },
 ]
@@ -272,6 +275,7 @@ function pageMeta(pathname: string): { title: string; eyebrow: string } {
   if (pathname === '/connections') return { title: 'Connections', eyebrow: 'NETWORK' }
   if (pathname === '/devices') return { title: '设备', eyebrow: 'DEVICES' }
   if (pathname === '/networks') return { title: '网络与房间', eyebrow: 'NETWORK' }
+  if (pathname === '/health') return { title: '连接健康', eyebrow: 'OPERATIONS' }
   if (pathname === '/system') return { title: '运行健康', eyebrow: 'OPERATIONS' }
   return { title: '概览', eyebrow: 'OVERVIEW' }
 }
@@ -316,6 +320,11 @@ function Dashboard() {
   const overview = useQuery({ queryKey: ['overview'], queryFn: adminApi.overview, refetchInterval: 30_000 })
   const accounts = useQuery({ queryKey: ['accounts', 'recent'], queryFn: () => adminApi.accounts('', 6, 0), refetchInterval: 30_000 })
   const runtime = useQuery({ queryKey: ['runtime'], queryFn: adminApi.runtime, refetchInterval: 30_000 })
+  const connectionHealth = useQuery({
+    queryKey: ['connection-health', 'dashboard', 3600],
+    queryFn: () => adminApi.connectionHealth({ windowSeconds: 3600 }, 5),
+    refetchInterval: 60_000,
+  })
   if (overview.isPending || accounts.isPending || runtime.isPending) return <PendingBlock queries={[overview, accounts, runtime]} label="正在读取 Control 状态…" />
   const error = overview.error || accounts.error || runtime.error
   if (error) return <ErrorBlock error={error} />
@@ -330,6 +339,19 @@ function Dashboard() {
       <MetricCard icon={<Network size={18} />} label="网络" value={overview.data.networks} meta={<>{overview.data.rooms} 个房间网络</>} />
       <MetricCard icon={<Activity size={18} />} label="待处理信令" value={overview.data.pending_signals} meta={<>{overview.data.active_tunnels} 个 Control 活动隧道</>} />
     </section>
+
+    {connectionHealth.isPending
+      ? <section className="dashboard-health-strip"><div className="dashboard-health-title"><span><Gauge size={16} /></span><div><strong>Connection Health</strong><small>正在聚合最近 1 小时的路径信号…</small></div></div></section>
+      : connectionHealth.error
+        ? <section className="dashboard-health-strip"><div className="dashboard-health-title"><span><CircleAlert size={16} /></span><div><strong>Connection Health 暂不可用</strong><small>{connectionHealth.error instanceof Error ? connectionHealth.error.message : '读取失败'}</small></div></div><Link to="/health">打开工作区<ArrowRight size={14} /></Link></section>
+        : connectionHealth.data && <section className="dashboard-health-strip">
+          <div className="dashboard-health-title"><span><Gauge size={16} /></span><div><strong>Connection Health · 1h</strong><small>派生信号，不是综合健康分</small></div></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.alerts_total}</strong><span>Needs attention</span></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.fresh_direct}</strong><span>Fresh Direct</span></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.fresh_relay}</strong><span>Fresh Relay</span></div>
+          <div className="dashboard-health-fact"><strong>{connectionHealth.data.summary.recent_path_switches}</strong><span>Path switches</span></div>
+          <Link to="/health">查看连接健康<ArrowRight size={14} /></Link>
+        </section>}
 
     <section className="dashboard-grid operations-grid">
       <Panel className="health-card" title="Control 运行健康" subtitle="这里只展示 Control 能直接确认的事实" action={<span className="badge success"><span />可响应</span>}>
@@ -641,6 +663,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
       <Route path="connections" element={<ConnectionsPage />} />
       <Route path="devices" element={<DevicesPage />} />
       <Route path="networks" element={<NetworksPage />} />
+      <Route path="health" element={<ConnectionHealthPage />} />
       <Route path="system" element={<SystemPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Route>

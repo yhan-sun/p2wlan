@@ -2,6 +2,8 @@ import type {
   AdminAccount,
   AdminAccountDetail,
   AdminConnectionFilters,
+  AdminConnectionHealth,
+  AdminConnectionHealthFilters,
   AdminConnectionPage,
   AdminConnectionTransitionPage,
   AdminDevice,
@@ -119,5 +121,13 @@ export const adminApi = {
     })
     if (cursor) params.set('cursor', cursor)
     return api<AdminConnectionTransitionPage>(`/connection-transitions?${params}`)
+  },
+  connectionHealth: (filters: AdminConnectionHealthFilters = {}, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (filters.networkId) params.set('network_id', filters.networkId)
+    if (filters.accountId) params.set('account_id', filters.accountId)
+    if (filters.deviceId) params.set('device_id', filters.deviceId)
+    if (filters.windowSeconds) params.set('window_seconds', String(filters.windowSeconds))
+    return api<AdminConnectionHealth>(`/connection-health?${params}`)
   },
 }
