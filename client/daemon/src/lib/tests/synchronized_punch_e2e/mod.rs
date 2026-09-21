@@ -2352,22 +2352,31 @@ async fn wait_for_failed_attempt_cleanup(harness: &TwoPeerHarness) {
 }
 
 async fn assert_relay_remains_available(harness: &TwoPeerHarness) {
-    assert_eq!(
-        harness
-            .peers_a
-            .select_path_for_data(HARD_HARD_B, true, true)
-            .await
-            .path,
-        Some(NetworkPath::Relay)
-    );
-    assert_eq!(
-        harness
-            .peers_b
-            .select_path_for_data(HARD_HARD_A, true, true)
-            .await
-            .path,
-        Some(NetworkPath::Relay)
-    );
+    // A failed speculative session is not the DirectFirst connection
+    // deadline. Keep the default policy: Relay can already be confirmed
+    // while neither side is yet allowed to send business through it.
+    // Require eventual fallback on BOTH sides without ever permitting a
+    // stale/unauthenticated Direct path to satisfy this assertion.
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let a = harness
+                .peers_a
+                .select_path_for_data(HARD_HARD_B, true, true)
+                .await;
+            let b = harness
+                .peers_b
+                .select_path_for_data(HARD_HARD_A, true, true)
+                .await;
+            assert_ne!(a.path, Some(NetworkPath::Direct));
+            assert_ne!(b.path, Some(NetworkPath::Direct));
+            if a.path == Some(NetworkPath::Relay) && b.path == Some(NetworkPath::Relay) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both peers must admit confirmed Relay after the bounded DirectFirst window");
 }
 
 async fn build_hard_hard_ordinary_fallback_fixture(

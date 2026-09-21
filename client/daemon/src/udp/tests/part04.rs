@@ -1804,12 +1804,43 @@ async fn fresh_mapping_requires_probe_key_before_measuring() {
 
 #[tokio::test]
 async fn relay_availability_does_not_cancel_punch_generation() {
-    let (outcome, peers, _transport, _nat, _seen) = run_generation_roundtrip(1, false).await;
-    // A relay path is available for the peer.
-    peers.set_relay("peer-b", "tcp://relay.test:18081").await;
-    assert!(peers.has_relay_safety_net("peer-b").await);
-    // The generation still completed instead of being cancelled by the relay.
-    assert!(matches!(outcome, FreshMappingOutcome::Accepted(..)));
+    let (peers, transport, nat) = generation_env().await;
+    let generation = peers.current_network_generation().await;
+    // Prepare Relay BEFORE measuring. The former test prepared it only
+    // after the generation had already finished and therefore could not
+    // detect Relay availability accidentally cancelling the measurement.
+    assert!(
+        peers
+            .confirm_relay_peer("peer-b", "tcp://relay.test:18081", generation)
+            .await
+    );
+    assert_eq!(
+        peers.select_path_for_data("peer-b", true, true).await.path,
+        None,
+        "confirmed standby must not preempt the first Direct attempt"
+    );
+    let outcome = transport
+        .run_fresh_mapping_generation(
+            "peer-b",
+            &nat.observers,
+            Duration::from_millis(500),
+            &[nat.peer_public],
+            Duration::from_millis(10),
+            2,
+            None,
+        )
+        .await;
+    let result = accepted_result(outcome).await;
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer("peer-b").await,
+        Some(result.socket_index),
+        "Relay readiness must not revoke the successful measured socket"
+    );
+    assert!(
+        !peers
+            .is_relay_business_admitted_for_generation("peer-b", generation)
+            .await
+    );
 }
 
 /// Both sides with strict Address/Port-Dependent filtering punch each other's
