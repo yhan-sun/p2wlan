@@ -122,6 +122,25 @@ func (fakeStore) AdminConnectionHealth(filter database.AdminConnectionHealthFilt
 	}, nil
 }
 
+func (fakeStore) AdminConnectionTrends(filter database.AdminConnectionTrendsFilter) (*database.AdminConnectionTrends, error) {
+	window := filter.WindowHours
+	if window == 0 {
+		window = database.DefaultConnectionTrendsWindowHours
+	}
+	return &database.AdminConnectionTrends{
+		SchemaVersion:       database.ConnectionMetricsSchemaVersion,
+		GeneratedAt:         10,
+		BucketSeconds:       database.ConnectionMetricsBucketSeconds,
+		WindowHours:         window,
+		RetentionHours:      database.ConnectionMetricsRetentionHours,
+		NetworkID:           filter.NetworkID,
+		SampleSemantics:     "accepted_non_resync_committed_observation_samples",
+		PercentileSemantics: "fixed_histogram_upper_bound",
+		RTTBucketBoundsMS:   []uint64{50, 100, 250, 500, 1000, 3000, 10000},
+		Buckets:             []database.AdminConnectionTrendBucket{},
+	}, nil
+}
+
 type connectionFilterStore struct {
 	fakeStore
 	filter database.AdminConnectionFilter
@@ -157,7 +176,7 @@ func TestDisabledConsoleIsNotDiscoverable(t *testing.T) {
 	mux := http.NewServeMux()
 	server.RegisterRoutes(mux)
 
-	paths := []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/connections", "/admin/health", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions", "/admin/api/v1/connection-health", "/admin/api/v1/connection-health", "/admin/app.js", "/admin/index.html"}
+	paths := []string{"/admin", "/admin/", "/admin/accounts/u1", "/admin/connections", "/admin/health", "/admin/api/v1/runtime", "/admin/api/v1/accounts", "/admin/api/v1/topology", "/admin/api/v1/connections", "/admin/api/v1/connection-transitions", "/admin/api/v1/connection-health", "/admin/api/v1/connection-trends", "/admin/api/v1/connection-health", "/admin/api/v1/connection-trends", "/admin/app.js", "/admin/index.html"}
 	methods := []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions}
 	for _, path := range paths {
 		for _, method := range methods {
