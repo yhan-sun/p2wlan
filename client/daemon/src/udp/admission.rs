@@ -1069,8 +1069,8 @@ impl UdpTransport {
                 }
                 Err(err) => {
                     physical_send_errors = physical_send_errors.saturating_add(1);
-                    physical_send_error_bytes = physical_send_error_bytes
-                        .saturating_add(legacy_probe.len() as u64);
+                    physical_send_error_bytes =
+                        physical_send_error_bytes.saturating_add(legacy_probe.len() as u64);
                     if let Some(recorder) = live_recorder.as_ref() {
                         recorder.record_compatibility_error(legacy_probe.len());
                     }

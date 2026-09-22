@@ -130,12 +130,10 @@ fn control_udp_endpoint_rank(
     match source {
         Some("manual" | "upnp" | "pcp" | "nat_pmp" | "nat-pmp" | "port_mapping") => 0,
         Some("stun_observed")
-            if endpoint
-                .parse::<SocketAddr>()
-                .is_ok_and(|candidate| {
-                    is_public_udp_candidate(candidate)
-                        || (allow_loopback_stun && candidate.ip().is_loopback())
-                }) =>
+            if endpoint.parse::<SocketAddr>().is_ok_and(|candidate| {
+                is_public_udp_candidate(candidate)
+                    || (allow_loopback_stun && candidate.ip().is_loopback())
+            }) =>
         {
             1
         }

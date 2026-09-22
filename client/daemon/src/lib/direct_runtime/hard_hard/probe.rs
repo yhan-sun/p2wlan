@@ -117,9 +117,11 @@ fn hard_hard_apply_candidate_contract(
     observation.candidate_signal_payload_bytes = candidates
         .iter()
         .map(|candidate| candidate.len() as u64)
-        .chain(candidate_sources.iter().map(|(candidate, source)| {
-            candidate.len().saturating_add(source.len()) as u64
-        }))
+        .chain(
+            candidate_sources
+                .iter()
+                .map(|(candidate, source)| candidate.len().saturating_add(source.len()) as u64),
+        )
         .fold(0u64, u64::saturating_add);
 }
 
@@ -167,9 +169,9 @@ fn hard_hard_translate_transport_time(
     transport_now_ms: u64,
     timeline_now_ms: Option<u64>,
 ) -> Option<u64> {
-    transport_at_ms.zip(timeline_now_ms).map(|(at, timeline_now)| {
-        timeline_now.saturating_sub(transport_now_ms.saturating_sub(at))
-    })
+    transport_at_ms
+        .zip(timeline_now_ms)
+        .map(|(at, timeline_now)| timeline_now.saturating_sub(transport_now_ms.saturating_sub(at)))
 }
 
 fn hard_hard_attempt_failure_class(
@@ -245,10 +247,8 @@ fn build_hard_hard_pre_session_attempt_report(
     let measurement = measurement.cloned().unwrap_or_default();
     crate::peer::HardHardAttemptReport {
         schema_version: crate::peer::HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
-        baseline_git_commit: hard_hard_safe_experiment_label(
-            "P2WLAN_EXPERIMENT_BASELINE_SHA",
-        )
-        .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
+        baseline_git_commit: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_BASELINE_SHA")
+            .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
         source_git_commit: crate::build_info::GIT_COMMIT.to_string(),
         build_id: crate::build_info::BUILD_ID.to_string(),
         experiment_variant: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_VARIANT"),
@@ -385,10 +385,8 @@ fn build_hard_hard_attempt_report(
         .saturating_sub(punch_report.logical_probes_attempted);
     crate::peer::HardHardAttemptReport {
         schema_version: crate::peer::HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
-        baseline_git_commit: hard_hard_safe_experiment_label(
-            "P2WLAN_EXPERIMENT_BASELINE_SHA",
-        )
-        .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
+        baseline_git_commit: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_BASELINE_SHA")
+            .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
         source_git_commit: crate::build_info::GIT_COMMIT.to_string(),
         build_id: crate::build_info::BUILD_ID.to_string(),
         experiment_variant: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_VARIANT"),

@@ -330,8 +330,7 @@ fn hard_hard_plan_matches(
 }
 
 fn hard_hard_response_deadline_matches(expected_ms: u64, received_ms: u64) -> bool {
-    expected_ms.abs_diff(received_ms)
-        <= HARD_HARD_RESPONSE_DEADLINE_TOLERANCE.as_millis() as u64
+    expected_ms.abs_diff(received_ms) <= HARD_HARD_RESPONSE_DEADLINE_TOLERANCE.as_millis() as u64
 }
 
 fn hard_hard_prediction_targets(candidates: &[String], limit: usize) -> Vec<SocketAddr> {

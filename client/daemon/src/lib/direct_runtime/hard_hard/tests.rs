@@ -440,9 +440,7 @@ mod hard_hard_tests {
                 )
                 .await
         );
-        session
-            .cancellation_handle()
-            .cancel_for_hard_hard_cleanup();
+        session.cancellation_handle().cancel_for_hard_hard_cleanup();
 
         assert!(
             hard_hard_wait_for_exact_direct_confirmation(
@@ -1895,14 +1893,17 @@ mod hard_hard_tests {
 
     #[test]
     fn hard_hard_attempt_failure_classes_preserve_terminal_evidence() {
-        let classify = |report: PunchSendReport,
-                        probe_rx: UdpProbeRxSnapshot,
-                        direct: bool,
-                        reason: &str| {
-            hard_hard_attempt_failure_class(&report, probe_rx, direct, reason)
-        };
+        let classify =
+            |report: PunchSendReport, probe_rx: UdpProbeRxSnapshot, direct: bool, reason: &str| {
+                hard_hard_attempt_failure_class(&report, probe_rx, direct, reason)
+            };
         assert_eq!(
-            classify(PunchSendReport::default(), UdpProbeRxSnapshot::default(), true, "direct_confirmed"),
+            classify(
+                PunchSendReport::default(),
+                UdpProbeRxSnapshot::default(),
+                true,
+                "direct_confirmed"
+            ),
             "encrypted_validation_completed"
         );
         assert_eq!(
@@ -2009,19 +2010,13 @@ mod hard_hard_tests {
         stale.remote_candidate_epoch = stale.remote_candidate_epoch.saturating_add(1);
         assert!(
             !peers
-                .record_hard_hard_attempt_report(
-                    &identity.peer_id,
-                    &identity.session_token,
-                    stale,
-                )
+                .record_hard_hard_attempt_report(&identity.peer_id, &identity.session_token, stale,)
                 .await
         );
-        assert!(
-            !peers.diagnostics().await[0]
-                .direct_events
-                .iter()
-                .any(|event| event.stage == "hard_hard_attempt_report")
-        );
+        assert!(!peers.diagnostics().await[0]
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_attempt_report"));
         assert!(
             peers
                 .record_hard_hard_attempt_report(

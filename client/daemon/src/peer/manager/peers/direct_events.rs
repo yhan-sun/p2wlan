@@ -184,7 +184,8 @@ impl PeerManager {
                 peer_id,
                 PeerSessionGeneration(report.peer_session_generation),
             )
-            || self.current_remote_candidate_epoch(peer_id).await != Some(report.remote_candidate_epoch)
+            || self.current_remote_candidate_epoch(peer_id).await
+                != Some(report.remote_candidate_epoch)
         {
             self.emit_timeline_debug(
                 "hard_hard_attempt_report_fenced",

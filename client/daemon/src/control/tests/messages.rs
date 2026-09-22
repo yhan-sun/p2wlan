@@ -199,10 +199,7 @@ fn server_clock_estimate_translates_local_deadline_and_expires() {
         Some(13_500)
     );
     assert_eq!(
-        estimate.server_deadline_for_local(
-            83_501,
-            50_000 + ServerClockEstimate::MAX_AGE_MS + 1
-        ),
+        estimate.server_deadline_for_local(83_501, 50_000 + ServerClockEstimate::MAX_AGE_MS + 1),
         None
     );
 }

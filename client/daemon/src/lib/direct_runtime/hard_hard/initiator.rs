@@ -895,7 +895,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response(
             coordination.local_prediction_confidence,
             coordination.local_network_generation,
         )
-    .await
+        .await
     else {
         let _ = record_hard_hard_unexecuted_session_attempt(
             &peers,
