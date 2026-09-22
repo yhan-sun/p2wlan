@@ -24,6 +24,7 @@ fn sample_result() -> FreshMappingResult {
         public_ip: Some(IpAddr::V4(Ipv4Addr::new(220, 163, 6, 190))),
         first_punch_sent_at_ms: 1100,
         last_punch_sent_at_ms: 1120,
+        measurement: crate::udp::HardHardMeasurementStats::default(),
     }
 }
 

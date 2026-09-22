@@ -2,11 +2,30 @@
 // real Rust scope. Everything below is unchanged test code.
 use super::*;
 
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_role_fence_uses_the_managed_registration_node_id() {
+    let (_daemon, peers, _udp, _control) = build_hard_hard_ordinary_fallback_fixture().await;
+    assert_eq!(peers.local_node_id_for_traversal(), HARD_HARD_A);
+
+    let resolved = "node-peer-a-registration";
+    peers.set_local_node_id_for_traversal(resolved);
+
+    assert_eq!(peers.local_node_id_for_traversal(), resolved);
+    assert!(
+        peers.local_node_id_for_traversal().as_str() < "node-peer-b-registration",
+        "same-format resolved identities must select exactly one deterministic initiator"
+    );
+}
+
 fn hard_hard_fallback_signal(
     control: ControlClient,
     boot_epoch_ms: u64,
     stun_servers: Vec<SocketAddr>,
 ) -> HolePunchSignalContext {
+    // This unit fixture supplies a control context directly rather than
+    // polling HTTP or installing the two-peer forwarder. Model the fresh
+    // server timestamp either production signaling path would have supplied.
+    control.refresh_server_clock_for_test();
     HolePunchSignalContext {
         control,
         candidate_snapshot: Arc::new(RwLock::new(None)),
@@ -14,6 +33,36 @@ fn hard_hard_fallback_signal(
         stun_timeout: Duration::from_millis(25),
         boot_epoch_ms,
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_hard_experiment_lane_never_falls_into_ordinary_punching() {
+    let (_daemon, peers, udp, _control) =
+        build_hard_hard_ordinary_fallback_fixture_with_experiment(true).await;
+
+    spawn_hole_punch_task(
+        udp,
+        peers.clone(),
+        PunchAttemptDeduplicator::default(),
+        HARD_HARD_B.to_string(),
+        Duration::from_millis(1),
+        1,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    wait_for_stage(&peers, HARD_HARD_B, "hard_hard_experiment_waiting").await;
+    let conn = peers.get_connection(HARD_HARD_B).await.unwrap();
+    assert!(
+        !conn
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "punch_started"),
+        "the independent Hard↔Hard experiment must not consume its quota through an ordinary punch"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -483,6 +532,7 @@ async fn hard_hard_response_network_generation_fence_precedes_punch_preemption()
                 expires_at_ms: punch_at_ms.saturating_add(30_000),
                 state: peer::HardHardSessionState::AwaitingPeer,
                 attempt_count: 0,
+                measurement: peer::HardHardMeasurementObservation::default(),
                 created_at: Instant::now(),
                 cancellation: Arc::new(crate::PunchSessionCancellation::default()),
             })
@@ -1532,6 +1582,7 @@ async fn install_direct_scheduler_birthday_session(
                 expires_at_ms: now.saturating_add(30_000),
                 state: peer::HardHardSessionState::AwaitingPeer,
                 attempt_count: 0,
+                measurement: peer::HardHardMeasurementObservation::default(),
                 created_at: Instant::now(),
                 cancellation: Arc::new(crate::PunchSessionCancellation::default()),
             })
@@ -2531,6 +2582,7 @@ async fn hard_hard_manager_peer_isolation_keeps_unrelated_session_authoritative(
             expires_at_ms: hard_hard_now_for_test().saturating_add(30_000),
             state: peer::HardHardSessionState::AwaitingPeer,
             attempt_count: 0,
+            measurement: peer::HardHardMeasurementObservation::default(),
             created_at: Instant::now(),
             cancellation: Arc::new(crate::PunchSessionCancellation::default()),
         }
@@ -2623,6 +2675,7 @@ async fn hard_hard_manager_sticky_winner_rejects_delayed_authenticated_socket() 
         expires_at_ms: hard_hard_now_for_test().saturating_add(30_000),
         state: peer::HardHardSessionState::AwaitingPeer,
         attempt_count: 0,
+        measurement: peer::HardHardMeasurementObservation::default(),
         created_at: Instant::now(),
         cancellation: Arc::new(crate::PunchSessionCancellation::default()),
     };

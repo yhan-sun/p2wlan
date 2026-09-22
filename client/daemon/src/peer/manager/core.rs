@@ -35,6 +35,7 @@ impl PeerManager {
             tokio::sync::watch::channel(Arc::new(HashMap::<String, String>::new()));
         let (local_mtu_feedback_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
+            local_node_id_for_traversal: std::sync::RwLock::new(config.node.node_id.clone()),
             connections: Arc::new(RwLock::new(HashMap::new())),
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
             #[cfg(test)]
@@ -218,6 +219,18 @@ impl PeerManager {
             .timeline
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(timeline);
+    }
+
+    /// Return the current process-local timeline position without emitting an
+    /// event. Hard↔Hard measurement reports use this single clock for every
+    /// local milestone; the value is diagnostic-only and never participates
+    /// in scheduling or admission.
+    pub(crate) fn timeline_uptime_ms(&self) -> Option<u64> {
+        self.timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|timeline| timeline.uptime_ms())
     }
 
     /// Install or remove the relay-first topology gate after control has

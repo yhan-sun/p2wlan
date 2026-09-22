@@ -14,6 +14,9 @@
 #   run --validate-overlay --overlay-any-path and a round PASSES when BOTH
 #   sides complete the bidirectional encrypted overlay loopback over Relay.
 #   Direct results are reported separately as informational and must be 0.
+# - hard-hard: the same production daemons and encrypted overlay validator run
+#   with an unforced data path. Direct success, Relay fallback, and bounded
+#   failure are experimental outcomes; this mode never weakens either gate.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/diagnostics-auth.sh"
 
@@ -60,6 +63,34 @@ CONSUME_B=${CONSUME_B:-0}
 LOSS=${LOSS:-0.0}
 REORDER=${REORDER:-0}
 STRICT_FILTERING=${STRICT_FILTERING:-0}
+STRICT_FILTERING_A=${STRICT_FILTERING_A:-$STRICT_FILTERING}
+STRICT_FILTERING_B=${STRICT_FILTERING_B:-$STRICT_FILTERING}
+MAPPING_MODE_A=${MAPPING_MODE_A:-step}
+MAPPING_MODE_B=${MAPPING_MODE_B:-step}
+DELAY_A_MS=${DELAY_A_MS:-0}
+DELAY_B_MS=${DELAY_B_MS:-0}
+STUN_DELAY_A_MS=${STUN_DELAY_A_MS:-0}
+STUN_DELAY_B_MS=${STUN_DELAY_B_MS:-0}
+SIGNAL_DELAY_A_MS=${SIGNAL_DELAY_A_MS:-0}
+SIGNAL_DELAY_B_MS=${SIGNAL_DELAY_B_MS:-0}
+PREPARE_DELAY_A_MS=${PREPARE_DELAY_A_MS:-0}
+PREPARE_DELAY_B_MS=${PREPARE_DELAY_B_MS:-0}
+DUPLICATE_RATE=${DUPLICATE_RATE:-0.0}
+# The ordinary Direct/Relay gates always reject any WireGuard replay.  The
+# dedicated fault-injection experiment may instead require at least one
+# duplicate to reach (and be rejected by) WireGuard while still forbidding an
+# invalid overlay payload.  This is opt-in and is never inherited by the
+# established gates.
+ALLOW_REPLAY_REJECTS=${ALLOW_REPLAY_REJECTS:-0}
+HARD_HARD_GATE_MAX_SKEW_MS=${HARD_HARD_GATE_MAX_SKEW_MS:-250}
+UNASSIGNED_EGRESS_LISTENERS=${UNASSIGNED_EGRESS_LISTENERS:-}
+if [[ -z "$UNASSIGNED_EGRESS_LISTENERS" ]]; then
+  if [[ "$MODE" == "hard-hard" ]]; then
+    UNASSIGNED_EGRESS_LISTENERS=32
+  else
+    UNASSIGNED_EGRESS_LISTENERS=0
+  fi
+fi
 FRESH_MAPPING_PUNCH=${FRESH_MAPPING_PUNCH:-1}
 PREDICTED_CANDIDATES=${PREDICTED_CANDIDATES:-1}
 BIRTHDAY_PROBING=${BIRTHDAY_PROBING:-1}
@@ -81,6 +112,9 @@ NAT_TOPOLOGY_WORKFLOW_SHA=${NAT_TOPOLOGY_WORKFLOW_SHA:-$(git -C "$ROOT_DIR" rev-
 # still had a correlation_id.  This value is diagnostic-only and never carries
 # credentials or control-plane material.
 NAT_SIM_RUN_ID=${NAT_SIM_RUN_ID:-nat-sim-${MODE}-${NAT_SEED_BASE}}
+EXPERIMENT_VARIANT=${EXPERIMENT_VARIANT:-$MODE}
+EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-$MODE}
+EXPERIMENT_BASELINE_SHA=${EXPERIMENT_BASELINE_SHA:-$NAT_TOPOLOGY_HEAD_SHA}
 # Post-first-usable burst verification: fire this many business payloads per
 # peer right after first-usable evidence and require EVERY echo (zero loss /
 # duplicate / replay).  Relay-only rounds default to a 256-packet burst.
@@ -165,6 +199,54 @@ if ! [[ "$NAT_SEED_BASE" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "$NAT_SIM_RUN_ID" =~ ^[A-Za-z0-9_.-]{1,80}$ ]]; then
   echo "[nat-sim] NAT_SIM_RUN_ID must contain only letters, digits, '.', '_' or '-' and be <= 80 characters" >&2
+  exit 2
+fi
+if [[ "$MODE" != "direct" && "$MODE" != "relay-only" && "$MODE" != "hard-hard" ]]; then
+  echo "[nat-sim] MODE must be direct, relay-only, or hard-hard" >&2
+  exit 2
+fi
+for label in "$EXPERIMENT_VARIANT" "$EXPERIMENT_SCENARIO" "$EXPERIMENT_BASELINE_SHA"; do
+  if ! [[ "$label" =~ ^[A-Za-z0-9_.-]{1,80}$ ]]; then
+    echo "[nat-sim] experiment labels must contain only letters, digits, '.', '_' or '-' and be <= 80 characters" >&2
+    exit 2
+  fi
+done
+if [[ "$MAPPING_MODE_A" != "step" && "$MAPPING_MODE_A" != "random" ]] \
+   || [[ "$MAPPING_MODE_B" != "step" && "$MAPPING_MODE_B" != "random" ]]; then
+  echo "[nat-sim] mapping modes must be step or random" >&2
+  exit 2
+fi
+for value in "$DELAY_A_MS" "$DELAY_B_MS" "$STUN_DELAY_A_MS" "$STUN_DELAY_B_MS" \
+             "$SIGNAL_DELAY_A_MS" "$SIGNAL_DELAY_B_MS" \
+             "$PREPARE_DELAY_A_MS" "$PREPARE_DELAY_B_MS"; do
+  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "[nat-sim] experiment delay values must be non-negative integers" >&2
+    exit 2
+  fi
+done
+if (( SIGNAL_DELAY_A_MS > 2000 || SIGNAL_DELAY_B_MS > 2000 )); then
+  echo "[nat-sim] signaling delay values must not exceed 2000ms" >&2
+  exit 2
+fi
+for value in "$STRICT_FILTERING" "$STRICT_FILTERING_A" "$STRICT_FILTERING_B" "$REORDER" \
+             "$ALLOW_REPLAY_REJECTS"; do
+  if [[ "$value" != "0" && "$value" != "1" ]]; then
+    echo "[nat-sim] filtering, reorder, and replay-policy flags must be 0 or 1" >&2
+    exit 2
+  fi
+done
+if ! [[ "$HARD_HARD_GATE_MAX_SKEW_MS" =~ ^[0-9]+$ ]] \
+   || (( HARD_HARD_GATE_MAX_SKEW_MS > 1000 )); then
+  echo "[nat-sim] HARD_HARD_GATE_MAX_SKEW_MS must be an integer in 0..1000" >&2
+  exit 2
+fi
+if [[ "$ALLOW_REPLAY_REJECTS" == "1" && "$MODE" != "hard-hard" ]]; then
+  echo "[nat-sim] ALLOW_REPLAY_REJECTS is restricted to the hard-hard experiment" >&2
+  exit 2
+fi
+if ! [[ "$UNASSIGNED_EGRESS_LISTENERS" =~ ^[0-9]+$ ]] \
+   || (( UNASSIGNED_EGRESS_LISTENERS > 32 )); then
+  echo "[nat-sim] UNASSIGNED_EGRESS_LISTENERS must be an integer in 0..32" >&2
   exit 2
 fi
 
@@ -572,10 +654,10 @@ PY
 # the daemon's first 200 during startup. Once the endpoint is live, every
 # sample through the Relay burst must remain 200.
 status_http_code() {
-  local url="$1" token_file="$2" timeout_s="${3:-2}" code
+  local url="$1" token_file="$2" timeout_s="${3:-2}" connect_timeout_s="${4:-0.2}" code
   code=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
     p2wlan_diagnostics_curl \
-      -sS --connect-timeout 0.2 --max-time "$timeout_s" \
+      -sS --connect-timeout "$connect_timeout_s" --max-time "$timeout_s" \
       -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
   if ! [[ "$code" =~ ^[0-9]{3}$ ]]; then
     code=000
@@ -616,15 +698,23 @@ record_relay_status_code() {
 # code/timestamp stream is retained as acceptance evidence.
 sample_relay_status_pair() {
   local a_url="$1" a_token_file="$2" b_url="$3" b_token_file="$4"
-  local timeout_s
+  local timeout_s connect_timeout_s=0.2
   timeout_s=$(deadline_curl_timeout)
+  # Hard<->Hard can briefly saturate this shared local runner with the
+  # bounded multi-socket sweep. Give its diagnostics listener one second to
+  # accept the connection, while retaining the same fixed round deadline and
+  # the all-samples-must-be-200 verdict. Other modes keep their calibrated
+  # 200ms probe unchanged.
+  if [[ "$MODE" == "hard-hard" ]]; then
+    connect_timeout_s=1
+  fi
   local a_code_file="$ROUND_DIR/.status-a-code"
   local b_code_file="$ROUND_DIR/.status-b-code"
   local a_pid b_pid a_code b_code
 
-  status_http_code "$a_url" "$a_token_file" "$timeout_s" >"$a_code_file" &
+  status_http_code "$a_url" "$a_token_file" "$timeout_s" "$connect_timeout_s" >"$a_code_file" &
   a_pid=$!
-  status_http_code "$b_url" "$b_token_file" "$timeout_s" >"$b_code_file" &
+  status_http_code "$b_url" "$b_token_file" "$timeout_s" "$connect_timeout_s" >"$b_code_file" &
   b_pid=$!
   wait "$a_pid"
   wait "$b_pid"
@@ -866,7 +956,7 @@ trap cleanup EXIT
 echo "[nat-sim] mode=$MODE isolated network id: $NETWORK_ID"
 echo "[nat-sim] exact_head_sha=${NAT_TOPOLOGY_HEAD_SHA:-unknown} replica=${NAT_TOPOLOGY_REPLICA:-1}"
 echo "[nat-sim] reserved control port base: $PORT"
-echo "[nat-sim] traversal flags: strict_filtering=$STRICT_FILTERING fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
+echo "[nat-sim] traversal flags: strict_filtering_a=$STRICT_FILTERING_A strict_filtering_b=$STRICT_FILTERING_B mapping_a=$MAPPING_MODE_A mapping_b=$MAPPING_MODE_B delay_a_ms=$DELAY_A_MS delay_b_ms=$DELAY_B_MS stun_delay_a_ms=$STUN_DELAY_A_MS stun_delay_b_ms=$STUN_DELAY_B_MS signal_delay_a_ms=$SIGNAL_DELAY_A_MS signal_delay_b_ms=$SIGNAL_DELAY_B_MS prepare_delay_a_ms=$PREPARE_DELAY_A_MS prepare_delay_b_ms=$PREPARE_DELAY_B_MS duplicate_rate=$DUPLICATE_RATE unassigned_egress_listeners=$UNASSIGNED_EGRESS_LISTENERS fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
 echo "[nat-sim] building control server, relay and daemon..."
 (
   cd "$ROOT_DIR/server"
@@ -894,11 +984,37 @@ for round in $(seq 1 "$ROUNDS"); do
   NAT_SEED=$((NAT_SEED_BASE + round))
   ROUND_RUN_ID="${NAT_SIM_RUN_ID}-round-${round}"
 
-  echo "[nat-sim] round $round: starting NAT simulator (mode=$MODE step_a=$STEP_A step_b=$STEP_B consume_a=$CONSUME_A consume_b=$CONSUME_B loss=$LOSS reorder=$REORDER strict_filtering=$STRICT_FILTERING seed=$NAT_SEED round_timeout_s=$ROUND_TIMEOUT_S)"
+  echo "[nat-sim] round $round: starting NAT simulator (mode=$MODE step_a=$STEP_A step_b=$STEP_B consume_a=$CONSUME_A consume_b=$CONSUME_B loss=$LOSS reorder=$REORDER strict_filtering_a=$STRICT_FILTERING_A strict_filtering_b=$STRICT_FILTERING_B mapping_a=$MAPPING_MODE_A mapping_b=$MAPPING_MODE_B delay_a_ms=$DELAY_A_MS delay_b_ms=$DELAY_B_MS stun_delay_a_ms=$STUN_DELAY_A_MS stun_delay_b_ms=$STUN_DELAY_B_MS duplicate_rate=$DUPLICATE_RATE seed=$NAT_SEED round_timeout_s=$ROUND_TIMEOUT_S)"
   REORDER_FLAG=""
   if [[ "$REORDER" == "1" ]]; then REORDER_FLAG="--reorder"; fi
   STRICT_FILTERING_FLAG=""
   if [[ "$STRICT_FILTERING" == "1" ]]; then STRICT_FILTERING_FLAG="--strict-filtering"; fi
+  NAT_FEATURE_FLAGS=(
+    --mapping-mode-a "$MAPPING_MODE_A" --mapping-mode-b "$MAPPING_MODE_B"
+    --delay-a-ms "$DELAY_A_MS" --delay-b-ms "$DELAY_B_MS"
+    --stun-delay-a-ms "$STUN_DELAY_A_MS" --stun-delay-b-ms "$STUN_DELAY_B_MS"
+    --duplicate-rate "$DUPLICATE_RATE"
+    --unassigned-egress-listeners "$UNASSIGNED_EGRESS_LISTENERS"
+  )
+  DIRECT_GATE_FILE=""
+  if [[ "$MODE" == "hard-hard" ]]; then
+    # Hold only inter-NAT UDP while STUN, signaling and Relay continue. This
+    # prevents the ordinary startup probes from winning the loopback race
+    # before the freshly observed NAT profile is rebound to the current
+    # candidate epoch. The gate remains closed after both real Hard<->Hard
+    # workers have scheduled the same 3500ms rendezvous, then opens 10ms before
+    # their validated server-clock deadline. This keeps earlier control-path
+    # Direct copies from perturbing the fresh mappings under measurement.
+    DIRECT_GATE_FILE="$ROUND_DIR/hard-hard-direct.open"
+    rm -f -- "$DIRECT_GATE_FILE"
+    NAT_FEATURE_FLAGS+=(--direct-gate-file "$DIRECT_GATE_FILE")
+  fi
+  if [[ "$STRICT_FILTERING_A" == "1" && "$STRICT_FILTERING" != "1" ]]; then
+    NAT_FEATURE_FLAGS+=(--strict-filtering-a)
+  fi
+  if [[ "$STRICT_FILTERING_B" == "1" && "$STRICT_FILTERING" != "1" ]]; then
+    NAT_FEATURE_FLAGS+=(--strict-filtering-b)
+  fi
   MODE_FLAGS=""
   if [[ "$MODE" == "relay-only" ]]; then
     # Deterministic Direct impossibility: a bidirectional UDP blackhole that
@@ -910,6 +1026,7 @@ for round in $(seq 1 "$ROUNDS"); do
     --step-a "$STEP_A" --step-b "$STEP_B" \
     --consume-a "$CONSUME_A" --consume-b "$CONSUME_B" \
     --loss "$LOSS" $REORDER_FLAG $STRICT_FILTERING_FLAG $MODE_FLAGS \
+    "${NAT_FEATURE_FLAGS[@]}" \
     --seed "$NAT_SEED" --base-a "$BASE_A" --base-b "$BASE_B" \
     --trace-file "$ROUND_DIR/nat-trace.jsonl" \
     >"$ROUND_DIR/nat-sim.out" 2>&1 &
@@ -993,9 +1110,10 @@ for round in $(seq 1 "$ROUNDS"); do
   START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
 
   # In direct mode the validation loop targets confirmed Direct peers only;
-  # in relay-only mode it may use Relay so that profile tests availability.
+  # in availability/experiment modes it may use Relay so fallback remains a
+  # measured outcome rather than a harness failure.
   OVERLAY_FLAGS=(--validate-overlay)
-  if [[ "$MODE" == "relay-only" ]]; then
+  if [[ "$MODE" != "direct" ]]; then
     # Availability mode: drive the real encrypted overlay loopback through the
     # production dataplane over whatever path is usable (Relay here), and let
     # the outbound selector ride Relay since Direct is blackholed.
@@ -1023,8 +1141,17 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ "$BIRTHDAY_PROBING" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-birthday-probing"; fi
   if [[ -n "$SOCKET_POOL" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --socket-pool $SOCKET_POOL"; fi
   if [[ "${PREFER_RELAY:-0}" == "1" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-only"; fi
+  if [[ "$MODE" == "hard-hard" ]]; then
+    # This independent entry isolates the existing planner-authorized
+    # Hard<->Hard worker from the ordinary offer/punch lane. It does not force
+    # planner eligibility or bypass the encrypted validation/business gates.
+    TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --hard-hard-experiment-only"
+  fi
 
-  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  if (( PREPARE_DELAY_A_MS > 0 )); then
+    python3 -c 'import sys,time; time.sleep(int(sys.argv[1]) / 1000)' "$PREPARE_DELAY_A_MS"
+  fi
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_A_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$NODE_A_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
@@ -1042,12 +1169,21 @@ for round in $(seq 1 "$ROUNDS"); do
   NODE_A_PID=$!
   PIDS+=($NODE_A_PID)
 
-  for _ in {1..40}; do
-    grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null && break
-    deadline_pause 0.25 || break
-  done
+  # The ordinary gates retain their established sequential startup.  The
+  # Hard↔Hard experiment starts both daemons before waiting so one endpoint
+  # cannot publish and punch a fully initialized peer while the other is
+  # still before its local NAT-profile gather.
+  if [[ "$MODE" != "hard-hard" ]]; then
+    for _ in {1..40}; do
+      grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null && break
+      deadline_pause 0.25 || break
+    done
+  fi
 
-  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  if (( PREPARE_DELAY_B_MS > 0 )); then
+    python3 -c 'import sys,time; time.sleep(int(sys.argv[1]) / 1000)' "$PREPARE_DELAY_B_MS"
+  fi
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_B_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
     --config "$NODE_B_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
@@ -1075,6 +1211,12 @@ for round in $(seq 1 "$ROUNDS"); do
     grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-b.log" 2>/dev/null && break
     deadline_pause 0.25 || break
   done
+  if [[ "$MODE" == "hard-hard" ]]; then
+    for _ in {1..40}; do
+      grep -q 'Control plane registration confirmed' "$ROUND_DIR/node-a.log" 2>/dev/null && break
+      deadline_pause 0.25 || break
+    done
+  fi
 
   # Readiness gate: the status collector below must never run before the
   # daemon has published its diagnostics token (TOKEN_READY).  Each gate is
@@ -1096,7 +1238,74 @@ for round in $(seq 1 "$ROUNDS"); do
     continue
   fi
 
-  if [[ "$MODE" == "relay-only" ]]; then
+  if [[ "$MODE" != "direct" ]]; then
+    if [[ "$MODE" == "hard-hard" ]]; then
+      if ! grep -q '^DIRECT_GATE=1$' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then
+        echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_direct_gate_not_active" >&2
+        overall=1
+        stop_round_processes
+        continue
+      fi
+      HARD_HARD_GATE_DEADLINE=$(stage_deadline 20)
+      HARD_HARD_GATE_RESULT=pending
+      while [[ "$SECONDS" -lt "$HARD_HARD_GATE_DEADLINE" ]]; do
+        if grep -q 'event="hard_hard_rendezvous_scheduled"' "$ROUND_DIR/node-a.log" 2>/dev/null \
+          && grep -q 'event="hard_hard_rendezvous_scheduled"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+          HARD_HARD_GATE_RESULT=ready
+          break
+        fi
+        # A model/measurement/cancellation failure before rendezvous is a
+        # valid negative experiment result only when both endpoints have
+        # emitted their terminal typed attempt. Keep the Direct packet gate
+        # closed in that case and continue over Relay so the normal business,
+        # health, final-status, and evidence gates still run. Missing terminal
+        # evidence remains a fail-closed harness error.
+        if grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-a.log" 2>/dev/null \
+          && grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+          HARD_HARD_GATE_RESULT=terminal
+          break
+        fi
+        if ! kill -0 "$NODE_A_PID" 2>/dev/null || ! kill -0 "$NODE_B_PID" 2>/dev/null; then
+          break
+        fi
+        deadline_pause 0.05 "$HARD_HARD_GATE_DEADLINE" || break
+      done
+      if [[ "$HARD_HARD_GATE_RESULT" == pending ]]; then
+        echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_rendezvous_gate_timeout" >&2
+        # Preserve the exact planner/profile fences at the fail-closed gate.
+        # These are explicitly diagnostic snapshots, not substitutes for the
+        # final evidence files required by a valid matrix round.
+        fetch_required_json \
+          "http://127.0.0.1:$DIAG_A_PORT/status" \
+          "$ROUND_DIR/node-a.gate-timeout.status.json" \
+          status \
+          "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" || true
+        fetch_required_json \
+          "http://127.0.0.1:$DIAG_B_PORT/status" \
+          "$ROUND_DIR/node-b.gate-timeout.status.json" \
+          status \
+          "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" || true
+        overall=1
+        stop_round_processes
+        continue
+      fi
+      if [[ "$HARD_HARD_GATE_RESULT" == ready ]]; then
+        if ! python3 "$ROOT_DIR/scripts/nat-sim/hard_hard_gate.py" \
+          --node-a-log "$ROUND_DIR/node-a.log" \
+          --node-b-log "$ROUND_DIR/node-b.log" \
+          --gate-file "$DIRECT_GATE_FILE" \
+          --evidence-file "$ROUND_DIR/hard-hard-direct-gate.json" \
+          --max-skew-ms "$HARD_HARD_GATE_MAX_SKEW_MS"; then
+          echo "[nat-sim] ROUND $round: FAIL reason_code=hard_hard_rendezvous_gate_invalid" >&2
+          overall=1
+          stop_round_processes
+          continue
+        fi
+        echo "[nat-sim] round $round: released Hard<->Hard direct gate at the validated rendezvous deadline" >&2
+      else
+        echo "[nat-sim] round $round: kept Hard<->Hard direct gate closed after terminal pre-rendezvous reports on both endpoints" >&2
+      fi
+    fi
     # Availability pass condition: BOTH sides complete a bidirectional
     # encrypted overlay loopback (overlay_payload_verified), which here rides
     # Relay.  Direct must not establish (informational, not a failure signal).
@@ -1130,7 +1339,7 @@ for round in $(seq 1 "$ROUNDS"); do
     # the blackhole is asserted from the simulator banner, not assumed.  Like
     # a simulator that failed to start, a missing banner is an infrastructure
     # failure of this attempt, not a topology verdict.
-    if ! grep -q '^BLOCK_DIRECT=1$' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then
+    if [[ "$MODE" == "relay-only" ]] && ! grep -q '^BLOCK_DIRECT=1$' "$ROUND_DIR/nat-sim.out" 2>/dev/null; then
       echo "[nat-sim] FAIL reason_code=blackhole_not_active round=$round evidence=$ROUND_DIR/nat-sim.out" >&2
       exit 1
     fi
@@ -1161,11 +1370,21 @@ for round in $(seq 1 "$ROUNDS"); do
         if [[ "$OVERLAY_BURST" -gt 0 ]]; then
           if [[ "$A_BURST" -ge 1 && "$B_BURST" -ge 1 ]]; then
             overlay_ok=1
-            break
           fi
         else
           overlay_ok=1
-          break
+        fi
+        # Hard↔Hard acceptance needs the terminal typed attempt from both
+        # endpoints. Business traffic may succeed over Relay before the fixed
+        # punch/sweep window closes, so keep observing within this same bounded
+        # overlay deadline instead of snapshotting a still-running attempt.
+        if [[ "$overlay_ok" -eq 1 ]]; then
+          if [[ "$MODE" != "hard-hard" ]] || {
+            grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-a.log" 2>/dev/null &&
+            grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-b.log" 2>/dev/null
+          }; then
+            break
+          fi
         fi
       fi
       deadline_pause 0.5 "$OVERLAY_DEADLINE" || break
@@ -1307,6 +1526,39 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ "$MODE" == "relay-only" ]]; then
     TOPOLOGY="relay-blackhole"
     EXPECTED_PATH="relay"
+  elif [[ "$MODE" == "hard-hard" ]]; then
+    TOPOLOGY="hard-hard-experiment"
+    OBSERVED_PATHS=$(python3 - \
+      "$ROUND_DIR/node-a.status.json" "$ROUND_DIR/node-b.status.json" <<'PY'
+import json
+import sys
+
+def first_usable_path(path):
+    try:
+        status = json.load(open(path, encoding="utf-8"))
+        summaries = status["connection_timeline"]["first_usable_summaries"]
+        value = summaries[-1]["path"]
+        return value if value in {"direct", "relay"} else "unknown"
+    except Exception:
+        return "unknown"
+
+print(first_usable_path(sys.argv[1]), first_usable_path(sys.argv[2]))
+PY
+    )
+    OBSERVED_PATH_A=${OBSERVED_PATHS%% *}
+    OBSERVED_PATH_B=${OBSERVED_PATHS#* }
+    if [[ "$OBSERVED_PATH_A" == "$OBSERVED_PATH_B" \
+          && ( "$OBSERVED_PATH_A" == "direct" || "$OBSERVED_PATH_A" == "relay" ) ]]; then
+      EXPECTED_PATH="$OBSERVED_PATH_A"
+    else
+      # Fail closed through the existing collector while retaining both raw
+      # status snapshots for diagnosis.
+      EXPECTED_PATH="direct"
+    fi
+  fi
+  COLLECT_REPLAY_FLAG=
+  if [[ "$MODE" == "hard-hard" && "$ALLOW_REPLAY_REJECTS" == "1" ]]; then
+    COLLECT_REPLAY_FLAG=--allow-replay-rejects
   fi
   python3 "$ROOT_DIR/scripts/nat-sim/collect_evidence.py" \
     --topology "$TOPOLOGY" \
@@ -1322,6 +1574,7 @@ for round in $(seq 1 "$ROUNDS"); do
     --log-b "$ROUND_DIR/node-b.log" \
     --expected-path "$EXPECTED_PATH" \
     --overlay-burst "$OVERLAY_BURST" \
+    $COLLECT_REPLAY_FLAG \
     --output "$ROUND_DIR/nat-evidence.json"
   read -r EVIDENCE_PASS EVIDENCE_REASON EVIDENCE_A_DELTA EVIDENCE_B_DELTA \
     EVIDENCE_A_BUDGET EVIDENCE_B_BUDGET \
@@ -1567,6 +1820,64 @@ except Exception:
       echo "[nat-sim] ROUND $round: FAIL reason_code=$RELAY_REASON relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA a_budget_ms=$A_BUDGET b_budget_ms=$B_BUDGET a_direct_first_remaining_ms=$A_DIRECT_FIRST_REMAINING b_direct_first_remaining_ms=$B_DIRECT_FIRST_REMAINING a_budget_direct_first_remaining_ms=$A_BUDGET_DIRECT_FIRST_REMAINING b_budget_direct_first_remaining_ms=$B_BUDGET_DIRECT_FIRST_REMAINING slo_base_ms=3000 sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT status_always_200_a=$A_STATUS_ALWAYS_200 status_always_200_b=$B_STATUS_ALWAYS_200 task_health_a=$A_TASKS_OK task_health_b=$B_TASKS_OK elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= paired maximum remaining DirectFirst protection + 3000ms, zero drops/replay/invalid, burst complete, status always HTTP 200, no supervised task exit)"
       overall=1
     fi
+  elif [[ "$MODE" == "hard-hard" ]]; then
+    read -r A_DROPS A_DROP_BYTES < <(python3 -c "
+import json
+try:
+    drops=json.load(open('$ROUND_DIR/node-a.status.json')).get('stats',{})['outbound_drops']
+    print(sum(int(v['packets']) for v in drops.values()), sum(int(v['bytes']) for v in drops.values()))
+except Exception:
+    print('-1 -1')")
+    read -r B_DROPS B_DROP_BYTES < <(python3 -c "
+import json
+try:
+    drops=json.load(open('$ROUND_DIR/node-b.status.json')).get('stats',{})['outbound_drops']
+    print(sum(int(v['packets']) for v in drops.values()), sum(int(v['bytes']) for v in drops.values()))
+except Exception:
+    print('-1 -1')")
+    A_REPLAY=$(grep -c 'replay detected' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_REPLAY=$(grep -c 'replay detected' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    A_INVALID=$(grep -c 'overlay_payload_invalid' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_INVALID=$(grep -c 'overlay_payload_invalid' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    A_TASKS_OK=$(node_task_health_ok "$ROUND_DIR/node-a.status.json")
+    B_TASKS_OK=$(node_task_health_ok "$ROUND_DIR/node-b.status.json")
+    A_HARD_HARD=$(grep -c 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
+    B_HARD_HARD=$(grep -c 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+    REPLAY_POLICY_OK=0
+    if [[ "$ALLOW_REPLAY_REJECTS" == "0" && "$A_REPLAY" -eq 0 && "$B_REPLAY" -eq 0 ]]; then
+      REPLAY_POLICY_OK=1
+    elif [[ "$ALLOW_REPLAY_REJECTS" == "1" && $((A_REPLAY + B_REPLAY)) -gt 0 ]]; then
+      REPLAY_POLICY_OK=1
+    fi
+    outcome="relay_fallback"
+    if [[ "$EXPECTED_PATH" == "direct" ]]; then
+      outcome="direct_first_usable"
+    elif [[ "$A_DIRECT" -gt 0 && "$B_DIRECT" -gt 0 ]]; then
+      outcome="relay_then_direct"
+    fi
+    if [[ "$STATUS_SCHEMA_OK" -eq 1 && "$METRICS_SCHEMA_OK" -eq 1 \
+          && "$EVIDENCE_PASS" -eq 1 && "$overlay_ok" -eq 1 \
+          && "$A_STATUS_ALWAYS_200" -eq 1 && "$B_STATUS_ALWAYS_200" -eq 1 \
+          && "$A_TASKS_OK" -eq 1 && "$B_TASKS_OK" -eq 1 \
+          && "$A_HARD_HARD" -ge 1 && "$B_HARD_HARD" -ge 1 \
+          && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \
+          && "$REPLAY_POLICY_OK" -eq 1 \
+          && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 ]]; then
+      echo "[nat-sim] ROUND $round: PASS hard_hard_experiment outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json"
+    else
+      EXPERIMENT_REASON="${EVIDENCE_REASON:-hard_hard_experiment_invalid}"
+      if [[ "$A_HARD_HARD" -lt 1 || "$B_HARD_HARD" -lt 1 ]]; then
+        EXPERIMENT_REASON="hard_hard_attempt_missing"
+      elif [[ "$overlay_ok" -ne 1 ]]; then
+        EXPERIMENT_REASON="overlay_verification_failed"
+      elif [[ "$A_TASKS_OK" -ne 1 || "$B_TASKS_OK" -ne 1 ]]; then
+        EXPERIMENT_REASON="critical_tasks_unhealthy"
+      elif [[ "$REPLAY_POLICY_OK" -ne 1 ]]; then
+        EXPERIMENT_REASON="replay_policy_unsatisfied"
+      fi
+      echo "[nat-sim] ROUND $round: FAIL reason_code=$EXPERIMENT_REASON hard_hard_experiment outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json" >&2
+      overall=1
+    fi
   else
     # A single-sided Direct, Relay confirmation after the first Direct business
     # ingress, unverified Direct business ingress, loss/replay/invalid packets,
@@ -1673,9 +1984,10 @@ except Exception:
     fi
   fi
 
-  # Relay resilience scenarios (diagnostic; only run in relay-only mode where
-  # the relay is the only data path).
-  if [[ "$MODE" == "relay-only" && "$RELAY_KILL_RESTART" == "1" ]]; then
+  # Relay resilience scenarios remain deterministic in relay-only mode and
+  # are also available to the Hard↔Hard experiment (where the manifest keeps
+  # the observed first path instead of claiming Relay was the only path).
+  if [[ ( "$MODE" == "relay-only" || "$MODE" == "hard-hard" ) && "$RELAY_KILL_RESTART" == "1" ]]; then
     # Kill the active relay and restart it on the same port: the daemon must
     # reconnect and the encrypted overlay must recover (verified round trips
     # continue growing) within the window.
@@ -1711,7 +2023,7 @@ except Exception:
     fi
   fi
 
-  if [[ "$MODE" == "relay-only" && "$RELAY_FAILOVER" == "1" && "$RELAY_COUNT" -ge 2 ]]; then
+  if [[ ( "$MODE" == "relay-only" || "$MODE" == "hard-hard" ) && "$RELAY_FAILOVER" == "1" && "$RELAY_COUNT" -ge 2 ]]; then
     # Kill the ACTIVE relay (the one the daemons confirmed on); with another
     # candidate in the catalog the daemon must fail over, re-probe and
     # re-confirm on the replacement relay, and the overlay must keep running.
@@ -1775,6 +2087,8 @@ except Exception:
     overall=1
   fi
 
+  CLEANUP_START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
+  CLEANUP_PROCESS_COUNT=$((4 + ${#RELAY_PIDS[@]}))
   kill "$NODE_A_PID" "$NODE_B_PID" "$SERVER_PID" "$NAT_PID" 2>/dev/null || true
   for relay_pid in "${RELAY_PIDS[@]:-}"; do
     kill "$relay_pid" 2>/dev/null || true
@@ -1783,6 +2097,28 @@ except Exception:
   for relay_pid in "${RELAY_PIDS[@]:-}"; do
     wait "$relay_pid" 2>/dev/null || true
   done
+  CLEANUP_END_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
+  python3 - "$ROUND_DIR/cleanup.json" "$((CLEANUP_END_MS - CLEANUP_START_MS))" \
+    "$CLEANUP_PROCESS_COUNT" <<'PY'
+import json
+import os
+import sys
+
+path, duration_ms, process_count = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "schema_version": 1,
+            "duration_ms": int(duration_ms),
+            "process_count": int(process_count),
+            "all_reaped": True,
+        },
+        handle,
+        sort_keys=True,
+    )
+    handle.write("\n")
+os.chmod(path, 0o600)
+PY
   PIDS=()
   sleep 0.5
 done

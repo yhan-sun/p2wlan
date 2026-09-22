@@ -332,6 +332,29 @@ impl PeerConnection {
         );
     }
 
+    fn record_hard_hard_attempt_report(
+        &mut self,
+        report: HardHardAttemptReport,
+        detail: impl Into<String>,
+    ) {
+        let generation = report.network_generation;
+        let socket_index = report.socket_index;
+        let candidate_count = report.counts.planned_targets as usize;
+        let sent_datagrams = report.counts.send_success_datagrams;
+        self.push_direct_event(
+            DirectTraversalEvent::new(
+                generation,
+                "hard_hard_attempt_report",
+                None,
+                Some(candidate_count),
+                Some(sent_datagrams),
+                detail,
+            )
+            .with_socket_index(socket_index)
+            .with_hard_hard_attempt(report),
+        );
+    }
+
     /// Push one direct-traversal event into the bounded ring.
     ///
     /// The strict acceptance lifecycle (owned validation request -> ACK ->
@@ -351,8 +374,7 @@ impl PeerConnection {
         }
         // Evict ordinary events first so the owned request -> ACK -> promoted
         // -> path chain survives the ring no matter which side pushed the
-        // overflow.  If the ring is entirely validation evidence (impossible
-        // in practice), the final drain below still enforces the hard cap.
+        // overflow.
         let mut evicted = 0usize;
         let excess = self.direct_events.len() - DIRECT_TRAVERSAL_EVENT_LIMIT;
         self.direct_events.retain(|candidate| {
@@ -366,16 +388,26 @@ impl PeerConnection {
                 false
             }
         });
-        if self.direct_events.len() > DIRECT_TRAVERSAL_EVENT_LIMIT {
-            let excess = self.direct_events.len() - DIRECT_TRAVERSAL_EVENT_LIMIT;
-            self.direct_events.drain(0..excess);
+        // A miss can produce more than 32 protected validation request/ACK
+        // records while the final experiment snapshot is still pending. Keep
+        // typed attempt reports ahead of that repeatable lifecycle traffic;
+        // when only protected entries remain, evict the oldest non-report and
+        // retain the newest validation chain. The hard cap remains absolute.
+        while self.direct_events.len() > DIRECT_TRAVERSAL_EVENT_LIMIT {
+            let evict = self
+                .direct_events
+                .iter()
+                .position(|candidate| candidate.stage != "hard_hard_attempt_report")
+                .unwrap_or(0);
+            self.direct_events.remove(evict);
         }
     }
 }
 
 /// Direct-validation and bounded Hard↔Hard lifecycle stages that acceptance
 /// diagnostics need as one evidence chain. These events are never evicted
-/// from the bounded event ring by ordinary traversal noise.
+/// from the bounded event ring by ordinary traversal noise; a typed attempt
+/// report also survives a ring made entirely of repeated protected traffic.
 fn is_protected_direct_event_stage(stage: &str) -> bool {
     matches!(
         stage,
@@ -390,6 +422,7 @@ fn is_protected_direct_event_stage(stage: &str) -> bool {
             | "hard_hard_direct_validation_started"
             | "hard_hard_probe_summary"
             | "hard_hard_birthday_sweep_summary"
+            | "hard_hard_attempt_report"
             | "hard_hard_sweep_completed"
             | "hard_hard_sweep_failed"
             | "hard_hard_failed"

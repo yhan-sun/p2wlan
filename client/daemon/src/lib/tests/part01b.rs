@@ -166,6 +166,26 @@ fn control_endpoint_does_not_publish_speculative_candidate() {
 }
 
 #[test]
+fn control_endpoint_allows_loopback_stun_only_for_explicit_nat_sim_harness() {
+    let candidates = vec!["127.0.0.1:41000".to_string()];
+    let sources = HashMap::from([(
+        "127.0.0.1:41000".to_string(),
+        "stun_observed".to_string(),
+    )]);
+
+    assert_eq!(
+        control_udp_endpoint_from_candidates(&candidates, &sources),
+        None,
+        "production endpoint selection must keep rejecting loopback"
+    );
+    assert_eq!(
+        control_udp_endpoint_from_candidates_with_loopback(&candidates, &sources, true).as_deref(),
+        Some("127.0.0.1:41000"),
+        "the explicit NAT simulator harness may publish its measured loopback mapping"
+    );
+}
+
+#[test]
 fn stable_control_endpoint_refresh_promotes_private_to_public() {
     assert!(should_update_stable_control_endpoint(
         Some("192.168.0.239:52633"),

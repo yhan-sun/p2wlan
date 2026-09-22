@@ -166,6 +166,11 @@ struct Cli {
     #[arg(long, name = "fresh-mapping-harness-loopback")]
     fresh_mapping_harness_loopback: bool,
 
+    /// Run only planner-authorized Hard↔Hard punch workers, suppressing
+    /// ordinary candidate offers/punches (deterministic NAT experiments only).
+    #[arg(long, name = "hard-hard-experiment-only")]
+    hard_hard_experiment_only: bool,
+
     /// Do not gather the local socket address as a Host candidate
     /// (NAT-simulation harnesses only).
     #[arg(long, name = "no-host-candidates")]

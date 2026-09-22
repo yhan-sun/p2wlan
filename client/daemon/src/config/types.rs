@@ -215,6 +215,15 @@ pub struct NetworkConfig {
     /// escape hatch and defaults to off.
     #[serde(default)]
     pub fresh_mapping_harness_loopback: bool,
+    /// Isolate the production Hard↔Hard lane from ordinary candidate offers
+    /// and ordinary punch workers in the deterministic NAT experiment.
+    ///
+    /// This runtime-only harness switch does not force planner eligibility,
+    /// change packet/socket budgets, or bypass validation. The normal planner
+    /// must still authorize Hard↔Hard from live profiles; otherwise Relay is
+    /// the only usable path for the experiment.
+    #[serde(skip)]
+    pub hard_hard_experiment_only: bool,
     /// Drive a real encrypted overlay payload through the production
     /// dataplane (DataPlane -> WireGuard encrypt -> outbound path selector ->
     /// WireGuard decrypt -> DataPlane) using an in-memory mock TUN instead of

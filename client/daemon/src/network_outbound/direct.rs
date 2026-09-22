@@ -20,6 +20,20 @@ pub(super) async fn direct_business_budget_ready_for_active_path(
                 .as_ref()
                 .is_some_and(|udp| udp.direct_business_budget_ready_for_peer(peer_id));
             if budget_ready {
+                // Record the point where the production outbound selector
+                // observes the authoritative Direct business-MTU admission
+                // bit. This is deliberately later than encrypted path
+                // validation and does not feed back into selection.
+                peers.emit_timeline_first(
+                    peer_id,
+                    generation,
+                    "direct_business_mtu_ready",
+                    Some("direct"),
+                    None,
+                    Some(format!(
+                        "peer={peer_id} generation={generation} source=outbound_selector"
+                    )),
+                );
                 return true;
             }
             // Make-before-break: while the committed Direct path is still

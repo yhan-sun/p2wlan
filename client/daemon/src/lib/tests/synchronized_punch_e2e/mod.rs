@@ -2381,6 +2381,12 @@ async fn assert_relay_remains_available(harness: &TwoPeerHarness) {
 
 async fn build_hard_hard_ordinary_fallback_fixture(
 ) -> (Daemon, Arc<PeerManager>, UdpTransport, ControlClient) {
+    build_hard_hard_ordinary_fallback_fixture_with_experiment(false).await
+}
+
+async fn build_hard_hard_ordinary_fallback_fixture_with_experiment(
+    hard_hard_experiment_only: bool,
+) -> (Daemon, Arc<PeerManager>, UdpTransport, ControlClient) {
     let mut config =
         Config::generate_default("http://hard-hard-fallback.test", "phase-2-2-fallback").unwrap();
     config.node.node_id = HARD_HARD_A.to_string();
@@ -2388,6 +2394,7 @@ async fn build_hard_hard_ordinary_fallback_fixture(
     config.network.udp_bind = "127.0.0.1:0".to_string();
     config.network.fresh_mapping_punch_enabled = true;
     config.network.fresh_mapping_harness_loopback = true;
+    config.network.hard_hard_experiment_only = hard_hard_experiment_only;
     config.network.birthday_probing_enabled = false;
     config.relay.servers = vec!["relay.invalid:443".to_string()];
     let daemon = Daemon::new(config);

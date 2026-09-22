@@ -34,6 +34,41 @@ direct_time_to_connect_ms 使用固定边界 50、100、250、500、1000、3000�
 
 control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契约：进程时间线淘汰旧记录后，Control 重连计数仍来自有界状态，而不是依赖已被淘汰的事件。
 
+## Hard↔Hard attempt report
+
+`/status` 的 `peers[].direct_events[]` 在 `stage=hard_hard_attempt_report` 时携带 schema 1 的 `hard_hard_attempt`。它是现有会话状态所有者导出的只读终态记录，不参与候选排序、发送准入、路径选择或取消判定。写入前会再次核对 network generation、peer session generation、remote candidate epoch、profile generation、punch generation、socket index、session token 和 attempt；旧会话的迟到结果不会记到新会话。
+
+身份字段包含构建源码、比较基线、build ID、实验 variant/scenario/seed、角色与 attempt。原始 session、IP 和端口不进入结构化记录；`session_tag` 与 `target_order_tags` 是会话加盐的短 SHA-256 标签，只用于同一 attempt 内关联和保留候选顺序，不能当作跨会话身份。
+
+候选与发送成本保持不同口径：
+
+- `requested`、`generated`、`unique`、`advertised`、`received` 分别表示请求、模型输出、去重、信令和对端接收数量；
+- `planned_targets`、`planned_sockets`、`planned_socket_target_combinations`、`planned_logical_probes` 与 `planned_physical_datagram_cap` 描述有界计划；
+- `attempted_targets` 是至少收到一次逻辑探测的唯一远端目标数；重复波次由 `logical_probes_attempted`、`logical_probes_sent` 单独计数；
+- `send_success_datagrams` / `send_success_bytes` 与 send-error 字段描述实际 UDP 系统调用结果。一个逻辑探测可能带一个有界兼容副本，因此物理 datagram 数不能从候选数推导；
+- `budget_skipped` 与 `cancelled_or_not_executed` 保留没有执行的计划量；STUN datagram/byte/error/response 和候选信令载荷字节单独计费。
+
+`target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
+
+时间字段全部来自同一 daemon 进程的单调时钟。记录覆盖末次 STUN 发送、测量完成、候选交换、计划/实际发送、probe 命中和加密验证；实验采集器再使用同一份进程 timeline 关联后续里程碑。`business_ready_at_ms` 只取生产出站选择器观察到 `direct_business_mtu_ready` 的时刻；`first_business_success_at_ms` 只取同一 peer/generation 上真实解密的 Direct `business_ingress_observed`。两者都不能用 active path、probe/ACK 或加密验证时刻代替。两者分别描述本端出站就绪和入站交付，均须晚于本端加密验证，但在双向业务中互相没有先后因果约束：对端可能在本端出站 MTU 探索完成前先发送一帧合法业务。验证已经完成但任一后续证据不存在时，字段保持空并派生 `validation_completed_business_not_ready` 或 `business_ready_no_direct_business`；不同 daemon 的绝对毫秒值不能互减。
+
+## Hard↔Hard NAT 实验入口
+
+独立矩阵入口不会替换既有 Direct、Relay 或 fail-closed gate：
+
+    python3 scripts/nat-sim/run-hard-hard-matrix.py --list
+    python3 scripts/nat-sim/run-hard-hard-matrix.py \
+      --scenario equal-step \
+      --scenario random-high-entropy-negative \
+      --rounds 1 \
+      --output /absolute/path/outside/repository/hard-hard-evidence
+
+`--help` 列出完整参数。输出目录必须是仓库外尚不存在的绝对路径，创建为仅当前用户可访问；runner 不覆盖或清理已有目录。每个固定 seed 只执行一次，不做诊断重试，原始 stdout/stderr、两端日志/status、NAT trace、进程清理耗时和普通 `nat-evidence.json` 均保留。缺任一侧 typed attempt、首业务证据、健康的 critical task、完整进程回收或原始 trace 时，manifest 失败关闭。
+
+矩阵包含等/异步长、负步长回绕、端口竞争、单/双侧严格过滤、非对称 NAT/STUN/信令/准备延迟、丢包/乱序/重复，以及固定 seed 的高熵随机映射和 Relay 重连。Hard↔Hard 模式最多预建 32 个“仅允许已登记内端发送触发映射”的模拟器公网监听槽，以忠实承载双方同时首发；公网入站不能创建或认领这些槽，其他模式默认关闭。高熵场景是负对照：允许 Direct 失败并以 Relay 有界兜底，但不允许缺证据、任务泄漏或无界退出。取消的 generation/session fencing 由隔离 Rust 回归覆盖；本地双进程模拟不代表两台物理设备、真实运营商 NAT 或公网成功率。
+
+manifest 分开报告保护期内 Direct 首业务、Relay-first、Relay 后升级 Direct、固定观测期最终 Direct、全部 typed attempt 失败/终态分布、测量年龄与计划偏差、候选执行覆盖和确认命中位置、条件延迟样本量、packet/byte/STUN/信令成本、计划 Socket 峰值、清理耗时、子进程 CPU/RSS 和 critical task 数。资源数包含本地构建、启动、实验与清理，不是跨主机性能比较；本轮没有隔离的遥测开/关性能 A/B，只用确定性回归约束候选顺序、预算、路径和取消不变。它不把不同 seed 当作不同真实网络，也不从无因果证据的数据宣称成功率提升。
+
 ## 活动路径遥测契约（path_telemetry_v1）
 
 daemon 通过异步非阻塞 sidecar 向 Control 上报权威活动路径状态。遥测通道优先复用 WebSocket 信令连接（通过 ready 消息中的 `path_telemetry_v1` 协商），支持 HTTP `POST /api/v1/telemetry/paths` 作为断连或无 WebSocket 时的回退通道。

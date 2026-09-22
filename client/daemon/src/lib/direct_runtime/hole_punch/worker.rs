@@ -78,6 +78,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         return;
     }
+    let hard_hard_experiment_only = peers.hard_hard_experiment_only();
     // Bind every delayed result from this invocation to the exact online
     // lifecycle that admitted it.  Peer IDs are reusable after PeerLeft, so a
     // worker which merely re-reads `online=true` at completion can otherwise
@@ -112,10 +113,8 @@ async fn spawn_hole_punch_task_with_lifecycle(
     // fresh socket and publishes the first prediction; the responder is
     // entered exclusively by the matching `hh1` fresh signal.  Other NAT
     // strategies continue through the existing scheduler below.
-    if fresh_prediction.is_none()
-        && frozen_targets.is_none()
-        && peers.local_node_id_for_traversal() < peer_id.as_str()
-    {
+    let local_is_hard_hard_initiator = peers.local_node_id_for_traversal() < peer_id;
+    if fresh_prediction.is_none() && frozen_targets.is_none() && local_is_hard_hard_initiator {
         if let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await {
             if let Some(signal) = signal.clone() {
                 peers
@@ -154,7 +153,12 @@ async fn spawn_hole_punch_task_with_lifecycle(
                         None,
                         None,
                         format!(
-                            "Hard↔Hard did not acquire a traversal owner; continuing with ordinary synchronized punching reason={}",
+                            "Hard↔Hard did not acquire a traversal owner; {} reason={}",
+                            if hard_hard_experiment_only {
+                                "ordinary fallback suppressed by the explicit experiment lane"
+                            } else {
+                                "continuing with ordinary synchronized punching"
+                            },
                             hard_hard_start
                                 .fallback_reason()
                                 .unwrap_or("unknown_not_started")
@@ -163,6 +167,25 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     .await;
             }
         }
+    }
+    if hard_hard_experiment_only {
+        peers
+            .record_direct_event(
+                &peer_id,
+                "hard_hard_experiment_waiting",
+                None,
+                None,
+                None,
+                if fresh_prediction.is_some() || frozen_targets.is_some() {
+                    "suppressed an ordinary predicted/frozen-target punch in the isolated Hard↔Hard experiment lane"
+                } else if local_is_hard_hard_initiator {
+                    "planner prerequisites are not currently authorized; Relay remains available while the experiment waits for a fresh fenced trigger"
+                } else {
+                    "deterministic responder is waiting for the initiator's authenticated hh1 signal"
+                },
+            )
+            .await;
+        return;
     }
     // Every trigger enters the authoritative recovery-epoch scheduler: one
     // traversal plan per (peer_id, generation, epoch) with shared hard

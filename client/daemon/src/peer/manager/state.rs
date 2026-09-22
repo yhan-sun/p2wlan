@@ -61,12 +61,40 @@ pub(crate) struct HardHardFreshSocketIdentity {
 /// connection writer are held, then consumed by the Hard↔Hard confirmation
 /// wait without reacquiring the connection map.  The Direct-set mirror still
 /// supplies the active/inactive bit; this value only proves the exact local
-/// endpoint and remote candidate epoch of the commit.
+/// endpoint, remote candidate epoch and process-local commit time. The time is
+/// observation-only and lets a terminal Hard↔Hard report preserve the actual
+/// encrypted-validation milestone instead of its later write time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectCommitPairSnapshot {
     pub(crate) generation: u64,
     pub(crate) remote_candidate_epoch: u64,
     pub(crate) local_endpoint: Option<SocketAddr>,
+    pub(crate) confirmed_at_ms: Option<u64>,
+}
+
+/// Observation-only facts captured while the local side measures and
+/// advertises a Hard↔Hard candidate window.  These values travel with the
+/// authoritative short-lived session record so the terminal report can be
+/// assembled without maintaining a second independently evolving state map.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HardHardMeasurementObservation {
+    pub(crate) measurement_started_at_ms: Option<u64>,
+    pub(crate) last_measurement_send_at_ms: Option<u64>,
+    pub(crate) measurement_completed_at_ms: Option<u64>,
+    pub(crate) candidate_exchange_completed_at_ms: Option<u64>,
+    pub(crate) planned_send_at_ms: Option<u64>,
+    pub(crate) requested_candidate_count: usize,
+    pub(crate) generated_candidate_count: usize,
+    pub(crate) deduplicated_candidate_count: usize,
+    pub(crate) advertised_candidate_count: usize,
+    pub(crate) candidate_cap: usize,
+    pub(crate) truncation_reason: String,
+    pub(crate) stun_datagrams_sent: u32,
+    pub(crate) stun_bytes_sent: u64,
+    pub(crate) stun_send_errors: u32,
+    pub(crate) stun_send_error_bytes: u64,
+    pub(crate) stun_responses: u32,
+    pub(crate) candidate_signal_payload_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +138,7 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) expires_at_ms: u64,
     pub(crate) state: HardHardSessionState,
     pub(crate) attempt_count: u8,
+    pub(crate) measurement: HardHardMeasurementObservation,
     pub(crate) created_at: Instant,
     pub(crate) cancellation: Arc<crate::PunchSessionCancellation>,
 }
@@ -414,6 +443,11 @@ type RelayProbeSnapshotTestGateSlot =
 
 /// Manages all peer connections.
 pub struct PeerManager {
+    /// Control-plane-resolved local node ID used by deterministic traversal
+    /// role selection. Managed registration can replace the persisted short
+    /// ID with a fully qualified node ID; comparing mixed formats would make
+    /// both endpoints believe they are the Hard↔Hard initiator.
+    local_node_id_for_traversal: std::sync::RwLock<String>,
     /// Active peer connections, indexed by node ID.
     connections: Arc<RwLock<HashMap<String, PeerConnection>>>,
     /// No-await mirror of connection-map membership and peer lifecycle.

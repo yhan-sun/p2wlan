@@ -505,7 +505,7 @@ async fn dynamic_attach_waits_for_first_reader_poll_before_immediate_stun() {
         .measure_fresh_mapping_batch(&socket, &nat.observers, FRESH_MAPPING_STUN_TIMEOUT, || true)
         .await;
     assert_eq!(
-        observations.len(),
+        observations.observations.len(),
         3,
         "every immediate sequential observer response must reach the ready dynamic reader"
     );

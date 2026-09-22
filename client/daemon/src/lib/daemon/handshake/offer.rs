@@ -828,7 +828,7 @@ impl Daemon {
         // for the already-running startup gather to replace the provisional
         // host-only snapshot; if relay is available, an empty snapshot still
         // lets the encrypted session/relay probe complete immediately.
-        let (candidates, candidate_sources) = {
+        let (mut candidates, mut candidate_sources) = {
             let initial_snapshot = self.initial_candidate_set_if_ready().await;
             let mut relay_available = self.relay_available_tx.subscribe();
             let relay_is_available = *relay_available.borrow();
@@ -882,6 +882,20 @@ impl Daemon {
                 }
             }
         };
+        if self.peers.hard_hard_experiment_only() && !candidates.is_empty() {
+            self.peers
+                .record_direct_event(
+                    from_node_id,
+                    "hard_hard_experiment_handshake_answer_candidates_suppressed",
+                    None,
+                    Some(candidates.len()),
+                    None,
+                    "kept the production encrypted handshake answer but removed its ordinary Direct candidate payload for the isolated Hard↔Hard experiment",
+                )
+                .await;
+            candidates.clear();
+            candidate_sources.clear();
+        }
         if cancellation
             .as_deref()
             .is_some_and(|cancellation| *cancellation.borrow())

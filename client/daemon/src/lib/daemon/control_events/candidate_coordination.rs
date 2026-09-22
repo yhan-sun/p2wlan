@@ -362,6 +362,7 @@ impl Daemon {
                 &offer.from_node_id,
                 offer.session_id.as_deref(),
                 offer.punch_at_ms,
+                offer.punch_at_server_ms,
                 fresh_punch.clone(),
             )
             .await;
@@ -371,6 +372,11 @@ impl Daemon {
             self.peers
                 .clear_hard_hard_sessions(Some(&offer.from_node_id))
                 .await;
+        }
+        if self.peers.hard_hard_experiment_only()
+            && hard_hard_handling != HardHardOfferHandling::NotHardHard
+        {
+            return;
         }
         if matches!(
             hard_hard_handling,
@@ -445,6 +451,7 @@ impl Daemon {
                 &offer.from_node_id,
                 offer.session_id.as_deref(),
                 offer.punch_at_ms,
+                offer.punch_at_server_ms,
                 fresh_punch.clone(),
             )
             .await;
@@ -454,6 +461,11 @@ impl Daemon {
             self.peers
                 .clear_hard_hard_sessions(Some(&offer.from_node_id))
                 .await;
+        }
+        if self.peers.hard_hard_experiment_only()
+            && hard_hard_handling != HardHardOfferHandling::NotHardHard
+        {
+            return;
         }
         if matches!(
             hard_hard_handling,
@@ -501,6 +513,7 @@ impl Daemon {
         peer_id: &str,
         session_id: Option<&str>,
         punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
         fresh_punch: FreshPunchDecision,
     ) -> HardHardOfferHandling {
         let Some(session_id) = session_id else {
@@ -589,6 +602,7 @@ impl Daemon {
                     peer_id.to_string(),
                     coordination,
                     punch_at_ms,
+                    punch_at_server_ms,
                     frozen_targets,
                 )
                 .await

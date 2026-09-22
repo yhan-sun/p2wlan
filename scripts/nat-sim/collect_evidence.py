@@ -161,6 +161,7 @@ def _side_evidence(
     log_path: Path,
     expected_path: str,
     overlay_burst: int,
+    allow_replay_rejects: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     baseline_identity = _status_identity(baseline)
     final_identity = _status_identity(final)
@@ -384,7 +385,13 @@ def _side_evidence(
         "critical_tasks_healthy": tasks_ok,
         "overlay_verified": overlay_verified > 0,
         "direct_not_used": direct_upgrade_ok if expected_path == "relay" else True,
-        "no_replay_or_invalid": replay_rejected == 0 and overlay_invalid == 0,
+        # Ordinary topology gates require zero replay rejects. The dedicated
+        # duplicate-injection experiment may instead accept authenticated
+        # WireGuard replay rejection, but never an invalid overlay payload.
+        "no_replay_or_invalid": (
+            (allow_replay_rejects or replay_rejected == 0)
+            and overlay_invalid == 0
+        ),
         "burst_complete": not burst_required or (burst_complete > 0 and burst_incomplete == 0),
         "outbound_drops_zero": drops_packets == 0,
     }
@@ -559,11 +566,26 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         baseline_b = _load(Path(args.baseline_b))
         final_a = _load(Path(args.final_a))
         final_b = _load(Path(args.final_b))
+        allow_replay_rejects = bool(getattr(args, "allow_replay_rejects", False))
+        if allow_replay_rejects and topology != "hard-hard-experiment":
+            raise ValueError("replay_reject_policy_outside_hard_hard")
         side_a, reason_a = _side_evidence(
-            "a", baseline_a, final_a, Path(args.log_a), args.expected_path, int(args.overlay_burst)
+            "a",
+            baseline_a,
+            final_a,
+            Path(args.log_a),
+            args.expected_path,
+            int(args.overlay_burst),
+            allow_replay_rejects,
         )
         side_b, reason_b = _side_evidence(
-            "b", baseline_b, final_b, Path(args.log_b), args.expected_path, int(args.overlay_burst)
+            "b",
+            baseline_b,
+            final_b,
+            Path(args.log_b),
+            args.expected_path,
+            int(args.overlay_burst),
+            allow_replay_rejects,
         )
         reason_a = _apply_first_usable_budget(
             side_a, side_b, args.expected_path, reason_a
@@ -571,6 +593,35 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         reason_b = _apply_first_usable_budget(
             side_b, side_a, args.expected_path, reason_b
         )
+        hard_hard_experiment = topology == "hard-hard-experiment"
+        if hard_hard_experiment:
+            for side in (side_a, side_b):
+                first = side["observed"]["first_usable"]
+                remaining_ms = first.get(
+                    "direct_first_remaining_ms_at_relay_ready"
+                )
+                delta_ms = first.get("delta_ms")
+                protection_observed = (
+                    type(remaining_ms) is int
+                    and 0 <= remaining_ms <= DIRECT_FIRST_WINDOW_MS
+                    and type(delta_ms) is int
+                    and delta_ms >= 0
+                )
+                first["direct_first_protection_budget_ms"] = (
+                    remaining_ms if protection_observed else None
+                )
+                first["within_direct_first_protection"] = (
+                    first.get("path") == "direct" and delta_ms <= remaining_ms
+                    if protection_observed
+                    else None
+                )
+                side["invariants"][
+                    "direct_first_protection_observed"
+                ] = protection_observed
+            if not side_a["invariants"]["direct_first_protection_observed"]:
+                reason_a = reason_a or "evidence_parser_loss"
+            if not side_b["invariants"]["direct_first_protection_observed"]:
+                reason_b = reason_b or "evidence_parser_loss"
         record["baseline"] = {"a": side_a["baseline"], "b": side_b["baseline"]}
         record["final"] = {"a": side_a["final"], "b": side_b["final"]}
         record["observed"] = {"a": side_a["observed"], "b": side_b["observed"]}
@@ -593,15 +644,67 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             "same_workflow_sha": bool(args.workflow_sha),
         }
         failed_reasons = [reason for reason in (reason_a, reason_b) if reason]
-        all_invariants = all(side_a["invariants"].values()) and all(side_b["invariants"].values())
-        result = not failed_reasons and all_invariants
-        reason = None if result else (failed_reasons[0] if failed_reasons else "invariant_failed")
+        if hard_hard_experiment:
+            replay_rejects_observed = sum(
+                int(side["observed"]["replay_rejected"])
+                for side in (side_a, side_b)
+            )
+            replay_policy_satisfied = (
+                replay_rejects_observed > 0
+                if allow_replay_rejects
+                else replay_rejects_observed == 0
+            )
+            record["invariants"]["replay_policy_satisfied"] = replay_policy_satisfied
+            record["observed"]["replay_policy"] = {
+                "allow_replay_rejects": allow_replay_rejects,
+                "replay_rejects_observed": replay_rejects_observed,
+            }
+            if not replay_policy_satisfied:
+                failed_reasons.append("replay_policy_unsatisfied")
+            # The fixed 3500ms Hard<->Hard rendezvous can legitimately miss
+            # the existing 3000ms cold-start SLO. Keep the calibrated budget,
+            # raw delta, and miss explicit, but do not confuse that measured
+            # performance outcome with corrupt experiment evidence. The
+            # ordinary Direct/Relay records retain their fail-closed gates.
+            evidence_reasons = [
+                reason
+                for reason in failed_reasons
+                if reason != "relay_first_slo_exceeded"
+            ]
+            all_invariants = all(
+                value
+                for side in (side_a, side_b)
+                for name, value in side["invariants"].items()
+                if name != "first_usable_delta_fenced"
+            )
+        else:
+            evidence_reasons = failed_reasons
+            all_invariants = all(side_a["invariants"].values()) and all(
+                side_b["invariants"].values()
+            )
+        result = not evidence_reasons and all_invariants
+        reason = None if result else (
+            evidence_reasons[0] if evidence_reasons else "invariant_failed"
+        )
         record["result"] = "pass" if result else "fail"
         record["decision"] = {
             "result": record["result"],
             "reason_code": reason,
             "observed_decision": "first_usable_committed" if result else "first_usable_not_accepted",
         }
+        if hard_hard_experiment:
+            slo_met = (
+                side_a["invariants"]["first_usable_delta_fenced"]
+                and side_b["invariants"]["first_usable_delta_fenced"]
+            )
+            record["decision"].update(
+                {
+                    "performance_slo_result": "met" if slo_met else "miss",
+                    "performance_slo_reason_code": (
+                        None if slo_met else "relay_first_slo_exceeded"
+                    ),
+                }
+            )
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         reason = str(exc).split(":", 1)[0] or "evidence_parse_failed"
         record["decision"] = {
@@ -614,7 +717,11 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--topology", required=True, choices=["relay-blackhole", "direct-cold-start"])
+    parser.add_argument(
+        "--topology",
+        required=True,
+        choices=["relay-blackhole", "direct-cold-start", "hard-hard-experiment"],
+    )
     parser.add_argument("--replica", required=True, type=int)
     parser.add_argument("--round", required=True, type=int)
     parser.add_argument("--source-head-sha", required=True)
@@ -627,6 +734,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--log-b", required=True)
     parser.add_argument("--expected-path", required=True, choices=["relay", "direct"])
     parser.add_argument("--overlay-burst", type=int, default=0)
+    parser.add_argument("--allow-replay-rejects", action="store_true")
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)
 

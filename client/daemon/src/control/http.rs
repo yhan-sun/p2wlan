@@ -20,8 +20,9 @@ use crate::error::{DaemonError, Result};
 use super::{
     bounded_signal_log_value, ClientState, ControlErrorResponse, ControlEvent,
     CreateTunnelResponse, EndpointUpdateResponse, FetchRelayTicketResponse, ListNodesResponse,
-    ListSignalsResponse, PeerInfo, RegisterDeviceResponse, RelayCatalogEntry, SignalApplyOutcome,
-    SignalCreateResponse, SignalDeliveryReceipt, SignalDeliveryWaiter, SignalResponse,
+    ListSignalsResponse, PeerInfo, RegisterDeviceResponse, RelayCatalogEntry, ServerClockEstimate,
+    SignalApplyOutcome, SignalCreateResponse, SignalDeliveryReceipt, SignalDeliveryWaiter,
+    SignalResponse,
 };
 
 /// Candidate-set revisions must be strictly increasing within a daemon.  Wall

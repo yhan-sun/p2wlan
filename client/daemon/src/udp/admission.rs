@@ -29,6 +29,7 @@ struct ProbeSendFailure {
     error: DaemonError,
     kind: ProbeSendFailureKind,
     physical_send_errors: u8,
+    physical_send_error_bytes: u64,
 }
 
 impl ProbeSendFailure {
@@ -37,14 +38,16 @@ impl ProbeSendFailure {
             error,
             kind,
             physical_send_errors: 0,
+            physical_send_error_bytes: 0,
         }
     }
 
-    fn with_physical_send_error(error: DaemonError) -> Self {
+    fn with_physical_send_error(error: DaemonError, bytes: usize) -> Self {
         Self {
             error,
             kind: ProbeSendFailureKind::PhysicalSend,
             physical_send_errors: 1,
+            physical_send_error_bytes: bytes as u64,
         }
     }
 }
@@ -56,6 +59,7 @@ struct ProbeSendResult {
     /// send transaction.  Heartbeats have no retransmit burst, so this is the
     /// exact quantity that must be committed to their low-rate budget.
     datagrams_sent: u8,
+    physical_bytes_sent: u64,
     /// Actual socket selected after dynamic-socket resolution.  Keeping this
     /// beside the send result lets session telemetry account for the socket
     /// that really emitted the packet, even if a requested dynamic index was
@@ -67,6 +71,7 @@ struct ProbeSendResult {
     /// Physical sends which returned an error during this logical probe. A
     /// compatibility-copy failure can coexist with a successful primary.
     physical_send_errors: u8,
+    physical_send_error_bytes: u64,
 }
 
 impl UdpTransport {
@@ -972,7 +977,12 @@ impl UdpTransport {
                 // other follow-up await so a cancelled worker cannot lose a
                 // datagram that the kernel already accepted.
                 if let Some(recorder) = live_recorder.as_ref() {
-                    recorder.record_primary_success(socket_index, peer_addr, sent_at_ms);
+                    recorder.record_primary_success(
+                        socket_index,
+                        peer_addr,
+                        sent_at_ms,
+                        bytes.len(),
+                    );
                 }
                 #[cfg(test)]
                 wait_for_probe_post_send_gate_for_test().await;
@@ -982,7 +992,7 @@ impl UdpTransport {
                 // The primary send failed, but the physical error must still
                 // survive a cancellation racing the pending-probe cleanup.
                 if let Some(recorder) = live_recorder.as_ref() {
-                    recorder.record_primary_error();
+                    recorder.record_primary_error(bytes.len());
                 }
                 #[cfg(test)]
                 wait_for_probe_post_send_gate_for_test().await;
@@ -990,6 +1000,7 @@ impl UdpTransport {
                 self.clear_hard_hard_pending_probe_token(nonce).await;
                 return Err(ProbeSendFailure::with_physical_send_error(
                     DaemonError::Network(format!("UDP probe send to {peer_addr} failed: {error}")),
+                    bytes.len(),
                 ));
             }
         };
@@ -1010,7 +1021,9 @@ impl UdpTransport {
         }
 
         let mut datagrams_sent = 1u8;
+        let mut physical_bytes_sent = bytes.len() as u64;
         let mut physical_send_errors = 0u8;
+        let mut physical_send_error_bytes = 0u64;
         if let Some(legacy_probe) = compat_legacy_probe.clone() {
             match self
                 .send_probe_datagram(&socket, &legacy_probe, peer_addr)
@@ -1018,8 +1031,14 @@ impl UdpTransport {
             {
                 Ok(_) => {
                     datagrams_sent = datagrams_sent.saturating_add(1);
+                    physical_bytes_sent =
+                        physical_bytes_sent.saturating_add(legacy_probe.len() as u64);
                     if let Some(recorder) = live_recorder.as_ref() {
-                        recorder.record_compatibility_success(socket_index, monotonic_millis());
+                        recorder.record_compatibility_success(
+                            socket_index,
+                            monotonic_millis(),
+                            legacy_probe.len(),
+                        );
                     }
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.probes_sent += 1
@@ -1050,8 +1069,10 @@ impl UdpTransport {
                 }
                 Err(err) => {
                     physical_send_errors = physical_send_errors.saturating_add(1);
+                    physical_send_error_bytes = physical_send_error_bytes
+                        .saturating_add(legacy_probe.len() as u64);
                     if let Some(recorder) = live_recorder.as_ref() {
-                        recorder.record_compatibility_error();
+                        recorder.record_compatibility_error(legacy_probe.len());
                     }
                     debug!(
                         "Failed to send compatibility legacy UDP punch probe to peer {} at {}: {}",
@@ -1075,9 +1096,11 @@ impl UdpTransport {
         Ok(ProbeSendResult {
             nonce,
             datagrams_sent,
+            physical_bytes_sent,
             socket_index,
             first_send_at_ms,
             physical_send_errors,
+            physical_send_error_bytes,
         })
     }
 

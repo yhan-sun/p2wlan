@@ -329,7 +329,125 @@ pub struct DirectTraversalEvent {
     pub probe_tx_alt_socket_count: Option<u32>,
     pub probe_tx_unique_target_ports: Option<u32>,
     pub probe_tx_repeated_target_ports: Option<u32>,
+    /// Typed, endpoint-free terminal report for one bounded Hard↔Hard
+    /// attempt.  Ordinary traversal events leave this absent.  The report is
+    /// observation-only and never feeds path selection or send admission.
+    pub hard_hard_attempt: Option<HardHardAttemptReport>,
     pub detail: String,
+}
+
+pub const HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Candidate and physical-send accounting for one Hard↔Hard attempt.
+///
+/// "Candidate" is deliberately not overloaded: model output, unique wire
+/// candidates, received targets, scheduled socket×target work and actual UDP
+/// datagrams remain separate dimensions.  Target order is represented by
+/// session-keyed tags so local diagnostics retain ordering without exposing
+/// IP addresses or ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardAttemptCounts {
+    pub requested: u32,
+    pub generated: u32,
+    pub unique: u32,
+    pub advertised: u32,
+    pub received: u32,
+    pub planned_targets: u32,
+    pub planned_sockets: u32,
+    pub planned_socket_target_combinations: u32,
+    pub planned_logical_probes: u32,
+    /// Upper bound on physical sends when every logical Probe also needs its
+    /// one bounded legacy compatibility copy.
+    pub planned_physical_datagram_cap: u32,
+    /// Distinct remote endpoints that received at least one logical probe.
+    /// Repeated waves are counted by `logical_probes_attempted`, not here.
+    pub attempted_targets: u32,
+    pub logical_probes_attempted: u32,
+    pub logical_probes_sent: u32,
+    pub send_success_datagrams: u32,
+    pub send_success_bytes: u64,
+    pub send_errors: u32,
+    pub send_error_bytes: u64,
+    pub budget_skipped: u32,
+    pub cancelled_or_not_executed: u32,
+    pub stun_send_success_datagrams: u32,
+    pub stun_send_success_bytes: u64,
+    pub stun_send_errors: u32,
+    pub stun_send_error_bytes: u64,
+    pub stun_responses: u32,
+    /// Candidate/source strings handed to the existing signaling API. This is
+    /// the bounded payload content, not an estimate of HTTP/TLS framing.
+    pub candidate_signal_payload_bytes: u64,
+}
+
+/// Process-local monotonic milestones and derived durations.  Every absolute
+/// value uses the same daemon-start timeline; no field is a remote clock or a
+/// UNIX timestamp.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardAttemptTimeline {
+    pub measurement_started_at_ms: Option<u64>,
+    pub last_measurement_send_at_ms: Option<u64>,
+    pub measurement_completed_at_ms: Option<u64>,
+    pub candidate_exchange_completed_at_ms: Option<u64>,
+    pub planned_send_at_ms: Option<u64>,
+    pub send_dispatch_at_ms: Option<u64>,
+    pub actual_first_send_at_ms: Option<u64>,
+    pub probe_hit_at_ms: Option<u64>,
+    pub encrypted_validation_completed_at_ms: Option<u64>,
+    /// Filled by the existing process timeline/experiment collector. A sweep
+    /// report may be emitted before either business milestone exists.
+    pub business_ready_at_ms: Option<u64>,
+    pub first_business_success_at_ms: Option<u64>,
+    pub measurement_age_at_send_ms: Option<u64>,
+    pub schedule_deviation_ms: Option<i64>,
+    pub validation_duration_ms: Option<u64>,
+    pub time_to_first_business_ms: Option<u64>,
+}
+
+/// Endpoint-free report emitted once when a Hard↔Hard sweep reaches a
+/// terminal result. Build identity is embedded so a copied peer record still
+/// proves which binary produced it; scenario/seed/attempt identity remains in
+/// the bounded harness run id and experiment manifest rather than accepting
+/// arbitrary production labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardAttemptReport {
+    pub schema_version: u32,
+    pub baseline_git_commit: String,
+    pub source_git_commit: String,
+    pub build_id: String,
+    pub experiment_variant: Option<String>,
+    pub scenario_id: Option<String>,
+    pub seed: Option<u64>,
+    pub role: String,
+    pub mode: String,
+    pub session_tag: String,
+    pub network_generation: u64,
+    pub peer_session_generation: u64,
+    pub remote_candidate_epoch: u64,
+    pub local_profile_generation: u64,
+    pub remote_profile_generation: u64,
+    pub punch_generation: u64,
+    /// Exact local dynamic socket for an admitted sweep. Measurement/model
+    /// failures can terminate before a socket identity exists and leave this
+    /// absent; their plan/generation/session fences remain mandatory.
+    pub socket_index: Option<usize>,
+    pub attempt: u8,
+    pub counts: HardHardAttemptCounts,
+    pub candidate_cap: u32,
+    pub truncation_reason: String,
+    pub target_order_tags: Vec<String>,
+    /// Zero-based position in `target_order_tags` of the endpoint selected by
+    /// encrypted Direct validation. `None` means either Direct was not
+    /// confirmed or the learned endpoint was outside the advertised plan.
+    pub confirmed_target_rank: Option<u32>,
+    pub timeline: HardHardAttemptTimeline,
+    pub probe_packets_received: u64,
+    pub matched_probe_acks: u64,
+    pub authenticated_probe_packets_received: u64,
+    pub authenticated_probe_acks_unmatched: u64,
+    pub direct_confirmed: bool,
+    pub failure_class: String,
+    pub terminal_reason: String,
 }
 
 impl DirectTraversalEvent {
@@ -361,8 +479,14 @@ impl DirectTraversalEvent {
             probe_tx_alt_socket_count: None,
             probe_tx_unique_target_ports: None,
             probe_tx_repeated_target_ports: None,
+            hard_hard_attempt: None,
             detail: detail.into(),
         }
+    }
+
+    pub(super) fn with_hard_hard_attempt(mut self, report: HardHardAttemptReport) -> Self {
+        self.hard_hard_attempt = Some(report);
+        self
     }
 
     pub(super) fn with_socket_index(mut self, socket_index: Option<usize>) -> Self {

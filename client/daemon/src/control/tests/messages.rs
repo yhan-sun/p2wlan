@@ -191,6 +191,23 @@ fn signal_punch_time_uses_server_clock_offset() {
 }
 
 #[test]
+fn server_clock_estimate_translates_local_deadline_and_expires() {
+    let estimate = ServerClockEstimate::default();
+    estimate.observe(10_000, 50_000);
+    assert_eq!(
+        estimate.server_deadline_for_local(53_500, 50_010),
+        Some(13_500)
+    );
+    assert_eq!(
+        estimate.server_deadline_for_local(
+            83_501,
+            50_000 + ServerClockEstimate::MAX_AGE_MS + 1
+        ),
+        None
+    );
+}
+
+#[test]
 fn candidate_expiry_uses_the_server_clock_offset() {
     assert_eq!(
         normalize_signal_candidate_expiry(Some(55_000), Some(10_000), 80_000),

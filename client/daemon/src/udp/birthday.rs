@@ -327,7 +327,7 @@ impl UdpTransport {
                 vec![observers[position % observers.len()]]
             };
             measurements.spawn(async move {
-                let observations = transport
+                let measurement = transport
                     .measure_fresh_mapping_batch(&socket, &selected_observers, stun_timeout, || {
                         !cancellation
                             .as_ref()
@@ -337,13 +337,50 @@ impl UdpTransport {
                                 == network_generation
                     })
                     .await;
-                (position, observations)
+                (position, measurement)
             });
         }
         let mut observations_by_socket = vec![Vec::new(); attached.len()];
+        let mut measurement_stats = HardHardMeasurementStats::default();
         while let Some(joined) = measurements.join_next().await {
-            if let Ok((position, observations)) = joined {
-                observations_by_socket[position] = observations;
+            if let Ok((position, measurement)) = joined {
+                measurement_stats.stun_datagrams_sent = measurement_stats
+                    .stun_datagrams_sent
+                    .saturating_add(measurement.stats.stun_datagrams_sent);
+                measurement_stats.stun_bytes_sent = measurement_stats
+                    .stun_bytes_sent
+                    .saturating_add(measurement.stats.stun_bytes_sent);
+                measurement_stats.stun_send_errors = measurement_stats
+                    .stun_send_errors
+                    .saturating_add(measurement.stats.stun_send_errors);
+                measurement_stats.stun_send_error_bytes = measurement_stats
+                    .stun_send_error_bytes
+                    .saturating_add(measurement.stats.stun_send_error_bytes);
+                measurement_stats.stun_responses = measurement_stats
+                    .stun_responses
+                    .saturating_add(measurement.stats.stun_responses);
+                measurement_stats.measurement_started_at_ms = match (
+                    measurement_stats.measurement_started_at_ms,
+                    measurement.stats.measurement_started_at_ms,
+                ) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (None, value) | (value, None) => value,
+                };
+                measurement_stats.last_measurement_send_at_ms = match (
+                    measurement_stats.last_measurement_send_at_ms,
+                    measurement.stats.last_measurement_send_at_ms,
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (None, value) | (value, None) => value,
+                };
+                measurement_stats.measurement_completed_at_ms = match (
+                    measurement_stats.measurement_completed_at_ms,
+                    measurement.stats.measurement_completed_at_ms,
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (None, value) | (value, None) => value,
+                };
+                observations_by_socket[position] = measurement.observations;
             }
         }
         if cancellation.is_some_and(|cancellation| cancellation.is_cancelled())
@@ -496,6 +533,7 @@ impl UdpTransport {
             sockets,
             model_label,
             model_confidence: local_model.confidence,
+            measurement: measurement_stats,
         })
     }
 

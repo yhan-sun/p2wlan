@@ -456,6 +456,42 @@ struct ClientState {
     _relay_servers: Vec<String>,
 }
 
+/// Latest bounded translation between this process' wall clock and the
+/// control server clock. Signal polling refreshes it from a timestamp written
+/// into the same response as the durable signal batch. Hard<->Hard uses the
+/// estimate only to express its existing 3500ms local deadline on the server
+/// clock before queueing an initiating offer; the server remains authoritative
+/// and the receiver independently translates that one absolute deadline.
+#[derive(Debug, Default)]
+struct ServerClockEstimate {
+    offset_ms: AtomicI64,
+    observed_at_local_ms: AtomicU64,
+}
+
+impl ServerClockEstimate {
+    const MAX_AGE_MS: u64 = 30_000;
+
+    fn observe(&self, server_time_ms: u64, local_time_ms: u64) {
+        let offset = i128::from(server_time_ms) - i128::from(local_time_ms);
+        let Ok(offset) = i64::try_from(offset) else {
+            return;
+        };
+        self.offset_ms.store(offset, Ordering::Relaxed);
+        self.observed_at_local_ms
+            .store(local_time_ms, Ordering::Release);
+    }
+
+    fn server_deadline_for_local(&self, local_deadline_ms: u64, local_now_ms: u64) -> Option<u64> {
+        let observed_at = self.observed_at_local_ms.load(Ordering::Acquire);
+        if observed_at == 0 || local_now_ms.abs_diff(observed_at) > Self::MAX_AGE_MS {
+            return None;
+        }
+        let translated = i128::from(local_deadline_ms)
+            .checked_add(i128::from(self.offset_ms.load(Ordering::Relaxed)))?;
+        u64::try_from(translated).ok()
+    }
+}
+
 /// Relay catalog entry from control plane.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RelayCatalogEntry {
@@ -670,6 +706,8 @@ pub struct ControlClient {
     /// runtime, so a slow candidate POST cannot block roster polling or other
     /// peers.
     candidate_offer_tx: mpsc::Sender<CandidateOfferCommand>,
+    /// Shared server/local wall-clock translation refreshed by signal polls.
+    server_clock: Arc<ServerClockEstimate>,
     /// Shared state.
     state: Arc<RwLock<ClientState>>,
     /// Test-only in-process signaling adapter. It preserves the same
@@ -844,6 +882,9 @@ struct CandidateOfferCommand {
     candidate_sources: HashMap<String, String>,
     handshake_init: Vec<u8>,
     punch_at_ms: Option<u64>,
+    /// Preserve an already-normalized server deadline on a reciprocal
+    /// candidate-only response. Initial offers leave this empty.
+    punch_at_server_ms: Option<u64>,
     fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
     response_tx: oneshot::Sender<PeerOfferSendOutcome>,
 }

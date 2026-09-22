@@ -38,6 +38,7 @@ fn test_cli(control: Option<&str>, network: Option<&str>) -> Cli {
         prefer_direct: false,
         relay_only: false,
         fresh_mapping_harness_loopback: false,
+        hard_hard_experiment_only: false,
         no_host_candidates: false,
         disable_fresh_mapping_punch: false,
         disable_predicted_candidates: false,
@@ -127,6 +128,20 @@ fn traversal_ablation_flags_disable_only_the_requested_strategies() {
 }
 
 #[test]
+fn hard_hard_experiment_lane_is_explicit_and_runtime_only() {
+    let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
+    assert!(!config.network.hard_hard_experiment_only);
+    let mut cli = test_cli(None, None);
+    cli.hard_hard_experiment_only = true;
+
+    apply_cli_overrides(&mut config, &cli);
+
+    assert!(config.network.hard_hard_experiment_only);
+    let persisted = serde_json::to_value(&config.network).unwrap();
+    assert!(persisted.get("hard_hard_experiment_only").is_none());
+}
+
+#[test]
 fn prefer_relay_keeps_background_direct_upgrade_enabled() {
     let mut config = Config::generate_default("http://127.0.0.1", "default").unwrap();
     config.relay.prefer_direct = false;
@@ -195,6 +210,7 @@ fn network_arguments_override_generated_config() {
         prefer_direct: false,
         relay_only: false,
         fresh_mapping_harness_loopback: false,
+        hard_hard_experiment_only: false,
         no_host_candidates: false,
         disable_fresh_mapping_punch: false,
         disable_predicted_candidates: false,
@@ -268,6 +284,7 @@ fn test_validate_cli_invalid_cases() {
         prefer_direct: false,
         relay_only: false,
         fresh_mapping_harness_loopback: false,
+        hard_hard_experiment_only: false,
         no_host_candidates: false,
         disable_fresh_mapping_punch: false,
         disable_predicted_candidates: false,
@@ -408,6 +425,7 @@ fn managed_argument_overrides_existing_manual_config() {
         prefer_direct: false,
         relay_only: false,
         fresh_mapping_harness_loopback: false,
+        hard_hard_experiment_only: false,
         no_host_candidates: false,
         disable_fresh_mapping_punch: false,
         disable_predicted_candidates: false,

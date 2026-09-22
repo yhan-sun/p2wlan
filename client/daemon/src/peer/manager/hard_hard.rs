@@ -45,9 +45,29 @@ pub(crate) struct HardHardPlanSnapshot {
 }
 
 impl PeerManager {
+    /// Whether the explicit NAT experiment must isolate the Hard↔Hard lane
+    /// from ordinary candidate signaling and punch workers. Production and
+    /// the established direct/relay gates always leave this disabled.
+    pub(crate) fn hard_hard_experiment_only(&self) -> bool {
+        self.config.network.hard_hard_experiment_only
+    }
+
     /// The local node id used to choose one deterministic Hard↔Hard initiator.
-    pub(crate) fn local_node_id_for_traversal(&self) -> &str {
-        &self.config.node.node_id
+    pub(crate) fn local_node_id_for_traversal(&self) -> String {
+        self.local_node_id_for_traversal
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Publish the exact managed-registration identity before traversal work
+    /// starts. This updates only the local role fence; peer/session ownership
+    /// and every network generation remain unchanged.
+    pub(crate) fn set_local_node_id_for_traversal(&self, node_id: &str) {
+        *self
+            .local_node_id_for_traversal
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = node_id.to_string();
     }
 
     /// Return a point-in-time Hard↔Hard authorization snapshot.
@@ -374,6 +394,64 @@ impl PeerManager {
             .map(|(_, record)| record.clone())
     }
 
+    /// Attach the local control-plane completion milestone to the exact
+    /// authoritative session. A stale worker cannot write into a replacement
+    /// record because both peer and token must still match and retirement is
+    /// terminal. The timestamp is observation-only.
+    pub(crate) async fn hard_hard_mark_candidate_exchange_completed(
+        &self,
+        peer_id: &str,
+        token: &str,
+        completed_at_ms: Option<u64>,
+        advertised_candidate_count: usize,
+    ) -> bool {
+        let mut sessions = self.hard_hard_sessions.lock().await;
+        let Some((_, record)) = sessions.iter_mut().find(|((owner, _), record)| {
+            owner == peer_id
+                && record.session_token == token
+                && record.state != HardHardSessionState::Retiring
+                && !record.cancellation.is_cancelled()
+        }) else {
+            return false;
+        };
+        record.measurement.candidate_exchange_completed_at_ms = completed_at_ms;
+        record.measurement.advertised_candidate_count = advertised_candidate_count;
+        true
+    }
+
+    /// Report-only identity fence. A cancellation may already be visible by
+    /// the time its terminal report is committed, so this intentionally does
+    /// not require an uncancelled token. Replacement and retiring sessions
+    /// still fail closed through the exact token and generation identities.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn hard_hard_attempt_report_identity_is_current(
+        &self,
+        peer_id: &str,
+        token: &str,
+        network_generation: u64,
+        remote_candidate_epoch: u64,
+        punch_generation: u64,
+        socket_index: usize,
+        attempt: u8,
+    ) -> bool {
+        self.hard_hard_sessions
+            .lock()
+            .await
+            .iter()
+            .find(|((owner, _), record)| {
+                owner == peer_id
+                    && record.session_token == token
+                    && record.state != HardHardSessionState::Retiring
+            })
+            .is_some_and(|(_, session)| {
+                session.local_network_generation == network_generation
+                    && session.remote_candidate_epoch == remote_candidate_epoch
+                    && session.fresh_socket.punch_generation == punch_generation
+                    && session.fresh_socket.socket_index == socket_index
+                    && session.attempt_count == attempt
+            })
+    }
+
     /// Promote one authenticated speculative socket to the session winner.
     ///
     /// The UDP layer has already authenticated the Probe v2 packet and checked
@@ -621,7 +699,9 @@ impl PeerManager {
         &self,
         identity: &HardHardFreshSocketIdentity,
     ) -> bool {
-        if self.current_network_generation_sync() != identity.network_generation {
+        if self.current_network_generation_sync() != identity.network_generation
+            || self.current_local_profile_generation_sync() != identity.local_profile_generation
+        {
             return false;
         }
         let connections = self.connections.read().await;
@@ -630,6 +710,12 @@ impl PeerManager {
         };
         conn.state == ConnectionState::Direct
             && conn.direct_generation == identity.network_generation
+            && conn.remote_nat_profile_is_fresh()
+            && conn
+                .remote_nat_profile
+                .as_ref()
+                .and_then(|profile| profile.generation)
+                == Some(identity.remote_profile_generation)
             && conn.candidate_pairs.iter().any(|pair| {
                 pair.local_generation == identity.network_generation
                     && pair.remote_candidate_epoch == identity.remote_candidate_epoch
@@ -640,15 +726,15 @@ impl PeerManager {
     }
 
     /// Return true only when the authoritative Direct commit selected a pair
-    /// on this Hard↔Hard socket and the full session/generation/profile fence
-    /// is still current.  The UDP layer separately proves affinity and
-    /// authenticated socket evidence.
+    /// on this Hard↔Hard socket and every generation/profile fence remains
+    /// current. The live recovery-session cancellation bit is intentionally
+    /// not required: committing Direct ends that recovery epoch. The UDP layer
+    /// separately proves the token-tagged affinity and authenticated evidence.
     pub(crate) async fn hard_hard_direct_confirmation_is_current(
         &self,
         identity: &HardHardFreshSocketIdentity,
     ) -> bool {
-        self.hard_hard_session_identity_is_current(identity).await
-            && self.hard_hard_direct_pair_is_current(identity).await
+        self.hard_hard_direct_pair_is_current(identity).await
     }
 
     /// Atomically consume the one reciprocal-sweep slot for a session.  A

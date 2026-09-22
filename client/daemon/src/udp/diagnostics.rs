@@ -139,7 +139,16 @@ impl UdpTransport {
             snapshot: UdpProbeRxSnapshot::default(),
             last_updated: now,
         });
+        let authenticated_before = entry.snapshot.authenticated_probe_packets_received;
+        let matched_before = entry.snapshot.probe_acks_received;
         update(&mut entry.snapshot);
+        let observed_at_ms = monotonic_millis();
+        if entry.snapshot.authenticated_probe_packets_received > authenticated_before {
+            entry.snapshot.last_authenticated_at_ms = Some(observed_at_ms);
+        }
+        if entry.snapshot.probe_acks_received > matched_before {
+            entry.snapshot.last_matched_ack_at_ms = Some(observed_at_ms);
+        }
         entry.last_updated = now;
     }
 

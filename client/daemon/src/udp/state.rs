@@ -1084,6 +1084,29 @@ pub(crate) enum FreshMappingOutcome {
     Rejected(FreshMappingRejection),
 }
 
+/// Endpoint-free cost and timing facts for one local Hard↔Hard STUN
+/// measurement.  Durations use the transport's process-local monotonic clock;
+/// callers translate them onto the daemon timeline only after the measurement
+/// future completes.  This structure is observation-only and is never read by
+/// candidate generation or send admission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HardHardMeasurementStats {
+    /// Successful UDP sends to STUN observers, including samples that timed
+    /// out or returned an unusable response.
+    pub(crate) stun_datagrams_sent: u32,
+    pub(crate) stun_bytes_sent: u64,
+    /// STUN UDP sends rejected by the kernel.
+    pub(crate) stun_send_errors: u32,
+    pub(crate) stun_send_error_bytes: u64,
+    /// Usable STUN binding responses retained by the model input.
+    pub(crate) stun_responses: u32,
+    /// Transport-local monotonic milestones. They are translated onto the
+    /// daemon timeline as one group and are never exposed directly.
+    pub(crate) measurement_started_at_ms: Option<u64>,
+    pub(crate) last_measurement_send_at_ms: Option<u64>,
+    pub(crate) measurement_completed_at_ms: Option<u64>,
+}
+
 /// A successful fresh-mapping generation result.
 #[derive(Debug, Clone)]
 pub(crate) struct FreshMappingResult {
@@ -1104,6 +1127,8 @@ pub(crate) struct FreshMappingResult {
     /// First and last authenticated punch send timestamps (monotonic ms).
     pub(crate) first_punch_sent_at_ms: u64,
     pub(crate) last_punch_sent_at_ms: u64,
+    /// Measurement cost/timing exported for the Hard↔Hard attempt report.
+    pub(crate) measurement: HardHardMeasurementStats,
 }
 
 /// One committed speculative mapping used by the bounded Hard↔Hard birthday
@@ -1133,6 +1158,8 @@ pub(crate) struct HardHardBirthdayResult {
     pub(crate) sockets: Vec<HardHardBirthdaySocket>,
     pub(crate) model_label: String,
     pub(crate) model_confidence: u8,
+    /// Aggregate STUN cost/timing across every speculative source socket.
+    pub(crate) measurement: HardHardMeasurementStats,
 }
 
 /// Why a fresh-mapping generation was rejected and the legacy flow continued.
@@ -1667,7 +1694,9 @@ pub(crate) struct LiveBirthdayCounters {
     pub logical_probes_sent: u32,
     pub logical_probe_send_failures: u32,
     pub physical_datagrams_sent: u32,
+    pub physical_bytes_sent: u64,
     pub physical_send_errors: u32,
+    pub physical_send_error_bytes: u64,
     pub partial_physical_send_errors: u32,
     pub probe_path_errors: u32,
     pub workers_completed: u32,
@@ -1730,12 +1759,17 @@ impl BirthdayLiveRecorder {
         socket_index: usize,
         target: SocketAddr,
         sent_at_ms: u64,
+        bytes: usize,
     ) {
         self.update(|progress| {
             progress.counters.logical_probes_sent =
                 progress.counters.logical_probes_sent.saturating_add(1);
             progress.counters.physical_datagrams_sent =
                 progress.counters.physical_datagrams_sent.saturating_add(1);
+            progress.counters.physical_bytes_sent = progress
+                .counters
+                .physical_bytes_sent
+                .saturating_add(bytes as u64);
             progress.sent_target_endpoints.insert(target);
             let sent = progress.per_socket_sent.entry(socket_index).or_default();
             *sent = sent.saturating_add(1);
@@ -1745,10 +1779,19 @@ impl BirthdayLiveRecorder {
 
     /// Commit a compatibility datagram. It is physical-only: the logical
     /// Probe and unique target were already committed with the main packet.
-    pub(crate) fn record_compatibility_success(&self, socket_index: usize, sent_at_ms: u64) {
+    pub(crate) fn record_compatibility_success(
+        &self,
+        socket_index: usize,
+        sent_at_ms: u64,
+        bytes: usize,
+    ) {
         self.update(|progress| {
             progress.counters.physical_datagrams_sent =
                 progress.counters.physical_datagrams_sent.saturating_add(1);
+            progress.counters.physical_bytes_sent = progress
+                .counters
+                .physical_bytes_sent
+                .saturating_add(bytes as u64);
             let sent = progress.per_socket_sent.entry(socket_index).or_default();
             *sent = sent.saturating_add(1);
             Self::record_success_timestamp(progress, sent_at_ms);
@@ -1756,7 +1799,7 @@ impl BirthdayLiveRecorder {
     }
 
     /// Commit a failed main physical send before pending-probe cleanup.
-    pub(crate) fn record_primary_error(&self) {
+    pub(crate) fn record_primary_error(&self, bytes: usize) {
         self.update(|progress| {
             progress.counters.logical_probe_send_failures = progress
                 .counters
@@ -1764,15 +1807,23 @@ impl BirthdayLiveRecorder {
                 .saturating_add(1);
             progress.counters.physical_send_errors =
                 progress.counters.physical_send_errors.saturating_add(1);
+            progress.counters.physical_send_error_bytes = progress
+                .counters
+                .physical_send_error_bytes
+                .saturating_add(bytes as u64);
         });
     }
 
     /// Commit a failed compatibility copy as a partial physical error. The
     /// logical Probe remains successful because its main datagram succeeded.
-    pub(crate) fn record_compatibility_error(&self) {
+    pub(crate) fn record_compatibility_error(&self, bytes: usize) {
         self.update(|progress| {
             progress.counters.physical_send_errors =
                 progress.counters.physical_send_errors.saturating_add(1);
+            progress.counters.physical_send_error_bytes = progress
+                .counters
+                .physical_send_error_bytes
+                .saturating_add(bytes as u64);
             progress.counters.partial_physical_send_errors = progress
                 .counters
                 .partial_physical_send_errors
@@ -1823,9 +1874,14 @@ pub(crate) struct PunchSendReport {
     pub logical_probe_send_failures: u32,
     /// Successful physical UDP datagrams, including compatibility copies.
     pub physical_datagrams_sent: u32,
+    /// Bytes in physical UDP datagrams accepted by the kernel. Compatibility
+    /// copies are counted independently, exactly like datagrams.
+    pub physical_bytes_sent: u64,
     /// Physical UDP sends that returned an error, including compatibility
     /// copies after a successful primary send.
     pub physical_send_errors: u32,
+    /// Intended datagram bytes for physical sends rejected by the kernel.
+    pub physical_send_error_bytes: u64,
     /// Errors from a logical probe that still had at least one successful
     /// physical datagram.  These are degraded sends, not session failures.
     pub partial_physical_send_errors: u32,
@@ -1892,6 +1948,11 @@ pub struct UdpProbeRxSnapshot {
     pub legacy_probe_acks_observed: u64,
     pub legacy_probe_acks_unmatched: u64,
     pub probe_acks_received: u64,
+    /// Process-local UDP monotonic clock. These are translated to the daemon
+    /// timeline only by the terminal Hard↔Hard report and never serialized as
+    /// standalone absolute timestamps.
+    pub last_authenticated_at_ms: Option<u64>,
+    pub last_matched_ack_at_ms: Option<u64>,
 }
 
 /// Bounded, authenticated receive counters scoped to one remote peer, local
@@ -1933,6 +1994,13 @@ impl UdpProbeRxSnapshot {
             probe_acks_received: self
                 .probe_acks_received
                 .saturating_sub(earlier.probe_acks_received),
+            last_authenticated_at_ms: (self.authenticated_probe_packets_received
+                > earlier.authenticated_probe_packets_received)
+                .then_some(self.last_authenticated_at_ms)
+                .flatten(),
+            last_matched_ack_at_ms: (self.probe_acks_received > earlier.probe_acks_received)
+                .then_some(self.last_matched_ack_at_ms)
+                .flatten(),
         }
     }
 }

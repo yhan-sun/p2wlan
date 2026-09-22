@@ -1,4 +1,19 @@
 impl ControlClient {
+    /// Translate one local Hard<->Hard deadline into the most recently
+    /// observed control-server clock domain. A stale or missing sample fails
+    /// closed; callers keep Relay and the ordinary bounded fallback rather
+    /// than letting HTTP queue latency create two rendezvous windows.
+    pub(crate) fn hard_hard_server_deadline(&self, local_deadline_ms: u64) -> Option<u64> {
+        let local_now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()?;
+        self.server_clock
+            .server_deadline_for_local(local_deadline_ms, local_now_ms)
+    }
+
     pub async fn register_room_profile(config: &mut Config) -> Result<()> {
         if !config.network.network_id.starts_with("room-")
             || config.network.manual
@@ -117,6 +132,7 @@ impl ControlClient {
             mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
         let (critical_auth_tx, critical_auth_rx) = watch::channel(None);
         let event_loop_ready = Arc::new(AtomicBool::new(false));
+        let server_clock = Arc::new(ServerClockEstimate::default());
 
         let state = Arc::new(RwLock::new(ClientState {
             room_authorization: Arc::new(crate::rooms::RoomAuthorization::new(
@@ -147,6 +163,7 @@ impl ControlClient {
             critical_answer_tx,
             critical_ctrl_tx,
             candidate_offer_tx,
+            server_clock: server_clock.clone(),
             state: state.clone(),
             #[cfg(test)]
             test_signal_forwarder: None,
@@ -220,6 +237,7 @@ impl ControlClient {
                     advertised_snapshot,
                     event_loop_ready,
                     telemetry_hub,
+                    server_clock,
                 )
                 .await;
             };
@@ -255,6 +273,9 @@ impl ControlClient {
             mpsc::channel::<CriticalControlCommand>(CRITICAL_CTRL_QUEUE_CAPACITY);
         let (candidate_offer_tx, mut candidate_offer_rx) =
             mpsc::channel::<CandidateOfferCommand>(CANDIDATE_OFFER_QUEUE_CAPACITY);
+        let server_clock = Arc::new(ServerClockEstimate::default());
+        let test_now_ms = test_signal_now_ms();
+        server_clock.observe(test_now_ms, test_now_ms);
         tokio::spawn(async move {
             while let Some(cmd) = critical_offer_rx.recv().await {
                 let _ = cmd.response_tx.send(PeerOfferSendOutcome::Sent);
@@ -296,6 +317,7 @@ impl ControlClient {
             critical_answer_tx,
             critical_ctrl_tx,
             candidate_offer_tx,
+            server_clock,
             state,
             #[cfg(test)]
             test_signal_forwarder: None,
@@ -328,9 +350,20 @@ impl ControlClient {
         public_key: impl Into<String>,
         forwarder: Arc<dyn Fn(TestControlSignal) + Send + Sync>,
     ) {
+        // The in-process forwarder stands in for one control server shared by
+        // both endpoints. Give it the same fresh clock sample that a real
+        // HTTP signal response carries; production manual mode remains
+        // fail-closed because this adapter is compiled only for tests.
+        self.refresh_server_clock_for_test();
         self.test_signal_from_node_id = from_node_id.into();
         self.test_signal_public_key = public_key.into();
         self.test_signal_forwarder = Some(forwarder);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_server_clock_for_test(&self) {
+        let now_ms = test_signal_now_ms();
+        self.server_clock.observe(now_ms, now_ms);
     }
 
     /// Deliver a candidate signal through the test-only control boundary.
@@ -554,6 +587,7 @@ impl ControlClient {
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
                 punch_at_ms,
+                punch_at_server_ms: None,
                 fresh_ownership,
                 response_tx,
             })
@@ -616,6 +650,37 @@ impl ControlClient {
         session_id: Option<String>,
         fresh_ownership: Arc<crate::PunchSessionCancellation>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        self.send_fresh_peer_offer_with_session_and_punch_schedule(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            None,
+            session_id,
+            fresh_ownership,
+        )
+        .await
+    }
+
+    /// Send a reciprocal fresh-mapping prediction while preserving the
+    /// server-clock rendezvous deadline delivered with the initiating offer.
+    /// This mirrors the existing peer-answer scheduling contract: the local
+    /// `punch_at_ms` remains useful to WebSocket/test transports, while REST
+    /// can echo one canonical server deadline instead of adding another
+    /// request-processing delay.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_fresh_peer_offer_with_session_and_punch_schedule(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
+        session_id: Option<String>,
+        fresh_ownership: Arc<crate::PunchSessionCancellation>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
         #[cfg(test)]
         if let Some(result) = self.maybe_forward_test_signal(
             to_node_id,
@@ -638,6 +703,7 @@ impl ControlClient {
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
                 punch_at_ms,
+                punch_at_server_ms,
                 fresh_ownership: Some(fresh_ownership),
                 response_tx,
             })

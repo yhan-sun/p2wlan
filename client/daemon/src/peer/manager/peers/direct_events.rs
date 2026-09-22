@@ -160,11 +160,170 @@ impl PeerManager {
             stage,
             "hard_hard_probe_summary"
                 | "hard_hard_birthday_sweep_summary"
+                | "hard_hard_attempt_report"
                 | "hard_hard_sweep_completed"
                 | "hard_hard_sweep_failed"
                 | "hard_hard_failed"
                 | "hard_hard_winner_selected"
         )
+    }
+
+    /// Commit one endpoint-free Hard↔Hard attempt report to the existing
+    /// bounded per-peer diagnostics ring. Every identity is rechecked before
+    /// the write so a late old attempt is never attributed to a replacement
+    /// peer session or candidate epoch. The report is not consulted by any
+    /// production decision.
+    pub(crate) async fn record_hard_hard_attempt_report(
+        &self,
+        peer_id: &str,
+        session_token: &str,
+        report: HardHardAttemptReport,
+    ) -> bool {
+        if self.current_network_generation_sync() != report.network_generation
+            || !self.peer_session_is_current_sync(
+                peer_id,
+                PeerSessionGeneration(report.peer_session_generation),
+            )
+            || self.current_remote_candidate_epoch(peer_id).await != Some(report.remote_candidate_epoch)
+        {
+            self.emit_timeline_debug(
+                "hard_hard_attempt_report_fenced",
+                Some("direct"),
+                Some("stale_attempt_identity"),
+                Some(format!(
+                    "peer_id={peer_id} generation={} session_tag={} failure_class={}",
+                    report.network_generation, report.session_tag, report.failure_class,
+                )),
+            );
+            return false;
+        }
+        let Some(socket_index) = report.socket_index else {
+            return false;
+        };
+        let session_is_current = self
+            .hard_hard_attempt_report_identity_is_current(
+                peer_id,
+                session_token,
+                report.network_generation,
+                report.remote_candidate_epoch,
+                report.punch_generation,
+                socket_index,
+                report.attempt,
+            )
+            .await;
+        if !session_is_current {
+            return false;
+        }
+        let detail = format!(
+            "peer_id={peer_id} generation={} session_tag={} role={} mode={} attempt={} failure_class={} terminal_reason={} physical_datagrams_sent={} send_errors={} budget_skipped={}",
+            report.network_generation,
+            report.session_tag,
+            report.role,
+            report.mode,
+            report.attempt,
+            report.failure_class,
+            report.terminal_reason,
+            report.counts.send_success_datagrams,
+            report.counts.send_errors,
+            report.counts.budget_skipped,
+        );
+        let mut connections = self.connections.write().await;
+        let Some(connection) = connections.get_mut(peer_id) else {
+            return false;
+        };
+        if !self.peer_session_is_current_sync(
+            peer_id,
+            PeerSessionGeneration(report.peer_session_generation),
+        ) || connection.remote_candidate_epoch() != report.remote_candidate_epoch
+        {
+            return false;
+        }
+        tracing::info!(
+            event = "hard_hard_attempt_report",
+            peer_id,
+            network_generation = report.network_generation,
+            session_tag = %report.session_tag,
+            role = %report.role,
+            mode = %report.mode,
+            attempt = report.attempt,
+            failure_class = %report.failure_class,
+            terminal_reason = %report.terminal_reason,
+            direct_confirmed = report.direct_confirmed,
+            "hard_hard_attempt_report"
+        );
+        connection.record_hard_hard_attempt_report(report, detail);
+        true
+    }
+
+    /// Record a typed failure that terminated before the short-lived session
+    /// ledger owned a dynamic socket. The report is checked directly against
+    /// the current network/session/candidate/profile identities, including
+    /// paths where the strategy planner itself was temporarily unavailable;
+    /// a replacement lifecycle can never inherit this observation. This
+    /// remains diagnostics-only.
+    pub(crate) async fn record_hard_hard_pre_session_attempt_report(
+        &self,
+        peer_id: &str,
+        report: HardHardAttemptReport,
+    ) -> bool {
+        if report.socket_index.is_some()
+            || self.current_network_generation_sync() != report.network_generation
+            || !self.peer_session_is_current_sync(
+                peer_id,
+                PeerSessionGeneration(report.peer_session_generation),
+            )
+        {
+            return false;
+        }
+        let detail = format!(
+            "peer_id={peer_id} generation={} session_tag={} role={} mode={} attempt={} failure_class={} terminal_reason={} pre_session=true",
+            report.network_generation,
+            report.session_tag,
+            report.role,
+            report.mode,
+            report.attempt,
+            report.failure_class,
+            report.terminal_reason,
+        );
+        let mut connections = self.connections.write().await;
+        let Some(connection) = connections.get_mut(peer_id) else {
+            return false;
+        };
+        if self.current_network_generation_sync() != report.network_generation
+            || !self.peer_session_is_current_sync(
+                peer_id,
+                PeerSessionGeneration(report.peer_session_generation),
+            )
+            || connection.remote_candidate_epoch() != report.remote_candidate_epoch
+            || self.current_local_profile_generation_sync() != report.local_profile_generation
+            || !connection.online
+            || connection.state == ConnectionState::Direct
+            || !connection.remote_nat_profile_is_fresh()
+            || !connection.remote_nat_profile_matches_candidate_epoch()
+            || connection
+                .remote_nat_profile
+                .as_ref()
+                .and_then(|profile| profile.generation)
+                != Some(report.remote_profile_generation)
+        {
+            return false;
+        }
+        tracing::info!(
+            event = "hard_hard_attempt_report",
+            peer_id,
+            network_generation = report.network_generation,
+            session_tag = %report.session_tag,
+            role = %report.role,
+            mode = %report.mode,
+            attempt = report.attempt,
+            failure_class = %report.failure_class,
+            terminal_reason = %report.terminal_reason,
+            direct_confirmed = report.direct_confirmed,
+            pre_session = true,
+            "hard_hard_attempt_report"
+        );
+        connection.record_hard_hard_attempt_report(report, detail);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
