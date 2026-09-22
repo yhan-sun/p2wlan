@@ -2145,9 +2145,12 @@ mod tests {
         let endpoint_server = p2pnet_relay::RelayServer::start_random().await.unwrap();
         let relay_endpoint = endpoint_server.addr.to_string();
 
-        let local_peers = Arc::new(PeerManager::new(
-            Config::generate_default("https://ctrl.test", "net1").unwrap(),
-        ));
+        let local_peers = Arc::new(PeerManager::new({
+            // This regression exercises the explicit legacy Auto policy.
+            let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+            config.relay.path_policy = crate::config::PathPolicy::Auto;
+            config
+        }));
         local_peers
             .add_peer(&PeerInfo {
                 node_id: peer_id.to_string(),
@@ -2157,9 +2160,12 @@ mod tests {
                 ..PeerInfo::default()
             })
             .await;
-        let remote_peers = Arc::new(PeerManager::new(
-            Config::generate_default("https://ctrl.test", "net1").unwrap(),
-        ));
+        let remote_peers = Arc::new(PeerManager::new({
+            // This regression exercises the explicit legacy Auto policy.
+            let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+            config.relay.path_policy = crate::config::PathPolicy::Auto;
+            config
+        }));
         remote_peers
             .add_peer(&PeerInfo {
                 node_id: local_node_id.to_string(),
@@ -2767,9 +2773,12 @@ mod tests {
         let (transport, _encrypted_rx) = WireGuardTransport::new();
         transport.add_session("peer-a", local_session).await;
 
-        let peers = Arc::new(PeerManager::new(
-            Config::generate_default("http://ctrl.test", "default").unwrap(),
-        ));
+        let peers = Arc::new(PeerManager::new({
+            // This regression exercises the explicit legacy Auto policy.
+            let mut config = Config::generate_default("http://ctrl.test", "default").unwrap();
+            config.relay.path_policy = crate::config::PathPolicy::Auto;
+            config
+        }));
         peers
             .add_peer(&PeerInfo {
                 node_id: "peer-a".to_string(),

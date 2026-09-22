@@ -300,7 +300,7 @@ impl PeerManager {
         claimed_incarnation: u64,
         reason: &str,
     ) -> bool {
-        let had_relay_confirmation = {
+        let (had_relay_confirmation, direct_first_deadline_changed) = {
             let (_epoch_guard, mut connections) = self.lock_epoch_and_connections_write().await;
             let Some(conn) = connections.get_mut(node_id) else {
                 return false;
@@ -327,17 +327,29 @@ impl PeerManager {
                     PathEvent::PeerLeft { epoch }
                 };
                 conn.commit_path_transition(event, |_| {});
+                let direct_first_deadline_changed = conn.online
+                    && conn
+                        .start_direct_first(epoch, self.config.relay.effective_path_policy(true));
+                if had_relay_confirmation {
+                    conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
+                    self.bump_relay_confirm_seq(node_id);
+                }
+                (had_relay_confirmation, direct_first_deadline_changed)
             } else {
                 warn!(
                     "Peer lifecycle generation exhausted while resetting remote incarnation for {node_id}; authentication disabled"
                 );
+                if had_relay_confirmation {
+                    conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
+                    self.bump_relay_confirm_seq(node_id);
+                }
+                (had_relay_confirmation, false)
             }
-            if had_relay_confirmation {
-                conn.relay_confirm_seq = conn.relay_confirm_seq.wrapping_add(1);
-                self.bump_relay_confirm_seq(node_id);
-            }
-            had_relay_confirmation
         };
+        if direct_first_deadline_changed {
+            self.direct_first_deadline_change_tx
+                .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+        }
         self.clear_hard_hard_sessions(Some(node_id)).await;
         self.emit_timeline(
             "peer_restart_detected",

@@ -28,7 +28,7 @@ pub(super) async fn direct_business_budget_ready_for_active_path(
             // the first budget-confirmed packet switches it to Direct.
             relay_available
                 && peers
-                    .is_relay_peer_confirmed_for_generation(peer_id, generation)
+                    .is_relay_business_admitted_for_generation(peer_id, generation)
                     .await
         }
     }
@@ -39,6 +39,7 @@ pub(super) async fn direct_business_budget_ready_for_active_path(
 /// when no confirmed Relay exists, leaving the bounded Pending semantics in
 /// place instead of silently dropping the make-before-break guarantee.
 pub(super) async fn relay_make_before_break_fallback(
+    epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
     peers: &PeerManager,
     peer_id: &str,
     generation: u64,
@@ -47,7 +48,7 @@ pub(super) async fn relay_make_before_break_fallback(
 ) -> bool {
     let usable = relay_available
         && peers
-            .is_relay_peer_confirmed_for_generation(peer_id, generation)
+            .is_relay_business_admitted_in_epoch(epoch_guard, peer_id, generation)
             .await;
     if usable {
         peers.emit_timeline(

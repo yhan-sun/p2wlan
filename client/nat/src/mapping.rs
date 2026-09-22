@@ -145,13 +145,42 @@ pub fn infer_allocation_model(observations: &[MappingObservation]) -> Allocation
         || samples
             .iter()
             .any(|sample| sample.local_endpoint != samples[0].local_endpoint)
-        || samples.windows(2).any(|window| {
-            window[1].sent_at_ms < window[0].sent_at_ms
-                || window[1].responded_at_ms < window[0].responded_at_ms
-        })
+        || samples
+            .windows(2)
+            .any(|window| window[1].sent_at_ms < window[0].sent_at_ms)
         || public_ip_stable != Some(true)
     {
         return unknown(AllocationModelKind::Unknown);
+    }
+
+    if samples
+        .windows(2)
+        .any(|pair| pair[1].sequence - pair[0].sequence > 1)
+    {
+        let batch = MappingBatch {
+            generation: 0,
+            network_generation: 0,
+            socket_identity: samples[0].local_endpoint,
+            observations: samples.iter().map(|sample| (**sample).clone()).collect(),
+            started_at_ms: samples[0].sent_at_ms,
+            finished_at_ms: samples
+                .iter()
+                .map(|sample| sample.responded_at_ms)
+                .max()
+                .unwrap_or(0),
+        };
+        let model = build_model_from_gapped(&batch, batch.public_ip(), batch.ordered_ports());
+        // Missing responses are not single-allocation deltas. Keep descriptive
+        // statistics unknown and use the same safe admission as the predictor.
+        let kind = match model.kind {
+            PortModelKind::Stable => AllocationModelKind::Stable,
+            PortModelKind::FixedStep { step } => AllocationModelKind::FixedStep { step },
+            _ => AllocationModelKind::Unknown,
+        };
+        return AllocationModel {
+            confidence: model.confidence.min(60),
+            ..unknown(kind)
+        };
     }
 
     let ports = samples
@@ -266,7 +295,7 @@ pub fn infer_allocation_model(observations: &[MappingObservation]) -> Allocation
     let same_direction = positive == deltas.len() || negative == deltas.len();
     let min_delta = deltas.iter().copied().min().unwrap_or_default();
     let max_delta = deltas.iter().copied().max().unwrap_or_default();
-    let width = max_delta.saturating_sub(min_delta).unsigned_abs();
+    let width = (i32::from(max_delta) - i32::from(min_delta)) as u16;
     if same_direction && width <= 8 {
         return AllocationModel {
             kind: AllocationModelKind::SmallWindow {
@@ -512,6 +541,8 @@ pub enum PredictionReason {
     SuccessorWindow { distance: u8 },
     /// Wider window used only when model confidence is low.
     LowConfidenceWindow { distance: u8 },
+    /// A bounded secondary hypothesis from cross-batch learning.
+    LearnedSuccessor { distance: u8 },
     /// Same port again (endpoint-independent mapping).
     StablePort,
     /// Next port of the periodic pattern.
@@ -536,8 +567,13 @@ pub fn modular_difference(a: u16, b: u16) -> i16 {
 
 /// Apply `step` to `port` with 65536 wrap handling.
 pub fn modular_add(port: u16, step: i16) -> u16 {
-    let raw = i32::from(port) + i32::from(step);
-    (raw.rem_euclid(65536)) as u16
+    modular_add_wide(port, i64::from(step))
+}
+
+/// Preserve the 16-bit allocator ring; filter port zero at the plan boundary.
+/// Multiplication must happen in this wide domain, never saturate an i16 first.
+fn modular_add_wide(port: u16, delta: i64) -> u16 {
+    (i64::from(port) + delta.rem_euclid(65_536)).rem_euclid(65_536) as u16
 }
 
 fn median(deltas: &[i16]) -> i16 {
@@ -556,7 +592,7 @@ fn dominant_step(deltas: &[i16]) -> Option<i16> {
     ranked.sort_by(|(left_step, left_count), (right_step, right_count)| {
         right_count
             .cmp(left_count)
-            .then_with(|| left_step.abs().cmp(&right_step.abs()))
+            .then_with(|| left_step.unsigned_abs().cmp(&right_step.unsigned_abs()))
     });
     let (step, count) = *ranked.first()?;
     (count >= deltas.len().div_ceil(2)).then_some(step)
@@ -627,7 +663,7 @@ pub fn build_model(
     let all_equal = deltas.iter().all(|delta| *delta == deltas[0]);
     if all_equal {
         let step = deltas[0];
-        let confidence = if step.abs() <= 1024 { 95 } else { 80 };
+        let confidence = if step.unsigned_abs() <= 1024 { 95 } else { 80 };
         return PortModel {
             kind: PortModelKind::FixedStep { step },
             confidence,
@@ -643,7 +679,7 @@ pub fn build_model(
     let same_direction = positive || negative;
     let min_delta = deltas.iter().copied().min().unwrap_or(0);
     let max_delta = deltas.iter().copied().max().unwrap_or(0);
-    let spread = max_delta - min_delta;
+    let spread = i32::from(max_delta) - i32::from(min_delta);
     if same_direction && spread <= 2 {
         let step = median(&deltas);
         let confidence = 92u8.saturating_sub(spread as u8 * 6);
@@ -771,6 +807,9 @@ pub fn build_model_for_batch(
         return Err(ModelRejection::BatchStale);
     }
     let public_ip = batch.public_ip();
+    if batch.successful_samples() > 0 && public_ip.is_none() {
+        return Err(ModelRejection::PublicIpChanged);
+    }
     let sequence = batch.ordered_ports();
 
     // A sequence gap means a timed-out observer whose request was already sent
@@ -998,20 +1037,11 @@ fn reverse_window_size(base_window: usize, reverse_window: bool) -> usize {
     base.min(MAX_PREDICTED_PORTS)
 }
 
-/// Same as [`predict_ports_for_elapsed`], but with the adaptive-prediction
-/// refinements folded in from the [`crate::adaptive`] learner state:
-///
-/// - `step_estimate`: when `Some`, it **overrides** the model's stride for the
-///   `FixedStep` / `Linear` / `NoisyLinear` branches (the cross-batch EWMA
-///   estimate is more current than this one batch's median).  The caller is
-///   responsible for bounding the estimate (`FRESH_MAPPING_MAX_ABS_STEP`).
-/// - `reverse_window`: when `true` (the peer's mappings are walking backwards),
-///   the base confidence window is widened by one tier (`6 -> 12 -> 24`,
-///   already-capped tiers stay capped), still bounded by
-///   `MAX_PREDICTED_PORTS`.
-///
-/// With `step_estimate = None` and `reverse_window = false` the output is
-/// byte-for-byte identical to [`predict_ports_for_elapsed`].
+/// Preserve the current batch as the primary hypothesis. A different,
+/// same-direction learned stride contributes at most one slot per three fresh
+/// candidates, inside the unchanged total candidate cap. Historical estimates
+/// are not calibrated probabilities and never replace the fresh top prediction.
+/// With no estimate, output is identical to the non-learning predictor.
 pub fn predict_ports_with_learning(
     model: &PortModel,
     last: u16,
@@ -1020,14 +1050,59 @@ pub fn predict_ports_with_learning(
     step_estimate: Option<i16>,
     reverse_window: bool,
 ) -> Vec<PredictionCandidate> {
-    generate_candidates(
+    let primary = generate_candidates(
         model,
         last,
         measurement_span_ms,
         gap_ms,
-        step_estimate,
+        None,
         reverse_window,
-    )
+    );
+    let step = match model.kind {
+        PortModelKind::FixedStep { step }
+        | PortModelKind::Linear { step }
+        | PortModelKind::NoisyLinear { step } => step,
+        _ => return primary,
+    };
+    let Some(estimate) = step_estimate.filter(|estimate| {
+        *estimate != 0 && *estimate != step && estimate.signum() == step.signum()
+    }) else {
+        return primary;
+    };
+    let alternative = generate_candidates(
+        model,
+        last,
+        measurement_span_ms,
+        gap_ms,
+        Some(estimate),
+        reverse_window,
+    );
+    let budget = primary.len();
+    let mut result = Vec::with_capacity(budget);
+    let mut seen = HashSet::with_capacity(budget);
+    let mut alternative = alternative.into_iter();
+    for group in primary.chunks(3) {
+        for candidate in group {
+            if result.len() < budget && seen.insert(candidate.port) {
+                result.push(*candidate);
+            }
+        }
+        if result.len() < budget {
+            if let Some(mut candidate) =
+                alternative.find(|candidate| !seen.contains(&candidate.port))
+            {
+                seen.insert(candidate.port);
+                candidate.reason = PredictionReason::LearnedSuccessor {
+                    distance: candidate.rank,
+                };
+                result.push(candidate);
+            }
+        }
+    }
+    for (rank, candidate) in result.iter_mut().enumerate() {
+        candidate.rank = rank as u8;
+    }
+    result
 }
 
 /// Shared candidate generation for [`predict_ports_for_elapsed`] and
@@ -1058,6 +1133,9 @@ fn generate_candidates(
         }
         PortModelKind::Periodic { ref steps } => {
             let period = steps.len();
+            if period == 0 {
+                return candidates;
+            }
             for distance in 0..MAX_PREDICTED_PORTS {
                 let mut port = last;
                 for offset in 0..=distance {
@@ -1108,7 +1186,8 @@ fn generate_candidates(
                 .min(MAX_PREDICTED_PORTS);
             let low_confidence = model.confidence < 75;
             for distance in 0..window_size {
-                let port = modular_add(last, effective_step.saturating_mul((distance + 1) as i16));
+                let port =
+                    modular_add_wide(last, i64::from(effective_step) * (distance + 1) as i64);
                 candidates.push(PredictionCandidate {
                     port,
                     rank: distance as u8,
@@ -1141,7 +1220,7 @@ fn generate_candidates(
             };
             for distance in 1..=window {
                 candidates.push(PredictionCandidate {
-                    port: modular_add(last, step.saturating_mul(distance as i16)),
+                    port: modular_add_wide(last, i64::from(step) * distance as i64),
                     rank: (distance - 1) as u8,
                     reason: PredictionReason::LowConfidenceWindow {
                         distance: distance as u8,
@@ -1464,13 +1543,8 @@ mod tests {
         let mut batch = consistent_batch(&[45390, 45391, 45392]);
         batch.observations[2].observed = ("203.0.113.5:45392").parse().unwrap();
         let result = build_model_for_batch(&batch, Duration::from_secs(5), 2000);
-        // Public-IP changes surface through the batch-level consistency rules
-        // of the caller; the model layer still exposes the mixed public IP.
         assert!(batch.public_ip().is_none());
-        // The sequence itself is still linear on ports, so the model builds;
-        // the caller must reject on public_ip() == None.
-        assert!(result.is_ok());
-        assert!(result.unwrap().public_ip.is_none());
+        assert_eq!(result.unwrap_err(), ModelRejection::PublicIpChanged);
     }
 
     #[test]
@@ -1705,18 +1779,24 @@ mod tests {
     // ---- predict_ports_with_learning (adaptive step + reverse window) ----
 
     #[test]
-    fn learning_step_estimate_overrides_fixed_step_top_prediction() {
-        // A fixed step-1 model, but the cross-batch learner now believes the
-        // peer walks step 7: the top-1 candidate must be last + 7, not + 1.
+    fn learning_keeps_fresh_top_prediction_and_bounds_secondary_hypothesis() {
+        // A fresh step-1 batch must retain its first candidate even when the
+        // cross-batch learner has a different same-direction hypothesis.
         let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
         assert!(matches!(model.kind, PortModelKind::FixedStep { step: 1 }));
         let predicted = predict_ports_with_learning(&model, 45392, 0, 0, Some(7), false);
         assert_eq!(
-            predicted[0].port, 45399,
-            "the learned estimate must override the model step"
+            predicted[0].port, 45393,
+            "history must not replace the fresh batch's top candidate"
         );
         assert_eq!(predicted[0].reason, PredictionReason::TopPrediction);
         assert_eq!(predicted[0].rank, 0);
+        assert_eq!(predicted.len(), 6);
+        assert_eq!(predicted[3].port, 45399);
+        assert!(matches!(
+            predicted[3].reason,
+            PredictionReason::LearnedSuccessor { .. }
+        ));
     }
 
     #[test]
@@ -1820,12 +1900,13 @@ mod tests {
 
     #[test]
     fn learning_estimate_wrap_is_modular() {
-        // last 65534, learned step +3 -> top candidate wraps to port 1.
+        // Fresh step +1 retains port 65535; the learned +3 hypothesis wraps
+        // modulo 65536 without creating port zero or duplicate candidates.
         let model = build_model(&[45390, 45391, 45392], Some(ip()), 1000);
         let predicted = predict_ports_with_learning(&model, 65534, 0, 0, Some(3), false);
         assert_eq!(
-            predicted[0].port, 1,
-            "the learned-step top candidate must wrap mod 65536"
+            predicted[0].port, 65535,
+            "the fresh successor remains first across a modular wrap"
         );
     }
 
@@ -1855,20 +1936,21 @@ mod tests {
     }
 
     #[test]
-    fn learning_matching_negative_estimate_still_overrides() {
-        // Counterpart guard: when the learned estimate shares the model's
-        // direction it must still override the step (the cross-batch reading is
-        // more current).  Model step -3, learned -7 -> the top candidate is
-        // last - 7, not last - 3.
+    fn learning_matching_negative_estimate_retains_both_hypotheses() {
+        // Same direction does not establish which batch is more current.
+        // Preserve the fresh -3 successor and include the learned -7 walk
+        // as a secondary hypothesis without expanding the total budget.
         let model = build_model(&[30000, 29997, 29994], Some(ip()), 1000);
         assert!(matches!(model.kind, PortModelKind::FixedStep { step: -3 }));
+        let baseline = predict_ports_with_learning(&model, 29994, 0, 0, None, true);
         let predicted = predict_ports_with_learning(&model, 29994, 0, 0, Some(-7), true);
-        assert_eq!(
-            predicted.first().map(|c| c.port),
-            Some(29987),
-            "a same-direction negative estimate must still override the model step, got {:?}",
-            predicted
-        );
+        assert_eq!(predicted[0], baseline[0]);
+        assert_eq!(predicted[0].port, 29991);
+        assert_eq!(predicted.len(), baseline.len());
+        assert!(predicted.iter().any(|candidate| {
+            candidate.port == 29987
+                && matches!(candidate.reason, PredictionReason::LearnedSuccessor { .. })
+        }));
     }
 
     // ---- P0-3: port 0 is never a candidate ----

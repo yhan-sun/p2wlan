@@ -207,6 +207,10 @@ fn exhaust_runtime_current_confirmation(
 }
 
 async fn assert_relay_activation_revokes_old_direct_budget() {
+    assert_failed_direct_revokes_budget(true).await;
+}
+
+async fn assert_failed_direct_revokes_budget(business_ready: bool) {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
     ));
@@ -220,6 +224,17 @@ async fn assert_relay_activation_revokes_old_direct_budget() {
     peers
         .add_peer(&peer_info("peer", "10.20.0.2", remote_endpoint))
         .await;
+    let generation = peers.current_network_generation_sync();
+    assert!(
+        peers
+            .confirm_relay_peer("peer", "relay.test:443", generation)
+            .await
+    );
+    assert!(
+        !peers
+            .is_relay_business_admitted_for_generation("peer", generation)
+            .await
+    );
     let identity = commit_test_direct_path(
         &peers,
         &udp,
@@ -244,17 +259,48 @@ async fn assert_relay_activation_revokes_old_direct_budget() {
         now + Duration::from_millis(2),
     );
     assert!(runtime.confirmed_budget_for_path(&identity).is_some());
+    let old_token = business_token(runtime.direct_business_budget_entry("peer").unwrap(), 101);
+    assert_eq!(
+        runtime.with_current_direct_business_token(&old_token, || ()),
+        Some(())
+    );
+    assert!(
+        !peers
+            .is_relay_business_admitted_for_generation("peer", generation)
+            .await
+    );
 
+    if business_ready {
+        // This DPLPMTUD-focused fixture supplies the outbound owner's
+        // completed-readiness prerequisite explicitly, AFTER the exact BASE
+        // budget exists. The real encrypt/send/decrypt and immediate recovery
+        // path is covered by direct_first_queued_business_uses_direct_without_relay_prelude.
+        // A BASE ACK alone must never satisfy this prerequisite.
+        let gate = peers.network_epoch_gate();
+        let guard = gate.lock().await;
+        peers
+            .satisfy_direct_first_in_epoch(&guard, "peer", generation, remote_endpoint)
+            .await;
+    }
+    assert_eq!(
+        peers
+            .is_relay_business_admitted_for_generation("peer", generation)
+            .await,
+        business_ready
+    );
     peers
         .record_direct_failure("peer", "relay invalidation acceptance")
         .await;
-    peers.set_relay("peer", "relay.test:443").await;
+    let expected_path = business_ready.then_some(crate::peer::NetworkPath::Relay);
     assert_eq!(
         peers.get_connection("peer").await.unwrap().active_path(),
-        Some(crate::peer::NetworkPath::Relay)
+        expected_path
     );
     udp.reconcile_dplpmtud_paths().await;
 
+    // Revoking the failed Direct budget is independent of authorizing Relay.
+    // In particular, waiting for first-business admission cannot preserve an
+    // old send permit or keep the failed path's MTU worker alive.
     assert!(runtime.confirmed_budget_for_path(&identity).is_none());
     let snapshot = runtime.snapshot_for_peer(&identity.peer_id).unwrap();
     assert_eq!(
@@ -263,6 +309,42 @@ async fn assert_relay_activation_revokes_old_direct_budget() {
     );
     assert_eq!(snapshot.state, DplpmtudState::Disabled);
     assert_eq!(runtime.active_worker_count(), 0);
+    assert!(*lease.cancel_rx.borrow());
+    assert_eq!(
+        runtime.with_current_direct_business_token(&old_token, || ()),
+        None
+    );
+    assert!(runtime
+        .schedule_probe("peer", &identity, lease.worker_owner_token, Instant::now())
+        .is_none());
+    assert_ne!(
+        runtime.try_accept_ack(
+            "peer",
+            &identity,
+            base_plan.wire_token,
+            exact_ack_ingress(&identity),
+            Instant::now(),
+        ),
+        DplpmtudTransitionDecision::Applied,
+        "a late BASE ACK cannot revive the failed path"
+    );
+    assert!(runtime.confirmed_budget_for_path(&identity).is_none());
+    assert_eq!(runtime.active_worker_count(), 0);
+    assert_eq!(
+        peers.get_connection("peer").await.unwrap().active_path(),
+        expected_path
+    );
+    assert_eq!(
+        peers
+            .is_relay_business_admitted_for_generation("peer", generation)
+            .await,
+        business_ready
+    );
+}
+
+#[tokio::test]
+async fn direct_first_pending_failure_revokes_budget_without_relay_admission() {
+    assert_failed_direct_revokes_budget(false).await;
 }
 
 fn establish_sessions() -> (TransportSession, TransportSession) {

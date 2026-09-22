@@ -452,6 +452,10 @@ pub struct PeerManager {
     committed_business_paths: Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
     /// Latest-value notification for committed path/lifecycle/epoch changes.
     committed_business_path_change_tx: tokio::sync::watch::Sender<u64>,
+    /// Latest-value wakeup for the single supervised DirectFirst deadline
+    /// owner.  The deadline itself remains in `PathStateMachine`; this stream
+    /// only asks the owner to recompute the earliest pending deadline.
+    direct_first_deadline_change_tx: tokio::sync::watch::Sender<u64>,
     /// Session-bound DPLPMTUD capability mirror.  The immutable map survives
     /// a UDP transport replacement, so a modern peer cannot temporarily fall
     /// back to legacy business sending while the replacement exact path is

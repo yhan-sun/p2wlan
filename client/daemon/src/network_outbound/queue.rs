@@ -54,10 +54,11 @@ impl PendingPacket {
 /// candidates are configured) and the first packet of a peer waits up to
 /// `timeout` — SHARED across every queued packet of the same peer + generation
 /// — for RelayPeerConfirmed or DirectConfirmed before being dropped with a
-/// stable reason.  `None` means relay is not configured/expected: packets
-/// degrade to direct-only immediately.
+/// stable reason. Transport expectation is a separate fact: Direct-first can
+/// wait for a Direct-only topology without inventing a configured Relay.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RelayStartupWait {
+    pub(crate) relay_expected: bool,
     pub(crate) timeout: Option<Duration>,
 }
 
@@ -193,7 +194,7 @@ pub(crate) async fn run_network_outbound(
     // that the configured topology requires a relay-first admission window.
     // Keeping them separate closes the startup race where Direct was admitted
     // in the few milliseconds before the relay supervisor published its slot.
-    let relay_expected = relay_startup_wait.timeout.is_some();
+    let relay_expected = relay_startup_wait.relay_expected;
     let _ = relay_probe_kick_tx.send(probe_kick);
 
     loop {

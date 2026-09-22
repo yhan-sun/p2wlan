@@ -8,6 +8,15 @@
 use super::{ConnectionState, NetworkPath, PeerSessionGeneration};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+pub(crate) const DIRECT_FIRST_WINDOW: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectFirstWindow {
+    deadline: Instant,
+    released: bool,
+}
 
 const MAX_ACCEPTED_HEALTH_OBSERVATIONS: usize = 64;
 
@@ -351,6 +360,22 @@ pub(crate) enum DirectCandidateContinuity {
 /// concrete validation/transport identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PathEvent {
+    /// Local policy admission at a new online peer lifecycle. Replays cannot
+    /// extend the deadline; candidate refreshes do not create another window.
+    DirectFirstStarted {
+        epoch: PathEpoch,
+        now: Instant,
+    },
+    /// Driven by the existing outbound scheduler; carries no remote clock.
+    DirectFirstDeadline {
+        epoch: PathEpoch,
+        now: Instant,
+    },
+    /// An encrypted-confirmed Direct path is ready for a business send,
+    /// including the negotiated MTU budget. This is not a delivery receipt.
+    DirectFirstSatisfied {
+        validation: DirectValidationIdentity,
+    },
     PeerOnline {
         epoch: PathEpoch,
     },
@@ -424,7 +449,9 @@ pub(crate) enum PathEvent {
 impl PathEvent {
     pub(crate) fn epoch(&self) -> Option<PathEpoch> {
         match self {
-            Self::PeerOnline { epoch }
+            Self::DirectFirstStarted { epoch, .. }
+            | Self::DirectFirstDeadline { epoch, .. }
+            | Self::PeerOnline { epoch }
             | Self::PeerLeft { epoch }
             | Self::NetworkGenerationAdvanced { epoch, .. }
             | Self::RemoteCandidateEpochAdvanced { epoch, .. }
@@ -440,9 +467,9 @@ impl PathEvent {
             | Self::RelayHealthObserved { relay, .. }
             | Self::RelayTransportLost { relay }
             | Self::RelayPathFailed { relay } => Some(relay.epoch),
-            Self::DirectValidationStarted { validation } | Self::DirectCommitted { validation } => {
-                Some(validation.epoch)
-            }
+            Self::DirectFirstSatisfied { validation }
+            | Self::DirectValidationStarted { validation }
+            | Self::DirectCommitted { validation } => Some(validation.epoch),
             Self::IdentityReset => None,
         }
     }
@@ -590,6 +617,7 @@ pub(crate) enum PeerPathLifecycle {
 /// own by production path decisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PathState {
+    direct_first: Option<DirectFirstWindow>,
     pub(crate) lifecycle: PeerPathLifecycle,
     pub(crate) epoch: Option<PathEpoch>,
     pub(crate) active: ActiveBusinessPath,
@@ -694,6 +722,7 @@ impl PathStateMachine {
     pub(crate) fn new(initial_state: ConnectionState) -> Self {
         Self {
             state: PathState {
+                direct_first: None,
                 lifecycle: PeerPathLifecycle::Unbound,
                 epoch: None,
                 active: ActiveBusinessPath::Unavailable,
@@ -725,6 +754,29 @@ impl PathStateMachine {
         self.state.active.network_path()
     }
 
+    pub(crate) fn direct_first_configured(&self) -> bool {
+        self.state.direct_first.is_some()
+    }
+
+    pub(crate) fn direct_first_pending(&self) -> bool {
+        self.state
+            .direct_first
+            .is_some_and(|window| !window.released)
+    }
+
+    pub(crate) fn direct_first_deadline_due(&self, now: Instant) -> bool {
+        self.state
+            .direct_first
+            .is_some_and(|window| !window.released && now >= window.deadline)
+    }
+
+    pub(crate) fn direct_first_deadline(&self) -> Option<Instant> {
+        self.state
+            .direct_first
+            .filter(|window| !window.released)
+            .map(|window| window.deadline)
+    }
+
     /// Pure reducer: no compatibility mirror or transport side effect is
     /// touched until `PeerConnection::commit_path_transition` accepts it.
     pub(crate) fn reduce(&self, event: PathEvent) -> PathTransition {
@@ -735,6 +787,43 @@ impl PathStateMachine {
         let clear_relay_receipts = matches!(&event, PathEvent::RelayPathFailed { .. });
 
         let result: Result<(), PathTransitionDecision> = (|| match event {
+            PathEvent::DirectFirstStarted { epoch, now } => {
+                self.validate_exact_epoch(epoch)?;
+                if next.direct_first.is_none() {
+                    next.direct_first = Some(DirectFirstWindow {
+                        deadline: now + DIRECT_FIRST_WINDOW,
+                        released: !matches!(next.active, ActiveBusinessPath::Unavailable),
+                    });
+                }
+                Ok(())
+            }
+            PathEvent::DirectFirstDeadline { epoch, now } => {
+                self.validate_exact_epoch(epoch)?;
+                if self.direct_first_deadline_due(now) {
+                    if let Some(window) = next.direct_first.as_mut() {
+                        window.released = true;
+                    }
+                    if !matches!(next.active, ActiveBusinessPath::Direct(_)) {
+                        if let Some(relay) = next.relay.confirmed_identity().cloned() {
+                            next.active = ActiveBusinessPath::Relay(relay);
+                            next.compatibility_state = ConnectionState::Relay;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            PathEvent::DirectFirstSatisfied { validation } => {
+                self.validate_exact_epoch(validation.epoch)?;
+                if self.state.active != ActiveBusinessPath::Direct(validation)
+                    || self.state.direct != DirectPathState::Committed(validation)
+                {
+                    return Err(PathTransitionDecision::RejectedDirectValidationIdentity);
+                }
+                if let Some(window) = next.direct_first.as_mut() {
+                    window.released = true;
+                }
+                Ok(())
+            }
             PathEvent::IdentityReset => {
                 next = Self::unbound_state();
                 Ok(())
@@ -943,6 +1032,7 @@ impl PathStateMachine {
 
     fn unbound_state() -> PathState {
         PathState {
+            direct_first: None,
             lifecycle: PeerPathLifecycle::Unbound,
             epoch: None,
             active: ActiveBusinessPath::Unavailable,
@@ -976,6 +1066,7 @@ impl PathStateMachine {
             }
         }
         *next = PathState {
+            direct_first: None,
             lifecycle: PeerPathLifecycle::Online,
             epoch: Some(epoch),
             active: ActiveBusinessPath::Unavailable,
@@ -1008,6 +1099,9 @@ impl PathStateMachine {
         }
 
         let previous_active = self.state.active.network_path();
+        // Preserve the original admission deadline across epoch changes.
+        // DirectCommitted can precede its managed business MTU budget;
+        // only DirectFirstSatisfied (or the deadline) releases startup.
         next.epoch = Some(epoch);
         next.relay = if retained.keeps_relay() {
             self.state.relay.with_epoch(epoch)
@@ -1033,6 +1127,9 @@ impl PathStateMachine {
                 .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay),
             _ => ActiveBusinessPath::Unavailable,
         };
+        if self.direct_first_pending() && matches!(next.active, ActiveBusinessPath::Relay(_)) {
+            next.active = ActiveBusinessPath::Unavailable;
+        }
         Self::set_projection_after_epoch_change(next, previous_active, epoch);
         if previous_active == Some(NetworkPath::Direct)
             && next.active.network_path() == Some(NetworkPath::Relay)
@@ -1067,6 +1164,9 @@ impl PathStateMachine {
         }
 
         let previous_active = self.state.active.network_path();
+        // Preserve the original admission deadline across epoch changes.
+        // DirectCommitted can precede its managed business MTU budget;
+        // only DirectFirstSatisfied (or the deadline) releases startup.
         next.epoch = Some(epoch);
         // Relay delivery is not invalidated by a candidate refresh, but its
         // state stamp is rebased so future old-candidate events fail closed.
@@ -1093,6 +1193,9 @@ impl PathStateMachine {
                 .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay),
             (ActiveBusinessPath::Unavailable, _) => ActiveBusinessPath::Unavailable,
         };
+        if self.direct_first_pending() && matches!(next.active, ActiveBusinessPath::Relay(_)) {
+            next.active = ActiveBusinessPath::Unavailable;
+        }
         Self::set_projection_after_epoch_change(next, previous_active, epoch);
         Ok(())
     }
@@ -1151,7 +1254,7 @@ impl PathStateMachine {
             }
             _ => RelayPathState::Confirmed(relay.clone()),
         };
-        if !matches!(next.active, ActiveBusinessPath::Direct(_)) {
+        if !matches!(next.active, ActiveBusinessPath::Direct(_)) && !self.direct_first_pending() {
             next.active = ActiveBusinessPath::Relay(relay);
             next.compatibility_state = ConnectionState::Relay;
             if !matches!(
@@ -1176,7 +1279,7 @@ impl PathStateMachine {
             return Err(PathTransitionDecision::RejectedRelayConnectionIdentity);
         }
         next.relay = RelayPathState::Usable(relay.clone());
-        if !matches!(next.active, ActiveBusinessPath::Direct(_)) {
+        if !matches!(next.active, ActiveBusinessPath::Direct(_)) && !self.direct_first_pending() {
             next.active = ActiveBusinessPath::Relay(relay);
             next.compatibility_state = ConnectionState::Relay;
         }
@@ -1375,7 +1478,15 @@ impl PathStateMachine {
         let direct_was_active = matches!(self.state.active, ActiveBusinessPath::Direct(_));
         next.direct = DirectPathState::Idle;
         if direct_was_active {
-            let relay = next.relay.confirmed_identity().cloned();
+            // A business-ready Direct path has already satisfied startup and
+            // falls back immediately. An ACK-only path whose MTU budget
+            // never became usable must not turn a probe failure into an
+            // early release of the connection's first Direct window.
+            let relay = if self.direct_first_pending() {
+                None
+            } else {
+                next.relay.confirmed_identity().cloned()
+            };
             next.active = relay
                 .clone()
                 .map_or(ActiveBusinessPath::Unavailable, ActiveBusinessPath::Relay);
@@ -1496,7 +1607,12 @@ impl PathStateMachine {
                 next.recovery = PathRecoveryState::Stable;
             }
         }
-        next.compatibility_state = state;
+        if state == ConnectionState::Relay && self.direct_first_pending() {
+            next.active = ActiveBusinessPath::Unavailable;
+            next.compatibility_state = ConnectionState::Connecting;
+        } else {
+            next.compatibility_state = state;
+        }
         Ok(())
     }
 
@@ -1567,6 +1683,13 @@ impl PathStateMachine {
     }
 
     fn state_is_valid(state: &PathState) -> bool {
+        // Standby readiness is never first-business permission. Keep this
+        // invariant in the authoritative reducer, not just its selector.
+        if state.direct_first.is_some_and(|window| !window.released)
+            && matches!(state.active, ActiveBusinessPath::Relay(_))
+        {
+            return false;
+        }
         if state.lifecycle == PeerPathLifecycle::Unbound {
             return state.epoch.is_none()
                 && matches!(state.active, ActiveBusinessPath::Unavailable)

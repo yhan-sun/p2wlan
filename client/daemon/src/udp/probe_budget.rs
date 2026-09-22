@@ -34,10 +34,13 @@ pub(super) enum OutboundProbeBudgetKey {
     Network,
     Peer(String),
     PeerRemoteIp(String, IpAddr),
+    /// Aggregate destination scope, independent of peer/room identity.
+    DestinationIp(IpAddr),
     /// Long-term budget that survives per-second window resets.
     NetworkPersistent,
     PeerPersistent(String),
     PeerRemoteIpPersistent(String, IpAddr),
+    DestinationIpPersistent(IpAddr),
     /// Per (peer, local NAT socket) long-term budget: one peer must not
     /// exhaust a shared NAT socket's mapping state for other peers.
     PeerSocketPersistent(String, usize),
@@ -82,6 +85,11 @@ impl GlobalOutboundProbeBudget {
             return OutboundProbeAdmission::GlobalRemoteIpRateLimited;
         }
 
+        let destination_key = OutboundProbeBudgetKey::DestinationIp(peer_addr.ip());
+        if short_window_len(&budget, &destination_key) >= OUTBOUND_PROBE_BUDGET_PER_DESTINATION_IP {
+            return OutboundProbeAdmission::GlobalDestinationRateLimited;
+        }
+
         if long_window_len(&budget, &OutboundProbeBudgetKey::NetworkPersistent)
             >= OUTBOUND_PROBE_PERSISTENT_PER_NETWORK
         {
@@ -106,12 +114,25 @@ impl GlobalOutboundProbeBudget {
             return OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited;
         }
 
+        let destination_persistent_key =
+            OutboundProbeBudgetKey::DestinationIpPersistent(peer_addr.ip());
+        if long_window_len(&budget, &destination_persistent_key)
+            >= OUTBOUND_PROBE_PERSISTENT_PER_DESTINATION_IP
+        {
+            return OutboundProbeAdmission::GlobalDestinationPersistentRateLimited;
+        }
+
         budget
             .entry(OutboundProbeBudgetKey::Network)
             .or_default()
             .push_back(now);
         budget.entry(peer_key).or_default().push_back(now);
         budget.entry(remote_ip_key).or_default().push_back(now);
+        budget.entry(destination_key).or_default().push_back(now);
+        budget
+            .entry(destination_persistent_key)
+            .or_default()
+            .push_back(now);
         budget
             .entry(OutboundProbeBudgetKey::NetworkPersistent)
             .or_default()
@@ -618,6 +639,9 @@ pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER: usize = 256;
 // room — all well under the 512 ceiling the task requires the per-session
 // volume to stay below.
 pub(super) const OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP: usize = 224;
+// Two full peer windows may share one NAT, while other destination IPs retain
+// headroom under the unchanged process ceiling. This is not cross-process IPC.
+pub(super) const OUTBOUND_PROBE_BUDGET_PER_DESTINATION_IP: usize = 448;
 
 /// Persistent budgets span retries: they are only pruned every
 /// `OUTBOUND_PROBE_PERSISTENT_WINDOW`, so repeated punch sessions share one
@@ -626,6 +650,7 @@ pub(super) const OUTBOUND_PROBE_PERSISTENT_WINDOW: Duration = Duration::from_sec
 pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_NETWORK: usize = 6_000;
 pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER: usize = 3_000;
 pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER_REMOTE_IP: usize = 2_250;
+pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_DESTINATION_IP: usize = 4_500;
 pub(super) const OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET: usize = 1_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,9 +662,11 @@ pub(super) enum OutboundProbeAdmission {
     GlobalNetworkRateLimited,
     GlobalPeerRateLimited,
     GlobalRemoteIpRateLimited,
+    GlobalDestinationRateLimited,
     GlobalNetworkPersistentRateLimited,
     GlobalPeerPersistentRateLimited,
     GlobalRemoteIpPersistentRateLimited,
+    GlobalDestinationPersistentRateLimited,
     GlobalPeerSocketPersistentRateLimited,
     /// The peer's recovery-epoch probe credit is exhausted: the hard
     /// per-`(peer_id, generation, epoch)` total was reached, so no further
@@ -661,6 +688,10 @@ pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission)
         OutboundProbeAdmission::GlobalNetworkRateLimited => "global_network_rate_limited",
         OutboundProbeAdmission::GlobalPeerRateLimited => "global_peer_rate_limited",
         OutboundProbeAdmission::GlobalRemoteIpRateLimited => "global_remote_ip_rate_limited",
+        OutboundProbeAdmission::GlobalDestinationRateLimited => "global_destination_rate_limited",
+        OutboundProbeAdmission::GlobalDestinationPersistentRateLimited => {
+            "global_destination_persistent_rate_limited"
+        }
         OutboundProbeAdmission::GlobalNetworkPersistentRateLimited => {
             "global_network_persistent_rate_limited"
         }
@@ -721,9 +752,11 @@ pub(super) fn retain_live_budget_entries(
             OutboundProbeBudgetKey::NetworkPersistent
             | OutboundProbeBudgetKey::PeerPersistent(_)
             | OutboundProbeBudgetKey::PeerRemoteIpPersistent(..)
+            | OutboundProbeBudgetKey::DestinationIpPersistent(_)
             | OutboundProbeBudgetKey::PeerSocketPersistent(..) => OUTBOUND_PROBE_PERSISTENT_WINDOW,
             OutboundProbeBudgetKey::Network
             | OutboundProbeBudgetKey::Peer(_)
+            | OutboundProbeBudgetKey::DestinationIp(_)
             | OutboundProbeBudgetKey::PeerRemoteIp(..) => OUTBOUND_PROBE_BUDGET_WINDOW,
         };
         while sent

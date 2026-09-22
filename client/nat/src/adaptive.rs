@@ -78,7 +78,7 @@ pub struct StepLearner {
     diffs: VecDeque<i16>,
     /// Current fused estimate (signed), or `None` before any observation.
     estimate: Option<i16>,
-    /// Running maximum of the diff-channel mode coverage (0.0..=1.0).
+    /// Recent diff-channel mode coverage (0.0..=1.0).
     confidence: f64,
     /// Number of times the fused estimate changed (learning trajectory).
     revision_count: u32,
@@ -143,11 +143,11 @@ impl StepLearner {
         self.recompute(Some(coverage));
     }
 
-    /// Fold one peer-advertised stride value.  Non-positive values are
-    /// ignored.  The advertised channel is the authoritative one, so it is
-    /// EWMA-smoothed with the higher `ALPHA_ADVERT` weight.
+    /// Fold one signed advertised stride. Zero conveys no allocation step.
+    /// Callers own source authentication and allocator-range validation; the
+    /// public i16 API preserves both directions, including reverse allocation.
     pub fn observe_advertised(&mut self, step: i16) {
-        if step <= 0 {
+        if step == 0 {
             return;
         }
         let smoothed = match self.advert_est {
@@ -165,7 +165,7 @@ impl StepLearner {
         self.estimate
     }
 
-    /// Confidence in the estimate: the running maximum diff-channel mode
+    /// Confidence in the estimate: the recent diff-channel mode
     /// coverage, in `0.0..=1.0`.
     pub fn confidence(&self) -> f64 {
         self.confidence
@@ -212,11 +212,13 @@ impl StepLearner {
         };
         let new = est.round() as i16;
         if self.estimate != Some(new) {
-            self.revision_count += 1;
+            self.revision_count = self.revision_count.saturating_add(1);
         }
         self.estimate = Some(new);
         if let Some(cov) = diff_cov {
-            self.confidence = self.confidence.max(cov).min(1.0);
+            // Coverage describes the current bounded window, not its best
+            // historical fit and not a calibrated traversal probability.
+            self.confidence = cov.clamp(0.0, 1.0);
         }
     }
 }
@@ -452,16 +454,15 @@ mod tests {
     }
 
     #[test]
-    fn nonpositive_advertised_is_ignored() {
+    fn zero_advertised_is_ignored() {
         let mut learner = StepLearner::new();
         learner.observe_advertised(5);
         let before = (learner.estimate(), learner.revision_count());
         learner.observe_advertised(0);
-        learner.observe_advertised(-1);
         assert_eq!(
             (learner.estimate(), learner.revision_count()),
             before,
-            "zero/negative advertised steps must not touch the estimate"
+            "zero advertised steps must not touch the estimate"
         );
     }
 
@@ -615,5 +616,43 @@ mod tests {
         detector.reset();
         assert_eq!(detector.pattern(), DirectionPattern::Forward);
         assert_eq!(detector.suggest_window(2), 2);
+    }
+}
+
+#[cfg(test)]
+mod coverage_regressions {
+    use super::{StepLearner, DIFF_MODE_WINDOW};
+
+    #[test]
+    fn confidence_recovers_as_noise_leaves_the_window() {
+        let mut learner = StepLearner::new();
+        for diff in 1..=DIFF_MODE_WINDOW as i16 {
+            learner.observe_diff(diff);
+        }
+        assert_eq!(learner.confidence(), 1.0 / DIFF_MODE_WINDOW as f64);
+        for _ in 0..DIFF_MODE_WINDOW {
+            learner.observe_diff(-3);
+        }
+        assert_eq!(learner.confidence(), 1.0);
+    }
+
+    #[test]
+    fn advertisements_do_not_inflate_observed_coverage() {
+        let mut learner = StepLearner::new();
+        learner.observe_diff(3);
+        learner.observe_diff(4);
+        learner.observe_advertised(-5);
+        assert_eq!(learner.confidence(), 0.5);
+        learner.observe_diff(0);
+        assert_eq!(learner.confidence(), 0.5);
+    }
+
+    #[test]
+    fn revision_count_saturates_instead_of_overflowing() {
+        let mut learner = StepLearner::new();
+        learner.revision_count = u32::MAX;
+        learner.observe_diff(3);
+        assert_eq!(learner.estimate(), Some(3));
+        assert_eq!(learner.revision_count(), u32::MAX);
     }
 }

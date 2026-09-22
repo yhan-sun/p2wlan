@@ -771,6 +771,14 @@ impl UdpTransport {
                             );
                             continue;
                         }
+                        OutboundProbeAdmission::GlobalDestinationRateLimited
+                        | OutboundProbeAdmission::GlobalDestinationPersistentRateLimited => {
+                            budget_skipped = budget_skipped.saturating_add(1);
+                            last_budget_reason = Some(outbound_probe_admission_reason(admission));
+                            // Do not mark this as a whole-peer rejection: another
+                            // target IP can still be eligible in this window.
+                            continue;
+                        }
                         OutboundProbeAdmission::GlobalNetworkPersistentRateLimited => {
                             budget_skipped = budget_skipped.saturating_add(1);
                             wholesale_rejections = wholesale_rejections.saturating_add(1);

@@ -1,4 +1,42 @@
 impl PeerManager {
+    /// Subscribe to DirectFirst deadline-set changes. The authoritative
+    /// deadlines remain inside each connection's path state machine; this is
+    /// only a latest-value wakeup for the single supervised timer owner.
+    pub(crate) fn subscribe_direct_first_deadline_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        self.direct_first_deadline_change_tx.subscribe()
+    }
+
+    /// Read the earliest pending DirectFirst deadline without joining
+    /// Tokio's fair reader queue. A contended connection map is retried by the
+    /// supervised timer owner, so this observer can never stand in front of a
+    /// lifecycle writer.
+    pub(crate) fn try_next_direct_first_deadline(&self) -> Result<Option<Instant>, ()> {
+        let connections = self.connections.try_read().map_err(|_| ())?;
+        Ok(connections
+            .values()
+            .filter_map(|connection| connection.path_state_machine.direct_first_deadline())
+            .min())
+    }
+
+    /// Commit every due DirectFirst deadline under the canonical
+    /// network-epoch -> connection-writer transaction. This is deliberately
+    /// try-only: the supervised owner retries after a short cancellable delay
+    /// rather than adding another fair writer waiter during lifecycle churn.
+    pub(crate) fn try_advance_direct_first_deadlines_at(&self, now: Instant) -> Result<usize, ()> {
+        let _epoch_guard = self.network_epoch_gate.try_lock().map_err(|_| ())?;
+        let mut connections = self.connections.try_write().map_err(|_| ())?;
+        let generation = self.current_network_generation_sync();
+        let mut advanced = 0usize;
+        for connection in connections.values_mut() {
+            if connection.online && connection.advance_direct_first_deadline_at(generation, now) {
+                advanced = advanced.saturating_add(1);
+            }
+        }
+        Ok(advanced)
+    }
+
     /// Select the data path for one outbound encrypted packet.
     pub async fn select_path_for_data(
         &self,
@@ -71,6 +109,13 @@ impl PeerManager {
     ) -> PathSelection {
         match conns.get_mut(node_id) {
             Some(conn) => {
+                conn.advance_direct_first_deadline(generation);
+                if force_relay && conn.direct_first_pending() {
+                    return PathSelection::unavailable(
+                        REASON_PATH_DIRECT_FIRST_WAIT,
+                        "initial Direct business budget is pending; Relay remains standby",
+                    );
+                }
                 if force_relay {
                     // Make-before-break evidence: the committed Direct path is
                     // not business-ready yet, so the same plaintext rides the
@@ -183,11 +228,15 @@ impl PeerManager {
                 if !conn.online || conn.state == ConnectionState::Closed {
                     return false;
                 }
+                conn.advance_direct_first_deadline(generation);
                 if conn.has_current_authoritative_direct(generation) {
                     return true;
                 }
                 if conn.is_on_link_direct_for_generation(generation) {
                     return true;
+                }
+                if conn.direct_first_pending() {
+                    return false;
                 }
                 let relay_confirmed = relay_available
                     && conn.relay_confirmed_at.is_some()
@@ -579,5 +628,76 @@ impl PeerManager {
                     .iter()
                     .any(|pair| pair.remote_endpoint.ip() == ip)
         })
+    }
+}
+
+impl PeerManager {
+    /// Business eligibility is stricter than Relay authentication. Do not use
+    /// this predicate for control probes: warm standby must remain possible.
+    pub(crate) async fn is_relay_business_admitted_for_generation(
+        &self,
+        peer_id: &str,
+        generation: u64,
+    ) -> bool {
+        let gate = self.network_epoch_gate();
+        let guard = gate.lock().await;
+        self.is_relay_business_admitted_in_epoch(&guard, peer_id, generation)
+            .await
+    }
+
+    /// Counter allocation and send paths already own the network epoch gate.
+    /// Require the guard explicitly so deadline commits cannot race an epoch.
+    pub(crate) async fn is_relay_business_admitted_in_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        peer_id: &str,
+        generation: u64,
+    ) -> bool {
+        let mut conns = self.connections.write().await;
+        if generation != self.current_network_generation_sync() {
+            return false;
+        }
+        let Some(conn) = conns.get_mut(peer_id) else {
+            return false;
+        };
+        conn.advance_direct_first_deadline(generation);
+        conn.online
+            && conn.state != ConnectionState::Closed
+            && !conn.direct_first_pending()
+            && conn.relay_peer_confirmed_for_generation(generation)
+    }
+}
+
+impl PeerManager {
+    /// Complete only the initial preference window after the actual outbound
+    /// owner has both ciphertext and an eligible Direct business budget. A
+    /// later budget revocation may then use warm Relay without another wait.
+    pub(crate) async fn satisfy_direct_first_in_epoch(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        peer_id: &str,
+        generation: u64,
+        endpoint: SocketAddr,
+    ) {
+        let mut conns = self.connections.write().await;
+        if generation != self.current_network_generation_sync() {
+            return;
+        }
+        let Some(conn) = conns.get_mut(peer_id) else {
+            return;
+        };
+        if !conn.online || !conn.direct_first_pending() {
+            return;
+        }
+        let crate::peer::path_state_machine::ActiveBusinessPath::Direct(validation) =
+            conn.path_state_machine.snapshot().state.active
+        else {
+            return;
+        };
+        if validation.epoch.network_generation == generation
+            && validation.commit_endpoint() == Some(endpoint)
+        {
+            conn.commit_path_transition(PathEvent::DirectFirstSatisfied { validation }, |_| {});
+        }
     }
 }

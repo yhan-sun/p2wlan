@@ -52,9 +52,11 @@ fn peer_with_public_key(
 }
 
 fn peer_manager() -> Arc<PeerManager> {
-    Arc::new(PeerManager::new(
-        Config::generate_default("http://ctrl.test", "default").unwrap(),
-    ))
+    // Socket ownership and heartbeat tests seed already-active Relay state.
+    // Their legacy Auto fixture is independent of DirectFirst admission tests.
+    let mut config = Config::generate_default("http://ctrl.test", "default").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::Auto;
+    Arc::new(PeerManager::new(config))
 }
 
 fn config_for_identity(identity: &NodeIdentity, node_id: &str) -> Config {

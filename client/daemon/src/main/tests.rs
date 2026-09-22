@@ -153,7 +153,7 @@ fn prefer_relay_keeps_background_direct_upgrade_enabled() {
     direct_cli.prefer_direct = true;
     apply_cli_overrides(&mut sticky_config, &direct_cli);
     assert!(sticky_config.relay.prefer_direct);
-    assert_eq!(sticky_config.relay.path_policy, PathPolicy::Auto);
+    assert_eq!(sticky_config.relay.path_policy, PathPolicy::DirectFirst);
 }
 
 #[test]

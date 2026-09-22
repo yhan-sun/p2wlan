@@ -25,6 +25,7 @@ REASON = re.compile(r"(?:^|\s)reason_code=([^\s]+)")
 INTEGER = re.compile(r"-?[0-9]+\Z")
 RATIO = re.compile(r"[0-9]+/[0-9]+\Z")
 SHA1 = re.compile(r"[0-9a-f]{40}\Z")
+EVIDENCE_SCHEMA_VERSION = 2
 
 # The profile-specific summary lines are emitted by nat-sim-smoke.sh. Keeping
 # their contracts here makes a missing counter or type change fail closed.
@@ -40,6 +41,13 @@ PROFILE_FIELDS: dict[str, dict[str, set[str]]] = {
             "b_relay_confirmed",
             "a_delta_ms",
             "b_delta_ms",
+            "a_budget_ms",
+            "b_budget_ms",
+            "a_direct_first_remaining_ms",
+            "b_direct_first_remaining_ms",
+            "a_budget_direct_first_remaining_ms",
+            "b_budget_direct_first_remaining_ms",
+            "slo_base_ms",
             "sum_delta_ms",
             "drops_a",
             "drops_b",
@@ -230,7 +238,10 @@ def _validate_profile_line(profile: str, fields: dict[str, str]) -> str | None:
 
 def _validate_evidence(evidence: dict[str, Any], profile: str) -> tuple[str | None, str | None]:
     expected_scenario = "relay-blackhole" if profile == "relay-blackhole" else "direct-cold-start"
-    if type(evidence.get("schema_version")) is not int or evidence["schema_version"] != 1:
+    if (
+        type(evidence.get("schema_version")) is not int
+        or evidence["schema_version"] != EVIDENCE_SCHEMA_VERSION
+    ):
         return None, "evidence_schema_invalid"
     if evidence.get("repository") != "yhan-sun/p2wlan" or evidence.get("topology") != expected_scenario:
         return None, "evidence_identity_invalid"

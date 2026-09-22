@@ -106,6 +106,7 @@ pub(super) async fn encrypt_then_send(
                             // the queue behind a budget only the Direct
                             // commit can publish.
                             if !relay_make_before_break_fallback(
+                                &_epoch_guard,
                                 peers,
                                 &retry_packet.peer_id,
                                 current_generation,
@@ -173,6 +174,7 @@ pub(super) async fn encrypt_then_send(
                 }
                 _ => {
                     if !relay_make_before_break_fallback(
+                        &_epoch_guard,
                         peers,
                         &retry_packet.peer_id,
                         current_generation,
@@ -234,6 +236,19 @@ pub(super) async fn encrypt_then_send(
                 "tx_epoch_gate_hold_us",
                 epoch_gate_acquired.elapsed(),
             );
+        }
+        if selection.path == Some(NetworkPath::Direct) && selection.direct_confirmed && !force_relay
+        {
+            if let Some(endpoint) = selection.direct_endpoint {
+                peers
+                    .satisfy_direct_first_in_epoch(
+                        &_epoch_guard,
+                        &retry_packet.peer_id,
+                        current_generation,
+                        endpoint,
+                    )
+                    .await;
+            }
         }
         (result, direct_business_plan, force_relay)
     };
@@ -565,7 +580,7 @@ pub(super) async fn send_encrypted_packet_once(
         }
         let generation = peers.current_network_generation_sync();
         let relay_peer_confirmed = peers
-            .is_relay_peer_confirmed_for_generation(&packet.peer_id, generation)
+            .is_relay_business_admitted_in_epoch(&_epoch_guard, &packet.peer_id, generation)
             .await;
         let relay_available = relay.is_some();
         let udp_read_started = Instant::now();

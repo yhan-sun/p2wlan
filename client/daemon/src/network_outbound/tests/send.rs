@@ -2,8 +2,6 @@ use super::super::test_support::*;
 use super::*;
 use crate::config::Config;
 
-use crate::peer::REASON_PATH_DIRECT_CONFIRMED;
-
 #[test]
 fn relay_queue_full_and_writer_closed_are_safe_plaintext_retries() {
     for error in [
@@ -101,7 +99,10 @@ async fn send_selector_accepts_authoritative_direct_before_relay_transport_publi
     };
     let selection = select_outbound_path(&packet, &manager, true, false, true, None, false).await;
     assert_eq!(selection.path, Some(NetworkPath::Direct));
-    assert_eq!(selection.reason_code, REASON_PATH_DIRECT_CONFIRMED);
+    assert_eq!(
+        selection.reason_code,
+        crate::peer::REASON_PATH_DIRECT_STICKY
+    );
     assert!(selection.direct_confirmed);
 }
 

@@ -2,6 +2,134 @@
 // real Rust scope. Everything below is unchanged test code.
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+enum ContendedLifecycleLane {
+    Initiator,
+    Responder,
+}
+
+async fn assert_lifecycle_commit_drives_granted_lane(lane: ContendedLifecycleLane) {
+    let config = Config::generate_default("http://127.0.0.1:1", "lifecycle-lane-pump").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = match lane {
+        ContendedLifecycleLane::Initiator => "peer-granted-initiator-writer",
+        ContendedLifecycleLane::Responder => "peer-granted-responder-writer",
+    };
+    let mut peer_info = control::PeerInfo {
+        node_id: peer_id.to_string(),
+        public_key: hex::encode(NodeIdentity::generate().public_key()),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    daemon.peers.add_peer(&peer_info).await;
+
+    // Model the exact fair-lock edge from the failed NAT replica.  A reader
+    // keeps a cooperative handshake lane's writer queued.  The writer is
+    // polled once by the control loop before PeerUpdated enters its serial
+    // lifecycle transaction, so it is ahead of that transaction in Tokio's
+    // fair queue.
+    let connection_reader = daemon.peers.hold_connections_reader_for_test().await;
+    let mut slow_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let mut retry_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let mut responder_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let mut candidate_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let writer_peers = daemon.peers.clone();
+    let writer_peer_id = peer_id.to_string();
+    let writer: ControlEventWork<'_> = Box::pin(async move {
+        writer_peers
+            .update_state(&writer_peer_id, ConnectionState::HolePunching)
+            .await;
+    });
+    match lane {
+        ContendedLifecycleLane::Initiator => slow_work.push(writer),
+        ContendedLifecycleLane::Responder => responder_work.push(writer),
+    }
+
+    // Poll exactly once to enqueue the cooperative writer without allowing it
+    // to complete while the reader is held.  No sleeps or scheduler luck are
+    // involved in establishing the ordering.
+    let waker = futures_util::task::noop_waker_ref();
+    let mut context = std::task::Context::from_waker(waker);
+    let poll = match lane {
+        ContendedLifecycleLane::Initiator => {
+            let mut next = Box::pin(slow_work.next());
+            std::future::Future::poll(next.as_mut(), &mut context)
+        }
+        ContendedLifecycleLane::Responder => {
+            let mut next = Box::pin(responder_work.next());
+            std::future::Future::poll(next.as_mut(), &mut context)
+        }
+    };
+    assert!(
+        poll.is_pending(),
+        "the cooperative {lane:?} writer completed while the reader was held"
+    );
+    assert!(
+        daemon.peers.connection_map_for_test().try_read().is_err(),
+        "the cooperative {lane:?} writer did not enter the fair queue"
+    );
+
+    peer_info.last_seen = 7;
+    let peers = daemon.peers.clone();
+    let timeline = daemon.timeline.clone();
+    let (peer_add_started_tx, mut peer_add_started_rx) = mpsc::unbounded_channel();
+    peers.install_peer_add_wait_observer_for_test(peer_add_started_tx);
+    let lifecycle_peers = peers.clone();
+    let lifecycle_peer_info = peer_info.clone();
+    let mut deferred_initiators = InitiatorQueue::new();
+    let commit = await_peer_lifecycle_commit_while_driving_work(
+        &daemon,
+        lifecycle_peers.add_peer(&lifecycle_peer_info),
+        &mut slow_work,
+        &mut retry_work,
+        &mut responder_work,
+        &mut candidate_work,
+        &mut deferred_initiators,
+    );
+    let release_reader = async move {
+        peer_add_started_rx
+            .recv()
+            .await
+            .expect("PeerUpdated did not enter the lifecycle transaction");
+        loop {
+            if timeline.snapshot().events.iter().any(|event| {
+                event.event == "peer_update_lock_wait_started"
+                    && event.reason_code.as_deref() == Some("connections_write")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(connection_reader);
+    };
+
+    let (update, ()) = timeout(Duration::from_secs(1), async {
+        tokio::join!(commit, release_reader)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("PeerUpdated parked behind an unpolled, granted {lane:?} connection writer")
+    });
+    assert!(update.last_seen_only);
+    let connection = peers
+        .get_connection(peer_id)
+        .await
+        .expect("peer lifecycle disappeared after the contended commit");
+    assert_eq!(connection.last_seen, 7);
+    assert_eq!(connection.state, ConnectionState::HolePunching);
+}
+
+#[tokio::test]
+async fn peer_lifecycle_wait_drives_granted_initiator_writer() {
+    assert_lifecycle_commit_drives_granted_lane(ContendedLifecycleLane::Initiator).await;
+}
+
+#[tokio::test]
+async fn peer_lifecycle_wait_drives_granted_responder_writer() {
+    assert_lifecycle_commit_drives_granted_lane(ContendedLifecycleLane::Responder).await;
+}
+
 #[tokio::test]
 async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_blocked() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();

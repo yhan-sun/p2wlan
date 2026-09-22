@@ -390,6 +390,16 @@ impl PeerConnection {
             };
         }
 
+        if policy == crate::config::PathPolicy::DirectFirst
+            && self.direct_first_pending()
+            && !self.has_current_authoritative_direct(local_generation)
+        {
+            return PathSelection::unavailable(
+                REASON_PATH_DIRECT_FIRST_WAIT,
+                "initial Direct attempt is pending; Relay is standby only",
+            );
+        }
+
         let Some(endpoint) = direct_endpoint else {
             return if relay_available {
                 PathSelection::relay(
@@ -451,7 +461,11 @@ impl PeerConnection {
                         SLOW_DIRECT_RELAY_RETRY_COOLDOWN,
                     )
                 })
-                && policy != crate::config::PathPolicy::DirectSticky
+                && !matches!(
+                    policy,
+                    crate::config::PathPolicy::DirectSticky
+                        | crate::config::PathPolicy::DirectFirst
+                )
             {
                 return PathSelection::relay(
                     REASON_PATH_DIRECT_SLOW_RELAY_RETAINED,
@@ -468,7 +482,10 @@ impl PeerConnection {
             // hard consent/keepalive failure still changes the connection
             // state before the selector is called, so this cannot force a
             // dead socket to remain active.
-            if policy == crate::config::PathPolicy::DirectSticky {
+            if matches!(
+                policy,
+                crate::config::PathPolicy::DirectSticky | crate::config::PathPolicy::DirectFirst
+            ) {
                 return PathSelection::direct(
                     endpoint,
                     REASON_PATH_DIRECT_STICKY,

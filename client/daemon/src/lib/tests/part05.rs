@@ -192,6 +192,199 @@ async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
     wg_b_worker.abort();
 }
 
+/// A request that is already on the wire keeps its ACK lease while newer
+/// observations from the same reachability class update the next target. A
+/// delayed but valid ACK must therefore still promote Direct instead of
+/// racing a replacement request id and starting an unbounded worker storm.
+#[tokio::test]
+async fn same_class_endpoint_churn_preserves_delayed_validation_ack() {
+    let a_identity = NodeIdentity::generate();
+    let b_identity = NodeIdentity::generate();
+    let a_public_key = hex::encode(a_identity.public_key());
+    let b_public_key = hex::encode(b_identity.public_key());
+    let mut a_initiator = HandshakeInitiator::new(a_identity, b_identity.public_key(), None);
+    let initiation = a_initiator.create_initiation().unwrap();
+    let mut b_responder = HandshakeResponder::new(b_identity, None);
+    let (response, b_local_keys) = b_responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    let a_local_keys = a_initiator.consume_response(&response).unwrap();
+
+    let peers_a = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    let peers_b = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "net1").unwrap(),
+    ));
+    peers_a
+        .add_peer(&control::PeerInfo {
+            node_id: "node-b".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: b_public_key,
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+    peers_b
+        .add_peer(&control::PeerInfo {
+            node_id: "node-a".to_string(),
+            device_name: String::new(),
+            app_version: String::new(),
+            public_key: a_public_key,
+            endpoint: String::new(),
+            nat_type: "Unknown".to_string(),
+            virtual_ip: "10.20.0.1".to_string(),
+            online: true,
+            last_seen: 0,
+            relay_rtt_ms: None,
+        })
+        .await;
+
+    let (udp_inbound_tx_a, udp_inbound_rx_a) = mpsc::channel(64);
+    let (wg_a, _encrypted_rx_a) = WireGuardTransport::new();
+    wg_a.add_session("node-b", TransportSession::new(a_local_keys))
+        .await;
+    let udp_a = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_a.clone())
+        .await
+        .unwrap()
+        .with_inbound_channel(udp_inbound_tx_a.clone());
+    let udp_a_addr = udp_a.local_addr().unwrap();
+    let udp_a_worker = tokio::spawn(udp_a.clone().run_inbound(udp_inbound_tx_a));
+    let (inbound_tx_a, _inbound_rx_a) = mpsc::channel(64);
+    let wg_a_worker = {
+        let wg = wg_a.clone();
+        let peers = peers_a.clone();
+        let udp = udp_a.clone();
+        tokio::spawn(async move {
+            let _ = wg
+                .run_inbound_with_peers(udp_inbound_rx_a, inbound_tx_a, Some(peers), Some(udp))
+                .await;
+        })
+    };
+
+    let (udp_inbound_tx_b, udp_inbound_rx_b) = mpsc::channel(64);
+    let (wg_b, _encrypted_rx_b) = WireGuardTransport::new();
+    wg_b.add_session("node-a", TransportSession::new(b_local_keys))
+        .await;
+    let udp_b = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers_b.clone())
+        .await
+        .unwrap()
+        .with_wireguard_transport(wg_b.clone())
+        .with_inbound_channel(udp_inbound_tx_b.clone());
+    let udp_b_addr = udp_b.local_addr().unwrap();
+    let udp_b_worker = tokio::spawn(udp_b.clone().run_inbound(udp_inbound_tx_b));
+    let (inbound_tx_b, _inbound_rx_b) = mpsc::channel(64);
+    let wg_b_worker = {
+        let wg = wg_b.clone();
+        let peers = peers_b.clone();
+        let udp = udp_b.clone();
+        tokio::spawn(async move {
+            let _ = wg
+                .run_inbound_with_peers(udp_inbound_rx_b, inbound_tx_b, Some(peers), Some(udp))
+                .await;
+        })
+    };
+
+    // The proxy preserves its source tuple but delays the first request long
+    // enough for a burst of same-class observations to reach the active
+    // worker. It then forwards the responder's ACK from that exact tuple.
+    let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_worker = {
+        let proxy = proxy.clone();
+        tokio::spawn(async move {
+            let mut packet = vec![0u8; 65_535];
+            loop {
+                let (len, source) = proxy.recv_from(&mut packet).await.unwrap();
+                if source == udp_a_addr {
+                    sleep(Duration::from_millis(300)).await;
+                    proxy.send_to(&packet[..len], udp_b_addr).await.unwrap();
+                } else if source == udp_b_addr {
+                    proxy.send_to(&packet[..len], udp_a_addr).await.unwrap();
+                }
+            }
+        })
+    };
+
+    let validation_task = {
+        let udp = udp_a.clone();
+        let peers = peers_a.clone();
+        let wg = wg_a.clone();
+        tokio::spawn(async move {
+            run_direct_encrypted_validation(
+                PeerReflexiveObservation {
+                    peer_id: "node-b".to_string(),
+                    observed_endpoint: proxy_addr,
+                },
+                udp,
+                peers,
+                wg,
+                "10.20.0.1",
+            )
+            .await;
+        })
+    };
+
+    timeout(Duration::from_secs(2), async {
+        while !udp_a.has_direct_validation_expectation("node-b").await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first request must install its owned ACK expectation");
+
+    let decoy_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let decoy_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let decoy_endpoints = [decoy_a.local_addr().unwrap(), decoy_b.local_addr().unwrap()];
+    for offset in 0..20 {
+        assert!(matches!(
+            udp_a
+                .begin_or_merge_direct_validation(
+                    "node-b",
+                    decoy_endpoints[offset % decoy_endpoints.len()],
+                    0,
+                )
+                .await,
+            crate::udp::DirectValidationSessionStart::Merged
+        ));
+        sleep(Duration::from_millis(5)).await;
+    }
+
+    timeout(Duration::from_secs(2), async {
+        while !peers_a.is_direct("node-b").await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-class endpoint churn must not invalidate the delayed matching ACK");
+    validation_task.await.unwrap();
+
+    let diagnostics = peers_a.diagnostics().await;
+    let events = &diagnostics[0].direct_events;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.stage == "encrypted_trial_started")
+            .count(),
+        1,
+        "one owned worker must survive the observation burst"
+    );
+    assert!(events
+        .iter()
+        .any(|event| event.stage == "direct_validation_ack_received"));
+
+    proxy_worker.abort();
+    udp_a_worker.abort();
+    udp_b_worker.abort();
+    wg_a_worker.abort();
+    wg_b_worker.abort();
+}
+
 /// The daemon wires a matched-ACK convergence trigger into the UDP transport:
 /// whenever the UDP reader matches an authenticated probe ACK it must fire the
 /// registered trigger, which spawns the daemon-internal validation exchange.
@@ -1853,6 +2046,52 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
             .await
     );
     assert!(udp.direct_validation_target("node-b").await.is_none());
+
+    // Also cover the narrower prepare race: the worker snapshots an endpoint,
+    // then a same-class observation wins just before expectation registration.
+    // Registration must retain the request tuple that is about to be sent.
+    let prepared_endpoint: SocketAddr = "127.0.0.1:41051".parse().unwrap();
+    let replacement_endpoint: SocketAddr = "127.0.0.1:41052".parse().unwrap();
+    let prepared_owner = match udp
+        .begin_or_merge_direct_validation("node-c", prepared_endpoint, 0)
+        .await
+    {
+        crate::udp::DirectValidationSessionStart::Spawn(lease) => lease.owner_token,
+        _ => panic!("the prepare-race setup must receive one worker lease"),
+    };
+    assert!(matches!(
+        udp.begin_or_merge_direct_validation("node-c", replacement_endpoint, 0)
+            .await,
+        crate::udp::DirectValidationSessionStart::Merged
+    ));
+    assert!(
+        udp.expect_direct_validation_ack_owned(
+            "node-c",
+            0x4251,
+            0,
+            prepared_owner,
+            prepared_endpoint,
+        )
+        .await,
+        "same-class churn between target snapshot and registration must preserve the request"
+    );
+    assert!(udp
+        .consume_direct_validation_ack(
+            "node-c",
+            0x4251,
+            0,
+            prepared_owner,
+            0,
+            prepared_endpoint,
+            None,
+            false,
+        )
+        .await
+        .is_ok());
+    assert!(
+        udp.finish_direct_validation_session("node-c", prepared_owner)
+            .await
+    );
 
     let concurrent_spawns = (0..32u16)
         .map(|offset| {

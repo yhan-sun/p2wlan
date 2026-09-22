@@ -3,10 +3,15 @@ use super::*;
 pub(super) const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
 
 pub(super) fn monotonic_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    // Zero is reserved for a missing response in MappingObservation. Never
+    // publish this process-local value as an absolute signaling timestamp.
+    ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min((u64::MAX - 1) as u128) as u64
+        + 1
 }
 
 impl UdpTransport {
@@ -56,6 +61,13 @@ impl UdpTransport {
         stun_timeout: Duration,
         keep_measuring: impl Fn() -> bool,
     ) -> Vec<MappingObservation> {
+        let mut seen = HashSet::new();
+        let observers = observers
+            .iter()
+            .copied()
+            .filter(|observer| seen.insert(*observer))
+            .take(usize::from(u16::MAX))
+            .collect::<Vec<_>>();
         let started_ms = monotonic_millis();
         let mut observations = Vec::with_capacity(observers.len());
         for (sequence, observer) in observers.iter().enumerate() {
@@ -69,6 +81,9 @@ impl UdpTransport {
             let remaining_budget_ms = FRESH_MAPPING_MEASURE_BUDGET
                 .as_millis()
                 .saturating_sub(budget_elapsed_ms);
+            if remaining_budget_ms == 0 {
+                break;
+            }
             let remaining_samples = observers.len().saturating_sub(sequence).max(1) as u128;
             let per_sample_timeout =
                 stun_timeout

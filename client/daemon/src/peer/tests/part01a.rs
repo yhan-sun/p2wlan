@@ -8,7 +8,11 @@ fn unlabelled_private_candidates_do_not_beat_public_candidates() {
 }
 
 fn test_config() -> Config {
-    Config::generate_default("https://ctrl.test", "net1").unwrap()
+    // Preserve the explicit legacy policy covered by this test family.
+    // Default DirectFirst admission is covered independently in direct_first.
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::Auto;
+    config
 }
 
 fn birthday_nat_profile() -> NatProfile {

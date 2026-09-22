@@ -103,3 +103,6 @@ async fn room_authorization_is_checked_at_udp_socket_boundary() {
             .is_err()
     );
 }
+
+#[path = "tests/destination_budget.rs"]
+mod destination_budget;

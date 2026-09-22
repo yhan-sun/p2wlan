@@ -182,6 +182,20 @@ impl PeerManager {
                 || conn.relay_ready_generation != Some(generation)
                 || ready_incarnation_unknown_or_changed
             {
+                // Capture the authoritative policy wait at the exact
+                // Relay-ready commit.  Acceptance may add its independent
+                // post-protection SLO to this value, but must never rewrite
+                // the original ready or first-business timestamps.
+                let direct_first_remaining_ms = conn
+                    .path_state_machine
+                    .direct_first_deadline()
+                    .map(|deadline| {
+                        deadline
+                            .saturating_duration_since(now)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64
+                    })
+                    .unwrap_or(0);
                 let relay_identity = RelayConnectionIdentity::new(
                     PathEpoch::new(
                         generation,
@@ -249,6 +263,7 @@ impl PeerManager {
                     relay_endpoint = %relay_endpoint,
                     relay_connection_id = ?relay_connection_id,
                     generation = generation,
+                    direct_first_remaining_ms = ?direct_first_remaining_ms,
                     "relay transport ready for peer peer_id={node_id} relay_endpoint={relay_endpoint}",
                 );
                 self.emit_timeline(
@@ -256,7 +271,7 @@ impl PeerManager {
                     Some("relay"),
                     None,
                     Some(format!(
-                        "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?}"
+                        "peer={node_id} generation={generation} relay_endpoint={relay_endpoint} relay_connection_id={relay_connection_id:?} direct_first_remaining_ms={direct_first_remaining_ms}"
                     )),
                 );
                     },

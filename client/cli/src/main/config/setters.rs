@@ -141,7 +141,11 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
             config.relay.selection_timeout_ms = timeout;
         }
         "relay-policy" => match value.trim().to_ascii_lowercase().as_str() {
-            "auto" | "direct" => {
+            "direct" | "direct-first" => {
+                config.relay.prefer_direct = true;
+                config.relay.path_policy = PathPolicy::DirectFirst;
+            }
+            "auto" => {
                 config.relay.prefer_direct = true;
                 config.relay.path_policy = PathPolicy::Auto;
             }
@@ -159,24 +163,25 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
             let prefer_direct = parse_bool_config(value, "prefer-direct")?;
             config.relay.prefer_direct = prefer_direct;
             if prefer_direct && config.relay.path_policy == PathPolicy::RelayOnly {
-                config.relay.path_policy = PathPolicy::Auto;
+                config.relay.path_policy = PathPolicy::DirectFirst;
             } else if !prefer_direct {
                 config.relay.path_policy = PathPolicy::RelayOnly;
             }
         }
         "path-policy" => {
             let normalized = value.trim().to_ascii_lowercase();
-            let policy = match normalized.as_str() {
-                "auto" => PathPolicy::Auto,
-                "score" => PathPolicy::Score,
-                "direct-sticky" | "direct_sticky" | "direct" => PathPolicy::DirectSticky,
-                "relay-only" | "relay_only" | "relay" => PathPolicy::RelayOnly,
-                _ => {
-                    return Err(
-                        "path-policy 只支持 auto、score、direct-sticky 或 relay-only".to_string(),
-                    )
-                }
-            };
+            let policy =
+                match normalized.as_str() {
+                    "direct-first" | "direct_first" => PathPolicy::DirectFirst,
+                    "auto" => PathPolicy::Auto,
+                    "score" => PathPolicy::Score,
+                    "direct-sticky" | "direct_sticky" | "direct" => PathPolicy::DirectSticky,
+                    "relay-only" | "relay_only" | "relay" => PathPolicy::RelayOnly,
+                    _ => return Err(
+                        "path-policy 只支持 direct-first、auto、score、direct-sticky 或 relay-only"
+                            .to_string(),
+                    ),
+                };
             config.relay.path_policy = policy;
             config.relay.prefer_direct = policy != PathPolicy::RelayOnly;
         }

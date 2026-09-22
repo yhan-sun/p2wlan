@@ -10,6 +10,43 @@ type ControlEventWork<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 const MAX_CONTROL_EVENT_SLOW_WORK: usize = 64;
 
+/// Await one serial peer-lifecycle commit without parking the cooperative
+/// work lanes which were polled by the same control-event task.
+///
+/// Tokio's fair `RwLock` may grant a queued connection writer to an
+/// initiator/responder/candidate future immediately before `PeerUpdated`
+/// enters its inline lifecycle transaction.  A plain `.await` here would stop
+/// polling that future while the lifecycle writer queues behind it, leaving a
+/// granted-but-unpolled waiter at the head of the lock queue forever.  Keep
+/// polling the already-admitted bounded lanes until the lifecycle transaction
+/// commits.  The receiver itself is intentionally not polled here, so control
+/// event ordering remains serial.
+async fn await_peer_lifecycle_commit_while_driving_work<'a, F, T>(
+    daemon: &'a Daemon,
+    lifecycle_commit: F,
+    slow_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+    retry_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+    responder_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+    candidate_work: &mut FuturesUnordered<ControlEventWork<'a>>,
+    deferred_initiators: &mut InitiatorQueue<control::PeerInfo>,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(lifecycle_commit);
+    loop {
+        tokio::select! {
+            result = &mut lifecycle_commit => return result,
+            _ = slow_work.next(), if !slow_work.is_empty() => {}
+            _ = retry_work.next(), if !retry_work.is_empty() => {}
+            _ = responder_work.next(), if !responder_work.is_empty() => {}
+            _ = candidate_work.next(), if !candidate_work.is_empty() => {}
+        }
+        daemon.drain_initiator_retry_ledger(retry_work);
+        daemon.drain_deferred_initiator_handshakes(slow_work, deferred_initiators);
+    }
+}
+
 fn control_event_kind(event: &control::ControlEvent) -> &'static str {
     match event {
         control::ControlEvent::DeliveredSignal { event, .. } => control_event_kind(event),
@@ -285,7 +322,17 @@ impl Daemon {
                                 peer_info.node_id, peer_info.virtual_ip, peer_info.online
                             )),
                         );
-                        self.peers.add_peer(&peer_info).await;
+                        let peers = self.peers.clone();
+                        await_peer_lifecycle_commit_while_driving_work(
+                            daemon,
+                            peers.add_peer(&peer_info),
+                            &mut slow_work,
+                            &mut retry_work,
+                            &mut responder_work,
+                            &mut candidate_work,
+                            &mut deferred_initiators,
+                        )
+                        .await;
                         let peer_state_elapsed = peer_join_started.elapsed();
                         if peer_state_elapsed >= Duration::from_millis(250) {
                             warn!(
@@ -461,15 +508,22 @@ impl Daemon {
                                 signal_id, signal_type, signal_seq
                             );
                         }
-                        let update = self
-                            .peers
-                            .add_peer_with_signal_context(
+                        let peers = self.peers.clone();
+                        let update = await_peer_lifecycle_commit_while_driving_work(
+                            daemon,
+                            peers.add_peer_with_signal_context(
                                 &peer_info,
                                 signal_context.as_ref().map(|(signal_id, sequence, signal_type)| {
                                     (signal_id.as_str(), *sequence, signal_type.as_str())
                                 }),
-                            )
-                            .await;
+                            ),
+                            &mut slow_work,
+                            &mut retry_work,
+                            &mut responder_work,
+                            &mut candidate_work,
+                            &mut deferred_initiators,
+                        )
+                        .await;
                         info!(
                             event = "control_event_phase",
                             kind = "peer_updated",
@@ -538,10 +592,18 @@ impl Daemon {
                                 // detach and the affinity clears, all in one
                                 // transaction, so a late ACK can neither match,
                                 // re-insert nor leave pool affinity behind.
-                                udp.cleanup_peer_lifecycle(
-                                    &peer_info.node_id,
-                                    "peer_offline",
-                                    false,
+                                await_peer_lifecycle_commit_while_driving_work(
+                                    daemon,
+                                    udp.cleanup_peer_lifecycle(
+                                        &peer_info.node_id,
+                                        "peer_offline",
+                                        false,
+                                    ),
+                                    &mut slow_work,
+                                    &mut retry_work,
+                                    &mut responder_work,
+                                    &mut candidate_work,
+                                    &mut deferred_initiators,
                                 )
                                 .await;
                             }
@@ -612,10 +674,18 @@ impl Daemon {
                                 .clear_fresh_mapping(&peer_info.node_id, reason)
                                 .await;
                             if let Some(udp) = self.udp_transport.read().await.clone() {
-                                udp.cleanup_peer_lifecycle(
-                                    &peer_info.node_id,
-                                    reason,
-                                    false,
+                                await_peer_lifecycle_commit_while_driving_work(
+                                    daemon,
+                                    udp.cleanup_peer_lifecycle(
+                                        &peer_info.node_id,
+                                        reason,
+                                        false,
+                                    ),
+                                    &mut slow_work,
+                                    &mut retry_work,
+                                    &mut responder_work,
+                                    &mut candidate_work,
+                                    &mut deferred_initiators,
                                 )
                                 .await;
                             }
@@ -778,8 +848,16 @@ impl Daemon {
                             // re-insert, nor leave pool affinity / endpoint /
                             // candidate state behind for a new identity that
                             // later rejoins under the same node ID.
-                            udp.cleanup_peer_lifecycle(&node_id, "peer_left", true)
-                                .await;
+                            await_peer_lifecycle_commit_while_driving_work(
+                                daemon,
+                                udp.cleanup_peer_lifecycle(&node_id, "peer_left", true),
+                                &mut slow_work,
+                                &mut retry_work,
+                                &mut responder_work,
+                                &mut candidate_work,
+                                &mut deferred_initiators,
+                            )
+                            .await;
                         } else {
                             // The UDP task publishes its transport asynchronously,
                             // so control events can be consumed during a short
@@ -792,7 +870,17 @@ impl Daemon {
                             // lifecycle. When UDP is present, the branch above
                             // remains the single removal owner so connection and
                             // socket cleanup stay one adoption-lock transaction.
-                            self.peers.remove_peer(&node_id).await;
+                            let peers = self.peers.clone();
+                            await_peer_lifecycle_commit_while_driving_work(
+                                daemon,
+                                peers.remove_peer(&node_id),
+                                &mut slow_work,
+                                &mut retry_work,
+                                &mut responder_work,
+                                &mut candidate_work,
+                                &mut deferred_initiators,
+                            )
+                            .await;
                         }
                     }
 

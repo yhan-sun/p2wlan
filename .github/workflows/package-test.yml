@@ -75,7 +75,10 @@ jobs:
 
       - name: Build Flutter macOS app
         working-directory: apps/flutter_client
-        run: flutter build macos --release --split-debug-info build/symbols/macos-arm64
+        run: >
+          bash ../../scripts/release/build_flutter_client.sh macos
+          --release
+          --split-debug-info build/symbols/macos-arm64
 
       - name: Restore Flutter-managed source files after build
         run: bash scripts/release/hermetic_build.sh restore --macos
