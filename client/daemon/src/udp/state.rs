@@ -203,7 +203,10 @@ pub(crate) async fn wait_for_birthday_worker_completion_gate_for_test() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     if let Some(gate) = gate {
-        gate.reached.notify_waiters();
+        // Keep a permit when the worker wins the race with the test waiter.
+        // `notify_waiters` drops the signal when no waiter is registered yet,
+        // which made the production-entry tests scheduler-speed dependent.
+        gate.reached.notify_one();
         gate.release.notified().await;
     }
 }
@@ -257,7 +260,9 @@ pub(crate) async fn wait_for_probe_post_send_gate_for_test() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     if let Some(gate) = gate {
-        gate.reached.notify_waiters();
+        // Preserve the one-shot arrival if the sender reaches this seam before
+        // the test task has polled its waiter.
+        gate.reached.notify_one();
         gate.release.notified().await;
     }
 }

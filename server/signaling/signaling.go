@@ -65,11 +65,11 @@ type UpgradeGuard func(http.ResponseWriter, *http.Request) (release func(), ok b
 // Client is one authenticated device connection. Identity comes exclusively
 // from device credential claims; clients never self-declare node or network.
 type Client struct {
-	hub        *Hub
-	conn       *websocket.Conn
-	send       chan []byte
-	done       chan struct{}
-	closeReq   chan closeRequest
+	hub             *Hub
+	conn            *websocket.Conn
+	send            chan []byte
+	done            chan struct{}
+	closeReq        chan closeRequest
 	writerDone      chan struct{}
 	stopOnce        sync.Once
 	nodeID          string
@@ -470,10 +470,44 @@ func (h *Hub) handleTelemetry(c *Client, data []byte) {
 	}
 	result, err := handler(c.nodeID, c.networkID, c.registrationSeq, data)
 	if err == nil && result != nil {
-		if ackBytes, err := json.Marshal(result); err == nil {
+		if ackBytes, err := marshalTelemetryAck(result, data); err == nil {
 			c.enqueue(ackBytes)
 		}
 	}
+}
+
+// marshalTelemetryAck keeps the ingestion summary fields at the top level for
+// compatibility while adding the signaling envelope required by clients.  A
+// bare ingestion summary is not a valid server message; clients correctly
+// closed the WebSocket when they received one, which could delay durable
+// signal wake-ups until the HTTP fallback poll.
+func marshalTelemetryAck(result interface{}, request []byte) ([]byte, error) {
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	ack := make(map[string]interface{})
+	if err := json.Unmarshal(resultBytes, &ack); err != nil {
+		return nil, err
+	}
+
+	var frame struct {
+		SentAt  int64 `json:"sent_at"`
+		Payload struct {
+			SentAt int64 `json:"sent_at"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(request, &frame); err != nil {
+		return nil, err
+	}
+	sentAt := frame.SentAt
+	if frame.Payload.SentAt != 0 {
+		sentAt = frame.Payload.SentAt
+	}
+	ack["type"] = "path_telemetry_ack"
+	ack["protocol_version"] = ProtocolVersion
+	ack["sent_at"] = sentAt
+	return json.Marshal(ack)
 }
 
 func parseRegistrationSequence(r *http.Request) int64 {

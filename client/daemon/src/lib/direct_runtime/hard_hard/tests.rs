@@ -1445,36 +1445,15 @@ mod hard_hard_tests {
     }
 
     async fn wait_for_birthday_worker_gate(gate: &Arc<crate::udp::BirthdayWorkerCompletionGate>) {
-        let reached = gate.reached.notified();
-        let mut watchdog = tokio::spawn(async {
-            for _ in 0..64 {
-                tokio::task::yield_now().await;
-            }
-            tokio::time::advance(Duration::from_secs(1)).await;
-        });
-        tokio::select! {
-            _ = reached => {
-                watchdog.abort();
-            }
-            _ = &mut watchdog => panic!("production Birthday worker did not publish live progress"),
-        }
+        tokio::time::timeout(Duration::from_secs(1), gate.reached.notified())
+            .await
+            .expect("production Birthday worker did not publish live progress");
     }
 
     async fn wait_for_birthday_post_send_gate(gate: &Arc<crate::udp::ProbePostSendGate>) {
-        // Register the waiter before starting the production task: the hook
-        // uses notify_waiters, so an already-reached gate must not be lost.
-        let reached = gate.reached.notified();
-        let mut watchdog = tokio::spawn(async {
-            for _ in 0..128 {
-                tokio::task::yield_now().await;
-            }
-        });
-        tokio::select! {
-            _ = reached => {
-                watchdog.abort();
-            }
-            _ = &mut watchdog => panic!("production Birthday send did not reach the post-send gate"),
-        }
+        tokio::time::timeout(Duration::from_secs(1), gate.reached.notified())
+            .await
+            .expect("production Birthday send did not reach the post-send gate");
     }
 
     fn assert_live_birthday_terminal_summary(

@@ -125,6 +125,63 @@ func TestWebSocketBindsIdentityAndDeliversSequencedWakeups(t *testing.T) {
 	}
 }
 
+func TestWebSocketTelemetryAckKeepsSignalChannelConnected(t *testing.T) {
+	fixture := newWebSocketFixture(t)
+	observedSentAt := make(chan int64, 1)
+	fixture.hub.SetTelemetryHandler(func(_, _ string, _ int64, payload []byte) (interface{}, error) {
+		var frame struct {
+			Payload struct {
+				SentAt int64 `json:"sent_at"`
+			} `json:"payload"`
+		}
+		if err := json.Unmarshal(payload, &frame); err != nil {
+			return nil, err
+		}
+		observedSentAt <- frame.Payload.SentAt
+		return map[string]int{"accepted": 1}, nil
+	})
+	conn := fixture.dial(t, "")
+	_ = readServerMessage(t, conn)
+
+	if err := conn.WriteJSON(map[string]interface{}{
+		"type": "path_telemetry",
+		"payload": map[string]interface{}{
+			"sent_at":      1234,
+			"observations": []interface{}{},
+		},
+	}); err != nil {
+		t.Fatalf("write telemetry: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read telemetry ack: %v", err)
+	}
+	var ack struct {
+		Type            string `json:"type"`
+		ProtocolVersion int    `json:"protocol_version"`
+		SentAt          int64  `json:"sent_at"`
+		Accepted        int    `json:"accepted"`
+	}
+	if err := json.Unmarshal(payload, &ack); err != nil {
+		t.Fatalf("decode telemetry ack: %v", err)
+	}
+	if ack.Type != "path_telemetry_ack" || ack.ProtocolVersion != ProtocolVersion || ack.SentAt != 1234 || ack.Accepted != 1 {
+		t.Fatalf("unexpected telemetry ack: %+v", ack)
+	}
+	if sentAt := <-observedSentAt; sentAt != 1234 {
+		t.Fatalf("unexpected telemetry sent_at: %d", sentAt)
+	}
+
+	if !fixture.hub.Notify(fixture.deviceID) {
+		t.Fatal("telemetry ack must not disconnect the signal channel")
+	}
+	wakeup := readServerMessage(t, conn)
+	if wakeup.Type != "signals_available" || wakeup.Sequence != 1 {
+		t.Fatalf("unexpected signal wakeup after telemetry ack: %+v", wakeup)
+	}
+}
+
 func TestWebSocketRejectsMissingDeviceCredentialAndSubprotocol(t *testing.T) {
 	fixture := newWebSocketFixture(t)
 	url := "ws" + strings.TrimPrefix(fixture.server.URL, "http")
