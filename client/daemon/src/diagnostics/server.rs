@@ -141,7 +141,8 @@ async fn serve_diagnostics(
 
 async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -> Result<()> {
     let handler_started = std::time::Instant::now();
-    let request_id = DIAGNOSTICS_REQUEST_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let request_id =
+        DIAGNOSTICS_REQUEST_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request = match read_diagnostics_head(&mut stream).await {
         Ok(request) => request,
         Err((status, message)) => {
@@ -253,7 +254,8 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
                     let serialization_started = std::time::Instant::now();
                     let body =
                         serde_json::to_string_pretty(&StatusResponse::from_snapshot(snapshot))?;
-                    let serialization_ms = serialization_started.elapsed().as_micros() as u64 / 1_000;
+                    let serialization_ms =
+                        serialization_started.elapsed().as_micros() as u64 / 1_000;
                     let write_started = std::time::Instant::now();
                     write_response_with_headers(
                         &mut stream,
