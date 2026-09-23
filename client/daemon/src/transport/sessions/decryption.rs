@@ -28,7 +28,7 @@ impl WireGuardTransport {
         // WireGuard's replay protection then rejects the second copy.  These
         // duplicates are counted and logged rate-limited instead of emitting a
         // warning storm, and they never touch path state.
-        let mut replay_attributed_peers: Vec<String> = Vec::new();
+        let mut replay_attributed_sessions: Vec<(String, u64)> = Vec::new();
 
         // Prefer the active session if an extremely unlikely receiver-index
         // collision occurs. Successfully receiving the new key confirms the
@@ -53,9 +53,11 @@ impl WireGuardTransport {
                     break;
                 }
                 Err(error) => {
-                    if is_replay_decrypt_error(&error) && !replay_attributed_peers.contains(peer_id)
+                    if is_replay_decrypt_error(&error)
+                        && !replay_attributed_sessions
+                            .contains(&(peer_id.clone(), active.session_instance))
                     {
-                        replay_attributed_peers.push(peer_id.clone());
+                        replay_attributed_sessions.push((peer_id.clone(), active.session_instance));
                     }
                     first_decrypt_error.get_or_insert(error);
                 }
@@ -96,9 +98,11 @@ impl WireGuardTransport {
                     }
                     Err(error) => {
                         if is_replay_decrypt_error(&error)
-                            && !replay_attributed_peers.contains(peer_id)
+                            && !replay_attributed_sessions
+                                .contains(&(peer_id.clone(), pending.slot.session_instance))
                         {
-                            replay_attributed_peers.push(peer_id.clone());
+                            replay_attributed_sessions
+                                .push((peer_id.clone(), pending.slot.session_instance));
                         }
                         first_decrypt_error.get_or_insert(error);
                     }
@@ -183,9 +187,12 @@ impl WireGuardTransport {
                     }));
                 }
                 Err(error) => {
-                    if is_replay_decrypt_error(&error) && !replay_attributed_peers.contains(peer_id)
+                    if is_replay_decrypt_error(&error)
+                        && !replay_attributed_sessions
+                            .contains(&(peer_id.clone(), previous.slot.session_instance))
                     {
-                        replay_attributed_peers.push(peer_id.clone());
+                        replay_attributed_sessions
+                            .push((peer_id.clone(), previous.slot.session_instance));
                     }
                     first_decrypt_error.get_or_insert(error);
                 }
@@ -193,9 +200,14 @@ impl WireGuardTransport {
         }
 
         if let Some(error) = first_decrypt_error {
-            let replay_peers = std::mem::take(&mut replay_attributed_peers);
-            if !replay_peers.is_empty() {
-                self.note_hedge_duplicate_replay(&replay_peers, msg.counter);
+            let replay_sessions = std::mem::take(&mut replay_attributed_sessions);
+            if !replay_sessions.is_empty() {
+                self.note_hedge_duplicate_replay(
+                    &replay_sessions,
+                    receiver_index,
+                    msg.counter,
+                    wire_fingerprint(wire_bytes),
+                );
             }
             return Err(InboundDecryptError::Decrypt(error));
         }
@@ -229,12 +241,18 @@ impl WireGuardTransport {
     /// of the WARN log while security-class errors (parse failures, unknown
     /// receiver index, wrong key) still log at WARN through the ordinary
     /// error path.
-    pub(in crate::transport) fn note_hedge_duplicate_replay(&self, peers: &[String], counter: u64) {
+    pub(in crate::transport) fn note_hedge_duplicate_replay(
+        &self,
+        sessions: &[(String, u64)],
+        receiver_index: u32,
+        counter: u64,
+        wire_fp: u64,
+    ) {
         let mut counters = self
             .hedge_replay_counters
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for peer_id in peers {
+        for (peer_id, session_instance) in sessions {
             let replay_counter = counters.entry(peer_id.clone()).or_default();
             replay_counter.count = replay_counter.count.saturating_add(1);
             let loud = replay_counter
@@ -245,7 +263,10 @@ impl WireGuardTransport {
                 warn!(
                     event = "hedge_duplicate_replay",
                     peer_id = %peer_id,
+                    receiver_index,
+                    session_instance,
                     wireguard_counter = counter,
+                    wire_fp = format_args!("{wire_fp:016x}"),
                     total = replay_counter.count,
                     "WireGuard replay protection dropped a duplicate copy of an already-decrypted ciphertext; no path state changes"
                 );
@@ -253,7 +274,10 @@ impl WireGuardTransport {
                 debug!(
                     event = "hedge_duplicate_replay",
                     peer_id = %peer_id,
+                    receiver_index,
+                    session_instance,
                     wireguard_counter = counter,
+                    wire_fp = format_args!("{wire_fp:016x}"),
                     total = replay_counter.count,
                     "duplicate ciphertext copy dropped; no path state changes"
                 );

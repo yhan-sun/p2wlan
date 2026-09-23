@@ -294,8 +294,14 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
                     self.assertEqual(configured[key], {**defaults, **overrides}.get(key, defaults[key]))
                 for key, value in overrides.items():
                     self.assertEqual(configured[key], value)
-        self.assertIn("simulator UDP", MATRIX_RUNNER.SCENARIO_BY_NAME["loss-only"].description)
-        self.assertIn("not Control signaling", MATRIX_RUNNER.SCENARIO_BY_NAME["loss-only"].description)
+        self.assertIn(
+            "admitted by simulated public mappings",
+            MATRIX_RUNNER.SCENARIO_BY_NAME["loss-only"].description,
+        )
+        self.assertIn(
+            "STUN observer replies, Control, and TCP Relay are outside this hook",
+            MATRIX_RUNNER.SCENARIO_BY_NAME["reorder-only"].description,
+        )
         self.assertIn("before its existing signaling API", MATRIX_RUNNER.SCENARIO_BY_NAME["offer-dispatch-delay"].description)
 
     def test_a0_stage_parser_keeps_only_redacted_allowlisted_fields(self):
@@ -318,6 +324,13 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
                 'identity_scope="local_pre_session" session_tag="none" plan_tag="none" '
                 'stage="peer_signal_admission" reason_code="malformed_envelope"\n'
             )
+            log.write(
+                'INFO event="hard_hard_attempt_stage" role="responder" '
+                'identity_scope="shared_session" session_tag="0123456789abcdef" '
+                'plan_tag="fedcba9876543210" stage="peer_signal_admission" '
+                'reason_code="profile_missing" candidate_epoch=8 '
+                'declared_profile_generation=7 profile_generation=none\n'
+            )
         (round_dir / "server.log").write_text(
             '2026/09/23 event=hard_hard_attempt_stage role=initiator '
             'identity_scope=shared_session session_tag=0123456789abcdef '
@@ -326,14 +339,18 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
             encoding="utf-8",
         )
         evidence = MATRIX_RUNNER.extract_a0_stage_evidence(round_dir)
-        self.assertEqual(evidence["schema_version"], 2)
-        self.assertEqual(evidence["record_count"], 4)
+        self.assertEqual(evidence["schema_version"], 3)
+        self.assertEqual(evidence["record_count"], 5)
         self.assertEqual(evidence["missing_sources"], [])
         self.assertEqual(evidence["sides"]["a"]["records"][0]["stage"], "local_measurement")
         self.assertEqual(evidence["sides"]["server"]["records"][0]["stage"], "signal_persisted")
         self.assertEqual(
             evidence["sides"]["a"]["records"][1]["reason_code"], "malformed_envelope"
         )
+        self.assertEqual(
+            evidence["sides"]["a"]["records"][2]["reason_code"], "profile_missing"
+        )
+        self.assertNotIn("candidate_epoch", json.dumps(evidence))
         self.assertNotIn(secret_marker, json.dumps(evidence))
         self.assertNotIn("198.51.100.7", json.dumps(evidence))
         self.assertNotIn("do-not-copy", json.dumps(evidence))
@@ -343,7 +360,7 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         result = subprocess.run(self.command(output), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], 3)
+        self.assertEqual(manifest["schema_version"], 4)
         self.assertEqual(manifest["result"], "pass")
         self.assertEqual(manifest["source_head_sha"], SOURCE_SHA)
         self.assertEqual(manifest["summary"]["valid_rounds"], 1)
@@ -359,11 +376,101 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
             2,
         )
         self.assertEqual(manifest["summary"]["cleanup_duration_ms"]["p95"], 12)
+        duplicate_evidence = manifest["runs"][0]["rounds"][0]["duplicate_fault_evidence"]
+        self.assertEqual(duplicate_evidence["end_to_end_result"]["round_result"], "valid")
+        self.assertEqual(duplicate_evidence["legacy_round_verdict"], "valid")
+        self.assertTrue(manifest["summary"]["duplicate_fault_evidence"]["existing_end_to_end_verdicts_preserved"])
         attempts = manifest["runs"][0]["rounds"][0]["attempts"]
         self.assertEqual(attempts[0]["timeline"]["validation_to_first_business_ms"], 80)
         self.assertEqual(attempts[0]["timeline"]["business_ready_at_ms"], 3550)
         self.assertEqual(attempts[0]["experiment_outcome_class"], "direct_business_succeeded")
         self.assertTrue((output / "raw/equal-step/round-1/nat-trace.jsonl").is_file())
+
+    def test_probe_duplicate_does_not_count_as_wireguard_replay_evidence(self):
+        scenario = MATRIX_RUNNER.SCENARIO_BY_NAME["duplicate-only"]
+        with tempfile.TemporaryDirectory(prefix="p2wlan-duplicate-evidence-") as raw:
+            round_dir = Path(raw)
+            (round_dir / "nat-trace.jsonl").write_text(
+                json.dumps({"event": "packet_duplicated", "copies": 2}) + "\n",
+                encoding="utf-8",
+            )
+            evidence = MATRIX_RUNNER.extract_duplicate_fault_evidence(
+                round_dir, scenario, SOURCE_SHA, scenario.seed
+            )
+        self.assertTrue(evidence["fault_injection_requested"])
+        self.assertFalse(evidence["simulator_target_protocol_layer_hit"])
+        self.assertFalse(evidence["target_protocol_layer_hit"])
+        self.assertEqual(evidence["nat_sim_duplicate_events"], 1)
+        self.assertEqual(evidence["wireguard_transport_duplicate_events"], 0)
+        self.assertEqual(evidence["transport_replay_chain_complete_identities"], 0)
+        self.assertEqual(evidence["local_stage_evidence_validity"], "injection_missed_wireguard_transport")
+
+    def test_reorder_is_reported_as_transport_delay_without_claiming_packet_order(self):
+        scenario = MATRIX_RUNNER.SCENARIO_BY_NAME["reorder-only"]
+        identity = {
+            "payload_class": "wireguard_transport_v1",
+            "receiver_index": 17,
+            "wireguard_counter": 3,
+            "wire_fp": "0123456789abcdef",
+        }
+        with tempfile.TemporaryDirectory(prefix="p2wlan-reorder-evidence-") as raw:
+            round_dir = Path(raw)
+            trace_rows = [
+                {"event": "packet_delayed", "reorder_delay_injected": True, **identity},
+                {"event": "simulator_delivery", "duplicate_copy": 0, **identity},
+            ]
+            (round_dir / "nat-trace.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in trace_rows), encoding="utf-8"
+            )
+            evidence = MATRIX_RUNNER.extract_duplicate_fault_evidence(
+                round_dir, scenario, SOURCE_SHA, scenario.seed
+            )
+        self.assertTrue(evidence["fault_injection_requested"])
+        self.assertTrue(evidence["simulator_target_protocol_layer_hit"])
+        self.assertFalse(evidence["target_protocol_layer_hit"])
+        self.assertEqual(evidence["local_stage_evidence_validity"], "not_applicable_no_duplicate_requested")
+        self.assertEqual(
+            evidence["reorder_stage_evidence_validity"],
+            "wireguard_transport_delay_injected_no_order_claim",
+        )
+        self.assertEqual(evidence["actual_packet_order_evidence"], "not_recorded_by_nat_sim_trace")
+
+    def test_target_seed_override_is_limited_to_prebounded_single_round(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--dry-run",
+                "--scenario",
+                "loss-reorder-duplicate",
+                "--target-seed",
+                "42072",
+                "--rounds",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["first_seed_by_scenario"], {"loss-reorder-duplicate": 42072})
+        invalid = subprocess.run(
+            [
+                sys.executable,
+                str(RUNNER),
+                "--dry-run",
+                "--scenario",
+                "loss-reorder-duplicate",
+                "--target-seed",
+                "42073",
+                "--rounds",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("pre-bounded A0 diagnostic seeds", invalid.stderr)
 
     def test_business_events_require_exact_attempt_identity_across_shared_generation(self):
         old_identity = {

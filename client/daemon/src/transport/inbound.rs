@@ -1,4 +1,5 @@
 use super::*;
+use crate::transport::wire::wire_receiver_index;
 
 impl WireGuardTransport {
     /// Consume encrypted network packets, decrypt them, and emit raw inbound IP packets.
@@ -125,6 +126,7 @@ impl WireGuardTransport {
             debug!(
                 event = "wireguard_inbound_envelope_received",
                 bytes = packet.wire_bytes.len(),
+                receiver_index = ?wire_receiver_index(&packet.wire_bytes),
                 counter = ?wire_counter(&packet.wire_bytes),
                 wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
                 source = ?source,
@@ -168,6 +170,7 @@ impl WireGuardTransport {
                     debug!(
                         event = "wireguard_inbound_decrypt_succeeded",
                         peer_id = %inbound.peer_id,
+                        receiver_index = ?wire_receiver_index(&packet.wire_bytes),
                         counter = ?wire_counter(&packet.wire_bytes),
                         wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
                         session_instance = ?inbound.session_instance,

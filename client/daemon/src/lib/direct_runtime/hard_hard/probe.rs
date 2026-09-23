@@ -230,9 +230,24 @@ enum HardHardA0Reason {
     Completed,
     MeasurementRejected,
     GenerationOrProfileFence,
+    PeerMissing,
+    ProfileMissing,
+    ProfileExpired,
+    ProfileGenerationMissing,
+    ProfileGenerationMismatch,
     InvalidRole,
     InvalidPrediction,
     MissingFreshPrediction,
+    FreshLabelMissing,
+    FreshLabelMalformed,
+    FreshLabelsConflicting,
+    FreshSenderIdentityStale,
+    FreshPredictionStale,
+    FreshPayloadMismatch,
+    FreshCandidateSetRejected,
+    FreshPredictionSuperseded,
+    FreshSnapshotUnavailable,
+    FreshAdmissionContended,
     MissingPunchDeadline,
     OfferWindowTooLate,
     OfferWindowExpired,
@@ -274,9 +289,24 @@ impl HardHardA0Reason {
             Self::Completed => "completed",
             Self::MeasurementRejected => "measurement_rejected",
             Self::GenerationOrProfileFence => "generation_or_profile_fence",
+            Self::PeerMissing => "peer_missing",
+            Self::ProfileMissing => "profile_missing",
+            Self::ProfileExpired => "profile_expired",
+            Self::ProfileGenerationMissing => "profile_generation_missing",
+            Self::ProfileGenerationMismatch => "profile_generation_mismatch",
             Self::InvalidRole => "invalid_role",
             Self::InvalidPrediction => "invalid_prediction",
             Self::MissingFreshPrediction => "missing_fresh_prediction",
+            Self::FreshLabelMissing => "fresh_label_missing",
+            Self::FreshLabelMalformed => "fresh_label_malformed",
+            Self::FreshLabelsConflicting => "fresh_labels_conflicting",
+            Self::FreshSenderIdentityStale => "fresh_sender_identity_stale",
+            Self::FreshPredictionStale => "fresh_prediction_stale",
+            Self::FreshPayloadMismatch => "fresh_payload_mismatch",
+            Self::FreshCandidateSetRejected => "fresh_candidate_set_rejected",
+            Self::FreshPredictionSuperseded => "fresh_prediction_superseded",
+            Self::FreshSnapshotUnavailable => "fresh_snapshot_unavailable",
+            Self::FreshAdmissionContended => "fresh_admission_contended",
             Self::MissingPunchDeadline => "missing_punch_deadline",
             Self::OfferWindowTooLate => "offer_window_too_late",
             Self::OfferWindowExpired => "offer_window_expired",
@@ -334,6 +364,36 @@ fn hard_hard_a0_stage_log(
         stage = stage.label(),
         reason_code = reason.label(),
         "Hard-Hard A0 control stage"
+    );
+}
+
+fn hard_hard_a0_profile_binding_rejection_log(
+    peers: &PeerManager,
+    role: &'static str,
+    session_token: &str,
+    reason: HardHardA0Reason,
+    snapshot: crate::peer::RemoteNatProfileBindSnapshot,
+) {
+    if !peers.hard_hard_experiment_only() {
+        return;
+    }
+    let (session_tag, plan_tag, identity_scope) = hard_hard_a0_stage_tags(Some(session_token));
+    tracing::info!(
+        event = "hard_hard_attempt_stage",
+        role,
+        identity_scope,
+        session_tag = %session_tag,
+        plan_tag = %plan_tag,
+        stage = HardHardA0Stage::PeerSignalAdmission.label(),
+        reason_code = reason.label(),
+        peer_present = snapshot.candidate_epoch.is_some(),
+        candidate_epoch = ?snapshot.candidate_epoch,
+        profile_present = snapshot.profile_present,
+        profile_generation = ?snapshot.profile_generation,
+        profile_fresh = snapshot.profile_fresh,
+        profile_candidate_epoch = ?snapshot.profile_candidate_epoch,
+        declared_profile_generation = snapshot.declared_generation,
+        "Hard-Hard A0 profile-binding snapshot"
     );
 }
 
