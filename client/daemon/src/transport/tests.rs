@@ -1,9 +1,17 @@
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::io::{BufRead, BufReader};
     use std::net::Ipv4Addr;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use p2pnet_crypto::NodeIdentity;
     use p2pnet_tun::Ipv4Packet;
@@ -4645,6 +4653,240 @@ mod tests {
             .expect("a fresh packet must still decrypt after hedge duplicates")
             .expect("fresh packet decrypts");
         assert_eq!(next.peer_id, "peer-b");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nat_sim_duplicate_of_current_ciphertext_is_replayed_and_delivered_once() {
+        struct BridgeGuard(Child);
+        impl Drop for BridgeGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let artifact_dir = std::env::temp_dir().join(format!(
+            "p2wlan-wg-duplicate-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&artifact_dir).expect("create private evidence directory");
+        std::fs::set_permissions(&artifact_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict evidence directory permissions");
+        let trace_path = artifact_dir.join("nat-trace.jsonl");
+        let report_path = artifact_dir.join("evidence.json");
+
+        let receiver = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind receiving daemon socket");
+        let sender = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind sending daemon socket");
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/nat-sim/wg-duplicate-bridge.py");
+        let python = std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into());
+        let mut bridge = BridgeGuard(
+            Command::new(python)
+                .arg(script)
+                .arg("--receiver-host")
+                .arg(receiver_addr.ip().to_string())
+                .arg("--receiver-port")
+                .arg(receiver_addr.port().to_string())
+                .arg("--sender-host")
+                .arg(sender_addr.ip().to_string())
+                .arg("--sender-port")
+                .arg(sender_addr.port().to_string())
+                .arg("--trace-file")
+                .arg(&trace_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start the repository NAT simulator bridge"),
+        );
+        let stdout = bridge.0.stdout.take().expect("bridge stdout");
+        let ready_line = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || {
+                let mut line = String::new();
+                BufReader::new(stdout).read_line(&mut line)?;
+                Ok::<_, std::io::Error>(line)
+            }),
+        )
+        .await
+        .expect("NAT simulator must publish a mapping within ten seconds")
+        .expect("read NAT simulator readiness")
+        .expect("NAT simulator readiness output");
+        assert!(
+            !ready_line.trim().is_empty(),
+            "NAT simulator exited before readiness"
+        );
+        let ready: serde_json::Value =
+            serde_json::from_str(&ready_line).expect("parse NAT mapping endpoint");
+        let public_addr: std::net::SocketAddr = format!(
+            "{}:{}",
+            ready["public_ip"].as_str().unwrap(),
+            ready["public_port"].as_u64().unwrap()
+        )
+        .parse()
+        .unwrap();
+
+        let (mut remote_session, local_session) = establish_sessions();
+        let (transport, _raw_outbound_rx) = WireGuardTransport::new();
+        transport.add_session("peer-b", local_session).await;
+        let packet = Ipv4Packet::build_icmp_echo_request(
+            Ipv4Addr::new(10, 20, 0, 1),
+            Ipv4Addr::new(10, 20, 0, 2),
+            0x45A1,
+            1,
+            b"simulated-duplicate-current-session",
+        );
+        let wire = remote_session.encrypt_to_bytes(&packet).unwrap();
+        let message = MessageTransport::from_bytes(&wire).expect("valid transport ciphertext");
+        let receiver_index = message.receiver_index;
+        let counter = message.counter;
+        let wire_fp = wire_fingerprint(&wire);
+
+        sender
+            .send_to(&wire, public_addr)
+            .await
+            .expect("send valid current-session ciphertext into nat_sim");
+        let mut first_buf = vec![0; 2048];
+        let mut second_buf = vec![0; 2048];
+        let (first_len, first_source) = tokio::time::timeout(
+            Duration::from_secs(3),
+            receiver.recv_from(&mut first_buf),
+        )
+        .await
+        .expect("first simulated copy reaches the receiving socket")
+        .expect("receive first simulated copy");
+        let (second_len, second_source) = tokio::time::timeout(
+            Duration::from_secs(3),
+            receiver.recv_from(&mut second_buf),
+        )
+        .await
+        .expect("duplicate simulated copy reaches the receiving socket")
+        .expect("receive duplicate simulated copy");
+        assert_eq!(&first_buf[..first_len], wire);
+        assert_eq!(&second_buf[..second_len], wire);
+        assert_eq!(first_source, second_source);
+
+        let trace_text = std::fs::read_to_string(&trace_path).expect("read private NAT trace");
+        let trace_records: Vec<serde_json::Value> = trace_text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid NAT trace row"))
+            .collect();
+        let wire_fp_text = format!("{wire_fp:016x}");
+        let duplicate_events: Vec<_> = trace_records
+            .iter()
+            .filter(|row| row["event"] == "packet_duplicated")
+            .collect();
+        assert_eq!(duplicate_events.len(), 1);
+        assert_eq!(duplicate_events[0]["payload_class"], "wireguard_transport_v1");
+        assert_eq!(duplicate_events[0]["wire_fp"], wire_fp_text);
+        assert_eq!(duplicate_events[0]["wireguard_counter"], counter);
+        let delivery_events: Vec<_> = trace_records
+            .iter()
+            .filter(|row| row["event"] == "simulator_delivery")
+            .collect();
+        assert_eq!(delivery_events.len(), 2);
+        assert!(delivery_events.iter().all(|row| {
+            row["wire_fp"] == wire_fp_text && row["wireguard_counter"] == counter
+        }));
+        assert_eq!(delivery_events[0]["duplicate_copy"], 0);
+        assert_eq!(delivery_events[1]["duplicate_copy"], 1);
+
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(4);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let worker = tokio::spawn({
+            let transport = transport.clone();
+            async move { transport.run_inbound(encrypted_rx, inbound_tx).await }
+        });
+        for bytes in [&first_buf[..first_len], &second_buf[..second_len]] {
+            encrypted_tx
+                .send(ReceivedEncryptedPacket {
+                    source: Some(first_source),
+                    local_endpoint: Some(receiver_addr),
+                    relay_endpoint: None,
+                    relay_connection_id: None,
+                    relay_peer_id: None,
+                    socket_index: Some(0),
+                    direct_socket: None,
+                    udp_transport_owner: None,
+                    network_generation: Some(0),
+                    profile_sampled: false,
+                    udp_received: Some(Instant::now()),
+                    transport_queue_send_started: Some(Instant::now()),
+                    wire_bytes: bytes.to_vec(),
+                })
+                .await
+                .expect("queue each simulator-delivered copy at the decrypt boundary");
+        }
+        drop(encrypted_tx);
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .expect("inbound decrypt worker completes")
+            .expect("inbound decrypt worker joins")
+            .expect("inbound decrypt worker succeeds");
+        let delivered = inbound_rx
+            .try_recv()
+            .expect("the first authenticated business packet is delivered");
+        assert_eq!(delivered.peer_id, "peer-b");
+        assert_eq!(delivered.packet, packet);
+        assert!(!delivered.from_previous_session);
+        let session_instance = delivered.session_instance.expect("current session instance");
+        assert_eq!(
+            transport
+                .session_instance_state("peer-b", session_instance)
+                .await,
+            (true, true),
+            "the successful ciphertext authenticated under the current active session"
+        );
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "duplicate is not delivered to the app"
+        );
+        assert_eq!(transport.hedge_replay_count("peer-b"), 1);
+
+        bridge.0.kill().expect("stop the NAT simulator bridge");
+        let _ = bridge.0.wait();
+        for path in [&trace_path, &report_path] {
+            if path.exists() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .expect("restrict private evidence file permissions");
+            }
+        }
+        let evidence = serde_json::json!({
+            "schema_version": 1,
+            "fault_injection": {
+                "requested": true,
+                "nat_sim_duplicate_events": duplicate_events.len(),
+                "delivered_udp_copies": 2,
+                "target_protocol_layer": "wireguard_transport_v1",
+                "wire_fp": wire_fp_text,
+                "receiver_index": receiver_index,
+                "counter": counter,
+            },
+            "decrypt": {
+                "current_session_instance": session_instance,
+                "boundary_arrivals": 2,
+                "authenticated_deliveries": 1,
+                "replay_rejections": transport.hedge_replay_count("peer-b"),
+                "application_deliveries": 1,
+            },
+            "evidence_validity": "complete",
+            "end_to_end_result": "first_delivery_authenticated_duplicate_rejected",
+        });
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&evidence).unwrap())
+            .expect("write private duplicate replay evidence");
+        std::fs::set_permissions(&report_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict private report permissions");
+        eprintln!("NAT duplicate replay evidence: {}", artifact_dir.display());
     }
 
     #[test]

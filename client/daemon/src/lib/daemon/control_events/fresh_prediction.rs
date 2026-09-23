@@ -13,21 +13,35 @@
 /// different valid identities the signal is inconsistent and is rejected
 /// deterministically instead of letting HashMap iteration pick an arbitrary
 /// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshPredictionSources {
+    None,
+    Valid(crate::FreshPredictionId),
+    Malformed,
+    Conflicting,
+}
+
 fn fresh_prediction_from_sources(
     candidate_sources: &HashMap<String, String>,
-) -> std::result::Result<Option<crate::FreshPredictionId>, ()> {
+) -> FreshPredictionSources {
     let mut found = None;
     for source in candidate_sources.values() {
-        let Some(id) = crate::parse_fresh_prediction_source_label(source) else {
+        if !source.starts_with(crate::FRESH_PREDICTION_SOURCE_LABEL_PREFIX) {
             continue;
+        }
+        let Some(id) = crate::parse_fresh_prediction_source_label(source) else {
+            return FreshPredictionSources::Malformed;
         };
         match found {
             None => found = Some(id),
             Some(previous) if previous == id => {}
-            Some(_) => return Err(()),
+            Some(_) => return FreshPredictionSources::Conflicting,
         }
     }
-    Ok(found)
+    match found {
+        Some(id) => FreshPredictionSources::Valid(id),
+        None => FreshPredictionSources::None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +66,11 @@ enum FreshPunchDecision {
     /// handshake-carrying signal may degrade to an ORDINARY priority punch
     /// over the shared candidates; a candidate-only signal is ignored.
     Degraded,
+    /// A fresh label was present but its authenticated identity or candidate
+    /// transaction was rejected. Ordinary non-Hard↔Hard callers retain their
+    /// prior handshake fallback; the Hard↔Hard admission path records the
+    /// precise rejection and remains fail-closed.
+    Rejected(FreshPunchRejection),
 }
 
 impl Daemon {
@@ -143,7 +162,7 @@ impl Daemon {
         FreshPunchDecision,
     ) {
         let fresh_verdict = match fresh_prediction_from_sources(candidate_sources) {
-            Err(()) => {
+            FreshPredictionSources::Conflicting => {
                 self.peers
                     .record_direct_event(
                         from_node_id,
@@ -156,8 +175,21 @@ impl Daemon {
                     .await;
                 FreshSignalVerdict::Inconsistent
             }
-            Ok(None) => FreshSignalVerdict::None,
-            Ok(Some(id)) => {
+            FreshPredictionSources::Malformed => {
+                self.peers
+                    .record_direct_event(
+                        from_node_id,
+                        "fresh_prediction_label_malformed",
+                        None,
+                        Some(candidates.len()),
+                        None,
+                        "candidate source claimed the fresh-prediction label namespace but did not parse; fresh admission rejected",
+                    )
+                    .await;
+                FreshSignalVerdict::Malformed
+            }
+            FreshPredictionSources::None => FreshSignalVerdict::None,
+            FreshPredictionSources::Valid(id) => {
                 let signal_identity_matches =
                     self.signal_sender_identity_matches_peer(from_node_id, sender_public_key);
                 if !signal_identity_matches {
@@ -178,7 +210,7 @@ impl Daemon {
                             ),
                         )
                         .await;
-                    FreshSignalVerdict::Stale
+                    FreshSignalVerdict::StaleIdentity
                 } else {
                     match self
                         .peers
@@ -257,6 +289,10 @@ impl Daemon {
                     .await,
                 FreshPunchDecision::None,
             ),
+            FreshSignalVerdict::Malformed => (
+                CandidateSetApplyResult::IgnoredStale,
+                FreshPunchDecision::Rejected(FreshPunchRejection::MalformedLabel),
+            ),
             FreshSignalVerdict::Accepted(id) => {
                 let transaction = if retry_contention_in_candidate_lane {
                     match self
@@ -330,7 +366,12 @@ impl Daemon {
                             ),
                         )
                         .await;
-                        (apply_result, FreshPunchDecision::None)
+                        (
+                            apply_result,
+                            FreshPunchDecision::Rejected(
+                                FreshPunchRejection::CandidateSetNotApplied(apply_result),
+                            ),
+                        )
                     }
                     FreshCandidateTransactionResult::Committed => {
                         // The identity is committed with an immutable snapshot:
@@ -377,14 +418,14 @@ impl Daemon {
                         .await;
                         (
                             CandidateSetApplyResult::IgnoredStale,
-                            FreshPunchDecision::None,
+                            FreshPunchDecision::Rejected(FreshPunchRejection::Superseded),
                         )
                     }
                     FreshCandidateTransactionResult::Contended => {
                         return (
                             FreshSignalVerdict::Contended,
                             CandidateSetApplyResult::IgnoredStale,
-                            FreshPunchDecision::None,
+                            FreshPunchDecision::Rejected(FreshPunchRejection::Contended),
                         );
                     }
                 }
@@ -421,20 +462,28 @@ impl Daemon {
                 );
                 (
                     CandidateSetApplyResult::IgnoredStale,
-                    FreshPunchDecision::None,
+                    FreshPunchDecision::Rejected(FreshPunchRejection::PayloadMismatch),
                 )
             }
-            FreshSignalVerdict::Stale | FreshSignalVerdict::Inconsistent => {
+            FreshSignalVerdict::StaleIdentity => (
+                CandidateSetApplyResult::IgnoredStale,
+                FreshPunchDecision::Rejected(FreshPunchRejection::StaleSenderIdentity),
+            ),
+            FreshSignalVerdict::Stale => (
+                CandidateSetApplyResult::IgnoredStale,
+                FreshPunchDecision::Rejected(FreshPunchRejection::StalePrediction),
+            ),
+            FreshSignalVerdict::Inconsistent => {
                 // The current candidate set stays authoritative; only the
                 // handshake below may proceed.
                 (
                     CandidateSetApplyResult::IgnoredStale,
-                    FreshPunchDecision::None,
+                    FreshPunchDecision::Rejected(FreshPunchRejection::ConflictingLabels),
                 )
             }
             FreshSignalVerdict::Contended => (
                 CandidateSetApplyResult::IgnoredStale,
-                FreshPunchDecision::None,
+                FreshPunchDecision::Rejected(FreshPunchRejection::Contended),
             ),
         };
         (fresh_verdict, candidate_apply_result, fresh_punch)

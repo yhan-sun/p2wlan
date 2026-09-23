@@ -668,7 +668,7 @@ impl Daemon {
             {
                 if matches!(
                     fresh_prediction_from_sources(&offer.candidate_sources),
-                    Ok(None)
+                    FreshPredictionSources::None
                 ) {
                     // Ordinary candidate revisions are the common cold-start
                     // path. Never hold the epoch while queueing a connection

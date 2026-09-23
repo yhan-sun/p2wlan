@@ -22,6 +22,47 @@ struct PendingProbeSessionBinding {
     promote_on_match: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNatProfileBindFailure {
+    PeerMissing,
+    ProfileMissing,
+    ProfileExpired,
+    ProfileGenerationMissing,
+    ProfileGenerationMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteNatProfileBindSnapshot {
+    pub(crate) candidate_epoch: Option<u64>,
+    pub(crate) profile_candidate_epoch: Option<u64>,
+    pub(crate) profile_present: bool,
+    pub(crate) profile_generation: Option<u64>,
+    pub(crate) profile_fresh: bool,
+    pub(crate) declared_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNatProfileBindResult {
+    Bound(RemoteNatProfileBindSnapshot),
+    Rejected {
+        reason: RemoteNatProfileBindFailure,
+        snapshot: RemoteNatProfileBindSnapshot,
+    },
+}
+
+impl RemoteNatProfileBindSnapshot {
+    pub(crate) fn missing_peer(declared_generation: u64) -> Self {
+        Self {
+            candidate_epoch: None,
+            profile_candidate_epoch: None,
+            profile_present: false,
+            profile_generation: None,
+            profile_fresh: false,
+            declared_generation,
+        }
+    }
+}
+
 /// The relay-first business gate state for one peer connection.
 ///
 /// This is the set of fields that describe relay-first startup/fallback
@@ -335,17 +376,48 @@ impl PeerConnection {
         &mut self,
         profile_generation: u64,
     ) -> bool {
-        if !self.remote_nat_profile_is_fresh()
-            || self
-                .remote_nat_profile
-                .as_ref()
-                .and_then(|profile| profile.generation)
-                != Some(profile_generation)
-        {
-            return false;
+        matches!(
+            self.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(profile_generation),
+            RemoteNatProfileBindResult::Bound(_)
+        )
+    }
+
+    pub(crate) fn bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
+        &mut self,
+        profile_generation: u64,
+    ) -> RemoteNatProfileBindResult {
+        let profile_present = self.remote_nat_profile.is_some();
+        let profile_generation_seen = self
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.generation);
+        let profile_fresh = self.remote_nat_profile_is_fresh();
+        let snapshot = RemoteNatProfileBindSnapshot {
+            candidate_epoch: Some(self.remote_candidate_epoch),
+            profile_candidate_epoch: self.remote_nat_profile_candidate_epoch,
+            profile_present,
+            profile_generation: profile_generation_seen,
+            profile_fresh,
+            declared_generation: profile_generation,
+        };
+
+        let rejection = if !profile_present {
+            Some(RemoteNatProfileBindFailure::ProfileMissing)
+        } else if profile_generation_seen.is_none() {
+            Some(RemoteNatProfileBindFailure::ProfileGenerationMissing)
+        } else if !profile_fresh {
+            Some(RemoteNatProfileBindFailure::ProfileExpired)
+        } else if profile_generation_seen != Some(profile_generation) {
+            Some(RemoteNatProfileBindFailure::ProfileGenerationMismatch)
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            return RemoteNatProfileBindResult::Rejected { reason, snapshot };
         }
+
         self.remote_nat_profile_candidate_epoch = Some(self.remote_candidate_epoch);
-        true
+        RemoteNatProfileBindResult::Bound(snapshot)
     }
 
     pub(crate) fn set_local_interface_networks(&mut self, networks: Vec<LocalNetwork>) {

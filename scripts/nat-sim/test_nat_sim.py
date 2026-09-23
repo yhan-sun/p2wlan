@@ -1627,7 +1627,18 @@ class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(delivered, b"released")
 
     async def test_delay_and_duplicate_injection_preserve_public_source_identity(self):
-        fabric = NAT_SIM.NatFabric()
+        with tempfile.TemporaryDirectory(prefix="p2wlan-nat-duplicate-") as evidence_dir:
+            trace_path = Path(evidence_dir) / "nat-trace.jsonl"
+            trace = NAT_SIM.NatTrace(str(trace_path))
+            fabric = NAT_SIM.NatFabric(trace)
+            try:
+                await self._assert_duplicate_wireguard_delivery(fabric, trace_path)
+            finally:
+                trace.close()
+                if trace_path.exists():
+                    trace_path.chmod(0o600)
+
+    async def _assert_duplicate_wireguard_delivery(self, fabric, trace_path):
         nat_a = await self.new_nat("A", fabric)
         nat_b = await self.new_nat(
             "B", fabric, delivery_delay_ms=20, duplicate_rate=1.0
@@ -1639,13 +1650,33 @@ class NatIntegrationTests(unittest.IsolatedAsyncioTestCase):
         mapping_b = nat_b.mapping_for(client_b_addr, ("127.0.0.1", 9))
         await nat_b.ensure_bound(mapping_b)
 
-        client_a.sendto(b"delayed-duplicate", (nat_b.public_ip, mapping_b.port))
+        wire = (
+            b"\x04\x00\x00\x00"
+            + struct.pack("<I", 0x12345678)
+            + struct.pack("<Q", 27)
+            + bytes(range(32))
+        )
+        client_a.sendto(wire, (nat_b.public_ip, mapping_b.port))
         first = await asyncio.wait_for(received_b.received.get(), timeout=1)
         second = await asyncio.wait_for(received_b.received.get(), timeout=1)
-        self.assertEqual(first[0], b"delayed-duplicate")
-        self.assertEqual(second[0], b"delayed-duplicate")
+        self.assertEqual(first[0], wire)
+        self.assertEqual(second[0], wire)
         self.assertEqual(first[1], second[1])
         self.assertNotEqual(first[1], client_a_addr)
+        records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+        duplicate_events = [row for row in records if row["event"] == "packet_duplicated"]
+        delivery_events = [row for row in records if row["event"] == "simulator_delivery"]
+        expected = NAT_SIM.wireguard_transport_trace_fields(wire)
+        self.assertEqual(len(duplicate_events), 1)
+        self.assertEqual(duplicate_events[0]["payload_class"], "wireguard_transport_v1")
+        self.assertEqual(duplicate_events[0]["wire_fp"], expected["wire_fp"])
+        self.assertEqual(duplicate_events[0]["receiver_index"], 0x12345678)
+        self.assertEqual(duplicate_events[0]["wireguard_counter"], 27)
+        self.assertEqual(
+            [(row["duplicate_copy"], row["wire_fp"], row["wireguard_counter"])
+             for row in delivery_events],
+            [(0, expected["wire_fp"], 27), (1, expected["wire_fp"], 27)],
+        )
 
     async def test_stun_response_delay_is_bounded_and_does_not_change_mapping(self):
         nat = await self.new_nat("A", stun_delay_ms=20)

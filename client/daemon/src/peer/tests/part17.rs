@@ -117,6 +117,115 @@ fn remote_profile_is_invalidated_by_candidate_epoch_and_rebound_only_by_hh1_cont
     assert!(connection.remote_nat_profile_matches_candidate_epoch());
 }
 
+#[test]
+fn remote_nat_profile_binding_returns_typed_reason_and_coherent_snapshot() {
+    let mut connection = PeerConnection::new("peer-profile-binding", "10.20.0.41");
+    let absent = connection.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(7);
+    assert!(matches!(
+        absent,
+        RemoteNatProfileBindResult::Rejected {
+            reason: RemoteNatProfileBindFailure::ProfileMissing,
+            snapshot: RemoteNatProfileBindSnapshot {
+                candidate_epoch: Some(0),
+                profile_present: false,
+                profile_generation: None,
+                profile_fresh: false,
+                declared_generation: 7,
+                ..
+            }
+        }
+    ));
+
+    let versioned =
+        "p2v2:m=address_or_port_dependent;a=linear;d=4;c=90;f=address_dependent;h=unknown;g=7";
+    assert!(connection.update_remote_nat_profile(versioned, None));
+    let mismatch = connection.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(8);
+    assert!(matches!(
+        mismatch,
+        RemoteNatProfileBindResult::Rejected {
+            reason: RemoteNatProfileBindFailure::ProfileGenerationMismatch,
+            snapshot: RemoteNatProfileBindSnapshot {
+                candidate_epoch: Some(0),
+                profile_present: true,
+                profile_generation: Some(7),
+                profile_fresh: true,
+                declared_generation: 8,
+                ..
+            }
+        }
+    ));
+
+    connection
+        .remote_nat_profile
+        .as_mut()
+        .unwrap()
+        .received_at_ms = nat_profile_now_ms().saturating_sub(61_000);
+    assert!(matches!(
+        connection.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(7),
+        RemoteNatProfileBindResult::Rejected {
+            reason: RemoteNatProfileBindFailure::ProfileExpired,
+            snapshot: RemoteNatProfileBindSnapshot {
+                profile_generation: Some(7),
+                profile_fresh: false,
+                ..
+            }
+        }
+    ));
+
+    let mut unversioned = PeerConnection::new("peer-profile-unversioned", "10.20.0.42");
+    assert!(unversioned.update_remote_nat_profile(
+        "p2v2:m=address_or_port_dependent;a=random;d=?;c=50;f=address_dependent;h=unknown",
+        None,
+    ));
+    let unversioned_result =
+        unversioned.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(7);
+    assert!(matches!(
+        unversioned_result,
+        RemoteNatProfileBindResult::Rejected {
+            reason: RemoteNatProfileBindFailure::ProfileGenerationMissing,
+            snapshot: RemoteNatProfileBindSnapshot {
+                profile_present: true,
+                profile_generation: None,
+                profile_fresh: false,
+                declared_generation: 7,
+                ..
+            }
+        }
+    ), "{unversioned_result:?}");
+}
+
+#[test]
+fn current_profile_and_candidate_epoch_bind_in_either_arrival_order() {
+    let profile =
+        "p2v2:m=address_or_port_dependent;a=linear;d=4;c=90;f=address_dependent;h=unknown;g=9";
+    for profile_first in [true, false] {
+        let mut connection = PeerConnection::new("peer-order", "10.20.0.43");
+        if profile_first {
+            assert!(connection.update_remote_nat_profile(profile, None));
+        }
+        connection.mark_remote_transport_handover(
+            1,
+            PeerSessionGeneration::for_test(1),
+            "test candidate epoch advance",
+        );
+        if !profile_first {
+            assert!(connection.update_remote_nat_profile(profile, None));
+        }
+
+        assert!(matches!(
+            connection.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(9),
+            RemoteNatProfileBindResult::Bound(RemoteNatProfileBindSnapshot {
+                candidate_epoch: Some(1),
+                profile_generation: Some(9),
+                profile_fresh: true,
+                declared_generation: 9,
+                ..
+            })
+        ));
+        assert!(connection.remote_nat_profile_matches_candidate_epoch());
+    }
+}
+
 #[tokio::test]
 async fn remote_nat_profile_generation_advance_reopens_recovery_budget_and_zero_send_does_not_burn_network_failures(
 ) {
