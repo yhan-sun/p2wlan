@@ -897,38 +897,17 @@ mod hard_hard_tests {
         let candidates = (0..count)
             .map(|offset| SocketAddr::new(localhost, 41_000 + u16::try_from(offset).unwrap()))
             .collect::<Vec<_>>();
-        let task = tokio::spawn({
-            let udp = udp.clone();
-            let peer_id = identity.peer_id.clone();
-            let token = identity.session_token.clone();
-            let socket_index = identity.socket_index;
-            async move {
-                udp.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
-                    &peer_id,
-                    socket_index,
-                    candidates,
-                    Duration::ZERO,
-                    1,
-                    None,
-                    Some(&token),
-                )
-                .await
-            }
-        });
-        for _ in 0..128 {
-            if task.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-            tokio::time::advance(Duration::from_millis(5)).await;
-        }
-        assert!(
-            task.is_finished(),
-            "test probe seeding must finish before pending-probe leases expire"
-        );
-        task.await
-            .expect("test probe seeding task must not panic")
-            .expect("test probe seeding must produce a report")
+        udp.punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
+            &identity.peer_id,
+            identity.socket_index,
+            candidates,
+            Duration::ZERO,
+            1,
+            None,
+            Some(&identity.session_token),
+        )
+        .await
+        .expect("test probe seeding must produce a report")
     }
 
     async fn wait_for_hard_hard_cleanup_owner(
