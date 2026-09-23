@@ -685,8 +685,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             return;
         }
         let candidate_signal_accepted_at_ms = peers.timeline_uptime_ms();
-        measurement_observation.candidate_signal_accepted_at_ms =
-            candidate_signal_accepted_at_ms;
+        measurement_observation.candidate_signal_accepted_at_ms = candidate_signal_accepted_at_ms;
         measurement_observation.advertised_candidate_count = signaled_candidate_count;
         let _ = peers
             .hard_hard_mark_candidate_signal_accepted(

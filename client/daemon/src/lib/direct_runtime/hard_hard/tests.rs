@@ -5,7 +5,10 @@ mod hard_hard_tests {
     #[test]
     fn hard_hard_signal_delay_requires_the_explicit_experiment_lane() {
         assert_eq!(hard_hard_experiment_signal_delay_ms(false, Some("1200")), 0);
-        assert_eq!(hard_hard_experiment_signal_delay_ms(true, Some("1200")), 1200);
+        assert_eq!(
+            hard_hard_experiment_signal_delay_ms(true, Some("1200")),
+            1200
+        );
         assert_eq!(hard_hard_experiment_signal_delay_ms(true, Some("2001")), 0);
         assert_eq!(hard_hard_experiment_signal_delay_ms(true, Some("bad")), 0);
     }
@@ -1897,7 +1900,10 @@ mod hard_hard_tests {
         assert_eq!(report.counts.stun_send_success_datagrams, 4);
         assert_eq!(report.counts.stun_send_success_bytes, 80);
         assert_eq!(report.counts.candidate_signal_payload_logic_bytes, 48);
-        assert_eq!(report.schema_version, crate::peer::HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION);
+        assert_eq!(
+            report.schema_version,
+            crate::peer::HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION
+        );
         assert_eq!(
             report.plan_tag,
             hard_hard_rendezvous_plan_tag(&identity.session_token)

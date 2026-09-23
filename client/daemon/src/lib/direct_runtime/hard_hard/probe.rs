@@ -289,10 +289,7 @@ fn build_hard_hard_pre_session_attempt_report(
             experiment_only,
             "P2WLAN_EXPERIMENT_VARIANT",
         ),
-        scenario_id: hard_hard_safe_experiment_label(
-            experiment_only,
-            "P2WLAN_EXPERIMENT_SCENARIO",
-        ),
+        scenario_id: hard_hard_safe_experiment_label(experiment_only, "P2WLAN_EXPERIMENT_SCENARIO"),
         seed: experiment_only
             .then(|| std::env::var("P2WLAN_EXPERIMENT_SEED").ok())
             .flatten()
@@ -423,8 +420,10 @@ fn build_hard_hard_attempt_report(
         measurement.last_measurement_send_at_ms,
         actual_first_send_at_ms,
     );
-    let measurement_to_first_send_ms =
-        hard_hard_elapsed_ms(measurement.measurement_started_at_ms, actual_first_send_at_ms);
+    let measurement_to_first_send_ms = hard_hard_elapsed_ms(
+        measurement.measurement_started_at_ms,
+        actual_first_send_at_ms,
+    );
     let schedule_deviation_ms = actual_first_send_at_ms
         .zip(measurement.planned_send_at_ms)
         .map(|(actual, planned)| {
@@ -448,10 +447,7 @@ fn build_hard_hard_attempt_report(
             experiment_only,
             "P2WLAN_EXPERIMENT_VARIANT",
         ),
-        scenario_id: hard_hard_safe_experiment_label(
-            experiment_only,
-            "P2WLAN_EXPERIMENT_SCENARIO",
-        ),
+        scenario_id: hard_hard_safe_experiment_label(experiment_only, "P2WLAN_EXPERIMENT_SCENARIO"),
         seed: experiment_only
             .then(|| std::env::var("P2WLAN_EXPERIMENT_SEED").ok())
             .flatten()
