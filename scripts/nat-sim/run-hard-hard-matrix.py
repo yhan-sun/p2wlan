@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
-ATTEMPT_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+ATTEMPT_SCHEMA_VERSION = 2
 REPOSITORY = "yhan-sun/p2wlan"
 MAX_MATRIX_EXECUTIONS = 32
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
@@ -255,26 +255,51 @@ def first_timeline_event_at(
     status: dict[str, Any],
     event_name: str,
     peer_id: str,
-    generation: int,
     path: str,
-) -> int | None:
+    report: dict[str, Any],
+) -> tuple[int | None, str]:
+    # A peer/generation pair is not an attempt identity. Require the exact
+    # validation commit, transport instance, and socket before attaching MTU
+    # readiness or decrypted business ingress to a measured attempt.
+    identity = report.get("business_attribution_identity")
+    identity_fields = (
+        "validation_session_id",
+        "direct_commit_sequence",
+        "transport_instance_id",
+        "socket_index",
+    )
+    if not isinstance(identity, dict) or any(
+        type(identity.get(name)) is not int or identity[name] < 0
+        for name in identity_fields
+    ):
+        return None, "not_attributable:attempt_identity_missing"
     timeline = status.get("connection_timeline")
     events = timeline.get("events") if isinstance(timeline, dict) else None
     if not isinstance(events, list):
-        return None
+        return None, "not_attributable:timeline_missing"
     matches: list[int] = []
+    identity_seen = False
     for event in events:
+        if not isinstance(event, dict) or event.get("event") != event_name:
+            continue
+        event_identity = event.get("business_attribution_identity")
+        if not isinstance(event_identity, dict):
+            continue
+        identity_seen = True
         if (
-            isinstance(event, dict)
-            and event.get("event") == event_name
-            and event.get("path") == path
+            event.get("path") == path
             and event.get("peer_id") == peer_id
-            and event.get("connection_generation") == generation
+            and event.get("connection_generation") == report.get("network_generation")
+            and all(event_identity.get(name) == identity[name] for name in identity_fields)
             and type(event.get("at_ms")) is int
             and event["at_ms"] >= 0
         ):
             matches.append(event["at_ms"])
-    return min(matches) if matches else None
+    if matches:
+        return min(matches), "attributed:exact_attempt_identity"
+    if identity_seen:
+        return None, "not_attributable:identity_mismatch"
+    return None, "not_attributable:event_identity_missing"
 
 
 def validate_attempt(
@@ -287,6 +312,7 @@ def validate_attempt(
     first: dict[str, Any],
     business_ready_at_ms: int | None,
     direct_business_at_ms: int | None,
+    business_attribution: str,
 ) -> dict[str, Any]:
     if not isinstance(report, dict):
         raise EvidenceError(f"{side}_attempt_not_object")
@@ -298,11 +324,20 @@ def validate_attempt(
         raise EvidenceError(f"{side}_attempt_baseline_sha_mismatch")
     if report.get("scenario_id") != scenario.name or report.get("seed") != expected_seed:
         raise EvidenceError(f"{side}_attempt_scenario_identity_mismatch")
-    for name in ("build_id", "role", "mode", "session_tag", "failure_class", "terminal_reason"):
+    for name in (
+        "build_id",
+        "role",
+        "mode",
+        "session_tag",
+        "plan_tag",
+        "failure_class",
+        "terminal_reason",
+    ):
         if not isinstance(report.get(name), str) or not report[name]:
             raise EvidenceError(f"{side}_attempt_{name}_missing")
-    if not re.fullmatch(r"[0-9a-f]{16}", report["session_tag"]):
-        raise EvidenceError(f"{side}_attempt_session_tag_not_anonymized")
+    for name in ("session_tag", "plan_tag"):
+        if not re.fullmatch(r"[0-9a-f]{16}", report[name]):
+            raise EvidenceError(f"{side}_attempt_{name}_not_anonymized")
     for name in (
         "network_generation",
         "peer_session_generation",
@@ -329,7 +364,7 @@ def validate_attempt(
         "generated",
         "unique",
         "advertised",
-        "received",
+        "parsed_targets_for_plan",
         "planned_targets",
         "planned_sockets",
         "planned_socket_target_combinations",
@@ -343,13 +378,13 @@ def validate_attempt(
         "send_errors",
         "send_error_bytes",
         "budget_skipped",
-        "cancelled_or_not_executed",
+        "planned_logical_probes_not_attempted",
         "stun_send_success_datagrams",
         "stun_send_success_bytes",
         "stun_send_errors",
         "stun_send_error_bytes",
         "stun_responses",
-        "candidate_signal_payload_bytes",
+        "candidate_signal_payload_logic_bytes",
     )
     for name in count_fields:
         required_int(counts.get(name), f"{side}_attempt_counts_{name}")
@@ -360,8 +395,8 @@ def validate_attempt(
         raise EvidenceError(f"{side}_attempt_target_order_length_mismatch")
     if any(not isinstance(tag, str) or re.fullmatch(r"[0-9a-f]{16}", tag) is None for tag in tags):
         raise EvidenceError(f"{side}_attempt_target_tag_invalid")
-    if counts["received"] != counts["planned_targets"]:
-        raise EvidenceError(f"{side}_attempt_received_plan_mismatch")
+    if counts["parsed_targets_for_plan"] != counts["planned_targets"]:
+        raise EvidenceError(f"{side}_attempt_parsed_plan_mismatch")
     if counts["attempted_targets"] > counts["planned_targets"]:
         raise EvidenceError(f"{side}_attempt_distinct_target_overflow")
     if counts["attempted_targets"] > counts["logical_probes_attempted"]:
@@ -372,7 +407,7 @@ def validate_attempt(
         <= counts["planned_logical_probes"]
     ):
         raise EvidenceError(f"{side}_attempt_logical_probe_overflow")
-    if counts["cancelled_or_not_executed"] != (
+    if counts["planned_logical_probes_not_attempted"] != (
         counts["planned_logical_probes"] - counts["logical_probes_attempted"]
     ):
         raise EvidenceError(f"{side}_attempt_cancelled_count_mismatch")
@@ -385,17 +420,19 @@ def validate_attempt(
         "measurement_started_at_ms",
         "last_measurement_send_at_ms",
         "measurement_completed_at_ms",
-        "candidate_exchange_completed_at_ms",
+        "candidate_signal_accepted_at_ms",
         "planned_send_at_ms",
         "send_dispatch_at_ms",
         "actual_first_send_at_ms",
-        "probe_hit_at_ms",
+        "probe_last_hit_at_ms",
         "encrypted_validation_completed_at_ms",
         "business_ready_at_ms",
         "first_business_success_at_ms",
         "measurement_age_at_send_ms",
-        "validation_duration_ms",
-        "time_to_first_business_ms",
+        "measurement_to_first_send_ms",
+        "last_probe_hit_to_validation_ms",
+        "connection_to_first_business_ms",
+        "validation_to_first_business_ms",
     )
     for name in timeline_fields:
         optional_int(timeline.get(name), f"{side}_attempt_timeline_{name}")
@@ -408,18 +445,26 @@ def validate_attempt(
     last_measurement_send = timeline.get("last_measurement_send_at_ms")
     planned_send = timeline.get("planned_send_at_ms")
     if type(actual_send) is int and type(last_measurement_send) is int:
-        if timeline.get("measurement_age_at_send_ms") != max(
-            0, actual_send - last_measurement_send
-        ):
+        expected_age = actual_send - last_measurement_send
+        expected_age = expected_age if expected_age >= 0 else None
+        if timeline.get("measurement_age_at_send_ms") != expected_age:
             raise EvidenceError(f"{side}_attempt_measurement_age_mismatch")
+    measurement_started = timeline.get("measurement_started_at_ms")
+    if type(actual_send) is int and type(measurement_started) is int:
+        expected_age = actual_send - measurement_started
+        expected_age = expected_age if expected_age >= 0 else None
+        if timeline.get("measurement_to_first_send_ms") != expected_age:
+            raise EvidenceError(f"{side}_attempt_measurement_to_send_mismatch")
     if type(actual_send) is int and type(planned_send) is int:
         if timeline.get("schedule_deviation_ms") != actual_send - planned_send:
             raise EvidenceError(f"{side}_attempt_schedule_deviation_mismatch")
-    probe_hit = timeline.get("probe_hit_at_ms")
+    probe_hit = timeline.get("probe_last_hit_at_ms")
     validation_at = timeline.get("encrypted_validation_completed_at_ms")
     if type(probe_hit) is int and type(validation_at) is int:
-        if timeline.get("validation_duration_ms") != max(0, validation_at - probe_hit):
-            raise EvidenceError(f"{side}_attempt_validation_duration_mismatch")
+        expected_duration = validation_at - probe_hit
+        expected_duration = expected_duration if expected_duration >= 0 else None
+        if timeline.get("last_probe_hit_to_validation_ms") != expected_duration:
+            raise EvidenceError(f"{side}_attempt_last_hit_validation_mismatch")
 
     direct_confirmed = report.get("direct_confirmed")
     if type(direct_confirmed) is not bool:
@@ -440,6 +485,7 @@ def validate_attempt(
         raise EvidenceError(f"{side}_attempt_unconfirmed_validation_timestamp")
 
     enriched = json.loads(json.dumps(report))
+    enriched["evidence_side"] = side
     enriched_timeline = enriched["timeline"]
     validation_at = enriched_timeline.get("encrypted_validation_completed_at_ms")
     if report.get("direct_confirmed") is True:
@@ -448,15 +494,22 @@ def validate_attempt(
     else:
         enriched_timeline["business_ready_at_ms"] = None
         enriched_timeline["first_business_success_at_ms"] = None
-    enriched_timeline["time_to_first_business_ms"] = (
+    enriched_timeline["connection_to_first_business_ms"] = None
+    enriched_timeline["validation_to_first_business_ms"] = (
         direct_business_at_ms - validation_at
         if type(validation_at) is int
         and type(direct_business_at_ms) is int
         and direct_business_at_ms >= validation_at
         else None
     )
+    enriched_timeline["business_evidence_attribution"] = business_attribution
+    enriched_timeline["connection_timing_attribution"] = (
+        "not_attributable:connection_start_identity_unavailable"
+    )
     if report.get("direct_confirmed") is True:
-        if business_ready_at_ms is None:
+        if business_attribution != "attributed:exact_attempt_identity":
+            enriched["experiment_outcome_class"] = "validation_completed_business_evidence_unattributable"
+        elif business_ready_at_ms is None:
             enriched["experiment_outcome_class"] = "validation_completed_business_not_ready"
         elif direct_business_at_ms is None:
             enriched["experiment_outcome_class"] = "business_ready_no_direct_business"
@@ -502,21 +555,31 @@ def extract_attempts(
             )
             ready_at = None
             direct_business_at = None
+            attribution_reasons: list[str] = []
             if isinstance(peer_id, str) and type(generation) is int:
-                ready_at = first_timeline_event_at(
+                ready_at, ready_reason = first_timeline_event_at(
                     status,
                     "direct_business_mtu_ready",
                     peer_id,
-                    generation,
                     "direct",
+                    raw_report,
                 )
-                direct_business_at = first_timeline_event_at(
+                direct_business_at, business_reason = first_timeline_event_at(
                     status,
                     "business_ingress_observed",
                     peer_id,
-                    generation,
                     "direct",
+                    raw_report,
                 )
+                attribution_reasons.extend((ready_reason, business_reason))
+            else:
+                attribution_reasons.append("not_attributable:peer_or_generation_missing")
+            business_attribution = (
+                "attributed:exact_attempt_identity"
+                if attribution_reasons
+                and all(reason == "attributed:exact_attempt_identity" for reason in attribution_reasons)
+                else ";".join(dict.fromkeys(attribution_reasons))
+            )
             reports.append(
                 validate_attempt(
                     raw_report,
@@ -528,11 +591,42 @@ def extract_attempts(
                     first,
                     ready_at,
                     direct_business_at,
+                    business_attribution,
                 )
             )
     if not reports:
         raise EvidenceError(f"{side}_hard_hard_attempt_missing")
     return reports, final_path
+
+
+def validate_shared_plan_pair(
+    attempts_a: list[dict[str, Any]], attempts_b: list[dict[str, Any]]
+) -> None:
+    combined = attempts_a + attempts_b
+    if len(combined) != 2:
+        raise EvidenceError("shared_plan_attempt_count_not_two")
+    left, right = combined
+    if left.get("session_tag") != right.get("session_tag"):
+        raise EvidenceError("shared_plan_session_tag_mismatch")
+    if left.get("plan_tag") != right.get("plan_tag"):
+        raise EvidenceError("shared_plan_plan_tag_mismatch")
+    if {left.get("role"), right.get("role")} != {"initiator", "responder"}:
+        raise EvidenceError("shared_plan_roles_not_reciprocal")
+    by_role = {value["role"]: value for value in combined}
+    initiator = by_role["initiator"]
+    responder = by_role["responder"]
+    # The protocol reciprocates profile ownership. Network generations,
+    # candidate epochs, peer-session generations, socket indexes, and attempt
+    # counters remain endpoint-local and are never required to be numerically
+    # equal across the pair.
+    if initiator.get("local_profile_generation") != responder.get(
+        "remote_profile_generation"
+    ):
+        raise EvidenceError("shared_plan_initiator_profile_mismatch")
+    if initiator.get("remote_profile_generation") != responder.get(
+        "local_profile_generation"
+    ):
+        raise EvidenceError("shared_plan_responder_profile_mismatch")
 
 
 def validate_round(
@@ -583,6 +677,7 @@ def validate_round(
     attempts_b, final_b = extract_attempts(
         status_b, "b", scenario, seed, source_sha, baseline_sha, first_b
     )
+    validate_shared_plan_pair(attempts_a, attempts_b)
     attempts = [dict(side="a", **report) for report in attempts_a]
     attempts.extend(dict(side="b", **report) for report in attempts_b)
     if first_a["path"] == "direct":
@@ -595,17 +690,19 @@ def validate_round(
                 ready_at = timeline.get("business_ready_at_ms")
                 business_at = timeline.get("first_business_success_at_ms")
                 validation_at = timeline.get("encrypted_validation_completed_at_ms")
-                if type(ready_at) is not int:
-                    raise EvidenceError(f"{side}_direct_business_mtu_ready_missing")
-                if type(business_at) is not int:
-                    raise EvidenceError(f"{side}_direct_business_ingress_event_missing")
                 # `business_ready` is the local outbound-selector milestone,
                 # while `first_business_success` is authenticated inbound
                 # delivery. Both must follow encrypted validation, but either
                 # direction may win the race; imposing an order between them
-                # would reject real bidirectional Direct evidence.
-                if type(validation_at) is not int or not (
-                    validation_at <= ready_at and validation_at <= business_at
+                # would reject real bidirectional Direct evidence. These
+                # attempt-local fields are optional until the exact commit,
+                # transport, and socket identity is present on both events;
+                # requested-round business proof remains in first_usable.
+                if attempt["timeline"].get("business_evidence_attribution") == "attributed:exact_attempt_identity" and (
+                    type(ready_at) is not int
+                    or type(business_at) is not int
+                    or type(validation_at) is not int
+                    or not (validation_at <= ready_at and validation_at <= business_at)
                 ):
                     raise EvidenceError(f"{side}_direct_business_timeline_invalid")
     direct_within_protection = (
@@ -653,10 +750,169 @@ def distribution(values: Iterable[int]) -> dict[str, int | None]:
     }
 
 
+def observed_attempts(rounds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    for item in rounds:
+        values = item.get("attempts")
+        if not isinstance(values, list):
+            values = item.get("partial_attempts")
+        if isinstance(values, list):
+            reports.extend(value for value in values if isinstance(value, dict))
+    return reports
+
+
+def paired_plan_groups(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for attempt in attempts:
+        session_tag = attempt.get("session_tag")
+        plan_tag = attempt.get("plan_tag")
+        if not isinstance(session_tag, str) or not isinstance(plan_tag, str):
+            continue
+        groups.setdefault((session_tag, plan_tag), []).append(attempt)
+    return [
+        {"session_tag": key[0], "plan_tag": key[1], "attempts": values}
+        for key, values in groups.items()
+    ]
+
+
+def extract_partial_attempt_reports(
+    round_dir: Path,
+    scenario: Scenario,
+    seed: int,
+    source_sha: str,
+    baseline_sha: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Preserve typed costs from available sides when round evidence is invalid."""
+    attempts: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for side in ("a", "b"):
+        path = round_dir / f"node-{side}.status.json"
+        if not path.is_file():
+            errors.append(f"{side}_status_missing")
+            continue
+        try:
+            status = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            errors.append(f"{side}_status_unreadable")
+            continue
+        peers = status.get("peers") if isinstance(status, dict) else None
+        if not isinstance(peers, list):
+            errors.append(f"{side}_peers_missing")
+            continue
+        found = 0
+        for peer in peers:
+            events = peer.get("direct_events") if isinstance(peer, dict) else None
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict) or event.get("stage") != "hard_hard_attempt_report":
+                    continue
+                report = event.get("hard_hard_attempt")
+                if not isinstance(report, dict):
+                    continue
+                if (
+                    report.get("schema_version") != ATTEMPT_SCHEMA_VERSION
+                    or report.get("source_git_commit") != source_sha
+                    or report.get("baseline_git_commit") != baseline_sha
+                    or report.get("scenario_id") != scenario.name
+                    or report.get("seed") != seed
+                    or not isinstance(report.get("counts"), dict)
+                    or not isinstance(report.get("session_tag"), str)
+                    or not isinstance(report.get("plan_tag"), str)
+                    or re.fullmatch(r"[0-9a-f]{16}", report.get("session_tag", "")) is None
+                    or re.fullmatch(r"[0-9a-f]{16}", report.get("plan_tag", "")) is None
+                ):
+                    errors.append(f"{side}_partial_attempt_identity_invalid")
+                    continue
+                partial = json.loads(json.dumps(report))
+                partial["evidence_side"] = side
+                partial["evidence_validity"] = "incomplete_round"
+                if not isinstance(partial.get("timeline"), dict):
+                    partial["timeline"] = {}
+                partial["timeline"]["business_evidence_attribution"] = (
+                    "not_attributable:round_evidence_incomplete"
+                )
+                attempts.append(partial)
+                found += 1
+        if found == 0:
+            errors.append(f"{side}_attempt_report_missing")
+    return attempts, errors
+
+
+def cost_summary(
+    rounds: list[dict[str, Any]], attempts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    groups = paired_plan_groups(attempts)
+    paired = 0
+    incomplete = 0
+    for group in groups:
+        values = group["attempts"]
+        roles = [value.get("role") for value in values]
+        if roles.count("initiator") == 1 and roles.count("responder") == 1 and len(values) == 2:
+            paired += 1
+        else:
+            incomplete += 1
+    count_fields = {
+        "probe_datagrams": "send_success_datagrams",
+        "probe_bytes": "send_success_bytes",
+        "probe_send_errors": "send_errors",
+        "stun_datagrams": "stun_send_success_datagrams",
+        "stun_bytes": "stun_send_success_bytes",
+        "stun_send_errors": "stun_send_errors",
+        "candidate_signal_payload_logic_bytes": "candidate_signal_payload_logic_bytes",
+        "planned_logical_probes": "planned_logical_probes",
+        "planned_logical_probes_not_attempted": "planned_logical_probes_not_attempted",
+        "budget_skipped": "budget_skipped",
+    }
+    known: dict[str, int] = {}
+    unknown: dict[str, int] = {}
+    for output_name, field in count_fields.items():
+        values = [
+            attempt.get("counts", {}).get(field)
+            for attempt in attempts
+            if isinstance(attempt.get("counts"), dict)
+        ]
+        observed = [value for value in values if type(value) is int and value >= 0]
+        known[output_name] = sum(observed)
+        unknown[output_name] = len(values) - len(observed)
+    reason_totals: dict[str, int] = {}
+    for attempt in attempts:
+        counts = attempt.get("counts")
+        if not isinstance(counts, dict):
+            continue
+        missing = counts.get("planned_logical_probes_not_attempted")
+        if type(missing) is not int or missing <= 0:
+            continue
+        if attempt.get("direct_confirmed") is True:
+            reason = "success_cancelled"
+        elif attempt.get("failure_class") == "budget_rejected":
+            reason = "budget_rejected"
+        elif attempt.get("failure_class") == "missed_schedule" or attempt.get("terminal_reason") == "deadline":
+            reason = "expired"
+        elif attempt.get("failure_class") == "cancelled_generation_changed":
+            reason = "lifecycle_invalidated"
+        else:
+            reason = "unknown"
+        reason_totals[reason] = reason_totals.get(reason, 0) + missing
+    rounds_with_reports = sum(bool(observed_attempts([item])) for item in rounds)
+    return {
+        "basis": "all requested rounds; observed local side reports only",
+        "observed_attempt_reports": len(attempts),
+        "paired_shared_plan_samples": paired,
+        "incomplete_shared_plan_samples": incomplete,
+        "requested_rounds_without_attempt_costs": len(rounds) - rounds_with_reports,
+        "known_observed_costs": known,
+        "unknown_field_counts": unknown,
+        "full_control_transport_bytes": None,
+        "planned_minus_attempted_by_reason": reason_totals,
+    }
+
+
 def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     rounds = [item for run in runs for item in run.get("rounds", [])]
     valid = [item for item in rounds if item.get("result") == "valid"]
-    attempts = [attempt for item in valid for attempt in item.get("attempts", [])]
+    attempts = observed_attempts(rounds)
+    valid_attempts = observed_attempts(valid)
     direct_first = sum(item.get("direct_within_protection") is True for item in valid)
     relay_first = sum(item.get("first_usable_path") == "relay" for item in valid)
     relay_then_direct = sum(
@@ -674,30 +930,59 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         terminal_reasons[reason] = terminal_reasons.get(reason, 0) + 1
     first_business_durations = [
         value
-        for attempt in attempts
-        for value in [attempt.get("timeline", {}).get("time_to_first_business_ms")]
+        for attempt in valid_attempts
+        for value in [attempt.get("timeline", {}).get("validation_to_first_business_ms")]
         if type(value) is int
     ]
-    counts = [attempt["counts"] for attempt in attempts]
-    def timeline_values(name: str) -> list[int]:
+    counts = [attempt["counts"] for attempt in attempts if isinstance(attempt.get("counts"), dict)]
+    valid_counts = [
+        attempt["counts"]
+        for attempt in valid_attempts
+        if isinstance(attempt.get("counts"), dict)
+    ]
+    def timeline_values(name: str, values: list[dict[str, Any]]) -> list[int]:
         return [
             value
-            for attempt in attempts
+            for attempt in values
             for value in [attempt.get("timeline", {}).get(name)]
             if type(value) is int
         ]
     target_ranks = [
         rank
-        for attempt in attempts
+        for attempt in valid_attempts
         for rank in [attempt.get("confirmed_target_rank")]
         if type(rank) is int
     ]
     confirmed_attempts = sum(attempt.get("direct_confirmed") is True for attempt in attempts)
-    planned_targets = sum(value["planned_targets"] for value in counts)
-    attempted_targets = sum(value["attempted_targets"] for value in counts)
+    planned_targets = sum(value.get("planned_targets", 0) for value in counts)
+    attempted_targets = sum(value.get("attempted_targets", 0) for value in counts)
     cleanups = [item["cleanup"]["duration_ms"] for item in valid]
     resource_usage = [run.get("resource_usage", {}) for run in runs]
+    execution_results: dict[str, int] = {}
+    for run in runs:
+        exit_code = run.get("exit_code")
+        label = str(exit_code) if type(exit_code) is int else "not_started"
+        execution_results[label] = execution_results.get(label, 0) + 1
+    all_requested_costs = cost_summary(rounds, attempts)
+    valid_only_costs = cost_summary(valid, valid_attempts)
     return {
+        "requested": {
+            "scenario_runs": len(runs),
+            "rounds": len(rounds),
+        },
+        "execution_result": {
+            "completed_smoke_processes": sum(type(run.get("exit_code")) is int for run in runs),
+            "smoke_exit_codes": execution_results,
+        },
+        "evidence_validity": {
+            "valid_rounds": len(valid),
+            "invalid_rounds": len(rounds) - len(valid),
+            "direct_within_protection_requested": {
+                "observed_successes": direct_first,
+                "requested_denominator": len(rounds),
+                "invalid_or_missing_evidence": len(rounds) - len(valid),
+            },
+        },
         "requested_rounds": len(rounds),
         "valid_rounds": len(valid),
         "invalid_rounds": len(rounds) - len(valid),
@@ -709,48 +994,51 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
             for item in valid
         ),
         "attempt_count": len(attempts),
+        "valid_only_attempt_count": len(valid_attempts),
+        "paired_shared_plan_samples": all_requested_costs["paired_shared_plan_samples"],
         "attempt_failure_classes": failures,
         "attempt_terminal_reasons": terminal_reasons,
         "attempt_timeline_ms": {
             "measurement_age_at_send": distribution(
-                timeline_values("measurement_age_at_send_ms")
+                timeline_values("measurement_age_at_send_ms", valid_attempts)
             ),
-            "schedule_deviation": distribution(timeline_values("schedule_deviation_ms")),
+            "measurement_to_first_send": distribution(
+                timeline_values("measurement_to_first_send_ms", valid_attempts)
+            ),
+            "schedule_deviation": distribution(
+                timeline_values("schedule_deviation_ms", valid_attempts)
+            ),
             "absolute_schedule_deviation": distribution(
-                abs(value) for value in timeline_values("schedule_deviation_ms")
+                abs(value) for value in timeline_values("schedule_deviation_ms", valid_attempts)
             ),
-            "validation_duration": distribution(timeline_values("validation_duration_ms")),
+            "last_probe_hit_to_validation": distribution(
+                timeline_values("last_probe_hit_to_validation_ms", valid_attempts)
+            ),
+            "validation_to_first_business": distribution(first_business_durations),
+            "connection_to_first_business": distribution(
+                timeline_values("connection_to_first_business_ms", valid_attempts)
+            ),
         },
         "candidate_execution": {
             "planned_targets": planned_targets,
             "distinct_attempted_targets": attempted_targets,
-            "coverage_per_mille": (
-                round(attempted_targets * 1000 / planned_targets)
-                if planned_targets
-                else None
-            ),
+            "not_a_coverage_estimate": True,
             "confirmed_direct_attempts": confirmed_attempts,
             "confirmed_target_in_plan_attempts": len(target_ranks),
             "confirmed_target_rank_zero_based": distribution(target_ranks),
         },
-        "successful_time_to_first_business_ms": {
-            "condition": "typed attempt has encrypted validation and same-process first business",
+        "validation_to_first_business_ms": {
+            "condition": "exact attempt identity matched to both MTU readiness and decrypted Direct ingress",
             "sample_count": len(first_business_durations),
             "p50": percentile(first_business_durations, 0.50),
             "p95": percentile(first_business_durations, 0.95),
         },
-        "packet_cost": {
-            "probe_datagrams": sum(value["send_success_datagrams"] for value in counts),
-            "probe_bytes": sum(value["send_success_bytes"] for value in counts),
-            "probe_send_errors": sum(value["send_errors"] for value in counts),
-            "stun_datagrams": sum(value["stun_send_success_datagrams"] for value in counts),
-            "stun_bytes": sum(value["stun_send_success_bytes"] for value in counts),
-            "candidate_signal_payload_bytes": sum(
-                value["candidate_signal_payload_bytes"] for value in counts
-            ),
+        "costs": {
+            "all_requested": all_requested_costs,
+            "valid_only": valid_only_costs,
         },
         "peak_planned_sockets_per_attempt": max(
-            (value["planned_sockets"] for value in counts), default=0
+            (value.get("planned_sockets", 0) for value in counts), default=0
         ),
         "cleanup_duration_ms": distribution(cleanups),
         "resource_usage": {
@@ -837,12 +1125,21 @@ def execute_scenario(
             )
         except EvidenceError as exc:
             errors.append(f"round-{number}:{exc}")
+            partial_attempts, partial_errors = extract_partial_attempt_reports(
+                raw_dir / f"round-{number}",
+                scenario,
+                scenario.seed + number - 1,
+                source_sha,
+                baseline_sha,
+            )
             round_records.append(
                 {
                     "round": number,
                     "seed": scenario.seed + number - 1,
                     "result": "invalid",
                     "reason": str(exc),
+                    "partial_attempts": partial_attempts,
+                    "partial_report_errors": partial_errors,
                 }
             )
     if completed.returncode != 0:

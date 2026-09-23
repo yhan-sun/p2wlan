@@ -81,7 +81,7 @@ pub(crate) struct HardHardMeasurementObservation {
     pub(crate) measurement_started_at_ms: Option<u64>,
     pub(crate) last_measurement_send_at_ms: Option<u64>,
     pub(crate) measurement_completed_at_ms: Option<u64>,
-    pub(crate) candidate_exchange_completed_at_ms: Option<u64>,
+    pub(crate) candidate_signal_accepted_at_ms: Option<u64>,
     pub(crate) planned_send_at_ms: Option<u64>,
     pub(crate) requested_candidate_count: usize,
     pub(crate) generated_candidate_count: usize,
@@ -94,7 +94,7 @@ pub(crate) struct HardHardMeasurementObservation {
     pub(crate) stun_send_errors: u32,
     pub(crate) stun_send_error_bytes: u64,
     pub(crate) stun_responses: u32,
-    pub(crate) candidate_signal_payload_bytes: u64,
+    pub(crate) candidate_signal_payload_logic_bytes: u64,
 }
 
 #[derive(Debug, Clone)]

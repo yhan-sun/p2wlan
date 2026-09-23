@@ -464,6 +464,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 &PunchSendReport::default(),
                 UdpProbeRxSnapshot::default(),
                 false,
+                None,
                 "session_cancelled",
             )
             .await;
@@ -511,7 +512,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             && !cancellation.is_cancelled()
             && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
         {
-            hard_hard_experiment_signal_delay().await;
+            hard_hard_experiment_signal_delay(peers.hard_hard_experiment_only()).await;
             matches!(
                 signal
                     .control
@@ -572,6 +573,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 &PunchSendReport::default(),
                 UdpProbeRxSnapshot::default(),
                 false,
+                None,
                 terminal_reason,
             )
             .await;
@@ -594,15 +596,15 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 .await;
             return;
         }
-        let candidate_exchange_completed_at_ms = peers.timeline_uptime_ms();
-        measurement_observation.candidate_exchange_completed_at_ms =
-            candidate_exchange_completed_at_ms;
+        let candidate_signal_accepted_at_ms = peers.timeline_uptime_ms();
+        measurement_observation.candidate_signal_accepted_at_ms =
+            candidate_signal_accepted_at_ms;
         measurement_observation.advertised_candidate_count = signaled_candidate_count;
         let _ = peers
-            .hard_hard_mark_candidate_exchange_completed(
+            .hard_hard_mark_candidate_signal_accepted(
                 &peer_id,
                 &coordination.token,
-                candidate_exchange_completed_at_ms,
+                candidate_signal_accepted_at_ms,
                 signaled_candidate_count,
             )
             .await;
@@ -626,6 +628,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 &PunchSendReport::default(),
                 UdpProbeRxSnapshot::default(),
                 false,
+                None,
                 "socket_handoff_failed",
             )
             .await;
@@ -652,12 +655,27 @@ pub(crate) async fn spawn_hard_hard_initiator(
         // only after the prediction is accepted and the measured socket has
         // completed its durable handoff; releasing packet flow any earlier can
         // perturb the very mapping generation being measured.
+        let session_tag = hard_hard_anonymized_tag(&coordination.token, "session");
+        let plan_tag = hard_hard_rendezvous_plan_tag(&coordination.token);
+        let remote_network_generation = if coordination.remote_network_generation == 0 {
+            "unknown".to_string()
+        } else {
+            coordination.remote_network_generation.to_string()
+        };
         info!(
             event = "hard_hard_rendezvous_scheduled",
             role = "initiator",
             peer_id = %peer_id,
             network_generation = coordination.local_network_generation,
+            peer_session_generation = peer_session_generation.value(),
             remote_candidate_epoch = coordination.remote_candidate_epoch,
+            local_profile_generation = coordination.local_profile_generation,
+            remote_profile_generation = coordination.remote_profile_generation,
+            remote_network_generation = %remote_network_generation,
+            session_tag = %session_tag,
+            plan_tag = %plan_tag,
+            punch_at_server_ms,
+            clock_domain = "host_unix_ms",
             punch_at_ms,
             candidate_count = candidates.len(),
             "hard_hard_rendezvous_scheduled"
@@ -670,10 +688,17 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 Some(candidates.len()),
                 None,
                 format!(
-                    "role=initiator token={} punch_at_ms={} local_clock_ms={} lead_ms={} sweep_deadline_ms={} {}",
-                    coordination.token,
+                    "role=initiator session_tag={} plan_tag={} punch_at_ms={} punch_at_server_ms={} clock_domain=host_unix_ms network_generation={} peer_session_generation={} remote_network_generation={} remote_candidate_epoch={} local_profile_generation={} remote_profile_generation={} lead_ms={} sweep_deadline_ms={} {}",
+                    session_tag,
+                    plan_tag,
                     punch_at_ms,
-                    hard_hard_now_ms(),
+                    punch_at_server_ms,
+                    coordination.local_network_generation,
+                    peer_session_generation.value(),
+                    remote_network_generation,
+                    coordination.remote_candidate_epoch,
+                    coordination.local_profile_generation,
+                    coordination.remote_profile_generation,
                     punch_at_ms.saturating_sub(hard_hard_now_ms()),
                     HARD_HARD_SWEEP_DEADLINE.as_millis(),
                     hard_hard_measurement_summary(&measurement),

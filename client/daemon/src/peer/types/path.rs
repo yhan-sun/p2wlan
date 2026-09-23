@@ -336,7 +336,19 @@ pub struct DirectTraversalEvent {
     pub detail: String,
 }
 
-pub const HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION: u32 = 2;
+
+/// Exact local Direct path identity used only to join one attempt report to
+/// later business timeline milestones. The validation owner is already an
+/// endpoint-local diagnostic identity; no endpoint address or payload is
+/// included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardBusinessAttributionIdentity {
+    pub validation_session_id: u64,
+    pub direct_commit_sequence: u64,
+    pub transport_instance_id: u64,
+    pub socket_index: usize,
+}
 
 /// Candidate and physical-send accounting for one Hard↔Hard attempt.
 ///
@@ -351,7 +363,9 @@ pub struct HardHardAttemptCounts {
     pub generated: u32,
     pub unique: u32,
     pub advertised: u32,
-    pub received: u32,
+    /// Parsed remote targets admitted to the local plan. This is not the raw
+    /// pre-parse signal count, which is not available at this owner boundary.
+    pub parsed_targets_for_plan: u32,
     pub planned_targets: u32,
     pub planned_sockets: u32,
     pub planned_socket_target_combinations: u32,
@@ -369,15 +383,15 @@ pub struct HardHardAttemptCounts {
     pub send_errors: u32,
     pub send_error_bytes: u64,
     pub budget_skipped: u32,
-    pub cancelled_or_not_executed: u32,
+    pub planned_logical_probes_not_attempted: u32,
     pub stun_send_success_datagrams: u32,
     pub stun_send_success_bytes: u64,
     pub stun_send_errors: u32,
     pub stun_send_error_bytes: u64,
     pub stun_responses: u32,
     /// Candidate/source strings handed to the existing signaling API. This is
-    /// the bounded payload content, not an estimate of HTTP/TLS framing.
-    pub candidate_signal_payload_bytes: u64,
+    /// logical payload content, not REST/WebSocket/TLS network bytes.
+    pub candidate_signal_payload_logic_bytes: u64,
 }
 
 /// Process-local monotonic milestones and derived durations.  Every absolute
@@ -388,20 +402,27 @@ pub struct HardHardAttemptTimeline {
     pub measurement_started_at_ms: Option<u64>,
     pub last_measurement_send_at_ms: Option<u64>,
     pub measurement_completed_at_ms: Option<u64>,
-    pub candidate_exchange_completed_at_ms: Option<u64>,
+    /// Local API acceptance of this endpoint's offer; it does not prove peer
+    /// receipt, persistence, preparation, or reciprocal readiness.
+    pub candidate_signal_accepted_at_ms: Option<u64>,
     pub planned_send_at_ms: Option<u64>,
     pub send_dispatch_at_ms: Option<u64>,
     pub actual_first_send_at_ms: Option<u64>,
-    pub probe_hit_at_ms: Option<u64>,
+    /// The last authenticated probe or matched ACK observed before validation.
+    pub probe_last_hit_at_ms: Option<u64>,
+    pub probe_last_hit_source: Option<String>,
     pub encrypted_validation_completed_at_ms: Option<u64>,
     /// Filled by the existing process timeline/experiment collector. A sweep
     /// report may be emitted before either business milestone exists.
     pub business_ready_at_ms: Option<u64>,
     pub first_business_success_at_ms: Option<u64>,
     pub measurement_age_at_send_ms: Option<u64>,
+    pub measurement_to_first_send_ms: Option<u64>,
     pub schedule_deviation_ms: Option<i64>,
-    pub validation_duration_ms: Option<u64>,
-    pub time_to_first_business_ms: Option<u64>,
+    pub last_probe_hit_to_validation_ms: Option<u64>,
+    pub connection_to_first_business_ms: Option<u64>,
+    pub validation_to_first_business_ms: Option<u64>,
+    pub business_evidence_attribution: Option<String>,
 }
 
 /// Endpoint-free report emitted once when a Hard↔Hard sweep reaches a
@@ -421,6 +442,13 @@ pub struct HardHardAttemptReport {
     pub role: String,
     pub mode: String,
     pub session_tag: String,
+    /// De-identified identity of the single plan owned by this hh1 session.
+    pub plan_tag: String,
+    /// Exact Direct commit/socket identity when this attempt completed
+    /// encrypted validation and the published DPLPMTUD path can be verified.
+    /// Missing means business milestones cannot be attributed to this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_attribution_identity: Option<HardHardBusinessAttributionIdentity>,
     pub network_generation: u64,
     pub peer_session_generation: u64,
     pub remote_candidate_epoch: u64,

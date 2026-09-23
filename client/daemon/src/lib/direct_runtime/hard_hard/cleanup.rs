@@ -272,6 +272,7 @@ fn spawn_hard_hard_session_cleanup_with_owner(
                     &PunchSendReport::default(),
                     probe_rx,
                     false,
+                    None,
                     if expiry_woke {
                         "peer_response_timeout"
                     } else {

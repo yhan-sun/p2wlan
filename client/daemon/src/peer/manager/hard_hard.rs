@@ -398,7 +398,7 @@ impl PeerManager {
     /// authoritative session. A stale worker cannot write into a replacement
     /// record because both peer and token must still match and retirement is
     /// terminal. The timestamp is observation-only.
-    pub(crate) async fn hard_hard_mark_candidate_exchange_completed(
+    pub(crate) async fn hard_hard_mark_candidate_signal_accepted(
         &self,
         peer_id: &str,
         token: &str,
@@ -414,7 +414,7 @@ impl PeerManager {
         }) else {
             return false;
         };
-        record.measurement.candidate_exchange_completed_at_ms = completed_at_ms;
+        record.measurement.candidate_signal_accepted_at_ms = completed_at_ms;
         record.measurement.advertised_candidate_count = advertised_candidate_count;
         true
     }

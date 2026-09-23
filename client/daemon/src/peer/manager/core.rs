@@ -341,6 +341,37 @@ impl PeerManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_timeline_first_with_business_attribution_identity(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+        business_attribution_identity: Option<crate::peer::HardHardBusinessAttributionIdentity>,
+    ) -> bool {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let scope = format!("peer:{peer_id}:{generation}");
+        match timeline {
+            Some(timeline) => timeline.emit_first_scoped_with_business_attribution_identity(
+                &scope,
+                event,
+                event,
+                path,
+                reason_code,
+                detail,
+                business_attribution_identity,
+            ),
+            None => false,
+        }
+    }
+
     /// Record the first-usable milestone and the persistent machine-readable
     /// summary at the same authoritative business-ingress commit. The caller
     /// supplies the already-validated business dimensions; transport readiness

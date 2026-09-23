@@ -114,7 +114,7 @@ fn hard_hard_apply_candidate_contract(
     // six-candidate attempt from being misread as a 96-port scan.
     observation.candidate_cap = strategy_candidate_cap.min(contract.cap);
     observation.truncation_reason = contract.reason.to_string();
-    observation.candidate_signal_payload_bytes = candidates
+    observation.candidate_signal_payload_logic_bytes = candidates
         .iter()
         .map(|candidate| candidate.len() as u64)
         .chain(
@@ -125,7 +125,10 @@ fn hard_hard_apply_candidate_contract(
         .fold(0u64, u64::saturating_add);
 }
 
-fn hard_hard_safe_experiment_label(name: &str) -> Option<String> {
+fn hard_hard_safe_experiment_label(experiment_only: bool, name: &str) -> Option<String> {
+    if !experiment_only {
+        return None;
+    }
     let value = std::env::var(name).ok()?;
     (!value.is_empty()
         && value.len() <= 80
@@ -135,18 +138,32 @@ fn hard_hard_safe_experiment_label(name: &str) -> Option<String> {
     .then_some(value)
 }
 
+fn hard_hard_experiment_signal_delay_ms(
+    experiment_only: bool,
+    configured_value: Option<&str>,
+) -> u64 {
+    if !experiment_only {
+        return 0;
+    }
+    configured_value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value <= 2_000)
+        .unwrap_or(0)
+}
+
 /// Optional local-only experiment hook used by the NAT matrix to hold a
 /// measured offer before it enters the existing signaling API. The default is
 /// exactly zero and the bounded delay is never inferred from production
 /// state, so ordinary traversal policy, budgets, and the canonical punch time
 /// are unchanged. A delayed offer can therefore become late and be rejected
 /// by the same production fences it is intended to measure.
-async fn hard_hard_experiment_signal_delay() {
-    let delay_ms = std::env::var("P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value <= 2_000)
-        .unwrap_or(0);
+async fn hard_hard_experiment_signal_delay(experiment_only: bool) {
+    let delay_ms = hard_hard_experiment_signal_delay_ms(
+        experiment_only,
+        std::env::var("P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS")
+            .ok()
+            .as_deref(),
+    );
     if delay_ms > 0 {
         sleep(Duration::from_millis(delay_ms)).await;
     }
@@ -164,6 +181,13 @@ fn hard_hard_anonymized_tag(session_token: &str, value: impl std::fmt::Display) 
     digest[..16].to_string()
 }
 
+/// The current hh1 ledger owner holds exactly one rendezvous plan. Derive a
+/// separate tag for that plan so logs can pair both roles without exposing the
+/// opaque signaling token or comparing endpoint-local attempt counters.
+fn hard_hard_rendezvous_plan_tag(session_token: &str) -> String {
+    hard_hard_anonymized_tag(session_token, "rendezvous-plan")
+}
+
 fn hard_hard_translate_transport_time(
     transport_at_ms: Option<u64>,
     transport_now_ms: u64,
@@ -172,6 +196,12 @@ fn hard_hard_translate_transport_time(
     transport_at_ms
         .zip(timeline_now_ms)
         .map(|(at, timeline_now)| timeline_now.saturating_sub(transport_now_ms.saturating_sub(at)))
+}
+
+fn hard_hard_elapsed_ms(start_at_ms: Option<u64>, end_at_ms: Option<u64>) -> Option<u64> {
+    start_at_ms
+        .zip(end_at_ms)
+        .and_then(|(start, end)| end.checked_sub(start))
 }
 
 fn hard_hard_attempt_failure_class(
@@ -235,6 +265,7 @@ fn hard_hard_measurement_failure_class(rejection: &FreshMappingRejection) -> &'s
 
 #[allow(clippy::too_many_arguments)]
 fn build_hard_hard_pre_session_attempt_report(
+    experiment_only: bool,
     peer_session_generation: crate::peer::PeerSessionGeneration,
     plan: crate::peer::HardHardPlanSnapshot,
     session_token: &str,
@@ -247,18 +278,29 @@ fn build_hard_hard_pre_session_attempt_report(
     let measurement = measurement.cloned().unwrap_or_default();
     crate::peer::HardHardAttemptReport {
         schema_version: crate::peer::HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
-        baseline_git_commit: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_BASELINE_SHA")
-            .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
+        baseline_git_commit: hard_hard_safe_experiment_label(
+            experiment_only,
+            "P2WLAN_EXPERIMENT_BASELINE_SHA",
+        )
+        .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
         source_git_commit: crate::build_info::GIT_COMMIT.to_string(),
         build_id: crate::build_info::BUILD_ID.to_string(),
-        experiment_variant: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_VARIANT"),
-        scenario_id: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_SCENARIO"),
-        seed: std::env::var("P2WLAN_EXPERIMENT_SEED")
-            .ok()
+        experiment_variant: hard_hard_safe_experiment_label(
+            experiment_only,
+            "P2WLAN_EXPERIMENT_VARIANT",
+        ),
+        scenario_id: hard_hard_safe_experiment_label(
+            experiment_only,
+            "P2WLAN_EXPERIMENT_SCENARIO",
+        ),
+        seed: experiment_only
+            .then(|| std::env::var("P2WLAN_EXPERIMENT_SEED").ok())
+            .flatten()
             .and_then(|value| value.parse().ok()),
         role: role.to_string(),
         mode: "measurement".to_string(),
         session_tag: hard_hard_anonymized_tag(session_token, "session"),
+        plan_tag: hard_hard_rendezvous_plan_tag(session_token),
         network_generation: plan.local_network_generation,
         peer_session_generation: peer_session_generation.value(),
         remote_candidate_epoch: plan.remote_candidate_epoch,
@@ -277,7 +319,7 @@ fn build_hard_hard_pre_session_attempt_report(
             stun_send_errors: measurement.stun_send_errors,
             stun_send_error_bytes: measurement.stun_send_error_bytes,
             stun_responses: measurement.stun_responses,
-            candidate_signal_payload_bytes: measurement.candidate_signal_payload_bytes,
+            candidate_signal_payload_logic_bytes: measurement.candidate_signal_payload_logic_bytes,
             ..crate::peer::HardHardAttemptCounts::default()
         },
         candidate_cap: hard_hard_bounded_u32(measurement.candidate_cap),
@@ -291,7 +333,7 @@ fn build_hard_hard_pre_session_attempt_report(
             measurement_started_at_ms: measurement.measurement_started_at_ms,
             last_measurement_send_at_ms: measurement.last_measurement_send_at_ms,
             measurement_completed_at_ms: measurement.measurement_completed_at_ms,
-            candidate_exchange_completed_at_ms: measurement.candidate_exchange_completed_at_ms,
+            candidate_signal_accepted_at_ms: measurement.candidate_signal_accepted_at_ms,
             planned_send_at_ms: measurement.planned_send_at_ms,
             ..crate::peer::HardHardAttemptTimeline::default()
         },
@@ -319,6 +361,7 @@ async fn record_hard_hard_pre_session_failure(
         .record_hard_hard_pre_session_attempt_report(
             peer_id,
             build_hard_hard_pre_session_attempt_report(
+                peers.hard_hard_experiment_only(),
                 peer_session_generation,
                 plan,
                 session_token,
@@ -335,6 +378,7 @@ async fn record_hard_hard_pre_session_failure(
 #[allow(clippy::too_many_arguments)]
 fn build_hard_hard_attempt_report(
     peers: &PeerManager,
+    experiment_only: bool,
     peer_session_generation: crate::peer::PeerSessionGeneration,
     fresh_socket: &crate::peer::HardHardFreshSocketIdentity,
     session_token: &str,
@@ -350,6 +394,7 @@ fn build_hard_hard_attempt_report(
     punch_report: &PunchSendReport,
     probe_rx: UdpProbeRxSnapshot,
     direct_confirmed: bool,
+    business_attribution_identity: Option<crate::peer::HardHardBusinessAttributionIdentity>,
     encrypted_validation_completed_at_ms: Option<u64>,
     confirmed_target_rank: Option<u32>,
     terminal_reason: &str,
@@ -361,42 +406,61 @@ fn build_hard_hard_attempt_report(
         transport_now_ms,
         timeline_now_ms,
     );
-    let probe_hit_transport_ms = probe_rx
-        .last_authenticated_at_ms
-        .or(probe_rx.last_matched_ack_at_ms);
-    let probe_hit_at_ms = hard_hard_translate_transport_time(
-        probe_hit_transport_ms,
+    let (probe_last_hit_transport_ms, probe_last_hit_source) =
+        if let Some(at_ms) = probe_rx.last_authenticated_at_ms {
+            (Some(at_ms), Some("last_authenticated_probe".to_string()))
+        } else if let Some(at_ms) = probe_rx.last_matched_ack_at_ms {
+            (Some(at_ms), Some("last_matched_ack".to_string()))
+        } else {
+            (None, None)
+        };
+    let probe_last_hit_at_ms = hard_hard_translate_transport_time(
+        probe_last_hit_transport_ms,
         transport_now_ms,
         timeline_now_ms,
     );
-    let measurement_age_at_send_ms = actual_first_send_at_ms
-        .zip(measurement.last_measurement_send_at_ms)
-        .map(|(sent, measured)| sent.saturating_sub(measured));
+    let measurement_age_at_send_ms = hard_hard_elapsed_ms(
+        measurement.last_measurement_send_at_ms,
+        actual_first_send_at_ms,
+    );
+    let measurement_to_first_send_ms =
+        hard_hard_elapsed_ms(measurement.measurement_started_at_ms, actual_first_send_at_ms);
     let schedule_deviation_ms = actual_first_send_at_ms
         .zip(measurement.planned_send_at_ms)
         .map(|(actual, planned)| {
             let deviation = i128::from(actual) - i128::from(planned);
             deviation.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         });
-    let validation_duration_ms = encrypted_validation_completed_at_ms
-        .zip(probe_hit_at_ms)
-        .map(|(completed, hit)| completed.saturating_sub(hit));
-    let cancelled_or_not_executed = hard_hard_bounded_u32(planned_logical_probes)
+    let last_probe_hit_to_validation_ms =
+        hard_hard_elapsed_ms(probe_last_hit_at_ms, encrypted_validation_completed_at_ms);
+    let planned_logical_probes_not_attempted = hard_hard_bounded_u32(planned_logical_probes)
         .saturating_sub(punch_report.logical_probes_attempted);
     crate::peer::HardHardAttemptReport {
         schema_version: crate::peer::HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
-        baseline_git_commit: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_BASELINE_SHA")
-            .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
+        baseline_git_commit: hard_hard_safe_experiment_label(
+            experiment_only,
+            "P2WLAN_EXPERIMENT_BASELINE_SHA",
+        )
+        .unwrap_or_else(|| crate::build_info::GIT_COMMIT.to_string()),
         source_git_commit: crate::build_info::GIT_COMMIT.to_string(),
         build_id: crate::build_info::BUILD_ID.to_string(),
-        experiment_variant: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_VARIANT"),
-        scenario_id: hard_hard_safe_experiment_label("P2WLAN_EXPERIMENT_SCENARIO"),
-        seed: std::env::var("P2WLAN_EXPERIMENT_SEED")
-            .ok()
+        experiment_variant: hard_hard_safe_experiment_label(
+            experiment_only,
+            "P2WLAN_EXPERIMENT_VARIANT",
+        ),
+        scenario_id: hard_hard_safe_experiment_label(
+            experiment_only,
+            "P2WLAN_EXPERIMENT_SCENARIO",
+        ),
+        seed: experiment_only
+            .then(|| std::env::var("P2WLAN_EXPERIMENT_SEED").ok())
+            .flatten()
             .and_then(|value| value.parse().ok()),
         role: role.to_string(),
         mode: if birthday { "birthday" } else { "predictable" }.to_string(),
         session_tag: hard_hard_anonymized_tag(session_token, "session"),
+        plan_tag: hard_hard_rendezvous_plan_tag(session_token),
+        business_attribution_identity,
         network_generation: fresh_socket.network_generation,
         peer_session_generation: peer_session_generation.value(),
         remote_candidate_epoch: fresh_socket.remote_candidate_epoch,
@@ -410,7 +474,7 @@ fn build_hard_hard_attempt_report(
             generated: hard_hard_bounded_u32(measurement.generated_candidate_count),
             unique: hard_hard_bounded_u32(measurement.deduplicated_candidate_count),
             advertised: hard_hard_bounded_u32(measurement.advertised_candidate_count),
-            received: hard_hard_bounded_u32(targets.len()),
+            parsed_targets_for_plan: hard_hard_bounded_u32(targets.len()),
             planned_targets: hard_hard_bounded_u32(targets.len()),
             planned_sockets: hard_hard_bounded_u32(planned_sockets),
             planned_socket_target_combinations: hard_hard_bounded_u32(
@@ -432,13 +496,13 @@ fn build_hard_hard_attempt_report(
             send_errors: punch_report.physical_send_errors,
             send_error_bytes: punch_report.physical_send_error_bytes,
             budget_skipped: punch_report.budget_skipped,
-            cancelled_or_not_executed,
+            planned_logical_probes_not_attempted,
             stun_send_success_datagrams: measurement.stun_datagrams_sent,
             stun_send_success_bytes: measurement.stun_bytes_sent,
             stun_send_errors: measurement.stun_send_errors,
             stun_send_error_bytes: measurement.stun_send_error_bytes,
             stun_responses: measurement.stun_responses,
-            candidate_signal_payload_bytes: measurement.candidate_signal_payload_bytes,
+            candidate_signal_payload_logic_bytes: measurement.candidate_signal_payload_logic_bytes,
         },
         candidate_cap: hard_hard_bounded_u32(measurement.candidate_cap),
         truncation_reason: measurement.truncation_reason.clone(),
@@ -451,15 +515,17 @@ fn build_hard_hard_attempt_report(
             measurement_started_at_ms: measurement.measurement_started_at_ms,
             last_measurement_send_at_ms: measurement.last_measurement_send_at_ms,
             measurement_completed_at_ms: measurement.measurement_completed_at_ms,
-            candidate_exchange_completed_at_ms: measurement.candidate_exchange_completed_at_ms,
+            candidate_signal_accepted_at_ms: measurement.candidate_signal_accepted_at_ms,
             planned_send_at_ms: measurement.planned_send_at_ms,
             send_dispatch_at_ms,
             actual_first_send_at_ms,
-            probe_hit_at_ms,
+            probe_last_hit_at_ms,
+            probe_last_hit_source,
             encrypted_validation_completed_at_ms,
             measurement_age_at_send_ms,
+            measurement_to_first_send_ms,
             schedule_deviation_ms,
-            validation_duration_ms,
+            last_probe_hit_to_validation_ms,
             ..crate::peer::HardHardAttemptTimeline::default()
         },
         probe_packets_received: probe_rx.known_peer_ip_datagrams_received,
@@ -497,6 +563,7 @@ async fn record_hard_hard_terminal_attempt(
     punch_report: &PunchSendReport,
     probe_rx: UdpProbeRxSnapshot,
     direct_confirmed: bool,
+    business_attribution_identity: Option<crate::peer::HardHardBusinessAttributionIdentity>,
     terminal_reason: &str,
 ) -> bool {
     let encrypted_validation_completed_at_ms = direct_confirmed
@@ -519,6 +586,7 @@ async fn record_hard_hard_terminal_attempt(
     };
     let report = build_hard_hard_attempt_report(
         peers,
+        peers.hard_hard_experiment_only(),
         peer_session_generation,
         fresh_socket,
         session_token,
@@ -534,6 +602,7 @@ async fn record_hard_hard_terminal_attempt(
         punch_report,
         probe_rx,
         direct_confirmed,
+        business_attribution_identity,
         encrypted_validation_completed_at_ms,
         confirmed_target_rank,
         terminal_reason,
@@ -598,6 +667,7 @@ async fn record_hard_hard_unexecuted_session_attempt(
         &punch_report,
         UdpProbeRxSnapshot::default(),
         false,
+        None,
         terminal_reason,
     )
     .await
@@ -981,6 +1051,7 @@ async fn hard_hard_wait_and_sweep(
                     &report,
                     UdpProbeRxSnapshot::default(),
                     false,
+                    None,
                     "session_cancelled",
                 )
                 .await;
@@ -1029,6 +1100,7 @@ async fn hard_hard_wait_and_sweep(
             &report,
             UdpProbeRxSnapshot::default(),
             false,
+            None,
             reason,
         )
         .await;
@@ -1563,6 +1635,9 @@ async fn hard_hard_wait_and_sweep(
     } else {
         fresh_socket.clone()
     };
+    let business_attribution_identity = terminal_direct_confirmed
+        .then(|| udp.hard_hard_business_attribution_identity(&peer_id))
+        .flatten();
     let _ = record_hard_hard_terminal_attempt(
         &peers,
         &peer_id,
@@ -1581,6 +1656,7 @@ async fn hard_hard_wait_and_sweep(
         &terminal_punch_report,
         probe_rx_delta,
         terminal_direct_confirmed,
+        business_attribution_identity,
         &terminal_reason,
     )
     .await;

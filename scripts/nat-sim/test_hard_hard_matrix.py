@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,11 @@ from pathlib import Path
 RUNNER = Path(__file__).with_name("run-hard-hard-matrix.py")
 SOURCE_SHA = "a" * 40
 BASELINE_SHA = "b" * 40
+RUNNER_SPEC = importlib.util.spec_from_file_location("hard_hard_matrix_runner", RUNNER)
+assert RUNNER_SPEC is not None and RUNNER_SPEC.loader is not None
+MATRIX_RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
+sys.modules[RUNNER_SPEC.name] = MATRIX_RUNNER
+RUNNER_SPEC.loader.exec_module(MATRIX_RUNNER)
 
 
 FAKE_SMOKE = r'''
@@ -29,7 +35,7 @@ scenario = os.environ["EXPERIMENT_SCENARIO"]
 
 def report(side, seed):
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "baseline_git_commit": os.environ["EXPERIMENT_BASELINE_SHA"],
         "source_git_commit": os.environ["NAT_TOPOLOGY_HEAD_SHA"],
         "build_id": "test-build",
@@ -39,11 +45,12 @@ def report(side, seed):
         "role": "initiator" if side == "a" else "responder",
         "mode": "predictable",
         "session_tag": "0123456789abcdef",
+        "plan_tag": "fedcba9876543210",
         "network_generation": 1,
         "peer_session_generation": 2,
         "remote_candidate_epoch": 3,
-        "local_profile_generation": 4,
-        "remote_profile_generation": 5,
+        "local_profile_generation": 4 if side == "a" else 5,
+        "remote_profile_generation": 5 if side == "a" else 4,
         "punch_generation": 6,
         "socket_index": 4096,
         "attempt": 1,
@@ -52,7 +59,7 @@ def report(side, seed):
             "generated": 2,
             "unique": 1,
             "advertised": 1,
-            "received": 1,
+            "parsed_targets_for_plan": 1,
             "planned_targets": 1,
             "planned_sockets": 1,
             "planned_socket_target_combinations": 1,
@@ -66,13 +73,13 @@ def report(side, seed):
             "send_errors": 0,
             "send_error_bytes": 0,
             "budget_skipped": 0,
-            "cancelled_or_not_executed": 0,
+            "planned_logical_probes_not_attempted": 0,
             "stun_send_success_datagrams": 3,
             "stun_send_success_bytes": 60,
             "stun_send_errors": 0,
             "stun_send_error_bytes": 0,
             "stun_responses": 3,
-            "candidate_signal_payload_bytes": 48,
+            "candidate_signal_payload_logic_bytes": 48,
         },
         "candidate_cap": 32,
         "truncation_reason": "none",
@@ -82,18 +89,28 @@ def report(side, seed):
             "measurement_started_at_ms": 100,
             "last_measurement_send_at_ms": 120,
             "measurement_completed_at_ms": 140,
-            "candidate_exchange_completed_at_ms": 180,
+            "candidate_signal_accepted_at_ms": 180,
             "planned_send_at_ms": 3500,
             "send_dispatch_at_ms": 3501,
             "actual_first_send_at_ms": 3502,
-            "probe_hit_at_ms": 3510,
+            "probe_last_hit_at_ms": 3510,
+            "probe_last_hit_source": "last_authenticated_probe",
             "encrypted_validation_completed_at_ms": 3520,
             "business_ready_at_ms": None,
             "first_business_success_at_ms": None,
             "measurement_age_at_send_ms": 3382,
             "schedule_deviation_ms": 2,
-            "validation_duration_ms": 10,
-            "time_to_first_business_ms": None,
+            "measurement_to_first_send_ms": 3402,
+            "last_probe_hit_to_validation_ms": 10,
+            "connection_to_first_business_ms": None,
+            "validation_to_first_business_ms": None,
+            "business_evidence_attribution": None,
+        },
+        "business_attribution_identity": {
+            "validation_session_id": 100 if side == "a" else 200,
+            "direct_commit_sequence": 7,
+            "transport_instance_id": 10 if side == "a" else 20,
+            "socket_index": 4096,
         },
         "probe_packets_received": 1,
         "matched_probe_acks": 1,
@@ -134,6 +151,7 @@ def status(side, seed):
                     "peer_id": peer_id,
                     "connection_generation": 1,
                     "at_ms": business_ready_at,
+                    "business_attribution_identity": attempt["business_attribution_identity"],
                 },
                 {
                     "event": "business_ingress_observed",
@@ -141,6 +159,7 @@ def status(side, seed):
                     "peer_id": peer_id,
                     "connection_generation": 1,
                     "at_ms": 3600,
+                    "business_attribution_identity": attempt["business_attribution_identity"],
                 },
             ],
             "first_usable_summaries": [{
@@ -237,23 +256,121 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         result = subprocess.run(self.command(output), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertEqual(manifest["result"], "pass")
         self.assertEqual(manifest["source_head_sha"], SOURCE_SHA)
         self.assertEqual(manifest["summary"]["valid_rounds"], 1)
         self.assertEqual(manifest["summary"]["direct_within_protection_rounds"], 1)
         self.assertEqual(manifest["summary"]["attempt_count"], 2)
-        self.assertEqual(manifest["summary"]["packet_cost"]["probe_datagrams"], 8)
+        self.assertEqual(
+            manifest["summary"]["costs"]["all_requested"]["known_observed_costs"]["probe_datagrams"],
+            8,
+        )
+        self.assertEqual(manifest["summary"]["costs"]["all_requested"]["paired_shared_plan_samples"], 1)
         self.assertEqual(
             manifest["summary"]["candidate_execution"]["confirmed_target_in_plan_attempts"],
             2,
         )
         self.assertEqual(manifest["summary"]["cleanup_duration_ms"]["p95"], 12)
         attempts = manifest["runs"][0]["rounds"][0]["attempts"]
-        self.assertEqual(attempts[0]["timeline"]["time_to_first_business_ms"], 80)
+        self.assertEqual(attempts[0]["timeline"]["validation_to_first_business_ms"], 80)
         self.assertEqual(attempts[0]["timeline"]["business_ready_at_ms"], 3550)
         self.assertEqual(attempts[0]["experiment_outcome_class"], "direct_business_succeeded")
         self.assertTrue((output / "raw/equal-step/round-1/nat-trace.jsonl").is_file())
+
+    def test_business_events_require_exact_attempt_identity_across_shared_generation(self):
+        old_identity = {
+            "validation_session_id": 10,
+            "direct_commit_sequence": 2,
+            "transport_instance_id": 30,
+            "socket_index": 4096,
+        }
+        current_identity = {
+            "validation_session_id": 11,
+            "direct_commit_sequence": 3,
+            "transport_instance_id": 30,
+            "socket_index": 4097,
+        }
+        status = {
+            "connection_timeline": {
+                "events": [
+                    {
+                        "event": "direct_business_mtu_ready",
+                        "path": "direct",
+                        "peer_id": "node-b",
+                        "connection_generation": 5,
+                        "at_ms": 200,
+                        "business_attribution_identity": old_identity,
+                    },
+                    {
+                        "event": "business_ingress_observed",
+                        "path": "direct",
+                        "peer_id": "node-b",
+                        "connection_generation": 5,
+                        "at_ms": 250,
+                        "business_attribution_identity": old_identity,
+                    },
+                    {
+                        "event": "business_ingress_observed",
+                        "path": "direct",
+                        "peer_id": "node-b",
+                        "connection_generation": 5,
+                        "at_ms": 500,
+                        "business_attribution_identity": current_identity,
+                    },
+                ]
+            }
+        }
+        matched, reason = MATRIX_RUNNER.first_timeline_event_at(
+            status,
+            "business_ingress_observed",
+            "node-b",
+            "direct",
+            {"network_generation": 5, "business_attribution_identity": current_identity},
+        )
+        self.assertEqual(matched, 500)
+        self.assertEqual(reason, "attributed:exact_attempt_identity")
+
+    def test_socket_replacement_and_missing_attempt_identity_stay_unattributed(self):
+        status = {
+            "connection_timeline": {
+                "events": [{
+                    "event": "direct_business_mtu_ready",
+                    "path": "direct",
+                    "peer_id": "node-b",
+                    "connection_generation": 5,
+                    "at_ms": 400,
+                    "business_attribution_identity": {
+                        "validation_session_id": 11,
+                        "direct_commit_sequence": 3,
+                        "transport_instance_id": 30,
+                        "socket_index": 4096,
+                    },
+                }]
+            }
+        }
+        replaced_socket = {
+            "network_generation": 5,
+            "business_attribution_identity": {
+                "validation_session_id": 11,
+                "direct_commit_sequence": 3,
+                "transport_instance_id": 30,
+                "socket_index": 4097,
+            },
+        }
+        missing_identity = {"network_generation": 5}
+        self.assertEqual(
+            MATRIX_RUNNER.first_timeline_event_at(
+                status, "direct_business_mtu_ready", "node-b", "direct", replaced_socket
+            ),
+            (None, "not_attributable:identity_mismatch"),
+        )
+        self.assertEqual(
+            MATRIX_RUNNER.first_timeline_event_at(
+                status, "direct_business_mtu_ready", "node-b", "direct", missing_identity
+            ),
+            (None, "not_attributable:attempt_identity_missing"),
+        )
 
     def test_smoke_exit_code_is_propagated_without_discarding_attempts(self):
         output = self.directory / "exit-code"
@@ -281,7 +398,7 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
             timeline["first_business_success_at_ms"],
             timeline["business_ready_at_ms"],
         )
-        self.assertEqual(timeline["time_to_first_business_ms"], 80)
+        self.assertEqual(timeline["validation_to_first_business_ms"], 80)
 
     def test_missing_attempt_or_trace_fails_closed(self):
         for scenario, reason in (
@@ -297,6 +414,17 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
                 manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
                 self.assertEqual(manifest["result"], "fail")
                 self.assertIn(reason, manifest["runs"][0]["rounds"][0]["reason"])
+                all_requested = manifest["summary"]["costs"]["all_requested"]
+                if scenario == "strict-one-sided":
+                    self.assertEqual(
+                        all_requested["known_observed_costs"]["probe_datagrams"], 4
+                    )
+                    self.assertEqual(all_requested["incomplete_shared_plan_samples"], 1)
+                else:
+                    self.assertEqual(
+                        all_requested["known_observed_costs"]["probe_datagrams"], 8
+                    )
+                    self.assertEqual(all_requested["paired_shared_plan_samples"], 1)
 
     def test_inconsistent_attempt_dimensions_fail_closed(self):
         output = self.directory / "invalid-attempt"

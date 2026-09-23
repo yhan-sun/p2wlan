@@ -3,6 +3,14 @@ mod hard_hard_tests {
     use super::*;
 
     #[test]
+    fn hard_hard_signal_delay_requires_the_explicit_experiment_lane() {
+        assert_eq!(hard_hard_experiment_signal_delay_ms(false, Some("1200")), 0);
+        assert_eq!(hard_hard_experiment_signal_delay_ms(true, Some("1200")), 1200);
+        assert_eq!(hard_hard_experiment_signal_delay_ms(true, Some("2001")), 0);
+        assert_eq!(hard_hard_experiment_signal_delay_ms(true, Some("bad")), 0);
+    }
+
+    #[test]
     fn birthday_level_caps_android_without_downgrading_desktop() {
         use crate::peer::RecoveryStage;
 
@@ -1806,6 +1814,14 @@ mod hard_hard_tests {
         SocketAddr::new("198.51.100.20".parse().unwrap(), port)
     }
 
+    #[test]
+    fn hard_hard_elapsed_ms_rejects_missing_or_reversed_timestamps() {
+        assert_eq!(hard_hard_elapsed_ms(Some(10), Some(15)), Some(5));
+        assert_eq!(hard_hard_elapsed_ms(Some(15), Some(10)), None);
+        assert_eq!(hard_hard_elapsed_ms(Some(10), None), None);
+        assert_eq!(hard_hard_elapsed_ms(None, Some(15)), None);
+    }
+
     #[tokio::test]
     async fn hard_hard_attempt_report_keeps_candidate_order_and_cost_dimensions_separate() {
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
@@ -1818,7 +1834,7 @@ mod hard_hard_tests {
             measurement_started_at_ms: Some(10),
             last_measurement_send_at_ms: Some(20),
             measurement_completed_at_ms: Some(30),
-            candidate_exchange_completed_at_ms: Some(40),
+            candidate_signal_accepted_at_ms: Some(40),
             planned_send_at_ms: Some(50),
             requested_candidate_count: 0,
             generated_candidate_count: 0,
@@ -1831,7 +1847,7 @@ mod hard_hard_tests {
             stun_send_errors: 1,
             stun_send_error_bytes: 20,
             stun_responses: 3,
-            candidate_signal_payload_bytes: 48,
+            candidate_signal_payload_logic_bytes: 48,
         };
         let send = PunchSendReport {
             logical_probes_attempted: 4,
@@ -1847,6 +1863,7 @@ mod hard_hard_tests {
         };
         let report = build_hard_hard_attempt_report(
             &peers,
+            false,
             peer_session_generation,
             &identity,
             &identity.session_token,
@@ -1864,12 +1881,13 @@ mod hard_hard_tests {
             false,
             None,
             None,
+            None,
             "send_error",
         );
 
         assert_eq!(report.counts.requested, 0);
         assert_eq!(report.counts.generated, 0);
-        assert_eq!(report.counts.received, 3);
+        assert_eq!(report.counts.parsed_targets_for_plan, 3);
         assert_eq!(report.counts.planned_socket_target_combinations, 3);
         assert_eq!(report.counts.attempted_targets, 2);
         assert_eq!(report.counts.logical_probes_attempted, 4);
@@ -1878,7 +1896,12 @@ mod hard_hard_tests {
         assert_eq!(report.counts.send_error_bytes, 60);
         assert_eq!(report.counts.stun_send_success_datagrams, 4);
         assert_eq!(report.counts.stun_send_success_bytes, 80);
-        assert_eq!(report.counts.candidate_signal_payload_bytes, 48);
+        assert_eq!(report.counts.candidate_signal_payload_logic_bytes, 48);
+        assert_eq!(report.schema_version, crate::peer::HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION);
+        assert_eq!(
+            report.plan_tag,
+            hard_hard_rendezvous_plan_tag(&identity.session_token)
+        );
         assert_eq!(report.target_order_tags.len(), targets.len());
         assert_eq!(report.target_order_tags[0], report.target_order_tags[2]);
         assert_ne!(report.target_order_tags[0], report.target_order_tags[1]);
@@ -1987,6 +2010,7 @@ mod hard_hard_tests {
             .expect("fixture peer must have a lifecycle identity");
         let current = build_hard_hard_attempt_report(
             &peers,
+            false,
             peer_session_generation,
             &identity,
             &identity.session_token,
@@ -2002,6 +2026,7 @@ mod hard_hard_tests {
             &PunchSendReport::default(),
             UdpProbeRxSnapshot::default(),
             false,
+            None,
             None,
             None,
             "session_cancelled",
@@ -2094,7 +2119,7 @@ mod hard_hard_tests {
             HARD_HARD_SWEEP_ATTEMPTS
         );
         assert_eq!(
-            report.counts.cancelled_or_not_executed,
+            report.counts.planned_logical_probes_not_attempted,
             HARD_HARD_SWEEP_ATTEMPTS
         );
         udp.detach_all_dynamic_punch_sockets("unexecuted_response_report")
@@ -2121,6 +2146,7 @@ mod hard_hard_tests {
             remote_profile_generation: identity.remote_profile_generation,
         };
         let report = build_hard_hard_pre_session_attempt_report(
+            false,
             peer_session_generation,
             plan,
             &identity.session_token,

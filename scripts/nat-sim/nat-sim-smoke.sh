@@ -263,10 +263,13 @@ if [[ -n "$NAT_SIM_ARTIFACT_DIR" ]]; then
     exit 2
   fi
   BASE_DIR="$NAT_SIM_ARTIFACT_DIR"
+  umask 077
   mkdir -p "$BASE_DIR"
 else
+  umask 077
   BASE_DIR=$(mktemp -d /tmp/p2wlan-natsim.XXXXXX)
 fi
+chmod 700 "$BASE_DIR"
 PIDS=()
 # Per-round sum of the two ends' relay-ready -> usable deltas (monotonic, ms).
 DELTA_SUMS=()
@@ -650,26 +653,163 @@ PY
 }
 
 # Sample the authenticated status endpoint without writing credentials or a
-# response body. `000` means no HTTP response; callers tolerate it only before
-# the daemon's first 200 during startup. Once the endpoint is live, every
-# sample through the Relay burst must remain 200.
+# response body. Preserve timing and curl failure details in the protected
+# round artifact, but never include the authorization header or token.
 status_http_code() {
-  local url="$1" token_file="$2" timeout_s="${3:-2}" connect_timeout_s="${4:-0.2}" code
-  code=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$token_file" \
-    p2wlan_diagnostics_curl \
-      -sS --connect-timeout "$connect_timeout_s" --max-time "$timeout_s" \
-      -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
-  if ! [[ "$code" =~ ^[0-9]{3}$ ]]; then
-    code=000
-  fi
-  printf '%s\n' "$code"
+  local side="$1" url="$2" token_file="$3" process_pid="$4"
+  local timeout_s="${5:-2}" connect_timeout_s="${6:-0.2}" header_file="$ROUND_DIR/.status-${1}-headers"
+  python3 - "$side" "$url" "$token_file" "$process_pid" "$timeout_s" \
+    "$connect_timeout_s" "$header_file" <<'PY'
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+side, url, token_path, process_pid, timeout_s, connect_timeout_s, header_path = sys.argv[1:]
+parsed = urlsplit(url)
+host_port = f"{parsed.hostname or 'unknown'}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
+try:
+    token = Path(token_path).read_text(encoding="utf-8").strip()
+except OSError:
+    token = ""
+curl_path = shutil.which("curl")
+header_file = Path(header_path)
+header_file.touch(mode=0o600, exist_ok=True)
+try:
+    os.chmod(header_file, 0o600)
+except OSError:
+    pass
+
+process_started = None
+try:
+    process_started = subprocess.run(
+        ["ps", "-p", str(int(process_pid)), "-o", "lstart="],
+        capture_output=True,
+        text=True,
+        timeout=1,
+        check=False,
+    ).stdout.strip() or None
+except (OSError, ValueError, subprocess.TimeoutExpired):
+    pass
+
+started_ns = time.monotonic_ns()
+stderr_text = ""
+stdout_text = ""
+exit_code = 1
+if not token:
+    stderr_text = "diagnostics_token_file_missing"
+elif not curl_path:
+    stderr_text = "curl_executable_missing"
+else:
+    writeout = "%{http_code}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}"
+    command = [
+        curl_path,
+        "--config", "-",
+        "--silent", "--show-error",
+        "--connect-timeout", connect_timeout_s,
+        "--max-time", timeout_s,
+        "--output", os.devnull,
+        "--dump-header", str(header_file),
+        "--write-out", writeout,
+        url,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            input=f'header = "Authorization: Bearer {token}"\n',
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_s) + 2,
+            check=False,
+        )
+        exit_code = completed.returncode
+        stdout_text = completed.stdout.strip()
+        stderr_text = completed.stderr.strip()
+    except subprocess.TimeoutExpired as exc:
+        exit_code = 124
+        stderr_text = "curl_wrapper_timeout"
+        if isinstance(exc.stdout, str):
+            stdout_text = exc.stdout.strip()
+    except OSError as exc:
+        exit_code = 127
+        stderr_text = f"curl_launch_error:{type(exc).__name__}"
+completed_ns = time.monotonic_ns()
+
+parts = stdout_text.split("\t")
+code = parts[0] if parts and re.fullmatch(r"[0-9]{3}", parts[0]) else "000"
+def float_field(index):
+    try:
+        value = float(parts[index])
+        return value if value >= 0 else None
+    except (IndexError, ValueError):
+        return None
+try:
+    response_bytes = int(float(parts[4]))
+    if response_bytes < 0:
+        response_bytes = None
+except (IndexError, ValueError, OverflowError):
+    response_bytes = None
+
+request_id = None
+try:
+    for line in header_file.read_text(encoding="iso-8859-1").splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip().lower() == "x-p2wlan-status-request-id":
+            request_id = value.strip()
+except OSError:
+    pass
+finally:
+    try:
+        header_file.unlink()
+    except OSError:
+        pass
+
+stderr_text = stderr_text.replace(token, "<redacted>") if token else stderr_text
+stderr_text = re.sub(r"(?i)authorization\s*:\s*bearer\s+\S+", "Authorization: Bearer <redacted>", stderr_text)
+stderr_text = "".join(ch for ch in stderr_text if ch in "\t" or ord(ch) >= 32)[:500]
+record = {
+    "side": side,
+    "target_host_port": host_port,
+    "target_path": parsed.path or "/",
+    "target_process_pid": int(process_pid) if process_pid.isdigit() else None,
+    "target_process_start": process_started,
+    "client_started_monotonic_ns": started_ns,
+    "client_completed_monotonic_ns": completed_ns,
+    "client_duration_ms": round((completed_ns - started_ns) / 1_000_000, 3),
+    "curl_exit_code": exit_code,
+    "http_status": code,
+    "time_connect_s": float_field(1),
+    "time_starttransfer_s": float_field(2),
+    "time_total_s": float_field(3),
+    "response_bytes": response_bytes,
+    "server_request_id": request_id,
+    "curl_stderr": stderr_text,
+}
+print(json.dumps(record, sort_keys=True))
+PY
 }
 
 record_relay_status_code() {
-  local side="$1" code="$2"
-  printf 'side=%s code=%s at_ms=%s\n' \
-    "$side" "$code" "$(python3 -c 'import time; print(int(time.time()*1000))')" \
-    >>"$ROUND_DIR/status-http-samples.log"
+  local side="$1" code="$2" sample_file="$3"
+  python3 - "$side" "$sample_file" "$ROUND_DIR/status-http-samples.log" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+side, source, destination = sys.argv[1:]
+try:
+    record = json.loads(Path(source).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    record = {"side": side, "http_status": "000", "sample_record_error": "unreadable"}
+record["side"] = side
+with Path(destination).open("a", encoding="utf-8") as output:
+    output.write(json.dumps(record, sort_keys=True) + "\n")
+PY
   case "$side" in
     a)
       A_STATUS_SAMPLE_COUNT=$((A_STATUS_SAMPLE_COUNT + 1))
@@ -697,7 +837,8 @@ record_relay_status_code() {
 # carry the two subshell results back to this shell; only the final bounded
 # code/timestamp stream is retained as acceptance evidence.
 sample_relay_status_pair() {
-  local a_url="$1" a_token_file="$2" b_url="$3" b_token_file="$4"
+  local a_url="$1" a_token_file="$2" a_process_pid="$3"
+  local b_url="$4" b_token_file="$5" b_process_pid="$6"
   local timeout_s connect_timeout_s=0.2
   timeout_s=$(deadline_curl_timeout)
   # Hard<->Hard can briefly saturate this shared local runner with the
@@ -708,22 +849,34 @@ sample_relay_status_pair() {
   if [[ "$MODE" == "hard-hard" ]]; then
     connect_timeout_s=1
   fi
-  local a_code_file="$ROUND_DIR/.status-a-code"
-  local b_code_file="$ROUND_DIR/.status-b-code"
+  local a_code_file="$ROUND_DIR/.status-a-code.json"
+  local b_code_file="$ROUND_DIR/.status-b-code.json"
   local a_pid b_pid a_code b_code
 
-  status_http_code "$a_url" "$a_token_file" "$timeout_s" "$connect_timeout_s" >"$a_code_file" &
+  status_http_code a "$a_url" "$a_token_file" "$a_process_pid" \
+    "$timeout_s" "$connect_timeout_s" >"$a_code_file" &
   a_pid=$!
-  status_http_code "$b_url" "$b_token_file" "$timeout_s" "$connect_timeout_s" >"$b_code_file" &
+  status_http_code b "$b_url" "$b_token_file" "$b_process_pid" \
+    "$timeout_s" "$connect_timeout_s" >"$b_code_file" &
   b_pid=$!
   wait "$a_pid"
   wait "$b_pid"
-  IFS= read -r a_code <"$a_code_file" || a_code=000
-  IFS= read -r b_code <"$b_code_file" || b_code=000
-  rm -f "$a_code_file" "$b_code_file"
+  a_code=$(python3 - "$a_code_file" <<'PY'
+import json, sys
+try: print(json.load(open(sys.argv[1], encoding="utf-8")).get("http_status", "000"))
+except Exception: print("000")
+PY
+)
+  b_code=$(python3 - "$b_code_file" <<'PY'
+import json, sys
+try: print(json.load(open(sys.argv[1], encoding="utf-8")).get("http_status", "000"))
+except Exception: print("000")
+PY
+)
 
-  record_relay_status_code a "${a_code:-000}"
-  record_relay_status_code b "${b_code:-000}"
+  record_relay_status_code a "${a_code:-000}" "$a_code_file"
+  record_relay_status_code b "${b_code:-000}" "$b_code_file"
+  rm -f "$a_code_file" "$b_code_file"
 }
 
 # The Relay confirmation barrier needs the full authenticated JSON snapshots,
@@ -1360,8 +1513,10 @@ for round in $(seq 1 "$ROUNDS"); do
       sample_relay_status_pair \
         "http://127.0.0.1:$DIAG_A_PORT/status" \
         "$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" \
+        "$NODE_A_PID" \
         "http://127.0.0.1:$DIAG_B_PORT/status" \
-        "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth"
+        "$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" \
+        "$NODE_B_PID"
       A_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
       B_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
       A_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
