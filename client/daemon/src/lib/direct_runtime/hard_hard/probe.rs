@@ -181,6 +181,162 @@ fn hard_hard_anonymized_tag(session_token: &str, value: impl std::fmt::Display) 
     digest[..16].to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardHardA0Stage {
+    PlannerEligibility,
+    PeerSignalReceived,
+    PeerSignalAdmission,
+    OwnerAdmission,
+    LocalMeasurement,
+    SessionRegistration,
+    OfferApiDispatch,
+    ReciprocalResponseAdmission,
+    RendezvousSchedule,
+}
+
+impl HardHardA0Stage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PlannerEligibility => "planner_eligibility",
+            Self::PeerSignalReceived => "peer_signal_received",
+            Self::PeerSignalAdmission => "peer_signal_admission",
+            Self::OwnerAdmission => "owner_admission",
+            Self::LocalMeasurement => "local_measurement",
+            Self::SessionRegistration => "session_registration",
+            Self::OfferApiDispatch => "offer_api_dispatch",
+            Self::ReciprocalResponseAdmission => "reciprocal_response_admission",
+            Self::RendezvousSchedule => "rendezvous_schedule",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardHardA0Reason {
+    OwnerClaimed,
+    SignalReceived,
+    MalformedEnvelope,
+    AwaitingPeerSignal,
+    PeerSessionUnavailable,
+    ExistingOwner,
+    PlanUnavailable,
+    PlanAvailable,
+    BootEpochUnavailable,
+    StunObserversInsufficient,
+    RecoveryAdmissionRejected,
+    GenerationQuotaExhausted,
+    ClaimRejected,
+    ClaimDeferred,
+    Started,
+    Completed,
+    MeasurementRejected,
+    GenerationOrProfileFence,
+    InvalidRole,
+    InvalidPrediction,
+    MissingFreshPrediction,
+    MissingPunchDeadline,
+    OfferWindowTooLate,
+    OfferWindowExpired,
+    DeadlineExpired,
+    TransportUnavailable,
+    SignalContextUnavailable,
+    Registered,
+    RegistrationRejected,
+    SubmitStarted,
+    ApiReturnedOk,
+    ApiReturnedError,
+    CancelledBeforeSubmit,
+    SessionChangedBeforeSubmit,
+    RecoveryQuotaRejected,
+    Scheduled,
+    ResponseAdmitted,
+    ResponseAlreadySweeping,
+    ResponseFenced,
+}
+
+impl HardHardA0Reason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OwnerClaimed => "owner_claimed",
+            Self::SignalReceived => "signal_received",
+            Self::MalformedEnvelope => "malformed_envelope",
+            Self::AwaitingPeerSignal => "awaiting_peer_signal",
+            Self::PeerSessionUnavailable => "peer_session_unavailable",
+            Self::ExistingOwner => "existing_owner",
+            Self::PlanUnavailable => "plan_unavailable",
+            Self::PlanAvailable => "plan_available",
+            Self::BootEpochUnavailable => "boot_epoch_unavailable",
+            Self::StunObserversInsufficient => "stun_observers_insufficient",
+            Self::RecoveryAdmissionRejected => "recovery_admission_rejected",
+            Self::GenerationQuotaExhausted => "generation_quota_exhausted",
+            Self::ClaimRejected => "claim_rejected",
+            Self::ClaimDeferred => "claim_deferred",
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::MeasurementRejected => "measurement_rejected",
+            Self::GenerationOrProfileFence => "generation_or_profile_fence",
+            Self::InvalidRole => "invalid_role",
+            Self::InvalidPrediction => "invalid_prediction",
+            Self::MissingFreshPrediction => "missing_fresh_prediction",
+            Self::MissingPunchDeadline => "missing_punch_deadline",
+            Self::OfferWindowTooLate => "offer_window_too_late",
+            Self::OfferWindowExpired => "offer_window_expired",
+            Self::DeadlineExpired => "deadline_expired",
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::SignalContextUnavailable => "signal_context_unavailable",
+            Self::Registered => "registered",
+            Self::RegistrationRejected => "registration_rejected",
+            Self::SubmitStarted => "submit_started",
+            Self::ApiReturnedOk => "api_returned_ok",
+            Self::ApiReturnedError => "api_returned_error",
+            Self::CancelledBeforeSubmit => "cancelled_before_submit",
+            Self::SessionChangedBeforeSubmit => "session_changed_before_submit",
+            Self::RecoveryQuotaRejected => "recovery_quota_rejected",
+            Self::Scheduled => "scheduled",
+            Self::ResponseAdmitted => "response_admitted",
+            Self::ResponseAlreadySweeping => "response_already_sweeping",
+            Self::ResponseFenced => "response_fenced",
+        }
+    }
+}
+
+fn hard_hard_a0_stage_tags(session_token: Option<&str>) -> (String, String, &'static str) {
+    match session_token {
+        Some(token) => (
+            hard_hard_anonymized_tag(token, "session"),
+            hard_hard_rendezvous_plan_tag(token),
+            "shared_session",
+        ),
+        None => ("none".to_string(), "none".to_string(), "local_pre_session"),
+    }
+}
+
+/// Emit bounded A0 control-stage evidence only in the explicitly isolated
+/// experiment lane. Pre-session decisions have no shared identity yet and are
+/// marked local-only; later stages use the session and rendezvous-plan tags
+/// already shared by the existing hh1 envelope.
+fn hard_hard_a0_stage_log(
+    peers: &PeerManager,
+    role: &'static str,
+    session_token: Option<&str>,
+    stage: HardHardA0Stage,
+    reason: HardHardA0Reason,
+) {
+    if !peers.hard_hard_experiment_only() {
+        return;
+    }
+    let (session_tag, plan_tag, identity_scope) = hard_hard_a0_stage_tags(session_token);
+    tracing::info!(
+        event = "hard_hard_attempt_stage",
+        role,
+        identity_scope,
+        session_tag = %session_tag,
+        plan_tag = %plan_tag,
+        stage = stage.label(),
+        reason_code = reason.label(),
+        "Hard-Hard A0 control stage"
+    );
+}
+
 /// The current hh1 ledger owner holds exactly one rendezvous plan. Derive a
 /// separate tag for that plan so logs can pair both roles without exposing the
 /// opaque signaling token or comparing endpoint-local attempt counters.

@@ -249,14 +249,95 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         )
         self.assertEqual(listed.returncode, 0)
         self.assertIn("equal-step\tseed=42001", listed.stdout)
+        self.assertIn("loss-only\tseed=42101", listed.stdout)
+        self.assertIn("offer-dispatch-delay\tseed=42131", listed.stdout)
         self.assertIn("random-high-entropy-negative", listed.stdout)
+
+    def test_a0_fault_scenarios_are_isolated_and_control_delay_is_separate(self):
+        defaults = {
+            "LOSS": "0",
+            "REORDER": "0",
+            "DUPLICATE_RATE": "0",
+            "SIGNAL_DELAY_A_MS": "0",
+            "SIGNAL_DELAY_B_MS": "0",
+        }
+        expected = {
+            "equal-step": {},
+            "loss-only": {"LOSS": "0.08"},
+            "reorder-only": {"REORDER": "1"},
+            "duplicate-only": {
+                "DUPLICATE_RATE": "1.0",
+                "ALLOW_REPLAY_REJECTS": "1",
+            },
+            "loss-reorder-duplicate": {
+                "LOSS": "0.08",
+                "REORDER": "1",
+                "DUPLICATE_RATE": "1.0",
+                "ALLOW_REPLAY_REJECTS": "1",
+            },
+            "offer-dispatch-delay": {
+                "SIGNAL_DELAY_A_MS": "400",
+                "SIGNAL_DELAY_B_MS": "0",
+            },
+        }
+        for name, overrides in expected.items():
+            with self.subTest(scenario=name):
+                scenario = MATRIX_RUNNER.SCENARIO_BY_NAME[name]
+                configured = {**defaults, **scenario.env}
+                for key in defaults:
+                    self.assertEqual(configured[key], {**defaults, **overrides}.get(key, defaults[key]))
+                for key, value in overrides.items():
+                    self.assertEqual(configured[key], value)
+        self.assertIn("simulator UDP", MATRIX_RUNNER.SCENARIO_BY_NAME["loss-only"].description)
+        self.assertIn("not Control signaling", MATRIX_RUNNER.SCENARIO_BY_NAME["loss-only"].description)
+        self.assertIn("before its existing signaling API", MATRIX_RUNNER.SCENARIO_BY_NAME["offer-dispatch-delay"].description)
+
+    def test_a0_stage_parser_keeps_only_redacted_allowlisted_fields(self):
+        round_dir = self.directory / "a0-stage-parser"
+        round_dir.mkdir()
+        secret_marker = "peer_id=private-node endpoint=198.51.100.7:2345 opaque=raw-session-token"
+        for side, role in (("a", "initiator"), ("b", "responder")):
+            (round_dir / f"node-{side}.log").write_text(
+                'INFO event="hard_hard_attempt_stage" '
+                f'role="{role}" identity_scope="shared_session" '
+                'session_tag="0123456789abcdef" plan_tag="fedcba9876543210" '
+                'stage="local_measurement" reason_code="started" '
+                + secret_marker
+                + "\n",
+                encoding="utf-8",
+            )
+        with (round_dir / "node-a.log").open("a", encoding="utf-8") as log:
+            log.write(
+                'INFO event="hard_hard_attempt_stage" role="unclassified" '
+                'identity_scope="local_pre_session" session_tag="none" plan_tag="none" '
+                'stage="peer_signal_admission" reason_code="malformed_envelope"\n'
+            )
+        (round_dir / "server.log").write_text(
+            '2026/09/23 event=hard_hard_attempt_stage role=initiator '
+            'identity_scope=shared_session session_tag=0123456789abcdef '
+            'plan_tag=fedcba9876543210 stage=signal_persisted '
+            'reason_code=database_inserted raw_token=do-not-copy\n',
+            encoding="utf-8",
+        )
+        evidence = MATRIX_RUNNER.extract_a0_stage_evidence(round_dir)
+        self.assertEqual(evidence["schema_version"], 2)
+        self.assertEqual(evidence["record_count"], 4)
+        self.assertEqual(evidence["missing_sources"], [])
+        self.assertEqual(evidence["sides"]["a"]["records"][0]["stage"], "local_measurement")
+        self.assertEqual(evidence["sides"]["server"]["records"][0]["stage"], "signal_persisted")
+        self.assertEqual(
+            evidence["sides"]["a"]["records"][1]["reason_code"], "malformed_envelope"
+        )
+        self.assertNotIn(secret_marker, json.dumps(evidence))
+        self.assertNotIn("198.51.100.7", json.dumps(evidence))
+        self.assertNotIn("do-not-copy", json.dumps(evidence))
 
     def test_success_writes_schema_and_preserves_raw_evidence(self):
         output = self.directory / "success"
         result = subprocess.run(self.command(output), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
         self.assertEqual(manifest["result"], "pass")
         self.assertEqual(manifest["source_head_sha"], SOURCE_SHA)
         self.assertEqual(manifest["summary"]["valid_rounds"], 1)
