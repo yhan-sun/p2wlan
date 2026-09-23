@@ -2,11 +2,14 @@ package api
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -366,12 +369,49 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"signal creation failed"}`, http.StatusInternalServerError)
 		return
 	}
+	if os.Getenv("P2WLAN_A0_SIGNAL_TRACE") == "1" {
+		if role, sessionTag, planTag, ok := hardHardA0SessionTags(req.SessionID); ok {
+			log.Printf("event=hard_hard_attempt_stage role=%s identity_scope=shared_session session_tag=%s plan_tag=%s stage=signal_persisted reason_code=database_inserted", role, sessionTag, planTag)
+		}
+	}
 	s.signalNotifier.notify(req.ToNodeID)
 	if s.hub != nil {
 		s.hub.Notify(req.ToNodeID)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "signal": signal, "protocol_version": database.SignalProtocolVersion, "server_time_ms": time.Now().UnixMilli()})
+}
+
+func hardHardA0SessionTags(sessionID string) (role, sessionTag, planTag string, ok bool) {
+	fields := strings.SplitN(sessionID, ":", 4)
+	if len(fields) != 4 || fields[0] != "hh1" {
+		return "", "", "", false
+	}
+	switch fields[1] {
+	case "i":
+		role = "initiator"
+	case "r":
+		role = "responder"
+	default:
+		return "", "", "", false
+	}
+	token := fields[2]
+	if len(token) == 0 || len(token) > 32 {
+		return "", "", "", false
+	}
+	for _, char := range token {
+		if !((char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F') || (char >= '0' && char <= '9') || char == '-') {
+			return "", "", "", false
+		}
+	}
+	sessionTag = hardHardA0Digest(token, "session")
+	planTag = hardHardA0Digest(token, "rendezvous-plan")
+	return role, sessionTag, planTag, true
+}
+
+func hardHardA0Digest(token, label string) string {
+	digest := sha256.Sum256([]byte("p2wlan-hard-hard-report-v1\x00" + token + "\x00" + label))
+	return hex.EncodeToString(digest[:])[:16]
 }
 
 // ListSignals handles GET /api/v1/signals.

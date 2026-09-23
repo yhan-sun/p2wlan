@@ -523,6 +523,20 @@ impl Daemon {
             return HardHardOfferHandling::NotHardHard;
         }
         let Some(coordination) = HardHardCoordination::parse(session_id) else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                "unclassified",
+                None,
+                HardHardA0Stage::PeerSignalReceived,
+                HardHardA0Reason::SignalReceived,
+            );
+            hard_hard_a0_stage_log(
+                &self.peers,
+                "unclassified",
+                None,
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::MalformedEnvelope,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -535,7 +549,25 @@ impl Daemon {
                 .await;
             return HardHardOfferHandling::Rejected;
         };
+        let local_role = match coordination.role {
+            HardHardRole::Initiator => "responder",
+            HardHardRole::Responder => "initiator",
+        };
+        hard_hard_a0_stage_log(
+            &self.peers,
+            local_role,
+            Some(&coordination.token),
+            HardHardA0Stage::PeerSignalReceived,
+            HardHardA0Reason::SignalReceived,
+        );
         let FreshPunchDecision::Fresh(_id, frozen_targets) = fresh_punch else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::MissingFreshPrediction,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -556,6 +588,13 @@ impl Daemon {
             )
             .await
         {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::GenerationOrProfileFence,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -569,6 +608,13 @@ impl Daemon {
             return HardHardOfferHandling::Rejected;
         }
         let Some(punch_at_ms) = punch_at_ms else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::MissingPunchDeadline,
+            );
             self.peers
                 .record_direct_event(
                     peer_id,
@@ -582,9 +628,23 @@ impl Daemon {
             return HardHardOfferHandling::Rejected;
         };
         let Some(udp) = self.udp_transport.read().await.clone() else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::TransportUnavailable,
+            );
             return HardHardOfferHandling::Fallback;
         };
         let Some(signal) = self.hole_punch_signal_context().await else {
+            hard_hard_a0_stage_log(
+                &self.peers,
+                local_role,
+                Some(&coordination.token),
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::SignalContextUnavailable,
+            );
             return HardHardOfferHandling::Fallback;
         };
         match coordination.role {
@@ -628,6 +688,13 @@ impl Daemon {
                     .await
                 {
                     crate::peer::HardHardResponseAdmission::Rejected => {
+                        hard_hard_a0_stage_log(
+                            &self.peers,
+                            "initiator",
+                            Some(&coordination.token),
+                            HardHardA0Stage::ReciprocalResponseAdmission,
+                            HardHardA0Reason::ResponseFenced,
+                        );
                         self.peers
                             .record_direct_event(
                                 peer_id,
@@ -641,9 +708,24 @@ impl Daemon {
                         return HardHardOfferHandling::Rejected;
                     }
                     crate::peer::HardHardResponseAdmission::AlreadySweeping => {
+                        hard_hard_a0_stage_log(
+                            &self.peers,
+                            "initiator",
+                            Some(&coordination.token),
+                            HardHardA0Stage::ReciprocalResponseAdmission,
+                            HardHardA0Reason::ResponseAlreadySweeping,
+                        );
                         return HardHardOfferHandling::Started;
                     }
-                    crate::peer::HardHardResponseAdmission::Ready => {}
+                    crate::peer::HardHardResponseAdmission::Ready => {
+                        hard_hard_a0_stage_log(
+                            &self.peers,
+                            "initiator",
+                            Some(&coordination.token),
+                            HardHardA0Stage::ReciprocalResponseAdmission,
+                            HardHardA0Reason::ResponseAdmitted,
+                        );
+                    }
                 }
                 match spawn_hard_hard_initiator_response(
                     udp,

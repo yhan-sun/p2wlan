@@ -115,6 +115,11 @@ NAT_SIM_RUN_ID=${NAT_SIM_RUN_ID:-nat-sim-${MODE}-${NAT_SEED_BASE}}
 EXPERIMENT_VARIANT=${EXPERIMENT_VARIANT:-$MODE}
 EXPERIMENT_SCENARIO=${EXPERIMENT_SCENARIO:-$MODE}
 EXPERIMENT_BASELINE_SHA=${EXPERIMENT_BASELINE_SHA:-$NAT_TOPOLOGY_HEAD_SHA}
+P2WLAN_A0_SIGNAL_TRACE=0
+if [[ "$MODE" == "hard-hard" && "$EXPERIMENT_VARIANT" == "a0-phase-diagnosis" ]]; then
+  P2WLAN_A0_SIGNAL_TRACE=1
+fi
+export P2WLAN_A0_SIGNAL_TRACE
 # Post-first-usable burst verification: fire this many business payloads per
 # peer right after first-usable evidence and require EVERY echo (zero loss /
 # duplicate / replay).  Relay-only rounds default to a 256-packet burst.
@@ -1232,6 +1237,7 @@ for round in $(seq 1 "$ROUNDS"); do
   # Control server with the relay catalog (no UDP observer in the catalog:
   # every STUN flow must traverse the simulated NATs).
   export PORT DB_PATH="$ROUND_DIR/control.db" JWT_SECRET=smoke \
+    P2WLAN_A0_SIGNAL_TRACE \
     RELAY_TICKET_SIGNER_JSON="{\"active\":{\"kid\":\"relay-sim\",\"private_key\":\"$RELAY_SEED\"}}" \
     RELAY_CATALOG_JSON="[$RELAY_ENDPOINTS]"
   "$BASE_DIR/control-server" >"$ROUND_DIR/server.log" 2>&1 &

@@ -165,10 +165,35 @@ async fn spawn_hole_punch_task_with_lifecycle(
                         ),
                     )
                     .await;
+            } else {
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "initiator",
+                    None,
+                    HardHardA0Stage::OwnerAdmission,
+                    HardHardA0Reason::SignalContextUnavailable,
+                );
             }
+        } else {
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                None,
+                HardHardA0Stage::PlannerEligibility,
+                HardHardA0Reason::PlanUnavailable,
+            );
         }
     }
     if hard_hard_experiment_only {
+        if !local_is_hard_hard_initiator && fresh_prediction.is_none() && frozen_targets.is_none() {
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                None,
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::AwaitingPeerSignal,
+            );
+        }
         peers
             .record_direct_event(
                 &peer_id,
