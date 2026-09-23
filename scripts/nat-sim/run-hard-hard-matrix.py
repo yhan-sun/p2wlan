@@ -1531,10 +1531,19 @@ def main(argv: list[str] | None = None) -> int:
     if not SAFE_NAME.fullmatch(args.variant):
         parser.error("--variant must be a lowercase bounded label")
 
-    source_sha = args.source_sha or git_output(root, "rev-parse", "HEAD")
+    head_sha = git_output(root, "rev-parse", "HEAD")
+    source_sha = args.source_sha or head_sha
     baseline_sha = args.baseline_sha or git_output(root, "merge-base", "HEAD", "origin/main")
     if SHA1.fullmatch(source_sha) is None or SHA1.fullmatch(baseline_sha) is None:
         parser.error("source and baseline SHA values must be lowercase 40-character hex commits")
+    if source_sha != head_sha:
+        parser.error("--source-sha must match the checked-out HEAD commit")
+    try:
+        resolved_baseline_sha = git_output(root, "rev-parse", "--verify", f"{baseline_sha}^{{commit}}")
+    except subprocess.CalledProcessError:
+        parser.error("--baseline-sha must resolve to a locally available commit")
+    if resolved_baseline_sha != baseline_sha:
+        parser.error("--baseline-sha must be the canonical full commit SHA")
     smoke_script = (args.smoke_script or root / "scripts/nat-sim/nat-sim-smoke.sh").resolve()
     if not smoke_script.is_file() or not os.access(smoke_script, os.X_OK):
         parser.error(f"smoke script is not executable: {smoke_script}")

@@ -14,8 +14,14 @@ from pathlib import Path
 
 
 RUNNER = Path(__file__).with_name("run-hard-hard-matrix.py")
-SOURCE_SHA = "a" * 40
-BASELINE_SHA = "b" * 40
+REPOSITORY_ROOT = RUNNER.parents[2]
+SOURCE_SHA = subprocess.run(
+    ["git", "-C", str(REPOSITORY_ROOT), "rev-parse", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
+BASELINE_SHA = SOURCE_SHA
 RUNNER_SPEC = importlib.util.spec_from_file_location("hard_hard_matrix_runner", RUNNER)
 assert RUNNER_SPEC is not None and RUNNER_SPEC.loader is not None
 MATRIX_RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
@@ -547,6 +553,24 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("exceeding --max-executions=1", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_source_sha_must_match_head_before_creating_output(self):
+        output = self.directory / "source-sha-mismatch"
+        command = self.command(output)
+        command[command.index("--source-sha") + 1] = "f" * 40
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--source-sha must match the checked-out HEAD commit", result.stderr)
+        self.assertFalse(output.exists())
+
+    def test_baseline_sha_must_resolve_before_creating_output(self):
+        output = self.directory / "baseline-sha-missing"
+        command = self.command(output)
+        command[command.index("--baseline-sha") + 1] = "f" * 40
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--baseline-sha must resolve to a locally available commit", result.stderr)
         self.assertFalse(output.exists())
 
     def test_dry_run_prints_resolved_plan_without_creating_output(self):
