@@ -1660,6 +1660,12 @@ impl PathStateMachine {
         previous_active: Option<NetworkPath>,
         epoch: PathEpoch,
     ) {
+        // An epoch change retires any in-flight Direct probe or validation.
+        // In particular, Relay can remain active while its old Direct
+        // recovery stamp still names the previous candidate epoch; carrying
+        // that stamp forward makes the entire handover fail validation and
+        // strands the cancelled validation owner in Validating.
+        next.recovery = PathRecoveryState::Stable;
         next.compatibility_state = match next.active.network_path() {
             Some(NetworkPath::Direct) => ConnectionState::Direct,
             Some(NetworkPath::Relay) => ConnectionState::Relay,
@@ -2090,6 +2096,8 @@ mod tests {
         );
         assert_eq!(outcome.snapshot.state.active.network_path(), None);
     }
+
+    include!("tests/path_state_machine_regression.rs");
 
     #[test]
     fn candidate_refresh_retains_an_established_encrypted_direct_path_when_proven() {
